@@ -280,16 +280,96 @@ item; close with the shipping release.
   wk/wv/wo, declared dims consistent with q_dim). Its ssm_* tensor sizes
   remain hidden/head_dim-derived rather than GDN-dim-consistent, and it
   still omits `attn_gate` — the pre-existing generator gap below.
-- **TEMP-PATH · fixed-name staging paths remain** — the PID fix covered
-  the 5 session/provider sites only. The verified remaining production
-  instance: `lumen-cli/download.rs:171` builds `{filename}.part` (and
-  `.sha256`) with fixed names in the shared model cache — two concurrent
-  `lumen run` downloads of the same file clobber each other's `.part`
-  before the atomic rename at `:280`. Most other fixed-name temp sites
-  found in the sweep are `#[cfg(test)]` fixtures (risk = parallel
-  `cargo test` flakiness only, e.g. `storage/sync.rs:99,123`,
-  `download.rs:453/471/502`). Add `std::process::id()` to the download
-  staging names when touched next.
+- **TEMP-PATH / N2 · CLOSED (round 7, Category 3)** — every temp-path
+  collision site is PID-disambiguated: the production `.part` staging
+  name in `download.rs` (the clobber window before the atomic rename;
+  the `.sha256` sidecar deliberately keeps its stable name — persistent
+  cache metadata), the two `storage/sync.rs` fixtures the round-7 report
+  reproduced failing 30/40 and 22/40 under concurrent pairs, 5
+  counter-only src siblings (incl. convert.rs/sharded.rs), 3 fixed-name
+  download test dirs, and 23 integration-test dirs — 21 changed plus 2
+  that turned out already-PID-safe and were reverted (counters
+  disambiguate threads within a process, never across processes).
+  Round-final (codex fresh pass): PIDs are NOT unique across PID
+  namespaces — two containers sharing a cache volume can both be PID 1,
+  resurrecting the truncation race with a silently partial FINAL file.
+  Closed with exclusive creation: staging is `{filename}.{pid}-{nonce}`
+  opened with `create_new` (O_EXCL) and collision-retried — the
+  filesystem, not the name, is the arbiter (no lockfile needed); same
+  treatment in the bench model-cache generator. Reclamation parses both
+  name forms and moved back ABOVE the cache-hit return (a SIGKILLed
+  loser's litter would otherwise never be reclaimed once the winner
+  published; the scan is cheap now that liveness is one libc::kill).
+  Adversarial round outcomes folded in: the `.part` staging gained a
+  Drop guard (every error path cleans our own PID-named file) and
+  PID-liveness-checked stale-part reclamation at entry (never deletes a
+  live process's staging — age/name-based deletion would reintroduce the
+  bug); the sidecar write moved AFTER the rename with an honest comment
+  (shared last-writer-wins by design, content identical per URL,
+  write-only in production — `verify_sha256` has no production caller);
+  the reviewer-identified bench MODEL-CACHE hazard fixed
+  (`runner.rs` generated `bench_{size}.lbc` directly into the
+  existence-as-readiness path — now PID-staged + atomic rename); two
+  double-PID test hunks reverted. Counts corrected: 5 counter-only src
+  siblings (incl. convert.rs/sharded.rs), 23 integration-test sites of
+  which 2 were already PID-safe (reverted). Inherent residual, safe
+  direction: reclaim's liveness check is namespace-relative — across
+  containers it can keep another namespace's dead litter, or unlink a
+  live foreign-namespace staging file, which costs that download a clean
+  ENOENT rename failure, never corruption (O_EXCL guarantees the final
+  is never partial; cross-namespace liveness needs a lease, correctly
+  rejected). Codex's ask for a
+  per-cache-key lockfile REJECTED as over-engineering with rationale:
+  rename is atomic (final is always complete bytes), sidecar content is
+  deterministic per URL and write-only in production; the theoretical
+  file-A/hash-B window under a mutable upstream ref is ledgered.
+  Empirical proof: 20 concurrent pairs (40 runs) of the two
+  previously-failing tests, 0 failures, PLUS an independent same-session
+  control (old name 20/40 failures, PID name 0/40 on one binary) —
+  `evidence-v0190/n2-concurrency-proof.txt`. Remaining fixed names are deliberate
+  user-facing locations, read-only fixture constants, and env-var
+  round-trip strings that never touch disk — none collision-prone.
+  Review-round D-items folded: libc::kill liveness (EPERM = alive under
+  another user, keep; a `kill` subprocess also printed to the console),
+  legacy `{filename}.part` litter reclaimed when >1h stale, runner.rs
+  rename-failure cleanup, and explicit post-finish flush in the model
+  generators (BufWriter Drop swallows I/O errors). FINAL deletion rule
+  after the namespace round: reclaim runs ABOVE the cache-hit return (a
+  SIGKILLed loser's litter must remain reclaimable after the winner
+  publishes) and deletes only on stale-mtime (>60s grace — a live writer
+  in ANY namespace refreshes mtime every chunk) AND (ESRCH locally OR
+  >24h stale) — pure pid-liveness is namespace-local and could ESRCH a
+  live foreign container's writer. Non-UTF-8 cache dirs handled (staging
+  paths built by join, never lossy string mangling). NFS/FUSE/SMB caveat
+  ledgered: O_EXCL atomicity holds on NFSv3+/kernel 2.6+; nonconforming
+  network filesystems cannot provide the guarantee — sharing a model
+  cache over such mounts is unsupported. Codex r5's two deeper races
+  also closed: (i) hashing/renaming by PATHNAME could, after an unlink,
+  read a REUSED name's in-progress bytes and publish a partial final —
+  the download now hashes through its own fd and verifies fd-inode ==
+  path-inode before the rename (mismatch = disarm guard + clean
+  retryable error; the residual TOCTOU between check and rename is
+  microseconds and additionally requires a same-pid-same-nonce name
+  reuse — ledgered); (ii) the production wrappers' cache-hit
+  short-circuits bypassed download_gguf entirely, so post-publish
+  reclamation never ran — both wrappers now call the exported
+  reclaim_stale_parts before their cache-hit returns. Codex r6 then
+  caught (i) a HARD bug in the fd-hash change itself — staging was
+  opened write-only, so the same-fd hash read returned EBADF and every
+  cold download would have failed (fixed with .read(true); regression
+  test exclusive_staging_write_then_hash_via_same_fd covers the exact
+  create/write/seek/hash flow); and (ii) the Drop guard deleting by
+  pathname could remove a stranger's reused-name file on our error
+  paths — the guard now captures our inode at creation and removes only
+  when the path still resolves to it. r7 hardening: identity is
+  (dev, ino) not ino alone, the fd stays open through the rename
+  (prevents inode recycling from blurring the just-verified identity),
+  and the regression test is feature-gated so no-default-features builds
+  compile. Drop's own metadata-to-remove_file window remains a
+  microsecond-class TOCTOU — absolute closure needs serialized cleanup,
+  deliberately out of scope; every misfire direction is
+  keep-not-delete except that window, and it additionally requires a
+  same-pid-same-nonce name reuse.
 - **DENSE-F16-STREAM · Metal streaming dense-FFN gate/up F16/Bf16 arm
   missing** — `metal/backend_impl.rs:~2536` (`compute_layer` dense FFN)
   dispatches gate/up on Q8_0/Q4_0-else-`matmul_bytes_f32`; F16/Bf16 would

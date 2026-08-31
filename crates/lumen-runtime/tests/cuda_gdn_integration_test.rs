@@ -552,7 +552,8 @@ struct GdnSetup {
 fn setup_gdn_backend() -> GdnSetup {
     let lbc = build_gdn_hybrid_lbc();
     let id = GDN_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_gdn_integ_{id}"));
+    let dir =
+        std::env::temp_dir().join(format!("lumen_cuda_gdn_integ_{}_{id}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("gdn_hybrid.lbc");
     {

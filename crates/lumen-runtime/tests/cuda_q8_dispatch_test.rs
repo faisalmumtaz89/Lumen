@@ -270,7 +270,7 @@ fn setup_q8_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBacke
     let lbc_data = generate_test_model_q8_0(&config);
 
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_q8_test_{id}"));
+    let dir = std::env::temp_dir().join(format!("lumen_cuda_q8_test_{}_{id}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model_q8.lbc");
     {
@@ -421,7 +421,10 @@ fn test_cuda_q8_0_compute_final_with_q8_output_proj() {
     let lbc_data = generate_test_model_q8_0(&config);
 
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_q8_final_test_{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen_cuda_q8_final_test_{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model_q8.lbc");
     {
@@ -494,7 +497,10 @@ fn test_cuda_q8_0_embed_token() {
     let lbc_data = generate_test_model_q8_0(&config);
 
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lumen_cuda_q8_embed_test_{id}"));
+    let dir = std::env::temp_dir().join(format!(
+        "lumen_cuda_q8_embed_test_{}_{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test_model_q8.lbc");
     {

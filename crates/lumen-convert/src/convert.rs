@@ -692,7 +692,8 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lumen_convert_test_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("lumen_convert_test_{}_{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

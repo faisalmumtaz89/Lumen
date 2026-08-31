@@ -774,6 +774,7 @@ dependencies = [
  "dirs",
  "fancy-regex",
  "indicatif",
+ "libc",
  "lumen-bench",
  "lumen-convert",
  "lumen-format",

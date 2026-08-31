@@ -168,8 +168,20 @@ mod inner {
         let filename = local_name.as_str();
 
         let final_path = dest_dir.join(filename);
-        let part_path = dest_dir.join(format!("{filename}.part"));
+        // The staging name carries the PID: two concurrent first-time
+        // downloads of the same file must not clobber each other's .part
+        // before the atomic rename. The .sha256 sidecar keeps its stable
+        // name BY DESIGN: it is shared last-writer-wins metadata whose
+        // content is identical for both racers (hash of the same URL's
+        // bytes, same basename), written after the winner's rename, and
+        // write-only in production (only its unit test reads it back).
         let sha_path = dest_dir.join(format!("{filename}.sha256"));
+        // Reclaim BEFORE the cache-hit return: after one racer succeeds,
+        // every future call takes the cache-hit fast path, so litter from
+        // a SIGKILLed racer would otherwise never be reclaimed. The scan
+        // is a small read_dir plus one libc::kill per stale candidate —
+        // cheap since the subprocess-based check was replaced.
+        reclaim_stale_parts(dest_dir, filename);
 
         // Cache hit: file already exists and is non-empty.
         if final_path.is_file() {
@@ -230,11 +242,33 @@ mod inner {
             pb
         };
 
-        // Download to .part file.
+        // Download to .part file. The guard removes OUR pid-named staging
+        // file on every early-error return (network, write, flush, hash,
+        // rename); it is defused only after the atomic rename succeeds —
+        // the old fixed name self-overwrote, so without this the PID
+        // scheme would turn each aborted multi-GB pull into invisible
+        // litter no lumen command can reclaim.
+        // Exclusive creation with a collision-retried nonce: PIDs are NOT
+        // unique across PID namespaces (two containers sharing a cache
+        // volume can both be namespace-local PID 1, giving both the same
+        // pid-named path — a truncating create would resurrect the exact
+        // clobber race, this time publishing a silently partial FINAL).
+        // `create_new` (O_EXCL) makes the filesystem the arbiter; on a
+        // name collision we retry with a fresh nonce rather than truncate.
+        let (part_path, mut file) = create_exclusive_staging(dest_dir, filename)?;
+        let own_dev_ino = {
+            use std::os::unix::fs::MetadataExt;
+            let m = file
+                .metadata()
+                .map_err(|e| DownloadError::Io(format!("fstat error on staging: {e}")))?;
+            (m.dev(), m.ino())
+        };
+        let mut part_guard = StagingGuard {
+            path: part_path.clone(),
+            dev_ino: own_dev_ino,
+            armed: true,
+        };
         let mut reader = resp.into_reader();
-        let mut file = std::fs::File::create(&part_path).map_err(|e| {
-            DownloadError::Io(format!("failed to create {}: {e}", part_path.display()))
-        })?;
 
         let mut buf = vec![0u8; 64 * 1024]; // 64 KB buffer
         let mut total_written: u64 = 0;
@@ -254,36 +288,85 @@ mod inner {
 
         file.flush()
             .map_err(|e| DownloadError::Io(format!("flush error: {e}")))?;
-        drop(file);
 
         pb.finish_with_message("download complete");
 
         // Verify size if known.
         if let Some(expected) = content_length {
             if total_written != expected {
-                // Clean up .part file.
-                let _ = std::fs::remove_file(&part_path);
+                // Guard cleans up the .part file on return.
                 return Err(DownloadError::Io(format!(
                     "size mismatch: expected {expected} bytes, got {total_written} bytes"
                 )));
             }
         }
 
-        // Compute SHA-256 of the downloaded file.
-        let hash = compute_sha256(&part_path)?;
+        // Hash through OUR OWN file descriptor, never by reopening the
+        // pathname: after an unlink (e.g. a reclaimer that judged this
+        // transfer stalled) the NAME can be reused by a fresh exclusive
+        // create, and a pathname reopen would hash — and then rename —
+        // someone else's in-progress bytes.
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| DownloadError::Io(format!("seek error before hashing: {e}")))?;
+        let hash = sha256_of_reader(&mut file)?;
 
-        // Write SHA-256 sidecar.
-        std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
-            DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
-        })?;
+        // Identity check before the by-path rename: the pathname must
+        // still be OUR inode. If it is not (unlinked and possibly reused),
+        // renaming would publish a stranger's partial file — disarm the
+        // guard (the path is not ours to delete) and fail cleanly; a
+        // retry re-downloads.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let path_dev_ino = std::fs::metadata(&part_path)
+                .map(|m| (m.dev(), m.ino()))
+                .ok();
+            if path_dev_ino != Some(own_dev_ino) {
+                part_guard.armed = false;
+                return Err(DownloadError::Io(format!(
+                    "staging file {} was unlinked or replaced during the \
+                     download (a reclaimer judged this transfer stalled, or \
+                     the cache dir was cleaned) — retry the download",
+                    part_path.display()
+                )));
+            }
+        }
+        // The fd stays open through the rename: keeping it open prevents
+        // inode recycling from blurring the identity we just verified.
+        let file_kept_open = file;
 
-        // Atomic rename: .part -> final.
-        std::fs::rename(&part_path, &final_path).map_err(|e| {
-            DownloadError::Io(format!(
+        // Atomic rename FIRST: .part -> final. The sidecar follows, so a
+        // published file is never newer than its sidecar by more than one
+        // racer's window (contents are identical per URL either way).
+        //
+        // Rename FAILURE is cleaned up here, explicitly, while our fd is
+        // still open: a `?` would drop `file_kept_open` before the guard's
+        // Drop ran (reverse declaration order), letting the freed inode be
+        // recycled and the guard's identity check pass on a stranger's
+        // file. With the fd held, a path whose (dev, ino) matches ours IS
+        // ours, so the delete is safe.
+        if let Err(e) = std::fs::rename(&part_path, &final_path) {
+            use std::os::unix::fs::MetadataExt;
+            part_guard.armed = false;
+            let still_ours = std::fs::metadata(&part_path)
+                .map(|m| (m.dev(), m.ino()) == own_dev_ino)
+                .unwrap_or(false);
+            if still_ours {
+                let _ = std::fs::remove_file(&part_path);
+            }
+            drop(file_kept_open);
+            return Err(DownloadError::Io(format!(
                 "failed to rename {} -> {}: {e}",
                 part_path.display(),
                 final_path.display()
-            ))
+            )));
+        }
+        part_guard.armed = false;
+        drop(file_kept_open);
+
+        // Write SHA-256 sidecar (shared name, last-writer-wins by design).
+        std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
+            DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
         })?;
 
         eprintln!("Saved: {} (SHA-256: {hash})", final_path.display());
@@ -298,12 +381,17 @@ mod inner {
                 path.display()
             ))
         })?;
+        sha256_of_reader(&mut file)
+    }
 
+    /// Streaming SHA-256 over an already-open reader — used by the
+    /// download path to hash through its own descriptor (a pathname
+    /// reopen could read a reused name's bytes after an unlink).
+    pub fn sha256_of_reader<R: Read>(reader: &mut R) -> Result<String, DownloadError> {
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
-
         loop {
-            let n = file
+            let n = reader
                 .read(&mut buf)
                 .map_err(|e| DownloadError::Io(format!("read error during hashing: {e}")))?;
             if n == 0 {
@@ -311,9 +399,160 @@ mod inner {
             }
             hasher.update(&buf[..n]);
         }
+        Ok(hex_encode(&hasher.finalize()))
+    }
 
-        let digest = hasher.finalize();
-        Ok(hex_encode(&digest))
+    /// Removes the caller's PID-named staging file unless defused (set
+    /// `armed = false` after the atomic rename). Covers every early-error
+    /// return and panic unwind in the download path.
+    struct StagingGuard {
+        path: std::path::PathBuf,
+        /// (device, inode) of OUR staging file, captured at creation: the
+        /// guard must never delete a stranger's file that reused our
+        /// pathname after a reclaimer unlinked ours mid-download. The
+        /// check-to-unlink window inside Drop is a microsecond-class
+        /// TOCTOU (a replacement landing between metadata and remove_file)
+        /// — an absolute guarantee needs serialized cleanup, which is
+        /// deliberately out of scope; the residual is ledgered.
+        dev_ino: (u64, u64),
+        armed: bool,
+    }
+
+    impl Drop for StagingGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                use std::os::unix::fs::MetadataExt;
+                let still_ours = std::fs::metadata(&self.path)
+                    .map(|m| (m.dev(), m.ino()) == self.dev_ino)
+                    .unwrap_or(false);
+                if still_ours {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// Exclusive staging creation: opens `{base}.part`-style paths with
+    /// `create_new` (O_EXCL), retrying with a fresh nonce on collision so
+    /// two writers can never share (and truncate) one staging file — PIDs
+    /// alone are not unique across PID namespaces. The final path shape is
+    /// `{filename}.{pid}-{nonce}.part`.
+    pub fn create_exclusive_staging(
+        dest_dir: &Path,
+        filename: &str,
+    ) -> Result<(std::path::PathBuf, std::fs::File), DownloadError> {
+        // Built by joining onto dest_dir — never by string-mangling the
+        // full path, which breaks valid non-UTF-8 Unix cache directories.
+        for attempt in 0u32..16 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(attempt)
+                .wrapping_add(attempt);
+            let candidate =
+                dest_dir.join(format!("{filename}.{}-{nonce}.part", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .read(true) // the SAME fd is later re-read for hashing
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => return Ok((candidate, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(DownloadError::Io(format!(
+                        "failed to create staging {}: {e}",
+                        candidate.display()
+                    )))
+                }
+            }
+        }
+        Err(DownloadError::Io(
+            "could not create a unique staging file after 16 attempts".into(),
+        ))
+    }
+
+    /// Best-effort reclamation of `{filename}.<pid>[-<nonce>].part`
+    /// stragglers from crashed runs. Deletion requires BOTH a stale mtime
+    /// (>60s grace — a live writer refreshes mtime on every chunk, in any
+    /// PID namespace) AND either ESRCH in our namespace or >24h staleness
+    /// (pid numbers are namespace-local, so a foreign container's live
+    /// writer can look dead here; mtime freshness is the cross-namespace
+    /// protection). EPERM means alive under another user and keeps.
+    /// Legacy fixed-name `{filename}.part` litter is age-gated at >1h —
+    /// same mtime-freshness rationale.
+    pub fn reclaim_stale_parts(dest_dir: &std::path::Path, filename: &str) {
+        let Ok(entries) = std::fs::read_dir(dest_dir) else {
+            return;
+        };
+        let prefix = format!("{filename}.");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(pid) = rest.strip_suffix(".part") else {
+                // Legacy pre-PID litter: exactly `{filename}.part`.
+                // Reclaim only when stale by mtime (an old-binary
+                // download could still be writing it; the old scheme
+                // self-overwrote anyway).
+                if rest == "part" {
+                    let stale = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 3600);
+                    if stale {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+                continue;
+            };
+            // Accept both `{pid}` (v0.20-era) and `{pid}-{nonce}` forms;
+            // liveness keys on the pid component only.
+            let pid = pid.split('-').next().unwrap_or(pid);
+            if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
+                // Deletion rule, safe across users AND PID namespaces:
+                //   age < 60s          -> keep (grace: a live writer's
+                //                         mtime refreshes on every 64KB
+                //                         chunk, in any namespace)
+                //   ESRCH && age > 60s -> reclaim (dead in OUR namespace,
+                //                         provably not writing)
+                //   age > 24h          -> reclaim regardless of liveness
+                //                         (a foreign namespace's pid can
+                //                         alias a live local process; no
+                //                         real download goes 24h without
+                //                         touching mtime)
+                //   otherwise          -> keep
+                // libc::kill is silent and EPERM (alive under another
+                // user) keeps. Pure pid-liveness is NOT sufficient: pid
+                // numbers are namespace-local, so a foreign container's
+                // live writer could look ESRCH-dead here — the mtime
+                // grace is the cross-namespace protection.
+                let Ok(pid_num) = pid.parse::<i32>() else {
+                    continue;
+                };
+                let Some(age) = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs())
+                else {
+                    continue;
+                };
+                if age < 60 {
+                    continue;
+                }
+                let esrch = unsafe { libc::kill(pid_num, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if esrch || age > 24 * 3600 {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     /// Verify a cached file against its `.sha256` sidecar.
@@ -450,7 +689,8 @@ mod tests {
         #[test]
         fn compute_sha256_known_value() {
             // SHA-256 of "hello world\n" = a948904f2f0f479b8f8564...
-            let dir = std::env::temp_dir().join("lumen-test-sha256");
+            let dir =
+                std::env::temp_dir().join(format!("lumen-test-sha256-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("test-hello.txt");
             let mut f = std::fs::File::create(&path).unwrap();
@@ -468,7 +708,8 @@ mod tests {
 
         #[test]
         fn verify_sha256_roundtrip() {
-            let dir = std::env::temp_dir().join("lumen-test-sha256-verify");
+            let dir = std::env::temp_dir()
+                .join(format!("lumen-test-sha256-verify-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("test-verify.gguf");
             let sha_path = dir.join("test-verify.gguf.sha256");
@@ -499,7 +740,8 @@ mod tests {
 
         #[test]
         fn download_gguf_rejects_traversal() {
-            let dir = std::env::temp_dir().join("lumen-test-traversal");
+            let dir =
+                std::env::temp_dir().join(format!("lumen-test-traversal-{}", std::process::id()));
             let result = download_gguf("some/repo", "../etc/passwd", &dir, true);
             assert!(result.is_err());
             if let Err(DownloadError::InvalidFilename(msg)) = result {
@@ -511,5 +753,25 @@ mod tests {
                 panic!("expected InvalidFilename error");
             }
         }
+    }
+    #[cfg(feature = "download")]
+    #[test]
+    fn exclusive_staging_write_then_hash_via_same_fd() {
+        // Regression for the EBADF cold-download failure: the staging fd is
+        // opened read+write, written, seeked to 0, and hashed through the
+        // SAME descriptor — the exact production flow.
+        use std::io::{Seek, Write};
+        let dir = std::env::temp_dir().join(format!("lumen-staging-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, mut f) = super::create_exclusive_staging(&dir, "m.gguf").unwrap();
+        f.write_all(b"lumen staging bytes").unwrap();
+        f.flush().unwrap();
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let h = super::sha256_of_reader(&mut f).unwrap();
+        assert_eq!(h.len(), 64, "hex sha256 expected");
+        // Same-fd hash must match the by-path hash of the same bytes.
+        let h2 = super::compute_sha256(&path).unwrap();
+        assert_eq!(h, h2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
