@@ -15375,8 +15375,10 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 }
 
 /// Expected raw byte length for a `[vocab, hidden]` global tensor in the given
-/// scheme, when the scheme has a fixed block layout. `None` for schemes whose
-/// raw layout is not a plain block stream (validated elsewhere).
+/// scheme, when the scheme has a fixed block layout. `None` for schemes this
+/// path does not length-check: their raw globals are refused by the
+/// embedding/output-head quant allowlists at the call sites, and F32 globals
+/// take the plain-F32 upload path, which carries no length or cap check.
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
 /// only valid raw size. `Ok(None)` = the layout is not length-checkable
 /// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are
