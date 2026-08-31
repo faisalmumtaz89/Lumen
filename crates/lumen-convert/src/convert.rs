@@ -141,6 +141,10 @@ pub enum ConvertError {
         ggml_type: String,
     },
     UnsupportedOption(String),
+    /// The source model uses a combination the runtimes cannot serve; the
+    /// converter refuses rather than emitting an artifact its own loaders
+    /// reject.
+    UnsupportedModel(String),
 }
 
 impl fmt::Display for ConvertError {
@@ -165,6 +169,7 @@ impl fmt::Display for ConvertError {
                 write!(f, "tensor {tensor}: unsupported tensor type {ggml_type}")
             }
             Self::UnsupportedOption(msg) => write!(f, "unsupported option: {msg}"),
+            Self::UnsupportedModel(msg) => write!(f, "unsupported model: {msg}"),
         }
     }
 }
@@ -531,6 +536,42 @@ fn do_convert_from_reader<R: Read + Seek>(
             opts.requant_to,
             opts.target,
         )?);
+    }
+
+    // ---- Post-planning contract gate (round-7 structural fix) ----
+    // Run the LOADERS' own validation over every planned layer before a
+    // byte is written: lumen_format::serving_rules hosts the exact rules
+    // the Metal and CUDA loaders call, evaluated on the planned
+    // QuantSchemes (after requant/upcast/pair-force), not source types.
+    // Anything the loaders would refuse is refused here, with the
+    // loader's own message.
+    {
+        let d9 = lumen_format::hyperparams::GdnDims::QWEN35_9B;
+        let gd = hp.gdn.unwrap_or(d9);
+        let dims = lumen_format::serving_rules::AttnDims {
+            q_dim: (hp.num_heads * hp.head_dim) as usize,
+            kv_dim: (hp.num_kv_heads * hp.head_dim) as usize,
+            hidden: hp.hidden_dim as usize,
+            gdn_qkv_rows: ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize,
+            gdn_declared: hp.gdn.is_some(),
+            gdn_v_dim: (gd.num_v_heads * gd.head_dim) as usize,
+            gdn_conv_kernel: gd.conv_kernel as usize,
+        };
+        let metal = opts.target == ConvertTarget::Metal;
+        for (layer, shape) in layer_shapes.iter().enumerate() {
+            lumen_format::serving_rules::validate_layer_plan(
+                layer,
+                &shape.index.subtensors,
+                &dims,
+                hp.intermediate_dim as usize,
+                metal,
+            )
+            .map_err(|e| {
+                ConvertError::UnsupportedModel(format!(
+                    "planned artifact would be refused at load: {e}"
+                ))
+            })?;
+        }
     }
 
     // Build LBC header with quant metadata

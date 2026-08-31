@@ -107,8 +107,75 @@ item; close with the shipping release.
   elements, no such model exists, and it errs conservative (rejects,
   never admits a wrap).
 
-## Verified-latent (guard exists or path unreachable; do not fix unprompted)
-
+- **N3 · CLOSED (round 7, Category 2)** — Q+gate bias policy divergence:
+  CUDA served QKV biases on Q+gate layers via its unfused path while
+  Metal rejected the same artifact. Decided once for both backends:
+  REJECT (no shipped model emits the combination — qwen35 has no biases,
+  qwen2 has biases but never per-head Q/K norms; Metal has no kernel for
+  it and fail-closed consistency wins). CUDA now rejects in
+  `validate_mandatory_presence`; qwen2-style biased attention WITHOUT
+  per-head norms stays served (unit-tested both ways). The converters
+  refuse to emit the combination (UnsupportedModel).
+- **N4 · CLOSED STRUCTURALLY (round 7, Category 2)** — the
+  converter/loader contract is now enforced by construction: the loaders'
+  validation rules moved to `lumen_format::serving_rules` (single source
+  of truth; the Metal and CUDA loaders call thin wrappers over the same
+  functions), and `convert_gguf` runs `validate_layer_plan` — presence,
+  per-tensor projection geometry, and (Metal target) the full Metal rule
+  set — over every PLANNED layer's `SubtensorOffsets` before any byte is
+  written. Because the gate reads planned `QuantScheme`s (after
+  requant/upcast/pair-force), the convert-side shadow mappings of source
+  `GgmlType`s are deleted, retiring the entire divergence class two
+  review rounds of one-by-one fixes kept refilling (adversarial reviews
+  found 7 then 5 instances; the composite closes all 12 plus the
+  headerless-GDN residual — validated against the same
+  declared-or-QWEN35_9B default the loaders use). Round-8 reviewer pass
+  fixed the FILING: universal rules (zero-length optionals — the moved
+  19-entry `validate_layer_slices` — FFN pre-norm, expert-bank
+  uniformity via the shared `validate_expert_bank` that `build_moe_meta`
+  now delegates to, and attn_gate geometry [hidden→v_dim]) run
+  UNCONDITIONALLY, not inside the Metal branch; probes refuse on both
+  targets (`e2e-cat2-provenance.txt` shows metal+generic legs). In-repo
+  negative tests cover all four refusal classes
+  (`contract_gate_refuses_loader_rejected_plans`, mutation-proven:
+  disabling the gate fails the test). Fixer passes
+  (K-quant/Q5 upcast, GDN pair force incl. F16 and F32-split, Q4_1
+  requant) run in the planners BEFORE the gate, so legitimate sources
+  land on servable schemes; anything a fixer misses is refused with the
+  loader's own message prefixed "planned artifact would be refused at
+  load". Probes: c2q/c2b/c2n1 refused (three distinct rule classes),
+  c2f16 force-converts and serves, 9B+27B GGUFs regression-convert clean
+  (`evidence-v0190/e2e-cat2-provenance.txt`). Remedy string fixed
+  (`lumen convert --target metal`). Residuals: the HF importer
+  (`convert_hf.rs`) builds correct geometry by construction and is not
+  yet routed through the gate; generic-target artifacts satisfy the CUDA
+  rules only (Metal's allowlist refuses K-quants at load with a
+  re-convert message — by design). Lockstep/q6k test fixtures now
+  declare GDN dims coherent with EVERY tensor (nv=8,nk=2,gh=8: v_dim
+  64 = attn_gate/ssm_out/nh, qkv rows 96 — the gate caught fixtures whose
+  declared dims their own tensors contradicted, twice). Known limits,
+  stated: byte-length geometry is blind to transposition (neither loader
+  catches that either); CtInt4G32 skips the generic geometry table (its
+  ct4-specific check runs at CUDA load); the gate validates the PLAN —
+  only the writer's blob-length equality ties plan to bytes; the HF
+  importer bypasses the gate (its own shape asserts are stronger).
+  Round-9 (codex r5): the fixture repair exposed a LIVE bug — no
+  validator anywhere checked `ssm_conv1d` length while both backends
+  index `qkv_rows x conv_kernel` F32s from it (`cuda/shaders/gdn.cu:48`,
+  `metal/gdn.rs:221`): a short conv1d = CUDA OOB read / Metal silent
+  read of the next layer's bytes. Closed universally:
+  `serving_rules::validate_gdn_conv1d` (exact byte length) called by the
+  Metal loader (validate_attention_dims), the CUDA loader
+  (upload_layer_weights), and the convert gate (universal section) —
+  negative-tested at unit level; the rule immediately caught (a) the
+  format test-model generator's short conv, (b) two lockstep fixtures,
+  and (c) the round-6 c2 probe family's own conv1d (those artifacts
+  would have OOB'd at dispatch — regenerated coherent).
+  Follow-ups carried, not lost: direct unit tests for
+  `serving_rules.rs` itself (812 lines, currently covered indirectly
+  through the loader wrappers + the mutation-proven convert gate test);
+  tightening two role-agnostic negative-test needles; deriving fixture
+  constants (96, nh) from the declared ssm.* keys instead of hardcoding.
 - **C5b · Metal Q4_1 MoE expert kernels unreachable** — `named_slices()`
   covers experts and the layer-tensor allowlist rejects Q4_1, so the expert
   kernels cannot be reached; the converter force-requants Q4_1 experts to
@@ -168,8 +235,15 @@ item; close with the shipping release.
   contiguous, fused-geometry wq; zero-length wk; both loaded silently on
   v0.18.0) now rejected: `evidence-v0190/c2{b,c}.{gguf,lbc}` +
   `gen_c2_variants.py`. Remaining class members, recorded honestly:
-  (a) converter still emits these layouts silently — convert-time
-  fail-fast is the round-7 Category-2 item; (b) Metal checks wq/wk/wv
+  (a) CLOSED in Category 2: both converters now validate full-attention
+  attn_q/k/v dims against the same presence rule the loaders use
+  (TensorShapeMismatch at convert; canonical-C2 sources refuse to
+  convert), refuse Q+gate+bias and missing-both-pre-norms sources
+  (UnsupportedModel), and force F16 GDN qkv/gate pairs to Q8_0 on the
+  Metal target (the prefill has no F16 arm; Bf16 passes) — probes
+  c2q/c2b/c2n1 refuse at convert, c2f16 converts forced-Q8, real 27B
+  GGUF converts unchanged (evidence-v0190/convert-*-post*.log);
+  (b) Metal checks wq/wk/wv
   only — wo and the dense FFN trio have no Metal geometry/presence check
   (CUDA covers them; `gpu_resident.rs:~1828` even derives a qmv repack
   row count FROM the buffer); (c) GDN dims are pinned only through their
@@ -177,10 +251,12 @@ item; close with the shipping release.
   tensor is cross-checked against `hp.gdn`; (d) non-CtInt4G32 `ssm_out`
   has no CUDA geometry check; (e) byte-length checks are inherently blind
   to transposition/permutation and to the F32-vs-2xF16 length collision —
-  not closable this way, stated as a limit; (f) no MoE artifact exists on
-  this machine, so Qwen3.5-MoE full-attention geometry is covered by
-  converter-source reasoning plus the CI Modal matrix, not a local
-  byte-level check. The old entry's member (c),
+  not closable this way, stated as a limit; (f) narrowed in Category 2: the real MoE GGUF's
+  attention geometry is now verified at the header level (16 MiB ranged
+  fetch of bartowski Q4_0; attn_q [2048,8192] = 2*q_dim WITH q_norm,
+  k/v = kv_dim — `evidence-v0190/moe-geometry-verification.md`); expert
+  and FFN tensors remain covered by converter-source reasoning plus the
+  CI Modal matrix only. The old entry's member (c),
   `metal/moe.rs:2554` option-A, is covered transitively (all its weight
   paths pass a validated load point) and the route is documented dead
   outside tests.
