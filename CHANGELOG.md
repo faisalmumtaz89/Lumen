@@ -200,9 +200,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   heads); other schemes are not length-checked here — raw globals
   handed over via the direct raw setters are rejected for unsupported
   schemes during backend initialization, while on the ordinary provider
-  path they are never forwarded as raw (the provider reads them, with
-  unknown formats reinterpreted as F32 — a tracked residual — and the
-  backend uploads the resulting F32 copy).
+  path a non-colliding unsupported length is read with unknown formats
+  reinterpreted as F32 — a tracked residual — and the backend uploads
+  the resulting F32 copy. One length collision is tracked: Q4_K's
+  packed size equals Q4_0's (144 bytes per 256 elements), so a
+  hand-built Q4_K global would be misclassified as Q4_0 and forwarded
+  raw; the converter never emits K-quant globals.
 - **Session temp files are process-unique**: five session/provider staging
   paths gained `std::process::id()` suffixes, so concurrent processes no
   longer clobber each other's session staging files (model-download

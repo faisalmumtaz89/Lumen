@@ -15378,10 +15378,13 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// scheme, when the scheme has a fixed block layout. `None` for schemes this
 /// path does not length-check: raw globals stored via the direct setters are
 /// rejected for unsupported schemes during backend initialization (the
-/// setters themselves only store), and on the ordinary provider path they
-/// are never forwarded as raw — the provider reads them (unknown formats
-/// reinterpreted as F32) and the resulting F32 copy uploads via the
-/// plain-F32 path, which carries no length or cap check.
+/// setters themselves only store), and on the ordinary provider path a
+/// non-colliding unsupported length is read with unknown formats
+/// reinterpreted as F32, the resulting F32 copy uploading via the plain-F32
+/// path (no length or cap check). Known length collision, tracked: Q4_K's
+/// packed size equals Q4_0's (144 B / 256 elems), so a hand-built Q4_K
+/// global would be misdetected as Q4_0 and forwarded raw; the converter
+/// never emits K-quant globals.
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
 /// only valid raw size. `Ok(None)` = the layout is not length-checkable
 /// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are
