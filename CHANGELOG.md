@@ -56,8 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   round-7 report reproduced failing under concurrent test runs (30/40
   and 22/40), five counter-only source-crate siblings, and twenty-one
   integration-test directories now carry the process id — verified with
-  twenty concurrent pairs (forty runs), zero failures, against a
-  same-session control that still reproduced the old failure.
+  twenty concurrent pairs (forty runs), zero failures. (Correction
+  2026-08-31: this bullet originally cited a same-session control that
+  was never retained; the retained replacement control runs the
+  released v0.20.0 test binary vs the fixed one under 4-way contention
+  — 14/100 and 13/100 failures vs 0/100 and 0/100, per-process exit
+  records kept in the evidence tree.)
 
 ## [0.20.0] — 2026-08-31
 
@@ -74,7 +78,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   caught incoherent test fixtures, including this campaign's own earlier
   probe artifacts.
 - **GGUF conversion no longer emits artifacts the target backend's
-  loader would refuse**: the loaders' validation rules moved to a shared
+  loader would refuse** (scope correction 2026-08-31: for the covered
+  layer-plan rule classes listed below — backend-local rules such as
+  CUDA's CtInt4G32 geometry and F32-only norm/bias checks, and all
+  global-tensor rules, still run only at load): the loaders' shared
+  validation rules moved to a shared
   module (`lumen_format::serving_rules`) that both backends call, and
   conversion now runs the same rules over every planned layer — on the
   planned quantization schemes, after requant/upcast decisions — before
@@ -189,8 +197,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   raw-length validation rejects
   non-block-multiple element counts with checked arithmetic for the
   fixed-block-layout schemes it covers (Q8_0/Q4_0/F16/Bf16, plus Q6_K
-  heads); other schemes are refused by the embedding/output-head quant
-  allowlists rather than length-checked here.
+  heads); other schemes are not length-checked here — CUDA's direct
+  raw-buffer setters reject them, while on the ordinary provider path
+  they are never forwarded as raw (the provider reads them, with
+  unknown formats reinterpreted as F32 — a tracked residual — and the
+  backend uploads the resulting F32 copy).
 - **Session temp files are process-unique**: five session/provider staging
   paths gained `std::process::id()` suffixes, so concurrent processes no
   longer clobber each other's session staging files (model-download

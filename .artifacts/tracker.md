@@ -123,10 +123,16 @@ item; close with the shipping release.
   per-head norms stays served (unit-tested both ways). The converters
   refuse to emit the combination (UnsupportedModel).
 - **N4 · CLOSED STRUCTURALLY (round 7, Category 2)** — the
-  converter/loader contract is now enforced by construction: the loaders'
-  validation rules moved to `lumen_format::serving_rules` (single source
-  of truth; the Metal and CUDA loaders call thin wrappers over the same
-  functions), and `convert_gguf` runs `validate_layer_plan` — presence,
+  converter/loader contract is now enforced by construction for the
+  covered GGUF layer-plan rules: the loaders'
+  shared validation rules moved to `lumen_format::serving_rules` (the
+  Metal and CUDA loaders call thin wrappers into the same module —
+  CUDA for presence/geometry/slices/expert-bank/conv1d, Metal for the
+  allowlist/pairing and attention-geometry set, which re-run the
+  FFN-pre-norm/slice/expert-bank rules internally; backend-local rules
+  such as CUDA's CtInt4G32 geometry and F32-only norm/bias checks, and
+  both backends' global-tensor rules, remain outside the module), and
+  `convert_gguf` runs `validate_layer_plan` — presence,
   per-tensor projection geometry, and (Metal target) the full Metal rule
   set — over every PLANNED layer's `SubtensorOffsets` before any byte is
   written. Because the gate reads planned `QuantScheme`s (after
@@ -292,9 +298,15 @@ item; close with the shipping release.
   deterministic per URL and write-only in production; the theoretical
   file-A/hash-B window under a mutable upstream ref is ledgered.
   Empirical proof: 20 concurrent pairs (40 runs) of the two
-  previously-failing tests, 0 failures, PLUS an independent same-session
-  control (old name 20/40 failures, PID name 0/40 on one binary) —
-  `evidence-v0190/n2-concurrency-proof.txt`. Remaining fixed names are deliberate
+  previously-failing tests, 0 failures. CORRECTION (2026-08-31): the
+  same-session control originally cited here (old name 20/40, PID name
+  0/40) was never retained and is withdrawn; the retained replacement
+  runs the RELEASED v0.20.0 tag's test binary against main under 4-way
+  contention with per-process exit records: v0.20.0 14/100 and 13/100
+  failures vs main 0/100 and 0/100 (harness script, binary sha256s,
+  per-run lines, and the corrected 3-in-25-rounds ~12% residual bound
+  all in `evidence-v0190/n2-concurrency-proof.txt` and its companion
+  n2-control-* files). Remaining fixed names are deliberate
   user-facing locations, read-only fixture constants, and env-var
   round-trip strings that never touch disk — none collision-prone.
   Review-round D-items folded: libc::kill liveness (EPERM = alive under
@@ -357,7 +369,7 @@ item; close with the shipping release.
   (dev,ino) identity re-checks are reasoned, not tested: no guard-reuse
   regression test exists (r7 review finding, accepted).
 
-## Verified-latent (guard exists or path unreachable; do not fix unprompted)
+## Verified-latent / accepted residuals (each entry states its own containment — a guard, unreachability, or an accepted exposure; do not fix unprompted)
 
 - **F32-GATE-STREAMING · mode-level over-reject, contained by F1** —
   the GDN F32-gate load guard (GDN-GATE-F32 above) is backend-wide, but
@@ -377,11 +389,14 @@ item; close with the shipping release.
 - **PLAIN-F32-GLOBAL-CAP** — the u32 element/byte caps cover the raw
   quantized global paths only (EMBED-U32-CAP above); plain-F32 globals
   upload via a separate path with no cap on either backend. Containment
-  is thinner than the raw paths' 1.6x margin: a dequantized 9B-scale
-  F32 global (248320 x 4096 x 4 = 4,068,474,880 bytes) sits ~5% below
-  the 2^32 byte boundary; a larger vocab at F32 would cross it with no
-  loader check on this path. Extending the cap to the F32 upload path
-  is the fix when touched. Round-7 report §4 A2(f), accepted as stated.
+  is thinner than the raw paths' 1.6x margin — and absent for the
+  largest shipped geometry: a dequantized 27B-scale F32 global
+  (248320 x 5120 x 4 = 5,085,593,600 bytes) is already 1.18x PAST the
+  2^32 byte boundary on this uncapped path (reachable via
+  full-dequantize conversion); the 9B-scale one (248320 x 4096 x 4 =
+  4,068,474,880) sits ~5% below it. Extending the cap to the F32 upload
+  path is the fix when touched. Round-7 report §4 A2(f), accepted as
+  stated.
 
 - **C5b · Metal Q4_1 MoE expert kernels unreachable** — `named_slices()`
   covers experts and the layer-tensor allowlist rejects Q4_1, so the expert
@@ -448,8 +463,11 @@ item; close with the shipping release.
   convert), refuse Q+gate+bias and missing-both-pre-norms sources
   (UnsupportedModel), and force F16 GDN qkv/gate pairs to Q8_0 on the
   Metal target (the prefill has no F16 arm; Bf16 passes) — probes
-  c2q/c2b/c2n1 refuse at convert, c2f16 converts forced-Q8, real 27B
-  GGUF converts unchanged (evidence-v0190/convert-*-post*.log);
+  c2q/c2b/c2n1 refuse at convert, c2f16 converts forced-Q8; real 27B
+  and 9B GGUFs still convert successfully under the gate and serve
+  coherently — with the planner's normal transformations, and no
+  byte-identity check against pre-fix output was run
+  (evidence-v0190/convert-*-post*.log);
   (b) Metal checks wq/wk/wv
   only — wo and the dense FFN trio have no Metal geometry/presence check
   (CUDA covers them; `gpu_resident.rs:~1828` even derives a qmv repack
