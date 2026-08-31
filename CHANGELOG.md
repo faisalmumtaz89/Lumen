@@ -7,6 +7,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-08-31
+
+### Fixed
+
+- **A missing GDN conv-weight length check was an out-of-bounds read**:
+  both backends index `qkv_rows x conv_kernel` F32 values from
+  `ssm_conv1d` without consulting the slice length — a short tensor was
+  an out-of-bounds device read on CUDA and a silent read of adjacent
+  tensor bytes on Metal. An exact-length rule is now enforced at both
+  loaders and at conversion. Real sources carry exactly `qkv_rows` conv
+  channels — 9B and 27B verified end-to-end by conversion and serving
+  under the new rule, MoE from GGUF header dims; the rule immediately
+  caught incoherent test fixtures, including this campaign's own earlier
+  probe artifacts.
+- **GGUF conversion no longer emits artifacts the target backend's
+  loader would refuse**: the loaders' validation rules moved to a shared
+  module (`lumen_format::serving_rules`) that both backends call, and
+  conversion now runs the same rules over every planned layer — on the
+  planned quantization schemes, after requant/upcast decisions — before
+  any byte is written. Sources that would produce a loader-refused
+  artifact fail at conversion with the loader's own message. Covered
+  classes: mandatory tensor presence, attention/FFN/conv geometry,
+  zero-length optional and expert tensors, missing FFN pre-norms,
+  expert-bank uniformity, Q+gate bias sets, and (Metal target) the
+  scheme allowlist and pairing rules. Known limits: the Hugging Face
+  import path does not run the gate; `--target generic` applies only the
+  CUDA rule set, so such artifacts can still be refused by the Metal
+  loader; the gate validates the planned layout rather than the written
+  bytes; and `CtInt4G32` slices skip geometry validation.
+- **One QKV-bias policy on both backends**: Q+gate attention layers
+  (per-head Q/K norms) reject bias sets everywhere — previously CUDA
+  served them through an unfused path while Metal refused the same file.
+  Biased attention without per-head norms remains served.
+- **The GDN quantization pair force covers F16 and F32-split sources**
+  (the Metal prefill has no F16 arm; a lone F32 gate reads a buffer only
+  the F32 QKV route writes), and one load-error message recommended a
+  flag that does not exist (`--quant bf16`) — it now names the real
+  command.
 ## [0.19.0] — 2026-08-31
 
 ### Fixed
