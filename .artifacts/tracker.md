@@ -472,8 +472,12 @@ item; close with the shipping release.
   only — wo and the dense FFN trio have no Metal geometry/presence check
   (CUDA covers them; `gpu_resident.rs:~1828` even derives a qmv repack
   row count FROM the buffer); (c) GDN dims are pinned only through their
-  SUM — {32,16,128} and {48,8,128} both give 8192 rows, and no ssm_*
-  tensor is cross-checked against `hp.gdn`; (d) non-CtInt4G32 `ssm_out`
+  SUM — {32,16,128} and {48,8,128} both give 8192 rows; aggregate checks
+  cannot distinguish the component head decompositions (narrowed
+  2026-08-31: `ssm_conv1d` IS cross-checked against the aggregate
+  `hp.gdn` geometry by `validate_gdn_conv1d` on both loaders and at the
+  convert gate — the residual is decomposition ambiguity, not an absent
+  cross-check); (d) non-CtInt4G32 `ssm_out`
   has no CUDA geometry check; (e) byte-length checks are inherently blind
   to transposition/permutation and to the F32-vs-2xF16 length collision —
   not closable this way, stated as a limit; (f) narrowed in Category 2: the real MoE GGUF's
