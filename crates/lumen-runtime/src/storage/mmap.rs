@@ -392,7 +392,7 @@ mod tests {
 
     fn create_test_file() -> (std::path::PathBuf, Vec<u8>) {
         let id = MMAP_STORAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lumen_test_mmap_{id}"));
+        let dir = std::env::temp_dir().join(format!("lumen_test_mmap_{}_{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_mmap.bin");
         let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();

@@ -760,7 +760,10 @@ mod tests {
     /// Write the given LBC bytes to a unique temp file and return its path.
     fn write_test_lbc(data: &[u8], tag: &str) -> std::path::PathBuf {
         let id = SYNC_RAW_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lumen_sync_raw_invariant_{tag}_{id}"));
+        let dir = std::env::temp_dir().join(format!(
+            "lumen_sync_raw_invariant_{tag}_{}_{id}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.lbc");
         std::fs::File::create(&path)

@@ -252,7 +252,13 @@ fn pull_download_gguf_shards(
 /// Download a GGUF file, returning its path. Exits on failure.
 #[cfg(feature = "download")]
 fn pull_download_gguf(repo: &str, filename: &str, skip_confirm: bool) -> std::path::PathBuf {
-    // Check if GGUF is already cached.
+    // Check if GGUF is already cached. Reclaim first even on a hit: a
+    // SIGKILLed concurrent loser's staging litter is otherwise never
+    // cleaned once a winner has published (every later call returns
+    // here). Cheap: one read_dir; deletion needs stale mtime + liveness.
+    if let Ok((_, local_name)) = download::split_repo_path(filename) {
+        download::reclaim_stale_parts(&cache::cache_dir(), &local_name);
+    }
     if let Some(existing) = cache::cached_gguf(filename) {
         eprintln!("GGUF already downloaded: {}", existing.display());
         return existing;

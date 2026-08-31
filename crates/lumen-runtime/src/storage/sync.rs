@@ -96,7 +96,8 @@ mod tests {
 
     #[test]
     fn read_range_works() {
-        let dir = std::env::temp_dir().join("lumen_test_sync_storage");
+        let dir =
+            std::env::temp_dir().join(format!("lumen_test_sync_storage_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.bin");
         {
@@ -120,7 +121,8 @@ mod tests {
 
     #[test]
     fn io_tracker_counts_reads() {
-        let dir = std::env::temp_dir().join("lumen_test_sync_io_tracker");
+        let dir =
+            std::env::temp_dir().join(format!("lumen_test_sync_io_tracker_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.bin");
         {

@@ -118,9 +118,50 @@ pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf, BenchError> {
                 large_model::format_size(est)
             );
 
-            let file = std::fs::File::create(&path)?;
+            // Generate to a PID-staged temp and publish atomically: the
+            // existence check above treats the final path as readiness, so
+            // a concurrent process must never observe a partial file (and
+            // two generators must not interleave writes into one path).
+            // create_new (O_EXCL) + nonce retry: PIDs are not unique
+            // across PID namespaces (two containers sharing --output-dir
+            // can both be PID 1), and a truncating create would let one
+            // generator corrupt the other's staging.
+            let (staging, file) = {
+                let mut out = None;
+                for attempt in 0u32..16 {
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(attempt)
+                        .wrapping_add(attempt);
+                    let cand =
+                        output_dir.join(format!("{filename}.{}-{nonce}.tmp", std::process::id()));
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&cand)
+                    {
+                        Ok(f) => {
+                            out = Some((cand, f));
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                out.ok_or_else(|| {
+                    BenchError::Config("could not create unique staging file".into())
+                })?
+            };
             let w = BufWriter::with_capacity(8 * 1024 * 1024, file);
-            large_model::generate_large_model(w, &config)?;
+            if let Err(e) = large_model::generate_large_model(w, &config) {
+                let _ = std::fs::remove_file(&staging);
+                return Err(e.into());
+            }
+            if let Err(e) = std::fs::rename(&staging, &path) {
+                let _ = std::fs::remove_file(&staging);
+                return Err(e.into());
+            }
 
             eprintln!("  Written: {}", path.display());
             Ok(path)
