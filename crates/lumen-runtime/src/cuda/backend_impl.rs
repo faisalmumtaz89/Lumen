@@ -18869,7 +18869,24 @@ impl ComputeBackend for CudaBackend {
             }
             // Validate slices before ANY per-layer GPU work (meta tables
             // included), keeping the validator's before-upload contract true.
+            // The full set — extents, expert count, attention-vector geometry
+            // — must precede build_moe_meta so a rejected header never leaves
+            // a partial meta table behind (upload_layer_weights re-checks these
+            // for its streaming caller; here they gate the persistent caches).
             super::gpu_buffers::validate_layer_slices(layer_idx, &layer_view.subtensors)?;
+            lumen_format::serving_rules::validate_expert_count(
+                &layer_view.subtensors,
+                hp_copy.num_experts.unwrap_or(0) as usize,
+            )
+            .map_err(|e| RuntimeError::Compute(format!("layer {layer_idx}: {e}")))?;
+            lumen_format::serving_rules::validate_attn_vector_extents(
+                layer_idx,
+                &layer_view.subtensors,
+                hp_copy.head_dim as usize,
+                hp_copy.num_heads as usize * hp_copy.head_dim as usize,
+                hp_copy.num_kv_heads as usize * hp_copy.head_dim as usize,
+            )
+            .map_err(RuntimeError::Compute)?;
             // build per-layer MoE metadata when the layer has experts.
             // We build this BEFORE upload_layer_weights so the meta references
             // offsets that remain stable across the upload (the upload writes

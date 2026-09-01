@@ -417,9 +417,10 @@ impl HfCtCheckpoint {
         let mut f = File::open(&self.shard_paths[info.shard]).map_err(ConvertError::Io)?;
         f.seek(SeekFrom::Start(info.begin))
             .map_err(ConvertError::Io)?;
-        let mut buf = vec![0u8; info.byte_len() as usize];
-        f.read_exact(&mut buf).map_err(ConvertError::Io)?;
-        Ok(buf)
+        // Bounded read: a malformed safetensors header could declare a
+        // byte length beyond the file; the helper allocates only what the
+        // stream provides (same DoS guard as the GGUF read path).
+        crate::tensor_io::read_exact_bounded(&mut f, info.byte_len(), name)
     }
 }
 
