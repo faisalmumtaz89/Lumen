@@ -7,6 +7,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-09-02
+
+### Fixed
+
+- **Hostile-header hardening**: every model geometry field is bounds-checked
+  at parse (`validate_bounds`), GGUF tensor element-count products are capped
+  before any size arithmetic, and the converter's tensor reader reserves once
+  and reads in fixed chunks — no quadratic growth or 2x over-allocation under
+  the production allocator.
+- **Load-time validation parity across backends**: Metal now enforces the same
+  output-projection presence/geometry, Q/K-norm pairing, and norm/bias-extent
+  rules as CUDA. `LayerIndex::validate` runs at parse for every consumer and is
+  derived from the canonical slice list, so no sub-tensor field can be missed.
+- **Convert gate**: the GDN pair-force rejects non-32-aligned tensors with a
+  clean error instead of a quantizer panic (all four planner sites), and
+  `ssm_out` geometry is validated for every target (previously Metal-only), so
+  a malformed source can no longer yield a wrong-geometry generic artifact.
+- **Metal K-quant load guard** pinned by an end-to-end test: a `--target
+  generic` K-quant artifact is refused on Metal with a re-convert hint instead
+  of being dispatched to an F32-reading kernel and producing gibberish.
+- **CUDA preload** validates expert count and attention-vector extents before
+  building the MoE metadata tables, so a rejected header leaves no partial
+  state behind.
+- **Model download**: the staging file's cleanup guard is armed from the
+  exclusive-create file descriptor (no unguarded path delete), and a transfer
+  that reports no length is refused rather than published unverified.
+- **Server**: the KV-disk budget message names the real configuration knob.
+
 ## [0.21.0] — 2026-08-31
 
 ### Fixed
