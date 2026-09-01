@@ -372,14 +372,12 @@ impl ShardedGguf {
             )));
         }
         let spec = &self.shards[shard_idx];
-        let size = tensor.byte_size().unwrap_or(0) as usize;
+        let size = tensor.byte_size().unwrap_or(0);
 
         let f = std::fs::File::open(&spec.path)?;
         let mut reader = BufReader::new(f);
         reader.seek(SeekFrom::Start(abs_offset))?;
-        let mut buf = vec![0u8; size];
-        reader.read_exact(&mut buf)?;
-        Ok(buf)
+        crate::tensor_io::read_exact_bounded(&mut reader, size, &tensor.name)
     }
 
     /// Returns the absolute file offset of a tensor's data within its owning

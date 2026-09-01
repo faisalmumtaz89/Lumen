@@ -1156,6 +1156,16 @@ pub fn upload_layer_weights(
     let layer = weights.layer_idx;
 
     validate_layer_slices(layer, subs)?;
+    lumen_format::serving_rules::validate_expert_count(subs, hp.num_experts.unwrap_or(0) as usize)
+        .map_err(|e| RuntimeError::Compute(format!("layer {layer}: {e}")))?;
+    lumen_format::serving_rules::validate_attn_vector_extents(
+        layer,
+        subs,
+        hp.head_dim as usize,
+        hp.num_heads as usize * hp.head_dim as usize,
+        hp.num_kv_heads as usize * hp.head_dim as usize,
+    )
+    .map_err(RuntimeError::Compute)?;
 
     // Source-fidelity artifacts keep ssm_out in its source Q5_K form. Base
     // buffer becomes an F16 image (first-class prefill HGEMM / decode HGEMV
@@ -1194,7 +1204,7 @@ pub fn upload_layer_weights(
         }
         Some(s) if s.quant == QuantScheme::CtInt4G32 => {
             let gd = hp.gdn_dims();
-            let in_dim = (gd.num_v_heads * gd.head_dim) as usize;
+            let in_dim = gd.num_v_heads as usize * gd.head_dim as usize;
             (
                 Some(upload_projection_tensor(
                     device,
@@ -1222,8 +1232,8 @@ pub fn upload_layer_weights(
     };
 
     let hidden = hp.hidden_dim as usize;
-    let q_dim = (hp.num_heads * hp.head_dim) as usize;
-    let kv_dim = (hp.num_kv_heads * hp.head_dim) as usize;
+    let q_dim = hp.num_heads as usize * hp.head_dim as usize;
+    let kv_dim = hp.num_kv_heads as usize * hp.head_dim as usize;
     // GDN in-projection rows: declared header dims when present, else the
     // documented QWEN35_9B compatibility default (hyperparams.rs guarantees
     // headerless 9B-era artifacts keep their exact historical shape — the
@@ -1232,7 +1242,7 @@ pub fn upload_layer_weights(
     // observed vs expected so a defaulted mismatch is actionable.
     let gdn_qkv_rows = {
         let gd = hp.gdn_dims();
-        ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
+        (2 * gd.num_k_heads as usize + gd.num_v_heads as usize) * gd.head_dim as usize
     };
     validate_mandatory_presence(subs)?;
     {
@@ -1240,7 +1250,7 @@ pub fn upload_layer_weights(
         lumen_format::serving_rules::validate_gdn_conv1d(
             weights.layer_idx,
             subs,
-            ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize,
+            (2 * gd.num_k_heads as usize + gd.num_v_heads as usize) * gd.head_dim as usize,
             gd.conv_kernel as usize,
         )
         .map_err(RuntimeError::Compute)?;
@@ -1423,7 +1433,7 @@ pub fn upload_layer_weights(
                 hidden,
                 &[{
                     let gd = hp.gdn_dims();
-                    (gd.num_v_heads * gd.head_dim) as usize
+                    gd.num_v_heads as usize * gd.head_dim as usize
                 }],
             )?),
             None => None,
@@ -2325,11 +2335,34 @@ mod projection_geometry_tests {
             .unwrap_err()
             .to_string()
             .contains("Q+gate attention layer"));
-        // The same biases WITHOUT per-head norms stay admitted (qwen2-style
-        // biased attention is served).
+        // WITHOUT per-head norms, a bq-only set with quantized projections
+        // is an incomplete pair — Metal's fused decode arms would drop it
+        // while CUDA applies it, so it fails closed (both backends enforce
+        // one policy); the FULL set stays admitted (qwen2-style biased
+        // attention is served), as does a partial set on all-F32
+        // projections, and GDN layers are exempt.
         st.attn_q_norm = None;
         st.attn_k_norm = None;
+        assert!(validate_mandatory_presence(&st)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete QKV bias"));
+        st.bk = Some(sl(128, QuantScheme::F32));
+        st.bv = Some(sl(128, QuantScheme::F32));
         assert!(validate_mandatory_presence(&st).is_ok());
+        st.bk = None;
+        st.bv = None;
+        st.wq.quant = QuantScheme::F32;
+        st.wk.quant = QuantScheme::F32;
+        st.wv.quant = QuantScheme::F32;
+        assert!(validate_mandatory_presence(&st).is_ok());
+        st.wq.quant = QuantScheme::Q8_0;
+        st.layer_type = Some(1);
+        st.wk.length = 0;
+        st.wv.length = 0;
+        st.wo.length = 0;
+        assert!(validate_mandatory_presence(&st).is_ok());
+        st.layer_type = None;
         // Router without experts is malformed, never an exemption.
         let mut st = base.clone();
         st.router_weight = Some(sl(4, QuantScheme::F32));

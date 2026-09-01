@@ -135,7 +135,7 @@ pub(crate) fn compute_ssm_tensor_slice(
         length,
         quant,
     };
-    *blob_offset += length;
+    *blob_offset = blob_offset.saturating_add(length);
     Ok(Some(slice))
 }
 
@@ -233,6 +233,36 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
 /// carry one natively — so under default flags, when the pair's post-upcast
 /// schemes would split on the Q8_0 axis, both tensors are force-written
 /// Q8_0. Single decision point for the dense and MoE planners AND writers.
+/// Plan the Q8_0 slice for a tensor the GDN pair-force landed on Q8_0.
+/// Q8_0 requires the element count to be a multiple of 32; a source whose
+/// count is not (only reachable from a hand-crafted GGUF — real GDN dims
+/// are always 32-aligned) is rejected here with a clear error instead of
+/// panicking in the quantizer. Widening the pair-force to F16 and
+/// F32-split sources broadened the reachability of this path, so the guard
+/// lives at the plan step
+/// (before any byte is written).
+pub(crate) fn pair_forced_q8_slice(
+    n_elements: usize,
+    name: &str,
+    blob_offset: &mut u64,
+) -> Result<TensorSlice, ConvertError> {
+    if n_elements % 32 != 0 {
+        return Err(ConvertError::UnsupportedModel(format!(
+            "{name}: the Metal GDN pair force lands this tensor on Q8_0, which \
+             requires an element count divisible by 32, but it has {n_elements}. \
+             Re-convert from a GGUF whose GDN projections are 32-aligned."
+        )));
+    }
+    let size = ((n_elements / 32) * 34) as u64;
+    let slice = TensorSlice {
+        offset: *blob_offset,
+        length: size,
+        quant: QuantScheme::Q8_0,
+    };
+    *blob_offset = blob_offset.saturating_add(size);
+    Ok(slice)
+}
+
 pub(crate) fn metal_gdn_pair_forces_q8(
     gguf: &GgufFile,
     layer: usize,
@@ -275,4 +305,33 @@ pub(crate) fn metal_gdn_pair_forces_q8(
         || is_f16(qkv.ggml_type)
         || is_f16(gate.ggml_type)
         || (is_f32(qkv.ggml_type) != is_f32(gate.ggml_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pair-force Q8_0 planner rejects a non-32-aligned element count
+    /// (only reachable from a hand-crafted GGUF; the F16/F32-split
+    /// widening broadened its reachability) with a clean error instead of
+    /// the quantizer's panic, and plans the exact Q8_0 size otherwise.
+    #[test]
+    fn pair_forced_q8_slice_rejects_unaligned() {
+        let mut off = 100u64;
+        // 6144 = 192 blocks -> 192*34 bytes, offset advances.
+        let ok = pair_forced_q8_slice(6144, "blk.0.attn_qkv.weight", &mut off).unwrap();
+        assert_eq!(ok.quant, QuantScheme::Q8_0);
+        assert_eq!(ok.length, 192 * 34);
+        assert_eq!(ok.offset, 100);
+        assert_eq!(off, 100 + 192 * 34);
+        // Non-32-aligned -> clean error, offset untouched.
+        let mut off2 = 0u64;
+        let err = pair_forced_q8_slice(33, "blk.0.attn_qkv.weight", &mut off2).unwrap_err();
+        assert!(
+            matches!(err, ConvertError::UnsupportedModel(_))
+                && format!("{err}").contains("divisible by 32"),
+            "{err}"
+        );
+        assert_eq!(off2, 0, "offset must not advance on rejection");
+    }
 }

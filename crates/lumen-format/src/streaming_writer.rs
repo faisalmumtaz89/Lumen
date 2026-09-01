@@ -126,8 +126,24 @@ impl<W: Write> StreamingLbcWriter<W> {
         for (i, idx) in fixed_indices.iter_mut().enumerate() {
             idx.layer_offset_bytes = layer_cursor;
             idx.layer_length_bytes = layer_shapes[i].blob_size;
-            layer_cursor += layer_shapes[i].blob_size;
-            layer_cursor = align_up(layer_cursor as usize, alignment) as u64;
+            layer_cursor = layer_cursor
+                .checked_add(layer_shapes[i].blob_size)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "layer {i}: cumulative blob size overflows u64 \
+                             (malformed layer shapes)"
+                        ),
+                    )
+                })?;
+            layer_cursor = crate::writer::checked_align_up_u64(layer_cursor, alignment as u64)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("layer {i}: aligned cursor overflows u64 (malformed layer shapes)"),
+                    )
+                })?;
         }
 
         // Compute end of last layer (unaligned) for tokenizer placement
@@ -135,13 +151,26 @@ impl<W: Write> StreamingLbcWriter<W> {
             layers_start as u64
         } else {
             let last = &fixed_indices[fixed_indices.len() - 1];
-            last.layer_offset_bytes + last.layer_length_bytes
+            last.layer_offset_bytes
+                .checked_add(last.layer_length_bytes)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "final layer offset + length overflows u64 (malformed layer shapes)",
+                    )
+                })?
         };
 
         // Pre-serialize tokenizer section, compute CRC and offset
         let (tokenizer_bytes, tokenizer_padding) = if let Some(tok) = tokenizer {
             let tok_data = tok.serialize();
-            let tok_start = align_up(last_layer_end as usize, alignment) as u64;
+            let tok_start = crate::writer::checked_align_up_u64(last_layer_end, alignment as u64)
+                .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tokenizer offset overflows u64 (malformed layer shapes)",
+                )
+            })?;
             let tok_pad = (tok_start - last_layer_end) as usize;
             fixed_header.tokenizer_section_offset = tok_start;
             fixed_header.tokenizer_section_length = tok_data.len() as u64;

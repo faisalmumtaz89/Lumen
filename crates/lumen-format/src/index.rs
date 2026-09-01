@@ -226,148 +226,26 @@ pub struct LayerIndex {
 }
 
 impl LayerIndex {
-    /// Validates that all sub-tensor slices fit within the layer blob.
+    /// Validates that every sub-tensor slice fits within the layer blob.
+    ///
+    /// Drives off [`SubtensorOffsets::named_slices`] — the single
+    /// enumeration of every loader-consumed slice — so a field added to
+    /// the struct is bounds-checked here the moment it is wired for quant
+    /// dispatch, with no parallel list to fall out of sync.
     pub fn validate(&self, layer_idx: usize) -> Result<(), crate::FormatError> {
         let len = self.layer_length_bytes;
-
-        let validate_slice =
-            |name: &'static str, slice: &TensorSlice| -> Result<(), crate::FormatError> {
-                let end = slice.offset.checked_add(slice.length).ok_or(
-                    crate::FormatError::LayerOutOfBounds {
-                        layer: layer_idx,
-                        tensor_name: name,
-                        offset: slice.offset,
-                        length: slice.length,
-                        file_size: len,
-                    },
-                )?;
-                if end > len {
-                    return Err(crate::FormatError::LayerOutOfBounds {
-                        layer: layer_idx,
-                        tensor_name: name,
-                        offset: slice.offset,
-                        length: slice.length,
-                        file_size: len,
-                    });
-                }
-                Ok(())
-            };
-
-        let slices = [
-            ("wq", &self.subtensors.wq),
-            ("wk", &self.subtensors.wk),
-            ("wv", &self.subtensors.wv),
-            ("wo", &self.subtensors.wo),
-            ("w_gate", &self.subtensors.w_gate),
-            ("w_up", &self.subtensors.w_up),
-            ("w_down", &self.subtensors.w_down),
-            ("attn_norm", &self.subtensors.attn_norm),
-            ("ffn_norm", &self.subtensors.ffn_norm),
-        ];
-
-        for (name, slice) in slices {
-            validate_slice(name, slice)?;
-        }
-
-        // Optional bias slices (Qwen2-family models)
-        let bias_slices: [(&str, &Option<TensorSlice>); 3] = [
-            ("bq", &self.subtensors.bq),
-            ("bk", &self.subtensors.bk),
-            ("bv", &self.subtensors.bv),
-        ];
-        for (name, opt_slice) in bias_slices {
-            if let Some(slice) = opt_slice {
-                validate_slice(name, slice)?;
+        for (name, slice) in self.subtensors.named_slices() {
+            let end = slice.offset.checked_add(slice.length);
+            if end.map_or(true, |end| end > len) {
+                return Err(crate::FormatError::LayerOutOfBounds {
+                    layer: layer_idx,
+                    tensor_name: name,
+                    offset: slice.offset,
+                    length: slice.length,
+                    file_size: len,
+                });
             }
         }
-
-        // Shared expert slices
-        let shared_expert_slices: [(&str, &Option<TensorSlice>); 3] = [
-            ("shared_expert_gate", &self.subtensors.shared_expert_gate),
-            ("shared_expert_up", &self.subtensors.shared_expert_up),
-            ("shared_expert_down", &self.subtensors.shared_expert_down),
-        ];
-        for (name, opt_slice) in shared_expert_slices {
-            if let Some(slice) = opt_slice {
-                validate_slice(name, slice)?;
-            }
-        }
-
-        // Extended attention fields
-        let attn_ext_slices: [(&str, &Option<TensorSlice>); 2] = [
-            ("attn_gate", &self.subtensors.attn_gate),
-            ("attn_post_norm", &self.subtensors.attn_post_norm),
-        ];
-        for (name, opt_slice) in attn_ext_slices {
-            if let Some(slice) = opt_slice {
-                validate_slice(name, slice)?;
-            }
-        }
-
-        // SSM / linear attention fields
-        let ssm_slices: [(&str, &Option<TensorSlice>); 7] = [
-            ("ssm_a", &self.subtensors.ssm_a),
-            ("ssm_conv1d", &self.subtensors.ssm_conv1d),
-            ("ssm_dt", &self.subtensors.ssm_dt),
-            ("ssm_beta", &self.subtensors.ssm_beta),
-            ("ssm_alpha", &self.subtensors.ssm_alpha),
-            ("ssm_norm", &self.subtensors.ssm_norm),
-            ("ssm_out", &self.subtensors.ssm_out),
-        ];
-        for (name, opt_slice) in ssm_slices {
-            if let Some(slice) = opt_slice {
-                validate_slice(name, slice)?;
-            }
-        }
-
-        // MoE fields
-        if let Some(ref router) = self.subtensors.router_weight {
-            validate_slice("router_weight", router)?;
-        }
-        if let Some(ref experts) = self.subtensors.experts {
-            for (e, expert) in experts.iter().enumerate() {
-                // Use static string names for expert slices to satisfy the 'static
-                // lifetime requirement. We can only validate a fixed number of experts
-                // with static names; for the rest, reuse a generic name.
-                let gate_name: &'static str = match e {
-                    0 => "expert_0_gate",
-                    1 => "expert_1_gate",
-                    2 => "expert_2_gate",
-                    3 => "expert_3_gate",
-                    4 => "expert_4_gate",
-                    5 => "expert_5_gate",
-                    6 => "expert_6_gate",
-                    7 => "expert_7_gate",
-                    _ => "expert_N_gate",
-                };
-                let up_name: &'static str = match e {
-                    0 => "expert_0_up",
-                    1 => "expert_1_up",
-                    2 => "expert_2_up",
-                    3 => "expert_3_up",
-                    4 => "expert_4_up",
-                    5 => "expert_5_up",
-                    6 => "expert_6_up",
-                    7 => "expert_7_up",
-                    _ => "expert_N_up",
-                };
-                let down_name: &'static str = match e {
-                    0 => "expert_0_down",
-                    1 => "expert_1_down",
-                    2 => "expert_2_down",
-                    3 => "expert_3_down",
-                    4 => "expert_4_down",
-                    5 => "expert_5_down",
-                    6 => "expert_6_down",
-                    7 => "expert_7_down",
-                    _ => "expert_N_down",
-                };
-                validate_slice(gate_name, &expert.gate)?;
-                validate_slice(up_name, &expert.up)?;
-                validate_slice(down_name, &expert.down)?;
-            }
-        }
-
         Ok(())
     }
 }
@@ -449,6 +327,75 @@ mod tests {
         let mut idx = valid_index(100);
         idx.subtensors.wk = make_slice(u64::MAX, 1);
         assert!(idx.validate(0).is_err());
+    }
+
+    /// `attn_q_norm`, `attn_k_norm` and `ffn_gate_inp_shexp` are parsed
+    /// from the wire and bound raw into the Metal device buffer, but a
+    /// hand-rolled slice list once left them unchecked. Driving `validate`
+    /// off `named_slices` closes that; assert each is now caught.
+    #[test]
+    fn validate_optional_norm_and_shexp_fields_bounded() {
+        type Setter = fn(&mut SubtensorOffsets, TensorSlice);
+        let cases: [(Setter, &str); 3] = [
+            (|st, s| st.attn_q_norm = Some(s), "attn_q_norm"),
+            (|st, s| st.attn_k_norm = Some(s), "attn_k_norm"),
+            (
+                |st, s| st.ffn_gate_inp_shexp = Some(s),
+                "ffn_gate_inp_shexp",
+            ),
+        ];
+        for (set, name) in cases {
+            let mut idx = valid_index(100);
+            set(&mut idx.subtensors, make_slice(90, 20)); // 110 > 100
+            match idx.validate(0).unwrap_err() {
+                crate::FormatError::LayerOutOfBounds { tensor_name, .. } => {
+                    assert_eq!(tensor_name, name);
+                }
+                other => panic!("expected LayerOutOfBounds for {name}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every optional slice populated in-bounds must pass — guards against
+    /// over-rejecting a rich MoE+GDN layer once `validate` covers all
+    /// fields enumerated by `named_slices`.
+    #[test]
+    fn validate_fully_populated_layer_within_bounds() {
+        let s = make_slice(0, 10);
+        let mut idx = valid_index(1000);
+        let st = &mut idx.subtensors;
+        for f in [
+            &mut st.bq,
+            &mut st.bk,
+            &mut st.bv,
+            &mut st.router_weight,
+            &mut st.shared_expert_gate,
+            &mut st.shared_expert_up,
+            &mut st.shared_expert_down,
+            &mut st.attn_gate,
+            &mut st.attn_post_norm,
+            &mut st.ssm_a,
+            &mut st.ssm_conv1d,
+            &mut st.ssm_dt,
+            &mut st.ssm_beta,
+            &mut st.ssm_alpha,
+            &mut st.ssm_norm,
+            &mut st.ssm_out,
+            &mut st.attn_q_norm,
+            &mut st.attn_k_norm,
+            &mut st.ffn_gate_inp_shexp,
+        ] {
+            *f = Some(s);
+        }
+        st.experts = Some(vec![ExpertSlice {
+            gate: s,
+            up: s,
+            down: s,
+        }]);
+        // Every field validate visits is enumerated by named_slices, so a
+        // clean pass proves coverage without over-rejection.
+        idx.validate(0).unwrap();
+        assert!(idx.subtensors.named_slices().len() >= 20);
     }
 
     #[test]
