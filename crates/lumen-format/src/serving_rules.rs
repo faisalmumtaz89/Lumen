@@ -31,6 +31,9 @@ pub struct AttnDims {
     pub q_dim: usize,
     pub kv_dim: usize,
     pub hidden: usize,
+    /// Attention head width: per-head Q/K norm weights are read at exactly
+    /// this many F32 values per head.
+    pub head_dim: usize,
     /// Fused GDN in-projection rows: (2*num_k_heads + num_v_heads)*head_dim
     /// from declared header dims, else the documented QWEN35_9B
     /// compatibility default — the same default the kernels dispatch on, so
@@ -66,7 +69,16 @@ pub fn validate_gdn_conv1d(
     }
     if let Some(conv) = st.ssm_conv1d.as_ref() {
         if conv.length > 0 {
-            let want = (gdn_qkv_rows as u64) * (conv_kernel as u64) * 4;
+            let want = (gdn_qkv_rows as u64)
+                .checked_mul(conv_kernel as u64)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| {
+                    format!(
+                        "layer {layer}: ssm_conv1d expectation overflows \
+                         ({gdn_qkv_rows} x {conv_kernel} x 4 — malformed \
+                         hyperparams)"
+                    )
+                })?;
             if conv.length != want {
                 return Err(format!(
                     "layer {layer}: ssm_conv1d is {} bytes but the GDN \
@@ -81,28 +93,43 @@ pub fn validate_gdn_conv1d(
     Ok(())
 }
 
-/// Exact packed byte length of one weight row of `hidden` input columns in
+/// Exact packed byte length of one weight row of `in_dim` input columns in
 /// `quant`. Errors on schemes without a servable fixed layout and on
 /// non-block-multiple widths (the dispatch kernels stride rows by
-/// `hidden/32` blocks).
+/// `in_dim/32` blocks).
 fn attn_row_bytes(
     layer: usize,
     name: &str,
     quant: QuantScheme,
-    hidden: usize,
+    in_dim: usize,
 ) -> Result<usize, String> {
+    if in_dim == 0 {
+        return Err(format!(
+            "layer {layer}: {name} has a zero row width (malformed \
+             hyperparams) — every expectation would be vacuously zero \
+             bytes. Re-convert with `lumen convert`."
+        ));
+    }
+    let row_overflow = || {
+        format!(
+            "layer {layer}: {name} row width {in_dim} overflows the row-byte \
+             computation (malformed hyperparams)"
+        )
+    };
     match quant {
-        QuantScheme::F32 => Ok(hidden * 4),
-        QuantScheme::F16 | QuantScheme::Bf16 => Ok(hidden * 2),
+        QuantScheme::F32 => in_dim.checked_mul(4).ok_or_else(row_overflow),
+        QuantScheme::F16 | QuantScheme::Bf16 => in_dim.checked_mul(2).ok_or_else(row_overflow),
         QuantScheme::Q8_0 | QuantScheme::Q4_0 => {
-            if hidden % 32 != 0 {
+            if in_dim % 32 != 0 {
                 return Err(format!(
-                    "layer {layer}: {name} is {quant:?} but hidden_dim \
-                     {hidden} is not a multiple of the 32-element block \
+                    "layer {layer}: {name} is {quant:?} but its row width \
+                     {in_dim} is not a multiple of the 32-element block \
                      (malformed hyperparams)"
                 ));
             }
-            Ok(hidden / 32 * if quant == QuantScheme::Q8_0 { 34 } else { 18 })
+            (in_dim / 32)
+                .checked_mul(if quant == QuantScheme::Q8_0 { 34 } else { 18 })
+                .ok_or_else(row_overflow)
         }
         other => Err(format!(
             "layer {layer}: {name} is {other:?}, which the Metal attention \
@@ -125,26 +152,35 @@ pub fn validate_attention_dims(
     st: &crate::index::SubtensorOffsets,
     d: &AttnDims,
 ) -> Result<(), String> {
-    let expect =
-        |name: &str, slice: &crate::index::TensorSlice, rows: usize| -> Result<(), String> {
-            let row = attn_row_bytes(layer, name, slice.quant, d.hidden)?;
-            let want = rows as u64 * row as u64;
-            if slice.length != want {
-                return Err(format!(
-                    "layer {layer}: {name} is {} bytes but the dispatch expects \
-                 {rows} rows x {row} bytes = {want} ({:?}, hidden {}). The \
-                 kernels derive dimensions from hyperparams, so this tensor \
-                 would be read at the wrong geometry. Re-convert with \
+    validate_mandatory_presence(st).map_err(|e| format!("layer {layer}: {e}"))?;
+    let expect = |name: &str,
+                  slice: &crate::index::TensorSlice,
+                  rows: usize,
+                  in_dim: usize|
+     -> Result<(), String> {
+        let row = attn_row_bytes(layer, name, slice.quant, in_dim)?;
+        let want = (rows as u64).checked_mul(row as u64).ok_or_else(|| {
+            format!(
+                "layer {layer}: {name} expectation overflows ({rows} rows x \
+                 {row} bytes/row — malformed hyperparams)"
+            )
+        })?;
+        if slice.length != want {
+            return Err(format!(
+                "layer {layer}: {name} is {} bytes but the dispatch expects \
+                 {rows} rows x {row} bytes = {want} ({:?}, row width {in_dim}). \
+                 The kernels derive dimensions from hyperparams, so this \
+                 tensor would be read at the wrong geometry. Re-convert with \
                  `lumen convert`.",
-                    slice.length, slice.quant, d.hidden
-                ));
-            }
-            Ok(())
-        };
+                slice.length, slice.quant
+            ));
+        }
+        Ok(())
+    };
     if st.layer_type == Some(1) {
         // GDN: wq holds the fused in-projection; wk/wv are converter zero
         // sentinels — a non-empty wk/wv here is malformed.
-        expect("attn_qkv (wq)", &st.wq, d.gdn_qkv_rows).map_err(|e| {
+        expect("attn_qkv (wq)", &st.wq, d.gdn_qkv_rows, d.hidden).map_err(|e| {
             if d.gdn_declared {
                 e
             } else {
@@ -165,6 +201,13 @@ pub fn validate_attention_dims(
             ));
         }
         validate_gdn_conv1d(layer, st, d.gdn_qkv_rows, d.gdn_conv_kernel)?;
+        // ssm_out is the GDN output projection: the dispatch reads
+        // hidden rows x gdn_v_dim columns from its offset, deriving both
+        // from hyperparams — an index entry with any other length is read
+        // at the wrong geometry (or past the declared slice).
+        if let Some(out) = st.ssm_out.as_ref() {
+            expect("ssm_out", out, d.hidden, d.gdn_v_dim)?;
+        }
         return Ok(());
     }
     // Full attention: wq is 2*q_dim rows under Q+gate fusion (detected by
@@ -176,9 +219,11 @@ pub fn validate_attention_dims(
     } else {
         d.q_dim
     };
-    expect("wq", &st.wq, wq_rows)?;
-    expect("wk", &st.wk, d.kv_dim)?;
-    expect("wv", &st.wv, d.kv_dim)?;
+    expect("wq", &st.wq, wq_rows, d.hidden)?;
+    expect("wk", &st.wk, d.kv_dim, d.hidden)?;
+    expect("wv", &st.wv, d.kv_dim, d.hidden)?;
+    expect("wo", &st.wo, d.hidden, d.q_dim)?;
+    validate_attn_vector_extents(layer, st, d.head_dim, d.q_dim, d.kv_dim)?;
     Ok(())
 }
 
@@ -483,11 +528,6 @@ pub fn validate_layer_quants(
             }
         }
     }
-    // The QKV biases are read as F32 by the attention shaders. The fused
-    // bias decode arms (non-F32 weight schemes) apply biases only when all
-    // three are present — a partial set would be silently dropped there.
-    // The F32-weight fallback applies each bias independently, so partial
-    // sets are valid with F32 projections.
     let bias_present = [st.bq.is_some(), st.bk.is_some(), st.bv.is_some()];
     // The Q+gate attention path (layers with per-head Q/K norms) has no bias
     // handling at all — a bias there would be silently ignored, not dropped
@@ -497,16 +537,6 @@ pub fn validate_layer_quants(
             "layer {layer}: QKV biases are present on a Q+gate attention \
              layer, which does not apply biases. Re-convert from a source \
              GGUF without attention biases."
-        ));
-    }
-    let qkv_all_f32 = st.wq.quant == QuantScheme::F32
-        && st.wk.quant == QuantScheme::F32
-        && st.wv.quant == QuantScheme::F32;
-    if bias_present.iter().any(|&p| p) && !bias_present.iter().all(|&p| p) && !qkv_all_f32 {
-        return Err(format!(
-            "layer {layer}: incomplete QKV bias set (bq/bk/bv present: \
-             {bias_present:?}) with quantized projections: the fused bias \
-             kernels require all three. Re-convert with `lumen convert`."
         ));
     }
     // Every Metal shader reads norm tensors, the MoE routers, the SSM
@@ -616,6 +646,55 @@ pub fn validate_projection_geometry(
     Ok(())
 }
 
+/// Exact byte extents for the F32 attention vectors the kernels read at
+/// hyperparam-derived lengths: per-head Q/K norms at `head_dim` values
+/// per head (CUDA's `rmsnorm_per_head_inplace` indexes
+/// `weight[0..head_dim]` unconditionally — a short buffer is an
+/// out-of-bounds read on CUDA's per-tensor allocation, and on Metal a
+/// read of adjacent layer-blob bytes as weights), and QKV biases at
+/// `q_dim`/`kv_dim` values.
+/// Full-attention layers only; every tensor here is optional and
+/// F32-enforced by the existing scheme rules.
+pub fn validate_attn_vector_extents(
+    layer: usize,
+    st: &crate::index::SubtensorOffsets,
+    head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+) -> Result<(), String> {
+    if st.layer_type == Some(1) {
+        return Ok(());
+    }
+    let expect = |name: &str,
+                  slice: &Option<crate::index::TensorSlice>,
+                  elems: usize|
+     -> Result<(), String> {
+        if let Some(s) = slice.as_ref() {
+            let want = (elems as u64).checked_mul(4).ok_or_else(|| {
+                format!(
+                    "layer {layer}: {name} expectation overflows ({elems} \
+                     F32 values — malformed hyperparams)"
+                )
+            })?;
+            if s.length != want {
+                return Err(format!(
+                    "layer {layer}: {name} is {} bytes but the dispatch \
+                     reads {elems} F32 values = {want} bytes (malformed \
+                     LBC). Re-convert with `lumen convert`.",
+                    s.length
+                ));
+            }
+        }
+        Ok(())
+    };
+    expect("attn_q_norm", &st.attn_q_norm, head_dim)?;
+    expect("attn_k_norm", &st.attn_k_norm, head_dim)?;
+    expect("bq", &st.bq, q_dim)?;
+    expect("bk", &st.bk, kv_dim)?;
+    expect("bv", &st.bv, kv_dim)?;
+    Ok(())
+}
+
 /// Zero-length mandatory tensors would suppress the geometry checks (zero
 /// skips as an absence sentinel), so presence is enforced for every tensor
 /// whose role demands it: wq always; wk/wv/wo on full attention (GDN's
@@ -624,12 +703,10 @@ pub fn validate_projection_geometry(
 /// sentinels).
 pub fn validate_mandatory_presence(subs: &crate::index::SubtensorOffsets) -> Result<(), String> {
     if subs.wq.length == 0 {
-        return Err(
-            "layer carries an empty wq; every layer requires an attention \
+        return Err("empty wq: every layer requires an attention \
              (or GDN in-) projection (malformed LBC). Re-convert with \
              `lumen convert`."
-                .into(),
-        );
+            .into());
     }
     if subs.layer_type != Some(1)
         && (subs.wk.length == 0 || subs.wv.length == 0 || subs.wo.length == 0)
@@ -639,6 +716,31 @@ pub fn validate_mandatory_presence(subs: &crate::index::SubtensorOffsets) -> Res
              bytes); the attention dispatch requires all three (malformed \
              LBC). Re-convert with `lumen convert`.",
             subs.wk.length, subs.wv.length, subs.wo.length
+        ));
+    }
+    // The dispatch predicates diverge on a half pair: a lone Q-norm is
+    // applied by CUDA and by Metal PREFILL but ignored by Metal decode
+    // (which gates on both being present) — the same artifact silently
+    // produces different output across backends AND between Metal's own
+    // prefill and decode; a lone K-norm is ignored everywhere (CUDA
+    // nests both norm blocks under Q-norm presence). No served
+    // semantics exist for either half. One policy, fail closed (the N3
+    // precedent).
+    if subs.layer_type != Some(1) && subs.attn_q_norm.is_some() != subs.attn_k_norm.is_some() {
+        return Err(format!(
+            "half per-head Q/K norm pair (attn_q_norm {}, attn_k_norm {}); \
+             the backends require both or neither (malformed LBC). \
+             Re-convert with `lumen convert`.",
+            if subs.attn_q_norm.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            if subs.attn_k_norm.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
         ));
     }
     // Q+gate attention (per-head Q-norm present) applies no QKV biases on
@@ -655,6 +757,29 @@ pub fn validate_mandatory_presence(subs: &crate::index::SubtensorOffsets) -> Res
              Re-convert with `lumen convert`."
                 .into(),
         );
+    }
+    // An incomplete QKV bias set with quantized projections serves
+    // divergently: CUDA applies each present bias independently while
+    // Metal's fused bias arms apply biases only when all three exist —
+    // and drops a partial set silently. With F32 projections both
+    // backends apply each bias independently, so partial sets stay
+    // valid there.
+    let bias_present = [subs.bq.is_some(), subs.bk.is_some(), subs.bv.is_some()];
+    let qkv_all_f32 = subs.wq.quant == QuantScheme::F32
+        && subs.wk.quant == QuantScheme::F32
+        && subs.wv.quant == QuantScheme::F32;
+    if subs.layer_type != Some(1)
+        && bias_present.iter().any(|&p| p)
+        && !bias_present.iter().all(|&p| p)
+        && !qkv_all_f32
+    {
+        return Err(format!(
+            "incomplete QKV bias set (bq/bk/bv present: {bias_present:?}) \
+             with non-F32 projections: the backends diverge on partial \
+             sets (CUDA applies each present bias; Metal's fused decode \
+             arms drop them), so this fails closed (malformed LBC). \
+             Re-convert with `lumen convert`."
+        ));
     }
     // A layer routes through experts only when BOTH the router and a
     // non-empty expert bank exist (the runtime's own MoE predicate);
@@ -798,6 +923,33 @@ pub fn validate_expert_bank(st: &crate::index::SubtensorOffsets) -> Result<(), S
     Ok(())
 }
 
+/// A MoE layer's expert bank must hold exactly the header's declared
+/// expert count. The runtime sizes GPU offset tables and dispatch grids
+/// from the header count but fills only `min(header, bank.len())` entries
+/// — a header claiming MORE experts than the bank leaves the surplus
+/// pointing at offset 0, so those experts silently route to the first
+/// tensor's bytes (wrong-weight output, no crash). Enforced at load on
+/// both backends; non-MoE layers are exempt.
+pub fn validate_expert_count(
+    st: &crate::index::SubtensorOffsets,
+    expected: usize,
+) -> Result<(), String> {
+    let has_experts = st.experts.as_ref().is_some_and(|e| !e.is_empty());
+    if st.router_weight.is_none() || !has_experts {
+        return Ok(());
+    }
+    let actual = st.experts.as_ref().map_or(0, |e| e.len());
+    if actual != expected {
+        return Err(format!(
+            "MoE layer carries {actual} experts but the model header \
+             declares {expected}; the dispatch grid is sized from the \
+             header, so a mismatch routes surplus experts to offset 0 \
+             (malformed LBC). Re-convert with `lumen convert`."
+        ));
+    }
+    Ok(())
+}
+
 /// Composite layer-plan validation: everything the loaders will check at
 /// load time, runnable over a PLANNED `SubtensorOffsets` before any byte
 /// is written. `metal` adds the Metal-only rules (scheme allowlist, pair
@@ -811,12 +963,15 @@ pub fn validate_layer_plan(
     st: &crate::index::SubtensorOffsets,
     d: &AttnDims,
     inter: usize,
+    num_experts: usize,
     metal: bool,
 ) -> Result<(), String> {
-    validate_mandatory_presence(st)?;
     validate_layer_slices(layer, st)?;
+    validate_mandatory_presence(st).map_err(|e| format!("layer {layer}: {e}"))?;
+    validate_attn_vector_extents(layer, st, d.head_dim, d.q_dim, d.kv_dim)?;
     validate_ffn_pre_norm(layer, st)?;
     validate_expert_bank(st)?;
+    validate_expert_count(st, num_experts).map_err(|e| format!("layer {layer}: {e}"))?;
     validate_gdn_conv1d(layer, st, d.gdn_qkv_rows, d.gdn_conv_kernel)?;
     let is_gdn = st.layer_type == Some(1);
     let wq_rows = if is_gdn {
@@ -840,6 +995,16 @@ pub fn validate_layer_plan(
     // model by design). Universal.
     if let Some(gate) = st.attn_gate.as_ref() {
         validate_projection_geometry("attn_gate", gate, d.hidden, &[d.gdn_v_dim])?;
+    }
+    // ssm_out: the GDN output projection maps gdn_v_dim -> hidden (hidden
+    // rows x gdn_v_dim width). Validate its geometry for EVERY target, not
+    // only Metal: a `--target generic` conversion sizes ssm_out straight
+    // from the source's element count, so a malformed-source GGUF would
+    // otherwise emit a wrong-geometry ssm_out that no convert-time check
+    // catches (the Metal load guard would, but CUDA/CPU would read it at the
+    // wrong geometry). Well-formed sources are unaffected.
+    if let Some(out) = st.ssm_out.as_ref() {
+        validate_projection_geometry("ssm_out", out, d.gdn_v_dim, &[d.hidden])?;
     }
     if metal {
         validate_layer_quants(layer, st)?;

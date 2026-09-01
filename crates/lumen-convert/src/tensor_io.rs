@@ -70,10 +70,58 @@ pub(crate) fn read_tensor_data<R: Read + Seek>(
     tensor: &GgufTensorInfo,
 ) -> Result<Vec<u8>, ConvertError> {
     let offset = gguf.tensor_data_offset(tensor);
-    let size = tensor.byte_size().unwrap_or(0) as usize;
+    let size = tensor.byte_size().unwrap_or(0);
     reader.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; size];
-    reader.read_exact(&mut buf)?;
+    read_exact_bounded(reader, size, &tensor.name)
+}
+
+/// Read exactly `size` bytes for a tensor. A malformed file can declare a
+/// tensor far larger than it holds. A plain `vec![0u8; declared]` aborts on
+/// the allocation; `try_reserve_exact` + `resize` still OOM-kills because
+/// zeroing the pages faults them all in. This reserves the exact size ONCE
+/// (fallibly — a size the allocator cannot provide returns a clean error,
+/// and `reserve` touches no pages, so an over-commit does not fault the
+/// declared size), then fills it with fixed 8 MiB `read_exact` chunks. The
+/// single upfront reservation means the fill never reallocates (no
+/// quadratic copy, no ~2x transient heap under any allocator), and physical
+/// pages are backed only by bytes actually read — a short file hits EOF in
+/// the first chunk and errors cleanly. Reader-agnostic: no `SeekFrom::End`
+/// (the sharded reader rejects it).
+pub(crate) fn read_exact_bounded<R: Read>(
+    reader: &mut R,
+    size: u64,
+    name: &str,
+) -> Result<Vec<u8>, ConvertError> {
+    const CHUNK: usize = 8 << 20;
+    let size_usize = usize::try_from(size).map_err(|_| {
+        ConvertError::UnsupportedModel(format!(
+            "tensor '{name}' declares {size} bytes, beyond addressable memory"
+        ))
+    })?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size_usize).map_err(|_| {
+        ConvertError::UnsupportedModel(format!(
+            "tensor '{name}' declares {size} bytes, which cannot be allocated \
+             (malformed file)"
+        ))
+    })?;
+    let mut staging = vec![0u8; CHUNK.min(size_usize.max(1))];
+    let mut remaining = size_usize;
+    while remaining > 0 {
+        let want = CHUNK.min(remaining);
+        reader.read_exact(&mut staging[..want]).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                ConvertError::UnsupportedModel(format!(
+                    "tensor '{name}' declares {size} bytes but fewer are \
+                     available in the file (malformed file)"
+                ))
+            } else {
+                ConvertError::Io(e)
+            }
+        })?;
+        buf.extend_from_slice(&staging[..want]);
+        remaining -= want;
+    }
     Ok(buf)
 }
 
@@ -290,7 +338,7 @@ pub(crate) fn try_compute_bias_slice(
         length: size,
         quant: QuantScheme::F32,
     };
-    *blob_offset += size;
+    *blob_offset = blob_offset.saturating_add(size);
     Some(slice)
 }
 
@@ -299,6 +347,75 @@ mod tests {
     use super::*;
     use crate::gguf::{GgmlType, GgufBuilder, GgufFile};
     use std::io::Cursor;
+
+    /// A multi-chunk read (> the 8 MiB staging chunk), driven by a reader
+    /// that yields one byte per call to exercise the loop maximally,
+    /// returns exactly the requested bytes at EXACTLY the final capacity —
+    /// no over-allocation (this catches a `read_to_end`-style ~2x growth
+    /// regression). The stronger no-reallocation / no-quadratic-copy
+    /// property under the production allocator (mimalloc) is pinned
+    /// empirically by the retained real-conversion peak-RSS measurement
+    /// (~2.6 GB on a 9 GB model), which a unit test cannot observe without
+    /// a process-global allocator harness.
+    #[test]
+    fn bounded_read_multichunk_exact_no_overalloc() {
+        // A reader that yields 1 byte per read call — maximises growth
+        // opportunities within each staging chunk.
+        struct DribbleReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl Read for DribbleReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let size = (8 << 20) + 12345; // spans two staging chunks, non-aligned
+        let src: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut r = DribbleReader { data: &src, pos: 0 };
+        let out = read_exact_bounded(&mut r, size as u64, "t").unwrap();
+        assert_eq!(out.len(), size);
+        assert_eq!(out.capacity(), size, "capacity must be exact");
+        assert_eq!(out, src);
+    }
+
+    /// A short stream errors cleanly as a truncation (never an abort), and
+    /// a genuine non-EOF I/O fault is preserved as `Io`, not relabeled
+    /// malformed.
+    #[test]
+    fn bounded_read_short_and_io_errors() {
+        // Short stream -> UnexpectedEof -> the truncation message, NOT the
+        // allocation-failure branch (distinguished by the message).
+        let src = vec![0u8; 100];
+        let mut cur = Cursor::new(&src);
+        let err = read_exact_bounded(&mut cur, 1 << 20, "t").unwrap_err();
+        assert!(
+            format!("{err}").contains("available in the file"),
+            "expected truncation message, got {err}"
+        );
+
+        // A genuine non-EOF I/O fault is preserved as ConvertError::Io.
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            }
+        }
+        let mut fr = FailingReader;
+        let err = read_exact_bounded(&mut fr, 64, "t").unwrap_err();
+        assert!(
+            matches!(err, ConvertError::Io(_)),
+            "expected Io, got {err:?}"
+        );
+    }
 
     #[test]
     fn metal_target_upcasts_q5_0_layer_tensor_to_q8_0() {

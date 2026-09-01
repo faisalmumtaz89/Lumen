@@ -75,8 +75,14 @@ impl LbcFile {
         // layer_index_offset and num_layers so we know how much more to read.
         let (layer_index_offset, num_layers) = peek_header_offsets(&header_buf)?;
 
-        let index_end =
-            layer_index_offset as usize + (num_layers as usize) * MAX_LAYER_INDEX_ENTRY_SIZE;
+        // These two values come off disk unvalidated; the real gate runs in
+        // parse_lbc. Checked math here only prevents the pre-parse sizing
+        // from wrapping (a wrapped index_end could under-read and mask the
+        // real error, or drive a bogus resize).
+        let index_end = (num_layers as usize)
+            .checked_mul(MAX_LAYER_INDEX_ENTRY_SIZE)
+            .and_then(|v| v.checked_add(layer_index_offset as usize))
+            .unwrap_or(usize::MAX);
 
         // Step 3: If the initial read already covers everything, parse from it.
         // Otherwise, read the additional bytes we need.
@@ -104,7 +110,12 @@ impl LbcFile {
             if header.tokenizer_section_offset != 0 && header.tokenizer_section_length != 0 {
                 let tok_start = header.tokenizer_section_offset;
                 let tok_len = header.tokenizer_section_length;
-                if tok_start + tok_len > file_len {
+                let tok_end = tok_start.checked_add(tok_len).ok_or_else(|| {
+                    FormatError::InvalidHyperparams(format!(
+                        "tokenizer section range {tok_start}+{tok_len} overflows"
+                    ))
+                })?;
+                if tok_end > file_len {
                     return Err(FormatError::UnexpectedEof {
                         needed: tok_start + tok_len,
                         available: file_len,
@@ -243,6 +254,9 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
     // We'll verify checksum after parsing the full header
 
     let hyperparams = parse_hyperparams(&mut cursor, version)?;
+    hyperparams
+        .validate_bounds()
+        .map_err(FormatError::InvalidHyperparams)?;
     let quantization = parse_quant_desc(&mut cursor)?;
 
     let alignment = cursor.read_u64()?;
@@ -348,8 +362,14 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
     }
     cursor.pos = layer_index_offset as usize;
     let mut layer_indices = Vec::with_capacity(num_layers as usize);
-    for _ in 0..num_layers {
-        layer_indices.push(parse_layer_index(&mut cursor)?);
+    for i in 0..num_layers {
+        let idx = parse_layer_index(&mut cursor)?;
+        // Every subtensor offset+length must fit within the layer's own
+        // blob: the GPU-resident loaders bind these offsets into the layer
+        // buffer and the kernels read from them, so an exact-length tensor
+        // whose offset runs past the blob is an out-of-bounds device read.
+        idx.validate(i as usize)?;
+        layer_indices.push(idx);
     }
 
     Ok((header, layer_indices))
@@ -572,6 +592,12 @@ fn parse_layer_index(c: &mut Cursor<'_>) -> Result<LayerIndex, FormatError> {
         };
 
         let experts = if num_experts > 0 {
+            if num_experts > crate::hyperparams::ModelHyperparams::EXPERT_BOUND {
+                return Err(FormatError::InvalidHyperparams(format!(
+                    "layer index declares {num_experts} experts (bound {})",
+                    crate::hyperparams::ModelHyperparams::EXPERT_BOUND
+                )));
+            }
             let mut expert_vec = Vec::with_capacity(num_experts as usize);
             for _ in 0..num_experts {
                 let gate = parse_tensor_slice(c)?;
@@ -949,6 +975,45 @@ mod tests {
         match result.unwrap_err() {
             FormatError::InvalidMagic { .. } => {}
             other => panic!("expected InvalidMagic, got: {other}"),
+        }
+    }
+
+    /// A layer whose sub-tensor slice runs past its own blob must be
+    /// rejected at parse — the GPU-resident loaders bind these offsets
+    /// straight into the device layer buffer, so an out-of-blob offset is
+    /// an out-of-bounds device read, not a Rust panic. The blob length is
+    /// authoritative (the writer records it), so a crafted wo slice past
+    /// the blob is the reachable corruption. Removing the parse-time
+    /// `LayerIndex::validate` call makes this parse succeed.
+    #[test]
+    fn layer_subtensor_past_blob_rejected_at_parse() {
+        let (header, mut indices) = make_test_header();
+        // Blob is 1344 bytes; push wo's end (offset+length) past it.
+        indices[0].subtensors.wo = TensorSlice {
+            offset: 1300,
+            length: 128,
+            quant: QuantScheme::F32,
+        };
+
+        let globals = GlobalTensors {
+            embedding: vec![1u8; 32 * 8 * 4],
+            final_norm: vec![2u8; 8 * 4],
+            output_proj: vec![3u8; 32 * 8 * 4],
+        };
+        let layer_blob = vec![42u8; 1344];
+        let blobs: Vec<&[u8]> = vec![&layer_blob, &layer_blob];
+
+        let mut out = Vec::new();
+        write_lbc(&mut out, &header, &indices, &globals, &blobs, None).unwrap();
+
+        match LbcFile::from_bytes(&out, PathBuf::from("oob.lbc")) {
+            Err(FormatError::LayerOutOfBounds {
+                layer, tensor_name, ..
+            }) => {
+                assert_eq!(layer, 0);
+                assert_eq!(tensor_name, "wo");
+            }
+            other => panic!("expected LayerOutOfBounds for wo, got: {other:?}"),
         }
     }
 
@@ -1757,5 +1822,99 @@ mod tests {
         let lbc2 = LbcFile::from_bytes(&out2, PathBuf::from("gdn_none.lbc")).unwrap();
         assert_eq!(lbc2.header.hyperparams.gdn, None);
         assert_eq!(lbc2.header.hyperparams.gdn_dims(), GdnDims::QWEN35_9B);
+    }
+
+    /// Hostile header dims must die at parse, before any consumer derives
+    /// geometry: the u32 product num_heads x head_dim here lands at
+    /// 2^63+6471, which pre-bound wrapped downstream expectations into
+    /// tiny values a 4-byte tensor satisfied.
+    #[test]
+    fn hostile_hyperparam_dims_rejected_at_parse() {
+        use crate::header::LbcHeader;
+        use crate::hyperparams::ModelHyperparams;
+        use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+        use crate::test_model::{generate_test_model_q8_0, TestModelQ8Config};
+        use crate::writer::{write_lbc, GlobalTensors};
+
+        // A valid model parses cleanly (control).
+        let good = generate_test_model_q8_0(&TestModelQ8Config::default());
+        assert!(LbcFile::from_bytes(&good, std::path::PathBuf::from("good.lbc")).is_ok());
+
+        let hp = ModelHyperparams {
+            num_layers: 1,
+            num_heads: 3036988439,
+            num_kv_heads: 2,
+            head_dim: 3037012561,
+            hidden_dim: 64,
+            intermediate_dim: 128,
+            vocab_size: 256,
+            max_seq_len: 512,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let qd = QuantizationDescriptor {
+            scheme: QuantScheme::F32,
+            group_size: QuantGroupSize::PerTensor,
+            block_byte_size: 4,
+            scale_offset_in_block: None,
+        };
+        let header = LbcHeader::new(hp, qd);
+        let globals = GlobalTensors {
+            embedding: vec![0u8; 256 * 64 * 4],
+            final_norm: vec![0u8; 64 * 4],
+            output_proj: vec![0u8; 256 * 64 * 4],
+        };
+        // One empty layer keeps the writer's layer-count invariant; the
+        // bounds fire at header parse, before any layer is examined.
+        let zero = crate::index::TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::F32,
+        };
+        let layer = crate::index::LayerIndex {
+            layer_offset_bytes: 0,
+            layer_length_bytes: 0,
+            subtensors: crate::index::SubtensorOffsets {
+                wq: zero,
+                wk: zero,
+                wv: zero,
+                wo: zero,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate: zero,
+                w_up: zero,
+                w_down: zero,
+                attn_norm: zero,
+                ffn_norm: zero,
+                router_weight: None,
+                experts: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
+                layer_type: None,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_lbc(&mut bytes, &header, &[layer], &globals, &[&[]], None).unwrap();
+        let err = LbcFile::from_bytes(&bytes, std::path::PathBuf::from("bad.lbc")).unwrap_err();
+        assert!(err.to_string().contains("num_heads = 3036988439"), "{err}");
     }
 }

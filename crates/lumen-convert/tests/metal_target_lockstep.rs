@@ -494,6 +494,10 @@ fn metal_target_q5_0_respects_flag_precedence() {
 /// Build a dense qwen35 model whose layer 0 is a complete GDN layer with
 /// `ssm_alpha`/`ssm_beta` stored as `gates`.
 fn build_gdn_model(gates: GgmlType) -> Vec<u8> {
+    build_gdn_model_ssm_out(gates, &[HID, HID])
+}
+
+fn build_gdn_model_ssm_out(gates: GgmlType, ssm_out_dims: &[u64]) -> Vec<u8> {
     let mut b = GgufBuilder::new();
     let arch = "qwen35";
     let k = |s: &str| format!("{arch}.{s}");
@@ -560,11 +564,12 @@ fn build_gdn_model(gates: GgmlType) -> Vec<u8> {
             &[HID / nh],
             &vec![1.0; (HID / nh) as usize],
         );
+        let ssm_out_n: u64 = ssm_out_dims.iter().product();
         b.add_tensor(
             &format!("{p}.ssm_out.weight"),
             GgmlType::Q5_0,
-            &[HID, HID],
-            q5_bytes(HID * HID),
+            ssm_out_dims,
+            q5_bytes(ssm_out_n),
         );
         let ne = HID * nh;
         match gates {
@@ -643,6 +648,43 @@ fn convert_and_probe_gates(
     );
     std::fs::remove_file(&out).ok();
     (alpha.quant, alpha.length)
+}
+
+/// `ssm_out` geometry (hidden rows x gdn_v_dim width) must be validated at
+/// convert for EVERY target, not only Metal. The converter sizes `ssm_out`
+/// straight from the source's element count, so a malformed-source GGUF with
+/// an inconsistent `ssm_out` would otherwise produce a wrong-geometry
+/// `--target generic` LBC that no convert-time check catches (CUDA/CPU would
+/// then read it at the wrong geometry). The universal `validate_projection_
+/// geometry("ssm_out", ...)` in `validate_layer_plan` closes this; removing
+/// it lets the generic conversion below succeed and fails this test.
+#[test]
+fn generic_convert_rejects_wrong_ssm_out_geometry() {
+    // Declared geometry is hidden rows (HID) x gdn_v_dim width (HID); a
+    // well-formed ssm_out is [HID, HID]. Doubling the second dimension makes
+    // the element count no longer factor as hidden x gdn_v_dim, so the
+    // projection-geometry check rejects it. (hidden == gdn_v_dim on this
+    // fixture, so this pins the universal WIRING; the argument order
+    // in_dim=gdn_v_dim / rows=hidden is confirmed by inspection against the
+    // Metal `expect("ssm_out", out, hidden, gdn_v_dim)` twin.)
+    let gguf = build_gdn_model_ssm_out(GgmlType::Q8_0, &[HID, HID * 2]);
+    let out = std::env::temp_dir().join(format!(
+        "lumen_bad_ssm_out_generic_{}.lbc",
+        std::process::id()
+    ));
+    std::fs::remove_file(&out).ok();
+    let opts = ConvertOptions {
+        target: ConvertTarget::Generic,
+        ..Default::default()
+    };
+    let err = convert_gguf_bytes_to_lbc(&gguf, &out, &opts)
+        .expect_err("generic conversion must reject a wrong-geometry ssm_out");
+    assert!(
+        format!("{err}").contains("ssm_out"),
+        "rejection must name ssm_out, got {err:?}"
+    );
+    assert!(!out.exists(), "no partial output on a planning refusal");
+    std::fs::remove_file(&out).ok();
 }
 
 #[test]
@@ -963,10 +1005,124 @@ fn contract_gate_refuses_loader_rejected_plans() {
     };
     // Geometry (canonical C2 shape) — universal, generic target included.
     refuse(GateCase::C2Geometry, "requires out_dim in");
-    // Missing FFN pre-norm — universal (the round-8 filing fix).
+    // Missing FFN pre-norm — universal (the load-guard fix).
     refuse(GateCase::NoPreNorm, "no FFN pre-norm exists");
-    // Q+gate + bias policy.
-    refuse(GateCase::QGateBias, "Q+gate attention layer");
+    // Q+gate + bias policy — and the gate's presence-rule refusals carry
+    // the layer index (the fixture's full-attention layer is 3).
+    refuse(
+        GateCase::QGateBias,
+        "layer 3: QKV biases are present on a Q+gate attention layer",
+    );
     // Present-but-zero-length optional — universal (moved 19-entry rule).
     refuse(GateCase::ZeroLenOptional, "present but zero-length");
+}
+
+/// The four GDN pair-force sites: dense/MoE × qkv/gate. Each routes its
+/// element count through `pair_forced_q8_slice`; a mutation reverting any
+/// one back to an inline `assert!` must be caught, so every site gets its
+/// own unaligned-tensor case below.
+#[derive(Clone, Copy)]
+enum PairForceSite {
+    DenseQkv,
+    DenseGate,
+    MoeQkv,
+    MoeGate,
+}
+
+/// Builds a single-layer GDN model (layer 0 is linear-attention on this
+/// architecture) whose fused `attn_qkv` and `attn_gate` are both F16 — so
+/// the Metal pair-force fires — with exactly one of them given a non-32
+/// element count. The planner reaches qkv, then gate, before any FFN
+/// tensor, so a minimal fixture pins both sites. Returns the conversion
+/// error and asserts no partial output survives the refusal.
+fn refuse_unaligned_pair_force(site: PairForceSite) {
+    let moe = matches!(site, PairForceSite::MoeQkv | PairForceSite::MoeGate);
+    let arch = if moe { "qwen35moe" } else { "qwen35" };
+    let k = |s: &str| format!("{arch}.{s}");
+    let mut b = GgufBuilder::new();
+    b.add_string("general.architecture", arch);
+    b.add_u32(&k("block_count"), 1);
+    b.add_u32(&k("attention.head_count"), HEADS);
+    b.add_u32(&k("attention.head_count_kv"), KVH);
+    b.add_u32(&k("attention.key_length"), HID as u32 / HEADS);
+    b.add_u32(&k("embedding_length"), HID as u32);
+    b.add_u32(&k("feed_forward_length"), INTER as u32);
+    b.add_u32(&k("context_length"), 64);
+    b.add_f32(&k("rope.freq_base"), 10000.0);
+    b.add_f32(&k("attention.layer_norm_rms_epsilon"), 1e-5);
+    b.add_u32(&k("ssm.time_step_rank"), 8);
+    b.add_u32(&k("ssm.group_count"), 2);
+    b.add_u32(&k("ssm.state_size"), 8);
+    b.add_u32(&k("ssm.conv_kernel"), 4);
+    if moe {
+        b.add_u32(&k("expert_count"), NEXP as u32);
+        b.add_u32(&k("expert_used_count"), 2);
+    }
+    b.add_f32_tensor(
+        "token_embd.weight",
+        &[VOCAB, HID],
+        &vec![0.0; (VOCAB * HID) as usize],
+    );
+    b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    b.add_f32_tensor("blk.0.attn_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    b.add_f32_tensor("blk.0.ffn_norm.weight", &[HID], &vec![1.0; HID as usize]);
+    // Both pair members are F16 (forces the pair on Metal). The targeted
+    // member gets 33 elements — NOT a multiple of 32 — so its Q8_0
+    // pair-force must refuse; the other stays aligned at 64 so planning
+    // reaches the target. F16 byte length = 2 * element count.
+    let f16 = |b: &mut GgufBuilder, name: &str, n: u64| {
+        b.add_tensor(name, GgmlType::F16, &[n], vec![0u8; (n * 2) as usize]);
+    };
+    let (qkv_n, gate_n) = match site {
+        PairForceSite::DenseQkv | PairForceSite::MoeQkv => (33, 64),
+        PairForceSite::DenseGate | PairForceSite::MoeGate => (64, 33),
+    };
+    f16(&mut b, "blk.0.attn_qkv.weight", qkv_n);
+    f16(&mut b, "blk.0.attn_gate.weight", gate_n);
+
+    let gguf = b.build();
+    let out = std::env::temp_dir().join(format!(
+        "lumen_gdn_f16_unaligned_{}_{}.lbc",
+        arch,
+        std::process::id()
+    ));
+    std::fs::remove_file(&out).ok();
+    let opts = ConvertOptions {
+        target: ConvertTarget::Metal,
+        ..Default::default()
+    };
+    let err = convert_gguf_bytes_to_lbc(&gguf, &out, &opts)
+        .expect_err("unaligned F16 pair-force member must be refused");
+    assert!(
+        format!("{err}").contains("divisible by 32"),
+        "expected a divisibility error, got {err:?}"
+    );
+    assert!(!out.exists(), "no partial output on a planning refusal");
+    std::fs::remove_file(&out).ok();
+}
+
+/// The GDN pair-force covers F16 sources too. A non-32-aligned F16
+/// pair member (only constructible by hand — real GDN dims are 32-aligned)
+/// must be REJECTED at conversion with a clear error, not panic in the
+/// quantizer. Each test drives one production call site end-to-end, so
+/// reverting that site to its old inline `assert!` turns the test's clean
+/// refusal into a panic and fails it.
+#[test]
+fn metal_gdn_f16_qkv_unaligned_refused_at_convert() {
+    refuse_unaligned_pair_force(PairForceSite::DenseQkv);
+}
+
+#[test]
+fn metal_gdn_f16_gate_unaligned_refused_at_convert() {
+    refuse_unaligned_pair_force(PairForceSite::DenseGate);
+}
+
+#[test]
+fn metal_moe_gdn_f16_qkv_unaligned_refused_at_convert() {
+    refuse_unaligned_pair_force(PairForceSite::MoeQkv);
+}
+
+#[test]
+fn metal_moe_gdn_f16_gate_unaligned_refused_at_convert() {
+    refuse_unaligned_pair_force(PairForceSite::MoeGate);
 }

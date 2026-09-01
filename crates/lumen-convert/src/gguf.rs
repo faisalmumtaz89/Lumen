@@ -276,7 +276,10 @@ impl GgmlType {
         let bs = self.block_size()?;
         let ts = self.type_size()?;
         let blocks = n_elements.div_ceil(bs);
-        Some(blocks * ts)
+        // Saturating: a hostile dim set yields u64::MAX here, which then
+        // fails every downstream size/offset comparison instead of
+        // aliasing a small byte count.
+        Some(blocks.saturating_mul(ts))
     }
 
     /// Map this GGML type to the corresponding LBC [`QuantScheme`], if one
@@ -364,6 +367,14 @@ pub struct GgufArray {
 // Tensor info
 // ---------------------------------------------------------------------------
 
+/// Ceiling on a parsed GGUF tensor's total element count (product of its
+/// dimensions). Bounds every `n_elements()`/byte-size product the
+/// converter planners form so they stay within u64 without per-site
+/// checks: at 2^48, an element count times any per-element byte multiplier
+/// (<= ~256) stays under 2^56. It dwarfs any real weight (a 248320 x 4096
+/// embedding is ~2^30) while a hostile dim set is rejected at parse.
+const MAX_TENSOR_ELEMENTS: u64 = 1 << 48;
+
 /// Information about a single tensor in the GGUF file.
 ///
 /// This is the metadata only -- the actual weight bytes are not loaded.
@@ -380,12 +391,17 @@ pub struct GgufTensorInfo {
 }
 
 impl GgufTensorInfo {
-    /// Total number of elements (product of all dimensions).
+    /// Total number of elements (product of all dimensions). Saturates on
+    /// overflow: a hostile dim set then fails every downstream size
+    /// comparison instead of aliasing a small tensor.
     pub fn n_elements(&self) -> u64 {
         if self.dims.is_empty() {
             0
         } else {
-            self.dims.iter().copied().product()
+            self.dims
+                .iter()
+                .copied()
+                .fold(1u64, |acc, d| acc.saturating_mul(d))
         }
     }
 
@@ -494,8 +510,25 @@ impl GgufFile {
                 )));
             }
             let mut dims = Vec::with_capacity(n_dims as usize);
+            // Bound the ELEMENT-COUNT PRODUCT, not just each dimension: two
+            // dims of 2^31 each are individually tiny yet multiply to 2^62,
+            // where a downstream `n_elements() * bytes` wraps u64. Capping
+            // the running product at MAX_TENSOR_ELEMENTS (2^48) leaves every
+            // planner size product (x up to ~256 bytes/element) inside u64
+            // by construction, while dwarfing any real weight (a 248320 x
+            // 4096 embedding is ~2^30).
+            let mut n_elems: u64 = 1;
             for _ in 0..n_dims {
-                dims.push(read_u64_le(&mut cr)?);
+                let d = read_u64_le(&mut cr)?;
+                n_elems = n_elems
+                    .checked_mul(d.max(1))
+                    .filter(|&v| v <= MAX_TENSOR_ELEMENTS)
+                    .ok_or_else(|| {
+                        GgufError::ResourceLimit(format!(
+                            "tensor '{name}' element count exceeds maximum {MAX_TENSOR_ELEMENTS}"
+                        ))
+                    })?;
+                dims.push(d);
             }
             let type_tag = read_u32_le(&mut cr)?;
             let ggml_type = GgmlType::from_u32(type_tag);
@@ -1168,6 +1201,57 @@ mod tests {
     }
 
     // -- Parsing tests -------------------------------------------------------
+
+    /// A tensor whose element-count PRODUCT exceeds MAX_TENSOR_ELEMENTS is
+    /// rejected at parse — including the two-small-dims case
+    /// (2^31 x 2^31 = 2^62) where a downstream `n_elements() * 4` would
+    /// wrap u64 even though each dimension is individually tiny.
+    #[test]
+    fn oversized_tensor_elements_rejected() {
+        let build = |dims: &[u64]| {
+            let mut b = GgufBuilder::new();
+            b.add_tensor("blk.0.attn_q.weight", GgmlType::F32, dims, Vec::new());
+            b.build()
+        };
+        for dims in [&[1u64 << 49, 1][..], &[1u64 << 31, 1 << 31][..]] {
+            let bytes = build(dims);
+            let mut cur = std::io::Cursor::new(&bytes);
+            assert!(
+                matches!(
+                    GgufFile::parse(&mut cur).unwrap_err(),
+                    GgufError::ResourceLimit(_)
+                ),
+                "dims {dims:?} must be rejected"
+            );
+        }
+    }
+
+    /// A tensor that passes the element-count cap but declares far more
+    /// bytes than the file holds must be a clean error at read, not a
+    /// multi-exabyte allocation attempt.
+    #[test]
+    fn oversized_tensor_read_bounded_by_file() {
+        use crate::tensor_io::read_tensor_data;
+        // 2^40 F32 elements = 2^42 bytes declared, but no data bytes ship.
+        let mut b = GgufBuilder::new();
+        b.add_tensor(
+            "blk.0.attn_q.weight",
+            GgmlType::F32,
+            &[1 << 40, 1],
+            Vec::new(),
+        );
+        let bytes = b.build();
+        let mut cur = std::io::Cursor::new(&bytes);
+        let gguf = GgufFile::parse(&mut cur).unwrap();
+        let tensor = gguf.find_tensor("blk.0.attn_q.weight").unwrap().clone();
+        let mut cur2 = std::io::Cursor::new(&bytes);
+        let err = read_tensor_data(&mut cur2, &gguf, &tensor).unwrap_err();
+        // Rejected cleanly (either the allocation is refused or the read hits EOF) — never an abort.
+        assert!(
+            matches!(err, crate::convert::ConvertError::UnsupportedModel(_)),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn parse_minimal_gguf() {

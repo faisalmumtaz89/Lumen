@@ -21,18 +21,20 @@ impl ComputeBackend for MetalF32Backend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
+        self.cached_moe_num_experts = hyperparams.num_experts.unwrap_or(0) as usize;
         self.cached_attn_dims = Some(super::gpu_resident::AttnDims {
-            q_dim: (hyperparams.num_heads * hyperparams.head_dim) as usize,
-            kv_dim: (hyperparams.num_kv_heads * hyperparams.head_dim) as usize,
+            q_dim: hyperparams.num_heads as usize * hyperparams.head_dim as usize,
+            kv_dim: hyperparams.num_kv_heads as usize * hyperparams.head_dim as usize,
             hidden: hyperparams.hidden_dim as usize,
+            head_dim: hyperparams.head_dim as usize,
             gdn_qkv_rows: {
                 let gd = hyperparams.gdn_dims();
-                ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize
+                (2 * gd.num_k_heads as usize + gd.num_v_heads as usize) * gd.head_dim as usize
             },
             gdn_declared: hyperparams.gdn.is_some(),
             gdn_v_dim: {
                 let gd = hyperparams.gdn_dims();
-                (gd.num_v_heads * gd.head_dim) as usize
+                gd.num_v_heads as usize * gd.head_dim as usize
             },
             gdn_conv_kernel: hyperparams.gdn_dims().conv_kernel as usize,
         });
