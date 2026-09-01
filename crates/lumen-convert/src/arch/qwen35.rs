@@ -91,7 +91,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::F32,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             return Ok(slice);
         }
 
@@ -106,7 +106,7 @@ fn compute_layer_shape_qwen35(
                     length: size,
                     quant: QuantScheme::F32,
                 };
-                *blob_offset += size;
+                *blob_offset = blob_offset.saturating_add(size);
                 return Ok(slice);
             }
             let src_quant = tensor.ggml_type.to_lbc_quant();
@@ -118,7 +118,7 @@ fn compute_layer_shape_qwen35(
                     length: size,
                     quant: target_q,
                 };
-                *blob_offset += size;
+                *blob_offset = blob_offset.saturating_add(size);
                 return Ok(slice);
             }
             // Compute size for target quant
@@ -148,7 +148,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             return Ok(slice);
         }
 
@@ -160,7 +160,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::F32,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         } else if target == ConvertTarget::Metal && !is_norm && metal_needs_upcast(tensor.ggml_type)
         {
@@ -177,7 +177,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::Q8_0,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q4_1 {
             if target != ConvertTarget::Metal && crate::convert::source_fidelity() {
@@ -193,7 +193,7 @@ fn compute_layer_shape_qwen35(
                     length: size,
                     quant: QuantScheme::Q4_1,
                 };
-                *blob_offset += size;
+                *blob_offset = blob_offset.saturating_add(size);
                 return Ok(slice);
             }
             // Q4_1 has no dedicated GPU kernel -- requantize to Q4_0.
@@ -208,7 +208,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::Q4_0,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q8_1 {
             // Q8_1 has no LBC QuantScheme -- requantize to Q8_0.
@@ -223,7 +223,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::Q8_0,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         } else if tensor.ggml_type == GgmlType::Q5_1 {
             // Q5_1 has no LBC QuantScheme -- dequantize to F32.
@@ -234,7 +234,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant: QuantScheme::F32,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         } else {
             let quant = tensor.ggml_type.to_lbc_quant().ok_or_else(|| {
@@ -254,7 +254,7 @@ fn compute_layer_shape_qwen35(
                 length: size,
                 quant,
             };
-            *blob_offset += size;
+            *blob_offset = blob_offset.saturating_add(size);
             Ok(slice)
         }
     };
@@ -321,7 +321,7 @@ fn compute_layer_shape_qwen35(
             length: size,
             quant,
         };
-        *blob_offset += size;
+        *blob_offset = blob_offset.saturating_add(size);
         Ok(Some(slice))
     };
 
@@ -404,19 +404,11 @@ fn compute_layer_shape_qwen35(
             let t = gguf
                 .find_tensor(&qkv_name)
                 .ok_or_else(|| ConvertError::MissingTensor(qkv_name.clone()))?;
-            let n = t.n_elements() as usize;
-            assert!(
-                n % 32 == 0,
-                "Q8_0 requires elements divisible by 32, got {n} for {qkv_name}"
-            );
-            let size = ((n / 32) * 34) as u64;
-            let slice = TensorSlice {
-                offset: blob_size,
-                length: size,
-                quant: QuantScheme::Q8_0,
-            };
-            blob_size += size;
-            slice
+            super::gdn_gates::pair_forced_q8_slice(
+                t.n_elements() as usize,
+                &qkv_name,
+                &mut blob_size,
+            )?
         } else {
             compute_slice(gguf, &qkv_name, &mut blob_size, dequantize)?
         };
@@ -454,21 +446,14 @@ fn compute_layer_shape_qwen35(
     // attn_gate on its own quant wherever one exists)
     let attn_gate = if gdn_pair_q8 {
         let name = layer_tensor_name(layer, ATTN_GATE_WEIGHT);
-        gguf.find_tensor(&name).map(|t| {
-            let n = t.n_elements() as usize;
-            assert!(
-                n % 32 == 0,
-                "Q8_0 requires elements divisible by 32, got {n} for {name}"
-            );
-            let size = ((n / 32) * 34) as u64;
-            let slice = TensorSlice {
-                offset: blob_size,
-                length: size,
-                quant: QuantScheme::Q8_0,
-            };
-            blob_size += size;
-            slice
-        })
+        match gguf.find_tensor(&name) {
+            Some(t) => Some(super::gdn_gates::pair_forced_q8_slice(
+                t.n_elements() as usize,
+                &name,
+                &mut blob_size,
+            )?),
+            None => None,
+        }
     } else {
         try_compute_opt_slice(gguf, layer, ATTN_GATE_WEIGHT, &mut blob_size, dequantize)?
     };

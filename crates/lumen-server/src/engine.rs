@@ -1009,15 +1009,18 @@ impl EngineWorker {
         }
 
         // Disk-KV startup housekeeping.
-        // --kv-disk-dir without --kv-disk-space-mb runs in purge-only mode:
-        // .tmp.<pid> files are cleaned but .kv entries grow unbounded.
-        // Surface this once at startup so the operator can spot it.
+        // A disk-KV dir with an unbounded budget (`DiskKvConfig::budget_bytes`
+        // of 0 or u64::MAX) runs in purge-only mode: `.tmp.<pid>` files are
+        // cleaned but `.kv` entries grow unbounded. Surface this once at
+        // startup so the operator can spot it. (The budget is set by the
+        // embedder via `spawn_with_disk_cache`; lumen-server's own binary
+        // does not expose a disk-KV flag, so it never reaches this branch.)
         if let Some(cfg) = self.disk_kv.as_ref() {
             if cfg.budget_bytes == 0 || cfg.budget_bytes == u64::MAX {
                 eprintln!(
-                    "[server kv-disk] {} is configured without --kv-disk-space-mb: \
+                    "[server kv-disk] {} has an unbounded disk budget: \
                      .kv files will accumulate unbounded; only .tmp.<pid> orphans are purged. \
-                     Set --kv-disk-space-mb to enable eviction.",
+                     Set a finite DiskKvConfig::budget_bytes to enable eviction.",
                     cfg.dir.display(),
                 );
             }

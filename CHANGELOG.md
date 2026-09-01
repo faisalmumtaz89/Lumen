@@ -56,12 +56,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   round-7 report reproduced failing under concurrent test runs (30/40
   and 22/40), five counter-only source-crate siblings, and twenty-one
   integration-test directories now carry the process id — verified with
-  twenty concurrent pairs (forty runs), zero failures. (Correction
-  2026-08-31: this bullet originally cited a same-session control that
-  was never retained; the retained replacement control runs the
-  released v0.20.0 test binary vs the fixed one under 4-way contention
-  — 14/100 and 13/100 failures vs 0/100 and 0/100, per-process exit
-  records kept in the evidence tree.)
+  retained per-process exit records under 4-way contention: 0 failures
+  on the fixed binary vs 14/100 and 13/100 on the released pre-fix
+  binary. (Correction 2026-08-31: this bullet originally cited a
+  same-session control that was never retained; the retained replacement
+  control runs the released v0.20.0 test binary vs the fixed one under
+  4-way contention — 14/100 and 13/100 failures vs 0/100 and 0/100,
+  per-process exit records kept in the evidence tree. Round-8 addendum:
+  the earlier bare "forty runs, zero failures" figure is superseded by a
+  retained 0/200 re-run on the current binary via the same harness, per-
+  process records in the evidence tree.)
 
 ## [0.20.0] — 2026-08-31
 

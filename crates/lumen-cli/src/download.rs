@@ -141,8 +141,11 @@ mod inner {
 
     /// Download a GGUF file from HuggingFace.
     ///
-    /// The file is downloaded to a `.part` temporary file, then atomically renamed
-    /// to the final path after SHA-256 is computed and stored in a `.sha256` sidecar.
+    /// The file is downloaded to a `.part` temporary file whose full byte count
+    /// is verified, then hashed, then atomically renamed to the final path; the
+    /// `.sha256` sidecar is written after the rename (so a published file may
+    /// briefly exist without its sidecar — harmless, as the sidecar is
+    /// write-only metadata that no load path consults).
     ///
     /// If the final file already exists and is non-empty, this is a cache hit and
     /// the existing path is returned immediately.
@@ -171,10 +174,14 @@ mod inner {
         // The staging name carries the PID: two concurrent first-time
         // downloads of the same file must not clobber each other's .part
         // before the atomic rename. The .sha256 sidecar keeps its stable
-        // name BY DESIGN: it is shared last-writer-wins metadata whose
-        // content is identical for both racers (hash of the same URL's
-        // bytes, same basename), written after the winner's rename, and
-        // write-only in production (only its unit test reads it back).
+        // name BY DESIGN: it is shared last-writer-wins metadata, written
+        // after the winner's rename, and write-only in production (only its
+        // unit test reads it back). Because the cache keys on the flattened
+        // basename while the hash is of the source URL (repo + path), two
+        // different sources sharing a basename can leave a sidecar whose hash
+        // does not match the resident file — harmless, since no load path
+        // consults it; correctness rests on the atomic rename publishing only
+        // fully-verified bytes.
         let sha_path = dest_dir.join(format!("{filename}.sha256"));
         // Reclaim BEFORE the cache-hit return: after one racer succeeds,
         // every future call takes the cache-hit fast path, so litter from
@@ -255,14 +262,13 @@ mod inner {
         // clobber race, this time publishing a silently partial FINAL).
         // `create_new` (O_EXCL) makes the filesystem the arbiter; on a
         // name collision we retry with a fresh nonce rather than truncate.
-        let (part_path, mut file) = create_exclusive_staging(dest_dir, filename)?;
-        let own_dev_ino = {
-            use std::os::unix::fs::MetadataExt;
-            let m = file
-                .metadata()
-                .map_err(|e| DownloadError::Io(format!("fstat error on staging: {e}")))?;
-            (m.dev(), m.ino())
-        };
+        // create_exclusive_staging captures the inode from the fd it just
+        // O_EXCL-created and returns it, so the guard here is armed with the
+        // identity it will check on Drop without a second stat. The fstat
+        // failure window lives inside that helper, and its only outcome is a
+        // bounded, self-healing leak (the .part is left for reclaim, never
+        // deleted by path unverified) — not a wrong-file deletion.
+        let (part_path, mut file, own_dev_ino) = create_exclusive_staging(dest_dir, filename)?;
         let mut part_guard = StagingGuard {
             path: part_path.clone(),
             dev_ino: own_dev_ino,
@@ -291,15 +297,9 @@ mod inner {
 
         pb.finish_with_message("download complete");
 
-        // Verify size if known.
-        if let Some(expected) = content_length {
-            if total_written != expected {
-                // Guard cleans up the .part file on return.
-                return Err(DownloadError::Io(format!(
-                    "size mismatch: expected {expected} bytes, got {total_written} bytes"
-                )));
-            }
-        }
+        // Verify the full byte count before publishing. The guard cleans up
+        // the .part file on an error return.
+        verify_complete_transfer(content_length, total_written)?;
 
         // Hash through OUR OWN file descriptor, never by reopening the
         // pathname: after an unlink (e.g. a reclaimer that judged this
@@ -335,9 +335,13 @@ mod inner {
         // inode recycling from blurring the identity we just verified.
         let file_kept_open = file;
 
-        // Atomic rename FIRST: .part -> final. The sidecar follows, so a
-        // published file is never newer than its sidecar by more than one
-        // racer's window (contents are identical per URL either way).
+        // Atomic rename FIRST: .part -> final, then the sidecar. The rename
+        // publishes only fully size- and hash-verified bytes, so the final
+        // file is correct the instant it appears. The sidecar write that
+        // follows is best-effort write-only metadata; a crash or write
+        // failure between the two can leave the final without a current
+        // sidecar indefinitely, which is harmless because no load path reads
+        // it (the cache hit checks only that the file exists and is nonempty).
         //
         // Rename FAILURE is cleaned up here, explicitly, while our fd is
         // still open: a `?` would drop `file_kept_open` before the guard's
@@ -436,11 +440,16 @@ mod inner {
     /// `create_new` (O_EXCL), retrying with a fresh nonce on collision so
     /// two writers can never share (and truncate) one staging file — PIDs
     /// alone are not unique across PID namespaces. The final path shape is
-    /// `{filename}.{pid}-{nonce}.part`.
+    /// `{filename}.{pid}-{nonce}.part`. Returns the path, the read+write fd,
+    /// and the fd's `(dev, ino)` so the caller can arm its cleanup guard
+    /// atomically — no window between the exclusive create and the armed
+    /// guard. A failed stat on the fresh fd (near-impossible) leaves the
+    /// `.part` for `reclaim_stale_parts` to sweep rather than deleting it by
+    /// path unverified, which could not confirm the file is still ours.
     pub fn create_exclusive_staging(
         dest_dir: &Path,
         filename: &str,
-    ) -> Result<(std::path::PathBuf, std::fs::File), DownloadError> {
+    ) -> Result<(std::path::PathBuf, std::fs::File, (u64, u64)), DownloadError> {
         // Built by joining onto dest_dir — never by string-mangling the
         // full path, which breaks valid non-UTF-8 Unix cache directories.
         for attempt in 0u32..16 {
@@ -457,7 +466,13 @@ mod inner {
                 .create_new(true)
                 .open(&candidate)
             {
-                Ok(f) => return Ok((candidate, f)),
+                Ok(f) => {
+                    use std::os::unix::fs::MetadataExt;
+                    let m = f
+                        .metadata()
+                        .map_err(|e| DownloadError::Io(format!("fstat error on staging: {e}")))?;
+                    return Ok((candidate, f, (m.dev(), m.ino())));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     return Err(DownloadError::Io(format!(
@@ -470,6 +485,31 @@ mod inner {
         Err(DownloadError::Io(
             "could not create a unique staging file after 16 attempts".into(),
         ))
+    }
+
+    /// Decide whether a finished transfer is safe to publish. A clean EOF is
+    /// indistinguishable from a complete transfer, so a connection-close
+    /// truncation with no authoritative length would hash and publish a
+    /// partial model that the sidecar then certifies. `content_length` is the
+    /// GET length or the HEAD fallback; for HuggingFace it is always present.
+    /// When neither reports a size we cannot detect truncation, so we refuse
+    /// to publish rather than risk a silently partial model.
+    pub(crate) fn verify_complete_transfer(
+        content_length: Option<u64>,
+        total_written: u64,
+    ) -> Result<(), DownloadError> {
+        match content_length {
+            Some(expected) if total_written != expected => Err(DownloadError::Io(format!(
+                "size mismatch: expected {expected} bytes, got {total_written} bytes"
+            ))),
+            None => Err(DownloadError::Io(format!(
+                "server reported no Content-Length (HEAD or GET) for this download, \
+                 so a truncated transfer cannot be detected; refusing to publish \
+                 {total_written} unverified bytes — retry, or fetch from a source \
+                 that reports a size"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Best-effort reclamation of `{filename}.<pid>[-<nonce>].part`
@@ -765,7 +805,7 @@ mod tests {
         use std::io::{Seek, Write};
         let dir = std::env::temp_dir().join(format!("lumen-staging-fd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (path, mut f) = super::create_exclusive_staging(&dir, "m.gguf").unwrap();
+        let (path, mut f, _dev_ino) = super::create_exclusive_staging(&dir, "m.gguf").unwrap();
         f.write_all(b"lumen staging bytes").unwrap();
         f.flush().unwrap();
         f.seek(std::io::SeekFrom::Start(0)).unwrap();
@@ -775,5 +815,22 @@ mod tests {
         let h2 = super::compute_sha256(&path).unwrap();
         assert_eq!(h, h2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn verify_complete_transfer_rejects_short_and_unknown() {
+        // A known length that matches publishes.
+        assert!(super::verify_complete_transfer(Some(100), 100).is_ok());
+        // A short transfer against a known length is a size mismatch.
+        let e = super::verify_complete_transfer(Some(100), 40).unwrap_err();
+        assert!(format!("{e}").contains("size mismatch"), "got {e}");
+        // No authoritative length: refuse to publish rather than certify a
+        // possibly-truncated model.
+        let e = super::verify_complete_transfer(None, 40).unwrap_err();
+        assert!(
+            format!("{e}").contains("no Content-Length"),
+            "unknown-length transfer must be refused, got {e}"
+        );
     }
 }

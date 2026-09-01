@@ -549,12 +549,14 @@ fn do_convert_from_reader<R: Read + Seek>(
         let d9 = lumen_format::hyperparams::GdnDims::QWEN35_9B;
         let gd = hp.gdn.unwrap_or(d9);
         let dims = lumen_format::serving_rules::AttnDims {
-            q_dim: (hp.num_heads * hp.head_dim) as usize,
-            kv_dim: (hp.num_kv_heads * hp.head_dim) as usize,
+            q_dim: hp.num_heads as usize * hp.head_dim as usize,
+            kv_dim: hp.num_kv_heads as usize * hp.head_dim as usize,
             hidden: hp.hidden_dim as usize,
-            gdn_qkv_rows: ((2 * gd.num_k_heads + gd.num_v_heads) * gd.head_dim) as usize,
+            head_dim: hp.head_dim as usize,
+            gdn_qkv_rows: (2 * gd.num_k_heads as usize + gd.num_v_heads as usize)
+                * gd.head_dim as usize,
             gdn_declared: hp.gdn.is_some(),
-            gdn_v_dim: (gd.num_v_heads * gd.head_dim) as usize,
+            gdn_v_dim: gd.num_v_heads as usize * gd.head_dim as usize,
             gdn_conv_kernel: gd.conv_kernel as usize,
         };
         let metal = opts.target == ConvertTarget::Metal;
@@ -564,6 +566,7 @@ fn do_convert_from_reader<R: Read + Seek>(
                 &shape.index.subtensors,
                 &dims,
                 hp.intermediate_dim as usize,
+                hp.num_experts.unwrap_or(0) as usize,
                 metal,
             )
             .map_err(|e| {
@@ -743,6 +746,46 @@ mod tests {
         );
 
         builder.build()
+    }
+
+    /// A real tensor read must go through the production MultiShardReader
+    /// path, not just the Cursor path: the embedding tensor is read first
+    /// (convert.rs), and a reader-incompatible read (e.g. SeekFrom::End,
+    /// which MultiShardReader rejects) would break every `lumen convert`.
+    /// This qwen35 GGUF carries metadata + the embedding tensor, so the
+    /// conversion reads the embedding through the real reader before
+    /// failing later on the (deliberately absent) layer tensors — proving
+    /// the read path itself works on the production reader.
+    #[test]
+    fn convert_reads_embedding_through_production_reader() {
+        let gguf_data = build_minimal_qwen35_metadata_gguf(2, 8, 4, 64, 128, 256);
+        let dir = temp_dir();
+        let in_path = dir.join("prod-reader.gguf");
+        std::fs::write(&in_path, &gguf_data).unwrap();
+        let lbc_path = dir.join("prod-reader.lbc");
+        let err = convert_gguf_to_lbc(&in_path, &lbc_path, &ConvertOptions::default())
+            .expect_err("no layer tensors -> must fail, but AFTER the embedding read");
+        let msg = format!("{err}");
+        // The regression was a SeekFrom::End on MultiShardReader at the
+        // embedding read; that surfaces as this exact seek error. The fix
+        // must get PAST the embedding to a missing-layer-tensor error.
+        assert!(
+            !msg.contains("absolute (SeekFrom::Start)"),
+            "embedding read hit the reader seek incompatibility: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The converter boundary enforces the hyperparam bounds: a hostile
+    /// head_count dies in extract_hyperparams, not downstream.
+    #[test]
+    fn extract_hyperparams_rejects_out_of_bounds() {
+        // head_count = 65536 > DIM_BOUND (32768).
+        let gguf_data = build_minimal_qwen35_metadata_gguf(4, 65536, 4, 64, 128, 256);
+        let mut cursor = std::io::Cursor::new(&gguf_data);
+        let gguf = GgufFile::parse(&mut cursor).unwrap();
+        let err = extract_hyperparams(&gguf).unwrap_err();
+        assert!(err.to_string().contains("num_heads = 65536"), "{err}");
     }
 
     #[test]

@@ -1242,3 +1242,456 @@ fn metal_validate_kv_precision_rejects_int_quantized() {
         );
     }
 }
+
+/// A full-attention layer with a zero-length or wrong-length `wo` must be
+/// rejected at every Metal load path: the Wo matvec derives its geometry
+/// from hyperparams and would otherwise read `hidden` rows x `q_dim`
+/// columns of in-bounds bytes starting at wo's recorded offset — silently
+/// consuming the following tensors' bytes (`w_gate` onward in this
+/// fixture) as output weights. The zero-length case exercises the
+/// mandatory-presence rule, the wrong-length case the wo geometry rule;
+/// both drive a real file through provider open + init + prefill, so the
+/// validation call inside the load path itself is load-bearing.
+#[test]
+fn bad_wo_rejected_at_load() {
+    use crate::compute::ComputeBackend;
+    use crate::weight::provider_sync::SyncWeightProvider;
+    use lumen_format::header::LbcHeader;
+    use lumen_format::hyperparams::{ModelHyperparams, RopeParams};
+    use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
+    use lumen_format::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+    use lumen_format::writer::{write_lbc, GlobalTensors};
+
+    let (hidden, inter, heads, kv_heads, head_dim, vocab) =
+        (64usize, 128usize, 2u32, 2u32, 32u32, 256usize);
+    let q_dim = heads as usize * head_dim as usize;
+    let kv_dim = kv_heads as usize * head_dim as usize;
+
+    let q8_bytes = |n: usize| vec![0u8; n / 32 * 34];
+    let norm_bytes = |n: usize| {
+        let mut v = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            v.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        v
+    };
+    // (0, presence rule) and (1024 = nonzero wrong length, geometry rule):
+    // the second case is what keeps the wo-geometry line itself
+    // load-bearing — presence alone would also catch a zero length.
+    for (wo_len, want) in [(0u64, "empty wk/wv/wo"), (1024u64, "wo is 1024 bytes")] {
+        let mut blob = Vec::new();
+        let mut offset = 0u64;
+        let add = |data: Vec<u8>, quant: QuantScheme, blob: &mut Vec<u8>, offset: &mut u64| {
+            let s = TensorSlice {
+                offset: *offset,
+                length: data.len() as u64,
+                quant,
+            };
+            blob.extend_from_slice(&data);
+            *offset += s.length;
+            s
+        };
+        let wq = add(
+            q8_bytes(q_dim * hidden),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        let wk = add(
+            q8_bytes(kv_dim * hidden),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        let wv = add(
+            q8_bytes(kv_dim * hidden),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        // The defect under test: wo's index entry disagrees with the dispatch
+        // geometry (no wo bytes are appended, so a nonzero length aliases the
+        // following w_gate bytes).
+        let wo = TensorSlice {
+            offset,
+            length: wo_len,
+            quant: QuantScheme::Q8_0,
+        };
+        let w_gate = add(
+            q8_bytes(inter * hidden),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        let w_up = add(
+            q8_bytes(inter * hidden),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        let w_down = add(
+            q8_bytes(hidden * inter),
+            QuantScheme::Q8_0,
+            &mut blob,
+            &mut offset,
+        );
+        let attn_norm = add(norm_bytes(hidden), QuantScheme::F32, &mut blob, &mut offset);
+        let ffn_norm = add(norm_bytes(hidden), QuantScheme::F32, &mut blob, &mut offset);
+
+        let subtensors = SubtensorOffsets {
+            wq,
+            wk,
+            wv,
+            wo,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
+            layer_type: Some(0),
+        };
+        let layer_indices = vec![LayerIndex {
+            layer_offset_bytes: 0,
+            layer_length_bytes: blob.len() as u64,
+            subtensors,
+        }];
+
+        let hp = ModelHyperparams {
+            num_layers: 1,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            hidden_dim: hidden as u32,
+            intermediate_dim: inter as u32,
+            vocab_size: vocab as u32,
+            max_seq_len: 512,
+            rope_params: Some(RopeParams::default()),
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let qd = QuantizationDescriptor {
+            scheme: QuantScheme::Q8_0,
+            group_size: QuantGroupSize::Group(32),
+            block_byte_size: 34,
+            scale_offset_in_block: Some(0),
+        };
+        let mut header = LbcHeader::new(hp, qd);
+        header.embedding.quant = QuantScheme::Q8_0;
+        header.output_proj.quant = QuantScheme::Q8_0;
+        header.final_norm.quant = QuantScheme::F32;
+        let globals = GlobalTensors {
+            embedding: q8_bytes(vocab * hidden),
+            final_norm: norm_bytes(hidden),
+            output_proj: q8_bytes(vocab * hidden),
+        };
+        let mut bytes = Vec::new();
+        write_lbc(
+            &mut bytes,
+            &header,
+            &layer_indices,
+            &globals,
+            &[blob.as_slice()],
+            None,
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("lumen_zero_wo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zero_wo.lbc");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let provider = SyncWeightProvider::open(&path).unwrap();
+        let hp = provider.lbc().header.hyperparams;
+        let mut backend = MetalF32Backend::new().unwrap();
+        backend.set_global_tensors(
+            provider.embedding.clone(),
+            provider.final_norm.clone(),
+            provider.output_proj.clone(),
+        );
+        backend.init(&hp).unwrap();
+        let mut kv = crate::kv::KvCache::new(crate::kv::KvCacheConfig {
+            max_seq_len: hp.max_seq_len as usize,
+            num_layers: hp.num_layers as usize,
+            num_kv_heads: hp.num_kv_heads as usize,
+            head_dim: hp.head_dim as usize,
+            precision: crate::kv::KvPrecision::F32,
+        })
+        .unwrap();
+        let result = backend.prefill(
+            &[1, 2, 3],
+            &provider as &dyn crate::weight::cache::WeightProvider,
+            &mut kv,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        let err = match result {
+            Ok(_) => panic!("wo_len {wo_len}: model must fail Metal load validation"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains(want),
+            "wo_len {wo_len}: rejection must carry {want:?}: {err}"
+        );
+    }
+}
+
+/// A `--target generic` LBC keeps K-quant layer tensors intact (correct for
+/// CUDA/CPU); the Metal cache prefers the `-metal` variant but falls back to
+/// this generic artifact when none exists, and the Metal dense dispatch has
+/// no K-quant kernels — without `validate_layer_quants` those bytes feed an
+/// F32-reading pipeline and produce silent gibberish (documented at the
+/// cache lookup and the validator itself). This is a BENIGN-reachable
+/// correctness guard, so its wiring must stay pinned: this test drives a
+/// K-quant dense tensor through BOTH reachable Metal load sites (resident
+/// preload and the streaming create_layer_buffer via prefill) and asserts
+/// each refuses. Removing either `validate_layer_quants` call turns the
+/// clean refusal into silent-wrong output (or a later, differently-worded
+/// failure) and fails this test.
+#[test]
+fn metal_kquant_dense_tensor_rejected_at_both_load_sites() {
+    use crate::compute::ComputeBackend;
+    use crate::weight::provider_sync::SyncWeightProvider;
+    use lumen_format::header::LbcHeader;
+    use lumen_format::hyperparams::{ModelHyperparams, RopeParams};
+    use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
+    use lumen_format::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+    use lumen_format::writer::{write_lbc, GlobalTensors};
+
+    let (hidden, inter, heads, kv_heads, head_dim, vocab) =
+        (64usize, 128usize, 2u32, 2u32, 32u32, 256usize);
+    let q_dim = heads as usize * head_dim as usize;
+    let kv_dim = kv_heads as usize * head_dim as usize;
+
+    let q8_bytes = |n: usize| vec![0u8; n / 32 * 34];
+    let norm_bytes = |n: usize| {
+        let mut v = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            v.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        v
+    };
+
+    let mut blob = Vec::new();
+    let mut offset = 0u64;
+    let add = |data: Vec<u8>, quant: QuantScheme, blob: &mut Vec<u8>, offset: &mut u64| {
+        let s = TensorSlice {
+            offset: *offset,
+            length: data.len() as u64,
+            quant,
+        };
+        blob.extend_from_slice(&data);
+        *offset += s.length;
+        s
+    };
+    let wq = add(
+        q8_bytes(q_dim * hidden),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    let wk = add(
+        q8_bytes(kv_dim * hidden),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    let wv = add(
+        q8_bytes(kv_dim * hidden),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    let wo = add(
+        q8_bytes(q_dim * hidden),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    // The defect under test: a K-quant (Q2_K) dense FFN tensor — exactly what
+    // `--target generic` preserves and Metal cannot dispatch. The validator
+    // reads only the quant scheme, so the appended bytes stand in for the
+    // Q2_K blob (84 bytes / 256-element superblock).
+    let w_gate = add(
+        vec![0u8; inter * hidden / 256 * 84],
+        QuantScheme::Q2_K,
+        &mut blob,
+        &mut offset,
+    );
+    let w_up = add(
+        q8_bytes(inter * hidden),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    let w_down = add(
+        q8_bytes(hidden * inter),
+        QuantScheme::Q8_0,
+        &mut blob,
+        &mut offset,
+    );
+    let attn_norm = add(norm_bytes(hidden), QuantScheme::F32, &mut blob, &mut offset);
+    let ffn_norm = add(norm_bytes(hidden), QuantScheme::F32, &mut blob, &mut offset);
+
+    let subtensors = SubtensorOffsets {
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate,
+        w_up,
+        w_down,
+        attn_norm,
+        ffn_norm,
+        router_weight: None,
+        experts: None,
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
+        layer_type: Some(0),
+    };
+    let layer_indices = vec![LayerIndex {
+        layer_offset_bytes: 0,
+        layer_length_bytes: blob.len() as u64,
+        subtensors,
+    }];
+
+    let hp = ModelHyperparams {
+        num_layers: 1,
+        num_heads: heads,
+        num_kv_heads: kv_heads,
+        head_dim,
+        hidden_dim: hidden as u32,
+        intermediate_dim: inter as u32,
+        vocab_size: vocab as u32,
+        max_seq_len: 512,
+        rope_params: Some(RopeParams::default()),
+        num_experts: None,
+        num_active_experts: None,
+        norm_eps: 1e-5,
+        rotary_dim: None,
+        rope_neox: false,
+        gdn: None,
+    };
+    let qd = QuantizationDescriptor {
+        scheme: QuantScheme::Q8_0,
+        group_size: QuantGroupSize::Group(32),
+        block_byte_size: 34,
+        scale_offset_in_block: Some(0),
+    };
+    let mut header = LbcHeader::new(hp, qd);
+    header.embedding.quant = QuantScheme::Q8_0;
+    header.output_proj.quant = QuantScheme::Q8_0;
+    header.final_norm.quant = QuantScheme::F32;
+    let globals = GlobalTensors {
+        embedding: q8_bytes(vocab * hidden),
+        final_norm: norm_bytes(hidden),
+        output_proj: q8_bytes(vocab * hidden),
+    };
+    let mut bytes = Vec::new();
+    write_lbc(
+        &mut bytes,
+        &header,
+        &layer_indices,
+        &globals,
+        &[blob.as_slice()],
+        None,
+    )
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("lumen_kquant_metal_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("generic_kquant.lbc");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let hp = provider.lbc().header.hyperparams;
+    let want = "no dense DECODE dispatch kernels";
+
+    // Site 1 — resident preload (the production path; gpu_resident=true).
+    {
+        let mut backend = MetalF32Backend::new().unwrap();
+        backend.set_global_tensors(
+            provider.embedding.clone(),
+            provider.final_norm.clone(),
+            provider.output_proj.clone(),
+        );
+        backend.init(&hp).unwrap();
+        let err = backend
+            .preload_weights_gpu_resident(&provider)
+            .expect_err("resident preload must refuse a K-quant dense tensor on Metal");
+        assert!(
+            err.to_string().contains(want),
+            "preload rejection must carry {want:?}: {err}"
+        );
+    }
+
+    // Site 2 — streaming create_layer_buffer, reached via prefill.
+    {
+        let mut backend = MetalF32Backend::new().unwrap();
+        backend.set_global_tensors(
+            provider.embedding.clone(),
+            provider.final_norm.clone(),
+            provider.output_proj.clone(),
+        );
+        backend.init(&hp).unwrap();
+        let mut kv = crate::kv::KvCache::new(crate::kv::KvCacheConfig {
+            max_seq_len: hp.max_seq_len as usize,
+            num_layers: hp.num_layers as usize,
+            num_kv_heads: hp.num_kv_heads as usize,
+            head_dim: hp.head_dim as usize,
+            precision: crate::kv::KvPrecision::F32,
+        })
+        .unwrap();
+        let err = backend
+            .prefill(
+                &[1, 2, 3],
+                &provider as &dyn crate::weight::cache::WeightProvider,
+                &mut kv,
+            )
+            .expect_err("streaming prefill must refuse a K-quant dense tensor on Metal");
+        assert!(
+            err.to_string().contains(want),
+            "prefill rejection must carry {want:?}: {err}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

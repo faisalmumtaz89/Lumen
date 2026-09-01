@@ -206,6 +206,17 @@ pub(crate) fn write_zeros<W: Write>(w: &mut W, mut n: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Overflow-checked u64 alignment for offset arithmetic on
+/// possibly-hostile sizes (align_up's `value + alignment - 1` can wrap
+/// near the top of the range). Returns `None` if no aligned value >=
+/// `value` fits in u64.
+pub(crate) fn checked_align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment > 0 && alignment.is_power_of_two());
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+}
+
 pub(crate) fn align_up(value: usize, alignment: usize) -> usize {
     assert!(
         alignment > 0 && alignment.is_power_of_two(),

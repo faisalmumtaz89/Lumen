@@ -34,6 +34,11 @@ pub(crate) fn extract_hyperparams(
 
     let num_heads = get_required_u32(gguf, &format!("{prefix}.attention.head_count"))?;
     let hidden_dim = get_required_u32(gguf, &format!("{prefix}.embedding_length"))?;
+    if num_heads == 0 {
+        return Err(ConvertError::UnsupportedModel(
+            "malformed hyperparams: attention.head_count = 0".into(),
+        ));
+    }
 
     // Prefer explicit key_length metadata (required for qwen35moe where head_dim != hidden_dim/num_heads).
     let head_dim = gguf
@@ -96,7 +101,12 @@ pub(crate) fn extract_hyperparams(
     let vocab_size = if let Some(tokens) = gguf.get_string_array("tokenizer.ggml.tokens") {
         tokens.len() as u32
     } else if let Some(embd) = gguf.find_tensor(EMBEDDING_NAME) {
-        embd.dims.first().copied().unwrap_or(0) as u32
+        let d = embd.dims.first().copied().unwrap_or(0);
+        u32::try_from(d).map_err(|_| {
+            ConvertError::UnsupportedModel(format!(
+                "malformed hyperparams: embedding dim {d} exceeds u32"
+            ))
+        })?
     } else {
         return Err(ConvertError::MissingMetadata(
             "vocab_size (no tokenizer.ggml.tokens or token_embd.weight)".into(),
@@ -193,6 +203,8 @@ pub(crate) fn extract_hyperparams(
         gdn,
     };
 
+    hp.validate_bounds()
+        .map_err(ConvertError::UnsupportedModel)?;
     Ok((hp, arch))
 }
 

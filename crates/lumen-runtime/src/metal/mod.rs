@@ -605,6 +605,10 @@ pub struct MetalF32Backend {
     /// so streaming layer-buffer creation can validate without the scratch
     /// mutex. None until init() runs.
     cached_attn_dims: Option<gpu_resident::AttnDims>,
+    /// Header-declared MoE expert count (0 for dense), cached at init so
+    /// streaming layer-buffer creation can reconcile it against each
+    /// layer's expert bank without the scratch mutex.
+    cached_moe_num_experts: usize,
 
     // ====================================================================
     // MoE expert caching infrastructure
@@ -851,6 +855,7 @@ impl MetalF32Backend {
             scratch: Mutex::new(None),
             cached_hidden_dim: 0,
             cached_attn_dims: None,
+            cached_moe_num_experts: 0,
             cached_vocab_size: 0,
             expert_profiler: None,
             expert_cache: None,
@@ -990,6 +995,11 @@ impl MetalF32Backend {
             RuntimeError::Compute("Metal attention dims not set: call init() first".into())
         })?;
         gpu_resident::validate_attention_dims(weights.layer_idx, &weights.subtensors, &dims)?;
+        lumen_format::serving_rules::validate_expert_count(
+            &weights.subtensors,
+            self.cached_moe_num_experts,
+        )
+        .map_err(|e| RuntimeError::Compute(format!("layer {}: {e}", weights.layer_idx)))?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = blob.len();
@@ -1043,6 +1053,11 @@ impl MetalF32Backend {
             RuntimeError::Compute("Metal attention dims not set: call init() first".into())
         })?;
         gpu_resident::validate_attention_dims(weights.layer_idx, &weights.subtensors, &dims)?;
+        lumen_format::serving_rules::validate_expert_count(
+            &weights.subtensors,
+            self.cached_moe_num_experts,
+        )
+        .map_err(|e| RuntimeError::Compute(format!("layer {}: {e}", weights.layer_idx)))?;
         let blob = weights.as_bytes();
         let ptr = blob.as_ptr();
         let len = non_expert_end.min(blob.len());

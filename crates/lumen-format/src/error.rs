@@ -21,11 +21,14 @@ pub enum FormatError {
     #[error("layer {layer} tensor {tensor_name}: offset {offset} + length {length} exceeds blob size {file_size}")]
     LayerOutOfBounds {
         layer: usize,
-        tensor_name: &'static str,
+        tensor_name: String,
         offset: u64,
         length: u64,
         file_size: u64,
     },
+
+    #[error("{0}. Re-convert with `lumen convert` from a valid source.")]
+    InvalidHyperparams(String),
 
     #[error("unsupported quantization scheme: {0}")]
     UnsupportedQuantization(String),

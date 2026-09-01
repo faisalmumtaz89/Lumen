@@ -10,8 +10,6 @@ use super::repack_q8;
 use super::types::{CachedLayerMeta, CachedMoeMeta};
 use super::{MetalF32Backend, PAGE_SIZE};
 use crate::error::RuntimeError;
-#[cfg(test)]
-use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
 
 #[cfg(test)]
@@ -210,6 +208,8 @@ impl MetalF32Backend {
             let st = &layer_view.subtensors;
             validate_layer_quants(layer, st)?;
             validate_attention_dims(layer, st, &attn_dims)?;
+            lumen_format::serving_rules::validate_expert_count(st, s.moe_num_experts)
+                .map_err(|e| RuntimeError::Compute(format!("layer {layer}: {e}")))?;
             layer_metas.push(CachedLayerMeta {
                 attn_norm_off: base + st.attn_norm.offset,
                 wq_off: base + st.wq.offset,
@@ -2202,7 +2202,13 @@ mod tests {
             ssm_beta: Some(slice(gates)),
             ssm_alpha: Some(slice(gates)),
             ssm_norm: Some(slice(QuantScheme::F32)),
-            ssm_out: Some(slice(QuantScheme::Q8_0)),
+            ssm_out: Some(TensorSlice {
+                offset: 0,
+                // dispatch geometry: hidden (64) rows x one Q8_0 row of
+                // gdn_v_dim (64) columns = 68 bytes
+                length: 64 * 68,
+                quant: QuantScheme::Q8_0,
+            }),
             attn_q_norm: None,
             attn_k_norm: None,
             ffn_gate_inp_shexp: None,
@@ -2219,6 +2225,17 @@ mod tests {
     fn f32_gates_rejected() {
         let err = validate_layer_quants(0, &gdn_layer(QuantScheme::F32)).unwrap_err();
         assert!(err.to_string().contains("ssm_alpha is F32"), "{err}");
+    }
+
+    #[test]
+    fn f32_beta_alone_rejected() {
+        // alpha valid Q8_0, beta F32: pins ssm_beta's membership in the gate
+        // predicate independently — deleting the beta tuple must be caught,
+        // not masked by the alpha case (which fires first when both are F32).
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.ssm_beta = Some(slice(QuantScheme::F32));
+        let err = validate_layer_quants(0, &st).unwrap_err();
+        assert!(err.to_string().contains("ssm_beta is F32"), "{err}");
     }
 
     #[test]
@@ -2347,6 +2364,7 @@ mod tests {
             q_dim: 64,
             kv_dim: 32,
             hidden: 64,
+            head_dim: 8,
             gdn_qkv_rows: 128,
             gdn_declared: true,
             gdn_v_dim: 64,
@@ -2361,6 +2379,13 @@ mod tests {
         st.attn_gate = None;
         st.ssm_alpha = None;
         st.ssm_beta = None;
+        // wo at the dispatch geometry: hidden (64) rows x one Q8_0 row of
+        // q_dim (64) columns = 68 bytes.
+        st.wo = TensorSlice {
+            offset: 0,
+            length: 64 * 68,
+            quant: QuantScheme::Q8_0,
+        };
         st.wq = TensorSlice {
             offset: 0,
             length: wq_len,
@@ -2392,20 +2417,40 @@ mod tests {
         assert!(err.to_string().contains("expects 64 rows"), "{err}");
         // With per-head norms the SAME wq length is the correct geometry...
         let mut st = attn_st(128 * 68, 32 * 68, 32 * 68);
-        st.attn_q_norm = Some(slice(QuantScheme::F32));
-        st.attn_k_norm = Some(slice(QuantScheme::F32));
+        st.attn_q_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
+        st.attn_k_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
         assert!(validate_attention_dims(0, &st, &d).is_ok());
         // ...and a plain-q wq is rejected there.
         let mut st = attn_st(64 * 68, 32 * 68, 32 * 68);
-        st.attn_q_norm = Some(slice(QuantScheme::F32));
-        st.attn_k_norm = Some(slice(QuantScheme::F32));
+        st.attn_q_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
+        st.attn_k_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
         let err = validate_attention_dims(0, &st, &d).unwrap_err();
         assert!(err.to_string().contains("expects 128 rows"), "{err}");
         // Zero-length wk on a full-attention layer no longer suppresses
-        // anything: it fails the kv_dim expectation directly.
+        // anything: the mandatory-presence rule rejects it outright.
         let st = attn_st(64 * 68, 0, 32 * 68);
         let err = validate_attention_dims(0, &st, &d).unwrap_err();
-        assert!(err.to_string().contains("wk is 0 bytes"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("layer 0: full-attention layer carries empty wk/wv/wo"),
+            "{err}"
+        );
         // Wrong wv row count.
         let st = attn_st(64 * 68, 32 * 68, 16 * 68);
         let err = validate_attention_dims(0, &st, &d).unwrap_err();
@@ -2439,6 +2484,26 @@ mod tests {
             quant: QuantScheme::F32,
         });
         assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // ssm_out is read at hidden rows x gdn_v_dim columns — a
+        // wrong-length entry is rejected, and a correct one accepted.
+        let good_ssm_out = st.ssm_out;
+        st.ssm_out = Some(TensorSlice {
+            offset: 0,
+            length: 1024,
+            quant: QuantScheme::Q8_0,
+        });
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("ssm_out is 1024 bytes"), "{err}");
+        st.ssm_out = good_ssm_out;
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // What this rule catches is a wrong LENGTH. It does NOT catch a
+        // rows<->width transposition: attn_row_bytes is a constant
+        // bytes-per-element for every scheme, so rows x width is
+        // symmetric and a swapped orientation has the identical length
+        // (tracker QKV-SHAPE (e): byte-length checks are transposition-
+        // blind). Orientation correctness rests on the code reading
+        // rows = hidden, width = gdn_v_dim (traced against the gdn.rs
+        // dispatch), not on any load rejecting a swap.
         // A SHORT conv1d is an OOB read at dispatch — rejected.
         st.ssm_conv1d = Some(TensorSlice {
             offset: 0,
@@ -2544,6 +2609,49 @@ mod tests {
         st.experts = Some(vec![e(QuantScheme::Q4_0), e(QuantScheme::Q8_0)]);
         let err = validate_layer_quants(0, &st).unwrap_err();
         assert!(err.to_string().contains("expert 0's"), "{err}");
+    }
+
+    /// A MoE layer whose expert bank length disagrees with the header
+    /// expert count must be rejected: the GPU dispatch grid is sized from
+    /// the header, so a shorter bank routes surplus experts to offset 0.
+    #[test]
+    fn expert_count_mismatch_rejected() {
+        use lumen_format::index::ExpertSlice;
+        use lumen_format::serving_rules::validate_expert_count;
+        let e = || ExpertSlice {
+            gate: slice(QuantScheme::Q4_0),
+            up: slice(QuantScheme::Q4_0),
+            down: slice(QuantScheme::Q4_0),
+        };
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.layer_type = None;
+        st.router_weight = Some(slice(QuantScheme::F32));
+        st.experts = Some(vec![e(), e()]);
+        // Header agrees with the bank: accepted.
+        assert!(validate_expert_count(&st, 2).is_ok());
+        // Header claims more than the bank: rejected (the wrong-routing case).
+        let err = validate_expert_count(&st, 4).unwrap_err();
+        assert!(
+            err.contains("carries 2 experts") && err.contains("declares 4"),
+            "{err}"
+        );
+        // Header claims fewer: also a mismatch, rejected.
+        assert!(validate_expert_count(&st, 1).is_err());
+        // Non-MoE layers (no router / no experts) are exempt regardless.
+        st.router_weight = None;
+        assert!(validate_expert_count(&st, 4).is_ok());
+        st.router_weight = Some(slice(QuantScheme::F32));
+        st.experts = None;
+        assert!(validate_expert_count(&st, 4).is_ok());
+        // router + EMPTY bank is not a MoE layer for this rule (it's caught
+        // by validate_mandatory_presence's router-xor-experts check), so
+        // validate_expert_count exempts it rather than double-reporting.
+        st.experts = Some(vec![]);
+        assert!(validate_expert_count(&st, 4).is_ok());
+        assert!(
+            lumen_format::serving_rules::validate_mandatory_presence(&st).is_err(),
+            "router + empty bank must be rejected by mandatory presence"
+        );
     }
 
     #[test]
@@ -2683,10 +2791,10 @@ mod tests {
         st.ssm_alpha = None;
         st.ssm_beta = None;
         st.bq = Some(slice(QuantScheme::F32));
-        let err = validate_layer_quants(0, &st).unwrap_err();
-        assert!(err.to_string().contains("incomplete QKV bias"), "{err}");
-        // Partial sets are valid when the projections are F32: the F32
-        // fallback applies each bias independently.
+        let err = lumen_format::serving_rules::validate_mandatory_presence(&st).unwrap_err();
+        assert!(err.contains("incomplete QKV bias"), "{err}");
+        // Partial sets are valid when the projections are F32: both
+        // backends apply each bias independently there.
         let mut f32_st = st.clone();
         f32_st.wq = at(0, QuantScheme::F32);
         f32_st.wk = at(1024, QuantScheme::F32);
@@ -2695,9 +2803,11 @@ mod tests {
         f32_st.w_up = slice(QuantScheme::F32);
         f32_st.w_down = slice(QuantScheme::F32);
         f32_st.wo = slice(QuantScheme::F32);
+        assert!(lumen_format::serving_rules::validate_mandatory_presence(&f32_st).is_ok());
         assert!(validate_layer_quants(0, &f32_st).is_ok());
         st.bk = Some(slice(QuantScheme::F32));
         st.bv = Some(slice(QuantScheme::F32));
+        assert!(lumen_format::serving_rules::validate_mandatory_presence(&st).is_ok());
         assert!(validate_layer_quants(0, &st).is_ok());
         st.bv = Some(slice(QuantScheme::F16));
         let err = validate_layer_quants(0, &st).unwrap_err();
@@ -2764,5 +2874,162 @@ mod tests {
         ] {
             assert!(!dense_slice_quant_supported(q), "{q:?} must be rejected");
         }
+    }
+    /// A zero projection width (hostile hyperparams) must be an error,
+    /// never a vacuous 0-byte expectation that a zero-length tensor
+    /// satisfies.
+    #[test]
+    fn zero_row_width_rejected() {
+        let d = AttnDims {
+            gdn_v_dim: 0,
+            ..full_attn_dims()
+        };
+        let mut st = gdn_layer(QuantScheme::Q8_0);
+        st.wq = TensorSlice {
+            offset: 0,
+            length: 128 * 68,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wk = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q8_0,
+        };
+        st.wv = TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q8_0,
+        };
+        st.ssm_conv1d = Some(TensorSlice {
+            offset: 0,
+            length: 128 * 4 * 4,
+            quant: QuantScheme::F32,
+        });
+        st.ssm_out = Some(TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: QuantScheme::Q8_0,
+        });
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("zero row width"), "{err}");
+    }
+
+    /// A half Q/K per-head-norm pair silently diverges between backends
+    /// (CUDA applies the present one alone; Metal applies neither) — it
+    /// must be rejected, in either direction.
+    #[test]
+    fn qk_norm_half_pair_rejected() {
+        let d = full_attn_dims();
+        // Q-norm alone (wq at the fused 2*q_dim geometry its presence
+        // implies).
+        let mut st = attn_st(128 * 68, 32 * 68, 32 * 68);
+        st.attn_q_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("per-head Q/K norm"), "{err}");
+        // K-norm alone (wq at plain q_dim geometry).
+        let mut st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        st.attn_k_norm = Some(TensorSlice {
+            offset: 0,
+            length: 8 * 4,
+            quant: QuantScheme::F32,
+        });
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("per-head Q/K norm"), "{err}");
+    }
+
+    /// Per-head norms are read at exactly head_dim F32 values per head and
+    /// biases at q_dim/kv_dim F32 values — short buffers are out-of-bounds
+    /// reads at dispatch (CUDA rmsnorm_per_head_inplace indexes
+    /// weight[0..head_dim] unconditionally).
+    #[test]
+    fn qk_norm_and_bias_extents_rejected() {
+        let d = full_attn_dims();
+        let norm = |len: u64| {
+            Some(TensorSlice {
+                offset: 0,
+                length: len,
+                quant: QuantScheme::F32,
+            })
+        };
+        // Correct pair at head_dim (8) * 4 bytes accepted.
+        let mut st = attn_st(128 * 68, 32 * 68, 32 * 68);
+        st.attn_q_norm = norm(8 * 4);
+        st.attn_k_norm = norm(8 * 4);
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        // Short q-norm rejected.
+        st.attn_q_norm = norm(4);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("attn_q_norm is 4 bytes"), "{err}");
+        // Wrong-length (oversized) k-norm rejected.
+        st.attn_q_norm = norm(8 * 4);
+        st.attn_k_norm = norm(64);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("attn_k_norm is 64 bytes"), "{err}");
+        // Bias extents on a plain-attention layer: bq is q_dim (64) F32
+        // values, bk/bv kv_dim (32).
+        let mut st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        st.bq = norm(64 * 4);
+        st.bk = norm(32 * 4);
+        st.bv = norm(32 * 4);
+        assert!(validate_attention_dims(0, &st, &d).is_ok());
+        st.bv = norm(8);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("bv is 8 bytes"), "{err}");
+    }
+
+    /// An incomplete QKV bias set with quantized projections must be
+    /// rejected by the shared presence rule (all three consumers): CUDA
+    /// applies each bias independently while Metal's fused arms drop a
+    /// partial set — the same artifact would serve divergently.
+    #[test]
+    fn partial_bias_rejected_by_presence() {
+        let mut st = attn_st(64 * 68, 32 * 68, 32 * 68);
+        st.bq = Some(TensorSlice {
+            offset: 0,
+            length: 64 * 4,
+            quant: QuantScheme::F32,
+        });
+        let err = lumen_format::serving_rules::validate_mandatory_presence(&st).unwrap_err();
+        assert!(err.contains("incomplete QKV bias"), "{err}");
+        // F32 projections apply each bias independently on BOTH backends:
+        // the partial set stays valid there.
+        st.wq = at(0, QuantScheme::F32);
+        st.wk = at(1024, QuantScheme::F32);
+        st.wv = at(2048, QuantScheme::F32);
+        assert!(lumen_format::serving_rules::validate_mandatory_presence(&st).is_ok());
+    }
+
+    /// Hostile-header dims whose rows x row-bytes product wraps u64 must
+    /// error, never collapse every expectation to a tiny value a 4-byte
+    /// slice satisfies (hidden = 2147549185, q_dim = kv_dim = 2147418113
+    /// make all four wq/wk/wv/wo expectations wrap to exactly 4 bytes).
+    #[test]
+    fn overflowing_dims_rejected() {
+        let d = AttnDims {
+            q_dim: 2147418113,
+            kv_dim: 2147418113,
+            hidden: 2147549185,
+            head_dim: 256,
+            gdn_qkv_rows: 128,
+            gdn_declared: true,
+            gdn_v_dim: 64,
+            gdn_conv_kernel: 4,
+        };
+        let four = |q| TensorSlice {
+            offset: 0,
+            length: 4,
+            quant: q,
+        };
+        let mut st = attn_st(4, 4, 4);
+        st.wq = four(QuantScheme::F32);
+        st.wk = four(QuantScheme::F32);
+        st.wv = four(QuantScheme::F32);
+        st.wo = four(QuantScheme::F32);
+        let err = validate_attention_dims(0, &st, &d).unwrap_err();
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 }

@@ -510,9 +510,12 @@ pub fn generate_test_model_q8_0_gdn(config: &TestModelQ8Config) -> Vec<u8> {
                 // ssm_alpha / ssm_beta / ssm_out: Q8_0 (force-Q8 in the converter).
                 let ssm_alpha = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
                 let ssm_beta = add(&mut blob, rng.gen_q8_0_bytes(hidden), QuantScheme::Q8_0);
+                // ssm_out at the dispatch geometry: hidden rows x
+                // gdn_v_dim columns, where the declared dims give
+                // v_dim = num_v_heads * (q_dim / 4) = q_dim / 2.
                 let ssm_out = add(
                     &mut blob,
-                    rng.gen_q8_0_bytes(hidden * hidden),
+                    rng.gen_q8_0_bytes(hidden * q_dim / 2),
                     QuantScheme::Q8_0,
                 );
                 (
