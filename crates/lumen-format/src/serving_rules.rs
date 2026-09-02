@@ -426,53 +426,9 @@ pub fn validate_layer_quants(
             }
         }
     }
-    // Optional tensors are either absent (None) or real: the converter never
-    // emits a zero-length optional slice, while the dispatch paths gate on
-    // presence alone — a `Some` with length 0 would pass every quant check
-    // above as "absent" and then be bound (or unwrapped) at dispatch.
-    let optional_slices: [(&str, Option<&TensorSlice>); 19] = [
-        ("bq", st.bq.as_ref()),
-        ("bk", st.bk.as_ref()),
-        ("bv", st.bv.as_ref()),
-        ("router_weight", st.router_weight.as_ref()),
-        ("shared_expert_gate", st.shared_expert_gate.as_ref()),
-        ("shared_expert_up", st.shared_expert_up.as_ref()),
-        ("shared_expert_down", st.shared_expert_down.as_ref()),
-        ("attn_gate", st.attn_gate.as_ref()),
-        ("attn_post_norm", st.attn_post_norm.as_ref()),
-        ("ssm_a", st.ssm_a.as_ref()),
-        ("ssm_conv1d", st.ssm_conv1d.as_ref()),
-        ("ssm_dt", st.ssm_dt.as_ref()),
-        ("ssm_beta", st.ssm_beta.as_ref()),
-        ("ssm_alpha", st.ssm_alpha.as_ref()),
-        ("ssm_norm", st.ssm_norm.as_ref()),
-        ("ssm_out", st.ssm_out.as_ref()),
-        ("attn_q_norm", st.attn_q_norm.as_ref()),
-        ("attn_k_norm", st.attn_k_norm.as_ref()),
-        ("ffn_gate_inp_shexp", st.ffn_gate_inp_shexp.as_ref()),
-    ];
-    for (name, slice) in optional_slices {
-        if let Some(t) = slice {
-            if t.length == 0 {
-                return Err(format!(
-                    "layer {layer}: {name} is present but zero-length \
-                     (malformed LBC). Re-convert with `lumen convert`."
-                ));
-            }
-        }
-    }
-    if let Some(experts) = st.experts.as_ref() {
-        for (i, e) in experts.iter().enumerate() {
-            for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
-                if t.length == 0 {
-                    return Err(format!(
-                        "layer {layer} expert {i}: {name} is zero-length \
-                         (malformed LBC). Re-convert with `lumen convert`."
-                    ));
-                }
-            }
-        }
-    }
+    // A `Some` with length 0 passes every quant check above as "absent" and
+    // would then be bound (or unwrapped) at dispatch.
+    validate_layer_slices(layer, st)?;
     // The shared-expert FFN dispatch selects on the gate's quant alone and
     // binds up_off regardless (CachedMoeMeta carries no shared-expert up
     // quant): the Q8_0/Q4_0 arms select fused gate+up+SwiGLU shaders, and
@@ -818,28 +774,8 @@ pub fn validate_layer_slices(
     layer: usize,
     subs: &crate::index::SubtensorOffsets,
 ) -> Result<(), String> {
-    let optional_slices: [(&str, Option<&crate::index::TensorSlice>); 19] = [
-        ("bq", subs.bq.as_ref()),
-        ("bk", subs.bk.as_ref()),
-        ("bv", subs.bv.as_ref()),
-        ("router_weight", subs.router_weight.as_ref()),
-        ("shared_expert_gate", subs.shared_expert_gate.as_ref()),
-        ("shared_expert_up", subs.shared_expert_up.as_ref()),
-        ("shared_expert_down", subs.shared_expert_down.as_ref()),
-        ("attn_gate", subs.attn_gate.as_ref()),
-        ("attn_post_norm", subs.attn_post_norm.as_ref()),
-        ("ssm_a", subs.ssm_a.as_ref()),
-        ("ssm_conv1d", subs.ssm_conv1d.as_ref()),
-        ("ssm_dt", subs.ssm_dt.as_ref()),
-        ("ssm_beta", subs.ssm_beta.as_ref()),
-        ("ssm_alpha", subs.ssm_alpha.as_ref()),
-        ("ssm_norm", subs.ssm_norm.as_ref()),
-        ("ssm_out", subs.ssm_out.as_ref()),
-        ("attn_q_norm", subs.attn_q_norm.as_ref()),
-        ("attn_k_norm", subs.attn_k_norm.as_ref()),
-        ("ffn_gate_inp_shexp", subs.ffn_gate_inp_shexp.as_ref()),
-    ];
-    for (name, slice) in optional_slices {
+    let fields = subs.slice_fields();
+    for (name, slice) in fields.optional {
         if let Some(t) = slice {
             if t.length == 0 {
                 return Err(format!(
@@ -849,7 +785,7 @@ pub fn validate_layer_slices(
             }
         }
     }
-    if let Some(experts) = subs.experts.as_ref() {
+    if let Some(experts) = fields.experts.as_ref() {
         for (i, e) in experts.iter().enumerate() {
             for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
                 if t.length == 0 {

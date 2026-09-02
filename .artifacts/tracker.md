@@ -28,6 +28,30 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R9-ISSUE-2 · Sub-tensor field lists cannot drift — CLOSED (compile-time, mutation-proven)**
+  — `SubtensorOffsets` had 19 `Option<TensorSlice>` fields and no `Default`, and
+  FIVE hand-copied enumerations of them (the remaining-items note said four; the
+  fifth was `validate_layer_quants`, the only presence guard on the Metal load
+  path): `uses_quant`, `named_slices`, `validate_layer_quants`,
+  `validate_layer_slices`, and Metal `non_expert_byte_end`. A field added to the
+  struct compiled cleanly while escaping every list (probe field: 26 struct-literal
+  errors, ZERO from any consumer). Fix: one registry —
+  `SubtensorOffsets::slice_fields()` destructures with `let Self { … }` and no
+  `..`, classifying 9 mandatory + 19 optional + experts; all five consumers derive
+  from it (Metal traversal 94 → 12 lines), and the zero-length rule now has one
+  body (`validate_layer_quants` calls `validate_layer_slices`). Guarantee stated
+  exactly: a new field is `error[E0027]` at the registry until it is NAMED there;
+  binding it `_` is an explicit, reviewable opt-out (Rust cannot forbid `_`).
+  Evidence: probe field → E0027 at index.rs; karpathy 200,001-layer differential
+  fuzz vs verbatim pre-refactor bodies = zero differences incl. byte-identical
+  error strings, perf 4.87→4.89 ns; extent test now one case per field (28) —
+  mutants dropping `wq` / `attn_k_norm` fail by name; fixture asserts every
+  optional populated. format 82 / runtime 654 (Metal serial) / convert+cli 274 /
+  cuda check clean. Adversarial: codex FAIL(4) + karpathy FAIL(2+4) round 1, all
+  8 confirmed and fixed (evidence-v0230/issue2/TRIAGE.md). Remaining name lists
+  in serving_rules are rule-scoped policy subsets (e.g. the F32-only set), not
+  every-field copies. CHANGELOG [0.22.0] corrected (five, not four; "named").
+
 - **R8-ISSUE-13 · 27B + MoE load-coverage — CLOSED (empirically proven, both models)**
   — the round-8 loader changes were end-to-end validated by DOWNLOADING,
   CONVERTING, and LOADING the two real models #13 named, on Metal (serial,

@@ -1695,3 +1695,114 @@ fn metal_kquant_dense_tensor_rejected_at_both_load_sites() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The partial layer buffer covers `blob[0..non_expert_byte_end]`, so every
+/// non-expert slice must be able to extend it and expert slices must not.
+/// One assertion per field: a mutant that drops any single field from the
+/// extent scan fails exactly that field's case.
+#[test]
+fn non_expert_byte_end_spans_every_optional_slice_and_excludes_experts() {
+    use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
+    use lumen_format::quantization::QuantScheme;
+    let sl = |offset: u64, length: u64| TensorSlice {
+        offset,
+        length,
+        quant: QuantScheme::Q8_0,
+    };
+    let base = || SubtensorOffsets {
+        wq: sl(0, 10),
+        wk: sl(10, 10),
+        wv: sl(20, 10),
+        wo: sl(30, 10),
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate: sl(40, 10),
+        w_up: sl(50, 10),
+        w_down: sl(60, 10),
+        attn_norm: sl(70, 10),
+        ffn_norm: sl(80, 10),
+        router_weight: None,
+        experts: Some(vec![ExpertSlice {
+            gate: sl(20_000, 100),
+            up: sl(20_100, 100),
+            down: sl(20_200, 100),
+        }]),
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
+        layer_type: Some(0),
+    };
+    // Mandatory only: the prefix ends at the last mandatory slice, not at the
+    // experts far beyond it.
+    assert_eq!(MetalF32Backend::non_expert_byte_end(&base()), 90);
+    type Set = fn(&mut SubtensorOffsets, TensorSlice);
+    let setters: [(&str, Set); 19] = [
+        ("bq", |st, s| st.bq = Some(s)),
+        ("bk", |st, s| st.bk = Some(s)),
+        ("bv", |st, s| st.bv = Some(s)),
+        ("router_weight", |st, s| st.router_weight = Some(s)),
+        ("shared_expert_gate", |st, s| {
+            st.shared_expert_gate = Some(s)
+        }),
+        ("shared_expert_up", |st, s| st.shared_expert_up = Some(s)),
+        ("shared_expert_down", |st, s| {
+            st.shared_expert_down = Some(s)
+        }),
+        ("attn_gate", |st, s| st.attn_gate = Some(s)),
+        ("attn_post_norm", |st, s| st.attn_post_norm = Some(s)),
+        ("ssm_a", |st, s| st.ssm_a = Some(s)),
+        ("ssm_conv1d", |st, s| st.ssm_conv1d = Some(s)),
+        ("ssm_dt", |st, s| st.ssm_dt = Some(s)),
+        ("ssm_beta", |st, s| st.ssm_beta = Some(s)),
+        ("ssm_alpha", |st, s| st.ssm_alpha = Some(s)),
+        ("ssm_norm", |st, s| st.ssm_norm = Some(s)),
+        ("ssm_out", |st, s| st.ssm_out = Some(s)),
+        ("attn_q_norm", |st, s| st.attn_q_norm = Some(s)),
+        ("attn_k_norm", |st, s| st.attn_k_norm = Some(s)),
+        ("ffn_gate_inp_shexp", |st, s| {
+            st.ffn_gate_inp_shexp = Some(s)
+        }),
+    ];
+    for (name, set) in setters {
+        let mut st = base();
+        set(&mut st, sl(10_000, 100));
+        assert_eq!(
+            MetalF32Backend::non_expert_byte_end(&st),
+            10_100,
+            "{name} must extend the non-expert prefix"
+        );
+    }
+    let mandatory: [(&str, Set); 9] = [
+        ("wq", |st, s| st.wq = s),
+        ("wk", |st, s| st.wk = s),
+        ("wv", |st, s| st.wv = s),
+        ("wo", |st, s| st.wo = s),
+        ("w_gate", |st, s| st.w_gate = s),
+        ("w_up", |st, s| st.w_up = s),
+        ("w_down", |st, s| st.w_down = s),
+        ("attn_norm", |st, s| st.attn_norm = s),
+        ("ffn_norm", |st, s| st.ffn_norm = s),
+    ];
+    for (name, set) in mandatory {
+        let mut st = base();
+        set(&mut st, sl(10_000, 100));
+        assert_eq!(
+            MetalF32Backend::non_expert_byte_end(&st),
+            10_100,
+            "{name} must extend the non-expert prefix"
+        );
+    }
+}

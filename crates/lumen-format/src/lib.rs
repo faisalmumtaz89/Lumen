@@ -30,7 +30,7 @@ pub mod writer;
 pub use error::FormatError;
 pub use header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION};
 pub use hyperparams::ModelHyperparams;
-pub use index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
+pub use index::{ExpertSlice, LayerIndex, SliceFields, SubtensorOffsets, TensorSlice};
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
 pub use quantization::{CtInt4G32Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor};
 pub use reader::LbcFile;
