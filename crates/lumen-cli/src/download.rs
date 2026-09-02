@@ -186,8 +186,7 @@ mod inner {
         // Reclaim BEFORE the cache-hit return: after one racer succeeds,
         // every future call takes the cache-hit fast path, so litter from
         // a SIGKILLed racer would otherwise never be reclaimed. The scan
-        // is a small read_dir plus one libc::kill per stale candidate —
-        // cheap since the subprocess-based check was replaced.
+        // is a small read_dir plus one libc::kill per stale candidate — cheap.
         reclaim_stale_parts(dest_dir, filename);
 
         // Cache hit: file already exists and is non-empty.
