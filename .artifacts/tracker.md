@@ -28,6 +28,45 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R9-ISSUE-3 · Downloads take the bytes as stored, or refuse — CLOSED (mutation-proven, 3 adversarial rounds)**
+  — lumen-cli's ureq 2.12.1 ran with default features, so every HEAD/GET sent
+  `accept-encoding: gzip` (request.rs:93-110) and, had the CDN complied, ureq
+  would have decompressed transparently and dropped BOTH `content-encoding` and
+  `content-length` (response.rs:606-608, method-agnostic); `verify_complete_transfer(None, _)`
+  then refuses — every download fails closed. Reproduced deterministically on a
+  local gzip-capable server (HEAD/GET default → content-length None; identity →
+  Some). HF served the checked GGUF uncompressed whatever encodings were offered
+  (text on the same CDN is brotli'd) — latent, as the note said. Fix, hardened
+  through three attack rounds (codex + karpathy ×3, 30 findings, all confirmed
+  ones fixed; evidence-v0230/issue3/TRIAGE.md): one `stored_bytes_request`
+  helper (per-request agent: `Accept-Encoding: identity`, 60 s read/write stall
+  timeouts, `https_only` for https URLs so a redirect can never downgrade);
+  ureq built `default-features = false, features = ["tls"]` (gzip + unused json
+  off; flate2 and four transitive crates leave the lock; one feature edge into
+  ureq, so unification cannot re-enable it); `reject_encoded_response` on HEAD
+  and GET accepts a response only when every `Content-Encoding` value is a bare
+  `identity` and every `Transfer-Encoding` value is `chunked` — duplicate
+  headers (ureq's `header()` returns the first value) and values ureq cannot
+  render (`header()`/`all()` drop them, `headers_names()` still lists the name)
+  were FAIL-OPEN paths that would have published encoded bytes as the model;
+  `download_gguf` is a thin wrapper over `download_from(&BaseUrl::hugging_face(), …)`
+  where `BaseUrl` is sealed (private field, one production constructor), so the
+  real path is driven by tests against a two-authority stand-in (origin 302 →
+  CDN on another port, bounded wire I/O, deadline instead of blocking accepts)
+  while a wrong base in production is a compile error. Pinned: 17 mutants —
+  both sites reverted, header dropped / `identity, gzip` / `X-Accept-Encoding`,
+  either guard removed, presence check off, first-value guard, transfer-encoding
+  check off, `hugging_face()` → http, mock never redirects, ureq gzip feature
+  back on (`transparent_decompression_is_off` asserts the guard's own message),
+  and three wrapper mutants (literal base, direct `BaseUrl(..)`, test-only
+  `local(..)`) that fail to COMPILE; 30/30 flake-free incl. under CPU load.
+  Not test-pinned (disclosed): the `https_only`/60 s stall-timeout wiring in
+  `stored_bytes_request` — no TLS in the test stand-in and a 60 s wait is
+  impractical; both were verified from ureq source by the round-3 attacker
+  (https_only re-checked per redirect hop at unit.rs:351; timeout_read is per
+  read syscall, so a slow-but-progressing multi-GB pull cannot trip it). cli
+  69+2 green, clippy clean, `cargo check --locked --workspace` clean.
+
 - **R9-ISSUE-2 · Sub-tensor field lists cannot drift — CLOSED (compile-time, mutation-proven)**
   — `SubtensorOffsets` had 19 `Option<TensorSlice>` fields and no `Default`, and
   FIVE hand-copied enumerations of them (the remaining-items note said four; the
@@ -625,6 +664,24 @@ item; close with the shipping release.
   regression test exists (r7 review finding, accepted).
 
 ## Verified-latent / accepted residuals (each entry states its own containment — a guard, unreachability, or an accepted exposure; do not fix unprompted)
+
+- **R9-RESIDUAL-CHUNKED · chunked-but-complete transfer refused (2026-09-03)** — a
+  `Transfer-Encoding: chunked` response with no `Content-Length` yields
+  `verify_complete_transfer(None, _)` → refusal even when the terminal 0-chunk
+  proved completeness (ureq response.rs:332-343 gives `BodyType::Chunked`, no
+  length ever existed). Containment: safe (fail-closed), and HF sends
+  `Content-Length` for model files. Orthogonal to `Accept-Encoding`. Do not fix
+  unprompted; if resume/Range support is ever added, note ureq skips its default
+  accept-encoding when `Range` is set and a 206's length is the range length.
+- **R9-RESIDUAL-RELEASE-COVERAGE · the download path is barely exercised by the
+  release pipeline (2026-09-03)** — the Linux/CUDA leg reads models from a Modal
+  volume; the macOS leg's real `lumen pull` is skipped whenever `LUMEN_TEST_MODEL`
+  is set; `validate-install.yml` is dispatch-only; `packaging/macos/build-tarball.sh`
+  and `validate-metal.yml` build without `--locked`, so an audited lock delta is
+  not enforced on the leg that produces the shipped macOS tarball. Containment:
+  unit tests drive the real `download_from` against a local stand-in; the lock
+  is checked with `cargo check --locked --workspace` in-session. Pipeline change
+  is its own item.
 
 - **HOSTILE-HEADER-KERNEL-CAPS · residual u32/aggregate exposures under
   bounded-but-hostile headers (round-9 reviews; EMBED-U32-CAP posture:

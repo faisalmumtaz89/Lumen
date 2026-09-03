@@ -92,17 +92,99 @@ mod inner {
         }
     }
 
-    /// Get the file size from HuggingFace via a HEAD request.
-    ///
-    /// HF returns a 302 redirect to CDN; ureq follows it and we read Content-Length.
+    /// Where model files are fetched from. The field is private to this
+    /// module and production has exactly one constructor, so the download
+    /// path cannot be pointed anywhere else without the test-only one.
+    mod base_url {
+        pub(crate) struct BaseUrl(String);
+
+        impl BaseUrl {
+            pub(crate) fn hugging_face() -> Self {
+                Self("https://huggingface.co".to_string())
+            }
+
+            #[cfg(test)]
+            pub(crate) fn local(origin: String) -> Self {
+                Self(origin)
+            }
+
+            pub(crate) fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    }
+    pub(crate) use base_url::BaseUrl;
+
+    /// A read or write that makes no progress for this long is a stalled
+    /// transfer, not a slow one.
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// A request for the bytes with no content coding applied. A server that
+    /// honors the header does not touch any `Content-Length` it sends; one
+    /// that encodes anyway is caught by [`reject_encoded_response`], since
+    /// the crate is built without transparent decompression. A secure URL is
+    /// never followed to a plaintext one.
+    pub(crate) fn stored_bytes_request(method: &str, url: &str) -> ureq::Request {
+        let secure = url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+        ureq::AgentBuilder::new()
+            .https_only(secure)
+            .timeout_read(STALL_TIMEOUT)
+            .timeout_write(STALL_TIMEOUT)
+            .build()
+            .request(method, url)
+            .set("Accept-Encoding", "identity")
+    }
+
+    /// Encoded bytes would pass the length check and be published as the
+    /// model, so a response is accepted only when every `Content-Encoding`
+    /// value it carries is a bare `identity` and every `Transfer-Encoding`
+    /// value is `chunked`. Lists are refused as written, and a header ureq
+    /// parses but cannot render as text is refused rather than ignored; a
+    /// line ureq cannot parse at all never reaches this check.
+    fn reject_encoded_response(resp: &ureq::Response) -> Result<(), DownloadError> {
+        let refuse = |header: &str, values: &[&str]| {
+            let what = if values.is_empty() {
+                "an unreadable".to_string()
+            } else {
+                format!("{values:?}")
+            };
+            DownloadError::Io(format!(
+                "server sent {what} {header} for {}; refusing to store encoded bytes as the model",
+                resp.get_url()
+            ))
+        };
+        for (header, shown, allowed) in [
+            ("content-encoding", "Content-Encoding", "identity"),
+            ("transfer-encoding", "Transfer-Encoding", "chunked"),
+        ] {
+            let present = resp
+                .headers_names()
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(header));
+            if !present {
+                continue;
+            }
+            let values = resp.all(header);
+            if values.is_empty() || !values.iter().all(|v| v.eq_ignore_ascii_case(allowed)) {
+                return Err(refuse(shown, &values));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn model_url(base_url: &str, repo: &str, url_path: &str) -> String {
+        format!("{base_url}/{repo}/resolve/main/{url_path}")
+    }
+
+    /// Get the file size via a HEAD request. HF answers with a 302 to its
+    /// CDN; ureq follows it and the final response carries Content-Length.
     fn get_remote_size(url: &str) -> Result<Option<u64>, DownloadError> {
-        // ureq's HEAD doesn't read a body, but we need Content-Length from the
-        // final response (after redirects). Use a GET with range 0-0 to get
-        // Content-Range which tells us the total size.
-        // Actually, ureq follows redirects by default. Let's try HEAD first.
-        let resp = ureq::head(url)
+        let resp = stored_bytes_request("HEAD", url)
             .call()
             .map_err(|e| DownloadError::Io(format!("HEAD request failed for {url}: {e}")))?;
+        reject_encoded_response(&resp)?;
 
         if let Some(cl) = resp.header("content-length") {
             if let Ok(size) = cl.parse::<u64>() {
@@ -165,6 +247,22 @@ mod inner {
         dest_dir: &Path,
         skip_confirm: bool,
     ) -> Result<PathBuf, DownloadError> {
+        download_from(
+            &BaseUrl::hugging_face(),
+            repo,
+            filename,
+            dest_dir,
+            skip_confirm,
+        )
+    }
+
+    pub(crate) fn download_from(
+        base_url: &BaseUrl,
+        repo: &str,
+        filename: &str,
+        dest_dir: &Path,
+        skip_confirm: bool,
+    ) -> Result<PathBuf, DownloadError> {
         // Validate (traversal-safe) and split into URL path + local basename.
         let (url_path, local_name) =
             super::split_repo_path(filename).map_err(DownloadError::InvalidFilename)?;
@@ -199,9 +297,9 @@ mod inner {
             }
         }
 
-        // Build the HuggingFace download URL (uses the full repo path, which
-        // may include a subdirectory; the local file is the flat basename).
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{url_path}");
+        // The URL uses the full repo path, which may include a subdirectory;
+        // the local file is the flat basename.
+        let url = model_url(base_url.as_str(), repo, &url_path);
 
         // Get file size for confirmation and progress bar.
         let size = get_remote_size(&url)?;
@@ -218,9 +316,10 @@ mod inner {
 
         // Start the download.
         eprintln!("Downloading: {url}");
-        let resp = ureq::get(&url)
+        let resp = stored_bytes_request("GET", &url)
             .call()
             .map_err(|e| DownloadError::Io(format!("GET request failed: {e}")))?;
+        reject_encoded_response(&resp)?;
 
         // Get content length from the actual response (might differ from HEAD due to CDN).
         let content_length = resp
@@ -831,5 +930,219 @@ mod tests {
             format!("{e}").contains("no Content-Length"),
             "unknown-length transfer must be refused, got {e}"
         );
+    }
+
+    /// A stand-in for HF's topology: an origin that answers every request
+    /// with a 302 to a CDN on a different authority, and a CDN that serves
+    /// `BODY` with the given extra headers. Requests are accepted until
+    /// `expected` heads were seen or a deadline passes, and every read or
+    /// write on the wire is bounded, so a broken premise or a silent peer
+    /// fails the count instead of hanging. Returns the origin base URL.
+    #[cfg(feature = "download")]
+    fn serve_like_hf(
+        expected: usize,
+        head_extra: &'static str,
+        get_extra: &'static str,
+    ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cdn = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_base = format!("http://{}", origin.local_addr().unwrap());
+        let base = format!("http://{}", cdn.local_addr().unwrap());
+        origin.set_nonblocking(true).unwrap();
+        cdn.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut heads = Vec::new();
+            while heads.len() < expected && std::time::Instant::now() < deadline {
+                let stream = match origin.accept().or_else(|_| cdn.accept()) {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let wire = Some(std::time::Duration::from_secs(2));
+                stream.set_read_timeout(wire).unwrap();
+                stream.set_write_timeout(wire).unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        head.clear();
+                        break;
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                if head.is_empty() {
+                    continue;
+                }
+                let is_head = head.starts_with("HEAD ");
+                let response = if !head.contains(" /cdn/") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {base}/cdn/m.gguf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    let extra = if is_head { head_extra } else { get_extra };
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                        BODY.len()
+                    )
+                };
+                let stream = reader.get_mut();
+                let _ = stream.write_all(response.as_bytes());
+                if !is_head && head.contains(" /cdn/") {
+                    let _ = stream.write_all(BODY);
+                }
+                heads.push(head.to_ascii_lowercase());
+            }
+            heads
+        });
+        (super::BaseUrl::local(origin_base), handle)
+    }
+
+    #[cfg(feature = "download")]
+    const BODY: &[u8] = b"stored model bytes";
+
+    #[cfg(feature = "download")]
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(feature = "download")]
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lumen-dl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The real download path against the stand-in: both hops of HEAD and
+    /// GET ask for stored bytes, and the published file is byte-exact.
+    #[cfg(feature = "download")]
+    #[test]
+    fn download_asks_for_stored_bytes_across_the_redirect() {
+        let (base, server) = serve_like_hf(4, "", "");
+        let dir = scratch_dir("ok");
+        let path = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BODY);
+        assert_eq!(entries(&dir), vec!["m.gguf", "m.gguf.sha256"]);
+        let heads = server.join().unwrap();
+        assert_eq!(
+            heads.len(),
+            4,
+            "each method: origin hop + cross-authority CDN hop"
+        );
+        for head in heads {
+            assert!(
+                head.lines().any(|l| l == "accept-encoding: identity"),
+                "request must ask for stored bytes, got:\n{head}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A server that encodes anyway is refused on the GET, before any byte
+    /// is published.
+    #[cfg(feature = "download")]
+    #[test]
+    fn encoded_get_is_refused() {
+        let (base, server) = serve_like_hf(4, "", "Content-Encoding: br\r\n");
+        let dir = scratch_dir("enc-get");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("[\"br\"] Content-Encoding"),
+            "got {err}"
+        );
+        assert!(
+            entries(&dir).is_empty(),
+            "nothing may be left behind, got {:?}",
+            entries(&dir)
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Only bare `identity` values pass: a duplicate header whose first value
+    /// is identity, a value ureq cannot render, a list, and a coded transfer
+    /// encoding are all refused.
+    #[cfg(feature = "download")]
+    #[test]
+    fn duplicate_or_unrenderable_content_encoding_is_refused() {
+        for (tag, extra) in [
+            (
+                "dup",
+                "Content-Encoding: identity\r\nContent-Encoding: gzip\r\n",
+            ),
+            ("raw", "Content-Encoding: gzip\u{e9}\r\n"),
+            ("list", "Content-Encoding: identity, gzip\r\n"),
+            ("transfer", "Transfer-Encoding: gzip, chunked\r\n"),
+        ] {
+            let (base, server) = serve_like_hf(4, "", extra);
+            let dir = scratch_dir(tag);
+            let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+            assert!(format!("{err}").contains("-Encoding"), "{tag}: got {err}");
+            assert!(
+                entries(&dir).is_empty(),
+                "{tag}: nothing may be left behind"
+            );
+            assert_eq!(server.join().unwrap().len(), 4, "{tag}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn hf_url_is_https_huggingface() {
+        assert_eq!(
+            super::model_url(
+                super::BaseUrl::hugging_face().as_str(),
+                "org/repo",
+                "sub/m.gguf"
+            ),
+            "https://huggingface.co/org/repo/resolve/main/sub/m.gguf"
+        );
+    }
+
+    /// The guard can only see an encoding ureq leaves in place: were ureq's
+    /// gzip feature back on, it would decode this response and drop the
+    /// header, the guard would pass, and the message here would not appear.
+    #[cfg(feature = "download")]
+    #[test]
+    fn transparent_decompression_is_off() {
+        let (base, server) = serve_like_hf(4, "", "Content-Encoding: gzip\r\n");
+        let dir = scratch_dir("gzip-off");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("[\"gzip\"] Content-Encoding"),
+            "got {err}"
+        );
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same refusal on the HEAD, whose length would describe encoded bytes.
+    #[cfg(feature = "download")]
+    #[test]
+    fn encoded_head_is_refused() {
+        let (base, server) = serve_like_hf(2, "Content-Encoding: gzip\r\n", "");
+        let dir = scratch_dir("enc-head");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("[\"gzip\"] Content-Encoding"),
+            "got {err}"
+        );
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
