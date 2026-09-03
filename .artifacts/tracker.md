@@ -28,6 +28,132 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R9-ISSUE-5 · four small corrections — CLOSED (each sentence verified against the tree)**
+  — (a) the CUDA resident-preload comment now names the three header-level
+  checks that precede `build_moe_meta` (non-zero slice lengths, expert count,
+  attention-vector byte extents) and says which validators still run later
+  inside `upload_layer_weights` (mandatory presence, GDN conv1d extent,
+  projection geometry per non-CT4 tensor); (b) the R8-ISSUE-9 tally "13 = 9
+  Metal + 4 CUDA" is qualified in place: it counts only the rules that finding
+  named; counting every rule a CUDA load path invokes gives 10 (path, rule)
+  pairs (streaming upload 6; resident preload 4 including expert bank inside
+  build_moe_meta, which is preload-only — the streaming path never reaches
+  `validate_expert_bank`), and the review note's "8" is the same tree under a
+  narrower scope, the guards written at the two load sites themselves (5 + 3);
+  a first draft of this note called 8 "not reproducible" and was refuted by
+  the verifier, who also re-parsed the 16 MiB GGUF header from scratch and
+  reproduced 10,990,900 as the end of the tensor-info table (data starts at
+  10,990,912 after the 32-byte alignment pad); the entry's own stale
+  backend_impl.rs line citations are bracketed with today's lines;
+  (c) the resolution report's verification grep for the nonexistent server
+  flag is scoped to `crates/lumen-server/` (the workspace-wide grep has eight
+  legitimate hits in lumen-cli and the KV docs, since `--kv-disk-space-mb` is a
+  real CLI flag; the finding was a server message pointing at it); (d) the MoE
+  geometry verification doc records the header-complete offset 10,990,900 with
+  its source line. Evidence: evidence-v0230/issue5/.
+
+- **R9-ISSUE-4 · Load-site guard wiring pinned at every site, on both backends — CLOSED (mutation-proven; CUDA on A100)**
+  — what was pinned before: the guard RULES, and the Metal streaming
+  `create_layer_buffer` site (via prefill) and resident preload only for
+  K-quant; what was not: the resident preload for the geometry rule, the
+  expert-cache `create_partial_layer_buffer` site (reachable only from the
+  engine's streaming `compute_layer` once every expert of a layer is cached —
+  no test ever configured a cache), the CUDA `upload_layer_weights` site, and
+  three rules with no DIRECT unit test (`validate_attn_vector_extents`,
+  `validate_gdn_conv1d`, `validate_expert_bank` — pinned only through
+  `validate_attention_dims` in the Metal tests, or only under `--features
+  cuda`; an earlier draft of this entry called them "unpinned", which a
+  name-only grep suggested and the attacker refuted). Now: `bad_wo_rejected_at_load` drives the
+  resident preload too (preload-site `validate_attention_dims` call
+  neutralised → its leg fails); `moe_layer_defects_rejected_at_every_metal_load_site`
+  builds a 2-expert MoE LBC with one of three defects (wo geometry, K-quant
+  QKV, one expert instead of two) and drives each through all three sites —
+  preload, prefill → `create_layer_buffer`, and the expert-cache
+  `create_partial_layer_buffer` reached only by the engine's streaming
+  `compute_layer` over a cache holding every expert of the layer; all nine
+  (rule × site) guard removals fail at their own site, and a positive control
+  (a sound layer over the same warmed cache binds the partial buffer and not
+  the full one) pins the branch itself — forcing `use_partial` false fails
+  it. That third site is defence in depth: the shipped 256-expert model's
+  cache (num_layers × 4) never holds a whole layer. A first draft that drove
+  `prefill` was proven by mutants to take the full site and was rewritten; `serving_rules::tests` pin the three rules in
+  both directions with exemptions and overflow (mutants: bk check dropped,
+  GDN exemption dropped, `!=`→`<` — survived until a longer-than-expected
+  case was added — gate/up check off: all killed); CUDA
+  `malformed_layer_rejected_before_upload` writes an LBC, opens it through
+  the production provider and calls `upload_layer_weights` on a device with
+  a mis-sized q-norm (pair present) and a wo whose length disagrees with the
+  projection geometry — refused by the vector-extents and projection rules
+  respectively, verified on Modal A100 (evidence-v0230/issue4/modal-cuda-unit.log;
+  two earlier runs failed on the FIXTURE — a lone q-norm trips the half-pair
+  rule first, and the provider serves the layer dequantized so the message
+  reports the F32 size — both kept as logs). Panics locally inside cudarc's
+  loader like every GPU test here. runtime 655 (Metal serial) / format 85 /
+  format+convert+cli 365 / cuda type-check clean.
+
+- **R9-ISSUE-3 · Downloads take the bytes as stored, or refuse — CLOSED (mutation-proven, 3 adversarial rounds)**
+  — lumen-cli's ureq 2.12.1 ran with default features, so every HEAD/GET sent
+  `accept-encoding: gzip` (request.rs:93-110) and, had the CDN complied, ureq
+  would have decompressed transparently and dropped BOTH `content-encoding` and
+  `content-length` (response.rs:606-608, method-agnostic); `verify_complete_transfer(None, _)`
+  then refuses — every download fails closed. Reproduced deterministically on a
+  local gzip-capable server (HEAD/GET default → content-length None; identity →
+  Some). HF served the checked GGUF uncompressed whatever encodings were offered
+  (text on the same CDN is brotli'd) — latent, as the note said. Fix, hardened
+  through three attack rounds (codex + karpathy ×3, 30 findings, all confirmed
+  ones fixed; evidence-v0230/issue3/TRIAGE.md): one `stored_bytes_request`
+  helper (per-request agent: `Accept-Encoding: identity`, 60 s read/write stall
+  timeouts, `https_only` for https URLs so a redirect can never downgrade);
+  ureq built `default-features = false, features = ["tls"]` (gzip + unused json
+  off; flate2 and four transitive crates leave the lock; one feature edge into
+  ureq, so unification cannot re-enable it); `reject_encoded_response` on HEAD
+  and GET accepts a response only when every `Content-Encoding` value is a bare
+  `identity` and every `Transfer-Encoding` value is `chunked` — duplicate
+  headers (ureq's `header()` returns the first value) and values ureq cannot
+  render (`header()`/`all()` drop them, `headers_names()` still lists the name)
+  were FAIL-OPEN paths that would have published encoded bytes as the model;
+  `download_gguf` is a thin wrapper over `download_from(&BaseUrl::hugging_face(), …)`
+  where `BaseUrl` is sealed (private field, one production constructor), so the
+  real path is driven by tests against a two-authority stand-in (origin 302 →
+  CDN on another port, bounded wire I/O, deadline instead of blocking accepts)
+  while a wrong base in production is a compile error. Pinned: 17 mutants —
+  both sites reverted, header dropped / `identity, gzip` / `X-Accept-Encoding`,
+  either guard removed, presence check off, first-value guard, transfer-encoding
+  check off, `hugging_face()` → http, mock never redirects, ureq gzip feature
+  back on (`transparent_decompression_is_off` asserts the guard's own message),
+  and three wrapper mutants (literal base, direct `BaseUrl(..)`, test-only
+  `local(..)`) that fail to COMPILE; 30/30 flake-free incl. under CPU load.
+  Not test-pinned (disclosed): the `https_only`/60 s stall-timeout wiring in
+  `stored_bytes_request` — no TLS in the test stand-in and a 60 s wait is
+  impractical; both were verified from ureq source by the round-3 attacker
+  (https_only re-checked per redirect hop at unit.rs:351; timeout_read is per
+  read syscall, so a slow-but-progressing multi-GB pull cannot trip it). cli
+  69+2 green, clippy clean, `cargo check --locked --workspace` clean.
+
+- **R9-ISSUE-2 · Sub-tensor field lists cannot drift — CLOSED (compile-time, mutation-proven)**
+  — `SubtensorOffsets` had 19 `Option<TensorSlice>` fields and no `Default`, and
+  FIVE hand-copied enumerations of them (the remaining-items note said four; the
+  fifth was `validate_layer_quants`, the only presence guard on the Metal load
+  path): `uses_quant`, `named_slices`, `validate_layer_quants`,
+  `validate_layer_slices`, and Metal `non_expert_byte_end`. A field added to the
+  struct compiled cleanly while escaping every list (probe field: 26 struct-literal
+  errors, ZERO from any consumer). Fix: one registry —
+  `SubtensorOffsets::slice_fields()` destructures with `let Self { … }` and no
+  `..`, classifying 9 mandatory + 19 optional + experts; all five consumers derive
+  from it (Metal traversal 94 → 12 lines), and the zero-length rule now has one
+  body (`validate_layer_quants` calls `validate_layer_slices`). Guarantee stated
+  exactly: a new field is `error[E0027]` at the registry until it is NAMED there;
+  binding it `_` is an explicit, reviewable opt-out (Rust cannot forbid `_`).
+  Evidence: probe field → E0027 at index.rs; karpathy 200,001-layer differential
+  fuzz vs verbatim pre-refactor bodies = zero differences incl. byte-identical
+  error strings, perf 4.87→4.89 ns; extent test now one case per field (28) —
+  mutants dropping `wq` / `attn_k_norm` fail by name; fixture asserts every
+  optional populated. format 82 / runtime 654 (Metal serial) / convert+cli 274 /
+  cuda check clean. Adversarial: codex FAIL(4) + karpathy FAIL(2+4) round 1, all
+  8 confirmed and fixed (evidence-v0230/issue2/TRIAGE.md). Remaining name lists
+  in serving_rules are rule-scoped policy subsets (e.g. the F32-only set), not
+  every-field copies. CHANGELOG [0.22.0] corrected (five, not four; "named").
+
 - **R8-ISSUE-13 · 27B + MoE load-coverage — CLOSED (empirically proven, both models)**
   — the round-8 loader changes were end-to-end validated by DOWNLOADING,
   CONVERTING, and LOADING the two real models #13 named, on Metal (serial,
@@ -69,12 +195,12 @@ item; close with the shipping release.
   round-8 and byte-matching the claims. Evidence only.
 - **R8-ISSUE-9-SSMOUT · generic-target `ssm_out` geometry now validated at convert — CLOSED (fixed)**
   — round-8 review (codex) found `validate_layer_plan` checked `ssm_out` geometry
-  only inside its Metal-only branch, while the converter sizes `ssm_out` straight
+  only inside its Metal-only branch [erratum 2026-09-03: this check was itself new in 2c12c1c — see REMEDIATION-HISTORY], while the converter sizes `ssm_out` straight
   from the source GGUF's element count — so a malformed-source GGUF converted with
   `--target generic` produced a wrong-geometry `ssm_out` LBC that no convert-time
   check caught (CUDA/CPU would then read it at the wrong geometry; only the Metal
-  load guard would catch it). Hoisted `validate_projection_geometry("ssm_out", …,
-  gdn_v_dim, [hidden])` out of the `if metal` block into the universal projection
+  load guard would catch it) [erratum 2026-09-03: the Metal guard did not check `ssm_out` at 6914bd4 either — see REMEDIATION-HISTORY]. Hoisted `validate_projection_geometry("ssm_out", …,
+  gdn_v_dim, [hidden])` out of the `if metal` block into the universal projection [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
   checks (serving_rules.rs, beside the existing universal `attn_gate` check), so
   every target now rejects an inconsistent `ssm_out` at convert. Well-formed
   sources unaffected (convert 199 / format 82 still green). MUTATION-PROVEN by
@@ -131,17 +257,17 @@ item; close with the shipping release.
   rename). Karpathy PASS (code + restructure); codex confirmed code-safety on
   every point (its residual notes were comment-accuracy, now corrected). CLI
   75/75, fmt clean.
-- **R8-ISSUE-7 · CUDA preload validated MoE meta after building it — CLOSED (fixed)**
+- **R8-ISSUE-7 · CUDA preload validated MoE meta after building it — CLOSED (fixed)** [erratum 2026-09-03: this "after" ordering is intra-PR, never merged history — see REMEDIATION-HISTORY]
   — the GPU-resident preload built and stored per-layer MoE meta tables
   (`build_moe_meta` + `build_batched_offsets`, writing the persistent
   `moe_meta_cache`/`moe_batched_offsets` + device allocations) before the
   full validator set ran; expert-count and attn-extent checks lived only
-  inside `upload_layer_weights`, which followed. A header passing bounds but
-  failing those checks left a partial meta table behind before the load
+  inside `upload_layer_weights`, which followed. [erratum 2026-09-03: both validators and those call sites are new in 2c12c1c — see REMEDIATION-HISTORY] A header passing bounds but
+  failing those checks left a partial meta table behind before the load [erratum 2026-09-03: intra-PR state — see REMEDIATION-HISTORY]
   errored. The preload comment already promised "validate before ANY
   per-layer GPU work (meta tables included)" but only ran the bounds
   validator there; completed the contract by hoisting `validate_expert_count`
-  + `validate_attn_vector_extents` ahead of `build_moe_meta`
+  + `validate_attn_vector_extents` ahead of `build_moe_meta` [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
   (backend_impl.rs preload loop). Behavior-neutral on valid artifacts (same
   read-only serving_rules validators, convert-time gate already runs all
   three); a rejected header now aborts before any persistent/device write.
@@ -168,7 +294,7 @@ item; close with the shipping release.
   rejects non-%32 element counts before the quantizer panics) is called at
   four convert sites (dense/MoE × qkv/gate); only dense-qkv had an E2E
   wiring pin, leaving the other three revertible to an inline `assert!`
-  undetected. Parametrized the convert-E2E test over all four sites
+  undetected. Parametrized the convert-E2E test over all four sites [erratum 2026-09-03: no pin existed at 6914bd4; all four are new — see REMEDIATION-HISTORY]
   (metal_target_lockstep.rs); each independently mutation-proven (reverting
   one site fails only its own test; files byte-identical after restore).
   Dual PASS (karpathy + codex r3).
@@ -281,7 +407,7 @@ item; close with the shipping release.
   set — over every PLANNED layer's `SubtensorOffsets` before any byte is
   written. Because the gate reads planned `QuantScheme`s (after
   requant/upcast/pair-force), the convert-side shadow mappings of source
-  `GgmlType`s are deleted, retiring the entire divergence class two
+  `GgmlType`s are deleted [erratum 2026-09-03: nothing was deleted — see REMEDIATION-HISTORY], retiring the entire divergence class two
   review rounds of one-by-one fixes kept refilling (adversarial reviews
   found 7 then 5 instances; the composite closes all 12 plus the
   headerless-GDN residual — validated against the same
@@ -332,6 +458,93 @@ item; close with the shipping release.
   through the loader wrappers + the mutation-proven convert gate test);
   tightening two role-agnostic negative-test needles; deriving fixture
   constants (96, nh) from the declared ssm.* keys instead of hardcoding.
+- **REMEDIATION-HISTORY · pattern named (round 9): remediation history invented
+  for newly written code** — ledger entries narrate a fix as moving, hoisting,
+  deleting, replacing or re-ordering something, when git shows the cited commit
+  only ADDED the code and no prior state existed in merged history. Six dated
+  errata (A–F, 2026-09-03) stand corrected here, decided against 6914bd4 (the
+  parent of 2c12c1c) and the round-7 commits 8ca6834 / 33ace97; every affected
+  locus carries an inline pointer back to this entry and its original wording is
+  retained. In every instance the SUBSTANCE — the gap and the fix — is real; only
+  the history was invented.
+  Erratum A (R8-ISSUE-7 — its title and consequence included — and the
+  R8-ISSUE-9 call-site inventory): `validate_expert_count` and
+  `validate_attn_vector_extents` have zero hits at 6914bd4. 2c12c1c defined both
+  in serving_rules.rs (`git diff -U0 6914bd4 2c12c1c --
+  crates/lumen-format/src/serving_rules.rs`: `validate_attn_vector_extents` at
+  `@@ -618,0 +649,49`, `validate_expert_count` at `@@ -800,0 +926,27`), added
+  their `upload_layer_weights` call sites as a pure `+10` hunk
+  (crates/lumen-runtime/src/cuda/gpu_buffers.rs `@@ -1156`), and added the
+  resident-preload calls before `build_moe_meta` in the same commit. So nothing
+  pre-existed to hoist, and the "validated MoE meta AFTER building it" ordering
+  never existed in merged history — it describes a state between iterations of
+  the one squashed PR. Correct statement: added at both the resident preload and
+  `upload_layer_weights`. The preload wiring is the load-site wiring R8-ISSUE-9
+  ledgers as NOT mutation-pinned; the mutation-pinned tests belong to B and F.
+  Erratum B (R8-ISSUE-9-SSMOUT; the R8-ISSUE-9 containment note; QKV-SHAPE (d)):
+  serving_rules.rs / `validate_layer_plan` had no `ssm_out` geometry check at
+  6914bd4 (the symbol appears only in slice-name lists there). Rejecting
+  `ssm_out` geometry checks did exist ELSEWHERE and are separate from this
+  gate: CUDA's CtInt4G32 upload path, `upload_projection_tensor(…, "ssm_out",
+  …)` (unchanged — 2c12c1c only retyped that arm's `in_dim` arithmetic), and
+  the HF-import converter's `linear_attn.out_proj` shape checks in
+  convert_hf.rs (`(n, k) != (hidden, v_rows)` and the Bf16 shape test), which
+  concern the HF path, not GGUF conversion; Metal's gpu_resident.rs
+  compared `ssm_out.length == hidden × q8_row_bytes` only to gate an optional
+  Q8→Q4 requant buffer — `None` on mismatch, never a rejection. 2c12c1c's
+  serving_rules diff for `ssm_out` is all `+` lines: the Metal-branch
+  `expect("ssm_out", …)` and the universal `validate_projection_geometry("ssm_out",
+  …)` were BOTH added, nothing removed, and the Metal-branch check still exists.
+  So the entry's premise "checked only inside its Metal-only branch" and "only the
+  Metal load guard would catch it" describe the state within 2c12c1c, not the
+  prior release. Correct statement: added a universal check alongside a
+  Metal-branch check introduced in the same commit.
+  Erratum C (the round-7 gate entry, re 8ca6834): "the convert-side shadow
+  mappings of source `GgmlType`s are deleted" — `git diff -U0 8ca6834^ 8ca6834 --
+  crates/lumen-convert/src | grep '^-'` removes no `GgmlType` mapping code (one
+  pattern replacement and two diagnostic strings). The source-type predicates
+  still exist and still drive planning — `metal_gdn_pair_forces_q8` has four call
+  sites at HEAD, and 8ca6834 EXPANDED it (two `is_f16`/`is_f32` closures and
+  three applications, five `+` lines). Correct statement: the mappings were not
+  deleted; the gate validates every planned layer against the loader's own rules,
+  and that — not any deletion — is what retires the divergence class.
+  Erratum D (the staging entry, re 33ace97): "reclamation … moved back ABOVE the
+  cache-hit return" — `reclaim_stale_parts` has zero hits at 33ace97^; the
+  function and its call were added in 33ace97. Correct statement: added above
+  the cache-hit return.
+  Erratum E (the same entry, re 33ace97 — three sentences): "the Drop guard
+  deleting by pathname … the guard now captures our inode" implies a prior
+  pathname-deleting guard, "identity is (dev, ino) not ino alone" implies a prior
+  ino-only identity, and "a `kill` subprocess also printed to the console"
+  implies a prior subprocess liveness check. `StagingGuard`, `.dev()`, `.ino()`
+  and `libc::kill` all have zero hits at 33ace97^ and no revision on any branch
+  contains a `kill` subprocess — all were introduced together in 33ace97.
+  Correct statement: the guard was introduced with (dev, ino) identity and
+  `libc::kill` liveness from the start.
+  Erratum F (R8-ISSUE-5): "only dense-qkv had an E2E wiring pin … Parametrized
+  the convert-E2E test over all four sites" — `pair_forced_q8_slice` has zero
+  hits at 6914bd4 and the `PairForceSite` enum plus all four tests are pure `+`
+  in 2c12c1c; no prior pin existed to parametrize. The other half of that entry
+  stands: the inline `assert!` sites in qwen35.rs WERE replaced (two `-` hunks).
+  Correct statement: four convert-E2E pins added, one per site.
+  Intra-PR narrative — states that existed only between iterations of one
+  squashed PR and leave no trace in the merged diff — is now marked as such where
+  it appears: the write-only/EBADF staging state (the parent hashed by pathname),
+  and the two "reverted" hunks in the temp-path entry. Prior instances of this
+  class, retracted below near the d0960ce note: the invented ledger-entry claim
+  and the d0960ce "hoisted above build_moe_meta" claim. Claims that survive the
+  same test and stand: round 7's rules "moved to serving_rules" (8ca6834's
+  loader-side diff is deletion-dominated — gpu_resident.rs −497/+35,
+  gpu_buffers.rs −164/+32 — as the loaders' own rule copies, their optional-slice
+  lists included, were replaced by calls into serving_rules) and "the sidecar
+  write moved AFTER the rename" (33ace97: write precedes rename at its parent,
+  follows it after). Round labels in this ledger count review passes, not
+  releases, and collide: 8ca6834 (2026-08-31) carries both "round 7" and
+  "Round-9 (codex r5)"; 2c12c1c (2026-09-02) carries both "round 8" and
+  "round-9" — substance unaffected. Policy: hoisted / moved / removed / deleted /
+  replaced / re-ordered is stated only when the cited commit carries the matching
+  `-` hunk; "restored" cites the commit that removed it; intra-PR sequence is
+  labelled intra-PR; anything else is stated as an addition.
 - **ROUNDING · pattern named and closed (round 7, Category 4)** — three
   historically published ratios rounded TOWARD Lumen: 0.892 (true
   0.891), 0.727 (true 0.726), 1.15 (true 1.145; the v0.11.0-metal
@@ -386,7 +599,7 @@ item; close with the shipping release.
   reproduced failing 30/40 and 22/40 under concurrent pairs, 5
   counter-only src siblings (incl. convert.rs/sharded.rs), 3 fixed-name
   download test dirs, and 23 integration-test dirs — 21 changed plus 2
-  that turned out already-PID-safe and were reverted (counters
+  that turned out already-PID-safe and were reverted [2026-09-03: intra-PR, net-zero in the merged diff] (counters
   disambiguate threads within a process, never across processes).
   Round-final (codex fresh pass): PIDs are NOT unique across PID
   namespaces — two containers sharing a cache volume can both be PID 1,
@@ -395,7 +608,7 @@ item; close with the shipping release.
   opened with `create_new` (O_EXCL) and collision-retried — the
   filesystem, not the name, is the arbiter (no lockfile needed); same
   treatment in the bench model-cache generator. Reclamation parses both
-  name forms and moved back ABOVE the cache-hit return (a SIGKILLed
+  name forms and moved back ABOVE the cache-hit return [erratum 2026-09-03: added, not moved — see REMEDIATION-HISTORY] (a SIGKILLed
   loser's litter would otherwise never be reclaimed once the winner
   published; the scan is cheap now that liveness is one libc::kill).
   Adversarial round outcomes folded in: the `.part` staging gained a
@@ -413,9 +626,9 @@ item; close with the shipping release.
   the reviewer-identified bench MODEL-CACHE hazard fixed
   (`runner.rs` generated `bench_{size}.lbc` directly into the
   existence-as-readiness path — now PID-staged + atomic rename); two
-  double-PID test hunks reverted. Counts corrected: 5 counter-only src
+  double-PID test hunks reverted [2026-09-03: intra-PR, net-zero in the merged diff]. Counts corrected: 5 counter-only src
   siblings (incl. convert.rs/sharded.rs), 23 integration-test sites of
-  which 2 were already PID-safe (reverted). Inherent residual, safe
+  which 2 were already PID-safe (reverted [2026-09-03: intra-PR, net-zero in the merged diff]). Inherent residual, safe
   direction: reclaim's liveness check is namespace-relative — across
   containers it can keep another namespace's dead litter, or unlink a
   live foreign-namespace staging file, which costs that download a
@@ -454,7 +667,7 @@ item; close with the shipping release.
   user-facing locations, read-only fixture constants, and env-var
   round-trip strings that never touch disk — none collision-prone.
   Review-round D-items folded: libc::kill liveness (EPERM = alive under
-  another user, keep; a `kill` subprocess also printed to the console),
+  another user, keep; a `kill` subprocess also printed to the console [erratum 2026-09-03: no subprocess kill ever existed; libc::kill was added in 33ace97 — see REMEDIATION-HISTORY]),
   legacy `{filename}.part` litter reclaimed when >1h stale, runner.rs
   rename-failure cleanup, and explicit post-finish flush in the model
   generators (BufWriter Drop swallows I/O errors). FINAL deletion rule
@@ -495,14 +708,14 @@ item; close with the shipping release.
   reclamation never ran — both wrappers now call the exported
   reclaim_stale_parts before their cache-hit returns. Codex r6 then
   caught (i) a HARD bug in the fd-hash change itself — staging was
-  opened write-only, so the same-fd hash read returned EBADF and every
+  opened write-only, so the same-fd hash read returned EBADF [erratum 2026-09-03: intra-PR state — the parent hashed by pathname — see REMEDIATION-HISTORY] and every
   cold download would have failed (fixed with .read(true); regression
   test exclusive_staging_write_then_hash_via_same_fd covers the exact
   create/write/seek/hash flow); and (ii) the Drop guard deleting by
   pathname could remove a stranger's reused-name file on our error
-  paths — the guard now captures our inode at creation and removes only
+  paths — the guard now captures our inode at creation [erratum 2026-09-03: no prior guard existed; introduced with inode identity — see REMEDIATION-HISTORY] and removes only
   when the path still resolves to it. r7 hardening: identity is
-  (dev, ino) not ino alone, the fd stays open through the rename
+  (dev, ino) not ino alone [erratum 2026-09-03: `.dev()` and `.ino()` were added together in 33ace97; no ino-only version shipped — see REMEDIATION-HISTORY], the fd stays open through the rename
   (prevents inode recycling from blurring the just-verified identity),
   and the regression test is feature-gated so no-default-features builds
   compile. Drop's own metadata-to-remove_file window remains a
@@ -514,6 +727,30 @@ item; close with the shipping release.
   regression test exists (r7 review finding, accepted).
 
 ## Verified-latent / accepted residuals (each entry states its own containment — a guard, unreachability, or an accepted exposure; do not fix unprompted)
+
+- **R9-RESIDUAL-EXPERT-BANK-STREAMING · `validate_expert_bank` runs only on the CUDA resident preload (2026-09-03)** —
+  the rule lives inside `build_moe_meta` (cuda/moe.rs:238), whose only production caller is the resident
+  preload (backend_impl.rs); the streaming `compute_layer` → `upload_layer_weights` path never invokes it.
+  Containment: the converter emits one quant per expert role (the rule's own premise), and Metal carries an
+  inline twin inside `validate_layer_quants`; found by the R9-ISSUE-5 verifier while re-deriving the CUDA
+  guard tally. Wiring it into the streaming path is its own item.
+- **R9-RESIDUAL-CHUNKED · chunked-but-complete transfer refused (2026-09-03)** — a
+  `Transfer-Encoding: chunked` response with no `Content-Length` yields
+  `verify_complete_transfer(None, _)` → refusal even when the terminal 0-chunk
+  proved completeness (ureq response.rs:332-343 gives `BodyType::Chunked`, no
+  length ever existed). Containment: safe (fail-closed), and HF sends
+  `Content-Length` for model files. Orthogonal to `Accept-Encoding`. Do not fix
+  unprompted; if resume/Range support is ever added, note ureq skips its default
+  accept-encoding when `Range` is set and a 206's length is the range length.
+- **R9-RESIDUAL-RELEASE-COVERAGE · the download path is barely exercised by the
+  release pipeline (2026-09-03)** — the Linux/CUDA leg reads models from a Modal
+  volume; the macOS leg's real `lumen pull` is skipped whenever `LUMEN_TEST_MODEL`
+  is set; `validate-install.yml` is dispatch-only; `packaging/macos/build-tarball.sh`
+  and `validate-metal.yml` build without `--locked`, so an audited lock delta is
+  not enforced on the leg that produces the shipped macOS tarball. Containment:
+  unit tests drive the real `download_from` against a local stand-in; the lock
+  is checked with `cargo check --locked --workspace` in-session. Pipeline change
+  is its own item.
 
 - **HOSTILE-HEADER-KERNEL-CAPS · residual u32/aggregate exposures under
   bounded-but-hostile headers (round-9 reviews; EMBED-U32-CAP posture:
@@ -563,13 +800,13 @@ item; close with the shipping release.
 - **R8-ISSUE-9 · load-point guard WIRING not mutation-pinned (same class as
   MOE-EXPERT-COUNT-WIRING-TEST above)** — servelumen round-8 observed that
   commenting out the load-site guard calls leaves the suite green. Full call-site
-  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named): Metal
+  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named) [2026-09-03: that tally counts only the rules this finding named. Counting every serving_rules rule a CUDA load path invokes: the streaming `upload_layer_weights` runs 6 (projection geometry for non-CT4 slices via upload_projection_tensor, mandatory presence, non-zero slice lengths, expert count, attention-vector extents, GDN conv1d — gpu_buffers.rs:853/860/1136/1159/1161/1250) and the resident preload runs 4 of its own before calling it (non-zero slice lengths, expert count, attention-vector extents at backend_impl.rs:18880/18881/18886, then expert bank inside build_moe_meta, moe.rs:238 — build_moe_meta is preload-only, so the streaming path never reaches `validate_expert_bank`), i.e. 10 (path, rule) pairs; the review note's "8" is the same tree under a narrower scope, the guards written at the two load sites themselves (5 + 3) — see R9-ISSUE-5]: Metal
   `validate_layer_quants` + `validate_attention_dims` + `validate_expert_count`
   at `create_layer_buffer` (mod.rs:993/997/998), `create_partial_layer_buffer`
   (mod.rs:1051/1055/1056), and resident preload (gpu_resident.rs:209/210/211);
   CUDA `validate_expert_count` + `validate_attn_vector_extents` in
-  `upload_layer_weights` (gpu_buffers.rs:1159/1161) AND the sibling pair hoisted
-  into the resident preload for R8-ISSUE-7 (backend_impl.rs:18877/18882). The
+  `upload_layer_weights` (gpu_buffers.rs:1159/1161) AND the sibling pair hoisted [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
+  into the resident preload for R8-ISSUE-7 (backend_impl.rs:18877/18882 [18881/18886 as of 2026-09-03]). The
   guard RULES are mutation-pinned (exhaustive `validate_attention_dims` /
   `validate_mandatory_presence` / `validate_attn_vector_extents` /
   `validate_expert_count` unit tests, both directions + exemptions), and the
@@ -580,11 +817,11 @@ item; close with the shipping release.
   passes all prior rules — the disproportionate surface documented above.
   Containment (verified by round-8 review): no correctly-converted Lumen artifact
   trips any of these — `validate_expert_count`/`validate_attn_vector_extents` run
-  at convert for EVERY target (serving_rules.rs:971/974, outside the `if metal`
+  at convert for EVERY target (serving_rules.rs:974/971 [citation corrected 2026-09-03], outside the `if metal`
   block); Metal `validate_attention_dims` byte-geometry is caught universally at
   convert by the byte-identical `validate_projection_geometry`; the GDN
   wk/wv-empty sentinel is a converter-guaranteed invariant; and `ssm_out`
-  geometry is now validated universally at convert too (round-8 fix — hoisted out
+  geometry is now validated universally at convert too (round-8 fix — hoisted out [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
   of the Metal-only branch, mutation-pinned by
   `generic_convert_rejects_wrong_ssm_out_geometry`), closing the earlier
   generic/CUDA asymmetry codex found. CORRECTION (round-8 codex, verified):
@@ -773,7 +1010,7 @@ item; close with the shipping release.
   loading and gate-absent artifacts, where only the sum is pinned);
   (d) the CUDA LOADER has no non-CtInt4G32 `ssm_out` geometry check, but the
   convert gate now validates `ssm_out` (hidden rows x gdn_v_dim width) for
-  EVERY target — round 8 hoisted it out of the Metal-only branch into the
+  EVERY target — round 8 hoisted it out of the Metal-only branch into the [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
   universal projection checks in `validate_layer_plan`
   (`validate_projection_geometry("ssm_out", …)`, mutation-pinned by
   `generic_convert_rejects_wrong_ssm_out_geometry`), so a wrong-geometry

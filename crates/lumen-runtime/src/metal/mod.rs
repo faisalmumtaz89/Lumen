@@ -1102,100 +1102,18 @@ impl MetalF32Backend {
     /// everything at or after it is expert data. If the layer has no experts,
     /// returns the full blob length.
     fn non_expert_byte_end(st: &lumen_format::index::SubtensorOffsets) -> usize {
-        let mut end: u64 = 0;
-
-        // Attention weights
-        let slices = [&st.wq, &st.wk, &st.wv, &st.wo, &st.attn_norm, &st.ffn_norm];
-        for s in &slices {
-            let s_end = s.offset + s.length;
-            if s_end > end {
-                end = s_end;
-            }
-        }
-
-        // Dense FFN weights (zero-length sentinels for MoE, but check anyway)
-        for s in &[&st.w_gate, &st.w_up, &st.w_down] {
-            let s_end = s.offset + s.length;
-            if s_end > end {
-                end = s_end;
-            }
-        }
-
-        // Optional biases
-        for opt in &[&st.bq, &st.bk, &st.bv] {
-            if let Some(s) = opt {
-                let s_end = s.offset + s.length;
-                if s_end > end {
-                    end = s_end;
-                }
-            }
-        }
-
-        // Router weight (non-expert, always loaded)
-        if let Some(ref s) = st.router_weight {
-            let s_end = s.offset + s.length;
-            if s_end > end {
-                end = s_end;
-            }
-        }
-
-        // Shared expert weights (always loaded, non-expert).
-        // Qwen3.5-MoE has an always-active shared expert whose gate/up/down
-        // weights live in the layer blob alongside attention/norm/router data.
-        for opt in &[
-            &st.shared_expert_gate,
-            &st.shared_expert_up,
-            &st.shared_expert_down,
-        ] {
-            if let Some(s) = opt {
-                let s_end = s.offset + s.length;
-                if s_end > end {
-                    end = s_end;
-                }
-            }
-        }
-
-        // Extended attention fields (always loaded, non-expert).
-        // attn_gate, attn_post_norm are per-layer tensors used by hybrid models.
-        for opt in &[&st.attn_gate, &st.attn_post_norm] {
-            if let Some(s) = opt {
-                let s_end = s.offset + s.length;
-                if s_end > end {
-                    end = s_end;
-                }
-            }
-        }
-
-        // SSM / linear attention fields (always loaded, non-expert).
-        // These are per-layer tensors for GatedDeltaNet hybrid layers.
-        for opt in &[
-            &st.ssm_a,
-            &st.ssm_conv1d,
-            &st.ssm_dt,
-            &st.ssm_beta,
-            &st.ssm_alpha,
-            &st.ssm_norm,
-            &st.ssm_out,
-        ] {
-            if let Some(s) = opt {
-                let s_end = s.offset + s.length;
-                if s_end > end {
-                    end = s_end;
-                }
-            }
-        }
-
-        // Per-head Q/K RMSNorm weights and shared expert gate input weight.
-        for opt in &[&st.attn_q_norm, &st.attn_k_norm, &st.ffn_gate_inp_shexp] {
-            if let Some(s) = opt {
-                let s_end = s.offset + s.length;
-                if s_end > end {
-                    end = s_end;
-                }
-            }
-        }
-
-        end as usize
+        let f = st.slice_fields();
+        f.mandatory
+            .iter()
+            .map(|(_, s)| s.offset + s.length)
+            .chain(
+                f.optional
+                    .iter()
+                    .filter_map(|(_, o)| o.as_ref())
+                    .map(|s| s.offset + s.length),
+            )
+            .max()
+            .unwrap_or(0) as usize
     }
 
     /// Dispatch a matmul_bytes_f32 kernel: out = W_bytes * x

@@ -7,6 +7,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Downloads take the bytes as stored, or refuse**: the HEAD and GET requests
+  send `Accept-Encoding: identity`, the CLI is built without ureq's transparent
+  decompression (its `gzip` and unused `json` features are off), and either
+  response is refused before a byte is staged unless every `Content-Encoding`
+  value it carries is a bare `identity` and every `Transfer-Encoding` value is
+  `chunked` — lists and values that cannot be read count as encoded. Before,
+  ureq asked for gzip by default: had the CDN
+  compressed both legs, it would have dropped `Content-Length` and the
+  completion check would have refused every download; an encoding ureq did not
+  decode (brotli, zstd) would have been stored and published as the model.
+  Hugging Face served the GGUF checked uncompressed whatever encodings were
+  offered, so both were latent. The same requests now give up after 60 s
+  without progress instead of waiting forever, and never follow a redirect
+  from https to plaintext http.
+- **Sub-tensor field lists cannot drift**: every consumer that enumerates
+  the sub-tensor fields — quant use, bounds, presence, Metal quant dispatch and
+  Metal byte extent — derives from one `SubtensorOffsets::slice_fields`
+  registry built on an exhaustive destructure, so a new field fails to compile
+  until it is named there instead of silently escaping a hand-copied list.
+
 ## [0.22.0] — 2026-09-02
 
 ### Fixed
@@ -20,6 +42,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   output-projection presence/geometry, Q/K-norm pairing, and norm/bias-extent
   rules as CUDA. `LayerIndex::validate` runs at parse for every consumer and is
   derived from the canonical slice list, so no sub-tensor field can be missed.
+  (Correction 2026-09-03: at this version that list was one of five hand-copied
+  enumerations of the 19 optional sub-tensor fields; a field added with a
+  mechanical `None` in every constructor compiled clean and escaped all four.
+  The next release derives all four from one exhaustive-destructure registry.)
 - **Convert gate**: the GDN pair-force rejects non-32-aligned tensors with a
   clean error instead of a quantizer panic (all four planner sites), and
   `ssm_out` geometry is validated for every target (previously Metal-only), so
