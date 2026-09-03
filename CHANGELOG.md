@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-03
+
 ### Fixed
 
 - **Downloads take the bytes as stored, or refuse**: the HEAD and GET requests
