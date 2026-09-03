@@ -1426,6 +1426,29 @@ fn bad_wo_rejected_at_load() {
 
         let provider = SyncWeightProvider::open(&path).unwrap();
         let hp = provider.lbc().header.hyperparams;
+
+        // Site 1 — resident preload.
+        {
+            let mut backend = MetalF32Backend::new().unwrap();
+            backend.set_global_tensors(
+                provider.embedding.clone(),
+                provider.final_norm.clone(),
+                provider.output_proj.clone(),
+            );
+            backend.init(&hp).unwrap();
+            let err = match backend.preload_weights_gpu_resident(&provider) {
+                Ok(()) => {
+                    panic!("wo_len {wo_len}: resident preload must fail Metal load validation")
+                }
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains(want),
+                "wo_len {wo_len}: preload rejection must carry {want:?}: {err}"
+            );
+        }
+
+        // Site 2 — streaming create_layer_buffer, reached via prefill.
         let mut backend = MetalF32Backend::new().unwrap();
         backend.set_global_tensors(
             provider.embedding.clone(),
@@ -1458,6 +1481,351 @@ fn bad_wo_rejected_at_load() {
     }
 }
 
+/// Which guard rule a MoE layer trips, or none.
+#[derive(Clone, Copy)]
+enum MoeDefect {
+    /// wo's index length disagrees with the dispatch geometry.
+    WoGeometry,
+    /// The fused QKV tensors sit in a K-quant scheme Metal has no kernels
+    /// for (uniform across wq/wk/wv, so only the scheme is at fault).
+    KQuantDense,
+    /// The layer carries fewer experts than the header declares.
+    ExpertCount,
+    /// Well-formed.
+    Sound,
+}
+
+impl MoeDefect {
+    fn refusal(self) -> [&'static str; 2] {
+        match self {
+            Self::WoGeometry => ["wo is", "the dispatch expects"],
+            Self::KQuantDense => ["tensor 'wq' is Q2_K", "no dense DECODE dispatch kernels"],
+            Self::ExpertCount => ["MoE layer carries 1 experts", "the model header"],
+            Self::Sound => ["", ""],
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::WoGeometry => "wo",
+            Self::KQuantDense => "kquant",
+            Self::ExpertCount => "experts",
+            Self::Sound => "sound",
+        }
+    }
+}
+
+/// A one-layer, two-expert MoE LBC carrying the given defect and nothing
+/// else. Returns the path and the number of experts the header declares.
+fn write_moe_layer_lbc(dir: &std::path::Path, defect: MoeDefect) -> (std::path::PathBuf, usize) {
+    use lumen_format::header::LbcHeader;
+    use lumen_format::hyperparams::{ModelHyperparams, RopeParams};
+    use lumen_format::index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
+    use lumen_format::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+    use lumen_format::writer::{write_lbc, GlobalTensors};
+
+    let (hidden, inter, heads, kv_heads, head_dim, vocab, num_experts) =
+        (64usize, 128usize, 2u32, 2u32, 32u32, 256usize, 2usize);
+    let q_dim = heads as usize * head_dim as usize;
+    let kv_dim = kv_heads as usize * head_dim as usize;
+    let q8_bytes = |n: usize| vec![0u8; n / 32 * 34];
+    let f32_bytes = |n: usize| {
+        let mut v = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            v.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        v
+    };
+    let mut blob = Vec::new();
+    let mut offset = 0u64;
+    let mut add = |data: Vec<u8>, quant: QuantScheme| {
+        let s = TensorSlice {
+            offset,
+            length: data.len() as u64,
+            quant,
+        };
+        blob.extend_from_slice(&data);
+        offset += s.length;
+        s
+    };
+    let qkv_quant = match defect {
+        MoeDefect::KQuantDense => QuantScheme::Q2_K,
+        _ => QuantScheme::Q8_0,
+    };
+    let wq = add(q8_bytes(q_dim * hidden), qkv_quant);
+    let wk = add(q8_bytes(kv_dim * hidden), qkv_quant);
+    let wv = add(q8_bytes(kv_dim * hidden), qkv_quant);
+    let wo = match defect {
+        MoeDefect::WoGeometry => TensorSlice {
+            length: 1024,
+            ..add(Vec::new(), QuantScheme::Q8_0)
+        },
+        _ => add(q8_bytes(hidden * q_dim), QuantScheme::Q8_0),
+    };
+    let attn_norm = add(f32_bytes(hidden), QuantScheme::F32);
+    let ffn_norm = add(f32_bytes(hidden), QuantScheme::F32);
+    let router_weight = add(f32_bytes(num_experts * hidden), QuantScheme::F32);
+    let zero = TensorSlice {
+        offset: 0,
+        length: 0,
+        quant: QuantScheme::F32,
+    };
+    let present = match defect {
+        MoeDefect::ExpertCount => 1,
+        _ => num_experts,
+    };
+    let experts: Vec<ExpertSlice> = (0..present)
+        .map(|_| ExpertSlice {
+            gate: add(q8_bytes(inter * hidden), QuantScheme::Q8_0),
+            up: add(q8_bytes(inter * hidden), QuantScheme::Q8_0),
+            down: add(q8_bytes(hidden * inter), QuantScheme::Q8_0),
+        })
+        .collect();
+    let subtensors = SubtensorOffsets {
+        wq,
+        wk,
+        wv,
+        wo,
+        bq: None,
+        bk: None,
+        bv: None,
+        w_gate: zero,
+        w_up: zero,
+        w_down: zero,
+        attn_norm,
+        ffn_norm,
+        router_weight: Some(router_weight),
+        experts: Some(experts),
+        shared_expert_gate: None,
+        shared_expert_up: None,
+        shared_expert_down: None,
+        attn_gate: None,
+        attn_post_norm: None,
+        ssm_a: None,
+        ssm_conv1d: None,
+        ssm_dt: None,
+        ssm_beta: None,
+        ssm_alpha: None,
+        ssm_norm: None,
+        ssm_out: None,
+        attn_q_norm: None,
+        attn_k_norm: None,
+        ffn_gate_inp_shexp: None,
+        layer_type: Some(0),
+    };
+    let layer_indices = vec![LayerIndex {
+        layer_offset_bytes: 0,
+        layer_length_bytes: blob.len() as u64,
+        subtensors,
+    }];
+    let hp = ModelHyperparams {
+        num_layers: 1,
+        num_heads: heads,
+        num_kv_heads: kv_heads,
+        head_dim,
+        hidden_dim: hidden as u32,
+        intermediate_dim: inter as u32,
+        vocab_size: vocab as u32,
+        max_seq_len: 512,
+        rope_params: Some(RopeParams::default()),
+        num_experts: Some(num_experts as u32),
+        num_active_experts: Some(1),
+        norm_eps: 1e-5,
+        rotary_dim: None,
+        rope_neox: false,
+        gdn: None,
+    };
+    let qd = QuantizationDescriptor {
+        scheme: QuantScheme::Q8_0,
+        group_size: QuantGroupSize::Group(32),
+        block_byte_size: 34,
+        scale_offset_in_block: Some(0),
+    };
+    let mut header = LbcHeader::new(hp, qd);
+    header.embedding.quant = QuantScheme::Q8_0;
+    header.output_proj.quant = QuantScheme::Q8_0;
+    header.final_norm.quant = QuantScheme::F32;
+    let globals = GlobalTensors {
+        embedding: q8_bytes(vocab * hidden),
+        final_norm: f32_bytes(hidden),
+        output_proj: q8_bytes(vocab * hidden),
+    };
+    let mut bytes = Vec::new();
+    write_lbc(
+        &mut bytes,
+        &header,
+        &layer_indices,
+        &globals,
+        &[blob.as_slice()],
+        None,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("moe_layer_{}.lbc", defect.tag()));
+    std::fs::write(&path, &bytes).unwrap();
+    (path, num_experts)
+}
+
+/// The engine's streaming `compute_layer` over a cache that already holds
+/// every expert of layer 0, which is the only way the expert-cache partial
+/// buffer is reached. The cache preconditions are asserted so an empty cache
+/// cannot let the call fall through to the full layer buffer.
+fn compute_layer_over_warmed_cache(
+    provider: &crate::weight::provider_sync::SyncWeightProvider,
+    path: &std::path::Path,
+    num_experts: usize,
+) -> (Result<(), crate::RuntimeError>, MetalF32Backend) {
+    use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype};
+    use crate::weight::cache::WeightProvider;
+    let hp = provider.lbc().header.hyperparams;
+    let mut backend = MetalF32Backend::new().unwrap();
+    backend.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    backend.configure_expert_cache(path, num_experts);
+    backend.init(&hp).unwrap();
+    {
+        let mut cache = backend.expert_cache.as_ref().unwrap().lock().unwrap();
+        let zero = lumen_format::index::TensorSlice {
+            offset: 0,
+            length: 0,
+            quant: lumen_format::quantization::QuantScheme::Q8_0,
+        };
+        let slices = lumen_format::index::ExpertSlice {
+            gate: zero,
+            up: zero,
+            down: zero,
+        };
+        for e in 0..num_experts as u32 {
+            assert!(
+                cache
+                    .insert((0, e), vec![0u8; 34], slices.clone())
+                    .is_none(),
+                "expert {e} must be cached without eviction"
+            );
+        }
+        assert!(
+            (0..num_experts as u32).all(|e| cache.contains(&(0, e))),
+            "every expert of layer 0 must be cached for the partial path"
+        );
+    }
+    let layer_view = provider.get_layer_raw(0).unwrap();
+    let mut x = ActivationBuffer::zeros(hp.hidden_dim as usize, ComputeDtype::F32);
+    let result = backend.compute_layer(0, &mut x, &layer_view, None, 0);
+    (result, backend)
+}
+
+/// Every Metal load site refuses each of the three rules the Metal sites
+/// wire, on a MoE layer: the resident preload, the streaming
+/// `create_layer_buffer` reached by prefill, and the expert-cache
+/// `create_partial_layer_buffer` reached by the engine's streaming
+/// `compute_layer` once every expert of the layer is cached. The third site
+/// is defence in depth for the shipped 256-expert model, whose expert cache
+/// never holds a whole layer; a decode pass over a warmed cache on a
+/// small-expert-count MoE is where it is live. A defect must be refused by
+/// name at all three sites, and a sound layer over the same warmed cache
+/// must create the partial buffer and not the full one, which pins the
+/// branch itself rather than only the cache state it reads.
+#[test]
+fn moe_layer_defects_rejected_at_every_metal_load_site() {
+    use crate::compute::ComputeBackend;
+    use crate::weight::cache::WeightProvider;
+    use crate::weight::provider_sync::SyncWeightProvider;
+
+    for defect in [
+        MoeDefect::WoGeometry,
+        MoeDefect::KQuantDense,
+        MoeDefect::ExpertCount,
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("lumen_moe_{}_{}", defect.tag(), std::process::id()));
+        let (path, num_experts) = write_moe_layer_lbc(&dir, defect);
+        let provider = SyncWeightProvider::open(&path).unwrap();
+        let hp = provider.lbc().header.hyperparams;
+        let [want, want2] = defect.refusal();
+        let check = |site: &str, result: Result<(), crate::RuntimeError>| {
+            let err = match result {
+                Ok(()) => panic!("{site}: {want:?} must fail Metal load validation"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(want) && err.contains(want2),
+                "{site}: refusal must carry {want:?} and {want2:?}: {err}"
+            );
+        };
+        let fresh = || {
+            let mut backend = MetalF32Backend::new().unwrap();
+            backend.set_global_tensors(
+                provider.embedding.clone(),
+                provider.final_norm.clone(),
+                provider.output_proj.clone(),
+            );
+            backend
+        };
+        let kv = || {
+            crate::kv::KvCache::new(crate::kv::KvCacheConfig {
+                max_seq_len: hp.max_seq_len as usize,
+                num_layers: hp.num_layers as usize,
+                num_kv_heads: hp.num_kv_heads as usize,
+                head_dim: hp.head_dim as usize,
+                precision: crate::kv::KvPrecision::F32,
+            })
+            .unwrap()
+        };
+
+        // Site 1 — resident preload.
+        {
+            let mut backend = fresh();
+            backend.init(&hp).unwrap();
+            check("preload", backend.preload_weights_gpu_resident(&provider));
+        }
+        // Site 2 — streaming create_layer_buffer via prefill.
+        {
+            let mut backend = fresh();
+            backend.init(&hp).unwrap();
+            let mut kv = kv();
+            check(
+                "prefill",
+                backend
+                    .prefill(&[1, 2, 3], &provider as &dyn WeightProvider, &mut kv)
+                    .map(|_| ()),
+            );
+        }
+        // Site 3 — expert-cache partial buffer via compute_layer.
+        let (result, _backend) = compute_layer_over_warmed_cache(&provider, &path, num_experts);
+        check("partial", result);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Positive control: a sound layer over the same warmed cache creates the
+    // partial buffer and not the full one, then stops at attention for want
+    // of a KV view — so the branch the defects were refused on is the
+    // partial one.
+    let dir = std::env::temp_dir().join(format!("lumen_moe_sound_{}", std::process::id()));
+    let (path, num_experts) = write_moe_layer_lbc(&dir, MoeDefect::Sound);
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let (result, backend) = compute_layer_over_warmed_cache(&provider, &path, num_experts);
+    std::fs::remove_dir_all(&dir).ok();
+    let err = result.expect_err("a sound layer must pass validation and stop at attention");
+    assert!(
+        err.to_string()
+            .contains("KV cache view required for attention"),
+        "sound layer must reach attention: {err}"
+    );
+    let scratch = backend.scratch.lock().unwrap();
+    let s = scratch.as_ref().unwrap();
+    assert!(
+        s.moe_partial_buf_cache[0].is_some(),
+        "partial buffer must be bound"
+    );
+    assert!(
+        s.layer_buf_cache[0].is_none(),
+        "full layer buffer must not be bound"
+    );
+}
+
 /// A `--target generic` LBC keeps K-quant layer tensors intact (correct for
 /// CUDA/CPU); the Metal cache prefers the `-metal` variant but falls back to
 /// this generic artifact when none exists, and the Metal dense dispatch has
@@ -1465,9 +1833,11 @@ fn bad_wo_rejected_at_load() {
 /// F32-reading pipeline and produce silent gibberish (documented at the
 /// cache lookup and the validator itself). This is a BENIGN-reachable
 /// correctness guard, so its wiring must stay pinned: this test drives a
-/// K-quant dense tensor through BOTH reachable Metal load sites (resident
-/// preload and the streaming create_layer_buffer via prefill) and asserts
-/// each refuses. Removing either `validate_layer_quants` call turns the
+/// K-quant dense tensor through the two dense-reachable Metal load sites
+/// (resident preload and the streaming create_layer_buffer via prefill) and
+/// asserts each refuses; the expert-cache partial site is covered by
+/// `moe_layer_defects_rejected_at_every_metal_load_site`. Removing either
+/// `validate_layer_quants` call turns the
 /// clean refusal into silent-wrong output (or a later, differently-worded
 /// failure) and fails this test.
 #[test]

@@ -948,3 +948,169 @@ pub fn validate_layer_plan(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
+    use crate::quantization::QuantScheme;
+
+    fn sl(length: u64, quant: QuantScheme) -> TensorSlice {
+        TensorSlice {
+            offset: 0,
+            length,
+            quant,
+        }
+    }
+
+    fn layer(layer_type: Option<u8>) -> SubtensorOffsets {
+        let z = sl(0, QuantScheme::F32);
+        SubtensorOffsets {
+            wq: z,
+            wk: z,
+            wv: z,
+            wo: z,
+            bq: None,
+            bk: None,
+            bv: None,
+            w_gate: z,
+            w_up: z,
+            w_down: z,
+            attn_norm: z,
+            ffn_norm: z,
+            router_weight: None,
+            experts: None,
+            shared_expert_gate: None,
+            shared_expert_up: None,
+            shared_expert_down: None,
+            attn_gate: None,
+            attn_post_norm: None,
+            ssm_a: None,
+            ssm_conv1d: None,
+            ssm_dt: None,
+            ssm_beta: None,
+            ssm_alpha: None,
+            ssm_norm: None,
+            ssm_out: None,
+            attn_q_norm: None,
+            attn_k_norm: None,
+            ffn_gate_inp_shexp: None,
+            layer_type,
+        }
+    }
+
+    #[test]
+    fn attn_vector_extents_pin_every_field_and_exempt_gdn() {
+        let (head_dim, q_dim, kv_dim) = (4usize, 8usize, 2usize);
+        let f32_bytes = |elems: usize| sl(elems as u64 * 4, QuantScheme::F32);
+        type Set = fn(&mut SubtensorOffsets, TensorSlice);
+        let fields: [(&str, usize, Set); 5] = [
+            ("attn_q_norm", head_dim, |st, s| st.attn_q_norm = Some(s)),
+            ("attn_k_norm", head_dim, |st, s| st.attn_k_norm = Some(s)),
+            ("bq", q_dim, |st, s| st.bq = Some(s)),
+            ("bk", kv_dim, |st, s| st.bk = Some(s)),
+            ("bv", kv_dim, |st, s| st.bv = Some(s)),
+        ];
+        assert!(validate_attn_vector_extents(0, &layer(Some(0)), head_dim, q_dim, kv_dim).is_ok());
+        for (name, elems, set) in fields {
+            let mut st = layer(Some(0));
+            set(&mut st, f32_bytes(elems));
+            assert!(
+                validate_attn_vector_extents(0, &st, head_dim, q_dim, kv_dim).is_ok(),
+                "{name}: exact length must pass"
+            );
+            for wrong in [elems - 1, elems + 1] {
+                let mut st = layer(Some(0));
+                set(&mut st, f32_bytes(wrong));
+                let err =
+                    validate_attn_vector_extents(3, &st, head_dim, q_dim, kv_dim).unwrap_err();
+                assert!(
+                    err.contains(&format!("layer 3: {name} is")),
+                    "{name} at {wrong}: wrong length must be refused by name: {err}"
+                );
+            }
+            let mut st = layer(Some(1));
+            set(&mut st, f32_bytes(elems + 1));
+            assert!(
+                validate_attn_vector_extents(0, &st, head_dim, q_dim, kv_dim).is_ok(),
+                "{name}: GDN layers carry none of these and are exempt"
+            );
+        }
+        let mut st = layer(Some(0));
+        st.bq = Some(f32_bytes(1));
+        let err = validate_attn_vector_extents(0, &st, head_dim, usize::MAX, kv_dim).unwrap_err();
+        assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn gdn_conv1d_pins_qkv_rows_times_kernel_and_exempts_others() {
+        let (rows, kernel) = (6usize, 4usize);
+        let want = (rows * kernel * 4) as u64;
+        let mut st = layer(Some(1));
+        assert!(
+            validate_gdn_conv1d(0, &st, rows, kernel).is_ok(),
+            "absent passes"
+        );
+        st.ssm_conv1d = Some(sl(0, QuantScheme::F32));
+        assert!(
+            validate_gdn_conv1d(0, &st, rows, kernel).is_ok(),
+            "zero-length sentinel passes"
+        );
+        st.ssm_conv1d = Some(sl(want, QuantScheme::F32));
+        assert!(
+            validate_gdn_conv1d(0, &st, rows, kernel).is_ok(),
+            "exact passes"
+        );
+        for wrong in [want - 4, want + 4] {
+            st.ssm_conv1d = Some(sl(wrong, QuantScheme::F32));
+            let err = validate_gdn_conv1d(5, &st, rows, kernel).unwrap_err();
+            assert!(
+                err.contains("layer 5: ssm_conv1d is") && err.contains("= 96 bytes"),
+                "{wrong}: {err}"
+            );
+        }
+        st.layer_type = Some(0);
+        assert!(
+            validate_gdn_conv1d(0, &st, rows, kernel).is_ok(),
+            "non-GDN layers are exempt"
+        );
+        st.layer_type = Some(1);
+        let err = validate_gdn_conv1d(0, &st, usize::MAX, 2).unwrap_err();
+        assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn expert_bank_requires_one_quant_per_role_across_experts() {
+        let e = |g, u, d| ExpertSlice {
+            gate: sl(8, g),
+            up: sl(8, u),
+            down: sl(8, d),
+        };
+        let mut st = layer(Some(0));
+        assert!(validate_expert_bank(&st).is_ok(), "no experts passes");
+        st.experts = Some(vec![]);
+        assert!(validate_expert_bank(&st).is_ok(), "empty bank passes");
+        let q8 = QuantScheme::Q8_0;
+        let q4 = QuantScheme::Q4_0;
+        st.experts = Some(vec![e(q8, q8, q4), e(q8, q8, q4)]);
+        assert!(validate_expert_bank(&st).is_ok(), "consistent bank passes");
+        st.experts = Some(vec![e(q8, q8, q8), e(q8, q4, q8)]);
+        let err = validate_expert_bank(&st).unwrap_err();
+        assert!(
+            err.starts_with("expert 1: gate is Q8_0 but up is Q4_0"),
+            "{err}"
+        );
+        st.experts = Some(vec![e(q8, q4, q8), e(q8, q4, q8)]);
+        let err = validate_expert_bank(&st).unwrap_err();
+        assert!(
+            err.starts_with("expert 0: gate is Q8_0 but up is Q4_0"),
+            "{err}"
+        );
+        st.experts = Some(vec![e(q8, q8, q8), e(q8, q8, q4)]);
+        let err = validate_expert_bank(&st).unwrap_err();
+        assert!(
+            err.starts_with("expert 1: down is Q4_0 but expert 0's is Q8_0"),
+            "{err}"
+        );
+    }
+}

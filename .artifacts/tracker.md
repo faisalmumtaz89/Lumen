@@ -28,6 +28,45 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R9-ISSUE-4 · Load-site guard wiring pinned at every site, on both backends — CLOSED (mutation-proven; CUDA on A100)**
+  — what was pinned before: the guard RULES, and the Metal streaming
+  `create_layer_buffer` site (via prefill) and resident preload only for
+  K-quant; what was not: the resident preload for the geometry rule, the
+  expert-cache `create_partial_layer_buffer` site (reachable only from the
+  engine's streaming `compute_layer` once every expert of a layer is cached —
+  no test ever configured a cache), the CUDA `upload_layer_weights` site, and
+  three rules with no DIRECT unit test (`validate_attn_vector_extents`,
+  `validate_gdn_conv1d`, `validate_expert_bank` — pinned only through
+  `validate_attention_dims` in the Metal tests, or only under `--features
+  cuda`; an earlier draft of this entry called them "unpinned", which a
+  name-only grep suggested and the attacker refuted). Now: `bad_wo_rejected_at_load` drives the
+  resident preload too (preload-site `validate_attention_dims` call
+  neutralised → its leg fails); `moe_layer_defects_rejected_at_every_metal_load_site`
+  builds a 2-expert MoE LBC with one of three defects (wo geometry, K-quant
+  QKV, one expert instead of two) and drives each through all three sites —
+  preload, prefill → `create_layer_buffer`, and the expert-cache
+  `create_partial_layer_buffer` reached only by the engine's streaming
+  `compute_layer` over a cache holding every expert of the layer; all nine
+  (rule × site) guard removals fail at their own site, and a positive control
+  (a sound layer over the same warmed cache binds the partial buffer and not
+  the full one) pins the branch itself — forcing `use_partial` false fails
+  it. That third site is defence in depth: the shipped 256-expert model's
+  cache (num_layers × 4) never holds a whole layer. A first draft that drove
+  `prefill` was proven by mutants to take the full site and was rewritten; `serving_rules::tests` pin the three rules in
+  both directions with exemptions and overflow (mutants: bk check dropped,
+  GDN exemption dropped, `!=`→`<` — survived until a longer-than-expected
+  case was added — gate/up check off: all killed); CUDA
+  `malformed_layer_rejected_before_upload` writes an LBC, opens it through
+  the production provider and calls `upload_layer_weights` on a device with
+  a mis-sized q-norm (pair present) and a wo whose length disagrees with the
+  projection geometry — refused by the vector-extents and projection rules
+  respectively, verified on Modal A100 (evidence-v0230/issue4/modal-cuda-unit.log;
+  two earlier runs failed on the FIXTURE — a lone q-norm trips the half-pair
+  rule first, and the provider serves the layer dequantized so the message
+  reports the F32 size — both kept as logs). Panics locally inside cudarc's
+  loader like every GPU test here. runtime 655 (Metal serial) / format 85 /
+  format+convert+cli 365 / cuda type-check clean.
+
 - **R9-ISSUE-3 · Downloads take the bytes as stored, or refuse — CLOSED (mutation-proven, 3 adversarial rounds)**
   — lumen-cli's ureq 2.12.1 ran with default features, so every HEAD/GET sent
   `accept-encoding: gzip` (request.rs:93-110) and, had the CDN complied, ureq
