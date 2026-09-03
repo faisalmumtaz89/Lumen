@@ -28,6 +28,85 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R10-PERF-TABLE · the v0.23.0 report's Metal perf rows came from the forbidden suite column — CORRECTED (2026-09-03, second correction)**
+  — servelumen round 10 refuted the perf section: the Metal decode figures (40.8 / 23.5) were
+  copied from `metal_suite.sh`'s decode column, whose own header says to publish decode numbers
+  ONLY from the audited battery, never from that column; Q8 sits under the open PERF-Q8-METAL
+  quarantine and was reported PASS with no mention; the σ floor cited (1.09 %) is CUDA's while
+  Metal's own A/A record reads σ_d 0.177 % (n = 10); and the harness meta recorded a stale binary
+  self-stamp (the D-1 defect). All four verified. First correction (LKA gate `gate-38-q4-metal`,
+  n_pairs 10, on a local release build of ec6a865) was itself refuted by the round-10 attacker on
+  five points, all confirmed and rewritten: the gate's own verdict is `discard` (the known-positive
+  control lever landed +2.27 % [1.96, 2.57] against a 2 % floor — an instrument caveat that must
+  travel with the number); the published 40.58 is the mean of all ten candidate samples while the
+  harness warms only the baseline arm (12 samples, last 10 used) — disclosed with the arrays (last
+  eight of the candidate average 40.74); "no decode-path code changed" was false (a memory barrier
+  in the fused GDN decode encoder among 1,330 Metal lines across ten PRs between a9fd84f and
+  ec6a865) and is withdrawn; the 2 % floor governs only a paired A/B within one run, so 40.58 vs
+  the prior 40.95 (`a9fd84f-dirty`, 2026-08-24) is stated as not comparable under this protocol;
+  MODE-1 is named as the open state that bounds any Metal number, with the very-long arm's 36.5
+  sample and zero-spanning CI disclosed. Q8 struck (quarantined); CUDA rows labelled as the suite
+  column with no σ attached (its dispersion is uncalibrated). Residual ledgered:
+  R10-RESIDUAL-LKA-WARMUP (the harness's asymmetric warm-up). Report and shared page updated.
+- **R10-D1 · stale version stamps — FIXED for commits, tags, packing and own-crate edits; cross-crate dirtiness ledgered**
+  — both `build.rs` files watched only `{git_dir}/HEAD`, a symbolic ref a same-branch commit never
+  rewrites, so `lumen --version` and every PRE-001 identity record went stale silently. Three
+  attempts, each refuted by the round-10 attacker until the last: the first declared a missing
+  `packed-refs` (Cargo treats a missing declared path as always changed → every build re-ran the
+  script and relinked the measured binary); the second declared only existing paths, which bakes in
+  whichever of loose ref / packed-refs exists at build time (a commit after `git pack-refs` creates
+  an undeclared loose ref → stale) and, by declaring any path, replaced Cargo's default source watch
+  so a dirty tree stamped a clean commit; tags were never watched. Now: `{git_dir}/HEAD`, the common
+  dir's whole `refs` directory (loose refs, tags, refs re-created after a pack), `packed-refs` when
+  it exists, and the crate's own `src` and `Cargo.toml` — existing paths only. Verified in a
+  throwaway worktree with the committed scripts: no-op rebuild 0 script runs; own-crate edit →
+  stamp `-dirty` matches git; `git pack-refs --all` then a commit → stamp follows; a new tag → stamp
+  follows; linked worktree identical; detached HEAD fine. Residual R10-RESIDUAL-STAMP-SCOPE: an
+  uncommitted edit in ANOTHER crate makes `git describe` dirty without re-running this crate's script,
+  so `-dirty` is reliable only for the binary's own crate; harness records take the tree state from
+  git directly (metal-results.meta records `commit` separately).
+- **R10-D2/D3/D4 · download guard hardening — FIXED**
+  — D-2 mixed header: a readable `identity` beside an unreadable second value passed
+  (`headers_names()` saw the name, `all()` dropped the unreadable value); the value count is now
+  held against the number of header lines carrying that name. D-3 colonless header line: ureq's
+  `into_header` accepts a line with no colon and every value accessor then slices past its end
+  (a panic inside the parser, pre-existing for `content-length`, trigger set widened by round 9's
+  encoding guard); header reads are fenced with `catch_unwind` (the release profile unwinds) and
+  a panic is a refusal. D-4 unsolicited 206: no status check existed, so a partial response's
+  Content-Length would have satisfied the completion check; only a complete 200 is stored.
+  The HEAD hop stores nothing and its size is advisory, so a non-200, encoded or malformed HEAD
+  now only loses that size instead of failing the download (the first fix applied the 200 rule to
+  HEAD too and would have refused origins answering HEAD with 204 — attacker finding, corrected);
+  the GET answers to every rule. The panic fence is needed at BOTH the call (ureq reads some
+  headers while building the response) and the value accessors (others on lookup), shown by one
+  run failing each way; the panic hook is left alone (it is process-global — a first attempt that
+  silenced it also swallowed the failure text of this crate's own parallel tests, the mutation
+  evidence itself; attacker finding, reverted), so the parser's one panic line prints before the
+  refusal. Out of reach and ledgered (R10-RESIDUAL-HEADER-DROP): any header line whose name holds a
+  non-token byte (a space before the colon, an obsolete folded continuation, a high byte) is dropped
+  by ureq before any header view exists. Two `Content-Length` lines must agree (the first gates the
+  completion check) — test `conflicting_content_lengths_are_refused`, mutant killed. A HEAD that
+  errors (4xx/5xx, dead host) also only loses the advisory size, and the loss is printed. Tests:
+  `identity_beside_an_unreadable_value_is_refused`, `colonless_header_line_is_refused_not_a_panic`,
+  `partial_content_is_refused`, `odd_head_only_loses_the_advisory_size` (204, 500, colonless),
+  `encoded_head_size_is_ignored`, `conflicting_content_lengths_are_refused`. Mutants: count check
+  dropped, fence made transparent, status check dropped, length agreement dropped, HEAD hard-fail
+  restored — each fails its own test. D-5 (cache never revalidates)
+  ledgered as R10-RESIDUAL-CACHE-REVALIDATE.
+- **R10-DOCS · round-10 documentation residuals — CLOSED**
+  — the missed erratum (R8-ISSUE-8 clause (ii): `reclaim_stale_parts` has zero hits at 33ace97^,
+  so "never ran" described no prior tree) carries its marker and the REMEDIATION-HISTORY policy is
+  extended from action verbs to past-state claims; the stale "deliberately not pinned" note is
+  superseded by R9-ISSUE-4; the R8-ISSUE-9 tally note is corrected (expert bank is not a third
+  path; transitive count 13; call sites cited instead of forwarder definitions); the CHANGELOG
+  "five … four … four" sentence reads five; the formula template's comment no longer contains
+  the substitution tokens (the formula already published to the tap carried the garble and is
+  regenerated from the fixed template and re-pushed); the report's errata labels, rounds claim,
+  residual list and premise wording are corrected; the writer's hand-enumeration, the manual tap and the formula style notes
+  are ledgered; every reviewer transcript of this session is retained under evidence-v0230/agent-transcripts
+  with a manifest (re-copied after the round-10 rounds; count and bytes in MANIFEST.txt); the merged PR #80 message's "is now refused at
+  the resident preload" (the call already existed; the pin is what was new) is ledgered as an
+  erratum here since a merged message cannot be edited.
 - **R9-ISSUE-5 · four small corrections — CLOSED (each sentence verified against the tree)**
   — (a) the CUDA resident-preload comment now names the three header-level
   checks that precede `build_moe_meta` (non-zero slice lengths, expert count,
@@ -223,7 +302,7 @@ item; close with the shipping release.
   independently; both files byte-identical after restore. A third
   `validate_layer_quants` site exists — `create_partial_layer_buffer`
   (mod.rs:1051, MoE partial-decode) — deliberately not pinned because it is
-  unreachable before 993/209 reject: partial decode requires all experts already
+  unreachable before 993/209 reject [superseded 2026-09-03: pinned by `moe_layer_defects_rejected_at_every_metal_load_site`, which reaches it through the engine's `compute_layer` over a warmed expert cache; every guard removal there fails — see R9-ISSUE-4]: partial decode requires all experts already
   LFU-cached, which only happens post-warmup after prior full decodes that each
   passed the pinned sites, so a K-quant expert model dies at 993/209 on its first
   MoE-layer decode and 1051 is only a downstream re-check. The K-quant MoE-EXPERT
@@ -544,7 +623,7 @@ item; close with the shipping release.
   "round-9" — substance unaffected. Policy: hoisted / moved / removed / deleted /
   replaced / re-ordered is stated only when the cited commit carries the matching
   `-` hunk; "restored" cites the commit that removed it; intra-PR sequence is
-  labelled intra-PR; anything else is stated as an addition.
+  labelled intra-PR; anything else is stated as an addition. [2026-09-03 extension: a PAST-STATE claim about the pre-PR tree ("X never ran", "Y was bypassed") takes the same test — the thing must exist at the parent commit — because the remaining instance found in round 10 (R8-ISSUE-8 clause (ii)) carried no action verb and slipped the verb-keyed reading.]
 - **ROUNDING · pattern named and closed (round 7, Category 4)** — three
   historically published ratios rounded TOWARD Lumen: 0.892 (true
   0.891), 0.727 (true 0.726), 1.15 (true 1.145; the v0.11.0-metal
@@ -706,7 +785,7 @@ item; close with the shipping release.
   reuse — ledgered); (ii) the production wrappers' cache-hit
   short-circuits bypassed download_gguf entirely, so post-publish
   reclamation never ran — both wrappers now call the exported
-  reclaim_stale_parts before their cache-hit returns. Codex r6 then
+  reclaim_stale_parts before their cache-hit returns [erratum 2026-09-03: intra-PR narrative — `reclaim_stale_parts` has zero hits at 33ace97^; the function and both wrapper calls arrived in #69 itself, so "never ran" describes no prior tree — see REMEDIATION-HISTORY, policy extended below]. Codex r6 then
   caught (i) a HARD bug in the fd-hash change itself — staging was
   opened write-only, so the same-fd hash read returned EBADF [erratum 2026-09-03: intra-PR state — the parent hashed by pathname — see REMEDIATION-HISTORY] and every
   cold download would have failed (fixed with .read(true); regression
@@ -728,6 +807,61 @@ item; close with the shipping release.
 
 ## Verified-latent / accepted residuals (each entry states its own containment — a guard, unreachability, or an accepted exposure; do not fix unprompted)
 
+- **R10-RESIDUAL-STAMP-SCOPE · `-dirty` in the version stamp covers the binary's own crate only (2026-09-04)** —
+  the build script re-runs on its crate's `src`/`Cargo.toml`, HEAD, refs and packed-refs; an
+  uncommitted edit in another workspace crate makes `git describe --dirty` dirty without re-running
+  it, so the stamp can read clean on a dirty tree — and, proven by the round-10 verifier, a
+  semantic edit in another crate produces a byte-different binary (sha 3928e40c… → 0625d75c…) under
+  the same stamp, so the stamp is not a build identity; the workspace-root Cargo.toml is outside the
+  watch too. Containment, checked per record writer: LKA verdicts record `rev-parse --short HEAD`
+  plus a `-dirty` suffix from `git status --porcelain` (lka/lka/backends.py `derive_git_hash`,
+  best-effort and overridable by `--git-hash`), and certification refuses a dirty checkout through
+  `identity.py`'s `clean` probe; metal-results.meta records the commit (no dirtiness) and the
+  binary's `sha256`, which is what separates two builds of the same commit; cuda-results.meta
+  recorded only the version stamp until 2026-09-04 — the very field D-1 can make stale — and now
+  records `path`, `sha256` and `git describe --dirty` as well (validation/cuda-modal/cuda_suite.sh).
+  Watching the whole workspace from the build script would rescan every source file on every build.
+  Its own item if a full-tree stamp is wanted.
+- **R10-RESIDUAL-HEADER-DROP · a header line ureq cannot parse is invisible to the download guard (2026-09-03)** —
+  ureq's `into_header` rejects any line whose pre-colon bytes hold a non-token character (a space
+  before the colon — `Content-Encoding : gzip` — an obsolete folded continuation starting with
+  SP/HTAB, a high byte) and `response.rs` drops the line before `headers_names()` or `all()` exist,
+  so such a line can carry a coding the guard never sees (`Transfer-Encoding: chunked` plus a folded
+  ` gzip` would be de-chunked once and stored as gzip bytes). Containment: a hostile origin past TLS
+  can already serve arbitrary bytes, so this widens no attacker capability; Hugging Face and its CDN
+  emit well-formed headers; the sidecar sha256 is recorded. Closing it needs raw header access, i.e.
+  a client change. Found by the round-10 attacker (obs-fold first, the wider class in round 2).
+- **R10-RESIDUAL-LKA-WARMUP · the LKA gate warms only the baseline arm (2026-09-03)** — raw
+  `ab_*.json` hold 12 baseline and 10 candidate samples per shape; the reported means use the
+  baseline's last 10 and every candidate sample, so a candidate mean carries its ramp (medium:
+  40.58 over ten, 40.74 over the last eight). Effect per shape in this run, published vs
+  warm-matched: short 2.50 → 2.77 %, medium 2.27 → 2.67 %, very long 1.75 → 1.41 % — so the
+  asymmetry is not conservative in general; disclosed wherever a candidate-arm figure is published.
+  Locus: `Lumen-Workbench/autoresearch/harness/runner.py` warms only `run_a` (`lka/lka/paired.py`
+  already warms both arms); its own item.
+- **R10-RESIDUAL-CACHE-REVALIDATE · a cached model file is never revalidated (2026-09-03)** — any
+  non-empty cached file is returned on the cache-hit path without a sidecar or content check, so a
+  legacy or corrupted file persists until removed by hand. Containment: the download path refuses
+  encoded, partial and malformed responses before staging, so new files are published only after the
+  completion check; the sidecar records the sha256 of what was stored. Revalidation is a cache design
+  change, its own item.
+- **R10-RESIDUAL-WRITER-ENUM · the LBC writer hand-enumerates the sub-tensor fields (2026-09-03)** —
+  `writer.rs` builds the presence bitmask and the serialization block field by field, outside the
+  `slice_fields` registry (`reader.rs` decodes the same bitmask by hand); a new optional field must be
+  added in all three. Containment: a field present in the registry but missing from the writer is
+  silently never written to disk and reads back as absent — a wire-format omission that the
+  validation registry cannot see; the reader/writer round-trip tests catch a field written but not
+  read. A registry-derived
+  pin of the bitmask's bit order is the recommended fix; the bit order is load-bearing and must not
+  be re-derived at runtime.
+- **R10-RESIDUAL-TAP-MANUAL · the Homebrew tap is updated by hand (2026-09-03)** — release.yml
+  attaches a generated formula but does not push it to `faisalmumtaz89/homebrew-lumen`; the tap goes
+  stale until the copy is repeated. Containment: RELEASING.md lists the step; the formula's
+  `depends_on macos: :sonoma` is the true floor (the Metal shaders compile at MSL 3.1, metal/ffi.rs)
+  even though the binary's load command reads minos 11.0. Auto-push is deferred per packaging/ci/SETUP.md.
+- **R10-RESIDUAL-FORMULA-STYLE · `brew audit` style notes on the generated formula (2026-09-03)** —
+  a redundant `version` line and a missing blank line after the magic comments, both from
+  packaging/homebrew/lumen.rb.in. Cosmetic; installs unaffected.
 - **R9-RESIDUAL-EXPERT-BANK-STREAMING · `validate_expert_bank` runs only on the CUDA resident preload (2026-09-03)** —
   the rule lives inside `build_moe_meta` (cuda/moe.rs:238), whose only production caller is the resident
   preload (backend_impl.rs); the streaming `compute_layer` → `upload_layer_weights` path never invokes it.
@@ -800,7 +934,7 @@ item; close with the shipping release.
 - **R8-ISSUE-9 · load-point guard WIRING not mutation-pinned (same class as
   MOE-EXPERT-COUNT-WIRING-TEST above)** — servelumen round-8 observed that
   commenting out the load-site guard calls leaves the suite green. Full call-site
-  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named) [2026-09-03: that tally counts only the rules this finding named. Counting every serving_rules rule a CUDA load path invokes: the streaming `upload_layer_weights` runs 6 (projection geometry for non-CT4 slices via upload_projection_tensor, mandatory presence, non-zero slice lengths, expert count, attention-vector extents, GDN conv1d — gpu_buffers.rs:853/860/1136/1159/1161/1250) and the resident preload runs 4 of its own before calling it (non-zero slice lengths, expert count, attention-vector extents at backend_impl.rs:18880/18881/18886, then expert bank inside build_moe_meta, moe.rs:238 — build_moe_meta is preload-only, so the streaming path never reaches `validate_expert_bank`), i.e. 10 (path, rule) pairs; the review note's "8" is the same tree under a narrower scope, the guards written at the two load sites themselves (5 + 3) — see R9-ISSUE-5]: Metal
+  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named) [2026-09-03: that tally counts only the rules this finding named. Counting every serving_rules rule a CUDA load path invokes, at the call sites: the streaming `upload_layer_weights` runs 6 (non-zero slice lengths at gpu_buffers.rs:1158; expert count at 1159; attention-vector extents at 1161; mandatory presence at 1247; GDN conv1d at 1250; projection geometry per non-CT4 tensor through the helper upload_projection_tensor (rule call at 881; helper called at 1264/1293-1295/1325-1341/1428, the wrapper body at 853-860)); the resident preload runs 4 of its own (non-zero slice lengths, expert count, attention-vector extents at backend_impl.rs:18880/18881/18886, then expert bank inside build_moe_meta, cuda/moe.rs:238 — build_moe_meta is preload-only, so the streaming path never reaches `validate_expert_bank`) and then calls `upload_layer_weights`, so attributed transitively it invokes 10 (7 distinct rules: its 4 own plus upload's 6, sharing 3); the two paths total 16 rule invocations and 13 distinct (path, rule) pairs; a separate count, rule-sites once each, is also 10 (upload's 6 + preload's 4 own) — a different quantity from the preload's transitive 10. This bracket's "13" is a different count from the entry's own "13 = 9 Metal + 4 CUDA", which covers three named rules on both backends. The review note's "8" is the guards written at the two sites themselves (5 + 3). Corrected in round 10: an earlier wording called expert-bank a third path and cited three forwarder definitions instead of call sites — see R9-ISSUE-5]: Metal
   `validate_layer_quants` + `validate_attention_dims` + `validate_expert_count`
   at `create_layer_buffer` (mod.rs:993/997/998), `create_partial_layer_buffer`
   (mod.rs:1051/1055/1056), and resident preload (gpu_resident.rs:209/210/211);
