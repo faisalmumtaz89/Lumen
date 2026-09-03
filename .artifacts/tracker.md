@@ -28,6 +28,30 @@ item; close with the shipping release.
 
 ## Closed this round
 
+- **R9-ISSUE-5 · four small corrections — CLOSED (each sentence verified against the tree)**
+  — (a) the CUDA resident-preload comment now names the three header-level
+  checks that precede `build_moe_meta` (non-zero slice lengths, expert count,
+  attention-vector byte extents) and says which validators still run later
+  inside `upload_layer_weights` (mandatory presence, GDN conv1d extent,
+  projection geometry per non-CT4 tensor); (b) the R8-ISSUE-9 tally "13 = 9
+  Metal + 4 CUDA" is qualified in place: it counts only the rules that finding
+  named; counting every rule a CUDA load path invokes gives 10 (path, rule)
+  pairs (streaming upload 6; resident preload 4 including expert bank inside
+  build_moe_meta, which is preload-only — the streaming path never reaches
+  `validate_expert_bank`), and the review note's "8" is the same tree under a
+  narrower scope, the guards written at the two load sites themselves (5 + 3);
+  a first draft of this note called 8 "not reproducible" and was refuted by
+  the verifier, who also re-parsed the 16 MiB GGUF header from scratch and
+  reproduced 10,990,900 as the end of the tensor-info table (data starts at
+  10,990,912 after the 32-byte alignment pad); the entry's own stale
+  backend_impl.rs line citations are bracketed with today's lines;
+  (c) the resolution report's verification grep for the nonexistent server
+  flag is scoped to `crates/lumen-server/` (the workspace-wide grep has eight
+  legitimate hits in lumen-cli and the KV docs, since `--kv-disk-space-mb` is a
+  real CLI flag; the finding was a server message pointing at it); (d) the MoE
+  geometry verification doc records the header-complete offset 10,990,900 with
+  its source line. Evidence: evidence-v0230/issue5/.
+
 - **R9-ISSUE-4 · Load-site guard wiring pinned at every site, on both backends — CLOSED (mutation-proven; CUDA on A100)**
   — what was pinned before: the guard RULES, and the Metal streaming
   `create_layer_buffer` site (via prefill) and resident preload only for
@@ -704,6 +728,12 @@ item; close with the shipping release.
 
 ## Verified-latent / accepted residuals (each entry states its own containment — a guard, unreachability, or an accepted exposure; do not fix unprompted)
 
+- **R9-RESIDUAL-EXPERT-BANK-STREAMING · `validate_expert_bank` runs only on the CUDA resident preload (2026-09-03)** —
+  the rule lives inside `build_moe_meta` (cuda/moe.rs:238), whose only production caller is the resident
+  preload (backend_impl.rs); the streaming `compute_layer` → `upload_layer_weights` path never invokes it.
+  Containment: the converter emits one quant per expert role (the rule's own premise), and Metal carries an
+  inline twin inside `validate_layer_quants`; found by the R9-ISSUE-5 verifier while re-deriving the CUDA
+  guard tally. Wiring it into the streaming path is its own item.
 - **R9-RESIDUAL-CHUNKED · chunked-but-complete transfer refused (2026-09-03)** — a
   `Transfer-Encoding: chunked` response with no `Content-Length` yields
   `verify_complete_transfer(None, _)` → refusal even when the terminal 0-chunk
@@ -770,13 +800,13 @@ item; close with the shipping release.
 - **R8-ISSUE-9 · load-point guard WIRING not mutation-pinned (same class as
   MOE-EXPERT-COUNT-WIRING-TEST above)** — servelumen round-8 observed that
   commenting out the load-site guard calls leaves the suite green. Full call-site
-  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named): Metal
+  inventory (13 = 9 Metal + 4 CUDA, broader than the 5 the finding named) [2026-09-03: that tally counts only the rules this finding named. Counting every serving_rules rule a CUDA load path invokes: the streaming `upload_layer_weights` runs 6 (projection geometry for non-CT4 slices via upload_projection_tensor, mandatory presence, non-zero slice lengths, expert count, attention-vector extents, GDN conv1d — gpu_buffers.rs:853/860/1136/1159/1161/1250) and the resident preload runs 4 of its own before calling it (non-zero slice lengths, expert count, attention-vector extents at backend_impl.rs:18880/18881/18886, then expert bank inside build_moe_meta, moe.rs:238 — build_moe_meta is preload-only, so the streaming path never reaches `validate_expert_bank`), i.e. 10 (path, rule) pairs; the review note's "8" is the same tree under a narrower scope, the guards written at the two load sites themselves (5 + 3) — see R9-ISSUE-5]: Metal
   `validate_layer_quants` + `validate_attention_dims` + `validate_expert_count`
   at `create_layer_buffer` (mod.rs:993/997/998), `create_partial_layer_buffer`
   (mod.rs:1051/1055/1056), and resident preload (gpu_resident.rs:209/210/211);
   CUDA `validate_expert_count` + `validate_attn_vector_extents` in
   `upload_layer_weights` (gpu_buffers.rs:1159/1161) AND the sibling pair hoisted [erratum 2026-09-03: an addition, not a hoist — see REMEDIATION-HISTORY]
-  into the resident preload for R8-ISSUE-7 (backend_impl.rs:18877/18882). The
+  into the resident preload for R8-ISSUE-7 (backend_impl.rs:18877/18882 [18881/18886 as of 2026-09-03]). The
   guard RULES are mutation-pinned (exhaustive `validate_attention_dims` /
   `validate_mandatory_presence` / `validate_attn_vector_extents` /
   `validate_expert_count` unit tests, both directions + exemptions), and the
