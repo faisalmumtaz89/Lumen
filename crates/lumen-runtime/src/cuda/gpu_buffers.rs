@@ -2118,8 +2118,12 @@ mod layer_slice_tests {
     /// geometry disagrees with the dispatch, must be refused before the
     /// malformed tensor is uploaded (the vector check precedes every upload;
     /// the projection check runs per tensor, so earlier tensors of the layer
-    /// are already on the device when wo is refused). Needs a GPU.
+    /// are already on the device when wo is refused). Needs a CUDA device,
+    /// so it is ignored on the GPU-less CI runner; run it on an A100 with
+    /// `cargo test --release -p lumen-runtime --features cuda
+    /// malformed_layer_refused_at_upload -- --ignored`.
     #[test]
+    #[ignore = "needs a CUDA device; run on an A100 with --ignored"]
     fn malformed_layer_refused_at_upload() {
         use crate::weight::cache::WeightProvider;
         use crate::weight::provider_sync::SyncWeightProvider;
