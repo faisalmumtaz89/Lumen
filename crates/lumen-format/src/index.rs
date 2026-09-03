@@ -116,37 +116,11 @@ impl SubtensorOffsets {
     /// backend-capability checks: LBC permits per-tensor quantization, so
     /// the header's primary scheme alone cannot prove a scheme is absent.
     pub fn uses_quant(&self, scheme: QuantScheme) -> bool {
+        let f = self.slice_fields();
         let hit = |t: &TensorSlice| t.length > 0 && t.quant == scheme;
-        let opt = |t: &Option<TensorSlice>| t.as_ref().is_some_and(hit);
-        hit(&self.wq)
-            || hit(&self.wk)
-            || hit(&self.wv)
-            || hit(&self.wo)
-            || hit(&self.w_gate)
-            || hit(&self.w_up)
-            || hit(&self.w_down)
-            || hit(&self.attn_norm)
-            || hit(&self.ffn_norm)
-            || opt(&self.bq)
-            || opt(&self.bk)
-            || opt(&self.bv)
-            || opt(&self.router_weight)
-            || opt(&self.shared_expert_gate)
-            || opt(&self.shared_expert_up)
-            || opt(&self.shared_expert_down)
-            || opt(&self.attn_gate)
-            || opt(&self.attn_post_norm)
-            || opt(&self.ssm_a)
-            || opt(&self.ssm_conv1d)
-            || opt(&self.ssm_dt)
-            || opt(&self.ssm_beta)
-            || opt(&self.ssm_alpha)
-            || opt(&self.ssm_norm)
-            || opt(&self.ssm_out)
-            || opt(&self.attn_q_norm)
-            || opt(&self.attn_k_norm)
-            || opt(&self.ffn_gate_inp_shexp)
-            || self.experts.as_ref().is_some_and(|es| {
+        f.mandatory.iter().any(|(_, t)| hit(t))
+            || f.optional.iter().any(|(_, o)| o.as_ref().is_some_and(hit))
+            || f.experts.as_ref().is_some_and(|es| {
                 es.iter()
                     .any(|e| hit(&e.gate) || hit(&e.up) || hit(&e.down))
             })
@@ -167,44 +141,18 @@ impl SubtensorOffsets {
     /// including optional fields and per-expert slices. Backends use this to
     /// validate that a layer's quant schemes are dispatchable before upload.
     pub fn named_slices(&self) -> Vec<(String, &TensorSlice)> {
-        let mut out: Vec<(String, &TensorSlice)> = vec![
-            ("wq".into(), &self.wq),
-            ("wk".into(), &self.wk),
-            ("wv".into(), &self.wv),
-            ("wo".into(), &self.wo),
-            ("w_gate".into(), &self.w_gate),
-            ("w_up".into(), &self.w_up),
-            ("w_down".into(), &self.w_down),
-            ("attn_norm".into(), &self.attn_norm),
-            ("ffn_norm".into(), &self.ffn_norm),
-        ];
-        let opts: [(&str, &Option<TensorSlice>); 19] = [
-            ("bq", &self.bq),
-            ("bk", &self.bk),
-            ("bv", &self.bv),
-            ("router_weight", &self.router_weight),
-            ("shared_expert_gate", &self.shared_expert_gate),
-            ("shared_expert_up", &self.shared_expert_up),
-            ("shared_expert_down", &self.shared_expert_down),
-            ("attn_gate", &self.attn_gate),
-            ("attn_post_norm", &self.attn_post_norm),
-            ("ssm_a", &self.ssm_a),
-            ("ssm_conv1d", &self.ssm_conv1d),
-            ("ssm_dt", &self.ssm_dt),
-            ("ssm_beta", &self.ssm_beta),
-            ("ssm_alpha", &self.ssm_alpha),
-            ("ssm_norm", &self.ssm_norm),
-            ("ssm_out", &self.ssm_out),
-            ("attn_q_norm", &self.attn_q_norm),
-            ("attn_k_norm", &self.attn_k_norm),
-            ("ffn_gate_inp_shexp", &self.ffn_gate_inp_shexp),
-        ];
-        for (name, slice) in opts {
-            if let Some(s) = slice {
-                out.push((name.to_string(), s));
-            }
-        }
-        if let Some(experts) = &self.experts {
+        let f = self.slice_fields();
+        let mut out: Vec<(String, &TensorSlice)> = f
+            .mandatory
+            .iter()
+            .map(|(name, s)| (name.to_string(), *s))
+            .collect();
+        out.extend(
+            f.optional
+                .iter()
+                .filter_map(|(name, o)| o.as_ref().map(|s| (name.to_string(), s))),
+        );
+        if let Some(experts) = f.experts {
             for (i, e) in experts.iter().enumerate() {
                 out.push((format!("expert[{i}].gate"), &e.gate));
                 out.push((format!("expert[{i}].up"), &e.up));
@@ -213,6 +161,94 @@ impl SubtensorOffsets {
         }
         out
     }
+
+    /// Every slice field of the layer, classified by role. This is the one
+    /// list the quant, bounds, presence and byte-extent consumers derive
+    /// from. The destructure names every field without `..`, so a field
+    /// added to the struct is a compile error here until it is named; the
+    /// only way past that is to bind it `_`, which is an explicit,
+    /// reviewable opt-out rather than a silent escape.
+    pub fn slice_fields(&self) -> SliceFields<'_> {
+        let Self {
+            wq,
+            wk,
+            wv,
+            wo,
+            bq,
+            bk,
+            bv,
+            w_gate,
+            w_up,
+            w_down,
+            attn_norm,
+            ffn_norm,
+            router_weight,
+            experts,
+            shared_expert_gate,
+            shared_expert_up,
+            shared_expert_down,
+            attn_gate,
+            attn_post_norm,
+            ssm_a,
+            ssm_conv1d,
+            ssm_dt,
+            ssm_beta,
+            ssm_alpha,
+            ssm_norm,
+            ssm_out,
+            attn_q_norm,
+            attn_k_norm,
+            ffn_gate_inp_shexp,
+            layer_type: _,
+        } = self;
+        SliceFields {
+            mandatory: [
+                ("wq", wq),
+                ("wk", wk),
+                ("wv", wv),
+                ("wo", wo),
+                ("w_gate", w_gate),
+                ("w_up", w_up),
+                ("w_down", w_down),
+                ("attn_norm", attn_norm),
+                ("ffn_norm", ffn_norm),
+            ],
+            optional: [
+                ("bq", bq),
+                ("bk", bk),
+                ("bv", bv),
+                ("router_weight", router_weight),
+                ("shared_expert_gate", shared_expert_gate),
+                ("shared_expert_up", shared_expert_up),
+                ("shared_expert_down", shared_expert_down),
+                ("attn_gate", attn_gate),
+                ("attn_post_norm", attn_post_norm),
+                ("ssm_a", ssm_a),
+                ("ssm_conv1d", ssm_conv1d),
+                ("ssm_dt", ssm_dt),
+                ("ssm_beta", ssm_beta),
+                ("ssm_alpha", ssm_alpha),
+                ("ssm_norm", ssm_norm),
+                ("ssm_out", ssm_out),
+                ("attn_q_norm", attn_q_norm),
+                ("attn_k_norm", attn_k_norm),
+                ("ffn_gate_inp_shexp", ffn_gate_inp_shexp),
+            ],
+            experts,
+        }
+    }
+}
+
+/// A layer's slice fields, classified by role — see
+/// [`SubtensorOffsets::slice_fields`].
+#[derive(Debug)]
+pub struct SliceFields<'a> {
+    /// Always present; a zero length is a converter absence sentinel.
+    pub mandatory: [(&'static str, &'a TensorSlice); 9],
+    /// Present only when the architecture carries the tensor.
+    pub optional: [(&'static str, &'a Option<TensorSlice>); 19],
+    /// Per-expert gate/up/down slices on MoE layers.
+    pub experts: &'a Option<Vec<ExpertSlice>>,
 }
 
 /// Index entry for a single transformer layer.
@@ -395,7 +431,12 @@ mod tests {
         // Every field validate visits is enumerated by named_slices, so a
         // clean pass proves coverage without over-rejection.
         idx.validate(0).unwrap();
-        assert!(idx.subtensors.named_slices().len() >= 20);
+        let fields = idx.subtensors.slice_fields();
+        assert!(
+            fields.optional.iter().all(|(_, o)| o.is_some()),
+            "fixture must populate every optional field"
+        );
+        assert_eq!(idx.subtensors.named_slices().len(), 9 + 19 + 3);
     }
 
     #[test]

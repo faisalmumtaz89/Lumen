@@ -18869,10 +18869,14 @@ impl ComputeBackend for CudaBackend {
             }
             // Validate slices before ANY per-layer GPU work (meta tables
             // included), keeping the validator's before-upload contract true.
-            // The full set — extents, expert count, attention-vector geometry
-            // — must precede build_moe_meta so a rejected header never leaves
-            // a partial meta table behind (upload_layer_weights re-checks these
-            // for its streaming caller; here they gate the persistent caches).
+            // The three header-level checks — non-zero slice lengths, expert
+            // count, attention-vector byte extents — must precede
+            // build_moe_meta so a rejected header never leaves a partial meta
+            // table behind (upload_layer_weights re-checks these for its
+            // streaming caller; here they gate the persistent caches).
+            // Mandatory presence, the GDN conv1d extent and projection
+            // geometry (per non-CT4 tensor) are still checked later, inside
+            // upload_layer_weights.
             super::gpu_buffers::validate_layer_slices(layer_idx, &layer_view.subtensors)?;
             lumen_format::serving_rules::validate_expert_count(
                 &layer_view.subtensors,

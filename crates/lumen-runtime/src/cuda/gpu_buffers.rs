@@ -2113,6 +2113,193 @@ mod layer_slice_tests {
     use super::*;
     use lumen_format::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
 
+    /// `upload_layer_weights` is the only CUDA load site for streaming
+    /// layers: a header whose attention vector is the wrong size, or whose wo
+    /// geometry disagrees with the dispatch, must be refused before the
+    /// malformed tensor is uploaded (the vector check precedes every upload;
+    /// the projection check runs per tensor, so earlier tensors of the layer
+    /// are already on the device when wo is refused). Needs a CUDA device,
+    /// so it is ignored on the GPU-less CI runner; run it on an A100 with
+    /// `cargo test --release -p lumen-runtime --features cuda
+    /// malformed_layer_refused_at_upload -- --ignored`.
+    #[test]
+    #[ignore = "needs a CUDA device; run on an A100 with --ignored"]
+    fn malformed_layer_refused_at_upload() {
+        use crate::weight::cache::WeightProvider;
+        use crate::weight::provider_sync::SyncWeightProvider;
+        use lumen_format::header::LbcHeader;
+        use lumen_format::hyperparams::{ModelHyperparams, RopeParams};
+        use lumen_format::index::LayerIndex;
+        use lumen_format::quantization::{QuantGroupSize, QuantizationDescriptor};
+        use lumen_format::writer::{write_lbc, GlobalTensors};
+
+        let device = match crate::cuda::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Skipping test: failed to init CUDA device: {e}");
+                return;
+            }
+        };
+        let (hidden, inter, heads, kv_heads, head_dim, vocab) =
+            (64usize, 128usize, 2u32, 2u32, 32u32, 256usize);
+        let q_dim = heads as usize * head_dim as usize;
+        let kv_dim = kv_heads as usize * head_dim as usize;
+        let q8_bytes = |n: usize| vec![0u8; n / 32 * 34];
+        let f32_bytes = |n: usize| {
+            let mut v = Vec::with_capacity(n * 4);
+            for _ in 0..n {
+                v.extend_from_slice(&1.0f32.to_le_bytes());
+            }
+            v
+        };
+        // (defect, expected refusal): a wrong-size q-norm vector, then a wo
+        // whose index length disagrees with the projection geometry. The
+        // provider serves the layer dequantized, so the message reports the
+        // F32 size, not the stored one.
+        for (case, want, rule) in [
+            (0u8, "attn_q_norm is", "F32 values"),
+            (1u8, "wo is", "would be read at the wrong geometry"),
+        ] {
+            let mut blob = Vec::new();
+            let mut offset = 0u64;
+            let mut add = |data: Vec<u8>, quant: QuantScheme| {
+                let s = TensorSlice {
+                    offset,
+                    length: data.len() as u64,
+                    quant,
+                };
+                blob.extend_from_slice(&data);
+                offset += s.length;
+                s
+            };
+            // With a per-head q-norm present, wq carries the fused Q+gate rows.
+            let wq_rows = if case == 0 { 2 * q_dim } else { q_dim };
+            let wq = add(q8_bytes(wq_rows * hidden), QuantScheme::Q8_0);
+            let wk = add(q8_bytes(kv_dim * hidden), QuantScheme::Q8_0);
+            let wv = add(q8_bytes(kv_dim * hidden), QuantScheme::Q8_0);
+            let wo = if case == 1 {
+                TensorSlice {
+                    length: 1024,
+                    ..add(Vec::new(), QuantScheme::Q8_0)
+                }
+            } else {
+                add(q8_bytes(hidden * q_dim), QuantScheme::Q8_0)
+            };
+            let w_gate = add(q8_bytes(inter * hidden), QuantScheme::Q8_0);
+            let w_up = add(q8_bytes(inter * hidden), QuantScheme::Q8_0);
+            let w_down = add(q8_bytes(hidden * inter), QuantScheme::Q8_0);
+            let attn_norm = add(f32_bytes(hidden), QuantScheme::F32);
+            let ffn_norm = add(f32_bytes(hidden), QuantScheme::F32);
+            // Case 0 carries the per-head norm pair with the q side its only
+            // defect; case 1 carries neither, so only wo is at fault.
+            let norms = (case == 0).then(|| {
+                let q = add(f32_bytes(head_dim as usize + 1), QuantScheme::F32);
+                let k = add(f32_bytes(head_dim as usize), QuantScheme::F32);
+                (q, k)
+            });
+            let subtensors = SubtensorOffsets {
+                wq,
+                wk,
+                wv,
+                wo,
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate,
+                w_up,
+                w_down,
+                attn_norm,
+                ffn_norm,
+                router_weight: None,
+                experts: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: norms.as_ref().map(|(q, _)| *q),
+                attn_k_norm: norms.as_ref().map(|(_, k)| *k),
+                ffn_gate_inp_shexp: None,
+                layer_type: Some(0),
+            };
+            let layer_indices = vec![LayerIndex {
+                layer_offset_bytes: 0,
+                layer_length_bytes: blob.len() as u64,
+                subtensors,
+            }];
+            let hp = ModelHyperparams {
+                num_layers: 1,
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                head_dim,
+                hidden_dim: hidden as u32,
+                intermediate_dim: inter as u32,
+                vocab_size: vocab as u32,
+                max_seq_len: 512,
+                rope_params: Some(RopeParams::default()),
+                num_experts: None,
+                num_active_experts: None,
+                norm_eps: 1e-5,
+                rotary_dim: None,
+                rope_neox: false,
+                gdn: None,
+            };
+            let qd = QuantizationDescriptor {
+                scheme: QuantScheme::Q8_0,
+                group_size: QuantGroupSize::Group(32),
+                block_byte_size: 34,
+                scale_offset_in_block: Some(0),
+            };
+            let mut header = LbcHeader::new(hp, qd);
+            header.embedding.quant = QuantScheme::Q8_0;
+            header.output_proj.quant = QuantScheme::Q8_0;
+            header.final_norm.quant = QuantScheme::F32;
+            let globals = GlobalTensors {
+                embedding: q8_bytes(vocab * hidden),
+                final_norm: f32_bytes(hidden),
+                output_proj: q8_bytes(vocab * hidden),
+            };
+            let mut bytes = Vec::new();
+            write_lbc(
+                &mut bytes,
+                &header,
+                &layer_indices,
+                &globals,
+                &[blob.as_slice()],
+                None,
+            )
+            .unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "lumen_cuda_malformed_{case}_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("malformed.lbc");
+            std::fs::write(&path, &bytes).unwrap();
+            let provider = SyncWeightProvider::open(&path).unwrap();
+            let hp = provider.lbc().header.hyperparams;
+            let view = provider.get_layer_blocking(0).unwrap();
+            let result = upload_layer_weights(&device, &view, &hp);
+            std::fs::remove_dir_all(&dir).ok();
+            let err = match result {
+                Ok(_) => panic!("case {case}: malformed layer must be refused before upload"),
+                Err(e) => e,
+            };
+            let text = err.to_string();
+            assert!(
+                text.contains(want) && text.contains(rule),
+                "case {case}: refusal must carry {want:?} from the geometry rules: {text}"
+            );
+        }
+    }
+
     #[test]
     fn zero_length_optionals_rejected() {
         let t = |offset: u64, length: u64| TensorSlice {
