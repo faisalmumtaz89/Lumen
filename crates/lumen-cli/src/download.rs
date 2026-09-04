@@ -189,13 +189,16 @@ mod inner {
     /// `Transfer-Encoding` value is `chunked`. The value count is checked
     /// against the number of header lines carrying that name, so a readable
     /// `identity` on one line cannot hide an unreadable value on another;
-    /// lists are refused as written. Encoded or partial bytes would
+    /// lists are refused as written. Every `Content-Length` line, one or
+    /// many, must be a plain decimal integer (digits only, no sign, no
+    /// whitespace) and all must be byte-identical, since the first gates the
+    /// completion check; a length that fails to parse would otherwise fall
+    /// back to the HEAD's advisory size. Encoded or partial bytes would
     /// otherwise pass the length check and be published as the model. Out of
     /// reach: any header line whose name holds a byte that is not a token
     /// character (a space before the colon, an obsolete folded continuation
     /// starting with a space or tab, a high byte) is dropped by ureq before
-    /// any header view exists. `Content-Length` lines must agree with each
-    /// other, since the first one gates the completion check.
+    /// any header view exists.
     fn reject_unusable_response(resp: &ureq::Response) -> Result<(), DownloadError> {
         if resp.status() != 200 {
             return Err(DownloadError::Io(format!(
@@ -221,9 +224,15 @@ mod inner {
             .iter()
             .filter(|n| n.eq_ignore_ascii_case("content-length"))
             .count();
-        if length_lines > 1 {
+        if length_lines > 0 {
             let lengths = header_values(resp, "content-length")?;
-            if lengths.len() != length_lines || lengths.iter().any(|l| l != &lengths[0]) {
+            let is_plain_integer = |l: &String| {
+                !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()) && l.parse::<u64>().is_ok()
+            };
+            if lengths.len() != length_lines
+                || !lengths.iter().all(is_plain_integer)
+                || lengths.iter().any(|l| l != &lengths[0])
+            {
                 return Err(refuse("Content-Length", &lengths));
             }
         }
@@ -1023,7 +1032,7 @@ mod tests {
         get_extra: &'static str,
         get_status: &'static str,
     ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
-        serve_like_hf_full(expected, head_extra, "200 OK", get_extra, get_status)
+        serve_like_hf_full(expected, head_extra, "200 OK", get_extra, get_status, false)
     }
 
     #[cfg(feature = "download")]
@@ -1032,7 +1041,7 @@ mod tests {
         head_extra: &'static str,
         head_status: &'static str,
     ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
-        serve_like_hf_full(expected, head_extra, head_status, "", "200 OK")
+        serve_like_hf_full(expected, head_extra, head_status, "", "200 OK", false)
     }
 
     #[cfg(feature = "download")]
@@ -1042,6 +1051,7 @@ mod tests {
         head_status: &'static str,
         get_extra: &'static str,
         get_status: &'static str,
+        extra_replaces_length: bool,
     ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Write};
         let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1090,10 +1100,12 @@ mod tests {
                     } else {
                         (get_status, get_extra)
                     };
-                    format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
-                        BODY.len()
-                    )
+                    let length = if extra_replaces_length && !is_head {
+                        String::new()
+                    } else {
+                        format!("Content-Length: {}\r\n", BODY.len())
+                    };
+                    format!("HTTP/1.1 {status}\r\n{length}{extra}Connection: close\r\n\r\n")
                 };
                 let stream = reader.get_mut();
                 let _ = stream.write_all(response.as_bytes());
@@ -1297,13 +1309,26 @@ mod tests {
     #[cfg(feature = "download")]
     #[test]
     fn conflicting_content_lengths_are_refused() {
-        let (base, server) = serve_like_hf(4, "", "Content-Length: 4096\r\n", "200 OK");
-        let dir = scratch_dir("cl-conflict");
-        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
-        assert!(format!("{err}").contains("Content-Length"), "got {err}");
-        assert!(entries(&dir).is_empty(), "nothing may be left behind");
-        assert_eq!(server.join().unwrap().len(), 4);
-        std::fs::remove_dir_all(&dir).ok();
+        // A different number, and the same number spelled differently: the
+        // lines must be byte-identical, not merely numerically equal.
+        for (tag, second) in [
+            ("cl-conflict", "Content-Length: 4096\r\n"),
+            ("cl-spelling", "Content-Length: 018\r\n"),
+        ] {
+            let (base, server) = serve_like_hf(4, "", second, "200 OK");
+            let dir = scratch_dir(tag);
+            let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+            assert!(
+                format!("{err}").contains("Content-Length"),
+                "{tag}: got {err}"
+            );
+            assert!(
+                entries(&dir).is_empty(),
+                "{tag}: nothing may be left behind"
+            );
+            assert_eq!(server.join().unwrap().len(), 4, "{tag}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A readable `Content-Length` beside one ureq cannot render is refused
@@ -1318,6 +1343,33 @@ mod tests {
         assert!(entries(&dir).is_empty(), "nothing may be left behind");
         assert_eq!(server.join().unwrap().len(), 4);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single `Content-Length` line that is not one plain integer (a comma
+    /// list, garbage, a sign) is refused: its parse would otherwise fail and
+    /// the download would fall back to the HEAD's advisory size.
+    #[cfg(feature = "download")]
+    #[test]
+    fn single_unparseable_content_length_is_refused() {
+        for (tag, extra) in [
+            ("cl-list", "Content-Length: 18, 18\r\n"),
+            ("cl-garbage", "Content-Length: 18abc\r\n"),
+            ("cl-signed", "Content-Length: +18\r\n"),
+        ] {
+            let (base, server) = serve_like_hf_full(4, "", "200 OK", extra, "200 OK", true);
+            let dir = scratch_dir(tag);
+            let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+            assert!(
+                format!("{err}").contains("Content-Length"),
+                "{tag}: got {err}"
+            );
+            assert!(
+                entries(&dir).is_empty(),
+                "{tag}: nothing may be left behind"
+            );
+            assert_eq!(server.join().unwrap().len(), 4, "{tag}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A HEAD the origin answers oddly (no content, a server error, or a line

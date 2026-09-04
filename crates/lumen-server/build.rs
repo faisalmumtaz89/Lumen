@@ -32,7 +32,8 @@ fn main() {
     // pack), plus packed-refs when it exists — only existing paths are
     // declared, since Cargo treats a missing declared path as always
     // changed. Declaring any path replaces Cargo's default watch on this
-    // crate's sources, so they are declared again for the `-dirty` marker.
+    // crate's sources, so they are declared again for the `-dirty` marker,
+    // as is the registry TOML (embedded by the CLI this binary links).
     // Limits: edits elsewhere in the workspace also make `git describe`
     // dirty but do not re-run this script, so the stamp is not a build
     // identity — two byte-different binaries can carry one stamp; harness
@@ -48,6 +49,7 @@ fn main() {
             format!("{common_dir}/packed-refs"),
             "src".to_string(),
             "Cargo.toml".to_string(),
+            "../../model_registry.toml".to_string(),
         ];
         for path in candidates
             .iter()
