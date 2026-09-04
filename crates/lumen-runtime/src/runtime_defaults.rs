@@ -55,6 +55,19 @@ static PATH_IS_SERVER: AtomicBool = AtomicBool::new(false);
 /// BF16, `2` = quantised (Q8/Q4/etc.). Encoded as `AtomicU8` so the read
 /// path is one relaxed load.
 static MODEL_DENSE_QUANT_HINT: AtomicU8 = AtomicU8::new(0);
+/// The active CUDA device's compute-capability major, stored by the CUDA
+/// backend at init before any lever default is resolved; 0 = unknown / not
+/// CUDA. Some defaults were tuned on one architecture and are wrong on
+/// another, so they read this.
+static DEVICE_CC_MAJOR: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_device_cc_major(major: u8) {
+    DEVICE_CC_MAJOR.store(major, Ordering::Relaxed);
+}
+
+pub fn device_cc_major() -> u8 {
+    DEVICE_CC_MAJOR.load(Ordering::Relaxed)
+}
 
 const HINT_UNSET: u8 = 0;
 const HINT_BF16: u8 = 1;
@@ -1511,6 +1524,13 @@ pub fn q6k_head_enabled() -> bool {
 /// (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default` and keeps the
 /// Q4-dense decode win without touching the MoE path.
 pub fn soa_locked_default() -> bool {
+    // The locked kernel's codegen was tuned on Ampere/Hopper. On Blackwell
+    // (cc 12.x) it decodes 27B-Q4 at 1.1 tok/s where the plain split path
+    // decodes at 69 tok/s (RTX 5090, 2026-09-04), so the default is OFF there;
+    // `LUMEN_CUDA_SOA_LOCKED=1` still forces it on for measurement.
+    if device_cc_major() >= 12 {
+        return false;
+    }
     match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
         // Q4 dense benefits (Q8/BF16/F32 lack the locked kernel → no-op).
         // MoE: explicit OFF (clone-pass hazard, mirrors q8_split_default).
@@ -1915,6 +1935,7 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 /// used by the unit tests below so each test starts from a known state.
 #[doc(hidden)]
 pub fn reset_for_tests() {
+    DEVICE_CC_MAJOR.store(0, Ordering::Relaxed);
     PATH_IS_SERVER.store(false, Ordering::Relaxed);
     MODEL_DENSE_QUANT_HINT.store(HINT_UNSET, Ordering::Relaxed);
     MODEL_PRIMARY_QUANT_SCHEME.store(QUANT_SCHEME_UNSET, Ordering::Relaxed);
@@ -2407,6 +2428,25 @@ mod tests {
         assert!(
             soa_locked_default(),
             "quantised dense should default SOA_LOCKED=ON"
+        );
+    }
+
+    #[test]
+    fn blackwell_disables_soa_locked_default_and_ampere_keeps_it() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q8_0);
+        set_device_cc_major(8);
+        assert!(
+            soa_locked_default(),
+            "cc 8.x (A100) keeps the tuned default ON"
+        );
+        set_device_cc_major(9);
+        assert!(soa_locked_default(), "cc 9.x (H100) keeps it ON");
+        set_device_cc_major(12);
+        assert!(
+            !soa_locked_default(),
+            "cc 12.x (Blackwell) must default OFF: 1.1 vs 69 tok/s"
         );
     }
 
