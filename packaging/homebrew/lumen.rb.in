@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 #
 # TEMPLATE — do not hand-edit url/version/sha256. release.yml (publish-release →
-# finalize-release.sh) substitutes __URL__/__VERSION__/__SHA256__ from the exact
+# finalize-release.sh) fills the url, version and sha256 placeholders from the exact
 # macOS tarball that shipped, producing dist/lumen.rb. Copy that generated file
 # into the tap repo (faisalmumtaz89/homebrew-lumen, Formula/lumen.rb).
 #

@@ -121,7 +121,7 @@ mod inner {
 
     /// A request for the bytes with no content coding applied. A server that
     /// honors the header does not touch any `Content-Length` it sends; one
-    /// that encodes anyway is caught by [`reject_encoded_response`], since
+    /// that encodes anyway is caught by [`reject_unusable_response`], since
     /// the crate is built without transparent decompression. A secure URL is
     /// never followed to a plaintext one.
     pub(crate) fn stored_bytes_request(method: &str, url: &str) -> ureq::Request {
@@ -137,14 +137,75 @@ mod inner {
             .set("Accept-Encoding", "identity")
     }
 
-    /// Encoded bytes would pass the length check and be published as the
-    /// model, so a response is accepted only when every `Content-Encoding`
-    /// value it carries is a bare `identity` and every `Transfer-Encoding`
-    /// value is `chunked`. Lists are refused as written, and a header ureq
-    /// parses but cannot render as text is refused rather than ignored; a
-    /// line ureq cannot parse at all never reaches this check.
-    fn reject_encoded_response(resp: &ureq::Response) -> Result<(), DownloadError> {
-        let refuse = |header: &str, values: &[&str]| {
+    /// Run a ureq call or header read with a panic turned into `Err`.
+    /// Unwinding is safe to assert: the closures only read a `Response` or
+    /// build a fresh agent, so no shared state is left half-updated. The
+    /// panic hook is left alone — it is process-global, and replacing it
+    /// would also swallow the failure text of any other thread (including
+    /// this crate's own tests) — so the parser's one panic line still
+    /// prints before the refusal.
+    fn fenced<T>(op: impl FnOnce() -> T) -> Result<T, ()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).map_err(|_| ())
+    }
+
+    /// Every value of a response header, or a refusal when a line ureq
+    /// accepted cannot be sliced (see [`call_for_stored_bytes`]).
+    fn header_values(resp: &ureq::Response, name: &str) -> Result<Vec<String>, DownloadError> {
+        fenced(|| resp.all(name).into_iter().map(str::to_owned).collect()).map_err(|_| {
+            DownloadError::Io(format!(
+                "the {name} header of the response from {} could not be read safely; refusing the response",
+                resp.get_url()
+            ))
+        })
+    }
+
+    /// Issue a stored-bytes request and hand back only a usable response.
+    /// A header line with no colon is accepted by ureq's parser, and its
+    /// value accessors then index past the end of the line — during response
+    /// construction for some headers, on later lookups for others — so both
+    /// the call and every value read are fenced: a panic is a refusal, not
+    /// an abort of the process on a hostile origin.
+    fn call_for_stored_bytes(method: &str, url: &str) -> Result<ureq::Response, DownloadError> {
+        let outcome = fenced(|| stored_bytes_request(method, url).call());
+        let resp = match outcome {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                return Err(DownloadError::Io(format!(
+                    "{method} request failed for {url}: {e}"
+                )))
+            }
+            Err(_) => {
+                return Err(DownloadError::Io(format!(
+                    "the response from {url} could not be read safely (a header line the parser cannot slice, or an internal error); refusing the response"
+                )))
+            }
+        };
+        reject_unusable_response(&resp)?;
+        Ok(resp)
+    }
+
+    /// A response is stored only when it is a complete 200 whose every
+    /// `Content-Encoding` value is a bare `identity` and every
+    /// `Transfer-Encoding` value is `chunked`. The value count is checked
+    /// against the number of header lines carrying that name, so a readable
+    /// `identity` on one line cannot hide an unreadable value on another;
+    /// lists are refused as written. Encoded or partial bytes would
+    /// otherwise pass the length check and be published as the model. Out of
+    /// reach: any header line whose name holds a byte that is not a token
+    /// character (a space before the colon, an obsolete folded continuation
+    /// starting with a space or tab, a high byte) is dropped by ureq before
+    /// any header view exists. `Content-Length` lines must agree with each
+    /// other, since the first one gates the completion check.
+    fn reject_unusable_response(resp: &ureq::Response) -> Result<(), DownloadError> {
+        if resp.status() != 200 {
+            return Err(DownloadError::Io(format!(
+                "server answered {} {} for {}; only a complete 200 response is stored",
+                resp.status(),
+                resp.status_text(),
+                resp.get_url()
+            )));
+        }
+        let refuse = |header: &str, values: &[String]| {
             let what = if values.is_empty() {
                 "an unreadable".to_string()
             } else {
@@ -155,19 +216,30 @@ mod inner {
                 resp.get_url()
             ))
         };
+        let names = resp.headers_names();
+        let length_lines = names
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("content-length"))
+            .count();
+        if length_lines > 1 {
+            let lengths = header_values(resp, "content-length")?;
+            if lengths.len() != length_lines || lengths.iter().any(|l| l != &lengths[0]) {
+                return Err(refuse("Content-Length", &lengths));
+            }
+        }
         for (header, shown, allowed) in [
             ("content-encoding", "Content-Encoding", "identity"),
             ("transfer-encoding", "Transfer-Encoding", "chunked"),
         ] {
-            let present = resp
-                .headers_names()
+            let lines = names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case(header));
-            if !present {
+                .filter(|n| n.eq_ignore_ascii_case(header))
+                .count();
+            if lines == 0 {
                 continue;
             }
-            let values = resp.all(header);
-            if values.is_empty() || !values.iter().all(|v| v.eq_ignore_ascii_case(allowed)) {
+            let values = header_values(resp, header)?;
+            if values.len() != lines || !values.iter().all(|v| v.eq_ignore_ascii_case(allowed)) {
                 return Err(refuse(shown, &values));
             }
         }
@@ -180,19 +252,28 @@ mod inner {
 
     /// Get the file size via a HEAD request. HF answers with a 302 to its
     /// CDN; ureq follows it and the final response carries Content-Length.
+    /// The HEAD stores nothing and its size is only advisory (a fallback
+    /// for a GET without a length), so anything but a clean, complete 200
+    /// makes the size unknown rather than failing the download; the GET
+    /// answers to every rule on its own.
     fn get_remote_size(url: &str) -> Result<Option<u64>, DownloadError> {
-        let resp = stored_bytes_request("HEAD", url)
-            .call()
-            .map_err(|e| DownloadError::Io(format!("HEAD request failed for {url}: {e}")))?;
-        reject_encoded_response(&resp)?;
-
-        if let Some(cl) = resp.header("content-length") {
-            if let Ok(size) = cl.parse::<u64>() {
-                return Ok(Some(size));
-            }
+        let unknown = |why: String| {
+            eprintln!("Size unknown before download ({why}); the GET's own length decides.");
+            Ok(None)
+        };
+        let resp = match fenced(|| stored_bytes_request("HEAD", url).call()) {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return unknown(format!("HEAD failed: {e}")),
+            Err(()) => return unknown("HEAD response could not be read safely".to_string()),
+        };
+        if let Err(e) = reject_unusable_response(&resp) {
+            return unknown(format!("HEAD unusable: {e}"));
         }
-
-        Ok(None)
+        let values = match header_values(&resp, "content-length") {
+            Ok(values) => values,
+            Err(e) => return unknown(format!("HEAD unusable: {e}")),
+        };
+        Ok(values.first().and_then(|cl| cl.parse::<u64>().ok()))
     }
 
     /// Prompt the user for [Y/n] confirmation.
@@ -316,14 +397,11 @@ mod inner {
 
         // Start the download.
         eprintln!("Downloading: {url}");
-        let resp = stored_bytes_request("GET", &url)
-            .call()
-            .map_err(|e| DownloadError::Io(format!("GET request failed: {e}")))?;
-        reject_encoded_response(&resp)?;
+        let resp = call_for_stored_bytes("GET", &url)?;
 
         // Get content length from the actual response (might differ from HEAD due to CDN).
-        let content_length = resp
-            .header("content-length")
+        let content_length = header_values(&resp, "content-length")?
+            .first()
             .and_then(|cl| cl.parse::<u64>().ok())
             .or(size);
 
@@ -943,6 +1021,27 @@ mod tests {
         expected: usize,
         head_extra: &'static str,
         get_extra: &'static str,
+        get_status: &'static str,
+    ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
+        serve_like_hf_full(expected, head_extra, "200 OK", get_extra, get_status)
+    }
+
+    #[cfg(feature = "download")]
+    fn serve_like_hf_with_head_status(
+        expected: usize,
+        head_extra: &'static str,
+        head_status: &'static str,
+    ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
+        serve_like_hf_full(expected, head_extra, head_status, "", "200 OK")
+    }
+
+    #[cfg(feature = "download")]
+    fn serve_like_hf_full(
+        expected: usize,
+        head_extra: &'static str,
+        head_status: &'static str,
+        get_extra: &'static str,
+        get_status: &'static str,
     ) -> (super::BaseUrl, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Write};
         let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -986,9 +1085,13 @@ mod tests {
                 let response = if !head.contains(" /cdn/") {
                     format!("HTTP/1.1 302 Found\r\nLocation: {base}/cdn/m.gguf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 } else {
-                    let extra = if is_head { head_extra } else { get_extra };
+                    let (status, extra) = if is_head {
+                        (head_status, head_extra)
+                    } else {
+                        (get_status, get_extra)
+                    };
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
                         BODY.len()
                     )
                 };
@@ -1030,7 +1133,7 @@ mod tests {
     #[cfg(feature = "download")]
     #[test]
     fn download_asks_for_stored_bytes_across_the_redirect() {
-        let (base, server) = serve_like_hf(4, "", "");
+        let (base, server) = serve_like_hf(4, "", "", "200 OK");
         let dir = scratch_dir("ok");
         let path = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), BODY);
@@ -1055,7 +1158,7 @@ mod tests {
     #[cfg(feature = "download")]
     #[test]
     fn encoded_get_is_refused() {
-        let (base, server) = serve_like_hf(4, "", "Content-Encoding: br\r\n");
+        let (base, server) = serve_like_hf(4, "", "Content-Encoding: br\r\n", "200 OK");
         let dir = scratch_dir("enc-get");
         let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
         assert!(
@@ -1086,7 +1189,7 @@ mod tests {
             ("list", "Content-Encoding: identity, gzip\r\n"),
             ("transfer", "Transfer-Encoding: gzip, chunked\r\n"),
         ] {
-            let (base, server) = serve_like_hf(4, "", extra);
+            let (base, server) = serve_like_hf(4, "", extra, "200 OK");
             let dir = scratch_dir(tag);
             let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
             assert!(format!("{err}").contains("-Encoding"), "{tag}: got {err}");
@@ -1118,7 +1221,7 @@ mod tests {
     #[cfg(feature = "download")]
     #[test]
     fn transparent_decompression_is_off() {
-        let (base, server) = serve_like_hf(4, "", "Content-Encoding: gzip\r\n");
+        let (base, server) = serve_like_hf(4, "", "Content-Encoding: gzip\r\n", "200 OK");
         let dir = scratch_dir("gzip-off");
         let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
         assert!(
@@ -1130,19 +1233,127 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The same refusal on the HEAD, whose length would describe encoded bytes.
+    /// A readable `identity` cannot vouch for a second, unreadable value on
+    /// another line of the same header: the value count is held against the
+    /// line count.
     #[cfg(feature = "download")]
     #[test]
-    fn encoded_head_is_refused() {
-        let (base, server) = serve_like_hf(2, "Content-Encoding: gzip\r\n", "");
-        let dir = scratch_dir("enc-head");
+    fn identity_beside_an_unreadable_value_is_refused() {
+        let (base, server) = serve_like_hf(
+            4,
+            "",
+            "Content-Encoding: identity\r\nContent-Encoding: gzip\u{e9}\r\n",
+            "200 OK",
+        );
+        let dir = scratch_dir("mixed");
         let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
         assert!(
-            format!("{err}").contains("[\"gzip\"] Content-Encoding"),
+            format!("{err}").contains("[\"identity\"] Content-Encoding"),
             "got {err}"
         );
         assert!(entries(&dir).is_empty(), "nothing may be left behind");
-        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A header line with no colon is refused as malformed rather than
+    /// aborting the process inside the header parser.
+    #[cfg(feature = "download")]
+    #[test]
+    fn colonless_header_line_is_refused_not_a_panic() {
+        let (base, server) = serve_like_hf(4, "", "Transfer-Encoding\r\n", "200 OK");
+        let dir = scratch_dir("te");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("could not be read safely"),
+            "got {err}"
+        );
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unsolicited partial response is refused: its Content-Length
+    /// describes the part, and the completion check would accept it.
+    #[cfg(feature = "download")]
+    #[test]
+    fn partial_content_is_refused() {
+        let (base, server) = serve_like_hf(
+            4,
+            "",
+            "Content-Range: bytes 0-17/4096\r\n",
+            "206 Partial Content",
+        );
+        let dir = scratch_dir("206");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(format!("{err}").contains("answered 206"), "got {err}");
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two `Content-Length` lines that disagree are refused: the first one
+    /// gates the completion check, so a second must not be able to differ.
+    #[cfg(feature = "download")]
+    #[test]
+    fn conflicting_content_lengths_are_refused() {
+        let (base, server) = serve_like_hf(4, "", "Content-Length: 4096\r\n", "200 OK");
+        let dir = scratch_dir("cl-conflict");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(format!("{err}").contains("Content-Length"), "got {err}");
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A readable `Content-Length` beside one ureq cannot render is refused
+    /// by the line count, since the unreadable line never reaches the values.
+    #[cfg(feature = "download")]
+    #[test]
+    fn unreadable_second_content_length_is_refused() {
+        let (base, server) = serve_like_hf(4, "", "Content-Length: 18\u{e9}\r\n", "200 OK");
+        let dir = scratch_dir("cl-unreadable");
+        let err = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap_err();
+        assert!(format!("{err}").contains("Content-Length"), "got {err}");
+        assert!(entries(&dir).is_empty(), "nothing may be left behind");
+        assert_eq!(server.join().unwrap().len(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A HEAD the origin answers oddly (no content, a server error, or a line
+    /// ureq cannot slice) costs only the advisory size; the download still
+    /// completes.
+    #[cfg(feature = "download")]
+    #[test]
+    fn odd_head_only_loses_the_advisory_size() {
+        for (tag, head_extra, head_status) in [
+            ("head-204", "", "204 No Content"),
+            ("head-500", "", "500 Internal Server Error"),
+            (
+                "head-colonless",
+                "Content-Length-Hint\r\nContent-Length\r\n",
+                "200 OK",
+            ),
+        ] {
+            let (base, server) = serve_like_hf_with_head_status(4, head_extra, head_status);
+            let dir = scratch_dir(tag);
+            let path = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), BODY, "{tag}");
+            assert_eq!(server.join().unwrap().len(), 4, "{tag}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// An encoded HEAD only loses its advisory size; the GET, answering to
+    /// every rule on its own, still publishes the file.
+    #[cfg(feature = "download")]
+    #[test]
+    fn encoded_head_size_is_ignored() {
+        let (base, server) = serve_like_hf(4, "Content-Encoding: gzip\r\n", "", "200 OK");
+        let dir = scratch_dir("enc-head");
+        let path = super::download_from(&base, "org/repo", "m.gguf", &dir, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BODY);
+        assert_eq!(server.join().unwrap().len(), 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -7,6 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Downloads refuse three more malformed responses**: a readable `identity`
+  beside an unreadable second `Content-Encoding` value (the value count is now
+  held against the header-line count), a header line with no colon (ureq's
+  parser accepts it and its value accessors then index past the line, which
+  aborted the process; the request call and every value read are now fenced,
+  and the parser's one panic line is followed by a clean refusal), and an
+  unsolicited partial response (only a complete 200 is stored). Two
+  `Content-Length` lines must agree. The HEAD hop stores nothing, so a HEAD the
+  origin answers oddly (no content, an error, an encoding, a line ureq cannot
+  slice) now only loses its advisory size instead of failing the download.
+  Out of reach: a header line whose name holds a non-token byte, which ureq
+  drops before any header is visible.
+- **Version stamps follow commits, tags and packing**: the build scripts
+  watched only the repository's `HEAD`, a symbolic ref that a commit on the
+  same branch never rewrites, so `lumen --version` went stale silently. They
+  now watch the refs directory of the git common dir (so linked worktrees,
+  tags and refs re-created after `git pack-refs` count), `packed-refs` when it
+  exists, and the crate's own sources so its `-dirty` marker is right; a no-op
+  rebuild stays a no-op. Edits in other crates do not re-stamp (see the
+  tracker's `R10-RESIDUAL-STAMP-SCOPE`).
+
 ## [0.23.0] — 2026-09-03
 
 ### Fixed
@@ -14,7 +37,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Downloads take the bytes as stored, or refuse**: the HEAD and GET requests
   send `Accept-Encoding: identity`, the CLI is built without ureq's transparent
   decompression (its `gzip` and unused `json` features are off), and either
-  response is refused before a byte is staged unless every `Content-Encoding`
+  response is refused before a byte is staged [superseded 2026-09-04: the GET is
+  refused; the HEAD only loses its advisory size — see Unreleased] unless every `Content-Encoding`
   value it carries is a bare `identity` and every `Transfer-Encoding` value is
   `chunked` — lists and values that cannot be read count as encoded. Before,
   ureq asked for gzip by default: had the CDN
@@ -28,6 +52,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Sub-tensor field lists cannot drift**: every consumer that enumerates
   the sub-tensor fields — quant use, bounds, presence, Metal quant dispatch and
   Metal byte extent — derives from one `SubtensorOffsets::slice_fields`
+  (Correction 2026-09-04: every VALIDATION consumer; the LBC writer and reader
+  enumerate the wire format by hand — tracker `R10-RESIDUAL-WRITER-ENUM`)
   registry built on an exhaustive destructure, so a new field fails to compile
   until it is named there instead of silently escaping a hand-copied list.
 
@@ -45,9 +71,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   rules as CUDA. `LayerIndex::validate` runs at parse for every consumer and is
   derived from the canonical slice list, so no sub-tensor field can be missed.
   (Correction 2026-09-03: at this version that list was one of five hand-copied
-  enumerations of the 19 optional sub-tensor fields; a field added with a
-  mechanical `None` in every constructor compiled clean and escaped all four.
-  The next release derives all four from one exhaustive-destructure registry.)
+  validation-side enumerations of the 19 optional sub-tensor fields — the writer
+  and reader enumerate the wire format separately; a field added with a
+  mechanical `None` in every constructor compiled clean and escaped all five.
+  The next release derives all five from one exhaustive-destructure registry.)
 - **Convert gate**: the GDN pair-force rejects non-32-aligned tensors with a
   clean error instead of a quantizer panic (all four planner sites), and
   `ssm_out` geometry is validated for every target (previously Metal-only), so

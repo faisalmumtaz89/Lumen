@@ -460,9 +460,10 @@ impl MetalDevice {
     ///
     /// `MTLLanguageVersion3_1` is encoded as `(3 << 16) | 1` (see
     /// `MTLLanguageVersion` in `Metal/MTLLanguage.h`). Apple guarantees MSL
-    /// 3.1 on macOS 14.x+, which is below the macOS 13 floor Lumen already
-    /// enforces for `MTLIOCommandQueue` plus a minor delta — and the active
-    /// targets (M2/M3) require BF16-vector support.
+    /// 3.1 on macOS 14.x+, one release above the macOS 13 `MTLIOCommandQueue`
+    /// floor, so shader compilation is what sets the Homebrew formula's
+    /// `depends_on macos: :sonoma` — and the active targets (M2/M3) require
+    /// BF16-vector support.
     pub fn new_library_with_source(&self, source: &str) -> Result<MetalLibrary, String> {
         unsafe {
             let ns_source = nsstring(source);
