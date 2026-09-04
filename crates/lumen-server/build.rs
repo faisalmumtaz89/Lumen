@@ -26,8 +26,34 @@ fn main() {
 
     println!("cargo:rustc-env=LUMEN_BUILD_VERSION={version}");
 
-    // Re-run when HEAD moves so the stamp stays current.
-    if let Some(git_dir) = git(&["rev-parse", "--git-dir"]) {
-        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    // Re-run when the stamp's inputs move. HEAD is a symbolic ref that a
+    // same-branch commit never rewrites, so the whole refs directory of the
+    // common dir is watched (loose refs, tags, and refs re-created after a
+    // pack), plus packed-refs when it exists — only existing paths are
+    // declared, since Cargo treats a missing declared path as always
+    // changed. Declaring any path replaces Cargo's default watch on this
+    // crate's sources, so they are declared again for the `-dirty` marker.
+    // Limits: edits elsewhere in the workspace also make `git describe`
+    // dirty but do not re-run this script, so the stamp is not a build
+    // identity — two byte-different binaries can carry one stamp; harness
+    // records identify a binary by its sha256. A fetch that writes a remote
+    // ref also re-runs the script (one relink, byte-identical output).
+    if let (Some(git_dir), Some(common_dir)) = (
+        git(&["rev-parse", "--git-dir"]),
+        git(&["rev-parse", "--git-common-dir"]),
+    ) {
+        let candidates = [
+            format!("{git_dir}/HEAD"),
+            format!("{common_dir}/refs"),
+            format!("{common_dir}/packed-refs"),
+            "src".to_string(),
+            "Cargo.toml".to_string(),
+        ];
+        for path in candidates
+            .iter()
+            .filter(|p| std::path::Path::new(p).exists())
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 }
