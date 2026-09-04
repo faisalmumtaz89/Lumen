@@ -191,9 +191,18 @@ impl CudaDevice {
             if super::ptx_cache::is_driver_rejected(&key) {
                 super::ptx_cache::record_miss();
                 return Err(RuntimeError::Compute(format!(
-                    "CUDA driver rejected cached PTX for arch '{}' on cc {}.{} \
-                     (driver-reject marker present; skipping doomed recompile)",
-                    key.arch, key.cc.0, key.cc.1
+                    "CUDA driver {} rejected this build's PTX for arch '{}' on cc {}.{} \
+                     on an earlier launch (driver-reject marker present; skipping the \
+                     doomed recompile). The usual cause is a CUDA toolkit newer than \
+                     the driver: NVRTC {}.{} emits a PTX ISA the driver cannot load. \
+                     Install the toolkit matching `nvidia-smi`'s CUDA version, or \
+                     update the driver; the marker clears itself once either changes.",
+                    key.driver_version,
+                    key.arch,
+                    key.cc.0,
+                    key.cc.1,
+                    key.nvrtc_version.0,
+                    key.nvrtc_version.1
                 )));
             }
 
@@ -231,7 +240,7 @@ impl CudaDevice {
                 }
                 Err(e) => {
                     super::ptx_cache::mark_driver_reject(&key);
-                    return Err(cuda_driver_err(e));
+                    return Err(ptx_load_err(e, &key));
                 }
             }
         }
@@ -494,6 +503,41 @@ fn cuda_driver_err(e: cudarc::driver::DriverError) -> RuntimeError {
     RuntimeError::Compute(format!("CUDA driver error: {e}"))
 }
 
+/// The driver refused freshly compiled PTX at `cuModuleLoadData`. Name the
+/// driver's own error and, for the one cause with a fix the user can apply,
+/// say what it means: a toolkit whose NVRTC emits a newer PTX ISA than the
+/// installed driver understands.
+fn ptx_load_err(e: cudarc::driver::DriverError, key: &super::ptx_cache::CacheKey) -> RuntimeError {
+    RuntimeError::Compute(ptx_load_message(
+        e.0,
+        key.driver_version,
+        key.nvrtc_version,
+        key.arch,
+    ))
+}
+
+fn ptx_load_message(
+    code: cudarc::driver::sys::CUresult,
+    driver_version: i32,
+    nvrtc_version: (i32, i32),
+    arch: &str,
+) -> String {
+    let base = format!(
+        "CUDA driver {driver_version} refused the PTX NVRTC {}.{} produced for arch '{arch}' ({code:?})",
+        nvrtc_version.0, nvrtc_version.1
+    );
+    if code == cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION {
+        format!(
+            "{base}: the toolkit is newer than the driver, so its PTX ISA is unknown to the \
+             driver. Install the CUDA toolkit matching `nvidia-smi`'s CUDA version (or update \
+             the driver); stale cache entries and reject markers clear themselves once either \
+             version changes."
+        )
+    } else {
+        base
+    }
+}
+
 /// Convert a cudarc NVRTC error to RuntimeError.
 fn cuda_nvrtc_err(e: cudarc::nvrtc::CompileError) -> RuntimeError {
     RuntimeError::Compute(format!("CUDA NVRTC compilation error: {e}"))
@@ -502,4 +546,40 @@ fn cuda_nvrtc_err(e: cudarc::nvrtc::CompileError) -> RuntimeError {
 /// Convert a cudarc cuBLAS error to RuntimeError.
 fn cuda_cublas_err(e: cudarc::cublas::result::CublasError) -> RuntimeError {
     RuntimeError::Compute(format!("cuBLAS error: {e}"))
+}
+
+#[cfg(test)]
+mod ptx_load_message_tests {
+    use super::ptx_load_message;
+    use cudarc::driver::sys::CUresult;
+
+    #[test]
+    fn ptx_load_message_names_the_toolkit_driver_skew() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            13010,
+            (13, 3),
+            "default",
+        );
+        assert!(m.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION"), "{m}");
+        assert!(
+            m.contains("NVRTC 13.3") && m.contains("driver 13010"),
+            "{m}"
+        );
+        assert!(m.contains("matching `nvidia-smi`"), "{m}");
+    }
+
+    #[test]
+    fn other_driver_errors_are_named_without_the_skew_remedy() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU,
+            13010,
+            (13, 1),
+            "compute_80",
+        );
+        assert!(
+            m.contains("CUDA_ERROR_NO_BINARY_FOR_GPU") && !m.contains("matching `nvidia-smi`"),
+            "{m}"
+        );
+    }
 }
