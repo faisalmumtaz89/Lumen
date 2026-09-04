@@ -190,8 +190,9 @@ mod inner {
     /// against the number of header lines carrying that name, so a readable
     /// `identity` on one line cannot hide an unreadable value on another;
     /// lists are refused as written. Every `Content-Length` line, one or
-    /// many, must be a plain decimal integer (digits only, no sign, no
-    /// whitespace) and all must be byte-identical, since the first gates the
+    /// many, must be ASCII digits that fit in a u64 (no sign, no other bytes;
+    /// ureq trims surrounding whitespace, Unicode included, before the value
+    /// is seen) and all must be byte-identical, since the first gates the
     /// completion check; a length that fails to parse would otherwise fall
     /// back to the HEAD's advisory size. Encoded or partial bytes would
     /// otherwise pass the length check and be published as the model. Out of
@@ -226,9 +227,11 @@ mod inner {
             .count();
         if length_lines > 0 {
             let lengths = header_values(resp, "content-length")?;
-            let is_plain_integer = |l: &String| {
-                !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()) && l.parse::<u64>().is_ok()
-            };
+            // ASCII digits only (ureq has already trimmed Unicode whitespace such as
+            // U+00A0 off the value, so the bytes are checked, not the trimmed text)
+            // and representable: 2^64 is all digits and would parse to nothing.
+            let is_plain_integer =
+                |l: &String| l.bytes().all(|b| b.is_ascii_digit()) && l.parse::<u64>().is_ok();
             if lengths.len() != length_lines
                 || !lengths.iter().all(is_plain_integer)
                 || lengths.iter().any(|l| l != &lengths[0])
@@ -1345,8 +1348,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A single `Content-Length` line that is not one plain integer (a comma
-    /// list, garbage, a sign) is refused: its parse would otherwise fail and
+    /// A single `Content-Length` line that is not one representable integer (a
+    /// comma list, garbage, a sign, a value past u64) is refused: its parse would otherwise fail and
     /// the download would fall back to the HEAD's advisory size.
     #[cfg(feature = "download")]
     #[test]
@@ -1355,6 +1358,7 @@ mod tests {
             ("cl-list", "Content-Length: 18, 18\r\n"),
             ("cl-garbage", "Content-Length: 18abc\r\n"),
             ("cl-signed", "Content-Length: +18\r\n"),
+            ("cl-overflow", "Content-Length: 18446744073709551616\r\n"),
         ] {
             let (base, server) = serve_like_hf_full(4, "", "200 OK", extra, "200 OK", true);
             let dir = scratch_dir(tag);
