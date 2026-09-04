@@ -16070,6 +16070,13 @@ impl ComputeBackend for CudaBackend {
         // `use_q4_split` (the SoA buffers must exist for the locked kernel to
         // read). Default resolved by `soa_locked_default` (ON for quantised
         // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
+        // The lever defaults below read the device's compute capability.
+        if let Ok((cc_major, _)) = self.device.compute_capability() {
+            crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
+            if cc_major >= 12 && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none() {
+                eprintln!("[CUDA] cc {cc_major}.x: LUMEN_CUDA_SOA_LOCKED defaults OFF (the locked Q4 kernel is pathological on Blackwell; set =1 to force)");
+            }
+        }
         let use_soa_locked = env_truthy_or_default(
             "LUMEN_CUDA_SOA_LOCKED",
             crate::runtime_defaults::soa_locked_default,
