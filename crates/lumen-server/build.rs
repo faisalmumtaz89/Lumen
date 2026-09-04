@@ -39,6 +39,11 @@ fn main() {
     // identity — two byte-different binaries can carry one stamp; harness
     // records identify a binary by its sha256. A fetch that writes a remote
     // ref also re-runs the script (one relink, byte-identical output).
+    // The registry TOML is embedded by the CLI regardless of git, so it is
+    // watched outside the git-dependent block.
+    if std::path::Path::new("../../model_registry.toml").exists() {
+        println!("cargo:rerun-if-changed=../../model_registry.toml");
+    }
     if let (Some(git_dir), Some(common_dir)) = (
         git(&["rev-parse", "--git-dir"]),
         git(&["rev-parse", "--git-common-dir"]),
@@ -49,7 +54,6 @@ fn main() {
             format!("{common_dir}/packed-refs"),
             "src".to_string(),
             "Cargo.toml".to_string(),
-            "../../model_registry.toml".to_string(),
         ];
         for path in candidates
             .iter()

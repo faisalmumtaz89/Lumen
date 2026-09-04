@@ -247,7 +247,11 @@ impl CudaDevice {
 
         // Cache key unavailable (version query failed) -> plain compile+load.
         let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
-        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+        // No cache key means the NVRTC/driver version query failed, so the
+        // message names the driver's error and the arch but no versions.
+        self.ctx.load_module(ptx).map_err(|e| {
+            RuntimeError::Compute(ptx_load_message(e.0, 0, (0, 0), arch.unwrap_or("default")))
+        })
     }
 
     /// Run NVRTC source->PTX compilation with the given arch / fast_math flags.
@@ -522,10 +526,16 @@ fn ptx_load_message(
     nvrtc_version: (i32, i32),
     arch: &str,
 ) -> String {
-    let base = format!(
-        "CUDA driver {driver_version} refused the PTX NVRTC {}.{} produced for arch '{arch}' ({code:?})",
-        nvrtc_version.0, nvrtc_version.1
-    );
+    let versions = if driver_version == 0 {
+        "(driver and NVRTC versions unknown: the version query failed)".to_string()
+    } else {
+        format!(
+            "(driver {driver_version}, NVRTC {}.{})",
+            nvrtc_version.0, nvrtc_version.1
+        )
+    };
+    let base =
+        format!("CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}");
     if code == cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION {
         format!(
             "{base}: the toolkit is newer than the driver, so its PTX ISA is unknown to the \
