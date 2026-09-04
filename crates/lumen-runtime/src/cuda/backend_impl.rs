@@ -16083,7 +16083,12 @@ impl ComputeBackend for CudaBackend {
         );
         let use_q4_split = env_truthy("LUMEN_CUDA_Q4_SPLIT") || use_soa_locked;
         if use_soa_locked {
-            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
+            let how = if parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_some() {
+                "env"
+            } else {
+                "default"
+            };
+            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED on ({how}): Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
         } else if use_q4_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q4_SPLIT=1: Q4_0 weights will be cloned to split layout for decode");
         }

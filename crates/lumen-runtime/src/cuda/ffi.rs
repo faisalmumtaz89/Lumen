@@ -580,6 +580,19 @@ mod ptx_load_message_tests {
     }
 
     #[test]
+    fn unknown_versions_are_stated_not_printed_as_zero() {
+        let u = ptx_load_message(
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            0,
+            (0, 0),
+            "default",
+        );
+        assert!(u.contains("versions unknown"), "{u}");
+        assert!(!u.contains("driver 0") && !u.contains("NVRTC 0."), "{u}");
+        assert!(u.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION"), "{u}");
+    }
+
+    #[test]
     fn other_driver_errors_are_named_without_the_skew_remedy() {
         let m = ptx_load_message(
             CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU,
