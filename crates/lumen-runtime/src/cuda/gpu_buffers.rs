@@ -1536,9 +1536,99 @@ pub fn dequant_q8_to_f16_gpu(
     Ok(f16_buf)
 }
 
-/// Pre-dequant all Q8_0 projection weights in a layer to F16 for HGEMM.
-///
-/// Populates the `wX_f16` fields. F32 and F16 weights are skipped (already usable).
+/// `LayerWeightsGpu::layer_type` value of a Gated DeltaNet layer; such layers
+/// build no F16 dequant caches.
+pub const LAYER_TYPE_GDN: u8 = 1;
+
+/// Element count of each F16 cache an attention layer builds in
+/// [`dequant_layer_q8_to_f16`]. One place for the shapes so the byte budget
+/// checked before the caches are built and the buffers actually allocated
+/// cannot drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct F16CacheElements {
+    /// Query projection (Q and its gate fused when the layer carries `attn_q_norm`).
+    pub wq: usize,
+    /// Key projection.
+    pub wk: usize,
+    /// Value projection.
+    pub wv: usize,
+    /// Attention output projection.
+    pub wo: usize,
+    /// FFN gate projection.
+    pub w_gate: usize,
+    /// FFN up projection.
+    pub w_up: usize,
+    /// FFN down projection.
+    pub w_down: usize,
+}
+
+/// The element count of each F16 cache an attention layer would build, from
+/// the model's dimensions. Qwen3.5 full-attention layers fuse Q and its gate
+/// into `wq` (`[q_dim * 2, hidden]`), signalled by the presence of
+/// `attn_q_norm`.
+pub fn attention_f16_elements(layer: &LayerWeightsGpu, hp: &ModelHyperparams) -> F16CacheElements {
+    let hidden = hp.hidden_dim as usize;
+    let head_dim = hp.head_dim as usize;
+    let inter = hp.intermediate_dim as usize;
+    let q_dim = hp.num_heads as usize * head_dim;
+    let kv_dim = hp.num_kv_heads as usize * head_dim;
+    let wq_out_dim = if layer.attn_q_norm.is_some() {
+        q_dim * 2
+    } else {
+        q_dim
+    };
+    F16CacheElements {
+        wq: wq_out_dim * hidden,
+        wk: kv_dim * hidden,
+        wv: kv_dim * hidden,
+        wo: hidden * q_dim,
+        w_gate: inter * hidden,
+        w_up: inter * hidden,
+        w_down: hidden * inter,
+    }
+}
+
+/// Whether [`dequant_layer_q8_to_f16`] materialises an F16 copy of this buffer.
+fn makes_f16_cache(w: &GpuWeightBuf) -> bool {
+    // Exhaustive on purpose: a new variant must decide here whether the
+    // allocator builds a cache for it, or the fit check under-counts.
+    match w {
+        GpuWeightBuf::Q8Raw(_) | GpuWeightBuf::Q4Raw(_) => true,
+        GpuWeightBuf::F32(f32_buf) => !f32_buf.is_empty(),
+        GpuWeightBuf::Q8Aligned(_)
+        | GpuWeightBuf::Q4Aligned(_)
+        | GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::F16Raw(_)
+        | GpuWeightBuf::Bf16Raw(_)
+        | GpuWeightBuf::Q8Split(_)
+        | GpuWeightBuf::Q4Split(_) => false,
+    }
+}
+
+/// Device bytes [`dequant_layer_q8_to_f16`] will allocate for this layer:
+/// zero for GDN layers (they skip the caches), otherwise two bytes per element
+/// of every weight that gets an F16 copy.
+pub fn f16_cache_bytes(layer: &LayerWeightsGpu, hp: &ModelHyperparams) -> u64 {
+    if layer.layer_type == LAYER_TYPE_GDN {
+        return 0;
+    }
+    let n = attention_f16_elements(layer, hp);
+    let targets: [(&GpuWeightBuf, usize); 7] = [
+        (&layer.wq, n.wq),
+        (&layer.wk, n.wk),
+        (&layer.wv, n.wv),
+        (&layer.wo, n.wo),
+        (&layer.w_gate, n.w_gate),
+        (&layer.w_up, n.w_up),
+        (&layer.w_down, n.w_down),
+    ];
+    targets
+        .iter()
+        .filter(|(w, _)| makes_f16_cache(w))
+        .map(|(_, elems)| *elems as u64 * 2)
+        .sum()
+}
+
 /// Pre-dequant all Q8_0 projection weights in a layer to F16 for HGEMM.
 ///
 /// Populates the `wX_f16` fields. F32 and F16 weights are skipped (already usable).
@@ -1550,15 +1640,6 @@ pub fn dequant_layer_q8_to_f16(
     layer: &mut LayerWeightsGpu,
     hp: &ModelHyperparams,
 ) -> Result<(), RuntimeError> {
-    let hidden = hp.hidden_dim as usize;
-    let heads = hp.num_heads as usize;
-    let kv_heads = hp.num_kv_heads as usize;
-    let head_dim = hp.head_dim as usize;
-    let inter = hp.intermediate_dim as usize;
-
-    let q_dim = heads * head_dim;
-    let kv_dim = kv_heads * head_dim;
-
     // For GDN layers (layer_type == 1):
     // F16 caches are REQUIRED for Q4_0 weights. Without them, Q4_0 falls through
     // to the slow scalar matvec_q4_0 kernel (~22 tok/s vs ~56 tok/s with HGEMV).
@@ -1584,7 +1665,7 @@ pub fn dequant_layer_q8_to_f16(
             GpuWeightBuf::F32(f32_buf) => {
                 // F32 weights (possibly from Q4_1/Q6_K host dequant) -- convert to F16 for HGEMV.
                 use cudarc::driver::PushKernelArg;
-                if f32_buf.len() == 0 {
+                if f32_buf.is_empty() {
                     return Ok(None);
                 }
                 let mut f16_buf: CudaSlice<u8> = device.alloc_zeros(n * 2)?;
@@ -1661,18 +1742,14 @@ pub fn dequant_layer_q8_to_f16(
         //
         // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate),
         // so element count must be doubled when attn_q_norm is present.
-        let wq_out_dim = if layer.attn_q_norm.is_some() {
-            q_dim * 2
-        } else {
-            q_dim
-        };
-        layer.wq_f16 = dequant_weight(&layer.wq, wq_out_dim * hidden)?;
-        layer.wk_f16 = dequant_weight(&layer.wk, kv_dim * hidden)?;
-        layer.wv_f16 = dequant_weight(&layer.wv, kv_dim * hidden)?;
-        layer.wo_f16 = dequant_weight(&layer.wo, hidden * q_dim)?;
-        layer.w_gate_f16 = dequant_weight(&layer.w_gate, inter * hidden)?;
-        layer.w_up_f16 = dequant_weight(&layer.w_up, inter * hidden)?;
-        layer.w_down_f16 = dequant_weight(&layer.w_down, hidden * inter)?;
+        let n = attention_f16_elements(layer, hp);
+        layer.wq_f16 = dequant_weight(&layer.wq, n.wq)?;
+        layer.wk_f16 = dequant_weight(&layer.wk, n.wk)?;
+        layer.wv_f16 = dequant_weight(&layer.wv, n.wv)?;
+        layer.wo_f16 = dequant_weight(&layer.wo, n.wo)?;
+        layer.w_gate_f16 = dequant_weight(&layer.w_gate, n.w_gate)?;
+        layer.w_up_f16 = dequant_weight(&layer.w_up, n.w_up)?;
+        layer.w_down_f16 = dequant_weight(&layer.w_down, n.w_down)?;
     }
 
     Ok(())

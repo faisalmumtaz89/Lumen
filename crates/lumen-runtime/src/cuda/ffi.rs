@@ -209,16 +209,30 @@ impl CudaDevice {
             // Cache hit: load the cached PTX bytes directly.
             if let Some(cached) = super::ptx_cache::load(&key) {
                 let ptx = cudarc::nvrtc::Ptx::from_binary(cached);
-                if let Ok(module) = self.ctx.load_module(ptx) {
-                    super::ptx_cache::record_hit();
-                    return Ok(module);
+                match self.ctx.load_module(ptx) {
+                    Ok(module) => {
+                        super::ptx_cache::record_hit();
+                        return Ok(module);
+                    }
+                    Err(e) => {
+                        // A cached blob the driver cannot load must never be
+                        // fatal: say what the driver said and fall through to a
+                        // fresh compile. Only a refusal of the PTX itself earns
+                        // a driver-reject marker (so later launches skip the
+                        // doomed reload); a transient failure (out of memory,
+                        // a lost context) leaves the entry alone, and a
+                        // successful `store` clears any marker in any case.
+                        eprintln!(
+                            "[CUDA] cached PTX for {} (arch {}) failed to load: {}; recompiling",
+                            key.digest_hex(),
+                            key.arch,
+                            ptx_load_message(e.0, key.driver_version, key.nvrtc_version, key.arch)
+                        );
+                        if ptx_rejected_by_driver(e.0) {
+                            super::ptx_cache::mark_driver_reject(&key);
+                        }
+                    }
                 }
-                // A cached blob that the driver rejects (e.g. produced by an
-                // incompatible build that somehow shares the key) must never be
-                // fatal: record a driver-reject marker so subsequent launches
-                // skip the doomed reload + recompile, then fall through to a
-                // fresh compile for this launch.
-                super::ptx_cache::mark_driver_reject(&key);
             }
 
             // Miss (or rejected cache entry): NVRTC-compile, then load. Only
@@ -239,7 +253,13 @@ impl CudaDevice {
                     return Ok(module);
                 }
                 Err(e) => {
-                    super::ptx_cache::mark_driver_reject(&key);
+                    // Only a rejection of the PTX itself earns a marker: a marker
+                    // says "recompiling cannot help", which is true for an
+                    // unsupported ISA or a JIT error and false for a device out of
+                    // memory or a lost context, where the next launch may load fine.
+                    if ptx_rejected_by_driver(e.0) {
+                        super::ptx_cache::mark_driver_reject(&key);
+                    }
                     return Err(ptx_load_err(e, &key));
                 }
             }
@@ -520,6 +540,27 @@ fn ptx_load_err(e: cudarc::driver::DriverError, key: &super::ptx_cache::CacheKey
     ))
 }
 
+/// Whether a `cuModuleLoadData` failure means the driver refused the PTX
+/// itself, so a recompile against the same toolkit and driver cannot help and
+/// a driver-reject marker is warranted. Only the codes the driver documents
+/// for a refused image count; every other failure (out of memory, a lost or
+/// invalid context, an uncorrectable ECC event, a device not yet ready, an
+/// unknown error) is treated as transient, because a marker written for a
+/// transient failure would outlive the condition and poison the key.
+pub(crate) fn ptx_rejected_by_driver(code: cudarc::driver::sys::CUresult) -> bool {
+    use cudarc::driver::sys::CUresult as R;
+    matches!(
+        code,
+        R::CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+            | R::CUDA_ERROR_INVALID_PTX
+            | R::CUDA_ERROR_NO_BINARY_FOR_GPU
+            | R::CUDA_ERROR_INVALID_IMAGE
+            | R::CUDA_ERROR_INVALID_SOURCE
+            | R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND
+            | R::CUDA_ERROR_JIT_COMPILATION_DISABLED
+    )
+}
+
 fn ptx_load_message(
     code: cudarc::driver::sys::CUresult,
     driver_version: i32,
@@ -560,8 +601,39 @@ fn cuda_cublas_err(e: cudarc::cublas::result::CublasError) -> RuntimeError {
 
 #[cfg(test)]
 mod ptx_load_message_tests {
-    use super::ptx_load_message;
+    use super::{ptx_load_message, ptx_rejected_by_driver};
     use cudarc::driver::sys::CUresult;
+
+    #[test]
+    fn only_a_refusal_of_the_ptx_earns_a_marker() {
+        for refused in [
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            CUresult::CUDA_ERROR_INVALID_PTX,
+            CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU,
+            CUresult::CUDA_ERROR_INVALID_IMAGE,
+            CUresult::CUDA_ERROR_INVALID_SOURCE,
+        ] {
+            assert!(
+                ptx_rejected_by_driver(refused),
+                "{refused:?} is a refusal of the PTX"
+            );
+        }
+        for transient in [
+            CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            CUresult::CUDA_ERROR_CONTEXT_IS_DESTROYED,
+            CUresult::CUDA_ERROR_INVALID_CONTEXT,
+            CUresult::CUDA_ERROR_ECC_UNCORRECTABLE,
+            CUresult::CUDA_ERROR_NOT_INITIALIZED,
+            CUresult::CUDA_ERROR_SYSTEM_NOT_READY,
+            CUresult::CUDA_ERROR_LAUNCH_FAILED,
+            CUresult::CUDA_ERROR_UNKNOWN,
+        ] {
+            assert!(
+                !ptx_rejected_by_driver(transient),
+                "{transient:?} must not write a marker"
+            );
+        }
+    }
 
     #[test]
     fn ptx_load_message_names_the_toolkit_driver_skew() {
