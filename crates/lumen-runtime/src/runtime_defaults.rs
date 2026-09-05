@@ -1509,26 +1509,186 @@ pub fn q6k_head_enabled() -> bool {
     })
 }
 
+/// Default byte budget for the split-sibling clones: free VRAM minus the
+/// activation slack. `free` is read in `preload_weights`, after `init` has
+/// allocated the KV caches, so it is already net of KV; subtracting a KV
+/// reserve here again would count it twice. A minimum budget floored against
+/// `free - slack` is the identity, so there is none. On a 32 GB card with
+/// 2.76 GB free after the F16 caches this resolves to 0.76 GB; the formula it
+/// replaces resolved 5.1 GB there and, with the other clones that follow,
+/// left the card at 0.14 GB free.
+pub fn split_clone_budget_bytes(free: usize, slack: usize) -> usize {
+    free.saturating_sub(slack)
+}
+
+/// Whether a clone of `clone_bytes` may be made when `free` bytes remain and
+/// `slack` must stay free for decode afterwards. Every clone made after the
+/// budgeted sibling passes — the output-projection split clone in particular —
+/// goes through this, so no clone can spend the decode slack. On a 32 GB card
+/// (Qwen3.8-27B Q4_0, 4096-token context) the sibling pass left 2.06 GB free;
+/// making this 1.35 GB clone then took the card to 32066 of 32607 MiB and the
+/// first inference failed with CUDA_ERROR_OUT_OF_MEMORY, while the same run
+/// with only this clone skipped completed with about 1 GB to spare.
+pub fn clone_fits(clone_bytes: u64, free: u64, slack: u64) -> bool {
+    clone_bytes
+        .checked_add(slack)
+        .is_some_and(|need| need <= free)
+}
+
+/// Whether the output-projection split clone is made. A clone that would
+/// spend the decode slack is skipped, and so is one decided on a failed
+/// memory query: the clone is an optimisation, so skipping it costs nothing.
+/// [`f16_cache_refusal`] goes the other way on a failed query and builds,
+/// because a telemetry failure is not a memory shortage and a load that got
+/// that far is refused only on a measured one. [`F16_CACHE_FORCE_ENV`]
+/// overrides both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneDecision {
+    /// Make the clone.
+    Proceed,
+    /// Skip it: the clone plus the slack exceeds the free bytes.
+    NoRoom {
+        clone_bytes: u64,
+        free: u64,
+        slack: u64,
+    },
+    /// Skip it: the free-memory query failed and the clone is not forced.
+    UnknownFree,
+}
+
+impl CloneDecision {
+    /// Whether the clone goes ahead.
+    pub fn proceed(self) -> bool {
+        matches!(self, CloneDecision::Proceed)
+    }
+
+    /// The reason the clone is skipped, for the start-up log; `None` when it
+    /// proceeds.
+    pub fn skip_reason(self) -> Option<String> {
+        let gb = |b: u64| b as f64 / 1.0e9;
+        match self {
+            CloneDecision::Proceed => None,
+            CloneDecision::NoRoom { clone_bytes, free, slack } => Some(format!(
+                "a {:.2} GB clone would leave less than the {:.2} GB decode slack of the {:.2} GB free \
+                 (set {F16_CACHE_FORCE_ENV}=1 to make it anyway)",
+                gb(clone_bytes),
+                gb(slack),
+                gb(free)
+            )),
+            CloneDecision::UnknownFree => Some(format!(
+                "the free-memory query failed (set {F16_CACHE_FORCE_ENV}=1 to make it anyway)"
+            )),
+        }
+    }
+}
+
+/// The decision for a clone of `clone_bytes` given what the memory query said;
+/// see [`CloneDecision`] for the policy.
+pub fn output_proj_clone_decision(
+    clone_bytes: u64,
+    free: FreeMemory,
+    slack: u64,
+    forced: bool,
+) -> CloneDecision {
+    if forced {
+        return CloneDecision::Proceed;
+    }
+    match free {
+        FreeMemory::Unknown => CloneDecision::UnknownFree,
+        FreeMemory::Bytes(free) if clone_fits(clone_bytes, free, slack) => CloneDecision::Proceed,
+        FreeMemory::Bytes(free) => CloneDecision::NoRoom {
+            clone_bytes,
+            free,
+            slack,
+        },
+    }
+}
+
+/// Device memory that must stay free after the F16 dequant caches: decode
+/// scratch, the cuBLAS workspace and the logits buffer are allocated later.
+/// The sizing is a lower bound (Qwen3.8-27B Q4_0 predicted 11.91 GB and
+/// allocated 11.91 GB at a 4096-token context and 12.01 GB at 2048), so the
+/// headroom also absorbs that spread.
+pub const F16_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Set to a truthy value to build the F16 dequant caches even when
+/// [`f16_cache_refusal`] would refuse. The refusal is a prediction; this is
+/// the escape hatch when the prediction is wrong for a card.
+pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
+
+/// What the memory query said just before the F16 caches are built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreeMemory {
+    /// `cuMemGetInfo` succeeded; the device has this many bytes free.
+    Bytes(u64),
+    /// `cuMemGetInfo` failed; the caches are built on the assumption that
+    /// the load that got this far will fit, and the caller logs the failure.
+    Unknown,
+}
+
+/// The refusal to build the F16 dequant caches when they cannot fit, or
+/// `None` when they can, when nothing needs building, when the memory query
+/// failed (a telemetry failure is not a memory shortage), or when
+/// [`F16_CACHE_FORCE_ENV`] is set. `needed` is the byte total the caches will
+/// allocate; the remaining arguments only make the message concrete.
+pub fn f16_cache_refusal(
+    needed: u64,
+    free: FreeMemory,
+    headroom: u64,
+    forced: bool,
+    attention_layers: usize,
+    max_seq_len: usize,
+    kv_bytes: u64,
+) -> Option<String> {
+    if needed == 0 || forced {
+        return None;
+    }
+    let free = match free {
+        FreeMemory::Bytes(b) => b,
+        FreeMemory::Unknown => return None,
+    };
+    if let Some(total) = needed.checked_add(headroom) {
+        if total <= free {
+            return None;
+        }
+    }
+    let gb = |b: u64| b as f64 / 1.0e9;
+    Some(format!(
+        "F16 dequant caches for {attention_layers} attention layers need {:.2} GB \
+         (+{:.2} GB headroom) but only {:.2} GB of device memory is free after the \
+         weights and the {max_seq_len}-token KV cache ({:.2} GB). Lower --context-len, \
+         use a smaller quantization, or set {F16_CACHE_FORCE_ENV}=1 to build them anyway. \
+         Refusing rather than oversubscribing: the later decode allocations would fail.",
+        gb(needed),
+        gb(headroom),
+        gb(free),
+        gb(kv_bytes)
+    ))
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
-/// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
-/// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
-/// faster than the unlocked split kernel). The effect is gated downstream by
-/// Q4 split-dispatch + locked-kernel presence (`matvec_q4_split_q8_1_locked`),
-/// so on a Q8/BF16 model the locked kernel is absent and this is a no-op.
+///
+/// ON only for quantised dense models on a measured-good compute capability
+/// (8.x and 9.x, where the codegen-locked Q4_0 split matvec was tuned:
+/// word-load nibble stream, load-hoist, `.rn`-pinned epilogue,
+/// bit-deterministic and faster than the unlocked split kernel). OFF on
+/// every other capability, including 12.x, 10.x and a device whose
+/// capability query failed (`device_cc_major() == 0`), because the kernel
+/// is unmeasured there, not because it is known to be slow: on an RTX 5090
+/// a controlled probe with memory held constant decodes Qwen3.8-27B Q4_0
+/// at 75.4–75.5 tok/s with the kernel forced on or off. `=1` still forces
+/// it on. The effect is gated downstream by Q4 split dispatch and the
+/// locked kernel's presence (`matvec_q4_split_q8_1_locked`), so on a
+/// Q8/BF16 model it is a no-op.
 ///
 /// **MoE: explicit OFF.** `SOA_LOCKED` implies the Q4 split clone pass
 /// (`repack_all_layers_q4_clone_to_split`), which populates the dense
-/// `wq/wk/wv/wo/w_gate/w_up/w_down` siblings only. On an MoE LBC the dense MLP
-/// is replaced by per-expert weights, so arming the clone there would partially
-/// populate siblings exactly as the Q8 SPLIT pass did before its MoE gate
-/// (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default` and keeps the
-/// Q4-dense decode win without touching the MoE path.
+/// `wq/wk/wv/wo/w_gate/w_up/w_down` siblings only. On an MoE LBC the dense
+/// MLP is replaced by per-expert weights, so arming the clone there would
+/// partially populate siblings exactly as the Q8 SPLIT pass did before its
+/// MoE gate (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default`.
 pub fn soa_locked_default() -> bool {
-    // The locked kernel's codegen was tuned on Ampere/Hopper. On Blackwell
-    // (cc 12.x) it decodes 27B-Q4 at 1.1 tok/s where the plain split path
-    // decodes at 69 tok/s (RTX 5090, 2026-09-04), so the default is OFF there;
-    // `LUMEN_CUDA_SOA_LOCKED=1` still forces it on for measurement.
-    if device_cc_major() >= 12 {
+    if !matches!(device_cc_major(), 8 | 9) {
         return false;
     }
     match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
@@ -1601,6 +1761,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
+    "LUMEN_CUDA_F16_CACHE_FORCE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_GATE_UP_BANK",
     "LUMEN_CUDA_Q4_DOWN_NR1",
@@ -1931,11 +2092,16 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 // configurations in the same process). Production code MUST NOT call this.
 // ---------------------------------------------------------------------------
 
-/// Resets the process-wide hint atomics to their defaults. Test-only —
-/// used by the unit tests below so each test starts from a known state.
+/// Resets the process-wide hint atomics to their defaults, with the device
+/// capability set to a measured-good one (8) so the capability gate does not
+/// mask the model-shape rules the tests exercise. Test-only — used by the
+/// unit tests below so each test starts from a known state.
 #[doc(hidden)]
 pub fn reset_for_tests() {
-    DEVICE_CC_MAJOR.store(0, Ordering::Relaxed);
+    // A measured-good capability, so the capability gate does not mask the
+    // model-shape rules the tests below exercise (an unknown capability
+    // returns early, before the MoE arm is reached).
+    DEVICE_CC_MAJOR.store(8, Ordering::Relaxed);
     PATH_IS_SERVER.store(false, Ordering::Relaxed);
     MODEL_DENSE_QUANT_HINT.store(HINT_UNSET, Ordering::Relaxed);
     MODEL_PRIMARY_QUANT_SCHEME.store(QUANT_SCHEME_UNSET, Ordering::Relaxed);
@@ -2423,31 +2589,156 @@ mod tests {
     fn quantised_dense_enables_soa_locked_default() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset_for_tests();
-        // Q4 dense (lm_head often Q8_0 → HINT_QUANTISED) defaults SOA_LOCKED ON.
-        set_model_dense_quant(QuantScheme::Q8_0);
-        assert!(
-            soa_locked_default(),
-            "quantised dense should default SOA_LOCKED=ON"
-        );
-    }
-
-    #[test]
-    fn blackwell_disables_soa_locked_default_and_ampere_keeps_it() {
-        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_tests();
+        // Q4 dense (lm_head often Q8_0 → HINT_QUANTISED) defaults SOA_LOCKED ON
+        // on a measured-good capability (the A100 the kernel was tuned on).
         set_model_dense_quant(QuantScheme::Q8_0);
         set_device_cc_major(8);
         assert!(
             soa_locked_default(),
-            "cc 8.x (A100) keeps the tuned default ON"
+            "quantised dense on cc 8.x should default SOA_LOCKED=ON"
         );
+    }
+
+    #[test]
+    fn split_clone_budget_is_free_minus_the_slack_and_nothing_else() {
+        let gb = |x: f64| (x * 1e9) as usize;
+        // A100 after a 27B-Q8 load: 46 GB free, 2 GB slack -> 44 GB.
+        assert_eq!(split_clone_budget_bytes(gb(46.0), gb(2.0)), gb(44.0));
+        // A 32 GB card with 2.76 GB free after the F16 caches -> 0.76 GB.
+        assert_eq!(split_clone_budget_bytes(gb(2.76), gb(2.0)), gb(0.76));
+        // Less than the slack: nothing. (Kills a mutant that subtracts any other
+        // amount, or that adds a floor back: 1.5 - 2.0 must be 0, not 5.1 or 1.5.)
+        assert_eq!(split_clone_budget_bytes(gb(1.5), gb(2.0)), 0);
+        assert_eq!(split_clone_budget_bytes(0, gb(2.0)), 0);
+        assert_eq!(split_clone_budget_bytes(gb(2.0), gb(2.0)), 0);
+    }
+
+    #[test]
+    fn a_clone_must_leave_the_slack_free() {
+        let gb = |x: f64| (x * 1e9) as u64;
+        // The 5090 case: 2.06 GB free, 1.35 GB clone, 2 GB slack -> refused.
+        assert!(!clone_fits(gb(1.35), gb(2.06), gb(2.0)));
+        // Exactly enough is enough.
+        assert!(clone_fits(gb(1.35), gb(3.35), gb(2.0)));
+        assert!(!clone_fits(gb(1.35), gb(3.34), gb(2.0)));
+        // Overflow is a refusal, not a wrap.
+        assert!(!clone_fits(u64::MAX, u64::MAX, 1));
+    }
+
+    #[test]
+    fn output_proj_clone_is_skipped_unless_it_fits_or_is_forced() {
+        let gb = |x: f64| (x * 1e9) as u64;
+        let b = FreeMemory::Bytes;
+        // The 5090 case: 2.06 GB free, 1.35 GB clone, 2 GB slack -> skipped, and the
+        // reason names all three numbers.
+        let d = output_proj_clone_decision(gb(1.35), b(gb(2.06)), gb(2.0), false);
+        assert!(!d.proceed());
+        let reason = d.skip_reason().expect("skipped clones give a reason");
+        for needle in ["1.35 GB", "2.00 GB", "2.06 GB", F16_CACHE_FORCE_ENV] {
+            assert!(reason.contains(needle), "missing {needle:?} in {reason}");
+        }
+        // Room enough: proceeds, no reason.
+        let d = output_proj_clone_decision(gb(1.35), b(gb(3.35)), gb(2.0), false);
+        assert!(d.proceed());
+        assert_eq!(d.skip_reason(), None);
+        // A failed memory query is no room, not a licence: skipped (fail-closed).
+        assert!(
+            !output_proj_clone_decision(gb(1.35), FreeMemory::Unknown, gb(2.0), false).proceed()
+        );
+        // The override proceeds regardless of either.
+        assert!(output_proj_clone_decision(gb(1.35), b(0), gb(2.0), true).proceed());
+        assert!(output_proj_clone_decision(gb(1.35), FreeMemory::Unknown, gb(2.0), true).proceed());
+    }
+
+    #[test]
+    fn f16_cache_refusal_fits_when_needed_plus_headroom_is_free() {
+        let b = FreeMemory::Bytes;
+        assert_eq!(f16_cache_refusal(10, b(90), 80, false, 16, 2048, 1), None);
+        assert!(f16_cache_refusal(10, b(90), 81, false, 16, 2048, 1).is_some());
+    }
+
+    #[test]
+    fn f16_cache_refusal_never_fires_for_nothing_to_build() {
+        // BF16 / F16 models build no caches: no refusal even at zero free.
+        assert_eq!(
+            f16_cache_refusal(0, FreeMemory::Bytes(0), 1, false, 0, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_treats_a_failed_memory_query_as_unknown_not_zero() {
+        assert_eq!(
+            f16_cache_refusal(10, FreeMemory::Unknown, 1, false, 16, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_is_overridden_by_force() {
+        assert_eq!(
+            f16_cache_refusal(10, FreeMemory::Bytes(0), 1, true, 16, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_names_the_levers_and_the_numbers() {
+        let msg = f16_cache_refusal(
+            13_500_000_000,
+            FreeMemory::Bytes(11_450_000_000),
+            F16_CACHE_HEADROOM_BYTES,
+            false,
+            16,
+            8192,
+            4_290_000_000,
+        )
+        .expect("13.5 GB cannot fit in 11.45 GB");
+        for needle in [
+            "16 attention layers",
+            "13.50 GB",
+            "11.45 GB",
+            "8192-token",
+            "4.29 GB",
+            "--context-len",
+            F16_CACHE_FORCE_ENV,
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+    }
+
+    #[test]
+    fn f16_cache_refusal_does_not_overflow_on_huge_need() {
+        assert!(f16_cache_refusal(
+            u64::MAX - 1,
+            FreeMemory::Bytes(u64::MAX - 1),
+            2,
+            false,
+            1,
+            1,
+            0
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn only_measured_good_capabilities_keep_soa_locked_on() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(8);
+        assert!(soa_locked_default(), "cc 8.x (A100) keeps it ON");
         set_device_cc_major(9);
         assert!(soa_locked_default(), "cc 9.x (H100) keeps it ON");
-        set_device_cc_major(12);
-        assert!(
-            !soa_locked_default(),
-            "cc 12.x (Blackwell) must default OFF: 1.1 vs 69 tok/s"
-        );
+        for cc in [0u8, 7, 10, 11, 12, 13] {
+            set_device_cc_major(cc);
+            assert!(
+                !soa_locked_default(),
+                "cc {cc}.x is not measured-good (0 = query failed): OFF"
+            );
+        }
+        reset_for_tests();
     }
 
     #[test]
@@ -2460,6 +2751,8 @@ mod tests {
         // Q8_SPLIT MoE regression).
         set_model_dense_quant(QuantScheme::Q8_0);
         set_model_is_moe(true);
+        // On a measured-good capability, so the MoE arm itself is what decides.
+        set_device_cc_major(8);
         assert!(
             !soa_locked_default(),
             "MoE should NOT default SOA_LOCKED=ON (clone-pass / PAD-spam regression)"
@@ -2939,6 +3232,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
         "LUMEN_CUDA_Q4_DOWN_NR1",

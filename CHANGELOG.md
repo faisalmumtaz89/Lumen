@@ -7,8 +7,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **Locked Q4 kernel gated by measured capability**: the codegen-locked Q4
+  split kernel defaults on only for compute capabilities 8.x and 9.x, where it
+  was measured; Blackwell (12.x), 10.x, and a device whose capability query
+  failed default it off, and the Q4 split dispatch goes with it (it was only
+  ever enabled through this lever or `LUMEN_CUDA_Q4_SPLIT=1`).
+  `LUMEN_CUDA_SOA_LOCKED=1` still forces it on. On an RTX 5090, five fresh
+  processes per arm with memory held constant decode Qwen3.8-27B Q4_0 at
+  75.4–75.5 tok/s with the kernel on or off, so the default is a no-op there.
+- **F16 dequant caches refused when they cannot fit**: the caches are sized
+  with the allocator's own arithmetic before any is built; when the bytes
+  needed plus a 512 MiB headroom exceed free memory the load is refused with
+  the bytes needed, the bytes free, the context length and the KV bytes.
+  Nothing to build, a failed free-memory query, or
+  `LUMEN_CUDA_F16_CACHE_FORCE=1` skip the check.
+- **Split-clone budget is free memory minus the slack**: the free figure is
+  read after the KV caches exist, so the KV reserve the budget used to
+  subtract was counted twice; the 5.1 GB minimum it used to raise itself to is
+  removed. A 32 GB card at 2.76 GB free now resolves 0.76 GB where it resolved
+  5.1 GB and, with the clones that followed, was left at 0.14 GB.
+- **Output-projection clone charged against free memory**: the split clone of
+  the output projection ran after the budgeted sibling clones and outside any
+  budget; on a 32 GB card at a 4096-token context it was the allocation that
+  pushed the first inference into `CUDA_ERROR_OUT_OF_MEMORY`. It is now made
+  only when it leaves the 2 GB decode slack free; otherwise, or when the
+  free-memory query fails, it is skipped with a message and the packed output
+  projection is used. `LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway.
+
 ### Fixed
 
+- **Driver-reject markers written only for a refused PTX**: the PTX cache
+  records a marker when the driver refuses an image (unsupported PTX version,
+  invalid PTX, no binary for the GPU, and the other refusal codes) so later
+  launches skip a doomed reload. A load that fails for any other reason (out
+  of memory, a lost context, an ECC event) now writes no marker, a cached
+  image the driver cannot load is reported instead of discarded silently, and
+  a successful store clears any marker for the key.
 - **Downloads refuse three more malformed responses**: a readable `identity`
   beside an unreadable second `Content-Encoding` value (the value count is now
   held against the header-line count), a header line with no colon (ureq's
@@ -27,8 +63,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   now watch the refs directory of the git common dir (so linked worktrees,
   tags and refs re-created after `git pack-refs` count), `packed-refs` when it
   exists, and the crate's own sources so its `-dirty` marker is right; a no-op
-  rebuild stays a no-op. Edits in other crates do not re-stamp (see the
-  tracker's `R10-RESIDUAL-STAMP-SCOPE`).
+  rebuild stays a no-op. The sources and manifest are watched whether or not
+  git is present, so a source edit re-stamps in a source tarball as it does
+  in a checkout. Edits in other crates do not re-stamp.
 
 ## [0.23.0] — 2026-09-03
 
@@ -863,7 +900,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
 [0.17.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.14.0...v0.15.0

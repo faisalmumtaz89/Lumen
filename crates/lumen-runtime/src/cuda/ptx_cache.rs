@@ -136,7 +136,7 @@ impl<'a> CacheKey<'a> {
     /// The on-disk filename for this key: a hex SHA-256 over all components.
     /// The source hash dominates; the env components are appended so a
     /// driver/toolkit/arch change cleanly re-keys.
-    fn digest_hex(&self) -> String {
+    pub(crate) fn digest_hex(&self) -> String {
         let mut h = Sha256::new();
         h.update(self.source.as_bytes());
         // Domain-separate each component with a tag + length so that, e.g.,
@@ -197,6 +197,12 @@ pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
+    }
+    // The driver accepted PTX for this key, so any driver-reject marker it
+    // carries is stale (a transient load failure, or a driver/toolkit change
+    // that kept the key): the marker must not outlive the proof against it.
+    if let Some(reject) = key.reject_path() {
+        let _ = std::fs::remove_file(reject);
     }
     // Unique temp name per (pid, key) so two concurrent first-launches writing
     // the *same* kernel don't clobber each other's temp file mid-write; the
@@ -766,6 +772,46 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("LUMEN_CUDA_PTX_CACHE_DIR");
+    }
+
+    /// A store the driver accepted clears a marker left by an earlier refusal
+    /// or transient failure for the same key.
+    #[test]
+    fn successful_store_clears_a_driver_reject_marker() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-ptxc-unpoison-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::env::set_var("LUMEN_CUDA_PTX_CACHE_DIR", &dir);
+        std::env::remove_var("LUMEN_CUDA_PTX_CACHE");
+
+        let key = CacheKey {
+            source: "k",
+            arch: "compute_120",
+            fast_math: false,
+            cc: (12, 0),
+            nvrtc_version: (13, 1),
+            driver_version: 13010,
+        };
+        mark_driver_reject(&key);
+        assert!(is_driver_rejected(&key), "marker written");
+        store(&key, b"ptx-the-driver-accepted\0");
+        assert!(
+            !is_driver_rejected(&key),
+            "a load the driver accepted must clear the reject marker"
+        );
+        assert_eq!(
+            load(&key).as_deref(),
+            Some(&b"ptx-the-driver-accepted\0"[..])
+        );
+
+        std::env::remove_var("LUMEN_CUDA_PTX_CACHE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Marking a key as driver-rejected drops any stale accepted-PTX entry for

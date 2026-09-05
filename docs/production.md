@@ -52,7 +52,7 @@ Qwen3.5-MoE-35B-A3B loads at Q4_0 and Q8_0 on a single A100-80GB (measured). The
 
 **BF16 MoE-35B-A3B headroom warning**: the H100-measured peak is 72,475 MiB; the A100 estimate is ≈74,955 MiB against the 81,152 MiB an A100-80GB PCIe reports, leaving ≈6.0 GiB estimated nominal headroom — an upper bound (CUDA context and driver reserve consume several hundred MiB before any allocation), and the conflicting unretained load records above mean even that margin is unconfirmed. Any concurrent process consuming a few GiB can race `cuMemAlloc` and cause OOM mid-upload. Deploy BF16 MoE on validated H100/H200-class hardware. No co-tenant workloads. For shared-GPU deployments, use Q8 (61,089 MiB ≈ 59.7 GiB peak) or Q4 (24.1 GB peak).
 
-KV cache is auto-sized to fit remaining VRAM; `--context-len` overrides. KV growth is bit-perfect to the theoretical formula: `max_seq_len × num_layers × num_kv_heads × head_dim × 4 (F32) × 2 (K + V)`.
+KV cache is sized to `--context-len` (the server defaults to 8192; the CLI sizes it to the prompt plus generation plus headroom). On CUDA the F16 dequant caches are then checked against the memory left: a load whose caches plus a 512 MiB headroom exceed free memory is refused with the bytes needed and free, so lower `--context-len` or use a smaller quantization (`LUMEN_CUDA_F16_CACHE_FORCE=1` overrides the check). KV growth is bit-perfect to the theoretical formula: `max_seq_len × num_layers × num_kv_heads × head_dim × 4 (F32) × 2 (K + V)`.
 
 ## Operational caveats summary
 
