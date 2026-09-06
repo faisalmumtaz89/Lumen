@@ -42,6 +42,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **The startup typo check knows the repository's own tooling names**: every
+  `LUMEN_*` variable not on the engine's allowlist drew an "unknown env var"
+  warning, including the names Lumen's own scripts, installer and release
+  workflow define (`LUMEN_BIN`, `LUMEN_SERVER_BIN`, the installer's
+  `LUMEN_MODEL` and `LUMEN_QUANT`, the determinism script's `LUMEN_DET_*`,
+  the quickstart's `LUMEN_QS_*`), which the shell that sets them passes on to
+  the binary. Those names are now a second, script-derived allowlist; a test
+  reads the scripts and fails when a name is added or dropped on either side.
 - **Driver-reject markers written only for a refused PTX**: the PTX cache
   records a marker when the driver refuses an image (unsupported PTX version,
   invalid PTX, no binary for the GPU, invalid image, invalid source) so later
