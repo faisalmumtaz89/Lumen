@@ -441,6 +441,15 @@ pub(crate) unsafe fn launch_gemm_projection(
     // fallback paths in the `match weight` block. Used to test whether HGEMM-F16
     // rounding accounts for the L0 drift on the Q8 projection.
     let force_f32 = std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok();
+    if force_f32 {
+        static F32_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !F32_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[CUDA] Prefill F32 SGEMM: ACTIVE (LUMEN_CUDA_PREFILL_F32; bypasses the F16 tensor core paths)"
+            );
+        }
+    }
 
     // when LUMEN_CUDA_Q8_PROJ_MMQ=1, also bypass the F16-cache
     // fast path so that Q8Raw weights are routed to mmq_q8_0_batched (MMQ-style
