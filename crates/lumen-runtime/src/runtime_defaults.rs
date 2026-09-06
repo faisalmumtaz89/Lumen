@@ -59,6 +59,12 @@ static MODEL_DENSE_QUANT_HINT: AtomicU8 = AtomicU8::new(0);
 /// backend at init before any lever default is resolved; 0 = unknown / not
 /// CUDA. Some defaults were tuned on one architecture and are wrong on
 /// another, so they read this.
+///
+/// Process-global, so it describes one device. A process that initialises
+/// backends on two devices of different capability concurrently can have the
+/// second store land between the first backend's store and its default
+/// resolution, and that backend then reads the other device's capability.
+/// Sequential initialisation, which is what the binaries do, is sound.
 static DEVICE_CC_MAJOR: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_device_cc_major(major: u8) {
@@ -1512,11 +1518,12 @@ pub fn q6k_head_enabled() -> bool {
 /// Default byte budget for the split-sibling clones: free VRAM minus the
 /// activation slack. `free` is read in `preload_weights`, after `init` has
 /// allocated the KV caches, so it is already net of KV; subtracting a KV
-/// reserve here again would count it twice. A minimum budget floored against
-/// `free - slack` is the identity, so there is none. On a 32 GB card with
-/// 2.76 GB free after the F16 caches this resolves to 0.76 GB; the formula it
-/// replaces resolved 5.1 GB there and, with the other clones that follow,
-/// left the card at 0.14 GB free.
+/// reserve here again would count it twice. The formula this replaces also
+/// raised the budget to a 5.1 GB minimum, and that minimum was live: on a
+/// 32 GB card with 2.76 GB free after the F16 caches it resolved 5.1 GB and,
+/// with the other clones that follow, left the card at 0.14 GB free. A
+/// minimum above `free - slack` spends the slack, so there is none now, and
+/// the same card resolves 0.76 GB.
 pub fn split_clone_budget_bytes(free: usize, slack: usize) -> usize {
     free.saturating_sub(slack)
 }
@@ -1543,15 +1550,18 @@ pub fn resolve_split_clone_budget_bytes(
 }
 
 /// Whether a clone of `clone_bytes` may be made when `free` bytes remain and
-/// `slack` must stay free for decode afterwards. Every clone made after the
-/// budgeted sibling passes — the output-projection split clone in particular —
-/// goes through this, so no clone can spend the decode slack. On a 32 GB card
+/// `slack` must stay free for decode afterwards. The output-projection split
+/// clone, made between the Q8 and Q4 sibling passes, goes through this, so it
+/// cannot spend the decode slack. Two clones do not: the aligned Q8 and Q4
+/// repacks of the output projection on a model without GDN layers, which every
+/// model in the shipped registry has, so neither path is reached. On a 32 GB card
 /// (Qwen3.8-27B Q4_0, 4096-token context) the sibling pass left 2.06 GB free;
 /// with this 1.35 GB clone also made the card reached 32066 of 32607 MiB and
 /// the first inference failed with CUDA_ERROR_OUT_OF_MEMORY. Skipping either
 /// the sibling clones or this clone let the same run complete (with this one
 /// skipped the peak was 30820 MiB): each clone class is necessary for the
-/// failure and neither alone is sufficient, so every one is budgeted.
+/// failure and neither alone is sufficient, so every clone on the reached
+/// paths is budgeted.
 pub fn clone_fits(clone_bytes: u64, free: u64, slack: u64) -> bool {
     clone_bytes
         .checked_add(slack)

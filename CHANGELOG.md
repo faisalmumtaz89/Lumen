@@ -17,7 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `LUMEN_CUDA_SOA_LOCKED=1` still forces it on. On an RTX 5090, in a
   configuration that fits, forcing the lever on does not reproduce the
   1.1 tok/s once attributed to it (75.4–75.5 tok/s either way, five fresh
-  processes per arm), so the default is a no-op there.
+  processes per arm); no difference was observed there, and whether the
+  locked kernel executed in the forced arm is not shown by that probe's
+  logs.
 - **F16 dequant caches refused when they cannot fit**: the caches are sized
   with the allocator's own arithmetic before any is built; when the bytes
   needed plus a 512 MiB headroom exceed free memory the load is refused with
@@ -29,14 +31,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   subtract was counted twice; the 5.1 GB minimum it used to raise itself to is
   removed. A 32 GB card at 2.76 GB free now resolves 0.76 GB where it resolved
   5.1 GB and, with the clones that followed, was left at 0.14 GB.
-- **Output-projection clone charged against free memory**: the split clone of
-  the output projection ran after the budgeted sibling clones and outside any
-  budget; on a 32 GB card at a 4096-token context the first inference failed
-  with `CUDA_ERROR_OUT_OF_MEMORY` when it and the sibling clones were both
-  made, and completed when either was skipped. It is now made
-  only when it leaves the 2 GB decode slack free; otherwise, or when the
-  free-memory query fails, it is skipped with a message and the packed output
-  projection is used. `LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway.
+- **Output-projection clone charged against free memory**: the split clone
+  of the output projection ran between the two budgeted sibling clone passes
+  and outside any budget; on a 32 GB card at a 4096-token context the first
+  inference failed with `CUDA_ERROR_OUT_OF_MEMORY` when it and the sibling
+  clones were both made, and completed when either was skipped. It is now
+  made only when it leaves the 2 GB decode slack free; otherwise, or when
+  the free-memory query fails, it is skipped with a message and the packed
+  output projection is used. `LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway.
 
 ### Fixed
 

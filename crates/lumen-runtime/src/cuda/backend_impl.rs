@@ -19229,10 +19229,11 @@ impl ComputeBackend for CudaBackend {
                 let vocab_size = hp_copy.vocab_size as usize;
                 let hidden = hp_copy.hidden_dim as usize;
                 // The split clone is the same size as the Q8 source it copies.
-                // It runs after the budgeted sibling passes, so it is charged
-                // against what is actually free now, and it may not spend the
-                // decode slack: on a 32 GB card the clones made past the slack
-                // pushed the first inference into CUDA_ERROR_OUT_OF_MEMORY.
+                // It runs after the budgeted Q8 sibling pass and before the Q4
+                // one, so it is charged against what is actually free now, and
+                // it may not spend the decode slack: on a 32 GB card the clones
+                // made past the slack pushed the first inference into
+                // CUDA_ERROR_OUT_OF_MEMORY.
                 let clone_bytes = proj_q8.len() as u64;
                 let forced =
                     parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
