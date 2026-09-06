@@ -4974,6 +4974,27 @@ impl CudaBackend {
                 let use_split_down = (st.kernels.use_q8_split_dispatch
                     && lw.q8_split_w_down.is_some())
                     || (st.kernels.use_q4_split_dispatch && lw.q4_split_w_down.is_some());
+                // Raw Q8_0/Q4_0 weights without a split sibling: the residual
+                // sibling of `launch_matvec` exists for both, and ends in the
+                // same single f32 add `residual_add` performs (`total +
+                // residual`, no product to contract), so folding the residual
+                // into the store keeps output bytes unchanged while eliding
+                // `residual_add` and the layer-commit D2D. On a card where the
+                // split clones do not fit, this is the route every layer takes.
+                let direct_resid_raw = crate::runtime_defaults::ffn_direct_residual()
+                    && matches!(lw.w_down, GpuWeightBuf::Q8Raw(_) | GpuWeightBuf::Q4Raw(_));
+                let note_direct_residual_raw = || {
+                    use std::sync::OnceLock;
+                    static MARK: OnceLock<()> = OnceLock::new();
+                    MARK.get_or_init(|| {
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] FFN_DIRECT_RESIDUAL: down folds residual -> x_gpu on the raw \
+                                 dp4a route (residual_add + layer-commit D2D elided)"
+                            );
+                        }
+                    });
+                };
                 if use_split_down {
                     let quant_fn = st.kernels.quantize_f32_to_q8_1.as_ref();
                     let q8_1_scratch = st.scratch.input_q8_1.as_mut();
@@ -5033,6 +5054,25 @@ impl CudaBackend {
                                 )?;
                             }
                         }
+                    } else if direct_resid_raw {
+                        unsafe {
+                            launch_matvec_residual(
+                                &self.device,
+                                &st.kernels,
+                                &lw.w_down,
+                                &st.scratch.gate,
+                                &st.scratch.attn_proj,
+                                &mut st.scratch.x_gpu,
+                                hidden_dim,
+                                inter_dim,
+                                "down",
+                                lw.w_down_f16.as_ref(),
+                                Some(&mut st.scratch.input_f16),
+                                st.scratch.input_q8_1.as_mut(),
+                            )?;
+                        }
+                        ffn_in_place = true;
+                        note_direct_residual_raw();
                     } else {
                         unsafe {
                             launch_matvec(
@@ -5050,6 +5090,25 @@ impl CudaBackend {
                             )?;
                         }
                     }
+                } else if direct_resid_raw {
+                    unsafe {
+                        launch_matvec_residual(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            &st.scratch.gate,
+                            &st.scratch.attn_proj,
+                            &mut st.scratch.x_gpu,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                            lw.w_down_f16.as_ref(),
+                            Some(&mut st.scratch.input_f16),
+                            st.scratch.input_q8_1.as_mut(),
+                        )?;
+                    }
+                    ffn_in_place = true;
+                    note_direct_residual_raw();
                 } else {
                     unsafe {
                         launch_matvec(
