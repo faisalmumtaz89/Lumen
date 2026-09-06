@@ -822,7 +822,9 @@ pub(crate) fn moe_fused_norm_router_enabled() -> bool {
 
 // NOTE: `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` was deleted 2026-07-14 (flag-cleanup
 // retention audit). The single-CTA `moe_router_fused_v2` router is now the
-// hardcoded default — see the dispatch sites below. Its former `=0` off-arm
+// fallback: the dispatch sites below take the two-launch parallel router when
+// `LUMEN_CUDA_MOE_ROUTER_PARALLEL` is on (its default) and this kernel
+// otherwise. Its former `=0` off-arm
 // dispatched the atomicAdd "last-CTA" router (`moe_router_fused_atomic_v2`),
 // which faults with `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens: a
 // persistent cross-launch `done_counter` can leave `expert_ids[]` uninitialized,
@@ -831,7 +833,8 @@ pub(crate) fn moe_fused_norm_router_enabled() -> bool {
 // kernel caches `normed_x` in shmem and warp-parallelizes per-expert dot products
 // (+1-3 μs/launch over the atomicAdd path).
 
-/// read `LUMEN_CUDA_MOE_ROUTER_PARALLEL` once via OnceLock (default OFF).
+/// read `LUMEN_CUDA_MOE_ROUTER_PARALLEL` once via OnceLock (default ON, via
+/// `runtime_defaults::moe_router_parallel_default`).
 ///
 /// **Why this exists** — nsys profiling of Lumen MoE Q8 decode on A100
 /// found `moe_router_fused_v2` (the hardcoded single-CTA router)
@@ -853,7 +856,7 @@ pub(crate) fn moe_fused_norm_router_enabled() -> bool {
 /// (same `w_e[j] * normed_x[j]`, same warp-reduce order within each expert).
 ///
 /// Two launches instead of one, but the parallelism gain (256 CTAs vs 1)
-/// dwarfs the extra launch overhead. Default OFF (opt-in) until benched.
+/// dwarfs the extra launch overhead.
 pub(crate) fn moe_router_parallel_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

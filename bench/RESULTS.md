@@ -222,16 +222,17 @@ The qwen35moe CUDA runtime path closed cleanly (one-line `BLOCK_DIM` fix in `moe
 |-------|-------|-------------:|---:|-----:|---------------|----------------|
 | Qwen3.5-MoE 35B-A3B | Q8_0 | **~71.8** *(historical; retained current record 79.2 = 0.567×)* | 140.65 | 0.510× | ≥0.65× llama.cpp | (earlier 8-flag stack) |
 | Qwen3.5-MoE 35B-A3B | Q4_0 | **~80.9** *(historical; retained current record 93.6 = 0.598×)* | 156.71 | 0.516× | ≥0.73× llama.cpp | |
-| Qwen3.5-MoE 35B-A3B | BF16 | see canonical production config below | — | — | — | canonical 8-flag stack |
+| Qwen3.5-MoE 35B-A3B | BF16 | see canonical production config below | — | — | — | canonical stack |
 | Qwen3.5-MoE 35B-A3B (original Q8) | Q8_0 | 17.79 (legacy) | — | — | — | D.1 (legacy reference) |
 | Qwen3.5-9B dense (regression check) | Q8_0 | 41.35 (legacy) | — | — | — | D.2 (legacy reference) |
 
 **Canonical production config (CUDA, Qwen3.5-MoE-35B-A3B BF16)**:
 
 ```bash
-# canonical 8-flag stack (defaults ON, opt-out=0):
+# canonical stack (defaults ON, opt-out=0). LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA is no
+# longer a flag: the single-CTA router is the fallback taken when the parallel
+# router below is off.
 LUMEN_CUDA_MOE_BATCHED=1                # default ON
-LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=1      # default ON
 LUMEN_CUDA_MOE_ROUTER_PARALLEL=1        # default ON
 LUMEN_CUDA_GDN_REGISTER_RESIDENT=1      # default ON
 LUMEN_CUDA_BF16_GEMMEX=0                # MUST be 0 for BF16 P3 correctness

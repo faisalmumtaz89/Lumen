@@ -188,14 +188,15 @@ Ratio = Lumen / baseline
 
 ## Required env-vars for full performance
 
-Lumen exposes several CUDA optimizations as environment variables. The **canonical production stack is 12 flags total** (8 default-ON opt-out flags + 4 load-bearing perf levers). All default to ON except `LUMEN_CUDA_BF16_GEMMEX` (which must be `0`), so setting them explicitly is idempotent.
+Lumen exposes several CUDA optimizations as environment variables. The **canonical production stack is 11 flags total** (7 default-ON opt-out flags + 4 load-bearing perf levers). All default to ON except `LUMEN_CUDA_BF16_GEMMEX` (which must be `0`), so setting them explicitly is idempotent.
 
 ### canonical production env stack (CUDA, MoE-35B-A3B)
 
 ```bash
-# canonical 8-flag stack (default-ON; opt-out=0):
+# canonical stack (default-ON; opt-out=0). LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA is no
+# longer a flag: the single-CTA router is the fallback taken when the parallel
+# router below is off.
 LUMEN_CUDA_MOE_BATCHED=1                  # default ON
-LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA=1        # default ON
 LUMEN_CUDA_MOE_ROUTER_PARALLEL=1          # default ON
 LUMEN_CUDA_GDN_REGISTER_RESIDENT=1                 # default ON — +9.4% Q8, +10.3% Q4
 LUMEN_CUDA_BF16_GEMMEX=0                  # MUST be 0 for BF16 P3 correctness
@@ -214,13 +215,10 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 
 ### Optional opt-ins (kept env-gated, default OFF)
 
-*(Per-flag gains in this table were recorded during the 2026-06/07 campaigns; their raw measurement artifacts are not individually retained.)*
+*(Per-flag gains in this table were recorded during the 2026-06/07 campaigns; their raw measurement artifacts are not individually retained. Three opt-ins once listed here, the V4 MoE FFN kernels, the FA2 attention port and the GDN split layout, have since been removed from the engine and are omitted.)*
 
 | Env var | Default | Path it toggles | Measured gain | Why default-OFF |
 |---------|---------|-----------------|--------------:|------------------|
-| `LUMEN_CUDA_MOE_BATCHED_V4=1` | OFF | V4 MoE FFN cooperative-CTA register-budget-reduced kernels | +16.8% Q8 standalone | Not integrated to main; ~450 LoC dispatch wiring deferred to a future release |
-| `LUMEN_CUDA_FA2_ATTN=1` | OFF | FA2 attention decode port | -2.7% Q8 | Per-call HBM alloc dominates at batch=1 |
-| `LUMEN_CUDA_GDN_SPLIT=1` | OFF | Split layout for GDN tensors (Q4 only) | +2.6% Q4 decode | Q8 + GDN_SPLIT does not fit in 80 GB VRAM |
 | `LUMEN_CUDA_Q8_SPLIT=1` | OFF | Raw + split layout for Q8_0 weights | +4.5% Q8 decode |  dense-9B opt-in; superseded by MMV_Q_DP4A for MoE |
 | `LUMEN_CUDA_Q4_SPLIT=1` | OFF | Raw + split layout for Q4_0 weights | +9.0% Q4 decode |  dense-9B opt-in; superseded by MMV_Q_MOE_DP4A for MoE |
 | `LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1` | OFF | Big-NR variant for the 1 GB output projection tensor | +7.7% Q8 decode (alone) | Dense-9B path; output_proj llama.cpp port is the MoE-class equivalent |
@@ -240,7 +238,7 @@ LUMEN_CUDA_MMV_Q_MOE_DP4A=1               # default ON — +11.7% Q4
 
 ### Legacy Modal full-perf invocation (DEPRECATED — retained for historical re-runs)
 
-> **Warning:** the Modal invocation block below targets dense-9B and uses the legacy opt-in set. It is **NOT** the current production stack. For current main, the 12-flag stack documented above is **default-ON** and out-of-the-box `lumen run` reproduces the published numbers. Critically, the legacy block below explicitly sets `LUMEN_CUDA_BF16_GEMMEX=1` (the legacy default); the **current production requirement is `LUMEN_CUDA_BF16_GEMMEX=0`** for BF16 P3 correctness on MoE. Do not copy this stanza into new deployments.
+> **Warning:** the Modal invocation block below targets dense-9B and uses the legacy opt-in set. It is **NOT** the current production stack. For current main, the 11-flag stack documented above is **default-ON** and out-of-the-box `lumen run` reproduces the published numbers. Critically, the legacy block below explicitly sets `LUMEN_CUDA_BF16_GEMMEX=1` (the legacy default); the **current production requirement is `LUMEN_CUDA_BF16_GEMMEX=0`** for BF16 P3 correctness on MoE. Do not copy this stanza into new deployments. `LUMEN_CUDA_GDN_SPLIT` no longer exists: the engine warns about it at startup and ignores it.
 
 ```bash
 modal run modal/bench_real_models.py --models qwen3.5-9b --quants q8_0,q4_0 \
