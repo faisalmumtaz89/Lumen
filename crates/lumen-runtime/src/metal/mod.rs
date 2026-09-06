@@ -819,6 +819,17 @@ impl MetalF32Backend {
     ///
     /// Returns an error if Metal is not available on this system.
     pub fn new() -> Result<Self, RuntimeError> {
+        // The fixed-horizon EOG mask (`LUMEN_BENCH_MASK_EOG`) is applied on the
+        // device only by the CUDA argmax; this backend's greedy selection runs
+        // on the device without it. Refuse, rather than run unmasked under the
+        // mask's marker line.
+        if !crate::runtime_defaults::bench_mask_eog_ids().is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "LUMEN_BENCH_MASK_EOG is not supported on the Metal backend: its greedy \
+                 argmax runs on the device without the mask"
+                    .into(),
+            ));
+        }
         let device = MetalDevice::system_default().ok_or_else(|| {
             RuntimeError::Compute("Metal GPU not available on this system".into())
         })?;

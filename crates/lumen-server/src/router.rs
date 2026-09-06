@@ -208,6 +208,7 @@ async fn chat_completions(
     // consumes the request; only the streaming path consults it.
     let include_usage = req.include_usage();
     let job = req.into_job(&state.engine)?;
+    wire::bench_token_ids_guard(stream, &job.stop_text)?;
     // Clone the stop list before `job` is moved into `submit`; the wire layer
     // seeds its redundant stop matcher from it (the worker enforces the actual
     // stop). Empty list => no-op, byte-identical streaming.
@@ -248,6 +249,7 @@ async fn completions(
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
     let job = req.into_job(&state.engine)?;
+    wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
@@ -275,6 +277,7 @@ async fn messages(
     // `<parameter>` values in the collectors).
     let tool_schemas = std::sync::Arc::new(wire::anthropic::tool_schemas(&req.tools));
     let job = req.into_job(&state.engine)?;
+    wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {

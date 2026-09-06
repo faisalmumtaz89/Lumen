@@ -192,6 +192,24 @@ pub enum TokenEvent {
     /// UTF-8 fragment (may be empty if the byte boundary did not yet
     /// resolve to a complete character).
     Token { token_id: u32, delta_text: String },
+    /// Bench surface (`LUMEN_BENCH_TOKEN_IDS=1`): the raw generated token ids
+    /// and the per-request EOS set, emitted immediately before `Done`. The
+    /// router refuses streaming and stop-sequence requests up front while the
+    /// surface is armed, so a collector always sees this event before `Done`.
+    ///
+    /// A separate variant rather than fields on `Done`, so the shipping event
+    /// shape is untouched when the surface is off and a wire layer that does
+    /// not handle it fails to compile rather than dropping the ids.
+    ///
+    /// `generated_token_ids` is the engine's own sampled-token record, in
+    /// order, before detokenisation, INCLUDING the terminating EOS id: the
+    /// decode loop consumes that id on its `break` without emitting a `Token`
+    /// event, so a wire-layer collection would lose the very id the
+    /// comparison is about.
+    BenchTokenIds {
+        generated_token_ids: Vec<u32>,
+        eos_token_ids: Vec<u32>,
+    },
     /// Generation ended cleanly. `finish_reason` is one of
     /// `"stop"` (EOS or stop sequence), `"length"` (max tokens reached),
     /// or `"tool_calls"` (the model emitted at least one tool call).
@@ -868,6 +886,9 @@ pub struct EngineWorker {
     /// The worker writes after every completed job; HTTP handlers read via
     /// [`EngineHandle::memory_breakdown_snapshot`].
     breakdown: Arc<Mutex<ServerMemoryBreakdown>>,
+    /// Bench surface (`LUMEN_BENCH_TOKEN_IDS=1`), resolved once at spawn so
+    /// the marker line is on the log before the first request.
+    bench_token_ids: bool,
 }
 
 impl EngineWorker {
@@ -946,7 +967,17 @@ impl EngineWorker {
             inbox_capacity: capacity,
             disk_kv,
             breakdown: Arc::clone(&breakdown),
+            bench_token_ids: lumen_runtime::runtime_defaults::bench_token_ids_enabled(),
         };
+        // The fixed-horizon EOG mask (`LUMEN_BENCH_MASK_EOG`) is parsed and
+        // range-checked here, before the listener exists, so a malformed or
+        // out-of-vocabulary value refuses to start on every backend instead of
+        // surfacing at the first request.
+        if let Err(e) = lumen_runtime::runtime_defaults::check_eog_mask_vocab(
+            worker.hyperparams.vocab_size as usize,
+        ) {
+            panic!("{e}");
+        }
         tokio::task::spawn_blocking(move || worker.run());
         EngineHandle {
             sender: tx,
@@ -1510,6 +1541,10 @@ impl EngineWorker {
         // budget (the entry guard breaks emitting nothing — byte-identical to
         // the pre-Part-4 `for _ in 0..0`). Every other exit reassigns it.
         let mut finish_reason = FinishReason::Stop;
+        // Bench surface (LUMEN_BENCH_TOKEN_IDS): the engine's own sampled-token
+        // record. Empty and never pushed to when the surface is off.
+        let bench_ids_on = self.bench_token_ids;
+        let mut bench_token_ids: Vec<u32> = Vec::new();
 
         // -- Part 4: reasoning-phase state machine + forced-close -----------
         //
@@ -1711,6 +1746,12 @@ impl EngineWorker {
                 }
             };
             generated += 1;
+            // Recorded BEFORE the EOS check: that branch `break`s without ever
+            // emitting a `Token` event, so a record taken after it, or at the
+            // wire layer, would silently drop the terminating id.
+            if bench_ids_on {
+                bench_token_ids.push(token_id);
+            }
             // Charge the token to the active phase. A token that carries (or
             // completes) `</think>` is the last reasoning token; the answer
             // begins on the following token.
@@ -1823,6 +1864,19 @@ impl EngineWorker {
             );
         }
 
+        if bench_ids_on {
+            let _ = self.send_event_polling_cancel(
+                &tokens_tx,
+                &cancel,
+                TokenEvent::BenchTokenIds {
+                    generated_token_ids: bench_token_ids.clone(),
+                    // The same value the wire layer put into the request, so a
+                    // reader compares against what the engine used to decide
+                    // stopping, not a re-derived set.
+                    eos_token_ids: request.eos_token_ids.clone(),
+                },
+            );
+        }
         let _ = self.send_event_polling_cancel(
             &tokens_tx,
             &cancel,

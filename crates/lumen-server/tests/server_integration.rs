@@ -1979,6 +1979,7 @@ async fn e1_engine_kv_overflow_emits_length_done_not_error() {
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            TokenEvent::BenchTokenIds { .. } => {}
             TokenEvent::Token { .. } => tokens_seen += 1,
             TokenEvent::Done {
                 finish_reason,
@@ -2521,6 +2522,7 @@ async fn drain_engine_text(
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            TokenEvent::BenchTokenIds { .. } => {}
             TokenEvent::Token { delta_text, .. } => text.push_str(&delta_text),
             TokenEvent::Done {
                 finish_reason,

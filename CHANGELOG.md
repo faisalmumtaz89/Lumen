@@ -7,6 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
+  names end-of-generation token ids that greedy decoding may never select, so a
+  run does not stop at an end-of-generation token before `max_tokens`. CUDA
+  masks the logits on the device before the argmax and every host-side
+  selection masks before sampling, from one parsed id set; the Metal backend
+  refuses to construct while it is set. A malformed, duplicate or
+  out-of-vocabulary value makes `lumen-server` refuse to start rather than run
+  unmasked. `LUMEN_BENCH_TOKEN_IDS=1` makes non-streaming server responses
+  carry a `lumen_bench` object with the raw generated token ids, terminator
+  included, their count, the finish reason and the request's EOS set; while
+  set, streaming requests and requests with stop sequences are rejected before
+  decoding.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed

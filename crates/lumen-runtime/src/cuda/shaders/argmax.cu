@@ -159,6 +159,30 @@ extern "C" __global__ void argmax_f32_tile_phase1(
     }
 }
 
+// ============================================================================
+// Fixed-horizon EOG mask (LUMEN_BENCH_MASK_EOG): writes the most negative
+// finite float (-FLT_MAX, the host's f32::MIN) at the given logit positions
+// BEFORE argmax, so a masked token can never be selected by greedy — the
+// "most likely continuation, conditional on continuing" a fixed-horizon
+// quality comparison is defined on. Mutates the logits buffer in place: any
+// later reader of this step's logits sees the value at the masked ids. Bench
+// surface, off unless set. One block, one thread per id; k <= 1024.
+// ============================================================================
+extern "C" __global__ void mask_logits_f32_min(
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ ids,
+    unsigned int k,
+    unsigned int n)
+{
+    unsigned int i = threadIdx.x;
+    if (i < k) {
+        unsigned int id = ids[i];
+        if (id < n) {
+            logits[id] = -3.402823466e+38f;
+        }
+    }
+}
+
 // Phase 2: one warp reduces the partials. num_partials <= 128.
 extern "C" __global__ void argmax_f32_tile_phase2(
     const float* __restrict__ partial_val,

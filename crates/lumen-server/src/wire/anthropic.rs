@@ -582,6 +582,16 @@ async fn drive_messages_stream(
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            // Bench surface: the router refuses streaming requests while it is
+            // armed, so this is unreachable in practice; if it does arrive,
+            // end the stream with an error rather than drop it silently.
+            TokenEvent::BenchTokenIds { .. } => {
+                let err = json!({"type": "error", "error": { "type": "api_error",
+                    "message": "LUMEN_BENCH_TOKEN_IDS is not supported on streaming \
+responses; use stream=false" }});
+                let _ = tx.send(sse_event("error", &err.to_string())).await;
+                return;
+            }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 // Reasoning trace -> a `thinking` content block, emitted BEFORE
@@ -878,10 +888,18 @@ pub async fn collect_messages(
     let mut prompt_tokens = 0usize;
     let mut completion_tokens = 0usize;
     let mut finish = FinishReason::Stop;
+    // Bench surface (LUMEN_BENCH_TOKEN_IDS): (generated ids, eos set).
+    let mut bench_ids: Option<(Vec<u32>, Vec<u32>)> = None;
 
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
+            TokenEvent::BenchTokenIds {
+                generated_token_ids,
+                eos_token_ids,
+            } => {
+                bench_ids = Some((generated_token_ids, eos_token_ids));
+            }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 reasoning.push_str(&delta.reasoning);
@@ -948,7 +966,7 @@ pub async fn collect_messages(
     }
     content_blocks.extend(tool_blocks);
 
-    Ok(json!({
+    let mut body = json!({
         "id": format!("msg_lumen_{:x}-{:x}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64).unwrap_or(0), super::next_response_seq()),
@@ -962,7 +980,10 @@ pub async fn collect_messages(
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens,
         }
-    }))
+    });
+    // The same surface as the OpenAI routes, so no route drops the ids silently.
+    super::openai::attach_bench_token_ids(&mut body, bench_ids, finish)?;
+    Ok(body)
 }
 
 #[cfg(test)]
