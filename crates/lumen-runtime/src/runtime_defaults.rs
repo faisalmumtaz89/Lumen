@@ -1521,6 +1521,27 @@ pub fn split_clone_budget_bytes(free: usize, slack: usize) -> usize {
     free.saturating_sub(slack)
 }
 
+/// The split-clone budget the clone passes consume, and whether it came from
+/// the operator: an explicit `LUMEN_CUDA_*_SPLIT_BUDGET_GB` value that parses
+/// as a finite number above zero is taken as gigabytes, uncapped, exactly as
+/// before the free-memory default existed; anything else (unset, empty,
+/// zero, negative, not a number) resolves to [`split_clone_budget_bytes`].
+/// Pure, so the choice is pinned off-device; the call site supplies the
+/// inputs (its free-memory reading, the slack, the raw override).
+pub fn resolve_split_clone_budget_bytes(
+    free: usize,
+    slack: usize,
+    override_raw: Option<&str>,
+) -> (usize, bool) {
+    if let Some(gb) = override_raw
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|gb| gb.is_finite() && *gb > 0.0)
+    {
+        return ((gb * 1_000_000_000.0) as usize, true);
+    }
+    (split_clone_budget_bytes(free, slack), false)
+}
+
 /// Whether a clone of `clone_bytes` may be made when `free` bytes remain and
 /// `slack` must stay free for decode afterwards. Every clone made after the
 /// budgeted sibling passes — the output-projection split clone in particular —
@@ -2615,6 +2636,42 @@ mod tests {
         assert_eq!(split_clone_budget_bytes(gb(1.5), gb(2.0)), 0);
         assert_eq!(split_clone_budget_bytes(0, gb(2.0)), 0);
         assert_eq!(split_clone_budget_bytes(gb(2.0), gb(2.0)), 0);
+    }
+
+    #[test]
+    fn the_budget_selection_takes_a_positive_override_and_nothing_else() {
+        let gb = |x: f64| (x * 1e9) as usize;
+        // An explicit override is taken verbatim, uncapped, and reported as such.
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), Some("3")),
+            (gb(3.0), true)
+        );
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), Some(" 1.5 ")),
+            (1_500_000_000, true)
+        );
+        // Everything that is not a finite positive number falls back to the
+        // free-minus-slack default. (Kills a mutant that returns usize::MAX or
+        // the raw free figure on the default path.)
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("nan"),
+            Some("inf"),
+            Some("abc"),
+        ] {
+            assert_eq!(
+                resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), raw),
+                (gb(0.76), false),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(1.5), gb(2.0), Some("x")),
+            (0, false)
+        );
     }
 
     #[test]

@@ -1176,7 +1176,8 @@ struct ResolvedSplitBudget {
 /// * `hp` — model config; supplies the KV-cache dims (layers / kv-heads / head-dim /
 ///   max_seq_len) so the reported reserve is derived from the ACTUAL model.
 ///
-/// Resolution:
+/// Resolution (`runtime_defaults::resolve_split_clone_budget_bytes`, a pure function
+/// pinned off-device; this site supplies its inputs and the log-line figures):
 /// * **`env_var` SET** (finite, > 0) → `gb * 1_000_000_000` bytes. Byte-for-byte the
 ///   pre-lever behavior: the same explicit override maps to the same cap, so the
 ///   env-override path is unchanged. The override is not capped.
@@ -1222,27 +1223,16 @@ fn resolve_split_clone_budget(
         .saturating_mul(2) // K and V
         .saturating_mul(KV_DTYPE_BYTES);
 
-    // Explicit override: byte-for-byte the pre-lever behavior.
-    if let Some(gb) = std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|gb| gb.is_finite() && *gb > 0.0)
-    {
-        return ResolvedSplitBudget {
-            budget_bytes: (gb * 1_000_000_000.0) as usize,
-            free_mem_bytes,
-            kv_reserve_bytes,
-            slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-            from_env: true,
-        };
-    }
-
     // `free_mem_bytes` was read in `preload_weights`, after `init` allocated
     // the KV caches, so it is already net of KV; the reserve is reported for
-    // the log line only and is not subtracted again.
-    let budget_bytes = crate::runtime_defaults::split_clone_budget_bytes(
+    // the log line only and is not subtracted again. The choice between the
+    // operator's override and the free-minus-slack default is the pure
+    // function; this site only gathers its inputs.
+    let override_raw = std::env::var(env_var).ok();
+    let (budget_bytes, from_env) = crate::runtime_defaults::resolve_split_clone_budget_bytes(
         free_mem_bytes,
         SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+        override_raw.as_deref(),
     );
 
     ResolvedSplitBudget {
@@ -1250,7 +1240,7 @@ fn resolve_split_clone_budget(
         free_mem_bytes,
         kv_reserve_bytes,
         slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-        from_env: false,
+        from_env,
     }
 }
 
