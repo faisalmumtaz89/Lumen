@@ -24,8 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   logs.
 - **F16 dequant caches refused when they cannot fit**: the caches are sized
   with the allocator's own arithmetic before any is built; when the bytes
-  needed plus a 512 MiB headroom exceed free memory the load is refused with
-  the bytes needed, the bytes free, the context length and the KV bytes.
+  needed plus a 128 MiB margin (the sizing's measured spread) exceed free
+  memory the load is refused with the bytes needed, the bytes free, the
+  context length and the KV bytes. The margin reserves nothing for the
+  allocations that follow: a Tesla T4 that serves Qwen3.5-9B Q8_0 with
+  0.45 GB left after the caches is accepted.
   Nothing to build, a failed free-memory query, or
   `LUMEN_CUDA_F16_CACHE_FORCE=1` skip the check.
 - **Split-clone budget is free memory minus the slack**: the free figure is

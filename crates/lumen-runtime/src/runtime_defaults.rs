@@ -1637,12 +1637,15 @@ pub fn output_proj_clone_decision(
     }
 }
 
-/// Device memory that must stay free after the F16 dequant caches: decode
-/// scratch, the cuBLAS workspace and the logits buffer are allocated later.
-/// The sizing is a lower bound (Qwen3.8-27B Q4_0 predicted 11.91 GB and
-/// allocated 11.91 GB at a 4096-token context and 12.01 GB at 2048), so the
-/// headroom also absorbs that spread.
-pub const F16_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+/// Margin on top of the F16 dequant caches' predicted size. The sizing is a
+/// lower bound (Qwen3.8-27B Q4_0 predicted 11.91 GB and allocated 11.91 GB
+/// on one load and 12.01 GB on another), and this covers that measured
+/// spread. It reserves nothing for the allocations that follow the caches,
+/// the aligned Q8 repack on a model without GDN layers among them: a Tesla
+/// T4 serving Qwen3.5-9B Q8_0 at an 8192-token context builds 3.36 GB of
+/// caches into 3.80 GB free and then decodes with the 0.45 GB left, which a
+/// 512 MiB reserve refused.
+pub const F16_CACHE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Set to a truthy value to build the F16 dequant caches even when
 /// [`f16_cache_refusal`] would refuse. The refusal is a prediction; this is
@@ -1688,10 +1691,9 @@ pub fn f16_cache_refusal(
     let gb = |b: u64| b as f64 / 1.0e9;
     Some(format!(
         "F16 dequant caches for {attention_layers} attention layers need {:.2} GB \
-         (+{:.2} GB headroom) but only {:.2} GB of device memory is free after the \
+         (+{:.2} GB margin) but only {:.2} GB of device memory is free after the \
          weights and the {max_seq_len}-token KV cache ({:.2} GB). Lower --context-len, \
-         use a smaller quantization, or set {F16_CACHE_FORCE_ENV}=1 to build them anyway. \
-         Refusing rather than oversubscribing: the later decode allocations would fail.",
+         use a smaller quantization, or set {F16_CACHE_FORCE_ENV}=1 to build them anyway.",
         gb(needed),
         gb(headroom),
         gb(free),
@@ -2772,6 +2774,41 @@ mod tests {
         let b = FreeMemory::Bytes;
         assert_eq!(f16_cache_refusal(10, b(90), 80, false, 16, 2048, 1), None);
         assert!(f16_cache_refusal(10, b(90), 81, false, 16, 2048, 1).is_some());
+    }
+
+    #[test]
+    fn f16_cache_refusal_accepts_the_t4_that_serves_with_half_a_gigabyte_left() {
+        // Tesla T4, Qwen3.5-9B Q8_0, 8192-token context: 3.36 GB of caches into
+        // 3.80 GB free, then a passing determinism and coherence run. The margin
+        // must not turn that into a refusal (a 512 MiB reserve did), and it is
+        // the measured sizing spread, not a reserve for what comes after.
+        assert_eq!(F16_CACHE_HEADROOM_BYTES, 128 * 1024 * 1024);
+        let gb = |x: f64| (x * 1e9) as u64;
+        assert_eq!(
+            f16_cache_refusal(
+                gb(3.36),
+                FreeMemory::Bytes(gb(3.80)),
+                F16_CACHE_HEADROOM_BYTES,
+                false,
+                8,
+                8192,
+                gb(2.15),
+            ),
+            None
+        );
+        // And the margin is still a margin: caches that fit only by eating into
+        // it are refused (this passes with no margin at all, so a zeroed constant
+        // fails here).
+        assert!(f16_cache_refusal(
+            gb(3.80) - 64 * 1024 * 1024,
+            FreeMemory::Bytes(gb(3.80)),
+            F16_CACHE_HEADROOM_BYTES,
+            false,
+            8,
+            8192,
+            gb(2.15),
+        )
+        .is_some());
     }
 
     #[test]
