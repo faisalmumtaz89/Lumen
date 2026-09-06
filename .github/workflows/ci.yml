@@ -66,6 +66,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build server (cuda)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
+      # The workspace clippy gate above runs without the cuda feature, so the
+      # CUDA backend's lints are checked here, in the job that already compiles it.
+      - name: clippy (cuda feature)
+        run: cargo clippy --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-server/cuda --release
       # The cuda::prefill_attention lib tests and the cuda integration test
       # binaries need a physical GPU (cudarc dlopen of libcuda), so this
       # runner executes the host-side lib suite only — but compiles every
