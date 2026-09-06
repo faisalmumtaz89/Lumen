@@ -30,7 +30,7 @@
 //! # Design
 //!
 //! - [`ToolSchema`] is the structural type the caller hands us. It is
-//!   serialized into the prompt by [`Renderer::render_tools_block`].
+//!   serialized into the prompt by [`Qwen35Renderer::render_tools_block`].
 //! - [`StreamingParser`] consumes the model's emitted text incrementally.
 //!   It distinguishes three states: "outside any call", "inside a call's
 //!   JSON body", and "uncertain -- holding back a possible marker

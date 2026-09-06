@@ -114,7 +114,7 @@ impl CudaDevice {
     /// Routes through the persistent PTX disk cache: on a cache hit the NVRTC
     /// compile is skipped and the cached PTX is handed straight to
     /// `cuModuleLoadData` (the driver JIT still runs and is itself cached by
-    /// the driver's compute cache). See [`super::ptx_cache`].
+    /// the driver's compute cache). See `ptx_cache`.
     pub fn compile_and_load(&self, cuda_source: &str) -> Result<Arc<CudaModule>, RuntimeError> {
         self.compile_and_load_cached(cuda_source, None, false)
     }

@@ -217,7 +217,7 @@ pub struct GpuSamplerRunCfg {
     pub presence: f32,
     pub freq: f32,
     /// The post-finalizer `Xorshift64::new(seed).state()` u64 — the EXACT RNG
-    /// state the CPU sampler would start from, used to seed the GPU RNG ring[0].
+    /// state the CPU sampler would start from, used to seed the GPU RNG `ring[0]`.
     pub rng_seed_state: u64,
     /// The full prompt-history token ids (what the engine recorded into
     /// SamplerState before decode). Used once at fresh-run to seed the GPU

@@ -1,6 +1,6 @@
 //! Anthropic-compatible `/v1/messages` endpoint.
 //!
-//! Reference: https://docs.anthropic.com/en/api/messages
+//! Reference: <https://docs.anthropic.com/en/api/messages>
 //!
 //! Streaming format uses Anthropic typed events:
 //!

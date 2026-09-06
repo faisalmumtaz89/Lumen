@@ -90,7 +90,7 @@ pub struct BpeTokenizer {
     /// Special tokens: exact string -> token_id. Sorted longest-first.
     special_tokens: Vec<(String, u32)>,
     /// The model's embedded Jinja chat template (LBC v3 `tokenizer.chat_template`).
-    /// Preserved here so [`apply_chat_template_with_system`] can render the
+    /// Preserved here so [`apply_chat_template_with_system`](BpeTokenizer::apply_chat_template_with_system) can render the
     /// model's NATIVE protocol via the shared Jinja renderer instead of the
     /// hard-coded ChatML; `None` for older LBCs / synthetic tokenizers, which
     /// fall back to the hard-coded per-family render.

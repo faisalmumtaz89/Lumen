@@ -293,7 +293,7 @@ pub struct JobRequest {
 /// this is now a [`PooledReceiver`] rather than a raw
 /// `mpsc::Receiver<TokenEvent>`.  The handler-facing API is unchanged
 /// (`.recv().await` returns `Option<TokenEvent>`); the wrapper exists so
-/// the channel pair can return to [`EngineHandle::channel_pool`] on drop
+/// the channel pair can return to `EngineHandle::channel_pool` on drop
 /// rather than being deallocated.
 pub type JobResponseChannel = PooledReceiver;
 
@@ -313,15 +313,15 @@ struct WorkerJob {
 /// RAII guard that cancels its associated job on Drop.
 ///
 /// `EngineHandle::submit` returns the guard wrapped inside the
-/// [`JobResponseChannel`] (see [`PooledReceiver::cancel_guard`]) so the
+/// [`JobResponseChannel`] (see `PooledReceiver::cancel_guard`) so the
 /// wire-layer task that drives the SSE body owns the guard for the
 /// request lifetime.  When the body task returns — for any reason:
 /// normal end-of-stream, client disconnect, panic — the
 /// `PooledReceiver` drops, which drops the guard, which sets the
 /// cancellation flag, which the worker observes within
-/// [`CANCEL_POLL_INTERVAL`].
+/// `CANCEL_POLL_INTERVAL`.
 ///
-/// Construct via [`CancellationGuard::new`]; the only public surface is
+/// Construct via `CancellationGuard::new`; the only public surface is
 /// `Drop`.  We intentionally do NOT expose a `cancel()` method — the
 /// guard's contract is "cancel happens on drop" and exposing manual
 /// cancellation would invite callers to forget the drop semantics.
@@ -359,7 +359,7 @@ impl Drop for CancellationGuard {
 type ChannelPool = Arc<Mutex<VecDeque<(mpsc::Sender<TokenEvent>, mpsc::Receiver<TokenEvent>)>>>;
 
 /// Receiver wrapper that returns its (Sender, Receiver)
-/// pair to [`EngineHandle::channel_pool`] on drop, instead of letting the
+/// pair to `EngineHandle::channel_pool` on drop, instead of letting the
 /// channel internals be deallocated.
 ///
 /// Public API mirrors the subset of `tokio::sync::mpsc::Receiver` the wire

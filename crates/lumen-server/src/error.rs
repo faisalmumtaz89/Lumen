@@ -5,7 +5,7 @@
 //!
 //! the OpenAI envelope is now the full four-field shape
 //! `{"error":{"message", "type", "param", "code"}}` per the OpenAI spec
-//! (https://platform.openai.com/docs/guides/error-codes#api-errors).
+//! (<https://platform.openai.com/docs/guides/error-codes#api-errors>).
 //! `param` and `code` are emitted as JSON `null` when unknown, never
 //! omitted, so the wire shape is byte-stable across both schema-level
 //! (extractor) and semantic-level (wire layer) failures.

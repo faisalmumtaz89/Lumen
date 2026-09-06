@@ -194,7 +194,7 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     }
 }
 
-/// Public diagnostic wrapper over [`model_dense_quant`] for the
+/// Public diagnostic wrapper over `model_dense_quant` for the
 /// `dump_quant_hint` example (which lives outside the crate and so cannot see
 /// the `pub(crate)` accessor). Behaviourally identical; not used on any hot
 /// path.
@@ -618,7 +618,7 @@ pub fn chat_reasoning_budget_default() -> usize {
 ///   and is byte-identical to every surface's prior hardcoded string.
 /// * `enable_thinking == true` → `"<think>\n"` — an OPEN think block
 ///   (Qwen3.5 `enable_thinking=true`): the model emits a reasoning trace which
-///   the [`tooling::ReasoningExtractor`] then routes to `reasoning_content`.
+///   the [`ReasoningExtractor`](crate::tooling::ReasoningExtractor) then routes to `reasoning_content`.
 pub fn think_prompt_tail(enable_thinking: bool) -> &'static str {
     if enable_thinking {
         "<think>\n"
@@ -1444,7 +1444,7 @@ pub fn q4_b160_enabled() -> bool {
 }
 
 /// `LUMEN_CUDA_Q8_AB_BANK` (default ON; `=0` opts out): the GDN alpha+beta Q8Raw matvecs
-/// ([48,5120] each, 24-CTA grids) issue as ONE banked launch. The banked
+/// (`[48,5120]` each, 24-CTA grids) issue as ONE banked launch. The banked
 /// kernel duplicates the raw-route body verbatim but compiles under
 /// fast-math, so equality vs the two-launch route is validated by output-equality tests
 /// rather than assumed.

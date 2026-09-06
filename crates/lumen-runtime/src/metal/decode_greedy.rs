@@ -3255,7 +3255,7 @@ impl MetalF32Backend {
     /// unique token == the CPU full-history freq map) and the kernel appends the
     /// chosen token to it, so a speculative CB(k+1) sees CB(k)'s token WITHOUT a
     /// CPU round-trip (the FIFO queue orders append-before-read). At fresh-run we
-    /// seed ring[0] from `cfg.rng_seed_state` (== CPU `Xorshift64::new(seed)`)
+    /// seed `ring[0]` from `cfg.rng_seed_state` (== CPU `Xorshift64::new(seed)`)
     /// and the freq array from the prompt history -- exactly the CPU sampler's
     /// `Xorshift64::new` + `SamplerState` prompt seeding.
     ///

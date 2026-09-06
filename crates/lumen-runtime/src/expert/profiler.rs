@@ -40,7 +40,7 @@ impl ExpertActivationProfiler {
         }
     }
 
-    /// Record that `expert_ids` (shape: [top_k]) were activated at `layer`.
+    /// Record that `expert_ids` (shape: `[top_k]`) were activated at `layer`.
     /// Called once per forward pass per MoE layer for each token.
     ///
     /// # Panics
@@ -108,7 +108,7 @@ impl ExpertActivationProfiler {
     }
 
     /// Returns the top-K most activated expert IDs for each layer.
-    /// Result: Vec<Vec<u32>> -- for each layer, the hot expert IDs sorted by frequency.
+    /// Result: `Vec<Vec<u32>>` -- for each layer, the hot expert IDs sorted by frequency.
     pub fn top_k_per_layer(&self, k: usize) -> Vec<Vec<u32>> {
         (0..self.num_layers)
             .map(|layer| {

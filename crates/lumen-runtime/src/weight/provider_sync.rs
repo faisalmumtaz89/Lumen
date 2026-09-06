@@ -203,7 +203,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     }
 }
 
-/// Dequantize Q8_0 bytes to Vec<f32>.
+/// Dequantize Q8_0 bytes to `Vec<f32>`.
 /// Q8_0 block layout: [2 bytes f16 scale] [32 bytes int8 values], total 34 bytes per 32 elements.
 pub fn dequantize_q8_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n_elements);
@@ -226,7 +226,7 @@ pub fn dequantize_q8_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
-/// Dequantize Q6_K superblocks to Vec<f32>.
+/// Dequantize Q6_K superblocks to `Vec<f32>`.
 /// Q6_K block layout (256 elements, 210 bytes): [128B ql low-4s] [64B qh
 /// upper-2s] [16B int8 sub-scales] [2B f16 d]. GGML group order: for each
 /// 128-element half, four 32-element groups combine ql lo/hi nibbles of
@@ -277,7 +277,7 @@ pub fn dequantize_q6_k_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
-/// Dequantize Q4_0 bytes to Vec<f32>.
+/// Dequantize Q4_0 bytes to `Vec<f32>`.
 /// Q4_0 block layout: [2 bytes f16 scale] [16 bytes packed nibbles], total 18 bytes per 32 elements.
 /// GGML de-interleaved order: indices 0-15 use lo nibbles, indices 16-31 use hi nibbles.
 pub fn dequantize_q4_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {

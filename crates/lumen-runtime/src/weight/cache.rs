@@ -270,10 +270,10 @@ impl CacheStats {
 ///
 /// # Prefetch protocol
 ///
-/// The pipeline scheduler calls [`prefetch_layer`] for upcoming layers.
-/// The compute loop calls [`try_get_layer`] (non-blocking) or
-/// [`get_layer_blocking`] (fallback). After a layer is no longer needed,
-/// [`release_layer_hint`] signals that it can be evicted.
+/// The pipeline scheduler calls [`WeightProvider::prefetch_layer`] for upcoming layers.
+/// The compute loop calls [`WeightProvider::try_get_layer`] (non-blocking) or
+/// [`WeightProvider::get_layer_blocking`] (fallback). After a layer is no longer needed,
+/// [`WeightProvider::release_layer_hint`] signals that it can be evicted.
 pub trait WeightProvider: Send + Sync {
     /// Begin prefetching the given layer into cache.
     ///

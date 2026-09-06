@@ -95,13 +95,13 @@ pub struct SubtensorOffsets {
     pub ssm_out: Option<TensorSlice>,
 
     // -- Per-head Q/K normalization (Qwen3.5 full-attention layers) --
-    /// Per-head Q RMSNorm weight. Shape: [head_dim] F32, shared across all heads.
+    /// Per-head Q RMSNorm weight. Shape: `[head_dim]` F32, shared across all heads.
     pub attn_q_norm: Option<TensorSlice>,
-    /// Per-head K RMSNorm weight. Shape: [head_dim] F32, shared across all heads.
+    /// Per-head K RMSNorm weight. Shape: `[head_dim]` F32, shared across all heads.
     pub attn_k_norm: Option<TensorSlice>,
 
     // -- Shared expert gating (MoE layers with a shared/always-on expert) --
-    /// Sigmoid gate weight for the shared expert. Shape: [hidden_dim] F32.
+    /// Sigmoid gate weight for the shared expert. Shape: `[hidden_dim]` F32.
     /// Applied as: shared_out *= sigmoid(dot(ffn_gate_inp_shexp, input))
     pub ffn_gate_inp_shexp: Option<TensorSlice>,
 
