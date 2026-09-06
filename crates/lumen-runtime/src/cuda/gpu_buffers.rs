@@ -302,7 +302,7 @@ pub(super) fn host_f16_to_f32(bits: u16) -> f32 {
         if frac == 0 {
             return if sign == 1 { -0.0 } else { 0.0 };
         }
-        let v = (frac as f32) * 6.103515625e-05 / 1024.0;
+        let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
         return if sign == 1 { -v } else { v };
     }
     if exp == 31 {
@@ -941,7 +941,7 @@ fn upload_tensor(
                     if frac == 0 {
                         return if sign == 1 { -0.0 } else { 0.0 };
                     }
-                    let v = (frac as f32) * 6.103515625e-05 / 1024.0;
+                    let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
                     return if sign == 1 { -v } else { v };
                 }
                 if exp == 31 {
@@ -1063,7 +1063,7 @@ fn upload_tensor(
                     if frac == 0 {
                         return if sign == 1 { -0.0 } else { 0.0 };
                     }
-                    let v = (frac as f32) * 6.103515625e-05 / 1024.0;
+                    let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
                     return if sign == 1 { -v } else { v };
                 }
                 if exp == 31 {

@@ -1867,7 +1867,7 @@ impl CudaBackend {
         })();
 
         match result {
-            Ok(status) if status == cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS => {
+            Ok(cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS) => {
                 // `available` already defaults to true; no flip needed.
             }
             Ok(status) => {
@@ -11111,11 +11111,10 @@ unsafe fn launch_matvec(
     // Used for F32 weights (from Q4_1 dequant) that have an F16 cache.
     // Q8Raw and Q4Raw are handled above via native kernels (smem/scalar).
     // Uses DEFAULT_TENSOR_OP (fallback path for F32 with F16 caches).
-    // Use `as_deref_mut()` to borrow without moving: if `weight` is NOT F32 we
-    // fall through to the `match` below, which still needs `input_f16_scratch`
-    // for the Bf16Raw fallback arm.
+    // Last use of `input_f16_scratch` in this function: the `match` below never
+    // reads it (the Bf16Raw arm is reached only when it was None), so it moves.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
             return launch_hgemv_f16(
                 device,
                 kernels,
@@ -11801,10 +11800,9 @@ unsafe fn launch_matvec_residual(
     // HGEMV residual: only for F32 weights with F16 cache.
     // Q8Raw and Q4Raw are handled above via native kernels (smem/scalar).
     // Uses DEFAULT_TENSOR_OP (fallback path for F32 with F16 caches).
-    // Use `as_deref_mut()` to avoid consuming `input_f16_scratch` on the
-    // non-F32 path -- symmetric to the launch_matvec fix.
+    // Last use of `input_f16_scratch` in this function, so it moves.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
             return launch_hgemv_f16_residual(
                 device,
                 kernels,
@@ -14943,7 +14941,7 @@ unsafe fn launch_hgemv_f16_batched(
 ) -> Result<(), RuntimeError> {
     let batch_count = w_f16_slices.len();
     debug_assert_eq!(batch_count, output_f32_slices.len());
-    debug_assert!(batch_count >= 2 && batch_count <= 3);
+    debug_assert!((2..=3).contains(&batch_count));
 
     use cudarc::driver::DevicePtr;
 
@@ -15132,7 +15130,7 @@ fn build_precomputed_batch_ptrs(
     let mut qkv_b_ptrs = Vec::with_capacity(if has_grouped_gemm { num_layers } else { 0 });
     let mut qkv_c_ptrs = Vec::with_capacity(if has_grouped_gemm { num_layers } else { 0 });
 
-    for (_layer_idx, lw) in layer_weights.iter().enumerate() {
+    for lw in layer_weights.iter() {
         // --- KV batched pointers ---
         // Try to get F16 weight pointers for K and V.
         let wk_f16_ptr = get_f16_weight_ptr(device, &lw.wk, lw.wk_f16.as_ref());
