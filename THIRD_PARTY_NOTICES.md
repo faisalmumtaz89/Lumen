@@ -53,7 +53,7 @@ Portions of the CUDA and Metal kernels are derived from
   `crates/lumen-runtime/src/cuda/shaders/matvec_*_mmvq.cu`,
   `fused_glu_gemv_q8_split_mmvq.cu`, `mmv_q.cu`, and `mmv_q_moe.cu`;
 - the `mul_mat_q`-style quantized GEMMs in
-  `crates/lumen-runtime/src/cuda/shaders/mmq_q4_0.cu` and `mmq_q8_0.cu`, and
+  `crates/lumen-runtime/src/cuda/shaders/mmq_q8_0.cu`, and
   the `mul_mat_vec_f`-style float matvec in `mul_mat_vec_f_bf16.cu`;
 - the `mul_mat_id`-style expert-grouped MoE dispatch in
   `crates/lumen-runtime/src/cuda/shaders/moe_grouped.cu` and

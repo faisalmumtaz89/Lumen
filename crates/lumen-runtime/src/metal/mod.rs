@@ -680,7 +680,7 @@ pub struct MetalF32Backend {
     /// back to synchronous load. Only active when use_option_a is true.
     ///
     /// The handle contains: (target_layer, expert_ids, join_handle).
-    /// The join_handle resolves to Vec<(expert_id, Result<(Vec<u8>, ExpertSlice)>)>.
+    /// The join_handle resolves to `Vec<(expert_id, Result<(Vec<u8>, ExpertSlice)>)>`.
     prefetch_handle: Mutex<Option<PrefetchState>>,
 
     // ====================================================================

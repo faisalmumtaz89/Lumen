@@ -55,6 +55,25 @@ static PATH_IS_SERVER: AtomicBool = AtomicBool::new(false);
 /// BF16, `2` = quantised (Q8/Q4/etc.). Encoded as `AtomicU8` so the read
 /// path is one relaxed load.
 static MODEL_DENSE_QUANT_HINT: AtomicU8 = AtomicU8::new(0);
+/// The active CUDA device's compute-capability major, stored by the CUDA
+/// backend at init before any lever default is resolved; 0 = unknown / not
+/// CUDA. Some defaults were tuned on one architecture and are wrong on
+/// another, so they read this.
+///
+/// Process-global, so it describes one device. A process that initialises
+/// backends on two devices of different capability concurrently can have the
+/// second store land between the first backend's store and its default
+/// resolution, and that backend then reads the other device's capability.
+/// Sequential initialisation, which is what the binaries do, is sound.
+static DEVICE_CC_MAJOR: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_device_cc_major(major: u8) {
+    DEVICE_CC_MAJOR.store(major, Ordering::Relaxed);
+}
+
+pub fn device_cc_major() -> u8 {
+    DEVICE_CC_MAJOR.load(Ordering::Relaxed)
+}
 
 const HINT_UNSET: u8 = 0;
 const HINT_BF16: u8 = 1;
@@ -175,7 +194,7 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     }
 }
 
-/// Public diagnostic wrapper over [`model_dense_quant`] for the
+/// Public diagnostic wrapper over `model_dense_quant` for the
 /// `dump_quant_hint` example (which lives outside the crate and so cannot see
 /// the `pub(crate)` accessor). Behaviourally identical; not used on any hot
 /// path.
@@ -599,7 +618,7 @@ pub fn chat_reasoning_budget_default() -> usize {
 ///   and is byte-identical to every surface's prior hardcoded string.
 /// * `enable_thinking == true` → `"<think>\n"` — an OPEN think block
 ///   (Qwen3.5 `enable_thinking=true`): the model emits a reasoning trace which
-///   the [`tooling::ReasoningExtractor`] then routes to `reasoning_content`.
+///   the [`ReasoningExtractor`](crate::tooling::ReasoningExtractor) then routes to `reasoning_content`.
 pub fn think_prompt_tail(enable_thinking: bool) -> &'static str {
     if enable_thinking {
         "<think>\n"
@@ -1425,7 +1444,7 @@ pub fn q4_b160_enabled() -> bool {
 }
 
 /// `LUMEN_CUDA_Q8_AB_BANK` (default ON; `=0` opts out): the GDN alpha+beta Q8Raw matvecs
-/// ([48,5120] each, 24-CTA grids) issue as ONE banked launch. The banked
+/// (`[48,5120]` each, 24-CTA grids) issue as ONE banked launch. The banked
 /// kernel duplicates the raw-route body verbatim but compiles under
 /// fast-math, so equality vs the two-launch route is validated by output-equality tests
 /// rather than assumed.
@@ -1496,21 +1515,217 @@ pub fn q6k_head_enabled() -> bool {
     })
 }
 
+/// Default byte budget for the split-sibling clones: free VRAM minus the
+/// activation slack. `free` is read in `preload_weights`, after `init` has
+/// allocated the KV caches, so it is already net of KV; subtracting a KV
+/// reserve here again would count it twice. The formula this replaces also
+/// raised the budget to a 5.1 GB minimum, and that minimum was live: on a
+/// 32 GB card with 2.76 GB free after the F16 caches it resolved 5.1 GB and,
+/// with the other clones that follow, left the card at 0.14 GB free. A
+/// minimum above `free - slack` spends the slack, so there is none now, and
+/// the same card resolves 0.76 GB.
+pub fn split_clone_budget_bytes(free: usize, slack: usize) -> usize {
+    free.saturating_sub(slack)
+}
+
+/// The split-clone budget the clone passes consume, and whether it came from
+/// the operator: an explicit `LUMEN_CUDA_*_SPLIT_BUDGET_GB` value that parses
+/// as a finite number above zero is taken as gigabytes, uncapped, exactly as
+/// before the free-memory default existed; anything else (unset, empty,
+/// zero, negative, not a number) resolves to [`split_clone_budget_bytes`].
+/// Pure, so the choice is pinned off-device; the call site supplies the
+/// inputs (its free-memory reading, the slack, the raw override).
+pub fn resolve_split_clone_budget_bytes(
+    free: usize,
+    slack: usize,
+    override_raw: Option<&str>,
+) -> (usize, bool) {
+    if let Some(gb) = override_raw
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|gb| gb.is_finite() && *gb > 0.0)
+    {
+        return ((gb * 1_000_000_000.0) as usize, true);
+    }
+    (split_clone_budget_bytes(free, slack), false)
+}
+
+/// Whether a clone of `clone_bytes` may be made when `free` bytes remain and
+/// `slack` must stay free for decode afterwards. The output-projection split
+/// clone, made between the Q8 and Q4 sibling passes, goes through this, so it
+/// cannot spend the decode slack. Two clones do not: the aligned Q8 and Q4
+/// repacks of the output projection on a model without GDN layers, which every
+/// model in the shipped registry has, so neither path is reached. On a 32 GB card
+/// (Qwen3.8-27B Q4_0, 4096-token context) the sibling pass left 2.06 GB free;
+/// with this 1.35 GB clone also made the card reached 32066 of 32607 MiB and
+/// the first inference failed with CUDA_ERROR_OUT_OF_MEMORY. Skipping either
+/// the sibling clones or this clone let the same run complete (with this one
+/// skipped the peak was 30820 MiB): each clone class is necessary for the
+/// failure and neither alone is sufficient, so every clone on the reached
+/// paths is budgeted.
+pub fn clone_fits(clone_bytes: u64, free: u64, slack: u64) -> bool {
+    clone_bytes
+        .checked_add(slack)
+        .is_some_and(|need| need <= free)
+}
+
+/// Whether the output-projection split clone is made. A clone that would
+/// spend the decode slack is skipped, and so is one decided on a failed
+/// memory query: the clone is an optimisation, so skipping it costs nothing.
+/// [`f16_cache_refusal`] goes the other way on a failed query and builds,
+/// because a telemetry failure is not a memory shortage and a load that got
+/// that far is refused only on a measured one. [`F16_CACHE_FORCE_ENV`]
+/// overrides both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneDecision {
+    /// Make the clone.
+    Proceed,
+    /// Skip it: the clone plus the slack exceeds the free bytes.
+    NoRoom {
+        clone_bytes: u64,
+        free: u64,
+        slack: u64,
+    },
+    /// Skip it: the free-memory query failed and the clone is not forced.
+    UnknownFree,
+}
+
+impl CloneDecision {
+    /// Whether the clone goes ahead.
+    pub fn proceed(self) -> bool {
+        matches!(self, CloneDecision::Proceed)
+    }
+
+    /// The reason the clone is skipped, for the start-up log; `None` when it
+    /// proceeds.
+    pub fn skip_reason(self) -> Option<String> {
+        let gb = |b: u64| b as f64 / 1.0e9;
+        match self {
+            CloneDecision::Proceed => None,
+            CloneDecision::NoRoom { clone_bytes, free, slack } => Some(format!(
+                "a {:.2} GB clone would leave less than the {:.2} GB decode slack of the {:.2} GB free \
+                 (set {F16_CACHE_FORCE_ENV}=1 to make it anyway)",
+                gb(clone_bytes),
+                gb(slack),
+                gb(free)
+            )),
+            CloneDecision::UnknownFree => Some(format!(
+                "the free-memory query failed (set {F16_CACHE_FORCE_ENV}=1 to make it anyway)"
+            )),
+        }
+    }
+}
+
+/// The decision for a clone of `clone_bytes` given what the memory query said;
+/// see [`CloneDecision`] for the policy.
+pub fn output_proj_clone_decision(
+    clone_bytes: u64,
+    free: FreeMemory,
+    slack: u64,
+    forced: bool,
+) -> CloneDecision {
+    if forced {
+        return CloneDecision::Proceed;
+    }
+    match free {
+        FreeMemory::Unknown => CloneDecision::UnknownFree,
+        FreeMemory::Bytes(free) if clone_fits(clone_bytes, free, slack) => CloneDecision::Proceed,
+        FreeMemory::Bytes(free) => CloneDecision::NoRoom {
+            clone_bytes,
+            free,
+            slack,
+        },
+    }
+}
+
+/// Device memory that must stay free after the F16 dequant caches: decode
+/// scratch, the cuBLAS workspace and the logits buffer are allocated later.
+/// The sizing is a lower bound (Qwen3.8-27B Q4_0 predicted 11.91 GB and
+/// allocated 11.91 GB at a 4096-token context and 12.01 GB at 2048), so the
+/// headroom also absorbs that spread.
+pub const F16_CACHE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Set to a truthy value to build the F16 dequant caches even when
+/// [`f16_cache_refusal`] would refuse. The refusal is a prediction; this is
+/// the escape hatch when the prediction is wrong for a card.
+pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
+
+/// What the memory query said just before the F16 caches are built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreeMemory {
+    /// `cuMemGetInfo` succeeded; the device has this many bytes free.
+    Bytes(u64),
+    /// `cuMemGetInfo` failed; the caches are built on the assumption that
+    /// the load that got this far will fit, and the caller logs the failure.
+    Unknown,
+}
+
+/// The refusal to build the F16 dequant caches when they cannot fit, or
+/// `None` when they can, when nothing needs building, when the memory query
+/// failed (a telemetry failure is not a memory shortage), or when
+/// [`F16_CACHE_FORCE_ENV`] is set. `needed` is the byte total the caches will
+/// allocate; the remaining arguments only make the message concrete.
+pub fn f16_cache_refusal(
+    needed: u64,
+    free: FreeMemory,
+    headroom: u64,
+    forced: bool,
+    attention_layers: usize,
+    max_seq_len: usize,
+    kv_bytes: u64,
+) -> Option<String> {
+    if needed == 0 || forced {
+        return None;
+    }
+    let free = match free {
+        FreeMemory::Bytes(b) => b,
+        FreeMemory::Unknown => return None,
+    };
+    if let Some(total) = needed.checked_add(headroom) {
+        if total <= free {
+            return None;
+        }
+    }
+    let gb = |b: u64| b as f64 / 1.0e9;
+    Some(format!(
+        "F16 dequant caches for {attention_layers} attention layers need {:.2} GB \
+         (+{:.2} GB headroom) but only {:.2} GB of device memory is free after the \
+         weights and the {max_seq_len}-token KV cache ({:.2} GB). Lower --context-len, \
+         use a smaller quantization, or set {F16_CACHE_FORCE_ENV}=1 to build them anyway. \
+         Refusing rather than oversubscribing: the later decode allocations would fail.",
+        gb(needed),
+        gb(headroom),
+        gb(free),
+        gb(kv_bytes)
+    ))
+}
+
 /// Per-process default for `LUMEN_CUDA_SOA_LOCKED` when the env is unset.
-/// ON for quantised dense (the codegen-locked Q4_0 split matvec: word-load
-/// nibble stream + load-hoist + `.rn`-pinned epilogue, bit-deterministic and
-/// faster than the unlocked split kernel). The effect is gated downstream by
-/// Q4 split-dispatch + locked-kernel presence (`matvec_q4_split_q8_1_locked`),
-/// so on a Q8/BF16 model the locked kernel is absent and this is a no-op.
+///
+/// ON only for quantised dense models on a measured-good compute capability
+/// (8.x and 9.x, where the codegen-locked Q4_0 split matvec was tuned:
+/// word-load nibble stream, load-hoist, `.rn`-pinned epilogue,
+/// bit-deterministic and faster than the unlocked split kernel). OFF on
+/// every other capability, including 12.x, 10.x and a device whose
+/// capability query failed (`device_cc_major() == 0`), because the kernel
+/// is unmeasured there, not because it is known to be slow: on an RTX 5090,
+/// in a configuration that fits, forcing the lever on does not reproduce
+/// the 1.1 tok/s once attributed to it (75.4–75.5 tok/s either way, five
+/// fresh processes per arm; whether the locked kernel executed in the
+/// forced arm is not shown by that probe's logs). `=1` still forces it on.
+/// The effect is gated downstream by Q4 split dispatch and the locked
+/// kernel's presence (`matvec_q4_split_q8_1_locked`), so on a Q8/BF16 model
+/// it is a no-op.
 ///
 /// **MoE: explicit OFF.** `SOA_LOCKED` implies the Q4 split clone pass
 /// (`repack_all_layers_q4_clone_to_split`), which populates the dense
-/// `wq/wk/wv/wo/w_gate/w_up/w_down` siblings only. On an MoE LBC the dense MLP
-/// is replaced by per-expert weights, so arming the clone there would partially
-/// populate siblings exactly as the Q8 SPLIT pass did before its MoE gate
-/// (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default` and keeps the
-/// Q4-dense decode win without touching the MoE path.
+/// `wq/wk/wv/wo/w_gate/w_up/w_down` siblings only. On an MoE LBC the dense
+/// MLP is replaced by per-expert weights, so arming the clone there would
+/// partially populate siblings exactly as the Q8 SPLIT pass did before its
+/// MoE gate (PAD-token spam). Gating OFF for MoE mirrors `q8_split_default`.
 pub fn soa_locked_default() -> bool {
+    if !matches!(device_cc_major(), 8 | 9) {
+        return false;
+    }
     match MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) {
         // Q4 dense benefits (Q8/BF16/F32 lack the locked kernel → no-op).
         // MoE: explicit OFF (clone-pass hazard, mirrors q8_split_default).
@@ -1552,9 +1767,12 @@ pub fn output_proj_nr_default() -> u32 {
 /// Canonical allowlist of `LUMEN_*` env vars recognised across the
 /// runtime, CLI, server, and bench crates. Generated by `grep -rEoh
 /// '"LUMEN_[A-Z0-9_]+"' crates/` and reviewed manually. ADD new names here
-/// when a new env gate ships, or the validator will warn at startup.
+/// when a new env gate ships, or the validator will warn at startup. Names
+/// that only the repository's own scripts define belong in
+/// [`KNOWN_LUMEN_TOOLING_ENV_VARS`] instead.
 ///
-/// Sorted alphabetically to make `diff` reviewable when the list changes.
+/// Sorted alphabetically to make `diff` reviewable when the list changes; a
+/// test holds both lists to that order.
 const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_AB_ITERATIONS",
     "LUMEN_AB_WARMUP",
@@ -1572,18 +1790,12 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CONVERT_KEEP_Q6K_OUTPUT",
     "LUMEN_CONVERT_SOURCE_FIDELITY",
     "LUMEN_CORR010_MODEL",
-    "LUMEN_CUDA_Q4_1_DOWN",
-    "LUMEN_CUDA_Q5K_SSMOUT",
-    "LUMEN_CUDA_Q6K_HEAD",
     "LUMEN_CUDA_ARGMAX_TILED",
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
-    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
-    "LUMEN_CUDA_FFN_GATE_UP_BANK",
-    "LUMEN_CUDA_Q4_DOWN_NR1",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -1597,7 +1809,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+    "LUMEN_CUDA_F16_CACHE_FORCE",
+    "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_FUSED_GLU",
+    "LUMEN_CUDA_FFN_GATE_UP_BANK",
     "LUMEN_CUDA_FORCE_SCALAR_ATTN",
     "LUMEN_CUDA_GDN_AB_F16",
     "LUMEN_CUDA_GDN_AB_F32",
@@ -1640,7 +1855,9 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PROFILE_ATTN_LEAF",
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
+    "LUMEN_CUDA_Q4_1_DOWN",
     "LUMEN_CUDA_Q4_B160",
+    "LUMEN_CUDA_Q4_DOWN_NR1",
     "LUMEN_CUDA_Q4_F32ACT_KERNEL",
     "LUMEN_CUDA_Q4_MMVQ",
     "LUMEN_CUDA_Q4_PROJ_BANK",
@@ -1649,6 +1866,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
     "LUMEN_CUDA_Q4_SPLIT_WO",
     "LUMEN_CUDA_Q4_V4LOAD",
+    "LUMEN_CUDA_Q5K_SSMOUT",
+    "LUMEN_CUDA_Q6K_HEAD",
     "LUMEN_CUDA_Q8_AB_BANK",
     "LUMEN_CUDA_Q8_MATVEC_FAST",
     "LUMEN_CUDA_Q8_MMVQ",
@@ -1734,6 +1953,48 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_XCHK2",
 ];
 
+/// `LUMEN_*` names the repository's own scripts, packaging and CI define and
+/// consume themselves; the engine never reads them. They still reach an
+/// engine process's environment, because the shell that exports them then
+/// runs the binary (the release workflow exports `LUMEN_BIN` and
+/// `LUMEN_SERVER_BIN` before the packaged binaries run; the installer's
+/// `LUMEN_MODEL` and `LUMEN_QUANT` are inherited by its `lumen pull`), so the
+/// typo validator must know them or every such run warns about a name that
+/// is not a typo. A test derives the expected set from the scripts themselves
+/// and fails on drift in either direction.
+///
+/// The cost is one near-miss the validator can no longer catch: a name here
+/// that resembles an engine name (`LUMEN_CACHE_ROOT` beside
+/// `LUMEN_CACHE_DIR`) is accepted as the tooling name it is.
+///
+/// Sorted alphabetically, like the list above.
+const KNOWN_LUMEN_TOOLING_ENV_VARS: &[&str] = &[
+    "LUMEN_ALLOW_INSECURE_BASE",
+    "LUMEN_BIN",
+    "LUMEN_CACHE_ROOT",
+    "LUMEN_DET_MAXTOK",
+    "LUMEN_DET_MODEL",
+    "LUMEN_DET_PORT",
+    "LUMEN_INSECURE_SKIP_CHECKSUM",
+    "LUMEN_MODEL",
+    "LUMEN_ONLY",
+    "LUMEN_PREFIX",
+    "LUMEN_QS_BACKEND",
+    "LUMEN_QS_FAKE_FREE_GIB",
+    "LUMEN_QS_HOST",
+    "LUMEN_QS_MODEL",
+    "LUMEN_QS_PORT",
+    "LUMEN_QS_QUANT",
+    "LUMEN_QS_VERBOSE",
+    "LUMEN_QS_YES",
+    "LUMEN_QUANT",
+    "LUMEN_RELEASE_BASE",
+    "LUMEN_ROOT",
+    "LUMEN_SERVER_BIN",
+    "LUMEN_TAG",
+    "LUMEN_TEST_MODEL",
+];
+
 /// Enumerates the process env and emits a stderr WARNING for every
 /// `LUMEN_*` env var that does NOT appear in `KNOWN_LUMEN_ENV_VARS`.
 ///
@@ -1786,15 +2047,16 @@ fn collect_unknown_lumen_env_vars() -> Vec<String> {
     let env_vars: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
     let mut warnings = Vec::new();
 
-    // Pass 1 — names that start with `LUMEN_` but are NOT in the
-    // allowlist. This catches mis-spelled suffixes on otherwise-correct
-    // env names.
+    // Pass 1 — names that start with `LUMEN_` but are neither an engine
+    // env nor one of the repository's own tooling names. This catches
+    // mis-spelled suffixes on otherwise-correct env names.
     let mut unknown_with_prefix: Vec<&String> = env_vars
         .iter()
         .filter(|k| k.starts_with("LUMEN_"))
         .filter(|k| {
             !KNOWN_LUMEN_ENV_VARS
                 .iter()
+                .chain(KNOWN_LUMEN_TOOLING_ENV_VARS.iter())
                 .any(|known| *known == k.as_str())
         })
         .collect();
@@ -1911,10 +2173,16 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 // configurations in the same process). Production code MUST NOT call this.
 // ---------------------------------------------------------------------------
 
-/// Resets the process-wide hint atomics to their defaults. Test-only —
-/// used by the unit tests below so each test starts from a known state.
+/// Resets the process-wide hint atomics to their defaults, with the device
+/// capability set to a measured-good one (8) so the capability gate does not
+/// mask the model-shape rules the tests exercise. Test-only — used by the
+/// unit tests below so each test starts from a known state.
 #[doc(hidden)]
 pub fn reset_for_tests() {
+    // A measured-good capability, so the capability gate does not mask the
+    // model-shape rules the tests below exercise (an unknown capability
+    // returns early, before the MoE arm is reached).
+    DEVICE_CC_MAJOR.store(8, Ordering::Relaxed);
     PATH_IS_SERVER.store(false, Ordering::Relaxed);
     MODEL_DENSE_QUANT_HINT.store(HINT_UNSET, Ordering::Relaxed);
     MODEL_PRIMARY_QUANT_SCHEME.store(QUANT_SCHEME_UNSET, Ordering::Relaxed);
@@ -2402,12 +2670,192 @@ mod tests {
     fn quantised_dense_enables_soa_locked_default() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset_for_tests();
-        // Q4 dense (lm_head often Q8_0 → HINT_QUANTISED) defaults SOA_LOCKED ON.
+        // Q4 dense (lm_head often Q8_0 → HINT_QUANTISED) defaults SOA_LOCKED ON
+        // on a measured-good capability (the A100 the kernel was tuned on).
         set_model_dense_quant(QuantScheme::Q8_0);
+        set_device_cc_major(8);
         assert!(
             soa_locked_default(),
-            "quantised dense should default SOA_LOCKED=ON"
+            "quantised dense on cc 8.x should default SOA_LOCKED=ON"
         );
+    }
+
+    #[test]
+    fn split_clone_budget_is_free_minus_the_slack_and_nothing_else() {
+        let gb = |x: f64| (x * 1e9) as usize;
+        // A100 after a 27B-Q8 load: 46 GB free, 2 GB slack -> 44 GB.
+        assert_eq!(split_clone_budget_bytes(gb(46.0), gb(2.0)), gb(44.0));
+        // A 32 GB card with 2.76 GB free after the F16 caches -> 0.76 GB.
+        assert_eq!(split_clone_budget_bytes(gb(2.76), gb(2.0)), gb(0.76));
+        // Less than the slack: nothing. (Kills a mutant that subtracts any other
+        // amount, or that adds a floor back: 1.5 - 2.0 must be 0, not 5.1 or 1.5.)
+        assert_eq!(split_clone_budget_bytes(gb(1.5), gb(2.0)), 0);
+        assert_eq!(split_clone_budget_bytes(0, gb(2.0)), 0);
+        assert_eq!(split_clone_budget_bytes(gb(2.0), gb(2.0)), 0);
+    }
+
+    #[test]
+    fn the_budget_selection_takes_a_positive_override_and_nothing_else() {
+        let gb = |x: f64| (x * 1e9) as usize;
+        // An explicit override is taken verbatim, uncapped, and reported as such.
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), Some("3")),
+            (gb(3.0), true)
+        );
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), Some(" 1.5 ")),
+            (1_500_000_000, true)
+        );
+        // Everything that is not a finite positive number falls back to the
+        // free-minus-slack default. (Kills a mutant that returns usize::MAX or
+        // the raw free figure on the default path.)
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("nan"),
+            Some("inf"),
+            Some("abc"),
+        ] {
+            assert_eq!(
+                resolve_split_clone_budget_bytes(gb(2.76), gb(2.0), raw),
+                (gb(0.76), false),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            resolve_split_clone_budget_bytes(gb(1.5), gb(2.0), Some("x")),
+            (0, false)
+        );
+    }
+
+    #[test]
+    fn a_clone_must_leave_the_slack_free() {
+        let gb = |x: f64| (x * 1e9) as u64;
+        // The 5090 case: 2.06 GB free, 1.35 GB clone, 2 GB slack -> refused.
+        assert!(!clone_fits(gb(1.35), gb(2.06), gb(2.0)));
+        // Exactly enough is enough.
+        assert!(clone_fits(gb(1.35), gb(3.35), gb(2.0)));
+        assert!(!clone_fits(gb(1.35), gb(3.34), gb(2.0)));
+        // Overflow is a refusal, not a wrap.
+        assert!(!clone_fits(u64::MAX, u64::MAX, 1));
+    }
+
+    #[test]
+    fn output_proj_clone_is_skipped_unless_it_fits_or_is_forced() {
+        let gb = |x: f64| (x * 1e9) as u64;
+        let b = FreeMemory::Bytes;
+        // The 5090 case: 2.06 GB free, 1.35 GB clone, 2 GB slack -> skipped, and the
+        // reason names all three numbers.
+        let d = output_proj_clone_decision(gb(1.35), b(gb(2.06)), gb(2.0), false);
+        assert!(!d.proceed());
+        let reason = d.skip_reason().expect("skipped clones give a reason");
+        for needle in ["1.35 GB", "2.00 GB", "2.06 GB", F16_CACHE_FORCE_ENV] {
+            assert!(reason.contains(needle), "missing {needle:?} in {reason}");
+        }
+        // Room enough: proceeds, no reason.
+        let d = output_proj_clone_decision(gb(1.35), b(gb(3.35)), gb(2.0), false);
+        assert!(d.proceed());
+        assert_eq!(d.skip_reason(), None);
+        // A failed memory query is no room, not a licence: skipped (fail-closed).
+        assert!(
+            !output_proj_clone_decision(gb(1.35), FreeMemory::Unknown, gb(2.0), false).proceed()
+        );
+        // The override proceeds regardless of either.
+        assert!(output_proj_clone_decision(gb(1.35), b(0), gb(2.0), true).proceed());
+        assert!(output_proj_clone_decision(gb(1.35), FreeMemory::Unknown, gb(2.0), true).proceed());
+    }
+
+    #[test]
+    fn f16_cache_refusal_fits_when_needed_plus_headroom_is_free() {
+        let b = FreeMemory::Bytes;
+        assert_eq!(f16_cache_refusal(10, b(90), 80, false, 16, 2048, 1), None);
+        assert!(f16_cache_refusal(10, b(90), 81, false, 16, 2048, 1).is_some());
+    }
+
+    #[test]
+    fn f16_cache_refusal_never_fires_for_nothing_to_build() {
+        // BF16 / F16 models build no caches: no refusal even at zero free.
+        assert_eq!(
+            f16_cache_refusal(0, FreeMemory::Bytes(0), 1, false, 0, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_treats_a_failed_memory_query_as_unknown_not_zero() {
+        assert_eq!(
+            f16_cache_refusal(10, FreeMemory::Unknown, 1, false, 16, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_is_overridden_by_force() {
+        assert_eq!(
+            f16_cache_refusal(10, FreeMemory::Bytes(0), 1, true, 16, 8192, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn f16_cache_refusal_names_the_levers_and_the_numbers() {
+        let msg = f16_cache_refusal(
+            13_500_000_000,
+            FreeMemory::Bytes(11_450_000_000),
+            F16_CACHE_HEADROOM_BYTES,
+            false,
+            16,
+            8192,
+            4_290_000_000,
+        )
+        .expect("13.5 GB cannot fit in 11.45 GB");
+        for needle in [
+            "16 attention layers",
+            "13.50 GB",
+            "11.45 GB",
+            "8192-token",
+            "4.29 GB",
+            "--context-len",
+            F16_CACHE_FORCE_ENV,
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+    }
+
+    #[test]
+    fn f16_cache_refusal_does_not_overflow_on_huge_need() {
+        assert!(f16_cache_refusal(
+            u64::MAX - 1,
+            FreeMemory::Bytes(u64::MAX - 1),
+            2,
+            false,
+            1,
+            1,
+            0
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn only_measured_good_capabilities_keep_soa_locked_on() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_dense_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(8);
+        assert!(soa_locked_default(), "cc 8.x (A100) keeps it ON");
+        set_device_cc_major(9);
+        assert!(soa_locked_default(), "cc 9.x (H100) keeps it ON");
+        for cc in [0u8, 7, 10, 11, 12, 13] {
+            set_device_cc_major(cc);
+            assert!(
+                !soa_locked_default(),
+                "cc {cc}.x is not measured-good (0 = query failed): OFF"
+            );
+        }
+        reset_for_tests();
     }
 
     #[test]
@@ -2420,6 +2868,8 @@ mod tests {
         // Q8_SPLIT MoE regression).
         set_model_dense_quant(QuantScheme::Q8_0);
         set_model_is_moe(true);
+        // On a measured-good capability, so the MoE arm itself is what decides.
+        set_device_cc_major(8);
         assert!(
             !soa_locked_default(),
             "MoE should NOT default SOA_LOCKED=ON (clone-pass / PAD-spam regression)"
@@ -2832,6 +3282,138 @@ mod tests {
         }
     }
 
+    /// Every `LUMEN_*` token the repository's scripts, packaging and CI
+    /// define, read from the checkout itself. `None` when the crate is built
+    /// outside a checkout (a packaged crate has no `scripts/`), and the test
+    /// that uses it skips then rather than pass vacuously.
+    fn lumen_names_defined_by_the_scripts() -> Option<std::collections::BTreeSet<String>> {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let roots = ["scripts", "packaging", ".github", "bench"];
+        if !roots.iter().all(|r| repo.join(r).is_dir()) {
+            return None;
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut stack: Vec<std::path::PathBuf> = roots.iter().map(|r| repo.join(r)).collect();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable repository directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                // Scripts, workflow files, Dockerfiles and templates only: a
+                // markdown file may quote a name that no longer exists.
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let is_script = file_name == "Dockerfile"
+                    || matches!(
+                        path.extension().and_then(|e| e.to_str()),
+                        Some("sh" | "py" | "yml" | "yaml" | "toml" | "in")
+                    );
+                if !is_script {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let bytes = text.as_bytes();
+                let mut i = 0;
+                while let Some(off) = text[i..].find("LUMEN_") {
+                    let start = i + off;
+                    let preceded_by_name_char = start > 0
+                        && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+                    let mut end = start;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_uppercase()
+                            || bytes[end].is_ascii_digit()
+                            || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    // A token written as a prefix (`LUMEN_METAL_DET_*`) names a
+                    // family, not a variable.
+                    if !preceded_by_name_char && !text[start..end].ends_with('_') {
+                        names.insert(text[start..end].to_string());
+                    }
+                    i = end;
+                }
+            }
+        }
+        Some(names)
+    }
+
+    #[test]
+    fn both_allowlists_are_sorted_and_disjoint() {
+        for (list, name) in [
+            (KNOWN_LUMEN_ENV_VARS, "KNOWN_LUMEN_ENV_VARS"),
+            (KNOWN_LUMEN_TOOLING_ENV_VARS, "KNOWN_LUMEN_TOOLING_ENV_VARS"),
+        ] {
+            let unsorted: Vec<&[&str]> = list.windows(2).filter(|w| w[0] >= w[1]).collect();
+            assert!(
+                unsorted.is_empty(),
+                "{name} is out of order at {unsorted:?}"
+            );
+        }
+        let engine: std::collections::BTreeSet<&str> =
+            KNOWN_LUMEN_ENV_VARS.iter().copied().collect();
+        let shared: Vec<&&str> = KNOWN_LUMEN_TOOLING_ENV_VARS
+            .iter()
+            .filter(|n| engine.contains(*n))
+            .collect();
+        assert!(shared.is_empty(), "names on both lists: {shared:?}");
+    }
+
+    #[test]
+    fn tooling_names_are_exactly_the_ones_the_scripts_define() {
+        let Some(defined) = lumen_names_defined_by_the_scripts() else {
+            eprintln!("skipped: not built inside a checkout");
+            return;
+        };
+        let engine: std::collections::BTreeSet<&str> =
+            KNOWN_LUMEN_ENV_VARS.iter().copied().collect();
+        let tooling: std::collections::BTreeSet<&str> =
+            KNOWN_LUMEN_TOOLING_ENV_VARS.iter().copied().collect();
+        // A script-defined name the engine does not read must be on the tooling
+        // list, or every run under that script warns about a name that is not
+        // a typo.
+        let missing: Vec<&String> = defined
+            .iter()
+            .filter(|n| !engine.contains(n.as_str()) && !tooling.contains(n.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "script-defined names the validator would flag: {missing:?}"
+        );
+        // And the tooling list may not outlive the scripts that justify it.
+        let stale: Vec<&&str> = tooling.iter().filter(|n| !defined.contains(**n)).collect();
+        assert!(
+            stale.is_empty(),
+            "tooling names no script defines any more: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn tooling_names_do_not_warn_when_set() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        for name in [
+            "LUMEN_BIN",
+            "LUMEN_SERVER_BIN",
+            "LUMEN_DET_MODEL",
+            "LUMEN_QS_MODEL",
+        ] {
+            let saved = std::env::var(name).ok();
+            std::env::set_var(name, "1");
+            let warnings = collect_unknown_lumen_env_vars();
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+            assert!(
+                !warnings.iter().any(|w| w.contains(name)),
+                "tooling name '{name}' must not warn; warnings = {warnings:?}"
+            );
+        }
+    }
+
     #[test]
     fn allowlist_members_do_not_warn_when_set() {
         // Completeness check that iterates the allowlist rather than hard-coding
@@ -2899,6 +3481,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
         "LUMEN_CUDA_Q4_DOWN_NR1",

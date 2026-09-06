@@ -1,8 +1,8 @@
 //! OpenAI-compatible endpoints: `/v1/chat/completions` + `/v1/completions`.
 //!
 //! References:
-//! - https://platform.openai.com/docs/api-reference/chat
-//! - https://platform.openai.com/docs/api-reference/completions
+//! - <https://platform.openai.com/docs/api-reference/chat>
+//! - <https://platform.openai.com/docs/api-reference/completions>
 //!
 //! the top-level request bodies (`ChatCompletionRequest`,
 //! `CompletionRequest`) carry `#[serde(deny_unknown_fields)]` to match

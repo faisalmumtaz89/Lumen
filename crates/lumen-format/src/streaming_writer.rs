@@ -38,7 +38,7 @@ impl<W: Write> StreamingLbcWriter<W> {
     /// Compute layout, write header + index + globals. O(globals) memory.
     ///
     /// If `tokenizer` is provided, it is serialized and its CRC/offset are
-    /// stored in the header. The actual bytes are written in [`finish()`].
+    /// stored in the header. The actual bytes are written in [`finish`](Self::finish).
     pub fn begin(
         mut w: W,
         header: &LbcHeader,

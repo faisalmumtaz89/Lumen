@@ -908,8 +908,8 @@ struct MutableState {
     /// cuBLAS must not allocate memory internally during graph capture (cudaMalloc
     /// is forbidden on a capturing stream). This 4 MB buffer is registered via
     /// `cublasSetWorkspace_v2` so cuBLAS uses it instead of allocating on-the-fly.
-    /// Must outlive the cuBLAS handle.
-    cublas_workspace: Option<CudaSlice<u8>>,
+    /// Held here only so it outlives the cuBLAS handle; nothing reads it.
+    _cublas_workspace: Option<CudaSlice<u8>>,
     /// Pre-computed per-layer batched GEMM pointer arrays.
     /// Populated once in `preload_weights()`, eliminates per-layer htod memcpys.
     /// `None` until preload completes.
@@ -1135,12 +1135,6 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
-/// Historical floor for a split-clone VRAM budget: 5.1 GB. The free-memory-aware
-/// default never resolves below this so that a small / heavily-loaded GPU keeps
-/// the exact pre-lever clone set (Q4_0 Qwen3.5-9B is ~5 GB total, fully cloned
-/// under this floor), preserving byte-identical decode there.
-const SPLIT_CLONE_MIN_BUDGET_BYTES: usize = 5_100_000_000;
-
 /// Bytes held back from the free-memory-aware split-clone budget for per-token
 /// activations and transient scratch that live *beyond* weights + KV cache.
 ///
@@ -1160,9 +1154,9 @@ const SPLIT_CLONE_ACTIVATION_SLACK_BYTES: usize = 2_000_000_000; // 2 GB
 struct ResolvedSplitBudget {
     /// Upper cap (bytes) the largest-first clone loop fills up to.
     budget_bytes: usize,
-    /// Device free VRAM queried at the clone call site (preload, before KV alloc).
+    /// Device free VRAM queried at the clone call site (preload_weights, after init() allocated KV).
     free_mem_bytes: usize,
-    /// VRAM reserved for the F32 KV cache that `init()` allocates after preload.
+    /// The F32 KV cache `init()` allocated before preload; reported, not subtracted.
     kv_reserve_bytes: usize,
     /// Activation / scratch slack held back ([`SPLIT_CLONE_ACTIVATION_SLACK_BYTES`]).
     slack_bytes: usize,
@@ -1174,20 +1168,23 @@ struct ResolvedSplitBudget {
 ///
 /// * `env_var` — the explicit override key (`LUMEN_CUDA_Q4_SPLIT_BUDGET_GB` for the
 ///   Q4 site, `LUMEN_CUDA_Q8_SPLIT_BUDGET_GB` for the Q8 site).
-/// * `device` — used to query FREE VRAM at the clone call site. The clone runs at
-///   preload, BEFORE `init()` allocates the KV cache, so this free figure still
-///   contains the KV headroom we then subtract.
+/// * `device` — used to query FREE VRAM at the clone call site. The clone runs
+///   in `preload_weights`, AFTER `init()` has allocated the KV caches, so the
+///   free figure is already net of KV; the KV reserve computed below is reported
+///   in the log line and is NOT subtracted from the budget (subtracting it again
+///   would count it twice).
 /// * `hp` — model config; supplies the KV-cache dims (layers / kv-heads / head-dim /
-///   max_seq_len) so the KV reserve is derived from the ACTUAL model, never hardcoded.
+///   max_seq_len) so the reported reserve is derived from the ACTUAL model.
 ///
-/// Resolution:
+/// Resolution (`runtime_defaults::resolve_split_clone_budget_bytes`, a pure function
+/// pinned off-device; this site supplies its inputs and the log-line figures):
 /// * **`env_var` SET** (finite, > 0) → `gb * 1_000_000_000` bytes. Byte-for-byte the
 ///   pre-lever behavior: the same explicit override maps to the same cap, so the
-///   env-override path is unchanged.
-/// * **`env_var` UNSET** → `max(5.1 GB, free_mem − KV_reserve − ACTIVATION_SLACK)`.
-///   On an 80 GB target with the 27B Q4 FFN (~9.6 GB), the resolved cap exceeds the
-///   FFN size so ALL 64 FFN layers clone (reproducing the gated +17%), while the
-///   subtracted `KV_reserve` provably preserves KV headroom.
+///   env-override path is unchanged. The override is not capped.
+/// * **`env_var` UNSET** → `free_mem - ACTIVATION_SLACK`
+///   (`runtime_defaults::split_clone_budget_bytes`), so the default can never spend
+///   the slack. On an 80 GB target with the 27B Q4 FFN (~9.6 GB) the resolved cap
+///   exceeds the FFN size so ALL 64 FFN layers clone (the gated +17%).
 ///
 /// `KV_reserve` mirrors `init()`'s allocation exactly: `init()` allocates a full
 /// F32 K and V cache for EVERY layer (`for _ in 0..num_layers`), even GDN layers,
@@ -1200,7 +1197,8 @@ fn resolve_split_clone_budget(
     device: &CudaDevice,
     hp: &ModelHyperparams,
 ) -> ResolvedSplitBudget {
-    // Free VRAM at the clone call site (preload, before KV alloc).
+    // Free VRAM at the clone call site (preload_weights, which runs after
+    // init() has already allocated the KV caches).
     let free_mem_bytes = device.free_memory().unwrap_or(0);
 
     // Effective max_seq_len: mirror init()'s LUMEN_CUDA_MAX_SEQ_LEN cap logic so the
@@ -1225,34 +1223,24 @@ fn resolve_split_clone_budget(
         .saturating_mul(2) // K and V
         .saturating_mul(KV_DTYPE_BYTES);
 
-    // Explicit override: byte-for-byte the pre-lever behavior.
-    if let Some(gb) = std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|gb| gb.is_finite() && *gb > 0.0)
-    {
-        return ResolvedSplitBudget {
-            budget_bytes: (gb * 1_000_000_000.0) as usize,
-            free_mem_bytes,
-            kv_reserve_bytes,
-            slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-            from_env: true,
-        };
-    }
-
-    // Free-memory-aware default: reserve KV + activation slack from free VRAM, never
-    // dropping below the 5.1 GB historical floor.
-    let budget_bytes = free_mem_bytes
-        .saturating_sub(kv_reserve_bytes)
-        .saturating_sub(SPLIT_CLONE_ACTIVATION_SLACK_BYTES)
-        .max(SPLIT_CLONE_MIN_BUDGET_BYTES);
+    // `free_mem_bytes` was read in `preload_weights`, after `init` allocated
+    // the KV caches, so it is already net of KV; the reserve is reported for
+    // the log line only and is not subtracted again. The choice between the
+    // operator's override and the free-minus-slack default is the pure
+    // function; this site only gathers its inputs.
+    let override_raw = std::env::var(env_var).ok();
+    let (budget_bytes, from_env) = crate::runtime_defaults::resolve_split_clone_budget_bytes(
+        free_mem_bytes,
+        SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+        override_raw.as_deref(),
+    );
 
     ResolvedSplitBudget {
         budget_bytes,
         free_mem_bytes,
         kv_reserve_bytes,
         slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
-        from_env: false,
+        from_env,
     }
 }
 
@@ -1879,7 +1867,7 @@ impl CudaBackend {
         })();
 
         match result {
-            Ok(status) if status == cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS => {
+            Ok(cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS) => {
                 // `available` already defaults to true; no flip needed.
             }
             Ok(status) => {
@@ -11123,11 +11111,10 @@ unsafe fn launch_matvec(
     // Used for F32 weights (from Q4_1 dequant) that have an F16 cache.
     // Q8Raw and Q4Raw are handled above via native kernels (smem/scalar).
     // Uses DEFAULT_TENSOR_OP (fallback path for F32 with F16 caches).
-    // Use `as_deref_mut()` to borrow without moving: if `weight` is NOT F32 we
-    // fall through to the `match` below, which still needs `input_f16_scratch`
-    // for the Bf16Raw fallback arm.
+    // Last use of `input_f16_scratch` in this function: the `match` below never
+    // reads it (the Bf16Raw arm is reached only when it was None), so it moves.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
             return launch_hgemv_f16(
                 device,
                 kernels,
@@ -11813,10 +11800,9 @@ unsafe fn launch_matvec_residual(
     // HGEMV residual: only for F32 weights with F16 cache.
     // Q8Raw and Q4Raw are handled above via native kernels (smem/scalar).
     // Uses DEFAULT_TENSOR_OP (fallback path for F32 with F16 caches).
-    // Use `as_deref_mut()` to avoid consuming `input_f16_scratch` on the
-    // non-F32 path -- symmetric to the launch_matvec fix.
+    // Last use of `input_f16_scratch` in this function, so it moves.
     if matches!(weight, GpuWeightBuf::F32(_)) {
-        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch.as_deref_mut()) {
+        if let (Some(w_f16), Some(scratch)) = (weight_f16_cache, input_f16_scratch) {
             return launch_hgemv_f16_residual(
                 device,
                 kernels,
@@ -13488,12 +13474,12 @@ unsafe fn repack_all_layers_q8_clone_to_split(
 
     // The `clone_budget_bytes` UPPER cap is resolved by the caller via
     // `resolve_split_clone_budget("LUMEN_CUDA_Q8_SPLIT_BUDGET_GB", ..)`: the env
-    // override (when set) maps to the exact pre-lever 5.1 GB-style cap, while the
-    // default is free-memory-aware (`free − KV_reserve − activation_slack`,
-    // floored at 5.1 GB). On an 80 GB target the default exceeds the ~19 GB 27B
-    // dense FFN (Q8) so all 64 FFN layers clone; on a small GPU it holds at the
-    // 5.1 GB floor. The cap does NOT force allocation -- per-clone `cudaMalloc`
-    // failures still fail-safe (Q8Raw fallback keeps correctness).
+    // override (when set) maps to the exact pre-lever cap, while the default is
+    // free-memory-aware (`free - activation_slack`; `free` is already net of the
+    // KV cache init() allocated). On an 80 GB target the default exceeds the
+    // ~19 GB 27B dense FFN (Q8) so all 64 FFN layers clone; on a small GPU it
+    // clones what fits. The cap does NOT force allocation -- per-clone
+    // `cudaMalloc` failures still fail-safe (Q8Raw fallback keeps correctness).
     let mut layers_with_split = std::collections::HashSet::new();
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
@@ -13801,10 +13787,11 @@ unsafe fn repack_all_layers_q4_clone_to_split(
     // `clone_budget_bytes` UPPER cap is resolved by the caller via
     // `resolve_split_clone_budget("LUMEN_CUDA_Q4_SPLIT_BUDGET_GB", ..)`: the env
     // override (when set) maps to the exact pre-lever cap, while the default is
-    // free-memory-aware (`free − KV_reserve − activation_slack`, floored at
-    // 5.1 GB). On an 80 GB target the default exceeds the ~9.6 GB 27B dense FFN so
-    // all 64 FFN layers clone; on a small GPU it holds at the 5.1 GB floor. The cap
-    // does NOT force allocation — per-clone `cudaMalloc` failures still fail-safe.
+    // free-memory-aware (`free - activation_slack`; `free` is already net of the
+    // KV cache init() allocated). On an 80 GB target the default exceeds the
+    // ~9.6 GB 27B dense FFN so all 64 FFN layers clone; on a small GPU it clones
+    // what fits. The cap does NOT force allocation — per-clone `cudaMalloc`
+    // failures still fail-safe.
     let mut layers_with_split = std::collections::HashSet::new();
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
@@ -14794,65 +14781,6 @@ unsafe fn launch_hgemv_f16_preconverted(
     Ok(())
 }
 
-/// cuBLAS HGEMV with pre-converted F16 input and beta=1.0 accumulation.
-///
-/// Used in the graph pipeline where the caller has already placed the residual
-/// into `output_f32` via the fused convert+residual kernel. The HGEMV accumulates
-/// on top with beta=1.0.
-///
-/// # Safety
-///
-/// Caller must ensure:
-/// - `w_f16` has `[out_dim * in_dim * 2]` bytes (F16 row-major)
-/// - `input_f16` has at least `in_dim * 2` bytes (pre-converted F16)
-/// - `output_f32` has `out_dim` elements (pre-loaded with residual)
-unsafe fn launch_hgemv_f16_preconverted_beta1(
-    device: &CudaDevice,
-    w_f16: &CudaSlice<u8>,
-    input_f16: &CudaSlice<u8>,
-    output_f32: &mut CudaSlice<f32>,
-    out_dim: usize,
-    in_dim: usize,
-    label: &str,
-    algo: cublas_sys::cublasGemmAlgo_t,
-) -> Result<(), RuntimeError> {
-    let alpha: f32 = 1.0;
-    let beta: f32 = 1.0;
-
-    use cudarc::driver::DevicePtr;
-    let (w_ptr, _) = w_f16.device_ptr(&device.stream);
-    let (a_ptr, _) = input_f16.device_ptr(&device.stream);
-    let (c_ptr, _) = output_f32.device_ptr(&device.stream);
-
-    let status = cublas_sys::cublasGemmEx(
-        *device.blas.handle(),
-        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32, // M
-        1i32,           // N = 1 (GEMV)
-        in_dim as i32,  // K
-        &alpha as *const f32 as *const std::ffi::c_void,
-        w_ptr as *const std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32, // lda
-        a_ptr as *const std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32, // ldb
-        &beta as *const f32 as *const std::ffi::c_void,
-        c_ptr as *mut std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32, // ldc
-        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
-        algo,
-    );
-    if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Err(RuntimeError::Compute(format!(
-            "cublasGemmEx HGEMV preconverted beta=1 {label}: status={status:?}",
-        )));
-    }
-    Ok(())
-}
-
 /// cuBLAS HGEMV with pre-converted F16 input and residual accumulation.
 ///
 /// Copies `residual` into `output_f32` first, then runs `cublasGemmEx` with
@@ -14954,7 +14882,7 @@ unsafe fn launch_hgemv_f16_batched(
 ) -> Result<(), RuntimeError> {
     let batch_count = w_f16_slices.len();
     debug_assert_eq!(batch_count, output_f32_slices.len());
-    debug_assert!(batch_count >= 2 && batch_count <= 3);
+    debug_assert!((2..=3).contains(&batch_count));
 
     use cudarc::driver::DevicePtr;
 
@@ -15143,7 +15071,7 @@ fn build_precomputed_batch_ptrs(
     let mut qkv_b_ptrs = Vec::with_capacity(if has_grouped_gemm { num_layers } else { 0 });
     let mut qkv_c_ptrs = Vec::with_capacity(if has_grouped_gemm { num_layers } else { 0 });
 
-    for (_layer_idx, lw) in layer_weights.iter().enumerate() {
+    for lw in layer_weights.iter() {
         // --- KV batched pointers ---
         // Try to get F16 weight pointers for K and V.
         let wk_f16_ptr = get_f16_weight_ptr(device, &lw.wk, lw.wk_f16.as_ref());
@@ -16070,13 +15998,38 @@ impl ComputeBackend for CudaBackend {
         // `use_q4_split` (the SoA buffers must exist for the locked kernel to
         // read). Default resolved by `soa_locked_default` (ON for quantised
         // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
+        // The lever defaults below read the device's compute capability.
+        match self.device.compute_capability() {
+            Ok((cc_major, cc_minor)) => {
+                crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
+                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
+                {
+                    eprintln!(
+                        "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
+                         Q4 split dispatch (the locked kernel is only measured on cc 8.x/9.x; set =1 to force, \
+                         or LUMEN_CUDA_Q4_SPLIT=1 for the split path alone)"
+                    );
+                }
+            }
+            Err(e) => {
+                crate::runtime_defaults::set_device_cc_major(0);
+                eprintln!(
+                    "[CUDA] compute-capability query failed ({e}): LUMEN_CUDA_SOA_LOCKED defaults OFF"
+                );
+            }
+        }
         let use_soa_locked = env_truthy_or_default(
             "LUMEN_CUDA_SOA_LOCKED",
             crate::runtime_defaults::soa_locked_default,
         );
         let use_q4_split = env_truthy("LUMEN_CUDA_Q4_SPLIT") || use_soa_locked;
         if use_soa_locked {
-            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
+            let how = if parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_some() {
+                "env"
+            } else {
+                "default"
+            };
+            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED on ({how}): Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
         } else if use_q4_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q4_SPLIT=1: Q4_0 weights will be cloned to split layout for decode");
         }
@@ -16243,7 +16196,7 @@ impl ComputeBackend for CudaBackend {
             has_moe_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
-            cublas_workspace,
+            _cublas_workspace: cublas_workspace,
             precomputed_ptrs: None,
             algo_cache: AlgoCache::new(),
             moe_scratch,
@@ -18989,7 +18942,45 @@ impl ComputeBackend for CudaBackend {
         // memory is ~2x the Q8_0 weight size (F16 = 2 bytes/element vs Q8_0 ~1.0625).
         // BF16 weights skip this step entirely (no F16 cache needed; matvec_bf16
         // dispatches directly off the raw BF16 bytes).
-        let mem_before_f16_cache = self.device.free_memory().unwrap_or(0);
+        let free_before_f16_cache = self.device.free_memory();
+        let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
+        let free_for_refusal = match free_before_f16_cache {
+            Ok(b) => crate::runtime_defaults::FreeMemory::Bytes(b as u64),
+            Err(e) => {
+                eprintln!(
+                    "[CUDA] free-memory query failed before the F16 dequant caches ({e}); \
+                     building them without a fit check"
+                );
+                crate::runtime_defaults::FreeMemory::Unknown
+            }
+        };
+        let f16_cache_forced =
+            parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
+        let f16_cache_needed: u64 = cache
+            .iter()
+            .map(|layer| super::gpu_buffers::f16_cache_bytes(layer, &hp_copy))
+            .sum();
+        let attention_layers = cache
+            .iter()
+            .filter(|layer| layer.layer_type != super::gpu_buffers::LAYER_TYPE_GDN)
+            .count();
+        let kv_bytes: u64 = st
+            .kv_caches
+            .iter()
+            .map(|kv| (kv.k_cache.len() + kv.v_cache.len()) as u64 * 4)
+            .sum();
+        let max_seq_len = st.kv_caches.first().map_or(0, |kv| kv.max_seq_len);
+        if let Some(msg) = crate::runtime_defaults::f16_cache_refusal(
+            f16_cache_needed,
+            free_for_refusal,
+            crate::runtime_defaults::F16_CACHE_HEADROOM_BYTES,
+            f16_cache_forced,
+            attention_layers,
+            max_seq_len,
+            kv_bytes,
+        ) {
+            return Err(RuntimeError::Compute(msg));
+        }
         for (layer_idx, layer) in cache.iter_mut().enumerate() {
             super::gpu_buffers::dequant_layer_q8_to_f16(
                 &self.device,
@@ -19094,9 +19085,9 @@ impl ComputeBackend for CudaBackend {
                 st.kernels.matvec_q8_split_q8_1.is_some(),
             ) {
                 // Resolve the split-clone VRAM budget (env override, else
-                // free-mem-aware default) at the clone site — preload, BEFORE the KV
-                // cache is allocated, so `free` still holds the KV headroom. Reuses
-                // the shared L8 resolver (same helper as the Q4 clone pass).
+                // free-mem-aware default) at the clone site — preload_weights, AFTER
+                // init() allocated the KV cache, so `free` is already net of it.
+                // Reuses the shared L8 resolver (same helper as the Q4 clone pass).
                 let budget = resolve_split_clone_budget(
                     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
                     &self.device,
@@ -19118,16 +19109,16 @@ impl ComputeBackend for CudaBackend {
                 // attempted — the loop aborts on OOM).
                 eprintln!(
                     "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
+                     slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
                      {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
                      enumerated: eligible Q8Raw FFN always; GDN ssm_out when \
                      LUMEN_CUDA_Q8_SPLIT_SSMOUT=1; attention/GDN projections on \
                      wide-GDN models when LUMEN_CUDA_Q8_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
                     if budget.from_env { "env" } else { "free-mem" },
+                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                 );
                 let mem_after_q8_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
@@ -19176,22 +19167,52 @@ impl ComputeBackend for CudaBackend {
             ) {
                 let vocab_size = hp_copy.vocab_size as usize;
                 let hidden = hp_copy.hidden_dim as usize;
-                match unsafe {
-                    repack_q8_raw_to_split(
-                        &self.device,
-                        split_repack_fn,
-                        proj_q8,
-                        vocab_size,
-                        hidden,
-                    )
-                } {
-                    Ok(split_buf) => {
+                // The split clone is the same size as the Q8 source it copies.
+                // It runs after the budgeted Q8 sibling pass and before the Q4
+                // one, so it is charged against what is actually free now, and
+                // it may not spend the decode slack: on a 32 GB card the clones
+                // made past the slack pushed the first inference into
+                // CUDA_ERROR_OUT_OF_MEMORY.
+                let clone_bytes = proj_q8.len() as u64;
+                let forced =
+                    parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
+                let decision = crate::runtime_defaults::output_proj_clone_decision(
+                    clone_bytes,
+                    self.device
+                        .free_memory()
+                        .map(|f| crate::runtime_defaults::FreeMemory::Bytes(f as u64))
+                        .unwrap_or(crate::runtime_defaults::FreeMemory::Unknown),
+                    SPLIT_CLONE_ACTIVATION_SLACK_BYTES as u64,
+                    forced,
+                );
+                if let Some(reason) = decision.skip_reason() {
+                    eprintln!(
+                        "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT: output_proj split clone skipped: {reason}; \
+                         using the Q8Raw output_proj path"
+                    );
+                }
+                let repack = if decision.proceed() {
+                    Some(unsafe {
+                        repack_q8_raw_to_split(
+                            &self.device,
+                            split_repack_fn,
+                            proj_q8,
+                            vocab_size,
+                            hidden,
+                        )
+                    })
+                } else {
+                    None
+                };
+                match repack {
+                    None => {}
+                    Some(Ok(split_buf)) => {
                         st.globals.output_proj_q8_split = Some(split_buf);
                         eprintln!(
                             "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1: output_proj cloned to split layout ({vocab_size}x{hidden})"
                         );
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         eprintln!(
                             "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1 set but output_proj split repack failed (falling back to Q8Raw/Q8Aligned): {e}"
                         );
@@ -19268,8 +19289,8 @@ impl ComputeBackend for CudaBackend {
                 st.kernels.matvec_q4_split_q8_1.is_some(),
             ) {
                 // Resolve the split-clone VRAM budget (env override, else
-                // free-mem-aware default) at the clone site — preload, BEFORE the KV
-                // cache is allocated, so `free` still holds the KV headroom.
+                // free-mem-aware default) at the clone site — preload_weights, AFTER
+                // init() allocated the KV cache, so `free` is already net of it.
                 let budget = resolve_split_clone_budget(
                     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
                     &self.device,
@@ -19291,14 +19312,14 @@ impl ComputeBackend for CudaBackend {
                 // gate/up/down weight-jobs were attempted.
                 eprintln!(
                     "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     kv_reserve={:.2} GB, slack={:.2} GB, source={}); cloned \
+                     slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
                      {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
                      enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
                     (budget.budget_bytes as f64) / 1.0e9,
                     (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                     (budget.slack_bytes as f64) / 1.0e9,
                     if budget.from_env { "env" } else { "free-mem" },
+                    (budget.kv_reserve_bytes as f64) / 1.0e9,
                 );
                 let mem_after_q4_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =

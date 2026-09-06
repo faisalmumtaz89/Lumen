@@ -32,12 +32,24 @@ fn main() {
     // pack), plus packed-refs when it exists — only existing paths are
     // declared, since Cargo treats a missing declared path as always
     // changed. Declaring any path replaces Cargo's default watch on this
-    // crate's sources, so they are declared again for the `-dirty` marker.
+    // crate's sources, so they are declared again for the `-dirty` marker,
+    // as is the registry TOML (embedded by the CLI this binary links).
     // Limits: edits elsewhere in the workspace also make `git describe`
     // dirty but do not re-run this script, so the stamp is not a build
     // identity — two byte-different binaries can carry one stamp; harness
     // records identify a binary by its sha256. A fetch that writes a remote
     // ref also re-runs the script (one relink, byte-identical output).
+    // The registry TOML is embedded by the CLI regardless of git, so it is
+    // watched outside the git-dependent block.
+    if std::path::Path::new("../../model_registry.toml").exists() {
+        println!("cargo:rerun-if-changed=../../model_registry.toml");
+    }
+    // Declaring any watch path replaces Cargo's default "re-run on any
+    // package change", so the crate's own source and manifest are declared
+    // unconditionally: a source edit must re-stamp in a tree without git
+    // (a source tarball) exactly as it does in a checkout.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     if let (Some(git_dir), Some(common_dir)) = (
         git(&["rev-parse", "--git-dir"]),
         git(&["rev-parse", "--git-common-dir"]),
@@ -46,8 +58,6 @@ fn main() {
             format!("{git_dir}/HEAD"),
             format!("{common_dir}/refs"),
             format!("{common_dir}/packed-refs"),
-            "src".to_string(),
-            "Cargo.toml".to_string(),
         ];
         for path in candidates
             .iter()

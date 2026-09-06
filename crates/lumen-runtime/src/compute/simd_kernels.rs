@@ -2783,7 +2783,7 @@ pub fn softmax_inplace_simd(logits: &mut [f32]) {
     softmax_inplace_fallback(logits);
 }
 
-/// SIMD-accelerated element-wise vector addition: dst[i] += src[i].
+/// SIMD-accelerated element-wise vector addition: `dst[i] += src[i]`.
 /// Used for residual connections in the transformer compute loop.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -2817,7 +2817,7 @@ pub fn vadd_inplace_simd(dst: &mut [f32], src: &[f32]) {
     vadd_inplace_fallback(dst, src);
 }
 
-/// SIMD-accelerated scaled vector addition: dst[i] += src[i] * scale.
+/// SIMD-accelerated scaled vector addition: `dst[i] += src[i] * scale`.
 /// Used for attention value accumulation (weighted sum of value vectors).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]

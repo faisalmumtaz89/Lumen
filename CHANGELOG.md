@@ -7,8 +7,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **Locked Q4 kernel gated by measured capability**: the codegen-locked Q4
+  split kernel defaults on only for compute capabilities 8.x and 9.x, where it
+  was measured; Blackwell (12.x), 10.x, and a device whose capability query
+  failed default it off, and the Q4 split dispatch goes with it (it was only
+  ever enabled through this lever or `LUMEN_CUDA_Q4_SPLIT=1`).
+  `LUMEN_CUDA_SOA_LOCKED=1` still forces it on. On an RTX 5090, in a
+  configuration that fits, forcing the lever on does not reproduce the
+  1.1 tok/s once attributed to it (75.4–75.5 tok/s either way, five fresh
+  processes per arm); no difference was observed there, and whether the
+  locked kernel executed in the forced arm is not shown by that probe's
+  logs.
+- **F16 dequant caches refused when they cannot fit**: the caches are sized
+  with the allocator's own arithmetic before any is built; when the bytes
+  needed plus a 512 MiB headroom exceed free memory the load is refused with
+  the bytes needed, the bytes free, the context length and the KV bytes.
+  Nothing to build, a failed free-memory query, or
+  `LUMEN_CUDA_F16_CACHE_FORCE=1` skip the check.
+- **Split-clone budget is free memory minus the slack**: the free figure is
+  read after the KV caches exist, so the KV reserve the budget used to
+  subtract was counted twice; the 5.1 GB minimum it used to raise itself to is
+  removed. A 32 GB card at 2.76 GB free now resolves 0.76 GB where it resolved
+  5.1 GB and, with the clones that followed, was left at 0.14 GB.
+- **Output-projection clone charged against free memory**: the split clone
+  of the output projection ran between the two budgeted sibling clone passes
+  and outside any budget; on a 32 GB card at a 4096-token context the first
+  inference failed with `CUDA_ERROR_OUT_OF_MEMORY` when it and the sibling
+  clones were both made, and completed when either was skipped. It is now
+  made only when it leaves the 2 GB decode slack free; otherwise, or when
+  the free-memory query fails, it is skipped with a message and the packed
+  output projection is used. `LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway.
+
+### Removed
+
+- **Unreached CUDA kernels**: the Q4_0 MMQ batched matmul pair
+  (`mmq_q4_0_batched`, `mmq_q4_0_batched_residual`) and the two fused
+  residual-add RMSNorm kernels (`fused_residual_rmsnorm_f16`,
+  `fused_residual_rmsnorm_q8_1`) were compiled and loaded at start-up but
+  never dispatched; they are gone with their shader source, along with a
+  pre-converted HGEMV helper nothing called.
+
 ### Fixed
 
+- **The Metal determinism script no longer kills its caller**: its
+  one-process discipline matched `target/release/lumen` anywhere in a
+  command line, so a shell that named the binary in its own arguments
+  (`LUMEN_BIN=.../target/release/lumen bash scripts/...`) was killed along
+  with any stale engine. The match is now anchored to the start of the
+  command line; the Metal matrix runner's per-port kill is anchored the
+  same way.
+- **The startup typo check knows the repository's own tooling names**: every
+  `LUMEN_*` variable not on the engine's allowlist drew an "unknown env var"
+  warning, including the names Lumen's own scripts, installer and release
+  workflow define (`LUMEN_BIN`, `LUMEN_SERVER_BIN`, the installer's
+  `LUMEN_MODEL` and `LUMEN_QUANT`, the determinism script's `LUMEN_DET_*`,
+  the quickstart's `LUMEN_QS_*`), which the shell that sets them passes on to
+  the binary. Those names are now a second, script-derived allowlist; a test
+  reads the scripts and fails when a name is added or dropped on either side.
+- **Driver-reject markers written only for a refused PTX**: the PTX cache
+  records a marker when the driver refuses an image (unsupported PTX version,
+  invalid PTX, no binary for the GPU, invalid image, invalid source) so later
+  launches skip a doomed reload. A load that fails for any other reason (out
+  of memory, a lost context, an ECC event, a PTX JIT compiler that is missing
+  or disabled on the host) now writes no marker, a cached image the driver
+  cannot load is reported instead of discarded silently, and a successful
+  store clears any marker for the key. The two JIT-compiler codes are named
+  as a condition of the host rather than as a refusal of the PTX.
 - **Downloads refuse three more malformed responses**: a readable `identity`
   beside an unreadable second `Content-Encoding` value (the value count is now
   held against the header-line count), a header line with no colon (ureq's
@@ -27,8 +93,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   now watch the refs directory of the git common dir (so linked worktrees,
   tags and refs re-created after `git pack-refs` count), `packed-refs` when it
   exists, and the crate's own sources so its `-dirty` marker is right; a no-op
-  rebuild stays a no-op. Edits in other crates do not re-stamp (see the
-  tracker's `R10-RESIDUAL-STAMP-SCOPE`).
+  rebuild stays a no-op. The sources and manifest are watched whether or not
+  git is present, so a source edit re-stamps in a source tarball as it does
+  in a checkout. Edits in other crates do not re-stamp.
 
 ## [0.23.0] — 2026-09-03
 
@@ -863,7 +930,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.12.1...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
 [0.17.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.14.0...v0.15.0

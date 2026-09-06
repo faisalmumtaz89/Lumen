@@ -114,7 +114,7 @@ impl CudaDevice {
     /// Routes through the persistent PTX disk cache: on a cache hit the NVRTC
     /// compile is skipped and the cached PTX is handed straight to
     /// `cuModuleLoadData` (the driver JIT still runs and is itself cached by
-    /// the driver's compute cache). See [`super::ptx_cache`].
+    /// the driver's compute cache). See `ptx_cache`.
     pub fn compile_and_load(&self, cuda_source: &str) -> Result<Arc<CudaModule>, RuntimeError> {
         self.compile_and_load_cached(cuda_source, None, false)
     }
@@ -191,25 +191,48 @@ impl CudaDevice {
             if super::ptx_cache::is_driver_rejected(&key) {
                 super::ptx_cache::record_miss();
                 return Err(RuntimeError::Compute(format!(
-                    "CUDA driver rejected cached PTX for arch '{}' on cc {}.{} \
-                     (driver-reject marker present; skipping doomed recompile)",
-                    key.arch, key.cc.0, key.cc.1
+                    "CUDA driver {} rejected this build's PTX for arch '{}' on cc {}.{} \
+                     on an earlier launch (driver-reject marker present; skipping the \
+                     doomed recompile). The usual cause is a CUDA toolkit newer than \
+                     the driver: NVRTC {}.{} emits a PTX ISA the driver cannot load. \
+                     Install the toolkit matching `nvidia-smi`'s CUDA version, or \
+                     update the driver; the marker clears itself once either changes.",
+                    key.driver_version,
+                    key.arch,
+                    key.cc.0,
+                    key.cc.1,
+                    key.nvrtc_version.0,
+                    key.nvrtc_version.1
                 )));
             }
 
             // Cache hit: load the cached PTX bytes directly.
             if let Some(cached) = super::ptx_cache::load(&key) {
                 let ptx = cudarc::nvrtc::Ptx::from_binary(cached);
-                if let Ok(module) = self.ctx.load_module(ptx) {
-                    super::ptx_cache::record_hit();
-                    return Ok(module);
+                match self.ctx.load_module(ptx) {
+                    Ok(module) => {
+                        super::ptx_cache::record_hit();
+                        return Ok(module);
+                    }
+                    Err(e) => {
+                        // A cached blob the driver cannot load must never be
+                        // fatal: say what the driver said and fall through to a
+                        // fresh compile. Only a refusal of the PTX itself earns
+                        // a driver-reject marker (so later launches skip the
+                        // doomed reload); a transient failure (out of memory,
+                        // a lost context) leaves the entry alone, and a
+                        // successful `store` clears any marker in any case.
+                        eprintln!(
+                            "[CUDA] cached PTX for {} (arch {}) failed to load: {}; recompiling",
+                            key.digest_hex(),
+                            key.arch,
+                            ptx_load_message(e.0, key.driver_version, key.nvrtc_version, key.arch)
+                        );
+                        if ptx_rejected_by_driver(e.0) {
+                            super::ptx_cache::mark_driver_reject(&key);
+                        }
+                    }
                 }
-                // A cached blob that the driver rejects (e.g. produced by an
-                // incompatible build that somehow shares the key) must never be
-                // fatal: record a driver-reject marker so subsequent launches
-                // skip the doomed reload + recompile, then fall through to a
-                // fresh compile for this launch.
-                super::ptx_cache::mark_driver_reject(&key);
             }
 
             // Miss (or rejected cache entry): NVRTC-compile, then load. Only
@@ -230,15 +253,26 @@ impl CudaDevice {
                     return Ok(module);
                 }
                 Err(e) => {
-                    super::ptx_cache::mark_driver_reject(&key);
-                    return Err(cuda_driver_err(e));
+                    // Only a rejection of the PTX itself earns a marker: a marker
+                    // says "recompiling cannot help", which is true for an
+                    // unsupported ISA or an invalid image and false for a device
+                    // out of memory, a lost context or a missing JIT compiler,
+                    // where the next launch may load fine.
+                    if ptx_rejected_by_driver(e.0) {
+                        super::ptx_cache::mark_driver_reject(&key);
+                    }
+                    return Err(ptx_load_err(e, &key));
                 }
             }
         }
 
         // Cache key unavailable (version query failed) -> plain compile+load.
         let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
-        self.ctx.load_module(ptx).map_err(cuda_driver_err)
+        // No cache key means the NVRTC/driver version query failed, so the
+        // message names the driver's error and the arch but no versions.
+        self.ctx.load_module(ptx).map_err(|e| {
+            RuntimeError::Compute(ptx_load_message(e.0, 0, (0, 0), arch.unwrap_or("default")))
+        })
     }
 
     /// Run NVRTC source->PTX compilation with the given arch / fast_math flags.
@@ -494,6 +528,79 @@ fn cuda_driver_err(e: cudarc::driver::DriverError) -> RuntimeError {
     RuntimeError::Compute(format!("CUDA driver error: {e}"))
 }
 
+/// The driver refused freshly compiled PTX at `cuModuleLoadData`. Name the
+/// driver's own error and, for the one cause with a fix the user can apply,
+/// say what it means: a toolkit whose NVRTC emits a newer PTX ISA than the
+/// installed driver understands.
+fn ptx_load_err(e: cudarc::driver::DriverError, key: &super::ptx_cache::CacheKey) -> RuntimeError {
+    RuntimeError::Compute(ptx_load_message(
+        e.0,
+        key.driver_version,
+        key.nvrtc_version,
+        key.arch,
+    ))
+}
+
+/// Whether a `cuModuleLoadData` failure means the driver refused the PTX
+/// itself, so a recompile against the same toolkit and driver cannot help and
+/// a driver-reject marker is warranted. Only the codes the driver documents
+/// for a refused image count; every other failure (out of memory, a lost or
+/// invalid context, an uncorrectable ECC event, a device not yet ready, an
+/// unknown error) is treated as transient, because a marker written for a
+/// transient failure would outlive the condition and poison the key. A
+/// missing or disabled PTX JIT compiler is a state of the host, not a verdict
+/// on the image: the same PTX loads once the compiler library is installed or
+/// JIT is re-enabled, so those two codes earn no marker either.
+pub(crate) fn ptx_rejected_by_driver(code: cudarc::driver::sys::CUresult) -> bool {
+    use cudarc::driver::sys::CUresult as R;
+    matches!(
+        code,
+        R::CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+            | R::CUDA_ERROR_INVALID_PTX
+            | R::CUDA_ERROR_NO_BINARY_FOR_GPU
+            | R::CUDA_ERROR_INVALID_IMAGE
+            | R::CUDA_ERROR_INVALID_SOURCE
+    )
+}
+
+fn ptx_load_message(
+    code: cudarc::driver::sys::CUresult,
+    driver_version: i32,
+    nvrtc_version: (i32, i32),
+    arch: &str,
+) -> String {
+    let versions = if driver_version == 0 {
+        "(driver and NVRTC versions unknown: the version query failed)".to_string()
+    } else {
+        format!(
+            "(driver {driver_version}, NVRTC {}.{})",
+            nvrtc_version.0, nvrtc_version.1
+        )
+    };
+    use cudarc::driver::sys::CUresult as R;
+    match code {
+        R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND | R::CUDA_ERROR_JIT_COMPILATION_DISABLED => format!(
+            "CUDA driver could not JIT-compile the PTX produced for arch '{arch}' ({code:?}) \
+             {versions}: the driver's PTX JIT compiler is {}. This is a condition of the host, \
+             not of the PTX, so no reject marker is written and the next launch tries again.",
+            if code == R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND {
+                "not installed (the libnvidia-ptxjitcompiler library that ships with the driver)"
+            } else {
+                "disabled (see CUDA_DISABLE_PTX_JIT)"
+            }
+        ),
+        R::CUDA_ERROR_UNSUPPORTED_PTX_VERSION => format!(
+            "CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}: the \
+             toolkit is newer than the driver, so its PTX ISA is unknown to the driver. Install \
+             the CUDA toolkit matching `nvidia-smi`'s CUDA version (or update the driver); stale \
+             cache entries and reject markers clear themselves once either version changes."
+        ),
+        _ => {
+            format!("CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}")
+        }
+    }
+}
+
 /// Convert a cudarc NVRTC error to RuntimeError.
 fn cuda_nvrtc_err(e: cudarc::nvrtc::CompileError) -> RuntimeError {
     RuntimeError::Compute(format!("CUDA NVRTC compilation error: {e}"))
@@ -502,4 +609,117 @@ fn cuda_nvrtc_err(e: cudarc::nvrtc::CompileError) -> RuntimeError {
 /// Convert a cudarc cuBLAS error to RuntimeError.
 fn cuda_cublas_err(e: cudarc::cublas::result::CublasError) -> RuntimeError {
     RuntimeError::Compute(format!("cuBLAS error: {e}"))
+}
+
+#[cfg(test)]
+mod ptx_load_message_tests {
+    use super::{ptx_load_message, ptx_rejected_by_driver};
+    use cudarc::driver::sys::CUresult;
+
+    #[test]
+    fn only_a_refusal_of_the_ptx_earns_a_marker() {
+        for refused in [
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            CUresult::CUDA_ERROR_INVALID_PTX,
+            CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU,
+            CUresult::CUDA_ERROR_INVALID_IMAGE,
+            CUresult::CUDA_ERROR_INVALID_SOURCE,
+        ] {
+            assert!(
+                ptx_rejected_by_driver(refused),
+                "{refused:?} is a refusal of the PTX"
+            );
+        }
+        for transient in [
+            CUresult::CUDA_ERROR_OUT_OF_MEMORY,
+            CUresult::CUDA_ERROR_CONTEXT_IS_DESTROYED,
+            CUresult::CUDA_ERROR_INVALID_CONTEXT,
+            CUresult::CUDA_ERROR_ECC_UNCORRECTABLE,
+            CUresult::CUDA_ERROR_NOT_INITIALIZED,
+            CUresult::CUDA_ERROR_SYSTEM_NOT_READY,
+            CUresult::CUDA_ERROR_LAUNCH_FAILED,
+            CUresult::CUDA_ERROR_UNKNOWN,
+            // A missing or disabled PTX JIT compiler is repaired on the host;
+            // a marker would keep refusing the key after the repair.
+            CUresult::CUDA_ERROR_JIT_COMPILER_NOT_FOUND,
+            CUresult::CUDA_ERROR_JIT_COMPILATION_DISABLED,
+        ] {
+            assert!(
+                !ptx_rejected_by_driver(transient),
+                "{transient:?} must not write a marker"
+            );
+        }
+    }
+
+    #[test]
+    fn ptx_load_message_names_the_toolkit_driver_skew() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            13010,
+            (13, 3),
+            "default",
+        );
+        assert!(m.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION"), "{m}");
+        assert!(
+            m.contains("NVRTC 13.3") && m.contains("driver 13010"),
+            "{m}"
+        );
+        assert!(m.contains("matching `nvidia-smi`"), "{m}");
+    }
+
+    #[test]
+    fn unknown_versions_are_stated_not_printed_as_zero() {
+        let u = ptx_load_message(
+            CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
+            0,
+            (0, 0),
+            "default",
+        );
+        assert!(u.contains("versions unknown"), "{u}");
+        assert!(!u.contains("driver 0") && !u.contains("NVRTC 0."), "{u}");
+        assert!(u.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION"), "{u}");
+    }
+
+    #[test]
+    fn a_missing_jit_compiler_is_named_as_a_host_condition() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_JIT_COMPILER_NOT_FOUND,
+            13010,
+            (13, 1),
+            "compute_120",
+        );
+        assert!(m.contains("CUDA_ERROR_JIT_COMPILER_NOT_FOUND"), "{m}");
+        assert!(
+            m.contains("not installed") && m.contains("no reject marker"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("refused the PTX") && !m.contains("matching `nvidia-smi`"),
+            "{m}"
+        );
+        let d = ptx_load_message(
+            CUresult::CUDA_ERROR_JIT_COMPILATION_DISABLED,
+            13010,
+            (13, 1),
+            "compute_120",
+        );
+        assert!(
+            d.contains("disabled") && d.contains("CUDA_DISABLE_PTX_JIT"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn other_driver_errors_are_named_without_the_skew_remedy() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU,
+            13010,
+            (13, 1),
+            "compute_80",
+        );
+        assert!(
+            m.contains("CUDA_ERROR_NO_BINARY_FOR_GPU") && !m.contains("matching `nvidia-smi`"),
+            "{m}"
+        );
+    }
 }

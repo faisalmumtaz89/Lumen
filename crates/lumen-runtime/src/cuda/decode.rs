@@ -249,21 +249,6 @@ pub(crate) struct KernelSet {
     // differs (load residual, add MMQ result, store sum).
     pub(crate) mmq_q8_0_batched_residual: Option<CudaFunction>,
 
-    // MMQ-style Q4_0 batched matmul (dp4a INT4 path). q4-specific twin of
-    // `mmq_q8_0_batched`: Q4_0 weights x per-token-INT8-quantized activation,
-    // INT32-exact dp4a with de-interleaved nibbles + -8 zero-point + once-only
-    // per-block F32 scale. Matches llama `mul_mat_q` INT4 numerics so MoE q4
-    // prefill projection products are correct (the dequant->F16->HGEMM default
-    // is F16-grade and the 256-expert router amplifies its drift into garbled
-    // arithmetic). MoE-gated, default ON for MoE q4; env override. SM 6.1+.
-    pub(crate) mmq_q4_0_batched: Option<CudaFunction>,
-
-    // MMQ-style Q4_0 batched matmul WITH RESIDUAL ADD (out = residual + W @ x).
-    // Same dp4a INT4 kernel class as `mmq_q4_0_batched`; final store adds the
-    // residual. Used by `launch_gemm_residual` for the GDN-block exit (ssm_out)
-    // and FFN-down projections, mirroring `mmq_q8_0_batched_residual`.
-    pub(crate) mmq_q4_0_batched_residual: Option<CudaFunction>,
-
     // Q8_0 native warp-cooperative: scalar dequant+FMA, no x-quantization.
     // 2 warps per row, deferred reduction. Reads 1.0625 bytes/elem.
     // Superseded by dp4a/HGEMV paths; kept for fallback.
@@ -409,10 +394,6 @@ pub(crate) struct KernelSet {
     // swiglu_f32_to_f16: SwiGLU activation + F32->F16 output in one kernel.
     // Replaces swiglu_inplace + f32_to_f16_vec at 1 site/layer (FFN).
     pub(crate) swiglu_f32_to_f16: Option<CudaFunction>,
-    // fused_residual_rmsnorm_f16: Residual add + RMSNorm + F16 output in one kernel.
-    // Fuses end of layer L (residual add) with start of layer L+1 (attn RMSNorm).
-    // Saves 1 dispatch per inter-layer boundary (35 fewer for 36-layer models).
-    pub(crate) fused_residual_rmsnorm_f16: Option<CudaFunction>,
     // fused_residual_rmsnorm_f32: Residual add + RMSNorm (F32 output) in one kernel.
     // For Q8_0/Q4_0 inter-layer: fuses residual_add_copy + rmsnorm.
     // Saves 1 dispatch per inter-layer boundary (47 fewer for 48-layer models).
@@ -697,9 +678,6 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
-    // fused_residual_rmsnorm_q8_1: Residual add + RMSNorm + Q8_1 quantize.
-    // For Q8_0 inter-layer boundaries: fuses residual_add_copy + rmsnorm + quantize_f32_to_q8_1.
-    pub(crate) fused_residual_rmsnorm_q8_1: Option<CudaFunction>,
 
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
@@ -1177,31 +1155,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // q4-specific MMQ INT4 batched matmul (mul_mat_q-grade numerics).
-        mmq_q4_0_batched: match load_fn_sm80(shaders::MMQ_Q4_0_KERNEL_SOURCE, "mmq_q4_0_batched") {
-            Ok(f) => {
-                cuda_log!("[CUDA] mmq_q4_0_batched: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] mmq_q4_0_batched: FAILED: {e}");
-                None
-            }
-        },
-        // residual variant. Same kernel source compiles both entry points.
-        mmq_q4_0_batched_residual: match load_fn_sm80(
-            shaders::MMQ_Q4_0_KERNEL_SOURCE,
-            "mmq_q4_0_batched_residual",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] mmq_q4_0_batched_residual: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] mmq_q4_0_batched_residual: FAILED: {e}");
-                None
-            }
-        },
         matvec_q8_0_aligned: match load_fn_sm80(
             shaders::MATVEC_Q8_0_ALIGNED_KERNEL_SOURCE,
             "matvec_q8_0_aligned",
@@ -1527,19 +1480,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] swiglu_f32_to_f16: FAILED: {e}");
-                None
-            }
-        },
-        fused_residual_rmsnorm_f16: match load_fn(
-            shaders::FUSED_F16_KERNEL_SOURCE,
-            "fused_residual_rmsnorm_f16",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] fused_residual_rmsnorm_f16: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] fused_residual_rmsnorm_f16: FAILED: {e}");
                 None
             }
         },
@@ -2559,19 +2499,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
-                None
-            }
-        },
-        fused_residual_rmsnorm_q8_1: match load_fn(
-            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
-            "fused_residual_rmsnorm_q8_1",
-        ) {
-            Ok(f) => {
-                cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: OK");
-                Some(f)
-            }
-            Err(e) => {
-                cuda_log!("[CUDA] fused_residual_rmsnorm_q8_1: FAILED: {e}");
                 None
             }
         },

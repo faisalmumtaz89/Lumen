@@ -338,7 +338,7 @@ impl ProfilerSummary {
     /// Emit a human-readable per-token table to a writer.
     pub fn write_table<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
         let total_per_tok = self.total_us_per_token().max(1e-9);
-        writeln!(w, "")?;
+        writeln!(w)?;
         writeln!(w, "=== Lumen CUDA Stage Profile ===")?;
         writeln!(w, "Tokens recorded: {}", self.decode_tokens)?;
         writeln!(
@@ -346,7 +346,7 @@ impl ProfilerSummary {
             "Total per-token (sum of stage medians): {:.1} µs",
             total_per_tok
         )?;
-        writeln!(w, "")?;
+        writeln!(w)?;
         writeln!(
             w,
             "| {:<10} | {:<28} | {:>9} | {:>9} | {:>7} | {:>9} |",
@@ -373,7 +373,7 @@ impl ProfilerSummary {
                 e.std_us,
             )?;
         }
-        writeln!(w, "")?;
+        writeln!(w)?;
         Ok(())
     }
 }

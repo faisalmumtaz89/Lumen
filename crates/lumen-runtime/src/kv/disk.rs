@@ -393,7 +393,7 @@ impl ModelFingerprint {
     /// where the operator opens an LBC file and needs a deterministic
     /// fingerprint without re-wiring the LBC reader to surface tensor CRCs.
     ///
-    /// `hyperparams_bytes` should encode the live model's [`ModelHyperparams`]
+    /// `hyperparams_bytes` should encode the live model's [`lumen_format::ModelHyperparams`]
     /// in a stable form (the CLI uses the LE bincode-equivalent layout via
     /// `serialize_hyperparams_le` below; the server can compute the same).
     /// `vocab_bytes` is the embedded tokenizer's `tokens_blob`, which is
@@ -1085,7 +1085,7 @@ fn layer_payload_bytes(cfg: &KvCacheConfig) -> usize {
 ///
 /// The `tokens.len()` MUST equal `kv.seq_len()` -- a hard requirement of the
 /// suffix-prefill contract (the in-memory pair is `Session::{tokens,kv}` with
-/// the invariant `tokens.len() == kv.seq_len()` enforced by [`Session::extend_with_cache`]).
+/// the invariant `tokens.len() == kv.seq_len()` enforced by [`Session::extend_with_cache`](crate::session::Session::extend_with_cache)).
 ///
 /// `fingerprint` identifies the model whose KV was saved; the loader rejects
 /// any file whose fingerprint differs. Callers compute

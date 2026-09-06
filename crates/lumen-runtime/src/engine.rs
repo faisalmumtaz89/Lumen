@@ -726,12 +726,12 @@ impl InferenceEngine {
     ///
     /// Generation flow:
     /// 1. If the session is empty AND the prompt is non-empty, call
-    ///    [`Session::extend`] (full cold prefill). If the session already
+    ///    [`Session::extend`](crate::session::Session::extend) (full cold prefill). If the session already
     ///    has tokens (resumed-from-disk case), call
-    ///    [`Session::extend_with_cache`] so the common prefix is reused —
+    ///    [`Session::extend_with_cache`](crate::session::Session::extend_with_cache) so the common prefix is reused —
     ///    this is what makes `--session-resume foo.kv` actually skip the
     ///    cold prefill on a continuing conversation.
-    /// 2. Stream tokens via [`Session::stream`] respecting the stop condition.
+    /// 2. Stream tokens via [`Session::stream`](crate::session::Session::stream) respecting the stop condition.
     ///
     /// Returns the same [`GenerationResult`] shape as [`Self::generate`], so
     /// CLI code can treat the two paths interchangeably for reporting.

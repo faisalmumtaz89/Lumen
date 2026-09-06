@@ -51,7 +51,7 @@ For the v1 Qwen3.5-9B cell, Lumen, llama.cpp, and vLLM all consume weights from 
 
 The Lumen production env stack is **default-ON**.
 
-The 12-flag canonical env stack is documented at [METHODOLOGY.md § Required env-vars for full performance](METHODOLOGY.md#required-env-vars-for-full-performance). Critically `LUMEN_CUDA_BF16_GEMMEX=0` is required for BF16 P3 correctness on MoE.
+The 11-flag canonical env stack is documented at [METHODOLOGY.md § Required env-vars for full performance](METHODOLOGY.md#required-env-vars-for-full-performance). Critically `LUMEN_CUDA_BF16_GEMMEX=0` is required for BF16 P3 correctness on MoE.
 
 ## Reproducing a single configuration
 

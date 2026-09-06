@@ -13,7 +13,7 @@
 //! # Optimization: Zero-Copy Weights & Scratch Buffer Reuse
 //!
 //! The hot path (`compute_layer`) eliminates per-call heap allocations via:
-//! - `matmul_bytes`/`rmsnorm_bytes`: read weight bytes as LE f32 inline (no Vec<f32>)
+//! - `matmul_bytes`/`rmsnorm_bytes`: read weight bytes as LE f32 inline (no `Vec<f32>`)
 //! - `ComputeScratch`: pre-allocated working buffers reused across calls
 //! - Pre-computed RoPE cos/sin tables (computed once in `init()`)
 //!

@@ -20,8 +20,8 @@
 //! [`ShardedGguf`] discovers the sibling shards from a single shard's path,
 //! parses each shard's header, validates consistency (matching `split.count`,
 //! contiguous `split.no`, no tensor-name collisions across shards, matching
-//! GGUF version + alignment), and exposes a [`ShardedGguf::view()`] that looks
-//! like a single merged [`GgufFile`] to downstream consumers (metadata accessors
+//! GGUF version + alignment), and presents the result to downstream consumers
+//! as a single merged [`GgufFile`] (metadata accessors
 //! delegate to shard 0; the tensor list is the concatenation across shards).
 //!
 //! Tensor data is read on demand via [`ShardedGguf::read_tensor_data`], which
@@ -693,7 +693,7 @@ fn build_merged_view(specs: &[ShardSpec]) -> Result<(GgufFile, Vec<u16>), ShardE
 /// is a [`MultiShardReader`], the virtual address is decoded into
 /// `(shard_id, abs_offset)`, the appropriate shard's [`BufReader<File>`] is
 /// selected, and the seek/read flow continues as if the model were a single
-/// file. This means [`crate::tensor_io::read_tensor_data`] and the
+/// file. This means `tensor_io::read_tensor_data` and the
 /// architecture converters work unchanged across single-shard and multi-shard
 /// inputs.
 ///

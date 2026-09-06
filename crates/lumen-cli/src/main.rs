@@ -10,6 +10,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod bench;
+#[cfg(test)]
+mod build_script_tests;
 pub mod cache;
 mod convert;
 #[allow(unused)]

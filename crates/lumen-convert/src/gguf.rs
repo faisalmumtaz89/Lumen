@@ -282,7 +282,7 @@ impl GgmlType {
         Some(blocks.saturating_mul(ts))
     }
 
-    /// Map this GGML type to the corresponding LBC [`QuantScheme`], if one
+    /// Map this GGML type to the corresponding LBC [`QuantScheme`](lumen_format::QuantScheme), if one
     /// exists.
     ///
     /// Types without a direct LBC equivalent return `None`.

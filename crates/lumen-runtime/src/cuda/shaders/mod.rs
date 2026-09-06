@@ -53,20 +53,13 @@ pub const DEQUANT_Q8_0_KERNEL_SOURCE: &str = include_str!("dequant_q8_0_f16.cu")
 /// kernel. Default OFF preserves byte-identical behaviour vs main.
 pub const MMQ_Q8_0_KERNEL_SOURCE: &str = include_str!("mmq_q8_0.cu");
 
-/// q4-specific MMQ twin of `MMQ_Q8_0_KERNEL_SOURCE`: Q4_0 weights x
-/// per-token-INT8-quantized activation via dp4a (de-interleaved nibbles + -8
-/// zero-point), matching llama.cpp `mul_mat_q` INT4 numerics for MoE q4
-/// prefill projections. Default OFF; MoE-gated. Two extern "C" kernels:
-/// `mmq_q4_0_batched` and `mmq_q4_0_batched_residual`.
-pub const MMQ_Q4_0_KERNEL_SOURCE: &str = include_str!("mmq_q4_0.cu");
-
 /// Q8_1-activation x {Q8_0,Q4_0}-weight matvec with dp4a INT8
 /// dot-product, plus the `quantize_q8_1` activation pre-pass.
 ///
 /// Three extern "C" kernels:
-///   - `quantize_q8_1_rawsum`: F32 [in_dim] -> block_q8_1 [ceil(in_dim/32)*36 bytes]
-///   - `mul_mat_vec_q_q8_0`: Q8_0 weights × Q8_1 activation -> F32 [out_dim]
-///   - `mul_mat_vec_q_q4_0`: Q4_0 weights × Q8_1 activation -> F32 [out_dim]
+///   - `quantize_q8_1_rawsum`: F32 `[in_dim]` -> block_q8_1 `[ceil(in_dim/32)*36 bytes]`
+///   - `mul_mat_vec_q_q8_0`: Q8_0 weights × Q8_1 activation -> F32 `[out_dim]`
+///   - `mul_mat_vec_q_q4_0`: Q4_0 weights × Q8_1 activation -> F32 `[out_dim]`
 ///
 /// Env-gated: `LUMEN_CUDA_MMV_Q_DP4A=1` (sub-gates per call site) replaces
 /// `matvec_q8_0_smem`, `matvec_q4_0`, and the MoE FFN batched paths with
@@ -160,7 +153,7 @@ pub const GDN_MEGAKERNEL_SOURCE: &str = include_str!("gdn_megakernel.cu");
 ///     to device buffers instead of carrying them in shared memory).
 ///   - `gdn_phase4_register_resident`: register-resident delta-rule state update.
 ///     Grid (num_heads, 1, ceil(head_dim/4)). Each warp owns one column;
-///     each lane keeps 4 state rows in registers (s_shard[4]).
+///     each lane keeps 4 state rows in registers (`s_shard[4]`).
 ///     Reads h_state ONCE per token, writes ONCE per token (vs Lumen's
 ///     existing 2R+2W per element).
 ///
@@ -311,7 +304,7 @@ pub const MATVEC_DP4A_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_dp4a_q8_1.
 ///
 /// Reads the input vector ONCE, computes BOTH gate and up projections
 /// simultaneously, and applies SwiGLU inline:
-///   output[row] = silu(dot(w_gate[row], normed_x)) * dot(w_up[row], normed_x)
+///   `output[row] = silu(dot(w_gate[row], normed_x)) * dot(w_up[row], normed_x)`
 ///
 /// Eliminates 2-4 kernel launches per layer vs separate dispatch:
 ///   (rmsnorm + convert + gate GEMV + up GEMV + swiglu) -> (rms_scale + fused_glu)
@@ -418,8 +411,6 @@ pub const MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE: &str =
 /// Fused RMSNorm + Q8_1 quantization kernels (dispatch count reduction for Q8_0 dp4a path).
 ///
 /// `rmsnorm_to_q8_1`: RMSNorm + Q8_1 quantize in one kernel (saves 1 dispatch per norm site).
-/// `fused_residual_rmsnorm_q8_1`: Residual add + RMSNorm + Q8_1 quantize (saves 2 dispatches
-/// per inter-layer boundary).
 ///
 /// Replaces the separate `rmsnorm` + `quantize_f32_to_q8_1` dispatch pair for Q8_0 decode
 /// paths that use dp4a with pre-quantized Q8_1 input. For 36-layer models: 72 fewer dispatches.
@@ -656,8 +647,8 @@ pub const MOE_EXPERT_KERNEL_SOURCE: &str = include_str!("moe_expert.cu");
 ///
 /// - `moe_shared_dot_f32`: scalar F32 dot product
 ///   (logit = dot(ffn_gate_inp_shexp, normed_x)).
-/// - `moe_shared_sigmoid_gated_accum`: x_out[i] += sigmoid(logit[0]) * shared_out[i].
-/// - `moe_shared_residual_accum`: x_out[i] += shared_out[i] (fallback for
+/// - `moe_shared_sigmoid_gated_accum`: `x_out[i] += sigmoid(logit[0]) * shared_out[i]`.
+/// - `moe_shared_residual_accum`: `x_out[i] += shared_out[i]` (fallback for
 ///   shared-expert variants without a gate weight).
 ///
 /// Mirrors `metal/shaders/moe.msl::sigmoid_scale_add` + the dot kernel used

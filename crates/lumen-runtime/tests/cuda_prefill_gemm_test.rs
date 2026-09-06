@@ -46,9 +46,9 @@ fn assert_f32_close(label: &str, actual: &[f32], expected: &[f32], tolerance: f3
     // aggregate L2-rel, larger than the tile-aligned cases): ruled NOT a GEMM bug /
     // padding leak (would be class D). Evidence chain: (1) prefill uses cuBLAS
     // SGEMM/GemmEx (prefill.rs:5,365), which writes EXACTLY M*N — it has no tiled
-    // padding rows to leak and no OOB; (2) the custom tiled MMQ batched kernel (the
-    // "rows M..tile_end must be zero" concern) is DEAD CODE (build: "launch_mmq_q4_0_
-    // batched is never used"); (3) production GQ passes for arbitrary prompt lengths
+    // padding rows to leak and no OOB; (2) the custom tiled Q4_0 MMQ batched kernel
+    // (the "rows M..tile_end must be zero" concern) was never dispatched and has since
+    // been removed; (3) production GQ passes for arbitrary prompt lengths
     // (16/17/33 tokens all occur), exercising these exact non-tile-aligned batches
     // end-to-end. The 13-15% is F16-HGEMM(tensor-core)-vs-F32-CPU precision (~1e-3/op)
     // amplified through 2 UNNORMALIZED random-weight layers (softmax/FFN amplify;

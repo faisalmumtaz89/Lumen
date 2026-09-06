@@ -39,7 +39,7 @@
 //! - It does not own a tokenizer. The runtime takes token-id slices; the
 //!   tokenizer is owned by the embedder (a CLI binary, an integration
 //!   test, an external process). Callers pass [`engine::Tokenize`]
-//!   implementations into [`engine::EngineWorker::new`].
+//!   implementations into [`engine::EngineWorker::spawn`].
 //! - It does not own a weight provider. The embedder constructs one and
 //!   moves it into the worker.
 //! - It does not enforce auth. Add a `tower::Layer` if you need bearer
