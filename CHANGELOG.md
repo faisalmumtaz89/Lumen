@@ -51,6 +51,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **The Metal determinism script no longer kills its caller**: its
+  one-process discipline matched `target/release/lumen` anywhere in a
+  command line, so a shell that named the binary in its own arguments
+  (`LUMEN_BIN=.../target/release/lumen bash scripts/...`) was killed along
+  with any stale engine. The match is now anchored to the start of the
+  command line; the Metal matrix runner's per-port kill is anchored the
+  same way.
 - **The startup typo check knows the repository's own tooling names**: every
   `LUMEN_*` variable not on the engine's allowlist drew an "unknown env var"
   warning, including the names Lumen's own scripts, installer and release

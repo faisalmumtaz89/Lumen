@@ -29,7 +29,10 @@ for entry in "${CELLS[@]}"; do
     echo "$cell  SKIP (model $mf not found)" | tee -a "$SCORE"
     continue
   fi
-  pkill -9 -f "lumen-server.*$PORT" 2>/dev/null; sleep 1
+  # Anchored to the command line's start: the server binary, never a caller
+  # whose arguments happen to name it and the port. A checkout path containing
+  # a space is not matched, and a stale server then survives this kill.
+  pkill -9 -f "^[^ ]*lumen-server .*$PORT" 2>/dev/null; sleep 1
   echo ">>> $cell ($mf) gates=$GATES  $(date +%H:%M:%S)" | tee -a "$SCORE"
   python3 quality/run_suite.py --model "$CACHE/$mf" --backend metal \
       --cell "$cell" --port "$PORT" --gates "$GATES" --out "$OUT" 2>&1 \

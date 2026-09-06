@@ -57,10 +57,16 @@ fi
 # Production default: decode-delay 0 (bit-exact). Do NOT set any DET toggle.
 unset LUMEN_METAL_DECODE_DELAY_US 2>/dev/null || true
 
-# One-process discipline.
-pkill -f "target/release/lumen" 2>/dev/null || true
-for _ in $(seq 1 10); do pgrep -f "target/release/lumen" >/dev/null || break; sleep 1; done
-if pgrep -f "target/release/lumen" >/dev/null; then echo "[FAIL] a lumen process is still alive"; exit 1; fi
+# One-process discipline. The pattern is anchored to the START of the command
+# line so it matches a lumen or lumen-server binary and never a caller whose own
+# arguments name that path (LUMEN_BIN=.../target/release/lumen bash ...): an
+# unanchored match killed the shell running this script. A checkout path that
+# contains a space is not matched by this pattern, and a stale process then
+# survives the kill and the check below.
+ENGINE_PROC='^[^ ]*target/release/lumen(-server)?( |$)'
+pkill -f "$ENGINE_PROC" 2>/dev/null || true
+for _ in $(seq 1 10); do pgrep -f "$ENGINE_PROC" >/dev/null || break; sleep 1; done
+if pgrep -f "$ENGINE_PROC" >/dev/null; then echo "[FAIL] a lumen process is still alive"; exit 1; fi
 
 LOG="$(mktemp -t lumen_det_server.XXXXXX.log)"
 "$SERVER" --model "$MODEL" --backend metal --port "$PORT" --log-level warn > "$LOG" 2>&1 &
