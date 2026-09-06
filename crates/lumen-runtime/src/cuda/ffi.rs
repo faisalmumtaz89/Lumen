@@ -255,8 +255,9 @@ impl CudaDevice {
                 Err(e) => {
                     // Only a rejection of the PTX itself earns a marker: a marker
                     // says "recompiling cannot help", which is true for an
-                    // unsupported ISA or a JIT error and false for a device out of
-                    // memory or a lost context, where the next launch may load fine.
+                    // unsupported ISA or an invalid image and false for a device
+                    // out of memory, a lost context or a missing JIT compiler,
+                    // where the next launch may load fine.
                     if ptx_rejected_by_driver(e.0) {
                         super::ptx_cache::mark_driver_reject(&key);
                     }
@@ -546,7 +547,10 @@ fn ptx_load_err(e: cudarc::driver::DriverError, key: &super::ptx_cache::CacheKey
 /// for a refused image count; every other failure (out of memory, a lost or
 /// invalid context, an uncorrectable ECC event, a device not yet ready, an
 /// unknown error) is treated as transient, because a marker written for a
-/// transient failure would outlive the condition and poison the key.
+/// transient failure would outlive the condition and poison the key. A
+/// missing or disabled PTX JIT compiler is a state of the host, not a verdict
+/// on the image: the same PTX loads once the compiler library is installed or
+/// JIT is re-enabled, so those two codes earn no marker either.
 pub(crate) fn ptx_rejected_by_driver(code: cudarc::driver::sys::CUresult) -> bool {
     use cudarc::driver::sys::CUresult as R;
     matches!(
@@ -556,8 +560,6 @@ pub(crate) fn ptx_rejected_by_driver(code: cudarc::driver::sys::CUresult) -> boo
             | R::CUDA_ERROR_NO_BINARY_FOR_GPU
             | R::CUDA_ERROR_INVALID_IMAGE
             | R::CUDA_ERROR_INVALID_SOURCE
-            | R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND
-            | R::CUDA_ERROR_JIT_COMPILATION_DISABLED
     )
 }
 
@@ -575,17 +577,27 @@ fn ptx_load_message(
             nvrtc_version.0, nvrtc_version.1
         )
     };
-    let base =
-        format!("CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}");
-    if code == cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION {
-        format!(
-            "{base}: the toolkit is newer than the driver, so its PTX ISA is unknown to the \
-             driver. Install the CUDA toolkit matching `nvidia-smi`'s CUDA version (or update \
-             the driver); stale cache entries and reject markers clear themselves once either \
-             version changes."
-        )
-    } else {
-        base
+    use cudarc::driver::sys::CUresult as R;
+    match code {
+        R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND | R::CUDA_ERROR_JIT_COMPILATION_DISABLED => format!(
+            "CUDA driver could not JIT-compile the PTX produced for arch '{arch}' ({code:?}) \
+             {versions}: the driver's PTX JIT compiler is {}. This is a condition of the host, \
+             not of the PTX, so no reject marker is written and the next launch tries again.",
+            if code == R::CUDA_ERROR_JIT_COMPILER_NOT_FOUND {
+                "not installed (the libnvidia-ptxjitcompiler library that ships with the driver)"
+            } else {
+                "disabled (see CUDA_DISABLE_PTX_JIT)"
+            }
+        ),
+        R::CUDA_ERROR_UNSUPPORTED_PTX_VERSION => format!(
+            "CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}: the \
+             toolkit is newer than the driver, so its PTX ISA is unknown to the driver. Install \
+             the CUDA toolkit matching `nvidia-smi`'s CUDA version (or update the driver); stale \
+             cache entries and reject markers clear themselves once either version changes."
+        ),
+        _ => {
+            format!("CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}")
+        }
     }
 }
 
@@ -627,6 +639,10 @@ mod ptx_load_message_tests {
             CUresult::CUDA_ERROR_SYSTEM_NOT_READY,
             CUresult::CUDA_ERROR_LAUNCH_FAILED,
             CUresult::CUDA_ERROR_UNKNOWN,
+            // A missing or disabled PTX JIT compiler is repaired on the host;
+            // a marker would keep refusing the key after the repair.
+            CUresult::CUDA_ERROR_JIT_COMPILER_NOT_FOUND,
+            CUresult::CUDA_ERROR_JIT_COMPILATION_DISABLED,
         ] {
             assert!(
                 !ptx_rejected_by_driver(transient),
@@ -662,6 +678,35 @@ mod ptx_load_message_tests {
         assert!(u.contains("versions unknown"), "{u}");
         assert!(!u.contains("driver 0") && !u.contains("NVRTC 0."), "{u}");
         assert!(u.contains("CUDA_ERROR_UNSUPPORTED_PTX_VERSION"), "{u}");
+    }
+
+    #[test]
+    fn a_missing_jit_compiler_is_named_as_a_host_condition() {
+        let m = ptx_load_message(
+            CUresult::CUDA_ERROR_JIT_COMPILER_NOT_FOUND,
+            13010,
+            (13, 1),
+            "compute_120",
+        );
+        assert!(m.contains("CUDA_ERROR_JIT_COMPILER_NOT_FOUND"), "{m}");
+        assert!(
+            m.contains("not installed") && m.contains("no reject marker"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("refused the PTX") && !m.contains("matching `nvidia-smi`"),
+            "{m}"
+        );
+        let d = ptx_load_message(
+            CUresult::CUDA_ERROR_JIT_COMPILATION_DISABLED,
+            13010,
+            (13, 1),
+            "compute_120",
+        );
+        assert!(
+            d.contains("disabled") && d.contains("CUDA_DISABLE_PTX_JIT"),
+            "{d}"
+        );
     }
 
     #[test]

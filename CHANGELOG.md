@@ -42,11 +42,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **Driver-reject markers written only for a refused PTX**: the PTX cache
   records a marker when the driver refuses an image (unsupported PTX version,
-  invalid PTX, no binary for the GPU, and the other refusal codes) so later
+  invalid PTX, no binary for the GPU, invalid image, invalid source) so later
   launches skip a doomed reload. A load that fails for any other reason (out
-  of memory, a lost context, an ECC event) now writes no marker, a cached
-  image the driver cannot load is reported instead of discarded silently, and
-  a successful store clears any marker for the key.
+  of memory, a lost context, an ECC event, a PTX JIT compiler that is missing
+  or disabled on the host) now writes no marker, a cached image the driver
+  cannot load is reported instead of discarded silently, and a successful
+  store clears any marker for the key. The two JIT-compiler codes are named
+  as a condition of the host rather than as a refusal of the PTX.
 - **Downloads refuse three more malformed responses**: a readable `identity`
   beside an unreadable second `Content-Encoding` value (the value count is now
   held against the header-line count), a header line with no colon (ureq's
