@@ -53,13 +53,6 @@ pub const DEQUANT_Q8_0_KERNEL_SOURCE: &str = include_str!("dequant_q8_0_f16.cu")
 /// kernel. Default OFF preserves byte-identical behaviour vs main.
 pub const MMQ_Q8_0_KERNEL_SOURCE: &str = include_str!("mmq_q8_0.cu");
 
-/// q4-specific MMQ twin of `MMQ_Q8_0_KERNEL_SOURCE`: Q4_0 weights x
-/// per-token-INT8-quantized activation via dp4a (de-interleaved nibbles + -8
-/// zero-point), matching llama.cpp `mul_mat_q` INT4 numerics for MoE q4
-/// prefill projections. Default OFF; MoE-gated. Two extern "C" kernels:
-/// `mmq_q4_0_batched` and `mmq_q4_0_batched_residual`.
-pub const MMQ_Q4_0_KERNEL_SOURCE: &str = include_str!("mmq_q4_0.cu");
-
 /// Q8_1-activation x {Q8_0,Q4_0}-weight matvec with dp4a INT8
 /// dot-product, plus the `quantize_q8_1` activation pre-pass.
 ///
@@ -418,8 +411,6 @@ pub const MATVEC_Q4_ALIGNED_FUSED_DOWN_KERNEL_SOURCE: &str =
 /// Fused RMSNorm + Q8_1 quantization kernels (dispatch count reduction for Q8_0 dp4a path).
 ///
 /// `rmsnorm_to_q8_1`: RMSNorm + Q8_1 quantize in one kernel (saves 1 dispatch per norm site).
-/// `fused_residual_rmsnorm_q8_1`: Residual add + RMSNorm + Q8_1 quantize (saves 2 dispatches
-/// per inter-layer boundary).
 ///
 /// Replaces the separate `rmsnorm` + `quantize_f32_to_q8_1` dispatch pair for Q8_0 decode
 /// paths that use dp4a with pre-quantized Q8_1 input. For 36-layer models: 72 fewer dispatches.

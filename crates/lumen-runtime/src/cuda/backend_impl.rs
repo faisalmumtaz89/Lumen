@@ -908,8 +908,8 @@ struct MutableState {
     /// cuBLAS must not allocate memory internally during graph capture (cudaMalloc
     /// is forbidden on a capturing stream). This 4 MB buffer is registered via
     /// `cublasSetWorkspace_v2` so cuBLAS uses it instead of allocating on-the-fly.
-    /// Must outlive the cuBLAS handle.
-    cublas_workspace: Option<CudaSlice<u8>>,
+    /// Held here only so it outlives the cuBLAS handle; nothing reads it.
+    _cublas_workspace: Option<CudaSlice<u8>>,
     /// Pre-computed per-layer batched GEMM pointer arrays.
     /// Populated once in `preload_weights()`, eliminates per-layer htod memcpys.
     /// `None` until preload completes.
@@ -14781,65 +14781,6 @@ unsafe fn launch_hgemv_f16_preconverted(
     Ok(())
 }
 
-/// cuBLAS HGEMV with pre-converted F16 input and beta=1.0 accumulation.
-///
-/// Used in the graph pipeline where the caller has already placed the residual
-/// into `output_f32` via the fused convert+residual kernel. The HGEMV accumulates
-/// on top with beta=1.0.
-///
-/// # Safety
-///
-/// Caller must ensure:
-/// - `w_f16` has `[out_dim * in_dim * 2]` bytes (F16 row-major)
-/// - `input_f16` has at least `in_dim * 2` bytes (pre-converted F16)
-/// - `output_f32` has `out_dim` elements (pre-loaded with residual)
-unsafe fn launch_hgemv_f16_preconverted_beta1(
-    device: &CudaDevice,
-    w_f16: &CudaSlice<u8>,
-    input_f16: &CudaSlice<u8>,
-    output_f32: &mut CudaSlice<f32>,
-    out_dim: usize,
-    in_dim: usize,
-    label: &str,
-    algo: cublas_sys::cublasGemmAlgo_t,
-) -> Result<(), RuntimeError> {
-    let alpha: f32 = 1.0;
-    let beta: f32 = 1.0;
-
-    use cudarc::driver::DevicePtr;
-    let (w_ptr, _) = w_f16.device_ptr(&device.stream);
-    let (a_ptr, _) = input_f16.device_ptr(&device.stream);
-    let (c_ptr, _) = output_f32.device_ptr(&device.stream);
-
-    let status = cublas_sys::cublasGemmEx(
-        *device.blas.handle(),
-        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-        out_dim as i32, // M
-        1i32,           // N = 1 (GEMV)
-        in_dim as i32,  // K
-        &alpha as *const f32 as *const std::ffi::c_void,
-        w_ptr as *const std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32, // lda
-        a_ptr as *const std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_16F,
-        in_dim as i32, // ldb
-        &beta as *const f32 as *const std::ffi::c_void,
-        c_ptr as *mut std::ffi::c_void,
-        cublas_sys::cudaDataType_t::CUDA_R_32F,
-        out_dim as i32, // ldc
-        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
-        algo,
-    );
-    if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Err(RuntimeError::Compute(format!(
-            "cublasGemmEx HGEMV preconverted beta=1 {label}: status={status:?}",
-        )));
-    }
-    Ok(())
-}
-
 /// cuBLAS HGEMV with pre-converted F16 input and residual accumulation.
 ///
 /// Copies `residual` into `output_f32` first, then runs `cublasGemmEx` with
@@ -16255,7 +16196,7 @@ impl ComputeBackend for CudaBackend {
             has_moe_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
-            cublas_workspace,
+            _cublas_workspace: cublas_workspace,
             precomputed_ptrs: None,
             algo_cache: AlgoCache::new(),
             moe_scratch,

@@ -40,6 +40,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   the free-memory query fails, it is skipped with a message and the packed
   output projection is used. `LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway.
 
+### Removed
+
+- **Unreached CUDA kernels**: the Q4_0 MMQ batched matmul pair
+  (`mmq_q4_0_batched`, `mmq_q4_0_batched_residual`) and the two fused
+  residual-add RMSNorm kernels (`fused_residual_rmsnorm_f16`,
+  `fused_residual_rmsnorm_q8_1`) were compiled and loaded at start-up but
+  never dispatched; they are gone with their shader source, along with a
+  pre-converted HGEMV helper nothing called.
+
 ### Fixed
 
 - **The startup typo check knows the repository's own tooling names**: every
