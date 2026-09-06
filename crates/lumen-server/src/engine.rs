@@ -193,7 +193,9 @@ pub enum TokenEvent {
     /// resolve to a complete character).
     Token { token_id: u32, delta_text: String },
     /// Bench surface (`LUMEN_BENCH_TOKEN_IDS=1`): the raw generated token ids
-    /// and the per-request EOS set, emitted immediately before `Done`.
+    /// and the per-request EOS set, emitted immediately before `Done`. The
+    /// router refuses streaming and stop-sequence requests up front while the
+    /// surface is armed, so a collector always sees this event before `Done`.
     ///
     /// A separate variant rather than fields on `Done`, so the shipping event
     /// shape is untouched when the surface is off and a wire layer that does
@@ -967,6 +969,15 @@ impl EngineWorker {
             breakdown: Arc::clone(&breakdown),
             bench_token_ids: lumen_runtime::runtime_defaults::bench_token_ids_enabled(),
         };
+        // The fixed-horizon EOG mask (`LUMEN_BENCH_MASK_EOG`) is parsed and
+        // range-checked here, before the listener exists, so a malformed or
+        // out-of-vocabulary value refuses to start on every backend instead of
+        // surfacing at the first request.
+        if let Err(e) = lumen_runtime::runtime_defaults::check_eog_mask_vocab(
+            worker.hyperparams.vocab_size as usize,
+        ) {
+            panic!("{e}");
+        }
         tokio::task::spawn_blocking(move || worker.run());
         EngineHandle {
             sender: tx,

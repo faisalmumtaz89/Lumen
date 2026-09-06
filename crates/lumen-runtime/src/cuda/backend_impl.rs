@@ -119,17 +119,17 @@ fn bf16_autotune_enabled() -> bool {
 /// instead of one SM. Output byte-identical (associative max-then-min-index).
 const ARGMAX_TILES: usize = 128;
 
-/// Default ON (`LUMEN_CUDA_ARGMAX_TILED=0` opts out): two-phase tiled argmax
-/// replacing the single-block reduction (one SM reading the whole ~1 MB
-/// logits vector). Same reduction operator and tie semantics (max value,
-/// then min index) => byte-identical output by construction.
 /// The fixed-horizon EOG-mask id set, read through the runtime's single source
 /// of truth so the device mask and the host mask can never disagree on the id
-/// set, the sentinel, or the parse (see `runtime_defaults::bench_mask_eog_ids`).
+/// set, the value written, or the parse (see `runtime_defaults::bench_mask_eog_ids`).
 fn bench_mask_eog_ids() -> &'static [u32] {
     crate::runtime_defaults::bench_mask_eog_ids()
 }
 
+/// Default ON (`LUMEN_CUDA_ARGMAX_TILED=0` opts out): two-phase tiled argmax
+/// replacing the single-block reduction (one SM reading the whole ~1 MB
+/// logits vector). Same reduction operator and tie semantics (max value,
+/// then min index) => byte-identical output by construction.
 fn argmax_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -9371,11 +9371,11 @@ impl CudaBackend {
         // entry point so both argmax variants honour it identically. Mutates
         // `st.logits_gpu` in place; a bench surface, off unless set.
         if let Some(ids_gpu) = st.bench_mask_eog_gpu.as_ref() {
-            let Some(mask_fn) = st.kernels.mask_logits_neg_inf.clone() else {
-                // Mask requested but the kernel is absent: refusing to run the
-                // wrong protocol silently.
+            let Some(mask_fn) = st.kernels.mask_logits_f32_min.clone() else {
+                // Mask requested but the kernel is absent: refuse rather than
+                // decode unmasked.
                 return Err(RuntimeError::Compute(
-                    "LUMEN_BENCH_MASK_EOG is set but mask_logits_neg_inf failed to load".into(),
+                    "LUMEN_BENCH_MASK_EOG is set but mask_logits_f32_min failed to load".into(),
                 ));
             };
             let k = ids_gpu.len() as u32;
@@ -16237,6 +16237,8 @@ impl ComputeBackend for CudaBackend {
                 if ids.is_empty() {
                     None
                 } else {
+                    crate::runtime_defaults::check_eog_mask_vocab(hyperparams.vocab_size as usize)
+                        .map_err(RuntimeError::Config)?;
                     Some(self.device.htod_copy(ids)?)
                 }
             },

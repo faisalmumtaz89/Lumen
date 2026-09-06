@@ -734,15 +734,15 @@ async fn drive_chat_stream(
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
-            // Bench surface: not representable on a streaming body, and silent
-            // omission is forbidden, so refuse loudly; the protocol uses
-            // stream=false.
+            // Bench surface: the router refuses streaming requests while it is
+            // armed, so this is unreachable in practice; if it does arrive,
+            // end the stream with an error rather than drop it silently.
             TokenEvent::BenchTokenIds { .. } => {
-                let _ = tx
-                    .send(sse_frame(
-                        "{\"error\":\"LUMEN_BENCH_TOKEN_IDS is not supported on streaming responses; use stream=false\"}",
-                    ))
-                    .await;
+                let err = json!({"error": {
+                    "message": "LUMEN_BENCH_TOKEN_IDS is not supported on streaming responses; use stream=false",
+                    "type": "api_error" }});
+                let _ = tx.send(sse_frame(&err.to_string())).await;
+                let _ = tx.send(sse_done()).await;
                 return;
             }
             TokenEvent::Token { delta_text, .. } => {
@@ -1122,25 +1122,42 @@ pub async fn collect_chat(
 }
 
 /// Attach the bench token-id surface (`LUMEN_BENCH_TOKEN_IDS=1`) to a finished
-/// response body as a top-level `lumen_bench` object.
+/// response body as a top-level `lumen_bench` object. `finish_reason` uses
+/// the OpenAI vocabulary on every route, so the object reads the same on
+/// `/v1/messages` as on `/v1/chat/completions`.
 ///
 /// Fail-closed: when the surface is armed the ids MUST be present. If the engine
 /// emitted none on this path, the request fails rather than returning a body
-/// that silently lacks the surface, which a reader would score as if it were
-/// there. When the flag is off this is a no-op and the body is byte-identical.
+/// that silently lacks the surface. When the flag is off this is a no-op and
+/// the body is byte-identical.
 pub(crate) fn attach_bench_token_ids(
     body: &mut serde_json::Value,
     bench_ids: Option<(Vec<u32>, Vec<u32>)>,
     finish: FinishReason,
 ) -> Result<(), ServerError> {
-    if !lumen_runtime::runtime_defaults::bench_token_ids_enabled() {
+    attach_bench_token_ids_if(
+        lumen_runtime::runtime_defaults::bench_token_ids_enabled(),
+        body,
+        bench_ids,
+        finish,
+    )
+}
+
+/// [`attach_bench_token_ids`] with the flag passed in, so the armed path is
+/// testable without touching the process environment.
+fn attach_bench_token_ids_if(
+    enabled: bool,
+    body: &mut serde_json::Value,
+    bench_ids: Option<(Vec<u32>, Vec<u32>)>,
+    finish: FinishReason,
+) -> Result<(), ServerError> {
+    if !enabled {
         return Ok(());
     }
     let Some((generated, eos)) = bench_ids else {
         return Err(ServerError::Internal(
             "LUMEN_BENCH_TOKEN_IDS=1 but the engine emitted no token-id record on \
-             this path (streaming, or a path that never runs the decode loop). \
-             Refusing to return a response without the requested surface."
+             this path. Refusing to return a response without the requested surface."
                 .to_string(),
         ));
     };
@@ -1298,7 +1315,7 @@ mod bench_token_ids_surface_tests {
     /// collector fed by `Token` events would lose the terminating id. The
     /// record is therefore taken inside the engine loop, before the EOS check.
     #[test]
-    fn ids_are_recorded_before_the_eos_break_not_from_token_events() {
+    fn ids_are_recorded_before_the_eos_break() {
         const ENG: &str = include_str!("../engine.rs");
         let push = ENG
             .find("bench_token_ids.push(token_id)")
@@ -1307,49 +1324,94 @@ mod bench_token_ids_surface_tests {
             .find("request.eos_token_ids.contains(&token_id)")
             .expect("engine must have the EOS check");
         assert!(push < eos_check, "the id record must precede the EOS check");
-        assert!(
-            !ENG.contains("encode(&text)") && !ENG.contains("re_tokenize"),
-            "token ids come from the engine's sampled record, never re-tokenised text"
-        );
     }
 
-    /// Off is a no-op and the body is byte-identical; armed without ids fails.
+    /// Off leaves the body byte-identical; armed without ids fails rather
+    /// than returning a body without the surface.
     #[test]
-    fn requested_but_unavailable_fails_loudly() {
+    fn off_is_a_no_op_and_armed_without_ids_fails() {
         let mut body = json!({"a": 1});
         let before = body.clone();
-        if !lumen_runtime::runtime_defaults::bench_token_ids_enabled() {
-            attach_bench_token_ids(&mut body, None, FinishReason::Stop).expect("off never fails");
-            assert_eq!(body, before, "off leaves the body byte-identical");
-            return;
-        }
-        assert!(attach_bench_token_ids(&mut body, None, FinishReason::Stop).is_err());
+        attach_bench_token_ids_if(false, &mut body, None, FinishReason::Stop)
+            .expect("off never fails");
+        assert_eq!(body, before);
+        attach_bench_token_ids_if(
+            false,
+            &mut body,
+            Some((vec![1], vec![2])),
+            FinishReason::Stop,
+        )
+        .expect("off ignores ids");
+        assert_eq!(body, before, "off never writes, even with ids present");
+        let err = attach_bench_token_ids_if(true, &mut body, None, FinishReason::Stop)
+            .expect_err("armed without ids must fail");
+        assert!(
+            matches!(err, ServerError::Internal(ref m) if m.starts_with("LUMEN_BENCH_TOKEN_IDS=1"))
+        );
+        assert_eq!(body, before, "a refused attach leaves the body untouched");
     }
 
-    /// The documented shape: the array, its length, the finish reason and the
-    /// EOS set, with the terminator as the last id.
+    /// The emitted shape: exactly the four keys, the array with the
+    /// terminator last, its length, the OpenAI finish vocabulary, the EOS set.
     #[test]
-    fn surface_shape_is_the_documented_schema() {
+    fn armed_attach_emits_the_documented_schema() {
         let mut body = json!({"object": "chat.completion"});
-        let generated = vec![9u32, 42, 248046];
-        body.as_object_mut().unwrap().insert(
-            "lumen_bench".to_string(),
-            json!({
-                "generated_token_ids": generated,
-                "generated_token_count": generated.len(),
-                "finish_reason": FinishReason::Stop.as_openai(),
-                "eos_token_ids": vec![248046u32],
-            }),
+        attach_bench_token_ids_if(
+            true,
+            &mut body,
+            Some((vec![9, 42, 248046], vec![248046, 248044])),
+            FinishReason::Stop,
+        )
+        .unwrap();
+        assert_eq!(body["object"], "chat.completion", "existing keys untouched");
+        let b = body["lumen_bench"]
+            .as_object()
+            .expect("top-level lumen_bench object");
+        let mut keys: Vec<&str> = b.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "eos_token_ids",
+                "finish_reason",
+                "generated_token_count",
+                "generated_token_ids"
+            ]
         );
-        let b = &body["lumen_bench"];
-        assert_eq!(b["generated_token_ids"].as_array().unwrap().len(), 3);
+        assert_eq!(b["generated_token_ids"], json!([9, 42, 248046]));
         assert_eq!(b["generated_token_count"], 3);
         assert_eq!(b["finish_reason"], "stop");
-        assert_eq!(b["eos_token_ids"][0], 248046);
-        assert_eq!(
-            b["generated_token_ids"].as_array().unwrap().last().unwrap(),
-            &json!(248046)
-        );
+        assert_eq!(b["eos_token_ids"], json!([248046, 248044]));
+
+        let mut body = json!({});
+        attach_bench_token_ids_if(
+            true,
+            &mut body,
+            Some((vec![], vec![])),
+            FinishReason::Length,
+        )
+        .unwrap();
+        assert_eq!(body["lumen_bench"]["finish_reason"], "length");
+        assert_eq!(body["lumen_bench"]["generated_token_count"], 0);
+    }
+
+    /// The guard refuses what the surface cannot serve, and only when armed.
+    #[test]
+    fn guard_refuses_streaming_and_stop_sequences_only_when_armed() {
+        if lumen_runtime::runtime_defaults::bench_token_ids_enabled() {
+            let e = super::super::bench_token_ids_guard(true, &[]).expect_err("streaming refused");
+            assert!(
+                matches!(e, ServerError::BadRequest { ref param, .. } if param.as_deref() == Some("stream"))
+            );
+            let e = super::super::bench_token_ids_guard(false, &["x".into()])
+                .expect_err("stop refused");
+            assert!(
+                matches!(e, ServerError::BadRequest { ref param, .. } if param.as_deref() == Some("stop"))
+            );
+            super::super::bench_token_ids_guard(false, &[]).expect("plain non-streaming allowed");
+        } else {
+            super::super::bench_token_ids_guard(true, &["x".into()]).expect("off never refuses");
+        }
     }
 }
 

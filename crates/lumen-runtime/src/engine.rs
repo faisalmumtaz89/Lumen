@@ -88,8 +88,8 @@ pub fn sample_token_with_state(
     // selection goes through it: the prefill-boundary token, and any token
     // taken from pending host logits, is chosen here with no backend call.
     // Masking at this one host choke point covers every such site and every
-    // non-CUDA backend, with the same sentinel and the same pinned id set as
-    // the kernel. A no-op when the mask is unset.
+    // backend that selects on the host, with the same value and the same id
+    // set as the kernel. A no-op when the mask is unset.
     crate::runtime_defaults::apply_eog_mask(&mut logits.data);
     let token = crate::sampling::sample_logits(&mut logits.data, params, state, rng);
     state.record(token);

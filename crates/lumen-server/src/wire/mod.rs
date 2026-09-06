@@ -14,6 +14,35 @@ use crate::error::ServerError;
 pub mod anthropic;
 pub mod openai;
 
+/// Refuse, before the job is submitted, a request the bench token-id surface
+/// (`LUMEN_BENCH_TOKEN_IDS=1`) cannot serve: a streaming response has no body
+/// to carry the `lumen_bench` object, and a stop sequence ends the response at
+/// the wire layer before the engine's token-id record arrives. Both would
+/// otherwise be served and then fail, or be served without the surface. A
+/// no-op when the flag is off.
+pub(crate) fn bench_token_ids_guard(stream: bool, stop_text: &[String]) -> Result<(), ServerError> {
+    if !lumen_runtime::runtime_defaults::bench_token_ids_enabled() {
+        return Ok(());
+    }
+    if stream {
+        return Err(ServerError::BadRequest {
+            message:
+                "LUMEN_BENCH_TOKEN_IDS is not supported on streaming responses; use stream=false"
+                    .to_string(),
+            param: Some("stream".to_string()),
+            code: Some("unsupported_with_bench_token_ids".to_string()),
+        });
+    }
+    if !stop_text.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "LUMEN_BENCH_TOKEN_IDS is not supported with stop sequences".to_string(),
+            param: Some("stop".to_string()),
+            code: Some("unsupported_with_bench_token_ids".to_string()),
+        });
+    }
+    Ok(())
+}
+
 /// Validate that a message `content` value is a shape both wire surfaces
 /// accept, then flatten it to prompt text — the SINGLE content-parts
 /// flattener routed through by BOTH OpenAI and Anthropic (replacing the two

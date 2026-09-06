@@ -25,6 +25,7 @@ Every variable below is tagged with one category:
 | **config** | An operator-tunable value or opt-in path. | Change deliberately for the documented effect. |
 | **diagnostic** | Off by default; when enabled it prints/dumps or times something. Default state is byte-identical to unset. | Set only while investigating; unset in production. |
 | **test-fixture** | Read only by tests / benches, never by the shipped `lumen` / `lumen-server` runtime path. | Ignore in production; used by the harness. |
+| **bench** | Off unless set. When set it changes the decode result or the response body for a cross-engine comparison run. | Never set in production. |
 
 ## Production canonical stack (CUDA)
 
@@ -262,6 +263,16 @@ individual switches also accept `=0`.
 | `LUMEN_DUMP_GDN_L0_BIN` | unset (no writes) | diagnostic | Dump GDN layer-0 full-precision binaries. **Value is a directory path** (or `=all` for every GDN layer), *not* a boolean — set it to an existing writable directory, e.g. `/tmp/gdndump`. | Set to a dir for GDN correctness triage. |
 | `LUMEN_DUMP_NORMED` | unset (no-op) | diagnostic | Dump post-RMSNorm activations. | Set to inspect normed activations. |
 
+## Bench-only surfaces (off unless set)
+
+Read by the shipped runtime, but only to change behaviour when set. Unset, the
+decode path and every response are byte-identical to a build without them.
+
+| Variable | Default | Category | Effect | When to touch |
+|---|---|---|---|---|
+| `LUMEN_BENCH_MASK_EOG` | unset | bench | Comma-separated end-of-generation token ids that greedy decoding may never select, so a run does not stop at an end-of-generation token before `max_tokens` (other stops still apply). CUDA masks the logits on the device before the argmax; every host-side selection masks before sampling; the Metal backend refuses to construct while it is set. A malformed value, a duplicate, more than 1024 ids, or an id outside the vocabulary refuses to run (`lumen-server` does not start), naming the variable. The process logs `[BENCH] MASK_EOG=ON ids=[…] count=N` when it is on. | Fixed-horizon quality comparisons only. |
+| `LUMEN_BENCH_TOKEN_IDS` | unset | bench | `1` only. Non-streaming `lumen-server` responses carry a top-level `lumen_bench` object: `generated_token_ids` (the terminating id included), `generated_token_count`, `finish_reason` (OpenAI vocabulary on every route) and `eos_token_ids`. While set, a streaming request or a request with stop sequences is rejected with HTTP 400 before decoding. | Token-level end-of-generation comparisons only. |
+
 ---
 
 ## Test-fixtures (test-only — not read by the shipped runtime)
@@ -280,8 +291,6 @@ startup allowlist (so they never false-warn) but have **no effect on the
 | `LUMEN_AB_ITERATIONS` | `10000` | Paired A/B measured iteration count. |
 | `LUMEN_AB_WARMUP` | `100` | Warmup iterations before A/B measurement. |
 | `LUMEN_BENCH_ITERATIONS` | `10000` | Measured iteration count for the in-tree bench harness. |
-| `LUMEN_BENCH_MASK_EOG` | unset | Bench-only. A comma-separated list of end-of-generation token ids that greedy decoding may never select, so a `max_tokens` request generates exactly `max_tokens` tokens (the fixed-horizon quality protocol). Applied on the device before the CUDA argmax and on the host before every CPU-side selection. A malformed value refuses to start rather than running unmasked; the process logs `[BENCH] MASK_EOG=ON ids=[…] count=N` when it is on. |
-| `LUMEN_BENCH_TOKEN_IDS` | unset | Bench-only, `1` only. Non-streaming `lumen-server` responses carry a top-level `lumen_bench` object with the raw generated token ids (terminator included), their count, the finish reason and the request's EOS set; streaming requests are refused while it is set. |
 | `LUMEN_BENCH_SCALE` | `tiny` | Synthetic bench workload scale. |
 | `LUMEN_BENCH_TOKENS` | `50` | Token budget for bench-driven decode runs. |
 | `LUMEN_BENCH_WARMUP` | `5` | Warmup iteration count before measurement. |

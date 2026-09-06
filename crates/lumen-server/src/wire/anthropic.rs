@@ -582,9 +582,9 @@ async fn drive_messages_stream(
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::PrefillDone { .. } => {}
-            // Bench surface: not representable on a streaming body, and silent
-            // omission is forbidden, so refuse loudly; the protocol uses
-            // stream=false.
+            // Bench surface: the router refuses streaming requests while it is
+            // armed, so this is unreachable in practice; if it does arrive,
+            // end the stream with an error rather than drop it silently.
             TokenEvent::BenchTokenIds { .. } => {
                 let err = json!({"type": "error", "error": { "type": "api_error",
                     "message": "LUMEN_BENCH_TOKEN_IDS is not supported on streaming \

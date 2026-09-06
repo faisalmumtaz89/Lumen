@@ -383,9 +383,9 @@ pub(crate) struct KernelSet {
     // byte-identical output — see argmax.cu). Option: absent => single-block.
     pub(crate) argmax_f32_tile_phase1: Option<CudaFunction>,
     pub(crate) argmax_f32_tile_phase2: Option<CudaFunction>,
-    // Fixed-horizon EOG mask (LUMEN_BENCH_MASK_EOG): writes the sentinel to the
-    // pinned ids before argmax. Bench surface; see argmax.cu.
-    pub(crate) mask_logits_neg_inf: Option<CudaFunction>,
+    // Fixed-horizon EOG mask (LUMEN_BENCH_MASK_EOG): writes f32::MIN at the
+    // masked ids before argmax. Bench surface; see argmax.cu.
+    pub(crate) mask_logits_f32_min: Option<CudaFunction>,
     // GPU-side argmax: finds index of max value in logits buffer.
     // Single block of 1024 threads, reads back 4 bytes instead of vocab_size*4.
     pub(crate) argmax_f32: CudaFunction,
@@ -1240,10 +1240,10 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mask_logits_neg_inf: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "mask_logits_neg_inf") {
+        mask_logits_f32_min: match load_fn(shaders::ARGMAX_KERNEL_SOURCE, "mask_logits_f32_min") {
             Ok(f) => Some(f),
             Err(e) => {
-                cuda_log!("[CUDA] mask_logits_neg_inf: FAILED: {e}");
+                cuda_log!("[CUDA] mask_logits_f32_min: FAILED: {e}");
                 None
             }
         },
