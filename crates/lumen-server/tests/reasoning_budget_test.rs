@@ -148,6 +148,7 @@ async fn drain(handle: &EngineHandle, req: JobRequest) -> Drained {
             }
             Ok(Some(TokenEvent::Error(e))) => panic!("engine error: {e}"),
             Ok(Some(TokenEvent::PrefillDone { .. })) => {}
+            Ok(Some(TokenEvent::BenchTokenIds { .. })) => {}
             Ok(None) => break,
             Err(_) => panic!("timed out draining job"),
         }

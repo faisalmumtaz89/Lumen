@@ -280,6 +280,8 @@ startup allowlist (so they never false-warn) but have **no effect on the
 | `LUMEN_AB_ITERATIONS` | `10000` | Paired A/B measured iteration count. |
 | `LUMEN_AB_WARMUP` | `100` | Warmup iterations before A/B measurement. |
 | `LUMEN_BENCH_ITERATIONS` | `10000` | Measured iteration count for the in-tree bench harness. |
+| `LUMEN_BENCH_MASK_EOG` | unset | Bench-only. A comma-separated list of end-of-generation token ids that greedy decoding may never select, so a `max_tokens` request generates exactly `max_tokens` tokens (the fixed-horizon quality protocol). Applied on the device before the CUDA argmax and on the host before every CPU-side selection. A malformed value refuses to start rather than running unmasked; the process logs `[BENCH] MASK_EOG=ON ids=[…] count=N` when it is on. |
+| `LUMEN_BENCH_TOKEN_IDS` | unset | Bench-only, `1` only. Non-streaming `lumen-server` responses carry a top-level `lumen_bench` object with the raw generated token ids (terminator included), their count, the finish reason and the request's EOS set; streaming requests are refused while it is set. |
 | `LUMEN_BENCH_SCALE` | `tiny` | Synthetic bench workload scale. |
 | `LUMEN_BENCH_TOKENS` | `50` | Token budget for bench-driven decode runs. |
 | `LUMEN_BENCH_WARMUP` | `5` | Warmup iteration count before measurement. |

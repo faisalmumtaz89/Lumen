@@ -1784,8 +1784,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_ANTI_RESTATE_SUBWORD",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
+    "LUMEN_BENCH_MASK_EOG",
     "LUMEN_BENCH_SCALE",
     "LUMEN_BENCH_TOKENS",
+    "LUMEN_BENCH_TOKEN_IDS",
     "LUMEN_BENCH_WARMUP",
     "LUMEN_CACHE_DIR",
     "LUMEN_CHAT_ENABLE_THINKING",
@@ -2204,6 +2206,295 @@ pub fn mark_validator_ran() {
 /// Reports whether `mark_validator_ran` has been called this process.
 pub fn validator_was_run() -> bool {
     VALIDATOR_RAN.get().is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-horizon instrument surfaces (bench-only; unset = shipping behaviour)
+// ---------------------------------------------------------------------------
+
+/// The masked-logit sentinel: the most negative finite `f32`, which is what
+/// the literal `-3.402823466e+38f` in `mask_logits_neg_inf` rounds to (see
+/// `cuda/shaders/argmax.cu`). The GPU and host selection paths write the same
+/// bits, so they can never disagree on a tie. Finite, not `-inf`, so a masked
+/// logit stays a valid comparand in every reduction.
+pub const EOG_MASK_SENTINEL: f32 = f32::MIN;
+
+/// `LUMEN_BENCH_MASK_EOG="id1,id2"` — the end-of-generation ids a greedy decode
+/// may never select, so a `max_tokens` request generates exactly `max_tokens`
+/// tokens: the "highest-probability continuation conditional on continuing"
+/// that a fixed-horizon quality comparison across engines is defined on. A
+/// bench surface, not a serving feature; unset means shipping behaviour and
+/// not one logit is touched.
+///
+/// Single source of truth for BOTH selection paths. The CUDA greedy path masks
+/// on the device at `launch_argmax`; every host-side selection masks in
+/// `engine::sample_token_with_state`. They must agree, so both read this.
+///
+/// # Fail-closed
+///
+/// A malformed value panics at first use, naming the variable. It does not
+/// fall back to an unmasked run: the protocol would then score a shipping
+/// (unmasked) run as though it were masked, and the downstream checks cannot
+/// reliably tell — a prompt that would not have ended within the horizon
+/// anyway yields exactly N tokens with no EOG either way, differing only by
+/// the absent marker line. Refusing to start is the only reliable guard.
+pub fn bench_mask_eog_ids() -> &'static [u32] {
+    static IDS: OnceLock<Vec<u32>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let raw = match std::env::var("LUMEN_BENCH_MASK_EOG") {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        match parse_eog_mask_ids(&raw) {
+            Ok(ids) => {
+                if !ids.is_empty() {
+                    // Unconditional marker: the protocol pins against this line,
+                    // and its absence is what proves an artifact was not masked.
+                    eprintln!(
+                        "[BENCH] MASK_EOG=ON ids=[{}] count={} (fixed-horizon protocol surface)",
+                        ids.iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        ids.len()
+                    );
+                }
+                ids
+            }
+            Err(e) => panic!("{e}"),
+        }
+    })
+}
+
+/// Exact-value parse for [`bench_mask_eog_ids`], separated so it is testable
+/// without touching the process environment or the `OnceLock`.
+///
+/// Empty or all-whitespace is the empty set (mask off). Any other malformed
+/// input is an error, never a silently smaller mask.
+pub fn parse_eog_mask_ids(raw: &str) -> Result<Vec<u32>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids: Vec<u32> = Vec::new();
+    for part in trimmed.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            return Err(format!(
+                "LUMEN_BENCH_MASK_EOG={raw:?}: empty element (doubled or trailing comma). \
+                 Refusing: a silently smaller mask measures a different protocol than pinned."
+            ));
+        }
+        let id: u32 = t.parse().map_err(|_| {
+            format!(
+                "LUMEN_BENCH_MASK_EOG={raw:?}: element {t:?} is not a u32 token id. \
+                 Refusing rather than running unmasked, which the protocol would then \
+                 score as though it were masked."
+            )
+        })?;
+        if ids.contains(&id) {
+            return Err(format!(
+                "LUMEN_BENCH_MASK_EOG={raw:?}: duplicate id {id}. Refusing so the marker \
+                 line cannot disagree with the pinned set."
+            ));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Apply the pinned EOG mask to a host logits slice, in place: the host twin of
+/// `mask_logits_neg_inf`, writing the same sentinel. Out-of-range ids are
+/// ignored, matching the kernel's bounds guard. A no-op when the mask is off.
+pub fn apply_eog_mask(logits: &mut [f32]) {
+    let ids = bench_mask_eog_ids();
+    if ids.is_empty() {
+        return;
+    }
+    for &id in ids {
+        if let Some(slot) = logits.get_mut(id as usize) {
+            *slot = EOG_MASK_SENTINEL;
+        }
+    }
+}
+
+/// `LUMEN_BENCH_TOKEN_IDS=1` — `lumen-server` responses additionally carry the
+/// raw generated token-id array, the finish reason, and the per-request EOS
+/// set, under a top-level `lumen_bench` object. A bench surface for comparing
+/// end-of-generation behaviour across engines on the ids themselves rather
+/// than on re-tokenised text; unset means shipping responses, byte for byte.
+///
+/// Exact-value: `1` only. `true`, `on`, `0` and an empty value are all off,
+/// so an instrument surface cannot be armed by a truthy-looking typo.
+pub fn bench_token_ids_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_is_exactly_one("LUMEN_BENCH_TOKEN_IDS");
+        if on {
+            eprintln!(
+                "[BENCH] TOKEN_IDS=ON: responses carry raw generated token ids + \
+                 eos set (instrument-only surface)"
+            );
+        }
+        on
+    })
+}
+
+/// `true` only when `name` is set to exactly `1`: no trimming, no truthy words.
+fn env_is_exactly_one(name: &str) -> bool {
+    matches!(std::env::var(name), Ok(v) if v == "1")
+}
+
+#[cfg(test)]
+mod fixed_horizon_instrument_tests {
+    use super::*;
+    use crate::ENV_TEST_LOCK as SERIAL;
+
+    /// Exact-value and fail-closed: empty means off and is legal; anything
+    /// malformed is an error, never a smaller or empty mask.
+    #[test]
+    fn eog_mask_parse_is_exact_value_and_fail_closed() {
+        assert_eq!(parse_eog_mask_ids("").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_eog_mask_ids("   ").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_eog_mask_ids("248046").unwrap(), vec![248046]);
+        assert_eq!(
+            parse_eog_mask_ids(" 248046 , 248044 ").unwrap(),
+            vec![248046, 248044]
+        );
+        for bad in [
+            "1,2x",
+            "248O46",
+            "248046,",
+            "248046,,7",
+            "-1",
+            "1e3",
+            "0x1",
+            " ,",
+            "248046 248044",
+            "248046,248046",
+        ] {
+            let r = parse_eog_mask_ids(bad);
+            assert!(r.is_err(), "{bad:?} must be rejected, got {r:?}");
+            assert!(
+                r.unwrap_err().starts_with("LUMEN_BENCH_MASK_EOG="),
+                "every refusal names the variable"
+            );
+        }
+        assert_eq!(parse_eog_mask_ids("0").unwrap(), vec![0]);
+    }
+
+    /// The host mask must write the same sentinel the kernel writes, or the two
+    /// selection paths could break a tie differently.
+    #[test]
+    fn host_sentinel_matches_the_kernel_sentinel() {
+        const SRC: &str = include_str!("cuda/shaders/argmax.cu");
+        assert!(
+            SRC.contains("-3.402823466e+38f"),
+            "argmax.cu no longer writes the sentinel this host path mirrors"
+        );
+        let kernel_literal: f32 = "-3.402823466e+38".parse::<f64>().unwrap() as f32;
+        assert_eq!(
+            EOG_MASK_SENTINEL.to_bits(),
+            kernel_literal.to_bits(),
+            "the kernel literal must round to the host sentinel bit-for-bit"
+        );
+        assert!(EOG_MASK_SENTINEL.is_finite());
+    }
+
+    /// A masked id must never win an argmax, even when it holds the true max.
+    #[test]
+    fn masked_id_never_wins_argmax() {
+        fn argmax(v: &[f32]) -> usize {
+            v.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i)
+                .unwrap()
+        }
+        let mut logits = vec![0.0f32; 64];
+        logits[7] = 100.0;
+        logits[9] = 50.0;
+        assert_eq!(argmax(&logits), 7);
+        logits[7] = EOG_MASK_SENTINEL;
+        assert_eq!(argmax(&logits), 9);
+    }
+
+    /// Mask off must be a true no-op on the logits buffer.
+    #[test]
+    fn mask_off_is_a_no_op() {
+        if std::env::var("LUMEN_BENCH_MASK_EOG").is_ok() {
+            eprintln!("skipping: LUMEN_BENCH_MASK_EOG is set in this environment");
+            return;
+        }
+        let orig: Vec<f32> = (0..128).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let mut logits = orig.clone();
+        apply_eog_mask(&mut logits);
+        assert_eq!(logits, orig);
+    }
+
+    /// Both GPU argmax variants sit behind the one entry point the mask is
+    /// applied at, and the host sampler masks before it selects. A third
+    /// argmax dispatch outside `launch_argmax`, or a sampler that no longer
+    /// masks, is a selection path the instrument silently stops covering.
+    #[test]
+    fn every_selection_path_is_masked() {
+        const BE: &str = include_str!("cuda/backend_impl.rs");
+        const EN: &str = include_str!("engine.rs");
+        assert_eq!(
+            BE.matches("st.kernels.mask_logits_neg_inf").count(),
+            1,
+            "the mask kernel handle must be read exactly once, inside launch_argmax"
+        );
+        let la = BE.find("fn launch_argmax(").expect("launch_argmax");
+        let after = &BE[la..];
+        assert!(
+            after.contains("argmax_f32_tile_phase1") && after.contains("kernels.argmax_f32"),
+            "both argmax variants must be dispatched from launch_argmax"
+        );
+        let sts = EN.find("pub fn sample_token_with_state(").expect("sampler");
+        let body = &EN[sts..sts + 2000];
+        let mask_at = body
+            .find("apply_eog_mask")
+            .expect("the host sampler must mask");
+        let sample_at = body.find("sample_logits").expect("sample_logits call");
+        assert!(
+            mask_at < sample_at,
+            "the mask must be applied before selection"
+        );
+    }
+
+    /// `=1` only: no presence-parse, no truthy words, no whitespace.
+    #[test]
+    fn token_ids_flag_is_exact_value_one_only() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let name = "LUMEN_BENCH_TOKEN_IDS_PARSE_PROBE";
+        for (v, want) in [
+            ("1", true),
+            ("0", false),
+            ("true", false),
+            ("on", false),
+            ("yes", false),
+            ("", false),
+            (" 1", false),
+            ("1 ", false),
+            ("01", false),
+        ] {
+            std::env::set_var(name, v);
+            assert_eq!(env_is_exactly_one(name), want, "value {v:?}");
+        }
+        std::env::remove_var(name);
+        assert!(!env_is_exactly_one(name));
+    }
+
+    /// Off is shipping behaviour: the resolver reports false.
+    #[test]
+    fn token_ids_off_is_shipping_behaviour() {
+        if std::env::var("LUMEN_BENCH_TOKEN_IDS").is_ok() {
+            eprintln!("skipping: LUMEN_BENCH_TOKEN_IDS is set in this environment");
+            return;
+        }
+        assert!(!bench_token_ids_enabled());
+    }
 }
 
 #[cfg(test)]
@@ -3506,8 +3797,10 @@ mod tests {
         "LUMEN_ANTI_RESTATE_SUBWORD",
         "LUMEN_BASE_URL",
         "LUMEN_BENCH_ITERATIONS",
+        "LUMEN_BENCH_MASK_EOG",
         "LUMEN_BENCH_SCALE",
         "LUMEN_BENCH_TOKENS",
+        "LUMEN_BENCH_TOKEN_IDS",
         "LUMEN_BENCH_WARMUP",
         "LUMEN_CACHE_DIR",
         "LUMEN_CHAT_ENABLE_THINKING",

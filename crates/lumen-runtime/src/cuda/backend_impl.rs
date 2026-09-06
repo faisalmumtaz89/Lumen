@@ -123,6 +123,13 @@ const ARGMAX_TILES: usize = 128;
 /// replacing the single-block reduction (one SM reading the whole ~1 MB
 /// logits vector). Same reduction operator and tie semantics (max value,
 /// then min index) => byte-identical output by construction.
+/// The fixed-horizon EOG-mask id set, read through the runtime's single source
+/// of truth so the device mask and the host mask can never disagree on the id
+/// set, the sentinel, or the parse (see `runtime_defaults::bench_mask_eog_ids`).
+fn bench_mask_eog_ids() -> &'static [u32] {
+    crate::runtime_defaults::bench_mask_eog_ids()
+}
+
 fn argmax_tiled_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -893,6 +900,9 @@ struct MutableState {
     /// (val, idx) pairs. Always allocated (1 KB) so the flag needs no realloc.
     argmax_partial_val: CudaSlice<f32>,
     argmax_partial_idx: CudaSlice<u32>,
+    /// Fixed-horizon EOG-mask ids on the device (`LUMEN_BENCH_MASK_EOG`);
+    /// `None` when the mask is off.
+    bench_mask_eog_gpu: Option<CudaSlice<u32>>,
     /// Whether the model has any GDN layers.
     has_gdn_layers: bool,
     /// Whether the model has any MoE layers. Populated in `preload_weights`
@@ -9357,6 +9367,36 @@ impl CudaBackend {
     /// reduction operator (max value, then min index) is associative and
     /// commutative, so tiling changes grouping, never the result.
     fn launch_argmax(&self, st: &mut MutableState, vocab: u32) -> Result<(), RuntimeError> {
+        // Fixed-horizon EOG mask (`LUMEN_BENCH_MASK_EOG`): applied at this one
+        // entry point so both argmax variants honour it identically. Mutates
+        // `st.logits_gpu` in place; a bench surface, off unless set.
+        if let Some(ids_gpu) = st.bench_mask_eog_gpu.as_ref() {
+            let Some(mask_fn) = st.kernels.mask_logits_neg_inf.clone() else {
+                // Mask requested but the kernel is absent: refusing to run the
+                // wrong protocol silently.
+                return Err(RuntimeError::Compute(
+                    "LUMEN_BENCH_MASK_EOG is set but mask_logits_neg_inf failed to load".into(),
+                ));
+            };
+            let k = ids_gpu.len() as u32;
+            let cfg = CudarcLaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (k.max(1), 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(&mask_fn)
+                    .arg(&mut st.logits_gpu)
+                    .arg(ids_gpu)
+                    .arg(&k)
+                    .arg(&vocab)
+                    .launch(cfg)
+            }
+            .map(|_| ())
+            .map_err(|e| RuntimeError::Compute(format!("eog mask launch: {e}")))?;
+        }
         if argmax_tiled_enabled() {
             static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SHOWN.load(std::sync::atomic::Ordering::Relaxed)
@@ -16192,6 +16232,14 @@ impl ComputeBackend for CudaBackend {
             argmax_result: self.device.alloc_zeros::<u32>(1)?,
             argmax_partial_val: self.device.alloc_zeros::<f32>(ARGMAX_TILES)?,
             argmax_partial_idx: self.device.alloc_zeros::<u32>(ARGMAX_TILES)?,
+            bench_mask_eog_gpu: {
+                let ids = bench_mask_eog_ids();
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(self.device.htod_copy(ids)?)
+                }
+            },
             has_gdn_layers: false,
             has_moe_layers: false,
             decode_token_count: 0,
