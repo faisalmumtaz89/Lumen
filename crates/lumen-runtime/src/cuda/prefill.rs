@@ -173,7 +173,6 @@ pub(crate) fn alloc_prefill_scratch(
     gdn_qkv_dim: Option<usize>,
     gdn_value_dim: Option<usize>,
     qgate_fused: bool,
-    attn_score_elems: Option<usize>,
 ) -> Result<PrefillScratch, RuntimeError> {
     // Maximum weight matrix size across all projections that share this scratch.
     //
@@ -209,7 +208,7 @@ pub(crate) fn alloc_prefill_scratch(
         .max()
         .unwrap_or(hidden_dim);
 
-    let mut pf = PrefillScratch {
+    Ok(PrefillScratch {
         x: device.alloc_zeros(batch * hidden_dim)?,
         normed: device.alloc_zeros(batch * hidden_dim)?,
         q: device.alloc_zeros(batch * q_dim)?,
@@ -231,23 +230,25 @@ pub(crate) fn alloc_prefill_scratch(
         // F16 dequant scratch: max_weight_elems * 2 bytes (F16). Enables HGEMM for Q8_0/Q4_0
         // weights without persistent F16 caches (GDN layers).
         dequant_f16: device.alloc_zeros(max_weight_elems * 2)?,
-    };
+    })
+}
 
-    // The tiled prefill attention's score block comes last: the buffers above
-    // are mandatory, this one is not. Asking for it after them means a tight
-    // device never loses a required buffer to it, and a refusal here costs
-    // the SGEMM path rather than the request -- `attn_scores` stays `None`
-    // and the dispatcher runs the scalar attention instead.
-    if let Some(elems) = attn_score_elems {
-        if elems > 0 {
-            match device.alloc_zeros::<f32>(elems) {
-                Ok(buf) => pf.attn_scores = Some(buf),
-                Err(e) => warn_attn_scores_alloc_failed(elems, &e),
-            }
+/// The tiled prefill attention's score block, or `None` when the device
+/// refuses it: the refusal is printed once and costs that route, not the
+/// request, since mode 3 then runs on the scalar kernel. `None` in means a
+/// geometry the route cannot host (see [`attn_score_block_elems`]).
+pub(crate) fn alloc_attn_score_block(
+    device: &CudaDevice,
+    elems: Option<usize>,
+) -> Option<CudaSlice<f32>> {
+    let elems = elems.filter(|&n| n > 0)?;
+    match device.alloc_zeros::<f32>(elems) {
+        Ok(buf) => Some(buf),
+        Err(e) => {
+            warn_attn_scores_alloc_failed(elems, &e);
+            None
         }
     }
-
-    Ok(pf)
 }
 
 /// Element count of the tiled prefill attention's score block for one
@@ -281,8 +282,8 @@ fn warn_attn_scores_alloc_failed(elems: usize, err: &RuntimeError) {
     ONCE.call_once(|| {
         eprintln!(
             "[CUDA] tiled prefill attention unavailable: its {:.1} MiB score block \
-             ({elems} floats) could not be allocated ({err}); prefill attention \
-             falls back to the scalar kernel",
+             ({elems} floats) could not be allocated ({err}); exact-F32 prefill \
+             attention runs on the scalar kernel",
             (elems as f64 * 4.0) / (1024.0 * 1024.0)
         );
     });

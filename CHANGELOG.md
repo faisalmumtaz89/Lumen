@@ -32,7 +32,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   context-scaled split-K changes: 515 ms against 713 to first token at a
   1.3k-token context and 1013 ms against 1820 at 2.6k, generated text
   md5-identical to the scalar kernel at 30, 1.3k and 2.6k tokens.
-  Qwen3.5-9B against the same parent commit, default environment: time to
+  Qwen3.5-9B, this route against the scalar kernel of the release before it,
+  default environment: time to
   first token 237.9 → 172.6 ms at 1.3k and 608.4 → 343.4 ms at 2.6k on Q4_0,
   234.2 → 168.4 ms at 1.3k on a Q8_0 body, decode throughput unchanged;
   generated text md5-identical at 25, 1.3k and 2.6k tokens of context, and

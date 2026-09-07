@@ -17707,25 +17707,6 @@ impl ComputeBackend for CudaBackend {
             .layer_weights_cache
             .iter()
             .any(|lw| lw.attn_q_norm.is_some());
-        // Score block for the tiled SGEMM prefill attention, sized once from
-        // the geometry this whole prefill will use. It is allocated here,
-        // before the layer loop, because the loop writes each layer's KV and
-        // advances that cache's length (step 2d) before it reaches the
-        // attention dispatch, while the host-side KV length only advances
-        // after the last layer: an out-of-memory error raised mid-loop would
-        // abort the prefill with the GPU caches already past the host's.
-        // `None` -- path off, kernel absent, geometry the path cannot host,
-        // or the allocation itself refused -- routes the dispatch to the
-        // scalar attention, which needs no score scratch.
-        let attn_score_elems = if batch >= 16
-            && crate::runtime_defaults::attn_prefill_sgemm_enabled()
-            && st.kernels.attn_softmax_causal.is_some()
-        {
-            super::prefill::attn_score_block_elems(batch, num_heads, num_kv_heads, pos_start)
-        } else {
-            None
-        };
-
         let mut pf = super::prefill::alloc_prefill_scratch(
             &self.device,
             batch,
@@ -17736,7 +17717,6 @@ impl ComputeBackend for CudaBackend {
             gdn_dims.map(|(q, _)| q),
             gdn_dims.map(|(_, v)| v),
             qgate_fused,
-            attn_score_elems,
         )?;
 
         // Allocate GDN prefill scratch if the model has GDN layers.
@@ -17754,6 +17734,32 @@ impl ComputeBackend for CudaBackend {
         } else {
             None
         };
+
+        // The tiled SGEMM prefill attention's score block, last of all the
+        // scratch so a tight device never loses a required buffer to it, and
+        // before the layer loop, because the loop writes each layer's KV and
+        // advances that cache's length before it reaches the attention
+        // dispatch while the host-side length only advances after the last
+        // layer. It exists exactly when the dispatch will take that route:
+        // mode 3 selected, the switch on, the softmax kernel built, a fused
+        // Q+gate attention layer present, 16 tokens or more, and no forced
+        // scalar attention. A refused allocation leaves it `None`, and mode 3
+        // then runs on the scalar kernel, which needs no scratch.
+        pf.attn_scores = None;
+        if !crate::runtime_defaults::force_scalar_attn_enabled()
+            && batch >= 16
+            && crate::runtime_defaults::attn_precise_selected() == 3
+            && crate::runtime_defaults::attn_prefill_sgemm_enabled()
+            && st.kernels.attn_softmax_causal.is_some()
+            && st.layer_weights_cache.iter().any(|lw| {
+                lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
+            })
+        {
+            pf.attn_scores = super::prefill::alloc_attn_score_block(
+                &self.device,
+                super::prefill::attn_score_block_elems(batch, num_heads, num_kv_heads, pos_start),
+            );
+        }
 
         // Upload token IDs to GPU.
         self.device.htod_copy_into(tokens, &mut pf.token_ids_gpu)?;
@@ -18086,40 +18092,41 @@ impl ComputeBackend for CudaBackend {
                 // (mode 3, the production default, is exact F32 — tiled cuBLAS
                 // SGEMM when that route is enabled, else the scalar kernel).
                 // 2. Scalar Br=4 fallback (batch < 16, or no WMMA kernels).
-                // DIAGNOSTIC (env LUMEN_CUDA_FORCE_SCALAR_ATTN=1): bypass FA2/WMMA
-                // and use the F32 scalar Br=4 attention. Tests whether the
-                // batch>=16 WMMA(F16) path is the source of the full-attn
-                // long-context divergence. Remove before commit.
-                let force_scalar_attn = {
-                    use std::sync::OnceLock;
-                    static FS: OnceLock<bool> = OnceLock::new();
-                    *FS.get_or_init(|| {
-                        std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1")
-                    })
-                };
+                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs every prefill attention on
+                // the F32 scalar Br=4 kernel, whatever the selector says.
+                let force_scalar_attn = crate::runtime_defaults::force_scalar_attn_enabled();
                 // Prefill full-attention precision selector. 0=WMMA F16,
                 // 1=qkf32 (exact QK^T), 2=pvf32 (exact P@V), 3=both exact
                 // (full F32). Unset resolves to the ratified per-class default
                 // (3 for every production class); 0/1/2/4 remain available for
                 // carrier A/B.
-                let attn_precise: u8 = {
-                    use std::sync::OnceLock;
-                    static AP: OnceLock<u8> = OnceLock::new();
-                    *AP.get_or_init(
-                        || match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
-                            Ok("1") => 1,
-                            Ok("2") => 2,
-                            Ok("3") => 3,
-                            Ok("4") => 4,
-                            Ok("0") => 0,
-                            // Unset → ratified per-class default (pvf32 for MoE +
-                            // dense ≤32 layers; legacy WMMA for the 27B class).
-                            _ => crate::runtime_defaults::attn_precise_default(),
-                        },
-                    )
-                };
+                let attn_precise = crate::runtime_defaults::attn_precise_selected();
                 unsafe {
                     if !force_scalar_attn
+                        && batch >= 16
+                        && attn_precise == 3
+                        && pf.attn_scores.is_some()
+                    {
+                        // Mode 3 (both matmuls exact F32) on the tiled cuBLAS
+                        // SGEMM route: the score block was sized before the
+                        // layer loop under exactly this condition, so its
+                        // presence is the whole decision. It needs no WMMA
+                        // kernel. Without it, mode 3 is the scalar kernel in
+                        // the selector below.
+                        super::prefill::launch_flash_attention_sgemm(
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            &mut pf.attn_scores,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
+                        )?;
+                    } else if !force_scalar_attn
                         && batch >= 16
                         && st.kernels.flash_attention_wmma.is_some()
                     {
@@ -18155,43 +18162,22 @@ impl ComputeBackend for CudaBackend {
                                 )?;
                             }
                             3 => {
-                                // Both exact == full F32. Two implementations of
-                                // the same policy: the tiled cuBLAS SGEMM route
-                                // (default, see attn_prefill_sgemm_enabled) and
-                                // the one-warp-per-row scalar br4 kernel it
-                                // replaces. Exact F32 in both, different
-                                // evaluation orders. The score block was sized
-                                // before the layer loop; without it (path off,
-                                // kernel absent, allocation refused) the scalar
-                                // kernel runs.
-                                if pf.attn_scores.is_some() {
-                                    super::prefill::launch_flash_attention_sgemm(
-                                        &self.device,
-                                        &st.kernels,
-                                        &pf.q,
-                                        kv_cache,
-                                        &mut pf.attn_out,
-                                        &mut pf.attn_scores,
-                                        batch,
-                                        num_heads,
-                                        num_kv_heads,
-                                        head_dim,
-                                        pos_start,
-                                    )?;
-                                } else {
-                                    super::prefill::launch_flash_attention_br4(
-                                        &self.device,
-                                        &st.kernels,
-                                        &pf.q,
-                                        kv_cache,
-                                        &mut pf.attn_out,
-                                        batch,
-                                        num_heads,
-                                        num_kv_heads,
-                                        head_dim,
-                                        pos_start,
-                                    )?;
-                                }
+                                // Both exact == full F32 on the one-warp-per-row
+                                // scalar kernel: the tiled SGEMM route above did
+                                // not take this layer (switch off, its kernel
+                                // absent, or its score block not allocated).
+                                super::prefill::launch_flash_attention_br4(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                )?;
                             }
                             4 if st.kernels.flash_attention_wmma_split.is_some() => {
                                 super::prefill::launch_flash_attention_wmma_split(
@@ -18582,26 +18568,10 @@ impl ComputeBackend for CudaBackend {
                     // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
                     // this secondary prefill-attention dispatch as well, so the
                     // eventual default change is complete across both sites.
-                    let attn_precise: u8 = {
-                        use std::sync::OnceLock;
-                        static AP2: OnceLock<u8> = OnceLock::new();
-                        *AP2.get_or_init(|| {
-                            match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
-                                Ok("1") => 1,
-                                Ok("2") => 2,
-                                Ok("3") => 3,
-                                Ok("4") => 4,
-                                Ok("0") => 0,
-                                // Unset → per-class default (must mirror the AP
-                                // site above; both dispatch sites stay in sync).
-                                // Mode 3 runs the scalar kernel here: the tiled
-                                // SGEMM route is dispatched on the fused Q+gate
-                                // site only, which is the site every artifact
-                                // the converter produces takes.
-                                _ => crate::runtime_defaults::attn_precise_default(),
-                            }
-                        })
-                    };
+                    // Mode 3 runs the scalar kernel here: the tiled SGEMM route
+                    // is dispatched on the fused Q+gate site only, which is the
+                    // site every artifact the converter produces takes.
+                    let attn_precise = crate::runtime_defaults::attn_precise_selected();
                     match attn_precise {
                         1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
                             super::prefill::launch_flash_attention_wmma_variant(

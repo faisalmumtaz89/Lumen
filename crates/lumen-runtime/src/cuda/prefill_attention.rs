@@ -1347,9 +1347,31 @@ mod tests {
             err.contains("attn_out too small"),
             "unexpected error: {err}"
         );
+        // Valid buffers but no score block: the route reports its contract
+        // rather than allocating for itself.
+        let q_ok = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        let mut scores_none: Option<cudarc::driver::CudaSlice<f32>> = None;
+        let err = unsafe {
+            super::super::prefill::launch_flash_attention_sgemm(
+                &device,
+                &kernels,
+                &q_ok,
+                &kv_cache,
+                &mut attn_out,
+                &mut scores_none,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+            )
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no score block"), "unexpected error: {err}");
         assert!(
-            scores.is_none(),
-            "the size checks must precede the score allocation"
+            scores_none.is_none(),
+            "the launcher must not allocate the block"
         );
     }
 
@@ -1391,8 +1413,13 @@ mod tests {
         for group in [1usize, 4, 8] {
             for batch in [1usize, 37, 512, 513, 600, 1300] {
                 for pos_start in [0usize, 1, 1023] {
-                    let allocated =
-                        group * batch.min(ATTN_PREFILL_SGEMM_ROWS) * (pos_start + batch);
+                    let allocated = super::super::prefill::attn_score_block_elems(
+                        batch,
+                        group * 2,
+                        2,
+                        pos_start,
+                    )
+                    .expect("a producible geometry has a score block size");
                     let mut qb = 0usize;
                     while qb < batch {
                         let rows = attn_sgemm_block_rows(batch, qb);
