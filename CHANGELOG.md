@@ -22,6 +22,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   set, streaming requests and requests with stop sequences are rejected before
   decoding.
 
+### Changed
+
+- **No F16 dequant caches for quantised projections**: only F32 projections
+  get an F16 copy now (decode reads it). A Q8_0 or Q4_0 projection's copy
+  served prefill alone, and prefill dequantises into scratch per matmul at the
+  same speed — no change in time to first token at 30 or 1,300 prompt tokens,
+  byte-identical output — for 11.9 GB less device memory on Qwen3.8-27B Q4_0,
+  which lets that model load with its source-fidelity tensors on a 32 GB card.
+  `LUMEN_CUDA_F16_CACHE=1` builds the copies as before.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed

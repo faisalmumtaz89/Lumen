@@ -18992,6 +18992,13 @@ impl ComputeBackend for CudaBackend {
         // memory is ~2x the Q8_0 weight size (F16 = 2 bytes/element vs Q8_0 ~1.0625).
         // BF16 weights skip this step entirely (no F16 cache needed; matvec_bf16
         // dispatches directly off the raw BF16 bytes).
+        if !crate::runtime_defaults::f16_cache_for_quantised() {
+            eprintln!(
+                "[CUDA] F16 dequant caches: F32 projections only; quantised projections \
+                 prefill from scratch ({}=1 builds theirs)",
+                crate::runtime_defaults::F16_CACHE_ENV
+            );
+        }
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
         let free_for_refusal = match free_before_f16_cache {

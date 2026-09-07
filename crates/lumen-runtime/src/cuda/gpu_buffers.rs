@@ -1588,12 +1588,16 @@ pub fn attention_f16_elements(layer: &LayerWeightsGpu, hp: &ModelHyperparams) ->
     }
 }
 
-/// Whether [`dequant_layer_q8_to_f16`] materialises an F16 copy of this buffer.
+/// Whether [`dequant_layer_q8_to_f16`] materialises an F16 copy of this buffer:
+/// F32 projections always (decode's HGEMV reads the copy), quantised ones only
+/// when `LUMEN_CUDA_F16_CACHE` asks (prefill dequantises into scratch otherwise).
 fn makes_f16_cache(w: &GpuWeightBuf) -> bool {
     // Exhaustive on purpose: a new variant must decide here whether the
     // allocator builds a cache for it, or the fit check under-counts.
     match w {
-        GpuWeightBuf::Q8Raw(_) | GpuWeightBuf::Q4Raw(_) => true,
+        GpuWeightBuf::Q8Raw(_) | GpuWeightBuf::Q4Raw(_) => {
+            crate::runtime_defaults::f16_cache_for_quantised()
+        }
         GpuWeightBuf::F32(f32_buf) => !f32_buf.is_empty(),
         GpuWeightBuf::Q8Aligned(_)
         | GpuWeightBuf::Q4Aligned(_)
@@ -1640,25 +1644,21 @@ pub fn dequant_layer_q8_to_f16(
     layer: &mut LayerWeightsGpu,
     hp: &ModelHyperparams,
 ) -> Result<(), RuntimeError> {
-    // For GDN layers (layer_type == 1):
-    // F16 caches are REQUIRED for Q4_0 weights. Without them, Q4_0 falls through
-    // to the slow scalar matvec_q4_0 kernel (~22 tok/s vs ~56 tok/s with HGEMV).
-    // For Q8_0, the dp4a kernel handles GDN dispatch efficiently, but F16 caches
-    // are still beneficial for the FFN block which runs after GDN attention.
-    //
     // GDN wq is fused [qkv_dim, hidden_dim], so we compute element counts from
     // actual buffer sizes rather than model hyperparams (which give q_dim, not qkv_dim).
     let is_gdn = layer.layer_type == 1;
 
-    // Process each weight: Q8_0 uses q8 dequant kernel, Q4_0 uses q4 dequant kernel.
-    // F16Raw weights are already in the right format for HGEMM -- no dequant needed.
-    // BF16Raw weights use the dedicated matvec_bf16 kernel for decode; no F16
-    // cache is created (HGEMM prefill path will dequant via a separate path).
-    // For F32 weights (e.g. Q4_1/Q6_K dequanted to F32), create F16 via f32_to_f16_vec.
+    // Which buffers get a copy is `makes_f16_cache`'s decision, the same one the
+    // fit check sized. Q8_0 / Q4_0 use their dequant kernels, F32 converts via
+    // f32_to_f16_vec; F16Raw is already HGEMM's format and BF16Raw has its own
+    // decode kernel, so neither gets a copy.
     let f32_to_f16_fn = &kernels.f32_to_f16_vec;
     let dequant_weight = |w: &GpuWeightBuf,
                           n: usize|
      -> Result<Option<CudaSlice<u8>>, RuntimeError> {
+        if !makes_f16_cache(w) {
+            return Ok(None);
+        }
         match w {
             GpuWeightBuf::Q8Raw(q8) => Ok(Some(dequant_q8_to_f16_gpu(device, kernel, q8, n)?)),
             GpuWeightBuf::Q4Raw(q4) => Ok(Some(dequant_q8_to_f16_gpu(device, q4_kernel, q4, n)?)),
