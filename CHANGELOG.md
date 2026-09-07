@@ -24,12 +24,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
-- **No F16 dequant caches for quantised projections**: only F32 projections
-  get an F16 copy now (decode reads it). A Q8_0 or Q4_0 projection's copy
-  served prefill alone, and prefill dequantises into scratch per matmul at the
-  same speed — no change in time to first token at 30 or 1,300 prompt tokens,
-  byte-identical output — for 11.9 GB less device memory on Qwen3.8-27B Q4_0,
-  which lets that model load with its source-fidelity tensors on a 32 GB card.
+- **No F16 dequant caches for quantised projections**: a full-attention
+  layer's Q/K/V/O and FFN gate/up/down projections no longer get an F16 copy
+  when they are Q8_0 or Q4_0. F32 projections keep theirs, which is the copy
+  decode's HGEMV reads. Batched prefill never read the quantised copies — it
+  dequantises each weight into scratch per matmul so its arithmetic matches
+  decode's — so the only reader was a decode fallback taken for input
+  dimensions above 24576 or when the faster matvec kernels fail to load,
+  neither of which the shipping models reach. Measured on one card and one
+  model (RTX 5090, Qwen3.8-27B Q4_0, 2048-token context): 11.9 GB less device
+  memory, byte-identical output, time to first token 92.8 ms at 30 prompt
+  tokens and 720 ms at ~1,300, decode 77.8 tok/s — each within run-to-run
+  noise of the same load with the copies. At a 4096-token context that load
+  admitted the copies and then died out of memory in its first prefill; it
+  runs without them. The memory this frees also lets the memory-aware
+  split-kernel clones be admitted where they were not before; the
+  byte-identical output above was measured with them in.
   `LUMEN_CUDA_F16_CACHE=1` builds the copies as before.
 
 ## [0.24.0] — 2026-09-06

@@ -18992,10 +18992,20 @@ impl ComputeBackend for CudaBackend {
         // memory is ~2x the Q8_0 weight size (F16 = 2 bytes/element vs Q8_0 ~1.0625).
         // BF16 weights skip this step entirely (no F16 cache needed; matvec_bf16
         // dispatches directly off the raw BF16 bytes).
-        if !crate::runtime_defaults::f16_cache_for_quantised() {
+        //
+        // Without a copy, decode has no cuBLAS-HGEMV fallback for a quantised
+        // projection; every shipping shape is served by the native matvecs, so
+        // the only way down to the last-resort kernel is one that did not load.
+        if !crate::runtime_defaults::f16_cache_for_quantised()
+            && (st.kernels.matvec_q8_0_smem.is_none()
+                || st.kernels.hgemv_q8_0.is_none()
+                || st.kernels.matvec_q4_0_smem.is_none()
+                || st.kernels.hgemv_q4_0.is_none())
+        {
             eprintln!(
-                "[CUDA] F16 dequant caches: F32 projections only; quantised projections \
-                 prefill from scratch ({}=1 builds theirs)",
+                "[CUDA] a quantised matvec kernel failed to load and no F16 caches were \
+                 built for quantised projections: wide projections fall to the \
+                 last-resort matvec ({}=1 restores the cuBLAS HGEMV path)",
                 crate::runtime_defaults::F16_CACHE_ENV
             );
         }
@@ -19542,10 +19552,25 @@ impl ComputeBackend for CudaBackend {
         // Benchmarks all 16 tensor-core algorithms + DEFAULT for each unique
         // (M=out_dim, K=in_dim) shape used during F16 decode. Caches the
         // fastest per shape. Only runs if any F16 weights are present.
-        let has_f16 = st
-            .layer_weights_cache
+        // Any of the seven projection slots can reach a cuBLAS HGEMV that
+        // takes its algorithm from `st.algo_cache`: the slot is F16Raw (Q4_1
+        // uploads that way) or F32 with an F16 cache (K-quant host dequant).
+        // Sampling `wq` alone misses a quantised wq beside such a sibling.
+        let has_f16 = st.layer_weights_cache.iter().any(|lw| {
+            let raw = [
+                &lw.wq, &lw.wk, &lw.wv, &lw.wo, &lw.w_gate, &lw.w_up, &lw.w_down,
+            ]
             .iter()
-            .any(|lw| matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) || lw.wq_f16.is_some());
+            .any(|w| matches!(w, GpuWeightBuf::F16Raw(_)));
+            let cached = lw.wq_f16.is_some()
+                || lw.wk_f16.is_some()
+                || lw.wv_f16.is_some()
+                || lw.wo_f16.is_some()
+                || lw.w_gate_f16.is_some()
+                || lw.w_up_f16.is_some()
+                || lw.w_down_f16.is_some();
+            raw || cached
+        });
         if has_f16 {
             let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
             let kv_dim = hp_copy.num_kv_heads as usize * hp_copy.head_dim as usize;
