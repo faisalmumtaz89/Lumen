@@ -1349,15 +1349,14 @@ mod tests {
         );
         // Valid buffers but no score block: the route reports its contract
         // rather than allocating for itself.
-        let q_ok = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         let mut scores_none: Option<cudarc::driver::CudaSlice<f32>> = None;
         let err = unsafe {
             super::super::prefill::launch_flash_attention_sgemm(
                 &device,
                 &kernels,
-                &q_ok,
+                &full_q,
                 &kv_cache,
-                &mut attn_out,
+                &mut full_out,
                 &mut scores_none,
                 batch,
                 num_heads,
@@ -1409,7 +1408,7 @@ mod tests {
     /// kv_len` footprint, for every block of every shape.
     #[test]
     fn test_attn_sgemm_score_scratch_bounds_every_block() {
-        use super::super::prefill::{attn_sgemm_block_rows, ATTN_PREFILL_SGEMM_ROWS};
+        use super::super::prefill::attn_sgemm_block_rows;
         for group in [1usize, 4, 8] {
             for batch in [1usize, 37, 512, 513, 600, 1300] {
                 for pos_start in [0usize, 1, 1023] {
