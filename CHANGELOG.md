@@ -22,6 +22,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   set, streaming requests and requests with stop sequences are rejected before
   decoding.
 
+### Fixed
+
+- **dp4a kernels load on CUDA 13**: fourteen kernels written against inline-PTX
+  `dp4a` were compiled for a fixed `compute_61`, a target CUDA 13's NVRTC no
+  longer accepts, so on such toolkits none of them loaded and their routes
+  silently fell back (the Q5_K ssm_out route to an F16 image). The target now
+  comes from the toolkit's own supported list: `compute_61` wherever it is still
+  listed, otherwise the highest target the device can run; the choice is logged
+  under `LUMEN_CUDA_VERBOSE=1`.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed
