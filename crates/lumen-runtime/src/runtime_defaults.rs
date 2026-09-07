@@ -1739,13 +1739,74 @@ pub fn output_proj_clone_decision(
 /// the aligned Q8 repack on a model without GDN layers among them: a Tesla
 /// T4 serving Qwen3.5-9B Q8_0 at an 8192-token context builds 3.36 GB of
 /// caches into 3.80 GB free and then decodes with the 0.45 GB left, which a
-/// 512 MiB reserve refused.
+/// 512 MiB reserve refused. Both figures are from loads that cached every
+/// quantised projection, which is now [`F16_CACHE_ENV`]'s path; by default
+/// the total the margin sits on covers the F32 projections and the quantised
+/// K/V or up beside an F32 Q or gate.
 pub const F16_CACHE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Set to a truthy value to build the F16 dequant caches even when
 /// [`f16_cache_refusal`] would refuse. The refusal is a prediction; this is
 /// the escape hatch when the prediction is wrong for a card.
 pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
+
+/// Set to a truthy value to build F16 dequant caches for the Q8_0 / Q4_0
+/// projections of full-attention layers (Q/K/V/O and the FFN gate/up/down) as
+/// well. By default a projection gets one when it is F32, or when it is a
+/// K/V beside an F32 Q or an up beside an F32 gate: those are the copies
+/// decode's HGEMV reads. Batched prefill dequantises each weight into scratch
+/// per matmul so its arithmetic matches decode's, and never reads these
+/// caches, so the other quantised copies served only the decode fallback
+/// taken for input dimensions above 24576 or for a matvec kernel that failed
+/// to load. Set it on a card where that fallback is the path taken, or to
+/// restore the previous memory profile.
+pub const F16_CACHE_ENV: &str = "LUMEN_CUDA_F16_CACHE";
+
+/// `true` for the values the `LUMEN_CUDA_*` truthy flags accept; unset, and
+/// anything outside that set, is off. Pure so the switch below is testable
+/// without mutating the process environment.
+fn env_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+/// Whether [`F16_CACHE_ENV`] asks for the quantised projections' F16 dequant
+/// caches. Read once, and announced only when it is on: the default is what
+/// every load does, so it is not news.
+pub fn f16_cache_for_quantised() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = env_truthy(std::env::var(F16_CACHE_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "[CUDA] {F16_CACHE_ENV}=ON: the quantised projections get F16 \
+                 dequant caches too"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+mod f16_cache_env_tests {
+    use super::*;
+
+    /// The documented truthy set, and what is outside it. The values are
+    /// arguments, so proving the policy costs no process-environment
+    /// mutation and the test is order-independent.
+    #[test]
+    fn env_truthy_accepts_only_the_documented_values() {
+        for v in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            assert!(env_truthy(Some(v)), "{v} is documented as truthy");
+        }
+        for v in ["0", "", "2", "True", "off", "no", " 1", "1 "] {
+            assert!(!env_truthy(Some(v)), "{v} is not in the truthy set");
+        }
+        assert!(!env_truthy(None), "unset is off");
+    }
+}
 
 /// What the memory query said just before the F16 caches are built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1910,6 +1971,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+    "LUMEN_CUDA_F16_CACHE",
     "LUMEN_CUDA_F16_CACHE_FORCE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_FUSED_GLU",
@@ -4044,6 +4106,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
         "LUMEN_CUDA_ATTN_SPLITK_SCALE",
+        "LUMEN_CUDA_F16_CACHE",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",

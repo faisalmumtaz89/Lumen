@@ -58,6 +58,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   artifact's quantised projections; with them it does not fit a 2048-token
   context on a 32 GB card.
 
+- **No F16 dequant caches for quantised projections**: a full-attention
+  layer's Q/K/V/O and FFN gate/up/down projections no longer get an F16 copy
+  when they are Q8_0 or Q4_0. F32 projections keep theirs, which is the copy
+  decode's HGEMV reads, and so does a quantised K/V beside an F32 Q, or a
+  quantised up beside an F32 gate, because decode's batched HGEMV reads those
+  too. Batched prefill never read the quantised copies — it dequantises each
+  weight into scratch per matmul so its arithmetic matches decode's — so the
+  only other reader was a decode fallback for input dimensions above 24576
+  or for a matvec kernel that failed to load, neither of which the shipping
+  models reach. Measured on one card and one
+  model (RTX 5090, Qwen3.8-27B Q4_0, 2048-token context): 11.9 GB less device
+  memory, byte-identical output, time to first token 92.8 ms at 30 prompt
+  tokens and 720 ms at ~1,300, decode 77.8 tok/s — each within run-to-run
+  noise of the same load with the copies. At a 4096-token context that load
+  admitted the copies and then died out of memory in its first prefill; it
+  runs without them. The memory this frees also lets the memory-aware
+  split-kernel clones be admitted where they were not before; the
+  byte-identical output above was measured with them in.
+  `LUMEN_CUDA_F16_CACHE=1` builds the copies as before.
+
+### Fixed
+
+- **Aligned output heads no longer dispatch the raw-layout dp4a kernels**: the
+  padded Q4/Q8 head arms could hand 20/36-byte blocks to `mul_mat_vec_q_*`,
+  which read 18/34-byte raw blocks, producing wrong logits. No artifact the
+  converter produces today builds an aligned head (every supported
+  architecture is a GDN model); a legacy non-GDN artifact would.
+- **dp4a kernels load on CUDA 13**: fourteen kernels written against inline-PTX
+  `dp4a` were compiled for a fixed `compute_61`, a target CUDA 13's NVRTC no
+  longer accepts, so on such toolkits none of them loaded and their routes
+  silently fell back (the Q5_K ssm_out route to an F16 image). The target now
+  comes from the toolkit's own supported list: `compute_61` wherever it is still
+  listed, otherwise the highest target the device can run; the choice is logged
+  under `LUMEN_CUDA_VERBOSE=1`.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed
