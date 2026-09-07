@@ -300,3 +300,151 @@ extern "C" __global__ void attention_decode_splitk_merge(
         attn_out[head * head_dim + d] = acc * inv_l;
     }
 }
+
+// ---------------------------------------------------------------------------
+// attention_decode_splitk_partial_gqa: one block per (KV head, chunk), serving
+// every query head of that KV head's GQA group from a single read of K and V.
+//
+// Nsight Compute on the RTX 5090 (Qwen3.8-27B, 1.3k-token context, 2026-09-07):
+// the per-query-head partial pass fetched each K/V row once per query head
+// (24 query heads over 8 KV heads: three times), ran 264 blocks on 170 SMs
+// (13 % of the warp slots) and spent three quarters of its issue cycles
+// waiting on memory. Here a block owns one chunk of at most T_C positions of
+// one KV head: the QK phase gives a warp to each position (one contiguous K
+// row read per warp, a float4 per lane per 128 dims) and produces the scores
+// of all G query heads from that one read; the PV phase keeps a thread per
+// dimension, reads each V row once and accumulates G outputs. Chunks are
+// small (the host picks 32-128 positions) so the grid reaches the SM count
+// several times over. Outputs are the same per-(query head, chunk) partial
+// triples the merge kernel consumes; only the summation order differs from
+// the other passes.
+//
+// Grid: num_kv_heads * num_chunks. Block: 128 threads (four warps).
+// Shared: 8 (reductions) + G*head_dim (q rows) + G*T_C (scores) floats.
+// Requires head_dim % 128 == 0, head_dim <= 1024, num_heads % num_kv_heads
+// == 0, num_heads / num_kv_heads <= GQA_MAX, chunk span <= T_C.
+// ---------------------------------------------------------------------------
+#define GQA_MAX 8u
+extern "C" __global__ void attention_decode_splitk_partial_gqa(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ m_part,
+    float* __restrict__ l_part,
+    float* __restrict__ o_part,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks)
+{
+    unsigned int blk = blockIdx.x;
+    unsigned int kv_h = blk / num_chunks;
+    unsigned int chunk = blk % num_chunks;
+    if (kv_h >= num_kv_heads) return;
+    unsigned int G = num_heads / num_kv_heads;
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    unsigned int num_warps = block_size >> 5;
+    unsigned int chunk_span = (seq_len + num_chunks - 1u) / num_chunks;
+    unsigned int p0 = chunk * chunk_span;
+    unsigned int p1 = p0 + chunk_span;
+    if (p1 > seq_len) p1 = seq_len;
+    unsigned int span = (p1 > p0) ? (p1 - p0) : 0u;
+    unsigned long long kv_base =
+        (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)head_dim;
+    extern __shared__ float smem[];
+    volatile float* partial = smem;
+    float* q_rows = smem + 8;                       // [G][head_dim]
+    float* s_tile = q_rows + G * head_dim;          // [G][T_C]
+    for (unsigned int i = tid; i < G * head_dim; i += block_size) {
+        unsigned int g = i / head_dim;
+        unsigned int d = i - g * head_dim;
+        q_rows[i] = q[(kv_h * G + g) * head_dim + d];
+    }
+    __syncthreads();
+    const unsigned int quads = head_dim >> 7;       // float4s per lane per 128 dims
+    // QK: a warp per position, every query head of the group from one K read.
+    for (unsigned int j = warp; j < T_C; j += num_warps) {
+        if (j < span) {
+            unsigned int pos = p0 + j;
+            const float4* k4 = reinterpret_cast<const float4*>(
+                k_cache + kv_base + (unsigned long long)pos * (unsigned long long)head_dim);
+            float4 kk[8];
+#pragma unroll
+            for (unsigned int qd = 0; qd < 8u; qd++) {
+                if (qd < quads) kk[qd] = k4[qd * 32u + lane];
+            }
+            for (unsigned int g = 0; g < G; g++) {
+                const float4* q4 = reinterpret_cast<const float4*>(q_rows + g * head_dim);
+                float dot = 0.0f;
+#pragma unroll
+                for (unsigned int qd = 0; qd < 8u; qd++) {
+                    if (qd < quads) {
+                        float4 qq = q4[qd * 32u + lane];
+                        dot += qq.x * kk[qd].x + qq.y * kk[qd].y + qq.z * kk[qd].z + qq.w * kk[qd].w;
+                    }
+                }
+                dot = splitk_warp_sum(dot) * scale;
+                if (lane == 0) s_tile[g * T_C + j] = dot;
+            }
+        } else {
+            if (lane == 0) {
+                for (unsigned int g = 0; g < G; g++) s_tile[g * T_C + j] = NEG_INF;
+            }
+        }
+    }
+    __syncthreads();
+    // Softmax per query head over the chunk: max, exponentiate in place, sum.
+    float m_g[GQA_MAX];
+    float l_g[GQA_MAX];
+    for (unsigned int g = 0; g < G; g++) {
+        float local_max = NEG_INF;
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            local_max = fmaxf(local_max, s_tile[g * T_C + j]);
+        }
+        float m = splitk_block_reduce_max(local_max, partial, tid, block_size);
+        float local_sum = 0.0f;
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            float p = (j < span) ? expf(s_tile[g * T_C + j] - m) : 0.0f;
+            s_tile[g * T_C + j] = p;
+            local_sum += p;
+        }
+        __syncthreads();
+        float l = splitk_block_reduce_sum(local_sum, partial, tid, block_size);
+        m_g[g] = m;
+        l_g[g] = l;
+    }
+    __syncthreads();
+    // PV: a thread per dimension, each V row read once, G outputs per thread.
+    unsigned int num_slots = (head_dim + block_size - 1u) / block_size;
+    for (unsigned int slot = 0; slot < num_slots; slot++) {
+        unsigned int d = tid + slot * block_size;
+        if (d >= head_dim) break;
+        float o_g[GQA_MAX];
+#pragma unroll
+        for (unsigned int g = 0; g < GQA_MAX; g++) o_g[g] = 0.0f;
+        const float* vcol = v_cache + kv_base + (unsigned long long)p0 * (unsigned long long)head_dim + d;
+        for (unsigned int j = 0; j < span; j++) {
+            float v = vcol[(unsigned long long)j * (unsigned long long)head_dim];
+            for (unsigned int g = 0; g < G; g++) {
+                o_g[g] += s_tile[g * T_C + j] * v;
+            }
+        }
+        for (unsigned int g = 0; g < G; g++) {
+            unsigned int head = kv_h * G + g;
+            o_part[((unsigned long long)head * num_chunks + chunk) * (unsigned long long)head_dim + d] = o_g[g];
+        }
+    }
+    if (tid == 0u) {
+        for (unsigned int g = 0; g < G; g++) {
+            unsigned int head = kv_h * G + g;
+            m_part[head * num_chunks + chunk] = (span > 0u) ? m_g[g] : NEG_INF;
+            l_part[head * num_chunks + chunk] = (span > 0u) ? l_g[g] : 0.0f;
+        }
+    }
+}

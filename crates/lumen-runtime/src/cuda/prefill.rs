@@ -2009,6 +2009,39 @@ fn attn_splitk_chunk_count(seq_len: u32, chunk_positions: u32) -> u32 {
         .clamp(1, ATTN_SPLITK_S_MAX)
 }
 
+/// Whether the GQA-group partial pass serves this shape: the kernel loaded,
+/// query heads a multiple of KV heads with at most 8 per group, a head_dim
+/// the pass's float4 lanes cover, and a chunk that fits the pass's one tile.
+pub(crate) fn attn_splitk_gqa_eligible(
+    kernels: &KernelSet,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+) -> bool {
+    kernels.attention_decode_splitk_partial_gqa.is_some()
+        && num_kv_heads > 0
+        && num_heads % num_kv_heads == 0
+        && num_heads / num_kv_heads <= 8
+        && head_dim % 128 == 0
+        && head_dim <= 1024
+        && seq_len.div_ceil(attn_splitk_gqa_chunks(seq_len)) <= ATTN_DECODE_TILED_BLOCK_DIM
+}
+
+/// The split count for the GQA-group pass: one chunk per
+/// [`crate::runtime_defaults::ATTN_SPLITK_GQA_CHUNK_POSITIONS`] positions
+/// (`LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK` overrides), clamped like
+/// [`attn_splitk_chunks`]; the fixed count when scaling is off.
+pub(crate) fn attn_splitk_gqa_chunks(seq_len: u32) -> u32 {
+    if !crate::runtime_defaults::attn_splitk_scale_with_context() {
+        return crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS;
+    }
+    attn_splitk_chunk_count(
+        seq_len,
+        crate::runtime_defaults::attn_splitk_gqa_chunk_positions(),
+    )
+}
+
 /// Split-K shape eligibility: the accumulator slots cover `head_dim` exactly
 /// (same 128-lane slot addressing as the tiled kernel, 8 slots max).
 fn attention_decode_splitk_supports_head_dim(head_dim: u32) -> bool {
@@ -2042,7 +2075,12 @@ unsafe fn launch_attention_decode_splitk(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<(), RuntimeError> {
-    let s: u32 = attn_splitk_chunks(seq_len);
+    let gqa = attn_splitk_gqa_eligible(kernels, num_heads, num_kv_heads, head_dim, seq_len);
+    let s: u32 = if gqa {
+        attn_splitk_gqa_chunks(seq_len)
+    } else {
+        attn_splitk_chunks(seq_len)
+    };
     if !attention_decode_splitk_supports_head_dim(head_dim) {
         return Err(RuntimeError::Compute(format!(
             "attention_decode_splitk: unsupported head_dim ({head_dim}); \
@@ -2050,7 +2088,11 @@ unsafe fn launch_attention_decode_splitk(
         )));
     }
     let (partial_fn, merge_fn) = match (
-        kernels.attention_decode_splitk_partial.as_ref(),
+        if gqa {
+            kernels.attention_decode_splitk_partial_gqa.as_ref()
+        } else {
+            kernels.attention_decode_splitk_partial.as_ref()
+        },
         kernels.attention_decode_splitk_merge.as_ref(),
     ) {
         (Some(p), Some(m)) => (p, m),
@@ -2060,7 +2102,13 @@ unsafe fn launch_attention_decode_splitk(
             ))
         }
     };
-    let shared_bytes = attention_decode_tiled_shared_bytes(head_dim);
+    let shared_bytes = if gqa {
+        let group = num_heads / num_kv_heads;
+        (8 + group * head_dim + group * ATTN_DECODE_TILED_BLOCK_DIM) * 4
+    } else {
+        attention_decode_tiled_shared_bytes(head_dim)
+    };
+    let partial_grid = if gqa { num_kv_heads * s } else { num_heads * s };
     let (m_part, l_part, o_part) = scratch;
     device
         .stream
@@ -2079,7 +2127,7 @@ unsafe fn launch_attention_decode_splitk(
         .arg(&scale)
         .arg(&s)
         .launch(CudarcLaunchConfig {
-            grid_dim: (num_heads * s, 1, 1),
+            grid_dim: (partial_grid, 1, 1),
             block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
             shared_mem_bytes: shared_bytes,
         })

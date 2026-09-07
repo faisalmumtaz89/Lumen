@@ -207,6 +207,8 @@ pub(crate) struct KernelSet {
     // and BF16-body dense models, OFF otherwise); both must be present for
     // the split-K route to dispatch.
     pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
+    /// The partial pass serving a whole GQA group from one K/V read (`LUMEN_CUDA_ATTN_SPLITK_GQA`).
+    pub(crate) attention_decode_splitk_partial_gqa: Option<CudaFunction>,
     pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
@@ -1100,6 +1102,22 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_partial: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        attention_decode_splitk_partial_gqa: if crate::runtime_defaults::attn_splitk_enabled()
+            && crate::runtime_defaults::attn_splitk_gqa_enabled()
+        {
+            match load_fn(
+                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_gqa",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa: FAILED ({e})");
                     None
                 }
             }
