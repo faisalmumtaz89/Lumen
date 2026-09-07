@@ -5821,7 +5821,15 @@ impl CudaBackend {
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
             // the two scratch fields are accessed sequentially. F32 source
             // gates (gdn_ab_f32) need the same F32 `normed` for their SGEMVs.
-            if gdn_ab_f16 || gdn_ab_f32 {
+            // With `rmsnorm_to_q8_1_normed` present the fused launch below writes
+            // that vector itself (same reduction, same product), so the extra
+            // launch is made only when the dual kernel is unavailable or
+            // switched off.
+            let needs_normed = gdn_ab_f16 || gdn_ab_f32;
+            let norm_dual = needs_normed
+                && crate::runtime_defaults::gdn_norm_dual_enabled()
+                && st.kernels.rmsnorm_to_q8_1_normed.is_some();
+            if needs_normed && !norm_dual {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -5846,7 +5854,6 @@ impl CudaBackend {
                 })?;
             }
 
-            let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
             let bs = rmsnorm_block_size(hidden_dim);
             let lc = CudarcLaunchConfig {
@@ -5855,18 +5862,40 @@ impl CudaBackend {
                 shared_mem_bytes: rmsnorm_shared_bytes(bs),
             };
             let dim = hidden_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(fused_fn)
-                    .arg(&st.scratch.x_gpu)
-                    .arg(&lw.attn_norm)
-                    .arg(&mut *q8_1_buf)
-                    .arg(&eps)
-                    .arg(&dim)
-                    .launch(lc)
+            if norm_dual {
+                let dual_fn = st.kernels.rmsnorm_to_q8_1_normed.as_ref().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(dual_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1_normed L{layer_idx}: {e}"))
+                })?;
+            } else {
+                let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}"))
+                })?;
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}")))?;
 
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.

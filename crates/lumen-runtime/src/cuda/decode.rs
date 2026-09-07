@@ -681,6 +681,8 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
+    /// The same norm-and-quantise, also writing the normalised F32 vector.
+    pub(crate) rmsnorm_to_q8_1_normed: Option<CudaFunction>,
 
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
@@ -2509,6 +2511,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
+                None
+            }
+        },
+        rmsnorm_to_q8_1_normed: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_normed",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_normed: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_normed: FAILED: {e}");
                 None
             }
         },
