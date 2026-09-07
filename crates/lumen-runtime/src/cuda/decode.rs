@@ -904,17 +904,34 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         })
     };
 
-    // For kernels using inline-PTX dp4a (sm_61+) — avoids the
-    // sm_80 PTX JIT issue observed in this build/driver env where every
-    // compute_XX target produces PTX that cuModuleLoadData rejects.
-    // compute_61 PTX loads successfully and __dp4a is emulated via PTX `dp4a`
-    // instruction directly (mmq_q8_0.cu uses inline `dp4a.s32.s32`).
-    #[allow(dead_code)]
-    let load_fn_sm61 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
-        let module = device.compile_and_load_with_arch(source, "compute_61")?;
-        module.load_function(name).map_err(|e| {
-            RuntimeError::Compute(format!("Failed to load SM61 CUDA kernel '{name}': {e}"))
-        })
+    // The kernels written against inline-PTX `dp4a` (sm_61+) are built for the
+    // target `CudaDevice::dp4a_arch` picks from the loaded toolkit's supported
+    // list: `compute_61` while the toolkit still lists it, else the highest
+    // target the device can run. No target means none of them load.
+    let dp4a_arch = match device.dp4a_arch() {
+        Ok(Some(arch)) => {
+            cuda_log!("[CUDA] dp4a kernel family target: {arch}");
+            Some(arch)
+        }
+        Ok(None) => {
+            cuda_log!("[CUDA] dp4a kernel family target: none (the toolkit lists no target this device can run)");
+            None
+        }
+        Err(e) => {
+            cuda_log!("[CUDA] dp4a kernel family target: none ({e})");
+            None
+        }
+    };
+    let load_fn_dp4a = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
+        let arch = dp4a_arch.ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "no NVRTC target for the dp4a kernel '{name}' on this device"
+            ))
+        })?;
+        let module = device.compile_and_load_with_arch(source, arch)?;
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
     // For dp4a kernels: SM 80+ with --use_fast_math (--fmad=true --ftz=true
@@ -3073,11 +3090,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        // dispatch the Q-quant decode matvec + quantize_q8_1 kernels.
-        // Uses load_fn_sm61 (PTX JIT workaround) because compute_80 PTX
-        // from NVRTC fails JIT in this build env; compute_61 PTX is accepted
-        // and `dp4a.s32.s32` PTX inline asm is sm_61+ compatible.
-        quantize_q8_1_rawsum: match load_fn_sm61(
+        // dispatch the Q-quant decode matvec + quantize_q8_1 kernels
+        // (inline `dp4a.s32.s32` PTX, built for the dp4a family's target).
+        quantize_q8_1_rawsum: match load_fn_dp4a(
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_rawsum",
         ) {
@@ -3090,7 +3105,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mul_mat_vec_q_q8_0: match load_fn_sm61(
+        mul_mat_vec_q_q8_0: match load_fn_dp4a(
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "mul_mat_vec_q_q8_0",
         ) {
@@ -3103,7 +3118,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mul_mat_vec_q_q4_0: match load_fn_sm61(
+        mul_mat_vec_q_q4_0: match load_fn_dp4a(
             shaders::MMV_Q_DP4A_KERNEL_SOURCE,
             "mul_mat_vec_q_q4_0",
         ) {
@@ -3117,8 +3132,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // mmv_q_moe kernels (batched MoE FFN matvec).
-        // Same sm_61 workaround.
-        quantize_q8_1_moe: match load_fn_sm61(
+        quantize_q8_1_moe: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_moe",
         ) {
@@ -3131,7 +3145,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        quantize_q8_1_moe_swiglu: match load_fn_sm61(
+        quantize_q8_1_moe_swiglu: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_moe_swiglu",
         ) {
@@ -3144,7 +3158,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_gate_up_swiglu_q8_0: match load_fn_sm61(
+        mmv_q_moe_gate_up_swiglu_q8_0: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_gate_up_swiglu_q8_0",
         ) {
@@ -3157,7 +3171,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_down_q8_0: match load_fn_sm61(
+        mmv_q_moe_down_q8_0: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_down_q8_0",
         ) {
@@ -3170,7 +3184,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_gate_up_swiglu_q4_0: match load_fn_sm61(
+        mmv_q_moe_gate_up_swiglu_q4_0: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_gate_up_swiglu_q4_0",
         ) {
@@ -3183,7 +3197,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_down_q4_0: match load_fn_sm61(
+        mmv_q_moe_down_q4_0: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_down_q4_0",
         ) {
@@ -3197,7 +3211,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // Two-term residual-Q8 activation Q4_0 MoE FFN kernels (LUMEN_CUDA_MOE_RESIDUAL_Q8).
-        quantize_q8_1_residual_moe: match load_fn_sm61(
+        quantize_q8_1_residual_moe: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_residual_moe",
         ) {
@@ -3210,7 +3224,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        quantize_q8_1_residual_moe_swiglu: match load_fn_sm61(
+        quantize_q8_1_residual_moe_swiglu: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "quantize_q8_1_residual_moe_swiglu",
         ) {
@@ -3223,7 +3237,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_gate_up_swiglu_q4_0_residual: match load_fn_sm61(
+        mmv_q_moe_gate_up_swiglu_q4_0_residual: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_gate_up_swiglu_q4_0_residual",
         ) {
@@ -3236,7 +3250,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
-        mmv_q_moe_down_q4_0_residual: match load_fn_sm61(
+        mmv_q_moe_down_q4_0_residual: match load_fn_dp4a(
             shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
             "mmv_q_moe_down_q4_0_residual",
         ) {
@@ -3250,11 +3264,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         // BF16 output_proj matvec dispatch.
-        // Uses load_fn_sm61 (compute_80 PTX JIT workaround).
         // BF16 -> F32 conversion is via bit-shift (the upper 16 bits of an
-        // IEEE F32), so no nv_bfloat16 intrinsics are needed and compute_61
-        // PTX is sufficient.
-        mul_mat_vec_f_bf16: match load_fn_sm61(
+        // IEEE F32), so no nv_bfloat16 intrinsics are needed.
+        mul_mat_vec_f_bf16: match load_fn_dp4a(
             shaders::MMV_F_BF16_KERNEL_SOURCE,
             "mul_mat_vec_f_bf16",
         ) {
