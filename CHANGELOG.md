@@ -20,6 +20,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   instead of a fixed 4, and the tiled kernel when one chunk would do. A
   fixed count left a 1.3k-token context to 96 blocks on a 170-SM card. The
   pair is still selected by `LUMEN_CUDA_ATTN_SPLITK` (unchanged defaults).
+- **Warp-per-position split-K attention partial pass**: the QK phase gives a
+  warp to each KV position (coalesced K rows, warp-tree dot) and the value
+  pass runs four positions deep, replacing one lane per position walking the
+  head serially. `LUMEN_CUDA_ATTN_SPLITK_WARP=0` restores the old pass.
 
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a

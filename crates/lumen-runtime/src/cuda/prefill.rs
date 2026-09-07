@@ -1941,7 +1941,10 @@ unsafe fn launch_attention_decode_splitk(
         )));
     }
     let (partial_fn, merge_fn) = match (
-        kernels.attention_decode_splitk_partial.as_ref(),
+        kernels
+            .attention_decode_splitk_partial_warp
+            .as_ref()
+            .or(kernels.attention_decode_splitk_partial.as_ref()),
         kernels.attention_decode_splitk_merge.as_ref(),
     ) {
         (Some(p), Some(m)) => (p, m),
