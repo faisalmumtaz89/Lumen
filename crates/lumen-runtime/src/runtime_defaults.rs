@@ -1217,8 +1217,8 @@ pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
 /// canonical-defaults master switch.
 pub fn attn_splitk_scale_with_context() -> bool {
     match std::env::var("LUMEN_CUDA_ATTN_SPLITK_SCALE") {
-        Ok(v) if v.trim() == "0" => false,
-        Ok(v) if v.trim() == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
         _ => canonical_default_on(),
     }
 }

@@ -1887,21 +1887,23 @@ pub(crate) unsafe fn launch_attention_decode_tiled(
 /// the scratch sizing (`GpuScratch::attn_splitk`); the partial-pass grid uses
 /// [`attn_splitk_chunks`] for the token's actual context.
 pub(crate) const ATTN_SPLITK_S_MAX: u32 = 32;
+const _: () = assert!(crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS <= ATTN_SPLITK_S_MAX);
 
 /// The split count for a decode step over `seq_len` KV positions: one chunk
 /// per [`crate::runtime_defaults::ATTN_SPLITK_CHUNK_POSITIONS`] positions
 /// (`LUMEN_CUDA_ATTN_SPLITK_CHUNK` overrides), at least 1, at most
-/// [`ATTN_SPLITK_S_MAX`]. That target picks the count, not the span: the
-/// kernel divides `seq_len` evenly into the count, so a chunk walks
-/// `seq_len` divided by it — 65 and 64 at a context of 129, 119 at 1300,
-/// and 384 at 12280, where the cap binds; past the cap the count is pinned
-/// and each chunk's walk grows a tile at every further multiple, the price
-/// of bounded scratch (the tiled route's one CTA walks all of it). A fixed
-/// count starved a long
-/// context (24 query heads × 4 chunks on a 170-SM card); scaling with the
-/// context keeps every chunk's serial walk bounded. A count of 1 means the
-/// caller takes the tiled kernel: one chunk plus a merge is the tiled walk
-/// with an extra launch.
+/// [`ATTN_SPLITK_S_MAX`]; or the fixed
+/// [`crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS`] at every context
+/// when `LUMEN_CUDA_ATTN_SPLITK_SCALE=0`. The target picks the count, not
+/// the span: the kernel divides `seq_len` evenly into the count, so a chunk
+/// walks `seq_len` divided by it — 65 and 64 at a context of 129, 119 at
+/// 1300, and 384 at 12280, where the cap binds; past the cap the count is
+/// pinned and each chunk's walk grows a tile at every further multiple, the
+/// price of bounded scratch (the tiled route's one CTA walks all of it). A
+/// fixed count starved a long context (24 query heads × 4 chunks on a
+/// 170-SM card); scaling with the context keeps every chunk's serial walk
+/// bounded up to the cap. A count of 1 means the caller takes the tiled kernel when it
+/// loaded: one chunk plus a merge is the tiled walk with an extra launch.
 pub(crate) fn attn_splitk_chunks(seq_len: u32) -> u32 {
     if !crate::runtime_defaults::attn_splitk_scale_with_context() {
         return crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS;
@@ -3559,7 +3561,7 @@ mod attn_splitk_chunk_tests {
         for seq_len in 1u32..20_000 {
             let count = attn_splitk_chunk_count(seq_len, ATTN_SPLITK_CHUNK_POSITIONS);
             if count == 1 {
-                continue; // the tiled kernel serves these
+                continue; // one chunk: the whole context, nothing to partition
             }
             let span = seq_len.div_ceil(count);
             let mut next = 0u32;

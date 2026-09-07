@@ -27,8 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Split-K decode attention scales its split count with the context**: the
   count is the context length divided by 128 KV positions
   (`LUMEN_CUDA_ATTN_SPLITK_CHUNK` sets the divisor), rounded up and capped at
-  32, instead of a fixed 4; where that count is 1 the tiled kernel runs and
-  the pair's merge launch is not paid. The context is then split evenly into
+  32, instead of a fixed 4; where that count is 1 the tiled kernel runs (when
+  it loaded) and the pair's merge launch is not paid. The context is then split evenly into
   that many chunks, so a chunk walks the divisor or less until the cap binds
   (above a 4096-token context at the default), and the context divided by 32
   beyond it. A fixed count left a 1.3k-token context to 96 blocks on a
