@@ -1646,7 +1646,8 @@ pub fn output_proj_clone_decision(
 /// caches into 3.80 GB free and then decodes with the 0.45 GB left, which a
 /// 512 MiB reserve refused. Both figures are from loads that cached every
 /// quantised projection, which is now [`F16_CACHE_ENV`]'s path; by default
-/// the total the margin sits on covers F32 projections only.
+/// the total the margin sits on covers the F32 projections and the quantised
+/// K/V or up beside an F32 Q or gate.
 pub const F16_CACHE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Set to a truthy value to build the F16 dequant caches even when
