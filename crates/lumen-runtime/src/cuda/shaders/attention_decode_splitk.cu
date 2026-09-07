@@ -299,3 +299,164 @@ extern "C" __global__ void attention_decode_splitk_merge(
         attn_out[head * head_dim + d] = acc * inv_l;
     }
 }
+
+// ---------------------------------------------------------------------------
+// attention_decode_splitk_partial_warp: the same partial pass with a warp per
+// KV position in the QK phase and a four-position unroll in the PV phase.
+//
+// The lane-per-position QK loop above has each lane walk head_dim alone,
+// with 32 lanes of a warp touching 32 different K rows: latency-bound at
+// ~30 % of the card's bandwidth on a 1.3k-token context (RTX 5090 census,
+// 2026-09-07). Here the four warps of the CTA take four positions per step;
+// each lane loads one float4 of the K row (head_dim = 128 lanes*4, or several
+// per lane for larger head_dim), so a warp reads a contiguous 512-byte row,
+// and the dot product is a warp xor tree. The PV phase keeps thread-per-dim
+// (coalesced across the CTA) and accumulates four positions into four
+// independent chains. Same tile bookkeeping, same online-softmax rescale,
+// same outputs as the kernel above; summation order differs (a warp tree
+// and four chains), so it is not bit-identical to it.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void attention_decode_splitk_partial_warp(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ m_part,
+    float* __restrict__ l_part,
+    float* __restrict__ o_part,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks)
+{
+    unsigned int blk = blockIdx.x;
+    unsigned int head = blk / num_chunks;
+    unsigned int chunk = blk % num_chunks;
+    if (head >= num_heads) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;
+    unsigned int lane = tid & 31u;
+    unsigned int warp = tid >> 5;
+    unsigned int num_warps = block_size >> 5;
+    unsigned int chunk_span = (seq_len + num_chunks - 1u) / num_chunks;
+    unsigned int p0 = chunk * chunk_span;
+    unsigned int p1 = p0 + chunk_span;
+    if (p1 > seq_len) p1 = seq_len;
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+    const float* q_head = q + head * head_dim;
+    unsigned long long kv_base =
+        (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)head_dim;
+    extern __shared__ float smem[];
+    volatile float* partial = smem;
+    float* q_row = smem + 8;
+    float* s_tile = smem + 8 + head_dim;
+    for (unsigned int d = tid; d < head_dim; d += block_size) {
+        q_row[d] = q_head[d];
+    }
+    __syncthreads();
+    // One float4 of the row per lane per 128 dims.
+    const unsigned int quads = head_dim >> 7;   // head_dim / 128 float4s per lane
+    float m_prev = NEG_INF;
+    float l_prev = 0.0f;
+    constexpr unsigned int MAX_SLOTS = 8u;
+    float o_acc[MAX_SLOTS];
+#pragma unroll
+    for (unsigned int s = 0; s < MAX_SLOTS; s++) {
+        o_acc[s] = 0.0f;
+    }
+    unsigned int num_slots = (head_dim + block_size - 1u) / block_size;
+    if (p0 < p1) {
+        unsigned int num_tiles = (p1 - p0 + T_C - 1u) / T_C;
+        for (unsigned int tile = 0; tile < num_tiles; tile++) {
+            unsigned int tile_start = p0 + tile * T_C;
+            unsigned int tile_end_raw = tile_start + T_C;
+            unsigned int tile_end = (tile_end_raw < p1) ? tile_end_raw : p1;
+            unsigned int tile_len = tile_end - tile_start;
+            // QK: a warp per position, a float4 per lane per 128 dims.
+            for (unsigned int j = warp; j < T_C; j += num_warps) {
+                float dot = 0.0f;
+                if (j < tile_len) {
+                    unsigned int pos = tile_start + j;
+                    const float4* k4 = reinterpret_cast<const float4*>(
+                        k_cache + kv_base + (unsigned long long)pos * (unsigned long long)head_dim);
+                    const float4* q4 = reinterpret_cast<const float4*>(q_row);
+                    for (unsigned int qd = 0; qd < quads; qd++) {
+                        unsigned int i = qd * 32u + lane;
+                        float4 kk = k4[i];
+                        float4 qq = q4[i];
+                        dot += qq.x * kk.x + qq.y * kk.y + qq.z * kk.z + qq.w * kk.w;
+                    }
+                    dot = splitk_warp_sum(dot) * scale;
+                } else {
+                    dot = NEG_INF;
+                }
+                if (lane == 0) s_tile[j] = dot;
+            }
+            __syncthreads();
+            float local_max = NEG_INF;
+            for (unsigned int j = tid; j < T_C; j += block_size) {
+                local_max = fmaxf(local_max, s_tile[j]);
+            }
+            float tile_max = splitk_block_reduce_max(local_max, partial, tid, block_size);
+            float m_new = fmaxf(m_prev, tile_max);
+            float rescale = expf(m_prev - m_new);
+            for (unsigned int j = tid; j < T_C; j += block_size) {
+                if (j < tile_len) {
+                    s_tile[j] = expf(s_tile[j] - m_new);
+                } else {
+                    s_tile[j] = 0.0f;
+                }
+            }
+            __syncthreads();
+            float local_sum = 0.0f;
+            for (unsigned int j = tid; j < T_C; j += block_size) {
+                local_sum += s_tile[j];
+            }
+            float tile_sum = splitk_block_reduce_sum(local_sum, partial, tid, block_size);
+            float l_new = rescale * l_prev + tile_sum;
+            // PV: thread per dim, four positions per step into four chains.
+#pragma unroll
+            for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+                if (slot >= num_slots) break;
+                unsigned int d = tid + slot * block_size;
+                if (d < head_dim) {
+                    const float* vcol = v_cache + kv_base
+                        + (unsigned long long)tile_start * (unsigned long long)head_dim
+                        + (unsigned long long)d;
+                    float pv0 = 0.0f, pv1 = 0.0f, pv2 = 0.0f, pv3 = 0.0f;
+                    unsigned int j = 0;
+                    for (; j + 4u <= tile_len; j += 4u) {
+                        unsigned long long o = (unsigned long long)j * (unsigned long long)head_dim;
+                        pv0 += s_tile[j]      * vcol[o];
+                        pv1 += s_tile[j + 1u] * vcol[o + head_dim];
+                        pv2 += s_tile[j + 2u] * vcol[o + 2ull * head_dim];
+                        pv3 += s_tile[j + 3u] * vcol[o + 3ull * head_dim];
+                    }
+                    for (; j < tile_len; j++) {
+                        pv0 += s_tile[j] * vcol[(unsigned long long)j * (unsigned long long)head_dim];
+                    }
+                    o_acc[slot] = rescale * o_acc[slot] + ((pv0 + pv1) + (pv2 + pv3));
+                }
+            }
+            m_prev = m_new;
+            l_prev = l_new;
+            __syncthreads();
+        }
+    }
+    if (tid == 0u) {
+        m_part[head * num_chunks + chunk] = m_prev;
+        l_part[head * num_chunks + chunk] = l_prev;
+    }
+#pragma unroll
+    for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+        if (slot >= num_slots) break;
+        unsigned int d = tid + slot * block_size;
+        if (d < head_dim) {
+            o_part[((unsigned long long)head * num_chunks + chunk)
+                   * (unsigned long long)head_dim + d] = o_acc[slot];
+        }
+    }
+}

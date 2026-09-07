@@ -1190,6 +1190,19 @@ pub fn attn_splitk_enabled() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_ATTN_SPLITK_WARP=0`: kill-switch for the split-K partial pass
+/// that gives a warp to each KV position in the QK phase (coalesced K rows,
+/// a warp tree for the dot) and unrolls the PV phase four positions deep.
+/// Default ON when the split-K pair is selected; summation order differs
+/// from the lane-per-position kernel.
+pub fn attn_splitk_warp_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_SPLITK_WARP") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
 /// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
 /// `matvec_bf16_v4` (+0.303 ms/token engine ABBA on H100; leaf 18.369 vs
@@ -1800,6 +1813,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
+    "LUMEN_CUDA_ATTN_SPLITK_WARP",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -3916,6 +3930,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_ATTN_SPLITK_WARP",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
