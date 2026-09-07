@@ -213,6 +213,8 @@ pub const PREFILL_ELEMENTWISE_KERNEL_SOURCE: &str = include_str!("prefill_elemen
 /// (4-row batch variant). Both use online softmax with tile-level rescaling for
 /// numerically stable attention without materializing the full score matrix.
 pub const FLASH_ATTENTION_KERNEL_SOURCE: &str = include_str!("flash_attention.cu");
+/// Causal row softmax for the tiled (SGEMM) prefill attention.
+pub const ATTN_SOFTMAX_CAUSAL_KERNEL_SOURCE: &str = include_str!("attn_softmax_causal.cu");
 
 /// Tensor-core Flash Attention v2 (WMMA via inline PTX, SM 80+).
 ///
