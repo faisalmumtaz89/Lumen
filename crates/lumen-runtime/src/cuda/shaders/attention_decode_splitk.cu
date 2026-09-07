@@ -7,7 +7,8 @@
 // ~1.4% of maximum resident-warp capacity — and each CTA walks its KV tiles
 // serially,
 // so per-call latency grows linearly with seq_len. This variant splits the
-// sequence into ATTN_SPLITK_S chunks per head:
+// sequence into S chunks per head, S being the count the host derives from
+// the context length and passes to both passes:
 //
 //   pass 1 (attention_decode_splitk_partial, grid = num_heads * S):
 //     chunk c of head h runs the SAME tile walk as the tiled kernel over

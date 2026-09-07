@@ -9,12 +9,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
-- **Split-K decode attention scales its split count with the context**: one
-  chunk per 128 KV positions (`LUMEN_CUDA_ATTN_SPLITK_CHUNK`), at most 32,
-  instead of a fixed 4, and the tiled kernel when one chunk would do. A
-  fixed count left a 1.3k-token context to 96 blocks on a 170-SM card. The
-  pair is still selected by `LUMEN_CUDA_ATTN_SPLITK` (unchanged defaults).
-
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a
   run does not stop at an end-of-generation token before `max_tokens`. CUDA
@@ -27,6 +21,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   included, their count, the finish reason and the request's EOS set; while
   set, streaming requests and requests with stop sequences are rejected before
   decoding.
+
+### Changed
+
+- **Split-K decode attention scales its split count with the context**: the
+  count is the context length divided by 128 KV positions
+  (`LUMEN_CUDA_ATTN_SPLITK_CHUNK` sets the divisor), rounded up and capped at
+  32, instead of a fixed 4; where that count is 1 the tiled kernel runs and
+  the pair's merge launch is not paid. The context is then split evenly into
+  that many chunks, so a chunk walks the divisor or less until the cap binds
+  (above a 4096-token context at the default), and the context divided by 32
+  beyond it. A fixed count left a 1.3k-token context to 96 blocks on a
+  170-SM card, each walking a quarter of the context serially.
+
+  Which models take the pair at all is unchanged (`LUMEN_CUDA_ATTN_SPLITK`),
+  and for a Q4-body model the pair is off by default — the measurements below
+  needed `LUMEN_CUDA_ATTN_SPLITK=1`. For the classes that take it by default
+  (dense Q8_0 and BF16 bodies) the split count changes from a fixed 4 to the
+  context-scaled count at most context lengths, so their greedy output can
+  differ from 0.24.0 where the merge lands on a near-tie: the cross-chunk
+  merge sums in an order that follows the count, which the kernel has always
+  documented as a near-tie against the tiled route rather than
+  byte-identical. Those defaults ship with the scaled count: on Qwen3.5-9B
+  Q8_0 (RTX 5090, default settings) generated text was md5-identical to
+  0.24.0 at 30, 330 and 1.3k tokens of context and decode gained 5.1 % at
+  1.3k, so the DET/GQ banking recorded at the fixed count is superseded
+  pending a re-gate of the default-on classes. `LUMEN_CUDA_ATTN_SPLITK_SCALE=0`
+  restores the fixed 4 at every context for that comparison.
+
+  Measured on an RTX 5090 with Qwen3.8-27B Q4_0 (one artifact, identical
+  bytes across arms, split-K forced on): at a 1.3k-token context 79.3 tok/s
+  against 75.6 at the fixed 4 and 60.0 on the tiled route; at 2.6k, 77.1
+  against 47.4 tiled; on a short prompt 80.7. Generated text was md5-identical
+  to the tiled route at 660, 1.3k and 2.6k tokens of context, and differed at
+  330. The build measured did not materialise F16 dequant caches for the
+  artifact's quantised projections; with them it does not fit a 2048-token
+  context on a 32 GB card.
 
 ## [0.24.0] — 2026-09-06
 

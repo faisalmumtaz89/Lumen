@@ -1891,13 +1891,33 @@ pub(crate) const ATTN_SPLITK_S_MAX: u32 = 32;
 /// The split count for a decode step over `seq_len` KV positions: one chunk
 /// per [`crate::runtime_defaults::ATTN_SPLITK_CHUNK_POSITIONS`] positions
 /// (`LUMEN_CUDA_ATTN_SPLITK_CHUNK` overrides), at least 1, at most
-/// [`ATTN_SPLITK_S_MAX`]. A fixed count starved a long context (24 query
-/// heads × 4 chunks on a 170-SM card); scaling with the context keeps every
-/// chunk's serial walk bounded. A count of 1 means the caller takes the
-/// tiled kernel: one chunk plus a merge is the tiled walk with an extra launch.
+/// [`ATTN_SPLITK_S_MAX`]. That target picks the count, not the span: the
+/// kernel divides `seq_len` evenly into the count, so a chunk walks
+/// `seq_len` divided by it — 65 and 64 at a context of 129, 119 at 1300,
+/// and 384 at 12280, where the cap binds; past the cap the count is pinned
+/// and each chunk's walk grows a tile at every further multiple, the price
+/// of bounded scratch (the tiled route's one CTA walks all of it). A fixed
+/// count starved a long
+/// context (24 query heads × 4 chunks on a 170-SM card); scaling with the
+/// context keeps every chunk's serial walk bounded. A count of 1 means the
+/// caller takes the tiled kernel: one chunk plus a merge is the tiled walk
+/// with an extra launch.
 pub(crate) fn attn_splitk_chunks(seq_len: u32) -> u32 {
-    let chunk = crate::runtime_defaults::attn_splitk_chunk_positions();
-    seq_len.div_ceil(chunk).clamp(1, ATTN_SPLITK_S_MAX)
+    if !crate::runtime_defaults::attn_splitk_scale_with_context() {
+        return crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS;
+    }
+    attn_splitk_chunk_count(
+        seq_len,
+        crate::runtime_defaults::attn_splitk_chunk_positions(),
+    )
+}
+
+/// Pure arithmetic behind [`attn_splitk_chunks`] (separated for unit
+/// testing), with the target positions per chunk resolved by the caller.
+fn attn_splitk_chunk_count(seq_len: u32, chunk_positions: u32) -> u32 {
+    seq_len
+        .div_ceil(chunk_positions)
+        .clamp(1, ATTN_SPLITK_S_MAX)
 }
 
 /// Split-K shape eligibility: the accumulator slots cover `head_dim` exactly
@@ -2041,7 +2061,11 @@ pub(crate) unsafe fn launch_attention_decode_gated(
             if kernels.attention_decode_splitk_partial.is_some()
                 && kernels.attention_decode_splitk_merge.is_some()
                 && attention_decode_splitk_supports_head_dim(head_dim)
-                && attn_splitk_chunks(seq_len) > 1
+                // One chunk plus a merge is the tiled walk with an extra
+                // launch, so a one-chunk context hands off to the tiled
+                // kernel, but only when that kernel is there to take it.
+                && (attn_splitk_chunks(seq_len) > 1
+                    || kernels.attention_decode_tiled.is_none())
             {
                 launch_attention_decode_splitk(
                     device,
@@ -3480,4 +3504,73 @@ pub(crate) unsafe fn launch_cublas_gemm_bf16(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod attn_splitk_chunk_tests {
+    //! Split-count and partition tests for the split-K decode-attention
+    //! pair. Both are hardware-independent: the count is pure Rust over the
+    //! resolved target, and the partition mirrors the bounds the partial
+    //! kernel derives from `seq_len` and the count.
+
+    use super::{attn_splitk_chunk_count, ATTN_SPLITK_S_MAX};
+    use crate::runtime_defaults::ATTN_SPLITK_CHUNK_POSITIONS;
+
+    /// The count at the shipping target: one chunk per 128 KV positions,
+    /// never below 1, never above the scratch bound.
+    #[test]
+    fn chunk_count_at_the_default_target() {
+        for (seq_len, want) in [
+            (0u32, 1u32),
+            (1, 1),
+            (127, 1),
+            (128, 1),
+            (129, 2),
+            (512, 4),
+            (1300, 11),
+            (4096, 32),
+            (4097, 32),
+            (u32::MAX, 32),
+        ] {
+            assert_eq!(
+                attn_splitk_chunk_count(seq_len, ATTN_SPLITK_CHUNK_POSITIONS),
+                want,
+                "seq_len={seq_len}"
+            );
+        }
+    }
+
+    /// A larger target yields proportionally fewer chunks, and the cap still
+    /// binds from above.
+    #[test]
+    fn chunk_count_follows_the_target() {
+        assert_eq!(attn_splitk_chunk_count(1300, 256), 6);
+        assert_eq!(attn_splitk_chunk_count(1300, 1300), 1);
+        assert_eq!(attn_splitk_chunk_count(1300, u32::MAX), 1);
+        assert_eq!(attn_splitk_chunk_count(u32::MAX, 128), ATTN_SPLITK_S_MAX);
+    }
+
+    /// The chunks the partial kernel derives cover [0, seq_len) exactly:
+    /// chunk c walks [c * span, min((c + 1) * span, seq_len)) with
+    /// span = seq_len divided by the count, rounded up. No gap, no overlap,
+    /// no empty chunk, at every context routed to the pair.
+    #[test]
+    fn chunks_partition_the_context_without_gap_or_overlap() {
+        for seq_len in 1u32..20_000 {
+            let count = attn_splitk_chunk_count(seq_len, ATTN_SPLITK_CHUNK_POSITIONS);
+            if count == 1 {
+                continue; // the tiled kernel serves these
+            }
+            let span = seq_len.div_ceil(count);
+            let mut next = 0u32;
+            for chunk in 0..count {
+                let p0 = chunk * span;
+                let p1 = (p0 + span).min(seq_len);
+                assert_eq!(p0, next, "seq_len={seq_len} chunk={chunk}: gap or overlap");
+                assert!(p0 < p1, "seq_len={seq_len} chunk={chunk}: empty chunk");
+                next = p1;
+            }
+            assert_eq!(next, seq_len, "seq_len={seq_len}: chunks left a tail");
+        }
+    }
 }
