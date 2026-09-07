@@ -44,6 +44,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   byte-identical output above was measured with them in.
   `LUMEN_CUDA_F16_CACHE=1` builds the copies as before.
 
+### Fixed
+
+- **Aligned output heads no longer dispatch the raw-layout dp4a kernels**: the
+  padded Q4/Q8 head arms could hand 20/36-byte blocks to `mul_mat_vec_q_*`,
+  which read 18/34-byte raw blocks, producing wrong logits. No artifact the
+  converter produces today builds an aligned head (every supported
+  architecture is a GDN model); a legacy non-GDN artifact would.
+- **dp4a kernels load on CUDA 13**: fourteen kernels written against inline-PTX
+  `dp4a` were compiled for a fixed `compute_61`, a target CUDA 13's NVRTC no
+  longer accepts, so on such toolkits none of them loaded and their routes
+  silently fell back (the Q5_K ssm_out route to an F16 image). The target now
+  comes from the toolkit's own supported list: `compute_61` wherever it is still
+  listed, otherwise the highest target the device can run; the choice is logged
+  under `LUMEN_CUDA_VERBOSE=1`.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed

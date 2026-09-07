@@ -9600,67 +9600,6 @@ impl CudaBackend {
 
         // Prefer Q4Aligned dp4a (highest priority for Q4_0), then smem, then scalar.
         if let Some(ref proj_q4a) = st.globals.output_proj_q4_aligned {
-            // Path -1: Q4_0 final-projection matvec dispatch
-            // for the Q4 output_proj. Env-gated `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1`.
-            // Default OFF preserves existing Q4Aligned dp4a path (byte-identical).
-            if super::moe::mmv_q_output_proj_enabled() {
-                let out_dim_u32 = vocab_size as u32;
-                let in_dim_u32 = hidden_dim as u32;
-                if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
-                    st.kernels.quantize_q8_1_rawsum.as_ref(),
-                    st.kernels.mul_mat_vec_q_q4_0.as_ref(),
-                    st.scratch.input_q8_1.as_mut(),
-                ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q4: Once = Once::new();
-                    TRACE_ONCE_Q4.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q4_0 output_proj: ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
-                    let quant_grid = (in_dim_u32 + 31) / 32;
-                    let quant_cfg = CudarcLaunchConfig {
-                        grid_dim: (quant_grid, 1, 1),
-                        block_dim: (32, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(quant_fn)
-                            .arg(&st.scratch.normed)
-                            .arg(&mut **q8_1_buf)
-                            .arg(&in_dim_u32)
-                            .launch(quant_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("quantize_q8_1_rawsum output_proj Q4: {e}"))
-                    })?;
-
-                    let mv_cfg = CudarcLaunchConfig {
-                        grid_dim: (out_dim_u32, 1, 1),
-                        block_dim: (32, 4, 1),
-                        shared_mem_bytes: 128,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(mv_fn)
-                            .arg(proj_q4a)
-                            .arg(&**q8_1_buf)
-                            .arg(&mut st.logits_gpu)
-                            .arg(&in_dim_u32)
-                            .arg(&out_dim_u32)
-                            .launch(mv_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 output_proj: {e}"))
-                    })?;
-                    return Ok(());
-                }
-            }
-
             // Q4Aligned dp4a: pre-quantize normed x to Q8_1, then aligned dp4a matvec.
             if let (Some(ref quant_fn), Some(ref mv_fn)) = (
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
@@ -10007,69 +9946,6 @@ impl CudaBackend {
             let out_dim_u32 = vocab_size as u32;
             let in_dim_u32 = hidden_dim as u32;
 
-            // Path -1: Q8_0 final-projection matvec dispatch
-            // for the Q8 output_proj. Env-gated `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=1`.
-            // Default OFF preserves existing Q8Aligned dp4a path (byte-identical).
-            //
-            // measures matvec_q8_0 (this single call) at 807 µs × 64 inst
-            // = 51.7 ms / 64-tok = 6.2% TPOT. The mul_mat_vec_q kernel
-            // is purpose-built for batch-1 dense matvec; predicted +3-6% Q8.
-            if super::moe::mmv_q_output_proj_enabled() {
-                if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
-                    st.kernels.quantize_q8_1_rawsum.as_ref(),
-                    st.kernels.mul_mat_vec_q_q8_0.as_ref(),
-                    st.scratch.input_q8_1.as_mut(),
-                ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q8: Once = Once::new();
-                    TRACE_ONCE_Q8.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q8_0 output_proj: ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
-                    let quant_grid = (in_dim_u32 + 31) / 32;
-                    let quant_cfg = CudarcLaunchConfig {
-                        grid_dim: (quant_grid, 1, 1),
-                        block_dim: (32, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(quant_fn)
-                            .arg(&st.scratch.normed)
-                            .arg(&mut **q8_1_buf)
-                            .arg(&in_dim_u32)
-                            .launch(quant_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("quantize_q8_1_rawsum output_proj: {e}"))
-                    })?;
-
-                    let mv_cfg = CudarcLaunchConfig {
-                        grid_dim: (out_dim_u32, 1, 1),
-                        block_dim: (32, 4, 1),
-                        shared_mem_bytes: 128,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(mv_fn)
-                            .arg(proj_q8a)
-                            .arg(&**q8_1_buf)
-                            .arg(&mut st.logits_gpu)
-                            .arg(&in_dim_u32)
-                            .arg(&out_dim_u32)
-                            .launch(mv_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 output_proj: {e}"))
-                    })?;
-                    return Ok(());
-                }
-            }
-
             // Path 0: Q8Aligned + pre-quantized Q8_1 input (NR=2, dp4a).
             // Q8_SCALE_HW: prefer halfword-scale variant for output_proj.
             let aligned_mv_fn = if st.kernels.use_q8_scale_hw {
@@ -10125,13 +10001,13 @@ impl CudaBackend {
                     RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 output_proj: {e}"))
                 })?;
             } else {
-                // Fallback: on-the-fly x quantization.
-                let q8a_fn = st
-                    .kernels
-                    .matvec_q8_0_aligned
-                    .as_ref()
-                    .or(st.kernels.matvec_q8_0_dp4a.as_ref())
-                    .unwrap_or(&st.kernels.matvec_q8_0);
+                // Fallback: on-the-fly x quantization. The padded layout has
+                // exactly one kernel that reads it.
+                let q8a_fn = st.kernels.matvec_q8_0_aligned.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "Q8Aligned output_proj present but matvec_q8_0_aligned unavailable".into(),
+                    )
+                })?;
                 let grid = matvec_q8_0_grid(out_dim_u32);
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (grid, 1, 1),
