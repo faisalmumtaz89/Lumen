@@ -19411,10 +19411,21 @@ impl ComputeBackend for CudaBackend {
         // Benchmarks all 16 tensor-core algorithms + DEFAULT for each unique
         // (M=out_dim, K=in_dim) shape used during F16 decode. Caches the
         // fastest per shape. Only runs if any F16 weights are present.
-        let has_f16 = st
-            .layer_weights_cache
-            .iter()
-            .any(|lw| matches!(&lw.wq, GpuWeightBuf::F16Raw(_)) || lw.wq_f16.is_some());
+        // The loads that tuned before the quantised copies became optional
+        // still tune: a full-attention layer's Q8_0 / Q4_0 wq, raw or
+        // repacked to its aligned form, always had an F16 copy then.
+        let has_f16 = st.layer_weights_cache.iter().any(|lw| {
+            let quantised_wq = matches!(
+                &lw.wq,
+                GpuWeightBuf::Q8Raw(_)
+                    | GpuWeightBuf::Q4Raw(_)
+                    | GpuWeightBuf::Q8Aligned(_)
+                    | GpuWeightBuf::Q4Aligned(_)
+            );
+            matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
+                || (quantised_wq && lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN)
+                || lw.wq_f16.is_some()
+        });
         if has_f16 {
             let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
             let kv_dim = hp_copy.num_kv_heads as usize * hp_copy.head_dim as usize;
