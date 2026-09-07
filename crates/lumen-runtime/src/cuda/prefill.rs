@@ -53,6 +53,8 @@ pub(crate) struct PrefillScratch {
     pub v: CudaSlice<f32>,
     /// Attention output: [batch, q_dim] (filled token-at-a-time).
     pub attn_out: CudaSlice<f32>,
+    /// Score block of the tiled SGEMM prefill attention, grown on demand.
+    pub attn_scores: Option<CudaSlice<f32>>,
     /// Output projection + residual: [batch, hidden_dim].
     pub attn_proj: CudaSlice<f32>,
     /// Gate FFN: [batch, inter_dim].
@@ -207,6 +209,7 @@ pub(crate) fn alloc_prefill_scratch(
         k: device.alloc_zeros(batch * kv_dim)?,
         v: device.alloc_zeros(batch * kv_dim)?,
         attn_out: device.alloc_zeros(batch * q_dim)?,
+        attn_scores: None,
         attn_proj: device.alloc_zeros(batch * hidden_dim)?,
         gate: device.alloc_zeros(batch * inter_dim)?,
         up: device.alloc_zeros(batch * inter_dim)?,
@@ -2701,6 +2704,143 @@ pub(crate) unsafe fn launch_flash_attention_v2(
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("flash_attention_v2 launch: {e}")))?;
 
+    Ok(())
+}
+
+/// Query rows per block of the tiled SGEMM prefill attention: bounds the score
+/// scratch to `group * 512 * kv_len` floats.
+pub(crate) const ATTN_PREFILL_SGEMM_ROWS: usize = 512;
+
+/// Tiled prefill attention in exact F32: for each block of query rows and
+/// each KV head, S = Q·Kᵀ over that head's query group by one strided-batched
+/// SGEMM (the same K for every head of the group), a causal row softmax, then
+/// O = P·V by a second strided-batched SGEMM. Same inputs and outputs as
+/// `launch_flash_attention_br4`; a different summation order, no F16 anywhere.
+///
+/// # Safety
+///
+/// `q` holds `batch * num_heads * head_dim` floats, `attn_out` at least as
+/// many, and the KV cache holds positions `0..pos_start + batch`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn launch_flash_attention_sgemm(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q: &CudaSlice<f32>,
+    kv_cache: &KvCacheGpu,
+    attn_out: &mut CudaSlice<f32>,
+    scores: &mut Option<CudaSlice<f32>>,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+) -> Result<(), RuntimeError> {
+    use cudarc::cublas::StridedBatchedConfig;
+    let softmax_fn = kernels.attn_softmax_causal.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("attention prefill sgemm: softmax kernel unavailable".into())
+    })?;
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "attention prefill sgemm: {num_heads} query heads over {num_kv_heads} KV heads"
+        )));
+    }
+    let group = num_heads / num_kv_heads;
+    let q_dim = num_heads * head_dim;
+    let max_seq = kv_cache.max_seq_len;
+    let kv_total = pos_start + batch;
+    if kv_total > max_seq {
+        return Err(RuntimeError::Compute(format!(
+            "attention prefill sgemm: {kv_total} positions exceed the KV cache's {max_seq}"
+        )));
+    }
+    let rows_max = batch.min(ATTN_PREFILL_SGEMM_ROWS);
+    let needed = group * rows_max * kv_total;
+    if scores.as_ref().map_or(true, |s| s.len() < needed) {
+        *scores = Some(device.alloc_zeros::<f32>(needed)?);
+    }
+    let s_buf = scores.as_mut().unwrap();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut qb = 0usize;
+    while qb < batch {
+        let rows = (batch - qb).min(ATTN_PREFILL_SGEMM_ROWS);
+        let kv_len = pos_start + qb + rows; // causal bound for this block
+        let s_ld = kv_len;
+        for kv_h in 0..num_kv_heads {
+            let h0 = kv_h * group;
+            let k_view = kv_cache.k_cache.slice(kv_h * max_seq * head_dim..);
+            let v_view = kv_cache.v_cache.slice(kv_h * max_seq * head_dim..);
+            let q_view = q.slice(qb * q_dim + h0 * head_dim..);
+            // S[g][i][j] = sum_d Q[i][h0+g][d] * K[j][d]: in cuBLAS's column-major
+            // terms C(kv_len x rows) = K(head_dim x kv_len)^T * Q(head_dim x rows).
+            let cfg = StridedBatchedConfig {
+                gemm: GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: kv_len as i32,
+                    n: rows as i32,
+                    k: head_dim as i32,
+                    alpha: 1.0f32,
+                    lda: head_dim as i32,
+                    ldb: q_dim as i32,
+                    beta: 0.0f32,
+                    ldc: s_ld as i32,
+                },
+                batch_size: group as i32,
+                stride_a: 0,
+                stride_b: head_dim as i64,
+                stride_c: (rows * s_ld) as i64,
+            };
+            device
+                .blas
+                .gemm_strided_batched(cfg, &k_view, &q_view, s_buf)
+                .map_err(|e| RuntimeError::Compute(format!("attention prefill sgemm QK: {e}")))?;
+            let rows_u32 = rows as u32;
+            let kv_u32 = kv_len as u32;
+            let ld_u32 = s_ld as u32;
+            let p0 = (pos_start + qb) as u32;
+            device
+                .stream
+                .launch_builder(softmax_fn)
+                .arg(&mut *s_buf)
+                .arg(&rows_u32)
+                .arg(&kv_u32)
+                .arg(&ld_u32)
+                .arg(&p0)
+                .arg(&scale)
+                .launch(CudarcLaunchConfig {
+                    grid_dim: (rows as u32, group as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| RuntimeError::Compute(format!("attn_softmax_causal_rows: {e}")))?;
+            // O[i][h0+g][d] = sum_j P[g][i][j] * V[j][d]: column-major
+            // C(head_dim x rows) = V(head_dim x kv_len) * P(kv_len x rows).
+            let mut o_view = attn_out.slice_mut(qb * q_dim + h0 * head_dim..);
+            let cfg = StridedBatchedConfig {
+                gemm: GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: head_dim as i32,
+                    n: rows as i32,
+                    k: kv_len as i32,
+                    alpha: 1.0f32,
+                    lda: head_dim as i32,
+                    ldb: s_ld as i32,
+                    beta: 0.0f32,
+                    ldc: q_dim as i32,
+                },
+                batch_size: group as i32,
+                stride_a: 0,
+                stride_b: (rows * s_ld) as i64,
+                stride_c: head_dim as i64,
+            };
+            device
+                .blas
+                .gemm_strided_batched(cfg, &v_view, &*s_buf, &mut o_view)
+                .map_err(|e| RuntimeError::Compute(format!("attention prefill sgemm PV: {e}")))?;
+        }
+        qb += rows;
+    }
     Ok(())
 }
 

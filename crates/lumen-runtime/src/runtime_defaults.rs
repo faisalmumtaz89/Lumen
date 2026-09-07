@@ -1211,6 +1211,20 @@ pub fn attn_splitk_chunk_positions() -> u32 {
     })
 }
 
+/// `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0`: kill-switch for the tiled prefill
+/// attention — cuBLAS F32 SGEMM for Q·Kᵀ and P·V (strided-batched over each
+/// KV head's query group) around an exact-F32 causal softmax, in query blocks
+/// of at most 512 rows. Exact F32 throughout like the scalar kernel it
+/// replaces (no F16 carrier), a different summation order. Default ON for
+/// prefills of 16 tokens or more.
+pub fn attn_prefill_sgemm_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PREFILL_SGEMM") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
 /// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
 /// `matvec_bf16_v4` (+0.303 ms/token engine ABBA on H100; leaf 18.369 vs
@@ -1862,6 +1876,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
+    "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
     "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
@@ -3982,6 +3997,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_BANK3",
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
+        "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",

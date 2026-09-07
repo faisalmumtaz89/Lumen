@@ -26,6 +26,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   instead of a fixed 4, and the tiled kernel when one chunk would do. A
   fixed count left a 1.3k-token context to 96 blocks on a 170-SM card. The
   pair is still selected by `LUMEN_CUDA_ATTN_SPLITK` (unchanged defaults).
+- **Tiled exact-F32 prefill attention**: prefills of 16 tokens or more run
+  attention as cuBLAS F32 SGEMM (Q·Kᵀ and P·V, strided-batched over each KV
+  head's query group) around a causal row softmax, in query blocks of 512
+  rows, replacing the one-warp-per-row scalar kernel (217 ms of a 1.3k-token
+  Qwen3.8-27B prefill on an RTX 5090). Exact F32 throughout, a different
+  summation order. `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0` restores the previous
+  selection.
 
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a

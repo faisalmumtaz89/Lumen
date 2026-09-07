@@ -222,6 +222,8 @@ pub(crate) struct KernelSet {
     // Flash Attention v2 for causal prefill (online softmax)
     pub(crate) flash_attention_v2: CudaFunction,
     pub(crate) flash_attention_br4: CudaFunction,
+    /// Causal row softmax of the tiled SGEMM prefill attention (`LUMEN_CUDA_ATTN_PREFILL_SGEMM`).
+    pub(crate) attn_softmax_causal: Option<CudaFunction>,
 
     // Q8_0 dequantization for batched prefill GEMM (replaces per-row matvec fallback)
     pub(crate) dequant_q8_0_to_f16: CudaFunction,
@@ -1087,6 +1089,16 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             shaders::FLASH_ATTENTION_KERNEL_SOURCE,
             "flash_attention_causal_br4",
         )?,
+        attn_softmax_causal: match load_fn(
+            shaders::ATTN_SOFTMAX_CAUSAL_KERNEL_SOURCE,
+            "attn_softmax_causal_rows",
+        ) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                cuda_log!("[CUDA] attn_softmax_causal_rows: FAILED ({e})");
+                None
+            }
+        },
         dequant_q8_0_to_f16: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f16")?,
         dequant_q8_0_to_f32: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f32")?,
         dequant_q4_0_to_f16: load_fn(

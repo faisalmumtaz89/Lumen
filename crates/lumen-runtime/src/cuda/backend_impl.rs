@@ -18193,6 +18193,24 @@ impl ComputeBackend for CudaBackend {
                 unsafe {
                     if !force_scalar_attn
                         && batch >= 16
+                        && crate::runtime_defaults::attn_prefill_sgemm_enabled()
+                        && st.kernels.attn_softmax_causal.is_some()
+                    {
+                        super::prefill::launch_flash_attention_sgemm(
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            &mut pf.attn_scores,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
+                        )?;
+                    } else if !force_scalar_attn
+                        && batch >= 16
                         && st.kernels.flash_attention_wmma.is_some()
                     {
                         match attn_precise {
