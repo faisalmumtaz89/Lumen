@@ -63,6 +63,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   set, streaming requests and requests with stop sequences are rejected before
   decoding.
 
+### Changed
+
+- **Split-K decode attention scales its split count with the context**: the
+  count is the context length divided by 128 KV positions
+  (`LUMEN_CUDA_ATTN_SPLITK_CHUNK` sets the divisor), rounded up and capped at
+  32, instead of a fixed 4; where that count is 1 the tiled kernel runs (when
+  it loaded) and the pair's merge launch is not paid. The context is then split evenly into
+  that many chunks, so a chunk walks the divisor or less until the cap binds
+  (above a 4096-token context at the default), and the context divided by 32
+  beyond it. A fixed count left a 1.3k-token context to 96 blocks on a
+  170-SM card, each walking a quarter of the context serially.
+
+  Which models take the pair at all is unchanged (`LUMEN_CUDA_ATTN_SPLITK`),
+  and for a Q4-body model the pair is off by default — the measurements below
+  needed `LUMEN_CUDA_ATTN_SPLITK=1`. For the classes that take it by default
+  (dense Q8_0 and BF16 bodies) the split count changes from a fixed 4 to the
+  context-scaled count at most context lengths, so their greedy output can
+  differ from 0.24.0 where the merge lands on a near-tie: the cross-chunk
+  merge sums in an order that follows the count, which the kernel has always
+  documented as a near-tie against the tiled route rather than
+  byte-identical. Those defaults ship with the scaled count: on Qwen3.5-9B
+  Q8_0 (RTX 5090, default settings) generated text was md5-identical to
+  0.24.0 at 30, 330 and 1.3k tokens of context and decode gained 5.1 % at
+  1.3k, so the DET/GQ banking recorded at the fixed count is superseded
+  pending a re-gate of the default-on classes. `LUMEN_CUDA_ATTN_SPLITK_SCALE=0`
+  restores the fixed 4 at every context for that comparison.
+
+  Measured on an RTX 5090 with Qwen3.8-27B Q4_0 (one artifact, identical
+  bytes across arms, split-K forced on): at a 1.3k-token context 79.3 tok/s
+  against 75.6 at the fixed 4 and 60.0 on the tiled route; at 2.6k, 77.1
+  against 47.4 tiled; on a short prompt 80.7. Generated text was md5-identical
+  to the tiled route at 660, 1.3k and 2.6k tokens of context, and differed at
+  330. The build measured did not materialise F16 dequant caches for the
+  artifact's quantised projections; with them it does not fit a 2048-token
+  context on a 32 GB card.
+
+- **No F16 dequant caches for quantised projections**: a full-attention
+  layer's Q/K/V/O and FFN gate/up/down projections no longer get an F16 copy
+  when they are Q8_0 or Q4_0. F32 projections keep theirs, which is the copy
+  decode's HGEMV reads, and so does a quantised K/V beside an F32 Q, or a
+  quantised up beside an F32 gate, because decode's batched HGEMV reads those
+  too. Batched prefill never read the quantised copies — it dequantises each
+  weight into scratch per matmul so its arithmetic matches decode's — so the
+  only other reader was a decode fallback for input dimensions above 24576
+  or for a matvec kernel that failed to load, neither of which the shipping
+  models reach. Measured on one card and one
+  model (RTX 5090, Qwen3.8-27B Q4_0, 2048-token context): 11.9 GB less device
+  memory, byte-identical output, time to first token 92.8 ms at 30 prompt
+  tokens and 720 ms at ~1,300, decode 77.8 tok/s — each within run-to-run
+  noise of the same load with the copies. At a 4096-token context that load
+  admitted the copies and then died out of memory in its first prefill; it
+  runs without them. The memory this frees also lets the memory-aware
+  split-kernel clones be admitted where they were not before; the
+  byte-identical output above was measured with them in.
+  `LUMEN_CUDA_F16_CACHE=1` builds the copies as before.
+
+### Fixed
+
+- **Aligned output heads no longer dispatch the raw-layout dp4a kernels**: the
+  padded Q4/Q8 head arms could hand 20/36-byte blocks to `mul_mat_vec_q_*`,
+  which read 18/34-byte raw blocks, producing wrong logits. No artifact the
+  converter produces today builds an aligned head (every supported
+  architecture is a GDN model); a legacy non-GDN artifact would.
+- **dp4a kernels load on CUDA 13**: fourteen kernels written against inline-PTX
+  `dp4a` were compiled for a fixed `compute_61`, a target CUDA 13's NVRTC no
+  longer accepts, so on such toolkits none of them loaded and their routes
+  silently fell back (the Q5_K ssm_out route to an F16 image). The target now
+  comes from the toolkit's own supported list: `compute_61` wherever it is still
+  listed, otherwise the highest target the device can run; the choice is logged
+  under `LUMEN_CUDA_VERBOSE=1`.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed

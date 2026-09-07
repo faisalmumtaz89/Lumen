@@ -1165,19 +1165,23 @@ pub fn q4_split_wo_probe_enabled() -> bool {
 
 /// `LUMEN_CUDA_ATTN_SPLITK` (model-aware default: ON for Q8_0- and
 /// BF16-body dense models, OFF otherwise): route the full-attention decode
-/// step through the split-K kernel pair (sequence-parallel: heads x 4 chunks
-/// + merge) instead of the one-CTA-per-head tiled kernel. Lifts the
-/// occupancy ceiling on few-head models (27B: 24 CTAs -> 96 + 24) and cuts
-/// each partial CTA's sequence walk to ~1/4 (total work stays linear in
-/// context length). Quality-equivalent
-/// near-tie — the cross-chunk merge sums in a different order than the
-/// tiled kernel's progressive rescale. `=0` opts out, `=1` forces on; unset
-/// resolves model-aware: ON for Q8_0-body and BF16-body dense models (the
-/// classes the engine A/Bs + full GQ/DET gates banked: Q8 +0.195 ms/tok on
-/// A100-SXM, BF16 +0.298 ms/tok on H100), following the canonical-defaults
-/// master switch. Q4-body models stay on the tiled route — the gates run
-/// FAILED Q4 quality with split-K on (near-tie perturbation lands on the
-/// noisier quant), so widening further is a separate, gated decision.
+/// step through the split-K kernel pair (sequence-parallel: one CTA per
+/// query head per chunk, plus a merge) instead of the one-CTA-per-head
+/// tiled kernel. Lifts the occupancy ceiling on few-head models (27B: 24
+/// CTAs -> 24 per chunk, plus a 24-CTA merge) and cuts each partial CTA's
+/// sequence walk to its own chunk (total work stays linear in context
+/// length). The chunk count follows the context length, one chunk per
+/// [`attn_splitk_chunk_positions`] positions; where that count is 1 the
+/// tiled kernel runs instead. Quality-equivalent near-tie — the cross-chunk
+/// merge sums in a different order than the tiled kernel's progressive
+/// rescale, and that order follows the chunk count. `=0` opts out, `=1`
+/// forces on; unset resolves model-aware: ON for Q8_0-body and BF16-body
+/// dense models (the classes the engine A/Bs + full GQ/DET gates banked, at
+/// a fixed 4 chunks: Q8 +0.195 ms/tok on A100-SXM, BF16 +0.298 ms/tok on
+/// H100), following the canonical-defaults master switch. Q4-body models
+/// stay on the tiled route — the gates run FAILED Q4 quality with split-K
+/// on (near-tie perturbation lands on the noisier quant), so widening
+/// further is a separate, gated decision.
 pub fn attn_splitk_enabled() -> bool {
     match std::env::var("LUMEN_CUDA_ATTN_SPLITK") {
         Ok(v) if v == "0" => false,
@@ -1248,6 +1252,97 @@ pub fn attn_prefill_sgemm_enabled() -> bool {
         Ok(v) => v != "0",
         Err(_) => canonical_default_on(),
     })
+}
+
+/// Target KV positions per split-K decode-attention chunk unless
+/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK` says otherwise: one of the kernel's
+/// 128-position tiles. The value picks the chunk *count* — the context
+/// length divided by it, rounded up, capped at the scratch bound — so the
+/// span a chunk actually walks is the context divided by that count: 65 and
+/// 64 at a context of 129, 119 at 1300, 384 at 12280, where the cap binds.
+/// Measured on the RTX 5090 (Qwen3.8-27B, 330 to 2.6k tokens of context):
+/// 128 beat 256 at every length.
+pub const ATTN_SPLITK_CHUNK_POSITIONS: u32 = 128;
+
+/// The split count the split-K pair used at every context through v0.24.0,
+/// and what [`attn_splitk_scale_with_context`] returns to when opted out.
+pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
+
+/// `LUMEN_CUDA_ATTN_SPLITK_SCALE` (default ON, canonical): size the split-K
+/// decode-attention split count from the context. `=0` pins the fixed count
+/// [`ATTN_SPLITK_FIXED_CHUNKS`] at every context, the configuration the
+/// classes that take the pair by default (Q8_0- and BF16-body dense) were
+/// gate-banked under; the scaled count merges a different number of chunks,
+/// a near-tie numerics change on those classes. Follows the
+/// canonical-defaults master switch.
+pub fn attn_splitk_scale_with_context() -> bool {
+    match std::env::var("LUMEN_CUDA_ATTN_SPLITK_SCALE") {
+        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" => true,
+        _ => canonical_default_on(),
+    }
+}
+
+/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK`: target KV positions per split-K attention
+/// chunk (default [`ATTN_SPLITK_CHUNK_POSITIONS`]). The chunk count is the
+/// context length divided by this, rounded up and capped at the scratch
+/// bound; a count of 1 means the tiled kernel runs instead. A value below 128
+/// is raised to 128 (one kernel tile) and an unparseable value is the
+/// default; either substitution is printed once, so a chunk size the operator
+/// wrote and the runtime did not use never passes unnoticed.
+pub fn attn_splitk_chunk_positions() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let (chunk, warning) = parse_attn_splitk_chunk(
+            std::env::var("LUMEN_CUDA_ATTN_SPLITK_CHUNK")
+                .ok()
+                .as_deref(),
+        );
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        chunk
+    })
+}
+
+/// Pure parser behind [`attn_splitk_chunk_positions`] (separated for unit
+/// testing): the resolved chunk size and, when the operator's value was not
+/// used verbatim, the one line the caller prints. A perf knob the runtime
+/// rewrites silently reads as honoured and is not; a typo must still not
+/// abort engine init.
+fn parse_attn_splitk_chunk(raw: Option<&str>) -> (u32, Option<String>) {
+    const ENV: &str = "LUMEN_CUDA_ATTN_SPLITK_CHUNK";
+    let Some(raw) = raw else {
+        return (ATTN_SPLITK_CHUNK_POSITIONS, None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (
+            ATTN_SPLITK_CHUNK_POSITIONS,
+            Some(format!(
+                "[CUDA] {ENV}='{raw}' is empty; using the default \
+                 {ATTN_SPLITK_CHUNK_POSITIONS} KV positions per chunk"
+            )),
+        );
+    }
+    match trimmed.parse::<u32>() {
+        Ok(v) if v >= ATTN_SPLITK_CHUNK_POSITIONS => (v, None),
+        Ok(v) => (
+            ATTN_SPLITK_CHUNK_POSITIONS,
+            Some(format!(
+                "[CUDA] {ENV}='{raw}' is below one kernel tile ({v} < \
+                 {ATTN_SPLITK_CHUNK_POSITIONS}); raised to \
+                 {ATTN_SPLITK_CHUNK_POSITIONS}"
+            )),
+        ),
+        Err(e) => (
+            ATTN_SPLITK_CHUNK_POSITIONS,
+            Some(format!(
+                "[CUDA] {ENV}='{raw}' is not a positive integer ({e}); using \
+                 the default {ATTN_SPLITK_CHUNK_POSITIONS} KV positions per chunk"
+            )),
+        ),
+    }
 }
 
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
@@ -1704,13 +1799,74 @@ pub fn output_proj_clone_decision(
 /// the aligned Q8 repack on a model without GDN layers among them: a Tesla
 /// T4 serving Qwen3.5-9B Q8_0 at an 8192-token context builds 3.36 GB of
 /// caches into 3.80 GB free and then decodes with the 0.45 GB left, which a
-/// 512 MiB reserve refused.
+/// 512 MiB reserve refused. Both figures are from loads that cached every
+/// quantised projection, which is now [`F16_CACHE_ENV`]'s path; by default
+/// the total the margin sits on covers the F32 projections and the quantised
+/// K/V or up beside an F32 Q or gate.
 pub const F16_CACHE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Set to a truthy value to build the F16 dequant caches even when
 /// [`f16_cache_refusal`] would refuse. The refusal is a prediction; this is
 /// the escape hatch when the prediction is wrong for a card.
 pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
+
+/// Set to a truthy value to build F16 dequant caches for the Q8_0 / Q4_0
+/// projections of full-attention layers (Q/K/V/O and the FFN gate/up/down) as
+/// well. By default a projection gets one when it is F32, or when it is a
+/// K/V beside an F32 Q or an up beside an F32 gate: those are the copies
+/// decode's HGEMV reads. Batched prefill dequantises each weight into scratch
+/// per matmul so its arithmetic matches decode's, and never reads these
+/// caches, so the other quantised copies served only the decode fallback
+/// taken for input dimensions above 24576 or for a matvec kernel that failed
+/// to load. Set it on a card where that fallback is the path taken, or to
+/// restore the previous memory profile.
+pub const F16_CACHE_ENV: &str = "LUMEN_CUDA_F16_CACHE";
+
+/// `true` for the values the `LUMEN_CUDA_*` truthy flags accept; unset, and
+/// anything outside that set, is off. Pure so the switch below is testable
+/// without mutating the process environment.
+fn env_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+/// Whether [`F16_CACHE_ENV`] asks for the quantised projections' F16 dequant
+/// caches. Read once, and announced only when it is on: the default is what
+/// every load does, so it is not news.
+pub fn f16_cache_for_quantised() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = env_truthy(std::env::var(F16_CACHE_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "[CUDA] {F16_CACHE_ENV}=ON: the quantised projections get F16 \
+                 dequant caches too"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+mod f16_cache_env_tests {
+    use super::*;
+
+    /// The documented truthy set, and what is outside it. The values are
+    /// arguments, so proving the policy costs no process-environment
+    /// mutation and the test is order-independent.
+    #[test]
+    fn env_truthy_accepts_only_the_documented_values() {
+        for v in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            assert!(env_truthy(Some(v)), "{v} is documented as truthy");
+        }
+        for v in ["0", "", "2", "True", "off", "no", " 1", "1 "] {
+            assert!(!env_truthy(Some(v)), "{v} is not in the truthy set");
+        }
+        assert!(!env_truthy(None), "unset is off");
+    }
+}
 
 /// What the memory query said just before the F16 caches are built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1861,6 +2017,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
+    "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+    "LUMEN_CUDA_ATTN_SPLITK_SCALE",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -1874,6 +2032,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+    "LUMEN_CUDA_F16_CACHE",
     "LUMEN_CUDA_F16_CACHE_FORCE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_FUSED_GLU",
@@ -3727,6 +3886,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attn_splitk_chunk_parse_warns_on_every_substituted_value() {
+        // Unset and any value of one kernel tile or more are taken verbatim
+        // and say nothing; every substitution (empty, sub-tile, negative,
+        // float, garbage) resolves to the default and names the variable.
+        for (raw, want) in [
+            (None, ATTN_SPLITK_CHUNK_POSITIONS),
+            (Some("128"), 128),
+            (Some(" 256 "), 256),
+            (Some("4294967295"), u32::MAX),
+        ] {
+            assert_eq!(parse_attn_splitk_chunk(raw), (want, None), "raw={raw:?}");
+        }
+        for raw in ["", "   ", "0", "1", "127", "-1", "12.5", "abc", "1e9"] {
+            let (chunk, warning) = parse_attn_splitk_chunk(Some(raw));
+            assert_eq!(chunk, ATTN_SPLITK_CHUNK_POSITIONS, "raw={raw:?}");
+            let warning = warning.unwrap_or_else(|| panic!("raw={raw:?} must warn"));
+            assert!(
+                warning.contains("LUMEN_CUDA_ATTN_SPLITK_CHUNK"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn attn_splitk_chunk_default_is_one_kernel_tile() {
+        assert_eq!(ATTN_SPLITK_CHUNK_POSITIONS, 128);
+    }
+
     // ---- F1 + F2: allowlist membership (no false unknown-env typo warning) ----
 
     #[test]
@@ -3978,6 +4166,9 @@ mod tests {
         "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+        "LUMEN_CUDA_ATTN_SPLITK_SCALE",
+        "LUMEN_CUDA_F16_CACHE",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
