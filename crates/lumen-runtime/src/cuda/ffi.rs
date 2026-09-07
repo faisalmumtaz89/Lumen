@@ -119,6 +119,28 @@ impl CudaDevice {
         self.compile_and_load_cached(cuda_source, None, false)
     }
 
+    /// The NVRTC target for this device's own compute capability, or `None`
+    /// when the capability is not one the table knows (a newer part than this
+    /// build): the caller then compiles for NVRTC's default target. PTX built
+    /// for the device's own architecture loads without a JIT-version gap, and
+    /// the target never ages out of the toolkit the way a fixed old one does
+    /// (CUDA 13 dropped `compute_61`).
+    pub fn native_arch(&self) -> Option<&'static str> {
+        Some(match self.compute_capability().ok()? {
+            (6, 1) => "compute_61",
+            (7, 0) => "compute_70",
+            (7, 5) => "compute_75",
+            (8, 0) => "compute_80",
+            (8, 6) => "compute_86",
+            (8, 7) => "compute_87",
+            (8, 9) => "compute_89",
+            (9, 0) => "compute_90",
+            (10, 0) => "compute_100",
+            (12, 0) => "compute_120",
+            _ => return None,
+        })
+    }
+
     /// Compile CUDA source targeting a specific SM architecture.
     ///
     /// Used for kernels requiring specific hardware features (e.g., tensor cores
