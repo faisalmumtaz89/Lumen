@@ -15650,7 +15650,7 @@ impl ComputeBackend for CudaBackend {
             attn_splitk: if kernels.attention_decode_splitk_partial.is_some()
                 && kernels.attention_decode_splitk_merge.is_some()
             {
-                let s = super::prefill::ATTN_SPLITK_S as usize;
+                let s = super::prefill::ATTN_SPLITK_S_MAX as usize;
                 match (
                     self.device.alloc_zeros::<f32>(num_heads * s),
                     self.device.alloc_zeros::<f32>(num_heads * s),

@@ -1190,6 +1190,27 @@ pub fn attn_splitk_enabled() -> bool {
     }
 }
 
+/// KV positions each split-K decode-attention chunk walks unless
+/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK` says otherwise: one of the kernel's
+/// 128-position tiles. Measured on the RTX 5090 (Qwen3.8-27B, 330 to 2.6k
+/// tokens of context): 128 beat 256 at every length.
+pub const ATTN_SPLITK_CHUNK_POSITIONS: u32 = 128;
+
+/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK`: KV positions per split-K attention chunk
+/// (default [`ATTN_SPLITK_CHUNK_POSITIONS`]). The split count is the context
+/// length divided by this, capped at the scratch bound. A value below 128 is
+/// raised to 128 (one kernel tile).
+pub fn attn_splitk_chunk_positions() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LUMEN_CUDA_ATTN_SPLITK_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.max(128))
+            .unwrap_or(ATTN_SPLITK_CHUNK_POSITIONS)
+    })
+}
+
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
 /// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
 /// `matvec_bf16_v4` (+0.303 ms/token engine ABBA on H100; leaf 18.369 vs
@@ -1800,6 +1821,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
+    "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -3916,6 +3938,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
