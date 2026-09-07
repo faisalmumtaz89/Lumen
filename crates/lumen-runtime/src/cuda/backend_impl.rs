@@ -1087,6 +1087,35 @@ fn bf16_gemmex_env_force_off() -> bool {
 /// byte-identical output; when set, every probe site prints. The env is read
 /// once for the whole process (previously each probe site had its own
 /// `OnceLock`; the cached result is identical since the env is constant).
+/// The fused GDN phase-1-2-3 selection for one decode step: whether the F64
+/// twin is the route (mirroring the MoE prefill selection exactly), the kernel
+/// that route uses, and whether the fused route is taken at all (switch,
+/// kernel present, shape). One function so the gate-projection fold, decided
+/// before the gates launch, and the phase launch itself agree.
+fn gdn_p123_selection<'a>(
+    kernels: &'a KernelSet,
+    p: &super::gdn::GdnParams,
+) -> (bool, Option<&'a CudaFunction>, bool) {
+    let use_prefill_f64 = gdn_f64_accum_enabled()
+        && kernels.l2_normalize_qk_strided_f64accum.is_some()
+        && kernels.gdn_prefill_fused_v3_f64accum.is_some()
+        && kernels.gdn_prefill_norm_gate_f64accum.is_some();
+    let p123_fuse_fn = if use_prefill_f64 {
+        kernels.gdn_decode_phase123_fused_f64norm.as_ref()
+    } else {
+        kernels.gdn_decode_phase123_fused.as_ref()
+    };
+    let p123_fused = crate::runtime_defaults::gdn_p123_fuse_enabled()
+        && p123_fuse_fn.is_some()
+        && p.qk_dim == p.num_kv_heads * p.head_dim
+        && p.value_dim == p.num_heads * p.head_dim
+        && p.qkv_dim == 2 * p.qk_dim + p.value_dim
+        && p.head_dim >= 32
+        && p.head_dim % 32 == 0
+        && p.head_dim <= 1024;
+    (use_prefill_f64, p123_fuse_fn, p123_fused)
+}
+
 fn moe_probe_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LUMEN_MOE_PROBE").as_deref() == Ok("1"))
@@ -5964,6 +5993,18 @@ impl CudaBackend {
             // Q8Raw; the F16/MMQ branches use the dequanted cache / Q8 bytes
             // respectively.
             //
+            let (use_prefill_f64, _p123_fuse_fn, p123_fused) = gdn_p123_selection(&st.kernels, &p);
+            // The F32 gate projections ride inside the fused phase kernel's
+            // V-head blocks when that kernel (the plain one, 128-thread blocks)
+            // is the route: bit-identical to the banked gates launch it replaces.
+            let gates_in_p123 = gdn_ab_f32
+                && p123_fused
+                && !use_prefill_f64
+                && p.head_dim == 128
+                && crate::runtime_defaults::gdn_gates_fused_enabled()
+                && st.kernels.gdn_decode_phase123_fused_gates.is_some()
+                && matches!(ssm_alpha_w, GpuWeightBuf::F32(_))
+                && matches!(ssm_beta_w, GpuWeightBuf::F32(_));
             // Source-fidelity F32 gates: prefer the banked custom kernel
             // (BOTH projections in one launch — the tensors are ~1 MB each,
             // so serving them through two cuBLAS SGEMVs pays two fixed launch
@@ -5973,68 +6014,73 @@ impl CudaBackend {
             // weights the source GGUF stores, on the exact activation the
             // prefill projection reads.
             if gdn_ab_f32 {
-                let banked = match (
-                    st.kernels.matvec_f32_gates_banked.as_ref(),
-                    ssm_alpha_w,
-                    ssm_beta_w,
-                ) {
-                    (Some(mv_fn), GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) => {
-                        Some((mv_fn, w_a, w_b))
-                    }
-                    _ => None,
-                };
-                if let Some((mv_fn, w_a, w_b)) = banked {
-                    let out_dim_u32 = p.num_heads as u32;
-                    let in_dim_u32 = hidden_dim as u32;
-                    let mv_cfg = CudarcLaunchConfig {
-                        grid_dim: (2 * out_dim_u32, 1, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 0,
+                // Folded into the fused phase kernel below when `gates_in_p123`.
+                if !gates_in_p123 {
+                    let banked = match (
+                        st.kernels.matvec_f32_gates_banked.as_ref(),
+                        ssm_alpha_w,
+                        ssm_beta_w,
+                    ) {
+                        (Some(mv_fn), GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) => {
+                            Some((mv_fn, w_a, w_b))
+                        }
+                        _ => None,
                     };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(mv_fn)
-                            .arg(w_a)
-                            .arg(w_b)
-                            .arg(&st.scratch.normed)
-                            .arg(&mut gdn.alpha_raw_buf)
-                            .arg(&mut gdn.beta_raw_buf)
-                            .arg(&out_dim_u32)
-                            .arg(&in_dim_u32)
-                            .launch(mv_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_f32_gates_banked L{layer_idx}: {e}"))
-                    })?;
-                } else {
-                    unsafe {
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            ssm_alpha_w,
-                            &st.scratch.normed,
-                            &mut gdn.alpha_raw_buf,
-                            p.num_heads,
-                            hidden_dim,
-                            "gdn_alpha_f32",
-                            None,
-                            Some(&mut st.scratch.input_f16),
-                            None,
-                        )?;
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            ssm_beta_w,
-                            &st.scratch.normed,
-                            &mut gdn.beta_raw_buf,
-                            p.num_heads,
-                            hidden_dim,
-                            "gdn_beta_f32",
-                            None,
-                            Some(&mut st.scratch.input_f16),
-                            None,
-                        )?;
+                    if let Some((mv_fn, w_a, w_b)) = banked {
+                        let out_dim_u32 = p.num_heads as u32;
+                        let in_dim_u32 = hidden_dim as u32;
+                        let mv_cfg = CudarcLaunchConfig {
+                            grid_dim: (2 * out_dim_u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(mv_fn)
+                                .arg(w_a)
+                                .arg(w_b)
+                                .arg(&st.scratch.normed)
+                                .arg(&mut gdn.alpha_raw_buf)
+                                .arg(&mut gdn.beta_raw_buf)
+                                .arg(&out_dim_u32)
+                                .arg(&in_dim_u32)
+                                .launch(mv_cfg)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_f32_gates_banked L{layer_idx}: {e}"
+                            ))
+                        })?;
+                    } else {
+                        unsafe {
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                ssm_alpha_w,
+                                &st.scratch.normed,
+                                &mut gdn.alpha_raw_buf,
+                                p.num_heads,
+                                hidden_dim,
+                                "gdn_alpha_f32",
+                                None,
+                                Some(&mut st.scratch.input_f16),
+                                None,
+                            )?;
+                            launch_matvec(
+                                &self.device,
+                                &st.kernels,
+                                ssm_beta_w,
+                                &st.scratch.normed,
+                                &mut gdn.beta_raw_buf,
+                                p.num_heads,
+                                hidden_dim,
+                                "gdn_beta_f32",
+                                None,
+                                Some(&mut st.scratch.input_f16),
+                                None,
+                            )?;
+                        }
                     }
                 }
             } else if gdn_ab_f16 {
@@ -6614,15 +6660,7 @@ impl CudaBackend {
             let batch_u32 = 1u32;
             let state_pos = gdn.conv_positions[gdn_idx];
 
-            // F64-accum gate: mirror the MoE prefill selection EXACTLY so the
-            // single-token decode recurrence matches the F64 prefill scan to
-            // F64 rounding (the MoE prefill runs these F64 variants by default
-            // via gdn_f64_accum_enabled()). When OFF / twin-missing, use F32.
-            let use_prefill_f64 = gdn_f64_accum_enabled()
-                && st.kernels.l2_normalize_qk_strided_f64accum.is_some()
-                && st.kernels.gdn_prefill_fused_v3_f64accum.is_some()
-                && st.kernels.gdn_prefill_norm_gate_f64accum.is_some();
-
+            let (use_prefill_f64, p123_fuse_fn, p123_fused) = gdn_p123_selection(&st.kernels, &p);
             // [GDNSTATE] one-time path diagnostic (env LUMEN_MOE_PROBE=1).
             {
                 let probe = moe_probe_enabled();
@@ -6636,61 +6674,87 @@ impl CudaBackend {
                     );
                 }
             }
-
-            // Fused phase-123 route (LUMEN_CUDA_GDN_P123_FUSE=1): one launch
-            // replaces launches 1-3 below on the dense F32 path. The kernel
-            // clones each per-channel/per-head op sequence verbatim, so
-            // conv_out/conv_state/alpha/beta are bit-identical to the chain.
-            // F64 recurrence uses the f64norm twin (phase-3 L2 accumulates in
-            // F64, bit-identical to the F64 three-launch chain); F32 keeps the
-            // original fused kernel.
-            let p123_fuse_fn = if use_prefill_f64 {
-                st.kernels.gdn_decode_phase123_fused_f64norm.as_ref()
-            } else {
-                st.kernels.gdn_decode_phase123_fused.as_ref()
-            };
-            let p123_fused = crate::runtime_defaults::gdn_p123_fuse_enabled()
-                && p123_fuse_fn.is_some()
-                && p.qk_dim == p.num_kv_heads * p.head_dim
-                && p.value_dim == p.num_heads * p.head_dim
-                && p.qkv_dim == 2 * p.qk_dim + p.value_dim
-                && p.head_dim >= 32
-                && p.head_dim % 32 == 0
-                && p.head_dim <= 1024;
             if p123_fused {
-                let fuse_fn = p123_fuse_fn.unwrap();
                 let grid = 2 * num_kv_heads_u32 + num_heads_u32;
                 let launch_cfg = CudarcLaunchConfig {
                     grid_dim: (grid, 1, 1),
                     block_dim: (head_dim_u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fuse_fn)
-                        .arg(&gdn.qkv_buf)
-                        .arg(&mut gdn.conv_states[gdn_idx])
-                        .arg(conv1d_weight)
-                        .arg(&mut gdn.qkv_conv_buf)
-                        .arg(&gdn.alpha_raw_buf)
-                        .arg(&gdn.beta_raw_buf)
-                        .arg(dt_bias)
-                        .arg(ssm_a)
-                        .arg(&mut gdn.alpha_buf)
-                        .arg(&mut gdn.beta_buf)
-                        .arg(&num_kv_heads_u32)
-                        .arg(&num_heads_u32)
-                        .arg(&head_dim_u32)
-                        .arg(&qk_dim_u32)
-                        .arg(&qkv_dim_u32)
-                        .arg(&kernel_size_u32)
-                        .arg(&state_pos)
-                        .launch(launch_cfg)
+                let gates_in_p123 = gdn_ab_f32
+                    && !use_prefill_f64
+                    && p.head_dim == 128
+                    && crate::runtime_defaults::gdn_gates_fused_enabled()
+                    && st.kernels.gdn_decode_phase123_fused_gates.is_some()
+                    && matches!(ssm_alpha_w, GpuWeightBuf::F32(_))
+                    && matches!(ssm_beta_w, GpuWeightBuf::F32(_));
+                if gates_in_p123 {
+                    let fuse_fn = st.kernels.gdn_decode_phase123_fused_gates.as_ref().unwrap();
+                    let (GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) =
+                        (ssm_alpha_w, ssm_beta_w)
+                    else {
+                        unreachable!("gates_in_p123 requires F32 gate weights")
+                    };
+                    let hidden_u32 = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fuse_fn)
+                            .arg(&gdn.qkv_buf)
+                            .arg(&mut gdn.conv_states[gdn_idx])
+                            .arg(conv1d_weight)
+                            .arg(&mut gdn.qkv_conv_buf)
+                            .arg(w_a)
+                            .arg(w_b)
+                            .arg(&st.scratch.normed)
+                            .arg(dt_bias)
+                            .arg(ssm_a)
+                            .arg(&mut gdn.alpha_buf)
+                            .arg(&mut gdn.beta_buf)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&num_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&qk_dim_u32)
+                            .arg(&qkv_dim_u32)
+                            .arg(&kernel_size_u32)
+                            .arg(&state_pos)
+                            .arg(&hidden_u32)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "GDN decode p123-fused+gates L{layer_idx}: {e}"
+                        ))
+                    })?;
+                } else {
+                    let fuse_fn = p123_fuse_fn.unwrap();
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(fuse_fn)
+                            .arg(&gdn.qkv_buf)
+                            .arg(&mut gdn.conv_states[gdn_idx])
+                            .arg(conv1d_weight)
+                            .arg(&mut gdn.qkv_conv_buf)
+                            .arg(&gdn.alpha_raw_buf)
+                            .arg(&gdn.beta_raw_buf)
+                            .arg(dt_bias)
+                            .arg(ssm_a)
+                            .arg(&mut gdn.alpha_buf)
+                            .arg(&mut gdn.beta_buf)
+                            .arg(&num_kv_heads_u32)
+                            .arg(&num_heads_u32)
+                            .arg(&head_dim_u32)
+                            .arg(&qk_dim_u32)
+                            .arg(&qkv_dim_u32)
+                            .arg(&kernel_size_u32)
+                            .arg(&state_pos)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("GDN decode p123-fused L{layer_idx}: {e}"))
+                    })?;
                 }
-                .map_err(|e| {
-                    RuntimeError::Compute(format!("GDN decode p123-fused L{layer_idx}: {e}"))
-                })?;
                 gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
             }
 

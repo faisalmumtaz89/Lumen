@@ -341,6 +341,8 @@ pub(crate) struct KernelSet {
     /// launches) — dispatched by default (LUMEN_CUDA_GDN_P123_FUSE=0 opts out) on the
     /// F32 (dense) path.
     pub(crate) gdn_decode_phase123_fused: Option<CudaFunction>,
+    /// The fused phase kernel with the F32 gate projections computed in-block (`LUMEN_CUDA_GDN_GATES_FUSED`).
+    pub(crate) gdn_decode_phase123_fused_gates: Option<CudaFunction>,
     /// F64-recurrence twin of the p123 fusion: phases 1/2 exact F32 clones,
     /// phase-3 L2 norm in F64 (l2_normalize_qk_strided_f64accum's exact
     /// arithmetic) — bit-identical to the F64 three-launch chain.
@@ -1393,6 +1395,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // GDN fused prefill kernels
         gdn_decode_phase123_fused: load_fn(shaders::GDN_KERNEL_SOURCE, "gdn_decode_phase123_fused")
             .ok(),
+        gdn_decode_phase123_fused_gates: load_fn(
+            shaders::GDN_KERNEL_SOURCE,
+            "gdn_decode_phase123_fused_gates",
+        )
+        .ok(),
         gdn_decode_phase123_fused_f64norm: load_fn(
             shaders::GDN_F64ACCUM_KERNEL_SOURCE,
             "gdn_decode_phase123_fused_f64norm",

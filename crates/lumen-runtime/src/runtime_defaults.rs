@@ -1505,6 +1505,19 @@ pub fn gdn_norm_dual_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_GDN_GATES_FUSED=0`: kill-switch for computing the F32 gate
+/// projections (ssm_alpha, ssm_beta of source-fidelity artifacts) inside the
+/// fused GDN phase kernel's V-head blocks instead of a separate launch per
+/// layer. The projection loop and reduction are cloned from the banked gates
+/// kernel, so alpha/beta are bit-identical. Default ON.
+pub fn gdn_gates_fused_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GDN_GATES_FUSED") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_Q4_1_DOWN=0`: kill-switch for the source-fidelity Q4_1
 /// w_down decode route (falls back to the F16 image via HGEMV). Default ON.
 pub fn q4_1_down_enabled() -> bool {
@@ -1836,6 +1849,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
     "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
     "LUMEN_CUDA_GDN_F64_ACCUM",
+    "LUMEN_CUDA_GDN_GATES_FUSED",
     "LUMEN_CUDA_GDN_NG_Q8",
     "LUMEN_CUDA_GDN_NORM_DUAL",
     "LUMEN_CUDA_GDN_P123_FUSE",
@@ -3954,6 +3968,7 @@ mod tests {
         "LUMEN_CUDA_GDN_DECODE_MEGAKERNEL_F64",
         "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
         "LUMEN_CUDA_GDN_F64_ACCUM",
+        "LUMEN_CUDA_GDN_GATES_FUSED",
         "LUMEN_CUDA_GDN_NG_Q8",
         "LUMEN_CUDA_GDN_NORM_DUAL",
         "LUMEN_CUDA_GDN_P123_FUSE",

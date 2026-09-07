@@ -75,6 +75,7 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_BF16_MOE_V3` | ON (no-op on dense/Q8/Q4) | kill-switch | Canonical BF16 MoE V3 FFN path. | `=0` only to A/B the legacy BF16 MoE path. |
 | `LUMEN_CUDA_BF16_AUTOTUNE` | ON | kill-switch | BF16 GEMM autotune selection. | `=0` to pin a fixed BF16 GEMM config. |
 | `LUMEN_CUDA_GDN_NORM_DUAL` | ON | kill-switch | On a GDN layer whose gates need the normalised F32 vector (F32 source gates, or the F16 gate path), the fused norm-and-quantise launch writes that vector too instead of a separate RMSNorm launch per layer. Same reduction and product: bit-identical. | Set to `0` to restore the two launches. |
+| `LUMEN_CUDA_GDN_GATES_FUSED` | ON | kill-switch | On source-fidelity artifacts (F32 gates), the fused GDN phase kernel's V-head blocks compute the two gate projections themselves instead of a separate launch per layer; the loop and reduction are cloned from the banked gates kernel, so alpha/beta are bit-identical. | Set to `0` to restore the separate gates launch. |
 | `LUMEN_CUDA_GDN_REGISTER_RESIDENT` | ON (GDN models) | kill-switch | Register-resident GDN two-launch dispatch (+9.4% Q8, +10.3% Q4). | `=0` to A/B the legacy GDN dispatch. |
 | `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` | ON | kill-switch | BF16 output_proj llama.cpp-parity matvec; load-bearing for the BF16 head path. | `=0` only to A/B output_proj. |
 | `LUMEN_CUDA_MMV_Q_DP4A` | ON | kill-switch | dp4a dense matvec (quality-equivalent; dense-9B Q8 measured byte-identical). | `=0` to fall back to the scalar matvec. |

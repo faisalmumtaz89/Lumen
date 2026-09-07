@@ -959,3 +959,142 @@ extern "C" __global__ void gdn_prefill_norm_gate(
     ssm_out[gate_idx] = silu_g * normed;
 }
 
+// ============================================================================
+// gdn_decode_phase123_fused_gates: the fused phase-1-2-3 kernel with the two
+// F32 gate projections (ssm_alpha, ssm_beta of source-fidelity artifacts)
+// computed inside the V-head CTAs instead of a separate launch. The block is
+// 128 threads (head_dim == 128 required), the same shape as
+// matvec_f32_gates_banked, and the projection loop, fmaf and reduction order
+// are cloned from it verbatim, so alpha/beta are bit-identical to the
+// two-launch chain. Everything else is the fused kernel above unchanged.
+// ============================================================================
+extern "C" __global__ void gdn_decode_phase123_fused_gates(
+    const float* __restrict__ input,      // [qkv_dim] qkv projection (T=1)
+    float* __restrict__ conv_state,       // [buf_slots, qkv_dim] ring R/W
+    const float* __restrict__ conv_weight,// [qkv_dim, kernel_size]
+    float* __restrict__ conv_out,         // [qkv_dim] OUTPUT
+    const float* __restrict__ w_alpha,    // [num_v_heads, hidden] F32 gate weights
+    const float* __restrict__ w_beta,     // [num_v_heads, hidden] F32 gate weights
+    const float* __restrict__ normed,     // [hidden] the F32 normalised activation
+    const float* __restrict__ dt_bias,    // [num_v_heads]
+    const float* __restrict__ ssm_a,      // [num_v_heads] -exp(A_log)
+    float* __restrict__ alpha_out,        // [num_v_heads] OUTPUT
+    float* __restrict__ beta_out,         // [num_v_heads] OUTPUT
+    unsigned int num_kv_heads,
+    unsigned int num_v_heads,
+    unsigned int head_dim,
+    unsigned int qk_dim,
+    unsigned int qkv_dim,
+    unsigned int kernel_size,
+    unsigned int state_pos,
+    unsigned int hidden)
+{
+    __shared__ float shared[33];
+    __shared__ float gate_partial[2][4];
+
+    unsigned int b = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    if (tid >= head_dim) return;
+
+    // Channel this thread owns.
+    unsigned int c;
+    int is_qk;
+    unsigned int v_head = 0;
+    if (b < num_kv_heads) {
+        c = b * head_dim + tid;                       // Q
+        is_qk = 1;
+    } else if (b < 2u * num_kv_heads) {
+        c = qk_dim + (b - num_kv_heads) * head_dim + tid; // K
+        is_qk = 1;
+    } else {
+        v_head = b - 2u * num_kv_heads;
+        c = 2u * qk_dim + v_head * head_dim + tid;    // V
+        is_qk = 0;
+    }
+
+    // ---- phase 1: conv1d + SiLU + ring update (exact T=1 clone) ----
+    unsigned int buf_slots = kernel_size - 1;
+    float inp = input[c];
+    float sum = 0.0f;
+    for (unsigned int tap = 0; tap < buf_slots; tap++) {
+        unsigned int slot = (state_pos + tap) % buf_slots;
+        sum += conv_weight[c * kernel_size + tap] * conv_state[slot * qkv_dim + c];
+    }
+    sum += conv_weight[c * kernel_size + buf_slots] * inp;
+    conv_state[state_pos * qkv_dim + c] = inp;
+    float activated = sum / (1.0f + expf(-sum));
+
+    if (!is_qk) {
+        conv_out[c] = activated;
+        // ---- phase 2a: the two gate projections for this V head, computed
+        // here by the whole 128-thread CTA exactly as matvec_f32_gates_banked
+        // computes them (same lane ownership i = tid, tid+128, ..., fmaf,
+        // the same warp xor tree, the same warp-partial order), so the values
+        // are bit-identical to that kernel's and its launch is not needed. ----
+        {
+            const float* wa = w_alpha + (unsigned long long)v_head * hidden;
+            const float* wb = w_beta + (unsigned long long)v_head * hidden;
+            float acc_a = 0.0f;
+            float acc_b = 0.0f;
+            for (unsigned int i = tid; i < hidden; i += 128u) {
+                float xv = normed[i];
+                acc_a = fmaf(wa[i], xv, acc_a);
+                acc_b = fmaf(wb[i], xv, acc_b);
+            }
+            acc_a = warp_reduce_sum(acc_a);
+            acc_b = warp_reduce_sum(acc_b);
+            unsigned int lane = tid & 31u;
+            unsigned int warp = tid >> 5;
+            if (lane == 0) {
+                gate_partial[0][warp] = acc_a;
+                gate_partial[1][warp] = acc_b;
+            }
+        }
+        __syncthreads();
+        // ---- phase 2b: gates for this V head (exact clone, thread 0) ----
+        if (tid == 0) {
+            float alpha_raw_v = 0.0f;
+            float beta_raw_v = 0.0f;
+#pragma unroll
+            for (int w2 = 0; w2 < 4; w2++) {
+                alpha_raw_v += gate_partial[0][w2];
+                beta_raw_v += gate_partial[1][w2];
+            }
+            float sp_input = alpha_raw_v + dt_bias[v_head];
+            float sp;
+            if (sp_input > 20.0f) {
+                sp = sp_input;
+            } else {
+                sp = logf(1.0f + expf(sp_input));
+            }
+            float gate = ssm_a[v_head] * sp;
+            alpha_out[v_head] = expf(gate);
+            beta_out[v_head] = 1.0f / (1.0f + expf(-beta_raw_v));
+        }
+        return;
+    }
+
+    // ---- phase 3: L2 norm over this head's channels (exact clone: one
+    // element per thread at block_size == head_dim, same reduction tree) ----
+    unsigned int warp_id = tid >> 5;
+    unsigned int lane_id = tid & 31u;
+    unsigned int num_warps = (head_dim + 31) >> 5;
+    float eps = 1e-12f;
+
+    float v = activated;
+    float ss = v * v;
+    ss = warp_reduce_sum(ss);
+    if (lane_id == 0) shared[warp_id] = ss;
+    __syncthreads();
+    float total_ss = 0.0f;
+    if (warp_id == 0) {
+        total_ss = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total_ss = warp_reduce_sum(total_ss);
+    }
+    if (tid == 0) shared[0] = total_ss;
+    __syncthreads();
+    total_ss = shared[0];
+    float norm = sqrtf(total_ss);
+    float scale = (norm > eps) ? (1.0f / norm) : (1.0f / eps);
+    conv_out[c] = v * scale;
+}

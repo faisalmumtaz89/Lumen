@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **Gate projections inside the fused GDN phase kernel**: on source-fidelity
+  artifacts the two F32 gate projections of each GDN layer are computed by the
+  phase kernel's V-head blocks instead of a separate launch (48 launches per
+  token on Qwen3.8-27B). Cloned loop and reduction: bit-identical.
+  `LUMEN_CUDA_GDN_GATES_FUSED=0` restores the separate launch.
+
 - **One norm launch per GDN layer when the gates need the F32 vector**: the
   fused norm-and-quantise kernel gains an entry point that also writes the
   normalised F32 vector, replacing a separate RMSNorm launch on every GDN
