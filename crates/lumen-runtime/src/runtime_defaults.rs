@@ -1493,6 +1493,18 @@ pub fn q5k_ssmout_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_GDN_NORM_DUAL=0`: kill-switch for the GDN norm launch that
+/// writes both the Q8_1 blocks and the normalised F32 vector when the layer's
+/// gates need the F32 form (falls back to a separate RMSNorm launch before the
+/// fused norm-and-quantise). Default ON.
+pub fn gdn_norm_dual_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GDN_NORM_DUAL") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_Q4_1_DOWN=0`: kill-switch for the source-fidelity Q4_1
 /// w_down decode route (falls back to the F16 image via HGEMV). Default ON.
 pub fn q4_1_down_enabled() -> bool {
@@ -1844,6 +1856,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
     "LUMEN_CUDA_GDN_F64_ACCUM",
     "LUMEN_CUDA_GDN_NG_Q8",
+    "LUMEN_CUDA_GDN_NORM_DUAL",
     "LUMEN_CUDA_GDN_P123_FUSE",
     "LUMEN_CUDA_GDN_PREFILL_F64",
     "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
@@ -3962,8 +3975,10 @@ mod tests {
         "LUMEN_CUDA_GDN_DECODE_VIA_PREFILL",
         "LUMEN_CUDA_GDN_F64_ACCUM",
         "LUMEN_CUDA_GDN_NG_Q8",
+        "LUMEN_CUDA_GDN_NORM_DUAL",
         "LUMEN_CUDA_GDN_P123_FUSE",
         "LUMEN_CUDA_GDN_PREFILL_F64",
+        "LUMEN_CUDA_GDN_NORM_DUAL",
         "LUMEN_CUDA_GDN_REGISTER_RESIDENT",
         "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
         "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
