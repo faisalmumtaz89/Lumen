@@ -1590,9 +1590,8 @@ pub fn attention_f16_elements(layer: &LayerWeightsGpu, hp: &ModelHyperparams) ->
 
 /// Whether [`dequant_layer_q8_to_f16`] materialises an F16 copy of this
 /// buffer: F32 projections always, since decode's HGEMV reads the copy;
-/// Q8_0 / Q4_0 ones only when `quantised_cached`, which the caller derives
-/// once from [`crate::runtime_defaults::f16_cache_for_quantised`] and from
-/// [`leads_f32_hgemv_group`] (prefill dequantises into scratch either way).
+/// Q8_0 / Q4_0 ones only when `quantised_cached`, which [`f16_cache_slots`]
+/// derives per slot (prefill dequantises into scratch either way).
 fn makes_f16_cache(w: &GpuWeightBuf, quantised_cached: bool) -> bool {
     // Exhaustive on purpose: a new variant must decide here whether the
     // allocator builds a cache for it, or the fit check under-counts.
@@ -1616,20 +1615,31 @@ pub fn f16_cache_bytes(layer: &LayerWeightsGpu, hp: &ModelHyperparams) -> u64 {
     if layer.layer_type == LAYER_TYPE_GDN {
         return 0;
     }
+    let n = attention_f16_elements(layer, hp);
+    let elems = [n.wq, n.wk, n.wv, n.wo, n.w_gate, n.w_up, n.w_down];
+    let cached = f16_cache_slots(layer);
+    f16_cache_bytes_of(std::array::from_fn(|i| (cached[i], elems[i])))
+}
+
+/// Which of the seven projection slots (wq, wk, wv, wo, w_gate, w_up,
+/// w_down) get an F16 copy. The one place that decides, so the fit check
+/// sizes exactly what [`dequant_layer_q8_to_f16`] builds: each slot by
+/// [`makes_f16_cache`], with a quantised wk/wv beside an F32 wq, and a
+/// quantised w_up beside an F32 w_gate, kept because decode's batched HGEMV
+/// route reads them (see [`leads_f32_hgemv_group`]).
+fn f16_cache_slots(layer: &LayerWeightsGpu) -> [bool; 7] {
     let quantised_cached = crate::runtime_defaults::f16_cache_for_quantised();
     let qkv = quantised_cached || leads_f32_hgemv_group(&layer.wq);
     let ffn = quantised_cached || leads_f32_hgemv_group(&layer.w_gate);
-    let n = attention_f16_elements(layer, hp);
-    let targets: [(&GpuWeightBuf, usize, bool); 7] = [
-        (&layer.wq, n.wq, quantised_cached),
-        (&layer.wk, n.wk, qkv),
-        (&layer.wv, n.wv, qkv),
-        (&layer.wo, n.wo, quantised_cached),
-        (&layer.w_gate, n.w_gate, quantised_cached),
-        (&layer.w_up, n.w_up, ffn),
-        (&layer.w_down, n.w_down, quantised_cached),
-    ];
-    f16_cache_bytes_of(targets.map(|(w, elems, cached)| (makes_f16_cache(w, cached), elems)))
+    [
+        makes_f16_cache(&layer.wq, quantised_cached),
+        makes_f16_cache(&layer.wk, qkv),
+        makes_f16_cache(&layer.wv, qkv),
+        makes_f16_cache(&layer.wo, quantised_cached),
+        makes_f16_cache(&layer.w_gate, quantised_cached),
+        makes_f16_cache(&layer.w_up, ffn),
+        makes_f16_cache(&layer.w_down, quantised_cached),
+    ]
 }
 
 /// Whether this buffer leads a decode group whose batched-HGEMV route reads
@@ -1674,13 +1684,12 @@ pub fn dequant_layer_q8_to_f16(
     // fit check sized. Q8_0 / Q4_0 use their dequant kernels, F32 converts via
     // f32_to_f16_vec; F16Raw is already HGEMM's format and BF16Raw has its own
     // decode kernel, so neither gets a copy.
-    let quantised_cached = crate::runtime_defaults::f16_cache_for_quantised();
     let f32_to_f16_fn = &kernels.f32_to_f16_vec;
     let dequant_weight = |w: &GpuWeightBuf,
                           n: usize,
                           cached: bool|
      -> Result<Option<CudaSlice<u8>>, RuntimeError> {
-        if !makes_f16_cache(w, cached) {
+        if !cached {
             return Ok(None);
         }
         match w {
@@ -1767,15 +1776,14 @@ pub fn dequant_layer_q8_to_f16(
         // Qwen3.5 full-attention layers: wq is [q_dim*2, hidden] (fused Q+gate),
         // so element count must be doubled when attn_q_norm is present.
         let n = attention_f16_elements(layer, hp);
-        let qkv = quantised_cached || leads_f32_hgemv_group(&layer.wq);
-        let ffn = quantised_cached || leads_f32_hgemv_group(&layer.w_gate);
-        layer.wq_f16 = dequant_weight(&layer.wq, n.wq, quantised_cached)?;
-        layer.wk_f16 = dequant_weight(&layer.wk, n.wk, qkv)?;
-        layer.wv_f16 = dequant_weight(&layer.wv, n.wv, qkv)?;
-        layer.wo_f16 = dequant_weight(&layer.wo, n.wo, quantised_cached)?;
-        layer.w_gate_f16 = dequant_weight(&layer.w_gate, n.w_gate, quantised_cached)?;
-        layer.w_up_f16 = dequant_weight(&layer.w_up, n.w_up, ffn)?;
-        layer.w_down_f16 = dequant_weight(&layer.w_down, n.w_down, quantised_cached)?;
+        let cached = f16_cache_slots(layer);
+        layer.wq_f16 = dequant_weight(&layer.wq, n.wq, cached[0])?;
+        layer.wk_f16 = dequant_weight(&layer.wk, n.wk, cached[1])?;
+        layer.wv_f16 = dequant_weight(&layer.wv, n.wv, cached[2])?;
+        layer.wo_f16 = dequant_weight(&layer.wo, n.wo, cached[3])?;
+        layer.w_gate_f16 = dequant_weight(&layer.w_gate, n.w_gate, cached[4])?;
+        layer.w_up_f16 = dequant_weight(&layer.w_up, n.w_up, cached[5])?;
+        layer.w_down_f16 = dequant_weight(&layer.w_down, n.w_down, cached[6])?;
     }
 
     Ok(())

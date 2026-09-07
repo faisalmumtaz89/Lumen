@@ -1656,13 +1656,14 @@ pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
 
 /// Set to a truthy value to build F16 dequant caches for the Q8_0 / Q4_0
 /// projections of full-attention layers (Q/K/V/O and the FFN gate/up/down) as
-/// well. By default only F32 projections get one, and that copy is what
-/// decode's HGEMV reads: batched prefill dequantises each weight into scratch
+/// well. By default a projection gets one when it is F32, or when it is a
+/// K/V beside an F32 Q or an up beside an F32 gate: those are the copies
+/// decode's HGEMV reads. Batched prefill dequantises each weight into scratch
 /// per matmul so its arithmetic matches decode's, and never reads these
-/// caches, so a quantised projection's copy served only the decode fallback
-/// taken for input dimensions above 24576 or when the faster matvec kernels
-/// fail to load. Set it on a card where that fallback is the path taken, or
-/// to restore the previous memory profile.
+/// caches, so the other quantised copies served only the decode fallback
+/// taken for input dimensions above 24576 or for a matvec kernel that failed
+/// to load. Set it on a card where that fallback is the path taken, or to
+/// restore the previous memory profile.
 pub const F16_CACHE_ENV: &str = "LUMEN_CUDA_F16_CACHE";
 
 /// `true` for the values the `LUMEN_CUDA_*` truthy flags accept; unset, and
