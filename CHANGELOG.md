@@ -22,6 +22,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   set, streaming requests and requests with stop sequences are rejected before
   decoding.
 
+### Fixed
+
+- **Aligned output heads no longer dispatch the raw-layout dp4a kernels**: the
+  padded Q4/Q8 head arms could hand 20/36-byte blocks to `mul_mat_vec_q_*`,
+  which read 18/34-byte raw blocks, producing wrong logits. No artifact the
+  converter produces today builds an aligned head (every supported
+  architecture is a GDN model); a legacy non-GDN artifact would.
+
 ## [0.24.0] — 2026-09-06
 
 ### Changed

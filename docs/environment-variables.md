@@ -78,7 +78,7 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` | ON | kill-switch | BF16 output_proj llama.cpp-parity matvec; load-bearing for the BF16 head path. | `=0` only to A/B output_proj. |
 | `LUMEN_CUDA_MMV_Q_DP4A` | ON | kill-switch | dp4a dense matvec (quality-equivalent; dense-9B Q8 measured byte-identical). | `=0` to fall back to the scalar matvec. |
 | `LUMEN_CUDA_MMV_Q_MOE_DP4A` | ON dense; OFF for MoE (model-aware) | kill-switch | MoE batched dp4a matvec (+11.7% Q4). | `=1` to force on for MoE experimentation. |
-| `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` | ON (canonical) | kill-switch | Q8/Q4 output_proj llama.cpp-parity port (within noise floor). | `=0` to A/B output_proj. |
+| `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` | ON (canonical) | kill-switch | Serve a raw-layout Q4_0 or Q8_0 output projection through the llama-style `quantize_q8_1_rawsum` + `mul_mat_vec_q_*` pair instead of Lumen's dp4a matvec. Aligned (padded) heads never take it; those kernels read the raw block layout only. | `=0` to A/B output_proj. |
 | `LUMEN_CUDA_FFN_FUSED_GLU` | model-aware (quant-dense uses dp4a fall-through) | kill-switch | Fused gate+up+SwiGLU FFN. | `=1`/`=0` to A/B the fused vs. split FFN. |
 | `LUMEN_CUDA_MOE_BATCHED` | ON | kill-switch | Batched MoE FFN dispatch. | `=0` to A/B against per-expert dispatch. |
 | `LUMEN_CUDA_MOE_BATCHED_V2` | ON (under `MOE_BATCHED`) | kill-switch | V2 batched MoE FFN variant. | `=0` to drop to V1 batching. |
