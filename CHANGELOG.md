@@ -15,6 +15,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   layer of a source-fidelity Qwen3.8-27B artifact (48 launches per token,
   ~0.2 ms). Same reduction and product, bit-identical output.
   `LUMEN_CUDA_GDN_NORM_DUAL=0` restores the two launches.
+- **Split-K decode attention scales its split count with the context**: one
+  chunk per 128 KV positions (`LUMEN_CUDA_ATTN_SPLITK_CHUNK`), at most 32,
+  instead of a fixed 4, and the tiled kernel when one chunk would do. A
+  fixed count left a 1.3k-token context to 96 blocks on a 170-SM card. The
+  pair is still selected by `LUMEN_CUDA_ATTN_SPLITK` (unchanged defaults).
 
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a
