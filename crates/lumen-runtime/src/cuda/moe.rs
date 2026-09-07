@@ -599,13 +599,11 @@ pub(crate) fn mmv_bf16_output_proj_enabled() -> bool {
     })
 }
 
-/// Phase 2/3: Q8_0/Q4_0 final-projection matvec dispatch
-/// for the Q8/Q4 output_proj (vocab head). When enabled, replaces the existing
-/// `matvec_q8_aligned_q8_1` / `matvec_q4_aligned_q8_1` dispatch in
-/// `compute_final_gpu` with's dp4a-mmvq matvec kernels.
-///
-/// Defaults through `runtime_defaults::mmv_q_output_proj_default()`
-/// (canonical default ON). `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ=0` opts out.
+/// `LUMEN_CUDA_MMV_Q_OUTPUT_PROJ` (default ON under the canonical defaults):
+/// serve a RAW-layout Q4_0 / Q8_0 output projection through the llama-style
+/// `quantize_q8_1_rawsum` + `mul_mat_vec_q_*` pair instead of Lumen's dp4a
+/// matvec. Aligned (padded) heads never take it: those kernels read the raw
+/// block layout only.
 pub(crate) fn mmv_q_output_proj_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

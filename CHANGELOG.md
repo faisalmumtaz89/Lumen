@@ -24,6 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **Aligned output heads no longer dispatch the raw-layout dp4a kernels**: the
+  padded Q4/Q8 head arms could hand 20/36-byte blocks to `mul_mat_vec_q_*`,
+  which read 18/34-byte raw blocks, producing wrong logits. No artifact the
+  converter produces today builds an aligned head (every supported
+  architecture is a GDN model); a legacy non-GDN artifact would.
 - **dp4a kernels load on CUDA 13**: fourteen kernels written against inline-PTX
   `dp4a` were compiled for a fixed `compute_61`, a target CUDA 13's NVRTC no
   longer accepts, so on such toolkits none of them loaded and their routes
