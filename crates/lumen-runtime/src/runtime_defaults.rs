@@ -1493,6 +1493,17 @@ pub fn q5k_ssmout_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_Q4_1_NR4=0`: kill-switch for the four-rows-per-block Q4_1
+/// matvec (falls back to the one-row kernel). Same per-thread block order and
+/// the same warp-partial order, so the totals are bit-identical. Default ON.
+pub fn q4_1_nr4_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_Q4_1_NR4") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_Q4_1_DOWN=0`: kill-switch for the source-fidelity Q4_1
 /// w_down decode route (falls back to the F16 image via HGEMV). Default ON.
 pub fn q4_1_down_enabled() -> bool {
@@ -1860,6 +1871,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_PTX_CACHE",
     "LUMEN_CUDA_PTX_CACHE_DIR",
     "LUMEN_CUDA_Q4_1_DOWN",
+    "LUMEN_CUDA_Q4_1_NR4",
     "LUMEN_CUDA_Q4_B160",
     "LUMEN_CUDA_Q4_DOWN_NR1",
     "LUMEN_CUDA_Q4_F32ACT_KERNEL",

@@ -12735,15 +12735,25 @@ unsafe fn launch_matvec_q4_1_preq8_1(
 ) -> Result<(), RuntimeError> {
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
-    // One row per 256-thread CTA.
+    // Four rows per 256-thread CTA when the four-row kernels loaded and the
+    // switch is on; one row per CTA otherwise.
+    let nr4 = crate::runtime_defaults::q4_1_nr4_enabled()
+        && kernels.matvec_q4_1_nr4.is_some()
+        && kernels.matvec_q4_1_nr4_residual.is_some();
+    let rows_per_block = if nr4 { 4 } else { 1 };
     let mv_cfg = CudarcLaunchConfig {
-        grid_dim: (out_dim_u32, 1, 1),
+        grid_dim: (out_dim_u32.div_ceil(rows_per_block), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
     match residual {
         Some(res) => {
-            let mv_fn = kernels.matvec_q4_1_residual.as_ref().ok_or_else(|| {
+            let mv_fn = if nr4 {
+                kernels.matvec_q4_1_nr4_residual.as_ref()
+            } else {
+                kernels.matvec_q4_1_residual.as_ref()
+            }
+            .ok_or_else(|| {
                 RuntimeError::Compute(format!(
                     "Q4_1 {label} present but matvec_q4_1_residual unavailable"
                 ))
@@ -12761,7 +12771,12 @@ unsafe fn launch_matvec_q4_1_preq8_1(
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1_residual {label}: {e}")))?;
         }
         None => {
-            let mv_fn = kernels.matvec_q4_1.as_ref().ok_or_else(|| {
+            let mv_fn = if nr4 {
+                kernels.matvec_q4_1_nr4.as_ref()
+            } else {
+                kernels.matvec_q4_1.as_ref()
+            }
+            .ok_or_else(|| {
                 RuntimeError::Compute(format!("Q4_1 {label} present but matvec_q4_1 unavailable"))
             })?;
             device

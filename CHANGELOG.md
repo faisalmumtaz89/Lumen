@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **Four rows per block in the Q4_1 matvec**: the source-fidelity Q4_1
+  `ffn_down` kernel reads each Q8_1 input block once per four weight rows,
+  the Q4_0 kernel's layout, instead of once per row. Same accumulation and
+  reduction order, bit-identical output. `LUMEN_CUDA_Q4_1_NR4=0` selects the
+  one-row kernel.
+
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a
   run does not stop at an end-of-generation token before `max_tokens`. CUDA

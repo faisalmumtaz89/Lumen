@@ -106,3 +106,106 @@ void matvec_q4_1_q8_1_residual(
 {
     matvec_q4_1_body(weight, input_q8_1, residual, out, out_dim, in_dim);
 }
+
+// Four rows per block: the Q8_1 input block is loaded once and applied to
+// four weight rows (the matvec_q4_0_dp4a layout), so the activation's bytes
+// are read once per four rows instead of once per row. Each thread still
+// walks the same blocks of each row in the same order, and the warp partials
+// are summed in the same order, so the totals are bit-identical to the
+// one-row kernel above.
+#define Q41_NR4 4
+#define Q41_NWARPS (Q41_THREADS / 32)
+
+__device__ __forceinline__ void matvec_q4_1_nr4_body(
+    const unsigned char* __restrict__ weight,
+    const char* __restrict__ input_q8_1,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    __shared__ float shmem[Q41_NWARPS * Q41_NR4];
+    const unsigned int r0 = blockIdx.x * Q41_NR4;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int nb = in_dim >> 5;
+    const unsigned long long row_bytes = (unsigned long long)nb * 20u;
+
+    float acc[Q41_NR4];
+    #pragma unroll
+    for (int r = 0; r < Q41_NR4; r++) acc[r] = 0.0f;
+
+    for (unsigned int b = threadIdx.x; b < nb; b += Q41_THREADS) {
+        const char* xb = input_q8_1 + (unsigned long long)b * 36u;
+        const float x_scale = q41_f16_to_f32(*(const unsigned short*)xb);
+        const float x_sum = q41_f16_to_f32(*(const unsigned short*)(xb + 2));
+        const int* xq = (const int*)(xb + 4);
+        int xv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) xv[k] = xq[k];
+
+        #pragma unroll
+        for (int r = 0; r < Q41_NR4; r++) {
+            if (r0 + r >= out_dim) break;
+            const unsigned char* blk = weight + (unsigned long long)(r0 + r) * row_bytes + b * 20u;
+            const float d = q41_f16_to_f32(*(const unsigned short*)blk);
+            const float m = q41_f16_to_f32(*(const unsigned short*)(blk + 2));
+            int dot = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const unsigned int w = *(const unsigned int*)(blk + 4 + 4 * k);
+                const int lo = (int)(w & 0x0F0F0F0Fu);
+                const int hi = (int)((w >> 4) & 0x0F0F0F0Fu);
+                dot = q41_dp4a(lo, xv[k], dot);
+                dot = q41_dp4a(hi, xv[k + 4], dot);
+            }
+            acc[r] += d * x_scale * (float)dot + m * x_sum;
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < Q41_NR4; r++) {
+        float v = acc[r];
+        v += __shfl_xor_sync(0xffffffffu, v, 16);
+        v += __shfl_xor_sync(0xffffffffu, v, 8);
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        v += __shfl_xor_sync(0xffffffffu, v, 2);
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        if (lane == 0) shmem[warp * Q41_NR4 + r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int r = 0; r < Q41_NR4; r++) {
+            float total = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < Q41_NWARPS; w++) total += shmem[w * Q41_NR4 + r];
+            if (r0 + r < out_dim) {
+                out[r0 + r] = (residual != 0) ? total + residual[r0 + r] : total;
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(Q41_THREADS, 1)
+void matvec_q4_1_q8_1_nr4(
+    const unsigned char* __restrict__ weight,
+    const char* __restrict__ input_q8_1,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    matvec_q4_1_nr4_body(weight, input_q8_1, 0, out, out_dim, in_dim);
+}
+
+extern "C" __global__ __launch_bounds__(Q41_THREADS, 1)
+void matvec_q4_1_q8_1_nr4_residual(
+    const unsigned char* __restrict__ weight,
+    const char* __restrict__ input_q8_1,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    unsigned int out_dim,
+    unsigned int in_dim)
+{
+    matvec_q4_1_nr4_body(weight, input_q8_1, residual, out, out_dim, in_dim);
+}
