@@ -556,6 +556,9 @@ pub(crate) struct KernelSet {
     /// source Q4_1 form. Plain + residual-folding variants.
     pub(crate) matvec_q4_1: Option<CudaFunction>,
     pub(crate) matvec_q4_1_residual: Option<CudaFunction>,
+    /// Four rows per block: one Q8_1 input read per four weight rows.
+    pub(crate) matvec_q4_1_nr4: Option<CudaFunction>,
+    pub(crate) matvec_q4_1_nr4_residual: Option<CudaFunction>,
     /// CtInt4G32 matvec against Q8_1 input (imported pack-quantized INT4
     /// g32 checkpoints). Plain + residual-folding variants, plus the F16
     /// dequant used by the prefill HGEMM path.
@@ -2103,6 +2106,32 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_1_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1_nr4: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1_nr4",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1_nr4: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1_nr4: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_1_nr4_residual: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_1_KERNEL_SOURCE,
+            "matvec_q4_1_q8_1_nr4_residual",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_1_nr4_residual: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_1_nr4_residual: FAILED: {e}");
                 None
             }
         },
