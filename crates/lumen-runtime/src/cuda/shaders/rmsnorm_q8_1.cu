@@ -52,10 +52,15 @@ __device__ __forceinline__ unsigned short f32_to_f16_bits(float val) {
     return result;
 }
 
-extern "C" __global__ void rmsnorm_to_q8_1(
-    const float* __restrict__ x,         // [dim] input activation
-    const float* __restrict__ weight,    // [dim] RMSNorm weight
-    char* __restrict__ output_q8_1,      // [dim/32 * 36] Q8_1 output
+// The body shared by the two entry points below. `normed_out`, when not null,
+// receives the normalised F32 vector as well: the same `val` the Q8_1 blocks
+// quantise, so a consumer that needs the F32 form (the GDN's F32 source gates)
+// gets it from this one launch instead of a second RMSNorm over the same input.
+__device__ __forceinline__ void rmsnorm_q8_1_body(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    char* __restrict__ output_q8_1,
+    float* __restrict__ normed_out,
     float eps,
     unsigned int dim)
 {
@@ -110,6 +115,9 @@ extern "C" __global__ void rmsnorm_to_q8_1(
 
         // Apply RMSNorm inline: normed = x[i] * rms * weight[i].
         float val = x[idx] * rms * weight[idx];
+        if (normed_out != nullptr) {
+            normed_out[idx] = val;
+        }
 
         // Warp-wide absolute max reduction for Q8_1 scale.
         float amax = val < 0.0f ? -val : val;
@@ -162,4 +170,26 @@ extern "C" __global__ void rmsnorm_to_q8_1(
         // All lanes write their quantized byte.
         block_out[4 + lane_id] = (char)(qi & 0xFF);
     }
+}
+
+extern "C" __global__ void rmsnorm_to_q8_1(
+    const float* __restrict__ x,         // [dim] input activation
+    const float* __restrict__ weight,    // [dim] RMSNorm weight
+    char* __restrict__ output_q8_1,      // [dim/32 * 36] Q8_1 output
+    float eps,
+    unsigned int dim)
+{
+    rmsnorm_q8_1_body(x, weight, output_q8_1, nullptr, eps, dim);
+}
+
+// RMSNorm + Q8_1 quantise, and the normalised F32 vector too.
+extern "C" __global__ void rmsnorm_to_q8_1_normed(
+    const float* __restrict__ x,         // [dim] input activation
+    const float* __restrict__ weight,    // [dim] RMSNorm weight
+    char* __restrict__ output_q8_1,      // [dim/32 * 36] Q8_1 output
+    float* __restrict__ normed_out,      // [dim] normalised F32 output
+    float eps,
+    unsigned int dim)
+{
+    rmsnorm_q8_1_body(x, weight, output_q8_1, normed_out, eps, dim);
 }
