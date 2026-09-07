@@ -1193,14 +1193,32 @@ pub fn attn_splitk_enabled() -> bool {
 /// `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0`: kill-switch for the tiled prefill
 /// attention — cuBLAS F32 SGEMM for Q·Kᵀ and P·V (strided-batched over each
 /// KV head's query group) around an exact-F32 causal softmax, in query blocks
-/// of at most 512 rows. Exact F32 throughout like the scalar kernel it
-/// replaces (no F16 carrier), a different summation order. Default ON for
-/// prefills of 16 tokens or more.
+/// of at most 512 rows.
+///
+/// This is not a precision policy of its own: it selects how
+/// `attn_precise_default`'s exact-F32 mode (`LUMEN_CUDA_ATTN_PRECISE=3`) is
+/// computed for prefills of 16 tokens or more. Modes 0/1/2/4 keep their own
+/// kernels whatever this returns, and so do shorter prefills, the decode
+/// path, every non-CUDA backend, and a full-attention layer without per-head
+/// q/k norms (none that today's converter produces): the SGEMM route serves
+/// the fused Q+gate prefill path only.
+///
+/// Exact F32 throughout like the one-warp-per-row scalar kernel it replaces —
+/// no F16 carrier, so neither of the carriers that mode 3 exists to close is
+/// reopened — but a different evaluation order: the softmax row is normalised
+/// before P·V and reduced over the whole row rather than online. Greedy output
+/// can therefore differ from the scalar kernel where two candidates sit within
+/// rounding of each other.
+///
+/// Default ON; unset follows `canonical_default_on`, so
+/// `LUMEN_CUDA_LEGACY_DEFAULTS=1` rolls this back with every other CUDA
+/// default. `=0` restores the scalar kernel for an exact A/B of the two
+/// evaluation orders at a fixed precision mode.
 pub fn attn_prefill_sgemm_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PREFILL_SGEMM") {
         Ok(v) => v != "0",
-        Err(_) => true,
+        Err(_) => canonical_default_on(),
     })
 }
 

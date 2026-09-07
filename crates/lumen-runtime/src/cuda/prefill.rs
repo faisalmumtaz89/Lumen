@@ -53,7 +53,13 @@ pub(crate) struct PrefillScratch {
     pub v: CudaSlice<f32>,
     /// Attention output: [batch, q_dim] (filled token-at-a-time).
     pub attn_out: CudaSlice<f32>,
-    /// Score block of the tiled SGEMM prefill attention, grown on demand.
+    /// Score block of the tiled SGEMM prefill attention: `group ×
+    /// min(batch, 512) × (pos_start + batch)` F32, reused across every KV
+    /// head and every layer. Allocated once here, before the layer loop
+    /// writes any KV, so an out-of-memory failure cannot land after the GPU
+    /// KV caches have advanced past the host's. `None` when the path is off,
+    /// its kernel did not load, or the allocation failed — the dispatcher
+    /// then takes the scalar attention, which needs no score scratch.
     pub attn_scores: Option<CudaSlice<f32>>,
     /// Output projection + residual: [batch, hidden_dim].
     pub attn_proj: CudaSlice<f32>,
@@ -167,6 +173,7 @@ pub(crate) fn alloc_prefill_scratch(
     gdn_qkv_dim: Option<usize>,
     gdn_value_dim: Option<usize>,
     qgate_fused: bool,
+    attn_score_elems: Option<usize>,
 ) -> Result<PrefillScratch, RuntimeError> {
     // Maximum weight matrix size across all projections that share this scratch.
     //
@@ -202,7 +209,7 @@ pub(crate) fn alloc_prefill_scratch(
         .max()
         .unwrap_or(hidden_dim);
 
-    Ok(PrefillScratch {
+    let mut pf = PrefillScratch {
         x: device.alloc_zeros(batch * hidden_dim)?,
         normed: device.alloc_zeros(batch * hidden_dim)?,
         q: device.alloc_zeros(batch * q_dim)?,
@@ -224,7 +231,61 @@ pub(crate) fn alloc_prefill_scratch(
         // F16 dequant scratch: max_weight_elems * 2 bytes (F16). Enables HGEMM for Q8_0/Q4_0
         // weights without persistent F16 caches (GDN layers).
         dequant_f16: device.alloc_zeros(max_weight_elems * 2)?,
-    })
+    };
+
+    // The tiled prefill attention's score block comes last: the buffers above
+    // are mandatory, this one is not. Asking for it after them means a tight
+    // device never loses a required buffer to it, and a refusal here costs
+    // the SGEMM path rather than the request -- `attn_scores` stays `None`
+    // and the dispatcher runs the scalar attention instead.
+    if let Some(elems) = attn_score_elems {
+        if elems > 0 {
+            match device.alloc_zeros::<f32>(elems) {
+                Ok(buf) => pf.attn_scores = Some(buf),
+                Err(e) => warn_attn_scores_alloc_failed(elems, &e),
+            }
+        }
+    }
+
+    Ok(pf)
+}
+
+/// Element count of the tiled prefill attention's score block for one
+/// prefill: `group × min(batch, ATTN_PREFILL_SGEMM_ROWS) × (pos_start +
+/// batch)` F32. The block is reused across every KV head and every layer, so
+/// this is the path's whole footprint. `None` when the geometry cannot host
+/// the path (no KV heads, or a query-head count that is not a multiple of
+/// them -- `launch_flash_attention_sgemm` rejects both) or when the product
+/// overflows `usize`.
+pub(crate) fn attn_score_block_elems(
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    pos_start: usize,
+) -> Option<usize> {
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return None;
+    }
+    let group = num_heads / num_kv_heads;
+    let rows_max = batch.min(ATTN_PREFILL_SGEMM_ROWS);
+    let kv_total = pos_start.checked_add(batch)?;
+    group.checked_mul(rows_max)?.checked_mul(kv_total)
+}
+
+/// One line, once per process, when the score block cannot be allocated. The
+/// prefill still runs -- the dispatcher falls back to the scalar attention --
+/// so this is not an error, and a device that is short of memory must not
+/// print it once per prefill.
+fn warn_attn_scores_alloc_failed(elems: usize, err: &RuntimeError) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[CUDA] tiled prefill attention unavailable: its {:.1} MiB score block \
+             ({elems} floats) could not be allocated ({err}); prefill attention \
+             falls back to the scalar kernel",
+            (elems as f64 * 4.0) / (1024.0 * 1024.0)
+        );
+    });
 }
 
 /// Batch embed tokens into [batch, hidden_dim] on GPU.
@@ -2697,11 +2758,76 @@ pub(crate) unsafe fn launch_flash_attention_v2(
 /// scratch to `group * 512 * kv_len` floats.
 pub(crate) const ATTN_PREFILL_SGEMM_ROWS: usize = 512;
 
+/// Threads per block of `attn_softmax_causal_rows`. The kernel folds the row
+/// max and the row sum across exactly `SMX_THREADS / 32` warps in a fixed
+/// order and sizes its shared `part[]` from that count, so this value and
+/// `SMX_THREADS` in `attn_softmax_causal.cu` must agree; the kernel carries a
+/// `static_assert` on the warp count.
+pub(crate) const ATTN_SOFTMAX_CAUSAL_THREADS: u32 = 128;
+
+/// Query rows of the block starting at `qb` in a `batch`-row prefill: the
+/// block size the tiled SGEMM attention walks with, `ATTN_PREFILL_SGEMM_ROWS`
+/// except for the last (partial) block. `qb < batch` is the caller's loop
+/// condition; `qb >= batch` yields 0, which would not terminate the walk.
+pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
+    batch.saturating_sub(qb).min(ATTN_PREFILL_SGEMM_ROWS)
+}
+
 /// Tiled prefill attention in exact F32: for each block of query rows and
 /// each KV head, S = Q·Kᵀ over that head's query group by one strided-batched
 /// SGEMM (the same K for every head of the group), a causal row softmax, then
 /// O = P·V by a second strided-batched SGEMM. Same inputs and outputs as
-/// `launch_flash_attention_br4`; a different summation order, no F16 anywhere.
+/// `launch_flash_attention_br4`.
+///
+/// # Exact F32
+///
+/// Both products run as `cublasSgemmStridedBatched` with F32 operands, F32
+/// scalars and an F32 accumulator, on the handle's default math mode
+/// (`CUBLAS_DEFAULT_MATH`, which cuBLAS documents as using "compute and
+/// intermediate storage precisions with at least the same number of mantissa
+/// and exponent bits as requested"). TF32 carries ten mantissa bits against
+/// F32's twenty-three, so it is outside what that mode may select for an F32
+/// request; cuBLAS documents TF32 acceleration of single-precision routines as
+/// what the `CUBLAS_TF32_TENSOR_OP_MATH` math mode enables. Nothing in the
+/// engine calls `cublasSetMathMode`, and the only documented environment lever,
+/// `NVIDIA_TF32_OVERRIDE=0`, can only take TF32 away. **Calling
+/// `cublasSetMathMode` with `CUBLAS_TF32_TENSOR_OP_MATH` (or building this
+/// through `cublasGemmEx` with a `_FAST_TF32` compute type) would silently
+/// break the exact-F32 contract these two calls stand on, and with it the
+/// precision policy the mode-3 default exists to enforce.**
+///
+/// # Evaluation order
+///
+/// The arithmetic is exact F32 but not the scalar kernel's order: the softmax
+/// row is normalised before P·V and reduced over the whole row, where the
+/// scalar kernel accumulates unnormalised weighted values online and
+/// normalises afterwards. Greedy output can therefore differ from the scalar
+/// kernel where two candidates sit within rounding of each other, and cuBLAS
+/// guarantees bit-wise reproducibility only within a toolkit version on a
+/// given architecture and SM count.
+///
+/// Dispatched as `LUMEN_CUDA_ATTN_PRECISE` mode 3 on the fused Q+gate prefill
+/// path only (`attn_q_norm` present — every artifact today's converter
+/// produces: qwen35 / qwen35moe). A layer without per-head q/k norms takes the
+/// plain prefill dispatch, which keeps the WMMA/scalar kernels.
+///
+/// `scores` is the block `alloc_prefill_scratch` sized for this prefill; it
+/// is never allocated here (see the check below for why).
+///
+/// Both GEMMs batch over the query group with `stride_a = 0`, which points
+/// every instance at the one K (or V) that group shares. cuBLAS's reference
+/// for `cublas<t>gemmStridedBatched` states the requirement on the batch
+/// offsets as "The unit for the offset is number of elements and must not be
+/// zero", while NVIDIA's own strided-batched example broadcasts an input with
+/// a zero stride; the sentence reads as a constraint on the output offsets,
+/// which the same page spells out ("Matrices C[i] should not overlap;
+/// otherwise, undefined behavior is expected") and which this call honours:
+/// `stride_c` is `rows * s_ld` for Q·Kᵀ and `head_dim` for P·V, so no two
+/// instances write the same element. A and B are read-only, so their
+/// instances may alias. Measured correct on CUDA 13.1 / sm_120 (md5-identical
+/// greedy output against the scalar kernel). If a future cuBLAS rejects a
+/// zero input stride, the replacement is one GEMM per group head — `group`
+/// times the launches per block and KV head, no extra memory.
 ///
 /// # Safety
 ///
@@ -2722,6 +2848,25 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
     pos_start: usize,
 ) -> Result<(), RuntimeError> {
     use cudarc::cublas::StridedBatchedConfig;
+    // Buffer sizes first, before any allocation or launch (as in
+    // `launch_flash_attention_br4`).
+    let needed_io = batch * num_heads * head_dim;
+    if q.len() < needed_io {
+        return Err(RuntimeError::Compute(format!(
+            "flash_attention_sgemm: q too small: have {} elements, \
+             need {needed_io} (batch={batch}, q_dim={})",
+            q.len(),
+            num_heads * head_dim,
+        )));
+    }
+    if attn_out.len() < needed_io {
+        return Err(RuntimeError::Compute(format!(
+            "flash_attention_sgemm: attn_out too small: have {} elements, \
+             need {needed_io} (batch={batch}, q_dim={})",
+            attn_out.len(),
+            num_heads * head_dim,
+        )));
+    }
     let softmax_fn = kernels.attn_softmax_causal.as_ref().ok_or_else(|| {
         RuntimeError::Compute("attention prefill sgemm: softmax kernel unavailable".into())
     })?;
@@ -2739,16 +2884,35 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
             "attention prefill sgemm: {kv_total} positions exceed the KV cache's {max_seq}"
         )));
     }
-    let rows_max = batch.min(ATTN_PREFILL_SGEMM_ROWS);
-    let needed = group * rows_max * kv_total;
-    if scores.as_ref().map_or(true, |s| s.len() < needed) {
-        *scores = Some(device.alloc_zeros::<f32>(needed)?);
+    let needed =
+        attn_score_block_elems(batch, num_heads, num_kv_heads, pos_start).ok_or_else(|| {
+            RuntimeError::Compute("attention prefill sgemm: score block size overflows".into())
+        })?;
+    // Never allocated here. The layer loop writes each layer's KV and
+    // advances that cache's length BEFORE it reaches this dispatch, while the
+    // host-side KV length only advances after the last layer; an allocation
+    // that failed inside the loop would abort the prefill with the two out of
+    // step. `alloc_prefill_scratch` therefore sizes the block up front, ahead
+    // of the first KV write, and the dispatcher only routes here when it is
+    // present. This check is the guard on that contract, not a fallback.
+    let have_block = match scores.as_ref() {
+        Some(s) => s.len() >= needed,
+        None => false,
+    };
+    if !have_block {
+        return Err(RuntimeError::Compute(format!(
+            "attention prefill sgemm: no score block for batch {batch} at position \
+             {pos_start} ({needed} floats needed); the block is sized before the \
+             layer loop and this route runs only when it exists"
+        )));
     }
-    let s_buf = scores.as_mut().unwrap();
+    let s_buf = scores
+        .as_mut()
+        .expect("score block presence checked immediately above");
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut qb = 0usize;
     while qb < batch {
-        let rows = (batch - qb).min(ATTN_PREFILL_SGEMM_ROWS);
+        let rows = attn_sgemm_block_rows(batch, qb);
         let kv_len = pos_start + qb + rows; // causal bound for this block
         let s_ld = kv_len;
         for kv_h in 0..num_kv_heads {
@@ -2795,7 +2959,7 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
                 .arg(&scale)
                 .launch(CudarcLaunchConfig {
                     grid_dim: (rows as u32, group as u32, 1),
-                    block_dim: (128, 1, 1),
+                    block_dim: (ATTN_SOFTMAX_CAUSAL_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| RuntimeError::Compute(format!("attn_softmax_causal_rows: {e}")))?;

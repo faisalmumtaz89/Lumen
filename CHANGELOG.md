@@ -7,15 +7,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- **Tiled exact-F32 prefill attention**: prefills of 16 tokens or more run
-  attention as cuBLAS F32 SGEMM (Q·Kᵀ and P·V, strided-batched over each KV
-  head's query group) around a causal row softmax, in query blocks of 512
-  rows, replacing the one-warp-per-row scalar kernel (217 ms of a 1.3k-token
-  Qwen3.8-27B prefill on an RTX 5090). Exact F32 throughout, a different
-  summation order. `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0` restores the previous
-  selection.
+- **Exact-F32 prefill attention is computed as tiled cuBLAS SGEMM**: on CUDA,
+  `LUMEN_CUDA_ATTN_PRECISE=3` — exact-F32 Q·Kᵀ and P·V, the default for every
+  supported production class — is now evaluated as two strided-batched F32
+  SGEMMs (S = Q·Kᵀ over each KV head's query group, then O = P·V) around an
+  exact-F32 causal row softmax, in query blocks of at most 512 rows, instead
+  of the one-warp-per-row scalar kernel. It applies to prefills of 16 tokens
+  or more on the fused Q+gate full-attention layers; shorter prefills, the
+  other precision modes, the non-fused attention dispatch and every non-CUDA
+  backend are unchanged. Arithmetic stays exact F32 with no F16 carrier, but the evaluation
+  order differs from the scalar kernel — the softmax row is
+  normalised before P·V and reduced over the whole row rather than online — so
+  greedy output can differ where two candidates sit within rounding of each
+  other. `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0` selects the scalar kernel again,
+  and `LUMEN_CUDA_LEGACY_DEFAULTS=1` rolls it back along with every other CUDA
+  default. The score block is sized and allocated once per prefill before the
+  layer loop; when it cannot be allocated, or the softmax kernel did not
+  build, the prefill runs on the scalar kernel rather than failing.
+
+  Measured on an RTX 5090. Qwen3.8-27B Q4_0, one artifact with identical
+  bytes across arms, on a build that also carried the F16 prefill-cache and
+  context-scaled split-K changes: 515 ms against 713 to first token at a
+  1.3k-token context and 1013 ms against 1820 at 2.6k, generated text
+  md5-identical to the scalar kernel at 30, 1.3k and 2.6k tokens.
+  Qwen3.5-9B against the same parent commit, default environment: time to
+  first token 237.9 → 172.6 ms at 1.3k and 608.4 → 343.4 ms at 2.6k on Q4_0,
+  234.2 → 168.4 ms at 1.3k on a Q8_0 body, decode throughput unchanged;
+  generated text md5-identical at 25, 1.3k and 2.6k tokens of context, and
+  different at 330, where one token of 48 flips on a near-tie (both
+  continuations coherent, both arms internally reproducible).
+
+  Every class that takes exact-F32 prefill attention by default — MoE at any
+  quantization and the dense 9B and 27B classes at Q4_0, Q8_0 and BF16 —
+  changes evaluation order here; the cells above are the ones measured, and
+  MoE and BF16 are not among them. Their generated text may differ from
+  0.24.0 at a near-tie, so the recorded goldens and the model-quality and
+  determinism results banked for the scalar kernel are superseded pending a
+  re-gate of the affected cells.
+
+### Added
 
 - **Fixed-horizon bench surfaces**, both off unless set. `LUMEN_BENCH_MASK_EOG`
   names end-of-generation token ids that greedy decoding may never select, so a

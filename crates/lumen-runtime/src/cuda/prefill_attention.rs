@@ -1057,4 +1057,377 @@ mod tests {
             "Error should mention q_batch: {err_msg}"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Tiled SGEMM prefill attention (launch_flash_attention_sgemm)
+    // ------------------------------------------------------------------
+
+    /// Absolute tolerance for the tiled SGEMM path against the CPU reference.
+    ///
+    /// Both sides are exact F32 with no F16 carrier, so the only difference is
+    /// summation order: a BLAS SGEMM blocks each `head_dim`-long dot product
+    /// and each `kv_len`-long P·V column its own way, and the block softmax
+    /// folds four warp trees where the reference sums left to right. Replaying
+    /// these four shapes in F32 on the host, sequential accumulation against
+    /// blocked BLAS, moves the output by at most 2.6e-6 (outputs are bounded by
+    /// max |V| = 1); 5e-4 leaves two orders of headroom over that and stays far
+    /// below any real defect -- a transposed operand, a wrong stride or a
+    /// missing mask moves the output by O(1).
+    const SGEMM_CPU_TOL: f32 = 5e-4;
+
+    /// Absolute tolerance between the tiled SGEMM path and `br4` on the same
+    /// inputs. Looser than `SGEMM_CPU_TOL` because br4's online softmax
+    /// rescales its running sum tile by tile, a third summation order with its
+    /// own drift: the br4-vs-CPU test above allows 1e-3 at head_dim 8.
+    const SGEMM_BR4_TOL: f32 = 2e-3;
+
+    /// Run one shape through `launch_flash_attention_sgemm` and check it against
+    /// both the CPU reference and `launch_flash_attention_br4` on the same
+    /// inputs. Returns early (skips) when no CUDA device is present, like the
+    /// other GPU tests in this module.
+    fn check_sgemm_shape(
+        case: &str,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pos_start: usize,
+    ) {
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Skipping test: failed to init CUDA device: {e}");
+                return;
+            }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
+
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let kv_total = pos_start + batch;
+        let max_seq_len = kv_total + 3; // room past the last position
+
+        // Deterministic inputs bounded by 1 in magnitude.
+        let q_data: Vec<f32> = (0..batch * q_dim)
+            .map(|i| ((i as f32) * 0.011 + 0.7).sin())
+            .collect();
+        let all_k: Vec<f32> = (0..kv_total * kv_dim)
+            .map(|i| ((i as f32) * 0.013 + 0.3).sin())
+            .collect();
+        let all_v: Vec<f32> = (0..kv_total * kv_dim)
+            .map(|i| ((i as f32) * 0.017 + 0.5).cos())
+            .collect();
+
+        // Fill the cache in its head-first [head][pos][dim] layout in one copy;
+        // appending 1000+ tokens one kernel at a time would dominate the test.
+        let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
+        let mut k_host = vec![0.0f32; num_kv_heads * max_seq_len * head_dim];
+        let mut v_host = vec![0.0f32; num_kv_heads * max_seq_len * head_dim];
+        for kv_h in 0..num_kv_heads {
+            for p in 0..kv_total {
+                for d in 0..head_dim {
+                    let dst = (kv_h * max_seq_len + p) * head_dim + d;
+                    let src = p * kv_dim + kv_h * head_dim + d;
+                    k_host[dst] = all_k[src];
+                    v_host[dst] = all_v[src];
+                }
+            }
+        }
+        device
+            .htod_copy_into(&k_host, &mut kv_cache.k_cache)
+            .unwrap();
+        device
+            .htod_copy_into(&v_host, &mut kv_cache.v_cache)
+            .unwrap();
+        kv_cache.advance_seq_len_by(kv_total);
+
+        let q_batch = device.htod_copy(&q_data).unwrap();
+        let mut out_sgemm = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        let mut out_br4 = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        // The score block is sized up front, as the prefill scratch does it.
+        let score_elems = super::super::prefill::attn_score_block_elems(
+            batch,
+            num_heads,
+            num_kv_heads,
+            pos_start,
+        )
+        .unwrap();
+        let mut scores: Option<cudarc::driver::CudaSlice<f32>> =
+            Some(device.alloc_zeros::<f32>(score_elems).unwrap());
+
+        unsafe {
+            super::super::prefill::launch_flash_attention_sgemm(
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut out_sgemm,
+                &mut scores,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
+            super::super::prefill::launch_flash_attention_br4(
+                &device,
+                &kernels,
+                &q_batch,
+                &kv_cache,
+                &mut out_br4,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                pos_start,
+            )
+            .unwrap();
+        }
+        device.synchronize().unwrap();
+        let got_sgemm = device.dtoh_copy(&out_sgemm).unwrap();
+        let got_br4 = device.dtoh_copy(&out_br4).unwrap();
+
+        let group = num_heads / num_kv_heads;
+        for kv_h in 0..num_kv_heads {
+            // Per-head K/V matrices, built once for the longest row.
+            let mut k_mat = vec![0.0f32; kv_total * head_dim];
+            let mut v_mat = vec![0.0f32; kv_total * head_dim];
+            for p in 0..kv_total {
+                for d in 0..head_dim {
+                    k_mat[p * head_dim + d] = all_k[p * kv_dim + kv_h * head_dim + d];
+                    v_mat[p * head_dim + d] = all_v[p * kv_dim + kv_h * head_dim + d];
+                }
+            }
+            for h in kv_h * group..(kv_h + 1) * group {
+                for t in 0..batch {
+                    let seq_len = pos_start + t + 1;
+                    let q_off = t * q_dim + h * head_dim;
+                    let expected = cpu_attention_single_head(
+                        &q_data[q_off..q_off + head_dim],
+                        &k_mat[..seq_len * head_dim],
+                        &v_mat[..seq_len * head_dim],
+                        seq_len,
+                        head_dim,
+                    );
+                    for d in 0..head_dim {
+                        let got = got_sgemm[q_off + d];
+                        let cpu = expected[d];
+                        assert!(
+                            (got - cpu).abs() < SGEMM_CPU_TOL,
+                            "{case}: sgemm vs cpu at token={t}(pos={}), head={h}, dim={d}: \
+                             gpu={got}, cpu={cpu}, diff={}",
+                            pos_start + t,
+                            (got - cpu).abs(),
+                        );
+                        let br4 = got_br4[q_off + d];
+                        assert!(
+                            (got - br4).abs() < SGEMM_BR4_TOL,
+                            "{case}: sgemm vs br4 at token={t}(pos={}), head={h}, dim={d}: \
+                             sgemm={got}, br4={br4}, diff={}",
+                            pos_start + t,
+                            (got - br4).abs(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Multi-block batch (600 rows = one full 512 block + an 88-row tail),
+    /// GQA group 4, head_dim 128, from an empty cache.
+    #[test]
+    fn test_flash_attention_sgemm_multi_block_group4() {
+        check_sgemm_shape("multi_block_group4", 600, 4, 1, 128, 0);
+    }
+
+    /// Multi-block batch with a 5-row tail (517 rows), no GQA (group 1),
+    /// head_dim 256 -- the 9B's shape.
+    #[test]
+    fn test_flash_attention_sgemm_multi_block_group1_hd256() {
+        check_sgemm_shape("multi_block_group1_hd256", 517, 2, 2, 256, 0);
+    }
+
+    /// Single block, batch a multiple of nothing, pos_start > 0: the causal
+    /// bound must start at pos_start, not at 0.
+    #[test]
+    fn test_flash_attention_sgemm_pos_offset_group4() {
+        check_sgemm_shape("pos_offset_group4", 37, 8, 2, 128, 11);
+    }
+
+    /// Long prefix (pos_start 1023) with a short continuation batch and
+    /// head_dim 256: every row of the block is nearly fully unmasked.
+    #[test]
+    fn test_flash_attention_sgemm_long_prefix_hd256() {
+        check_sgemm_shape("long_prefix_hd256", 13, 1, 1, 256, 1023);
+    }
+
+    /// Undersized `q` and `attn_out` are rejected before any GPU work.
+    #[test]
+    fn test_flash_attention_sgemm_buffer_validation() {
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Skipping test: failed to init CUDA device: {e}");
+                return;
+            }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
+
+        let batch = 8;
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 8;
+        let q_dim = num_heads * head_dim;
+        let kv_cache = KvCacheGpu::new(&device, num_kv_heads, 16, head_dim).unwrap();
+
+        let small_q = device.alloc_zeros::<f32>(q_dim).unwrap();
+        let full_q = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        let mut full_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
+        let mut small_out = device.alloc_zeros::<f32>(q_dim).unwrap();
+        let mut scores: Option<cudarc::driver::CudaSlice<f32>> = None;
+
+        let err = unsafe {
+            super::super::prefill::launch_flash_attention_sgemm(
+                &device,
+                &kernels,
+                &small_q,
+                &kv_cache,
+                &mut full_out,
+                &mut scores,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+            )
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("q too small"), "unexpected error: {err}");
+
+        let err = unsafe {
+            super::super::prefill::launch_flash_attention_sgemm(
+                &device,
+                &kernels,
+                &full_q,
+                &kv_cache,
+                &mut small_out,
+                &mut scores,
+                batch,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                0,
+            )
+        }
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("attn_out too small"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            scores.is_none(),
+            "the size checks must precede the score allocation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Host-side arithmetic of the tiled SGEMM path (no GPU)
+    // ------------------------------------------------------------------
+
+    /// The block walk covers every query row exactly once, in blocks of at most
+    /// `ATTN_PREFILL_SGEMM_ROWS`, and always advances.
+    #[test]
+    fn test_attn_sgemm_block_rows_partitions_the_batch() {
+        use super::super::prefill::{attn_sgemm_block_rows, ATTN_PREFILL_SGEMM_ROWS};
+        for batch in [1usize, 15, 511, 512, 513, 600, 1024, 1025, 4096] {
+            let mut qb = 0usize;
+            let mut blocks = 0usize;
+            while qb < batch {
+                let rows = attn_sgemm_block_rows(batch, qb);
+                assert!(rows > 0, "batch={batch} qb={qb}: zero-row block would hang");
+                assert!(rows <= ATTN_PREFILL_SGEMM_ROWS, "batch={batch} qb={qb}");
+                qb += rows;
+                blocks += 1;
+            }
+            assert_eq!(qb, batch, "batch={batch}: walk overshot or undershot");
+            assert_eq!(
+                blocks,
+                batch.div_ceil(ATTN_PREFILL_SGEMM_ROWS),
+                "batch={batch}"
+            );
+        }
+        assert_eq!(attn_sgemm_block_rows(0, 0), 0);
+    }
+
+    /// The score scratch allocated once up front -- `group * min(batch, 512) *
+    /// (pos_start + batch)` floats -- covers every block's `group * rows *
+    /// kv_len` footprint, for every block of every shape.
+    #[test]
+    fn test_attn_sgemm_score_scratch_bounds_every_block() {
+        use super::super::prefill::{attn_sgemm_block_rows, ATTN_PREFILL_SGEMM_ROWS};
+        for group in [1usize, 4, 8] {
+            for batch in [1usize, 37, 512, 513, 600, 1300] {
+                for pos_start in [0usize, 1, 1023] {
+                    let allocated =
+                        group * batch.min(ATTN_PREFILL_SGEMM_ROWS) * (pos_start + batch);
+                    let mut qb = 0usize;
+                    while qb < batch {
+                        let rows = attn_sgemm_block_rows(batch, qb);
+                        let kv_len = pos_start + qb + rows;
+                        assert!(
+                            group * rows * kv_len <= allocated,
+                            "group={group} batch={batch} pos_start={pos_start} qb={qb}: \
+                             block needs {} of {allocated} floats",
+                            group * rows * kv_len,
+                        );
+                        qb += rows;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The softmax kernel's four-warp fold and the launch's block size are one
+    /// constant on two sides of NVRTC; the shader also carries a
+    /// `static_assert` on the warp count.
+    #[test]
+    fn test_attn_softmax_causal_threads_match_the_shader() {
+        use super::super::prefill::ATTN_SOFTMAX_CAUSAL_THREADS;
+        let src = super::super::shaders::ATTN_SOFTMAX_CAUSAL_KERNEL_SOURCE;
+        assert!(
+            src.contains(&format!(
+                "#define SMX_THREADS {ATTN_SOFTMAX_CAUSAL_THREADS}u"
+            )),
+            "attn_softmax_causal.cu must define SMX_THREADS as \
+             {ATTN_SOFTMAX_CAUSAL_THREADS} to match the launch"
+        );
+        assert!(
+            src.contains("static_assert(SMX_WARPS == 4u"),
+            "the four-warp fold must stay guarded"
+        );
+        assert_eq!(ATTN_SOFTMAX_CAUSAL_THREADS % 32, 0);
+    }
 }

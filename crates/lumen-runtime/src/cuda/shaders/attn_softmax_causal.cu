@@ -6,10 +6,16 @@
 // position pos_start + r, so keys j > pos_start + r are masked. Masked
 // entries are written as 0 so the P·V GEMM can run over the full kv_len.
 //
-// Grid: (rows, heads). Block: 128 threads. One block per row; the max and
-// the sum are warp xor trees folded across the four warps in a fixed order.
+// Grid: (rows, heads). Block: SMX_THREADS threads. One block per row; the
+// max and the sum are warp xor trees folded across the four warps in a fixed
+// order.
 #define SMX_THREADS 128u
+#define SMX_WARPS (SMX_THREADS / 32u)
 #define SMX_NEG_INF (-3.402823466e+38f)
+
+// The block-level folds below name part[0..3] in a fixed order, so the launch
+// (ATTN_SOFTMAX_CAUSAL_THREADS in prefill.rs) must keep this at four warps.
+static_assert(SMX_WARPS == 4u, "attn_softmax_causal_rows folds exactly 4 warps");
 
 __device__ __forceinline__ float smx_warp_max(float v) {
     v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
@@ -37,7 +43,7 @@ extern "C" __global__ void attn_softmax_causal_rows(
     unsigned int pos_start,         // absolute position of row 0
     float scale)
 {
-    __shared__ float part[4];
+    __shared__ float part[SMX_WARPS];
     unsigned int r = blockIdx.x;
     unsigned int g = blockIdx.y;
     if (r >= rows) return;
