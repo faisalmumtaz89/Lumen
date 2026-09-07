@@ -1652,6 +1652,24 @@ pub const F16_CACHE_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 /// the escape hatch when the prediction is wrong for a card.
 pub const F16_CACHE_FORCE_ENV: &str = "LUMEN_CUDA_F16_CACHE_FORCE";
 
+/// Set to a truthy value to build F16 dequant caches for the quantised
+/// (Q8_0 / Q4_0) attention projections too. By default only F32 projections
+/// get one: decode reads that copy, while a quantised projection's copy served
+/// prefill alone, and prefill dequantises into scratch per matmul at the same
+/// speed (measured: no change in time to first token at 30 or 1,300 prompt
+/// tokens, byte-identical output) for 11.9 GB less on Qwen3.8-27B Q4_0.
+pub const F16_CACHE_ENV: &str = "LUMEN_CUDA_F16_CACHE";
+
+/// Whether [`F16_CACHE_ENV`] asks for F16 dequant caches on quantised projections.
+pub fn f16_cache_for_quantised() -> bool {
+    std::env::var(F16_CACHE_ENV).is_ok_and(|v| {
+        matches!(
+            v.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
+}
+
 /// What the memory query said just before the F16 caches are built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FreeMemory {
@@ -1813,6 +1831,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_DECODE_DELAY_US",
     "LUMEN_CUDA_DECODE_TILED",
     "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+    "LUMEN_CUDA_F16_CACHE",
     "LUMEN_CUDA_F16_CACHE_FORCE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
     "LUMEN_CUDA_FFN_FUSED_GLU",
@@ -3916,6 +3935,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
+        "LUMEN_CUDA_F16_CACHE",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",
