@@ -119,6 +119,22 @@ impl CudaDevice {
         self.compile_and_load_cached(cuda_source, None, false)
     }
 
+    /// The NVRTC target the inline-PTX dp4a kernels are built for on this
+    /// device, chosen from the targets the loaded NVRTC actually supports:
+    /// `compute_61` wherever the toolkit still lists it (the target every
+    /// certified CUDA 12 platform has always run these kernels on), otherwise
+    /// the highest supported target the device can run. `Ok(None)` when the
+    /// device is below sm_61 or the toolkit lists nothing it can run, `Err`
+    /// when a query fails; either way the caller loads none of these kernels
+    /// rather than compile for a default target that cannot assemble dp4a.
+    /// (A missing libnvrtc is not a query error: cudarc fails at load, as it
+    /// did before.)
+    pub fn dp4a_arch(&self) -> Result<Option<&'static str>, RuntimeError> {
+        let (major, minor) = self.compute_capability()?;
+        let supported = nvrtc_supported_archs()?;
+        Ok(dp4a_arch_for(major * 10 + minor, &supported))
+    }
+
     /// Compile CUDA source targeting a specific SM architecture.
     ///
     /// Used for kernels requiring specific hardware features (e.g., tensor cores
@@ -506,6 +522,77 @@ fn nvrtc_version() -> Result<(i32, i32), RuntimeError> {
     Ok((major as i32, minor as i32))
 }
 
+/// The compute capabilities the loaded NVRTC can target (`nvrtcGetSupportedArchs`,
+/// e.g. `[50, 52, …, 90]` on CUDA 12.2, `[75, 80, …, 121]` on CUDA 13.1).
+fn nvrtc_supported_archs() -> Result<Vec<i32>, RuntimeError> {
+    let mut count: std::ffi::c_int = 0;
+    // SAFETY: the count out-pointer is valid for the call; the buffer below is
+    // sized to the reported count before the second call writes it; cudarc's
+    // dynamic loader resolves both symbols from libnvrtc.
+    let res = unsafe { cudarc::nvrtc::sys::nvrtcGetNumSupportedArchs(&mut count) };
+    if res != cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS {
+        return Err(RuntimeError::Compute(format!(
+            "nvrtcGetNumSupportedArchs query failed: {res:?}"
+        )));
+    }
+    if count <= 0 {
+        return Err(RuntimeError::Compute(format!(
+            "nvrtcGetNumSupportedArchs reported {count} targets"
+        )));
+    }
+    let mut archs = vec![0 as std::ffi::c_int; count as usize];
+    let res = unsafe { cudarc::nvrtc::sys::nvrtcGetSupportedArchs(archs.as_mut_ptr()) };
+    if res != cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS {
+        return Err(RuntimeError::Compute(format!(
+            "nvrtcGetSupportedArchs query failed: {res:?}"
+        )));
+    }
+    Ok(archs.into_iter().map(|a| a as i32).collect())
+}
+
+/// The dp4a kernels' NVRTC target for a device of compute capability `cc`
+/// (`major * 10 + minor`) given the toolkit's supported targets: `compute_61`
+/// when the toolkit lists 61 and the device can run it, else the highest
+/// listed target at or below `cc` with a spelling this build knows. `dp4a`
+/// needs sm_61, so a device below it gets no target.
+pub(crate) fn dp4a_arch_for(cc: i32, supported: &[i32]) -> Option<&'static str> {
+    if cc < 61 {
+        return None;
+    }
+    if supported.contains(&61) {
+        return Some("compute_61");
+    }
+    let mut candidates: Vec<i32> = supported
+        .iter()
+        .copied()
+        .filter(|&a| a >= 61 && a <= cc)
+        .collect();
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.into_iter().find_map(arch_name)
+}
+
+fn arch_name(arch: i32) -> Option<&'static str> {
+    Some(match arch {
+        61 => "compute_61",
+        62 => "compute_62",
+        70 => "compute_70",
+        72 => "compute_72",
+        75 => "compute_75",
+        80 => "compute_80",
+        86 => "compute_86",
+        87 => "compute_87",
+        88 => "compute_88",
+        89 => "compute_89",
+        90 => "compute_90",
+        100 => "compute_100",
+        103 => "compute_103",
+        110 => "compute_110",
+        120 => "compute_120",
+        121 => "compute_121",
+        _ => return None,
+    })
+}
+
 /// Query the CUDA driver version (e.g. 12020 for 12.2) via `cuDriverGetVersion`.
 ///
 /// Part of the PTX cache key: a driver upgrade changes how PTX JITs to SASS,
@@ -721,5 +808,45 @@ mod ptx_load_message_tests {
             m.contains("CUDA_ERROR_NO_BINARY_FOR_GPU") && !m.contains("matching `nvidia-smi`"),
             "{m}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dp4a_arch_tests {
+    use super::dp4a_arch_for;
+
+    const NVRTC_12_2: &[i32] = &[50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90];
+    const NVRTC_13_1: &[i32] = &[75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121];
+
+    #[test]
+    fn a_toolkit_that_still_lists_compute_61_keeps_it_on_every_device() {
+        for cc in [75, 80, 86, 89, 90, 120] {
+            assert_eq!(dp4a_arch_for(cc, NVRTC_12_2), Some("compute_61"), "cc {cc}");
+        }
+    }
+
+    #[test]
+    fn a_device_newer_than_the_toolkit_takes_the_highest_target_it_can_run() {
+        let older = &[75, 80, 86, 87, 89, 90];
+        assert_eq!(dp4a_arch_for(120, older), Some("compute_90"));
+        assert_eq!(dp4a_arch_for(103, older), Some("compute_90"));
+    }
+
+    #[test]
+    fn a_toolkit_without_compute_61_builds_for_the_device_itself() {
+        assert_eq!(dp4a_arch_for(120, NVRTC_13_1), Some("compute_120"));
+        assert_eq!(dp4a_arch_for(121, NVRTC_13_1), Some("compute_121"));
+        assert_eq!(dp4a_arch_for(80, NVRTC_13_1), Some("compute_80"));
+        assert_eq!(dp4a_arch_for(75, NVRTC_13_1), Some("compute_75"));
+        assert_eq!(dp4a_arch_for(110, NVRTC_13_1), Some("compute_110"));
+    }
+
+    #[test]
+    fn a_device_below_every_listed_target_gets_no_target() {
+        assert_eq!(dp4a_arch_for(61, NVRTC_13_1), None);
+        assert_eq!(dp4a_arch_for(70, NVRTC_13_1), None);
+        assert_eq!(dp4a_arch_for(52, &[50, 52, 53, 60]), None);
+        assert_eq!(dp4a_arch_for(60, NVRTC_12_2), None);
+        assert_eq!(dp4a_arch_for(120, &[]), None);
     }
 }
