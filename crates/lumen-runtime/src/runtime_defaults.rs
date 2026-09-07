@@ -1209,9 +1209,10 @@ pub fn attn_precise_selected() -> u8 {
     )
 }
 
-/// `LUMEN_CUDA_FORCE_SCALAR_ATTN=1`: run every prefill attention on the
-/// one-warp-per-row scalar kernel, whatever the precision selector and the
-/// tiled route say. Read once.
+/// `LUMEN_CUDA_FORCE_SCALAR_ATTN=1`: run the fused Q+gate prefill attention
+/// on the one-warp-per-row scalar kernel, whatever the precision selector and
+/// the tiled route say. The dispatch for attention without per-head q/k norms
+/// does not read it. Read once.
 pub fn force_scalar_attn_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1"))

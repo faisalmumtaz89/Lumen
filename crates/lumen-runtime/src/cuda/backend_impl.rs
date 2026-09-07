@@ -17735,8 +17735,9 @@ impl ComputeBackend for CudaBackend {
             None
         };
 
-        // The tiled SGEMM prefill attention's score block, last of all the
-        // scratch so a tight device never loses a required buffer to it, and
+        // The tiled SGEMM prefill attention's score block, last of the
+        // pre-loop buffers so a tight device does not lose one of those to
+        // it, and
         // before the layer loop, because the loop writes each layer's KV and
         // advances that cache's length before it reaches the attention
         // dispatch while the host-side length only advances after the last
@@ -18092,8 +18093,9 @@ impl ComputeBackend for CudaBackend {
                 // (mode 3, the production default, is exact F32 — tiled cuBLAS
                 // SGEMM when that route is enabled, else the scalar kernel).
                 // 2. Scalar Br=4 fallback (batch < 16, or no WMMA kernels).
-                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs every prefill attention on
-                // the F32 scalar Br=4 kernel, whatever the selector says.
+                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs this site's prefill
+                // attention on the F32 scalar Br=4 kernel, whatever the
+                // selector says.
                 let force_scalar_attn = crate::runtime_defaults::force_scalar_attn_enabled();
                 // Prefill full-attention precision selector. 0=WMMA F16,
                 // 1=qkf32 (exact QK^T), 2=pvf32 (exact P@V), 3=both exact
