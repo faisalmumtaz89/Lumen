@@ -15,6 +15,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   layer of a source-fidelity Qwen3.8-27B artifact (48 launches per token,
   ~0.2 ms). Same reduction and product, bit-identical output.
   `LUMEN_CUDA_GDN_NORM_DUAL=0` restores the two launches.
+- **GQA-group split-K attention partial pass**: one block per (KV head,
+  chunk) computes every query head of the group from a single read of K and
+  V on 64-position chunks, replacing one block per query head that re-read
+  them (three times on Qwen3.8-27B) on 128-position tiles.
+  `LUMEN_CUDA_ATTN_SPLITK_GQA=0` restores the per-query-head pass;
+  `LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK` sets the chunk (32 to 128).
+
 - **Split-K decode attention scales its split count with the context**: one
   chunk per 128 KV positions (`LUMEN_CUDA_ATTN_SPLITK_CHUNK`), at most 32,
   instead of a fixed 4, and the tiled kernel when one chunk would do. A

@@ -1211,6 +1211,38 @@ pub fn attn_splitk_chunk_positions() -> u32 {
     })
 }
 
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA=0`: kill-switch for the split-K partial pass
+/// that serves every query head of a KV head's GQA group from one read of K
+/// and V, on small chunks (see [`attn_splitk_gqa_chunk_positions`]). Default
+/// ON when the split-K pair is selected and the shape qualifies (query heads
+/// a multiple of KV heads, at most 8 per group, head_dim a multiple of 128).
+/// Summation order differs from the per-query-head pass.
+pub fn attn_splitk_gqa_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// KV positions per chunk for the GQA-group split-K pass unless
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK` says otherwise; the kernel handles one
+/// chunk of at most 128 positions per block, and a smaller chunk means more
+/// blocks. Default 64; clamped to 32..=128.
+pub const ATTN_SPLITK_GQA_CHUNK_POSITIONS: u32 = 64;
+
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK`: see [`ATTN_SPLITK_GQA_CHUNK_POSITIONS`].
+pub fn attn_splitk_gqa_chunk_positions() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(32, 128))
+            .unwrap_or(ATTN_SPLITK_GQA_CHUNK_POSITIONS)
+    })
+}
+
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
 /// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
 /// `matvec_bf16_v4` (+0.303 ms/token engine ABBA on H100; leaf 18.369 vs
@@ -1852,6 +1884,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
     "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+    "LUMEN_CUDA_ATTN_SPLITK_GQA",
+    "LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -3972,6 +4006,8 @@ mod tests {
         "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
         "LUMEN_CUDA_F16_CACHE",
+        "LUMEN_CUDA_ATTN_SPLITK_GQA",
+        "LUMEN_CUDA_ATTN_SPLITK_GQA_CHUNK",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
         "LUMEN_CUDA_FFN_GATE_UP_BANK",

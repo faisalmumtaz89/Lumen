@@ -1886,7 +1886,7 @@ pub(crate) unsafe fn launch_attention_decode_tiled(
 /// Upper bound on the split-K decode-attention split count. Single source for
 /// the scratch sizing (`GpuScratch::attn_splitk`); the partial-pass grid uses
 /// [`attn_splitk_chunks`] for the token's actual context.
-pub(crate) const ATTN_SPLITK_S_MAX: u32 = 32;
+pub(crate) const ATTN_SPLITK_S_MAX: u32 = 128;
 
 /// The split count for a decode step over `seq_len` KV positions: one chunk
 /// per [`crate::runtime_defaults::ATTN_SPLITK_CHUNK_POSITIONS`] positions
@@ -1895,9 +1895,40 @@ pub(crate) const ATTN_SPLITK_S_MAX: u32 = 32;
 /// heads × 4 chunks on a 170-SM card); scaling with the context keeps every
 /// chunk's serial walk bounded. A count of 1 means the caller takes the
 /// tiled kernel: one chunk plus a merge is the tiled walk with an extra launch.
-pub(crate) fn attn_splitk_chunks(seq_len: u32) -> u32 {
-    let chunk = crate::runtime_defaults::attn_splitk_chunk_positions();
-    seq_len.div_ceil(chunk).clamp(1, ATTN_SPLITK_S_MAX)
+pub(crate) fn attn_splitk_chunks(seq_len: u32, chunk: u32) -> u32 {
+    seq_len.div_ceil(chunk.max(1)).clamp(1, ATTN_SPLITK_S_MAX)
+}
+
+/// Whether the GQA-group partial pass serves this shape: the kernel loaded,
+/// the switch on, query heads a multiple of KV heads with at most 8 per
+/// group, and a head_dim the pass's float4 lanes cover.
+pub(crate) fn attn_splitk_gqa_eligible(
+    kernels: &KernelSet,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) -> bool {
+    kernels.attention_decode_splitk_partial_gqa.is_some()
+        && num_kv_heads > 0
+        && num_heads % num_kv_heads == 0
+        && num_heads / num_kv_heads <= 8
+        && head_dim % 128 == 0
+        && head_dim <= 1024
+}
+
+/// The chunk the split-K pass walks per block: the GQA pass's small chunk
+/// when that pass serves the shape, the tile-sized chunk otherwise.
+pub(crate) fn attn_splitk_chunk_for(
+    kernels: &KernelSet,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+) -> u32 {
+    if attn_splitk_gqa_eligible(kernels, num_heads, num_kv_heads, head_dim) {
+        crate::runtime_defaults::attn_splitk_gqa_chunk_positions()
+    } else {
+        crate::runtime_defaults::attn_splitk_chunk_positions()
+    }
 }
 
 /// Split-K shape eligibility: the accumulator slots cover `head_dim` exactly
@@ -1933,7 +1964,11 @@ unsafe fn launch_attention_decode_splitk(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<(), RuntimeError> {
-    let s: u32 = attn_splitk_chunks(seq_len);
+    let gqa = attn_splitk_gqa_eligible(kernels, num_heads, num_kv_heads, head_dim);
+    let s: u32 = attn_splitk_chunks(
+        seq_len,
+        attn_splitk_chunk_for(kernels, num_heads, num_kv_heads, head_dim),
+    );
     if !attention_decode_splitk_supports_head_dim(head_dim) {
         return Err(RuntimeError::Compute(format!(
             "attention_decode_splitk: unsupported head_dim ({head_dim}); \
@@ -1941,7 +1976,11 @@ unsafe fn launch_attention_decode_splitk(
         )));
     }
     let (partial_fn, merge_fn) = match (
-        kernels.attention_decode_splitk_partial.as_ref(),
+        if gqa {
+            kernels.attention_decode_splitk_partial_gqa.as_ref()
+        } else {
+            kernels.attention_decode_splitk_partial.as_ref()
+        },
         kernels.attention_decode_splitk_merge.as_ref(),
     ) {
         (Some(p), Some(m)) => (p, m),
@@ -1951,7 +1990,13 @@ unsafe fn launch_attention_decode_splitk(
             ))
         }
     };
-    let shared_bytes = attention_decode_tiled_shared_bytes(head_dim);
+    let shared_bytes = if gqa {
+        let group = num_heads / num_kv_heads;
+        (8 + group * head_dim + group * ATTN_DECODE_TILED_BLOCK_DIM) * 4
+    } else {
+        attention_decode_tiled_shared_bytes(head_dim)
+    };
+    let partial_grid = if gqa { num_kv_heads * s } else { num_heads * s };
     let (m_part, l_part, o_part) = scratch;
     device
         .stream
@@ -1970,7 +2015,7 @@ unsafe fn launch_attention_decode_splitk(
         .arg(&scale)
         .arg(&s)
         .launch(CudarcLaunchConfig {
-            grid_dim: (num_heads * s, 1, 1),
+            grid_dim: (partial_grid, 1, 1),
             block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
             shared_mem_bytes: shared_bytes,
         })
@@ -2041,7 +2086,10 @@ pub(crate) unsafe fn launch_attention_decode_gated(
             if kernels.attention_decode_splitk_partial.is_some()
                 && kernels.attention_decode_splitk_merge.is_some()
                 && attention_decode_splitk_supports_head_dim(head_dim)
-                && attn_splitk_chunks(seq_len) > 1
+                && attn_splitk_chunks(
+                    seq_len,
+                    attn_splitk_chunk_for(kernels, num_heads, num_kv_heads, head_dim),
+                ) > 1
             {
                 launch_attention_decode_splitk(
                     device,
