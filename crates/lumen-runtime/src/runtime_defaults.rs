@@ -221,11 +221,13 @@ pub(crate) fn model_block_count() -> u32 {
 /// precision). Mode map for the batch-≥16 WMMA full-attention prefill kernel:
 /// `0` = legacy F16 WMMA (both QK^T and P@V rounded to F16 operands);
 /// `1` = qkf32 (exact-F32 QK^T, F16 P@V); `2` = pvf32 (F16 QK^T, exact-F32
-/// P@V); `3` = scalar (exact-F32 QK^T **and** exact-F32 P@V — the F32 Br=4
-/// scalar kernel, both dispatch sites route mode 3 there); `4` = split
-/// (hi/lo tensor-core approximation, unqualified).
+/// P@V); `3` = exact F32 (exact-F32 QK^T **and** exact-F32 P@V — the tiled
+/// cuBLAS SGEMM route where [`attn_prefill_sgemm_enabled`] and its kernel
+/// allow it, else the F32 Br=4 scalar kernel; the dispatch site for attention
+/// without per-head q/k norms keeps the scalar kernel); `4` = split (hi/lo
+/// tensor-core approximation, unqualified).
 ///
-/// **Ratified default (2026-07-22): `3` (scalar) for every supported
+/// **Ratified default (2026-07-22): `3` (exact F32) for every supported
 /// production class.** codex-sol RCA (F32-golden L3 trace) proved the
 /// batch-≥16 WMMA prefill has TWO independent precision carriers, and the
 /// prior pvf32 default only closed one of them:
@@ -320,21 +322,21 @@ pub(crate) fn model_block_count() -> u32 {
 /// build. `LUMEN_CUDA_ATTN_PRECISE=<0|1|2|3|4>` overrides either way.
 pub fn attn_precise_default() -> u8 {
     let layers = model_block_count();
-    // MoE (any quant) + dense 9B class (≤32 layers): ratified AP=3 (scalar).
+    // MoE (any quant) + dense 9B class (≤32 layers): ratified AP=3 (exact F32).
     // AP=3 = exact-F32 QK^T AND exact-F32 P@V. It keeps the exact P@V that
     // heals GQ-014 (see below) and ADDS exact QK^T to close the F16-QK score
     // carrier that flipped case-08 (cuda/9B/Q8_0: F16-QK emits 35, golden 28).
     if model_is_moe() || (layers > 0 && layers <= 32) {
         return 3;
     }
-    // 27B (64-layer) dense class: AP=3 (scalar). Exact P@V heals the GQ-014
+    // 27B (64-layer) dense class: AP=3 (exact F32). Exact P@V heals the GQ-014
     // multi-turn F16-WMMA near-tie flip (the per-QUANT bisect below), and the
     // added exact QK^T closes the quant-independent F16-QK score carrier. The
     // 2026-06-12 follow-up already proved exact P@V is correct for ALL three
     // 27B quants; AP=3 preserves it and layers exact QK^T on top:
-    //   * Q4_0 → 3 (scalar). Exact P@V re-confirmed N=3: GQ-014 4/8→8/8 with
+    //   * Q4_0 → 3 (exact F32). Exact P@V re-confirmed N=3: GQ-014 4/8→8/8 with
     //     ZERO single-prompt regression. AP=3 adds exact QK^T (no P@V change).
-    //   * Q8_0 → 3 (scalar). The P@V carrier is prefill-attention P@V F16
+    //   * Q8_0 → 3 (exact F32). The P@V carrier is prefill-attention P@V F16
     //     mantissa (lever bisect: AP=1 QK^T-only does NOT heal GQ-014, AP=2
     //     P@V-exact DOES; GQ-014 6/8→8/8 N=3) — AP=3 keeps that exact P@V and
     //     ALSO makes QK^T exact. The two prior "regressions" that excluded q8
@@ -342,7 +344,7 @@ pub fn attn_precise_default() -> u8 {
     //     DETECTOR FALSE-POSITIVES on gold-standard outputs (full-text: 963
     //     correct, finish=stop; coherent DNS explanation) — fixed by the
     //     harness-only detector calibration that lands with this change.
-    //   * Bf16 → 3 (scalar) AND `gdn_decode_via_prefill_default` carved back IN
+    //   * Bf16 → 3 (exact F32) AND `gdn_decode_via_prefill_default` carved back IN
     //     for the 27B class (see that fn). bf16 has TWO coupled carriers:
     //     prefill-attention P@V F16 (healed by exact P@V) + GDN decode-recurrence
     //     per-step drift over long gens (healed by via-prefill ON). ONLY the
@@ -1194,6 +1196,64 @@ pub fn attn_splitk_enabled() -> bool {
     }
 }
 
+/// `LUMEN_CUDA_ATTN_PRECISE` as selected for this process: an explicit `0`
+/// to `4`, otherwise [`attn_precise_default`] for the model class. Read once;
+/// both prefill-attention dispatch sites and the scratch sizing consult it.
+pub fn attn_precise_selected() -> u8 {
+    static CACHED: OnceLock<u8> = OnceLock::new();
+    *CACHED.get_or_init(
+        || match std::env::var("LUMEN_CUDA_ATTN_PRECISE").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            Ok("2") => 2,
+            Ok("3") => 3,
+            Ok("4") => 4,
+            _ => attn_precise_default(),
+        },
+    )
+}
+
+/// `LUMEN_CUDA_FORCE_SCALAR_ATTN=1`: run the fused Q+gate prefill attention
+/// on the one-warp-per-row scalar kernel, whatever the precision selector and
+/// the tiled route say. The dispatch for attention without per-head q/k norms
+/// does not read it. Read once.
+pub fn force_scalar_attn_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1"))
+}
+
+/// `LUMEN_CUDA_ATTN_PREFILL_SGEMM=0`: kill-switch for the tiled prefill
+/// attention — cuBLAS F32 SGEMM for Q·Kᵀ and P·V (strided-batched over each
+/// KV head's query group) around an exact-F32 causal softmax, in query blocks
+/// of at most 512 rows.
+///
+/// This is not a precision policy of its own: it selects how
+/// `attn_precise_default`'s exact-F32 mode (`LUMEN_CUDA_ATTN_PRECISE=3`) is
+/// computed for prefills of 16 tokens or more. Modes 0/1/2/4 keep their own
+/// kernels whatever this returns, and so do shorter prefills, the decode
+/// path, every non-CUDA backend, and a full-attention layer without per-head
+/// q/k norms (none that today's converter produces): the SGEMM route serves
+/// the fused Q+gate prefill path only.
+///
+/// Exact F32 throughout like the one-warp-per-row scalar kernel it replaces —
+/// no F16 carrier, so neither of the carriers that mode 3 exists to close is
+/// reopened — but a different evaluation order: the softmax row is normalised
+/// before P·V and reduced over the whole row rather than online. Greedy output
+/// can therefore differ from the scalar kernel where two candidates sit within
+/// rounding of each other.
+///
+/// Default ON; unset follows `canonical_default_on`, so
+/// `LUMEN_CUDA_LEGACY_DEFAULTS=1` rolls this back with every other CUDA
+/// default. `=0` restores the scalar kernel for an exact A/B of the two
+/// evaluation orders at a fixed precision mode.
+pub fn attn_prefill_sgemm_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_ATTN_PREFILL_SGEMM") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
 /// Target KV positions per split-K decode-attention chunk unless
 /// `LUMEN_CUDA_ATTN_SPLITK_CHUNK` says otherwise: one of the kernel's
 /// 128-position tiles. The value picks the chunk *count* — the context
@@ -1954,6 +2014,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_BANK3",
     "LUMEN_CUDA_ATTN_PRECISE",
     "LUMEN_CUDA_ATTN_PRECISE_DBG",
+    "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
     "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
@@ -4102,6 +4163,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_BANK3",
         "LUMEN_CUDA_ATTN_PRECISE",
         "LUMEN_CUDA_ATTN_PRECISE_DBG",
+        "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
