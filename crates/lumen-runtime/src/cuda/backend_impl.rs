@@ -9876,14 +9876,6 @@ impl CudaBackend {
                     st.kernels.mul_mat_vec_q_q4_0.as_ref(),
                     st.scratch.input_q8_1.as_mut(),
                 ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q4RAW: Once = Once::new();
-                    TRACE_ONCE_Q4RAW.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q4_0 output_proj (raw): ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
                     let quant_grid = (in_dim + 31) / 32;
                     let quant_cfg = CudarcLaunchConfig {
                         grid_dim: (quant_grid, 1, 1),
@@ -9924,6 +9916,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 output_proj Q4 raw: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_q_q4_0", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
             }
@@ -10330,14 +10326,6 @@ impl CudaBackend {
                     st.kernels.mul_mat_vec_q_q8_0.as_ref(),
                     st.scratch.input_q8_1.as_mut(),
                 ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q8RAW: Once = Once::new();
-                    TRACE_ONCE_Q8RAW.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q8_0 output_proj (raw): ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
                     let quant_grid = (in_dim_u32 + 31) / 32;
                     let quant_cfg = CudarcLaunchConfig {
                         grid_dim: (quant_grid, 1, 1),
@@ -10376,6 +10364,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 output_proj raw: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_q_q8_0", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
             }
@@ -10444,16 +10436,6 @@ impl CudaBackend {
                 && !super::moe::moe_decode_f32_ffn_enabled()
             {
                 if let Some(mv_fn) = st.kernels.mul_mat_vec_f_bf16.as_ref() {
-                    // tracer: emit a single one-shot log so
-                    // operators can confirm the dispatch path is active.
-                    use std::sync::Once;
-                    static TRACE_ONCE: Once = Once::new();
-                    TRACE_ONCE.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_f_bf16 output_proj: ACTIVE (grid={}, ncols2={}, stride={})",
-                            vocab_size, hidden_dim / 2, hidden_dim
-                        ));
-                    });
                     let nrows_x = vocab_size as i32;
                     let ncols_x = hidden_dim as i32;
                     debug_assert!(
@@ -10482,6 +10464,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_f_bf16 output_proj launch: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_f_bf16", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
                 // mul_mat_vec_f_bf16 kernel not loaded — fall through to

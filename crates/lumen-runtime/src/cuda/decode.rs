@@ -51,15 +51,6 @@ macro_rules! cuda_log {
     };
 }
 
-/// unconditional log used by one-shot tracers
-/// (the corresponding gate flag is checked at the call site).
-#[inline]
-pub(crate) fn cuda_log_force(msg: String) {
-    if crate::cuda::decode::cuda_verbose() {
-        eprintln!("{msg}");
-    }
-}
-
 /// Name the route a dispatch site actually took, once per process.
 ///
 /// `seen` is that site's own `OnceLock`: the first call claims it, reads the

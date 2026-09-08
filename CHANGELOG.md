@@ -37,6 +37,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   first visit a dispatch pays one atomic load — which matters here, because a
   decode token launches on the order of a thousand kernels.
 
+- **The three env-gated output-head routes join the announcement**: the
+  `mul_mat_vec_q_q4_0`, `mul_mat_vec_q_q8_0` and `mul_mat_vec_f_bf16` head
+  dispatches each printed a one-shot line of their own shape, before the
+  launch and outside the `ACTIVE` grammar the other head routes use, so a run
+  taking one of them carried no readable head route at all. They now announce
+  through the same helper as every other head route, after the launch that
+  proves the route ran. `cuda_log_force`, which existed only for those three
+  lines, is gone.
+
 - **The decode-attention and output-head routes name themselves under
   `LUMEN_CUDA_VERBOSE`**: on CUDA, the decode-attention variant that was
   dispatched (split-K partial + merge, with its chunk count and whether the
