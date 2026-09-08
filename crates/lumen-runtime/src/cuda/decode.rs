@@ -60,6 +60,28 @@ pub(crate) fn cuda_log_force(msg: String) {
     }
 }
 
+/// Name the route a dispatch site actually took, once per process.
+///
+/// `seen` is that site's own `OnceLock`: the first call claims it and, when
+/// `LUMEN_CUDA_VERBOSE` is on, writes `line()` to stderr; every later call
+/// returns immediately. `line` is only built when the gate is open, so a
+/// silent run pays one atomic load per site and formats nothing. Returns
+/// whether this call was the one that claimed `seen`.
+#[inline]
+pub(crate) fn announce_route_once(
+    seen: &std::sync::OnceLock<()>,
+    line: impl FnOnce() -> String,
+) -> bool {
+    let mut claimed = false;
+    seen.get_or_init(|| {
+        claimed = true;
+        if cuda_verbose() {
+            eprintln!("{}", line());
+        }
+    });
+    claimed
+}
+
 /// F32-EXACT Q4_0 decode matvec kernel variant selector
 /// (`LUMEN_CUDA_Q4_F32ACT_KERNEL`). ALL variants keep FULL F32 activations —
 /// pure kernel/occupancy selection with identical per-row numerics; only the
@@ -4496,3 +4518,47 @@ pub(crate) fn fused_glu_shared_bytes_f16(hidden_dim: u32) -> u32 {
 /// F32 variant covers hidden_dim <= 12288 (12288 * 4 = 49152).
 /// F16 variant covers hidden_dim <= 24576 (24576 * 2 = 49152).
 pub(crate) const FUSED_GLU_SHMEM_LIMIT: u32 = 49152;
+
+#[cfg(test)]
+mod announce_route_once_tests {
+    //! `announce_route_once` is a per-site latch: one line per process, and
+    //! nothing at all — not even the message — when the gate is closed.
+
+    use super::{announce_route_once, cuda_verbose};
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    #[test]
+    fn a_site_announces_at_most_once() {
+        static SEEN: OnceLock<()> = OnceLock::new();
+        let built = Cell::new(0usize);
+        let build = || {
+            built.set(built.get() + 1);
+            String::from("[CUDA] test_route: ACTIVE ()")
+        };
+
+        assert!(
+            announce_route_once(&SEEN, build),
+            "first call claims the site"
+        );
+        assert!(!announce_route_once(&SEEN, build), "second call is a no-op");
+        assert!(!announce_route_once(&SEEN, build), "third call is a no-op");
+
+        assert_eq!(
+            built.get(),
+            usize::from(cuda_verbose()),
+            "the message is built exactly once when verbose, never when quiet"
+        );
+    }
+
+    #[test]
+    fn sites_latch_independently() {
+        static ONE: OnceLock<()> = OnceLock::new();
+        static TWO: OnceLock<()> = OnceLock::new();
+
+        assert!(announce_route_once(&ONE, String::new));
+        assert!(announce_route_once(&TWO, String::new));
+        assert!(!announce_route_once(&ONE, String::new));
+        assert!(!announce_route_once(&TWO, String::new));
+    }
+}

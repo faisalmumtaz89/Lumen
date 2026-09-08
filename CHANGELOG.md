@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **The decode-attention and output-head routes name themselves under
+  `LUMEN_CUDA_VERBOSE`**: on CUDA, the decode-attention variant that was
+  dispatched (split-K partial + merge, with its chunk count and whether the
+  count is context-scaled or fixed; tiled; or single-block) and the output-head
+  kernel that computed the logits each write one `ACTIVE` line to stderr the
+  first time they run, so a route can be read off a run instead of inferred.
+  Output, timing and every dispatch are unchanged, and nothing is written
+  without the flag.
+
 - **Exact-F32 prefill attention is computed as tiled cuBLAS SGEMM**: on CUDA,
   `LUMEN_CUDA_ATTN_PRECISE=3` — exact-F32 Q·Kᵀ and P·V, the default for every
   supported production class — is now evaluated as two strided-batched F32

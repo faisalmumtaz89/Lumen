@@ -2081,6 +2081,28 @@ unsafe fn launch_attention_decode_splitk(
     Ok(())
 }
 
+/// Name the split-K decode-attention pair on its first dispatch.
+///
+/// The chunk count moves with the context, so the line reports the count of
+/// the dispatch that emitted it plus the policy that produced it — `scaled`
+/// (count grows with `seq_len`, capped) or `fixed`
+/// (`LUMEN_CUDA_ATTN_SPLITK_SCALE=0`).
+fn announce_splitk_route(head_dim: u32, seq_len: u32) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        let policy = if crate::runtime_defaults::attn_splitk_scale_with_context() {
+            "scaled"
+        } else {
+            "fixed"
+        };
+        let chunks = attn_splitk_chunks(seq_len);
+        format!(
+            "[CUDA] attention_decode_splitk_partial: ACTIVE (chunks={chunks} {policy}, \
+             head_dim={head_dim}, merge=attention_decode_splitk_merge)"
+        )
+    });
+}
+
 /// Gate-and-dispatch the appropriate decode-attention kernel for `seq_len`.
 ///
 /// Single source of truth for the kernel selection logic, used at the
@@ -2149,6 +2171,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                     max_seq_len,
                     scale,
                 )?;
+                announce_splitk_route(head_dim, seq_len);
                 return Ok(AttentionDecodeVariant::SplitK);
             }
         }
@@ -2201,6 +2224,12 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                 .arg(&scale)
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("attention_decode launch: {e}")))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                super::decode::announce_route_once(&SEEN, || {
+                    format!("[CUDA] attention_decode: ACTIVE (head_dim={head_dim})")
+                });
+            }
         }
         AttentionDecodeVariant::Tiled => {
             launch_attention_decode_tiled(
@@ -2217,6 +2246,12 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                 max_seq_len,
                 scale,
             )?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                super::decode::announce_route_once(&SEEN, || {
+                    format!("[CUDA] attention_decode_tiled: ACTIVE (head_dim={head_dim})")
+                });
+            }
         }
     }
 
