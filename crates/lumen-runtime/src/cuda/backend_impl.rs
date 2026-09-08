@@ -14789,9 +14789,10 @@ fn q8_aligned_fallback_residual_kernel_name(
 
 /// The one place the decode matvec route line is spelled.
 ///
-/// The autoresearch pipeline reads these lines out of a run's own log to prove
-/// which kernel served a decode matvec, so the shape is a contract: a kernel
-/// token the reader accepts, then `: ACTIVE`, then the site and dimensions.
+/// The shape is a contract with whatever reads a run's log back: a kernel name,
+/// then `: ACTIVE`, then the site the route was first taken at and the matvec's
+/// dimensions. Nothing else on the line, and no wording that reads as a route
+/// the run declined.
 fn matvec_route_line(kernel: &str, label: &str, out_dim: usize, in_dim: usize) -> String {
     format!("[CUDA] {kernel}: ACTIVE (first at {label}, out={out_dim}, in={in_dim})")
 }
@@ -14804,8 +14805,8 @@ fn matvec_route_line(kernel: &str, label: &str, out_dim: usize, in_dim: usize) -
 /// formatting run inside the latch initializer, so after each site's first
 /// visit a dispatch that does not announce pays one atomic load; the first
 /// visit also reads the verbosity flag once. That matters here: a decode token
-/// launches on the order of a thousand kernels, and both arms of a
-/// determinism gate run verbose.
+/// launches on the order of a thousand kernels, so anything paid per launch is
+/// paid a thousand times a token, verbose or not.
 ///
 /// `kernel` names the CUDA symbol the loader resolved the handle from, not the
 /// `KernelSet` field holding it — several fields load one symbol from
