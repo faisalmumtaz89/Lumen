@@ -25,8 +25,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   being suppressed by an earlier one. Which route a run took
   can now be read off the run rather than inferred from the environment.
   Numerical computation and dispatch parameters are unchanged; each line is a
-  one-time log write per process, and with the flag off a dispatch pays one
-  atomic load and formats nothing.
+  one-time log write per process, and with the flag off a dispatch formats
+  nothing: after each route's first visit it pays one atomic load, and that
+  first visit also reads the verbosity flag once.
 
 - **Exact-F32 prefill attention is computed as tiled cuBLAS SGEMM**: on CUDA,
   `LUMEN_CUDA_ATTN_PRECISE=3` — exact-F32 Q·Kᵀ and P·V, the default for every

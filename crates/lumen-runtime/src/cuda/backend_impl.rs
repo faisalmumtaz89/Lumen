@@ -13963,8 +13963,9 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
 ///
 /// `seen` is that branch's own `OnceLock`, so each head route reports itself
 /// exactly once and only under `LUMEN_CUDA_VERBOSE`. Both the name selection
-/// and the formatting run inside the latch initializer, so a dispatch that
-/// does not announce pays the latch check alone.
+/// and the formatting run inside the latch initializer, so after each site's
+/// first visit a dispatch that does not announce pays one atomic load; the
+/// first visit also reads the verbosity flag once.
 fn announce_head_route(
     seen: &std::sync::OnceLock<()>,
     kernel: impl FnOnce() -> &'static str,
