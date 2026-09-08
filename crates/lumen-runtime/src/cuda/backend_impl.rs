@@ -2304,6 +2304,16 @@ impl CudaBackend {
                             "wq",
                         )?;
                     }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wq",
+                            wq_od,
+                            hidden_dim,
+                        );
+                    }
                 }
                 if let GpuWeightBuf::F32(ref wk_f32) = lw.wk {
                     unsafe {
@@ -2320,6 +2330,16 @@ impl CudaBackend {
                             "wk",
                         )?;
                     }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wk",
+                            kv_dim,
+                            hidden_dim,
+                        );
+                    }
                 }
                 if let GpuWeightBuf::F32(ref wv_f32) = lw.wv {
                     unsafe {
@@ -2335,6 +2355,16 @@ impl CudaBackend {
                             hidden_dim,
                             "wv",
                         )?;
+                    }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wv",
+                            kv_dim,
+                            hidden_dim,
+                        );
                     }
                 }
             } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
@@ -3836,6 +3866,16 @@ impl CudaBackend {
                             "fused_glu_gemv_q8_split_mmvq L{layer_idx}: {e}",
                         ))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_glu_gemv_q8_split_mmvq",
+                            "ffn_gate_up",
+                            inter_dim,
+                            hidden_dim,
+                        );
+                    }
                 }
                 break 'fused_glu true;
             }
@@ -3906,6 +3946,16 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("fused_glu_gemv_bf16_nr1 L{layer_idx}: {e}",))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "fused_glu_gemv_bf16_nr1",
+                        "ffn_gate_up",
+                        inter_dim,
+                        hidden_dim,
+                    );
+                }
                 break 'fused_glu true;
             }
             // env-gated opt-out of the fused gate+up+SwiGLU kernel.
@@ -3983,6 +4033,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q8_0 L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q8_0",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4027,6 +4087,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q8_0_hg L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q8_0_hg",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4080,6 +4150,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q8_aligned L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q8_aligned",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4124,6 +4204,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q8_aligned_hg L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q8_aligned_hg",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4173,6 +4263,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q4_0 L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q4_0",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4216,6 +4316,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_q4_0_hg L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_q4_0_hg",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4266,6 +4376,16 @@ impl CudaBackend {
                                     "fused_glu_gemv_f16 L{layer_idx}: {e}",
                                 ))
                             })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route(
+                                &SEEN,
+                                || "fused_glu_gemv_f16",
+                                "ffn_gate_up",
+                                inter_dim,
+                                hidden_dim,
+                            );
+                        }
                     }
                     break 'fused_glu true;
                 }
@@ -4307,6 +4427,15 @@ impl CudaBackend {
                             inter_dim,
                             hidden_dim,
                         )?;
+                    }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route_dims(
+                            &SEEN,
+                            || "fused_norm_dual_matvec_f32",
+                            "ffn_gate_up",
+                            || (2 * inter_dim, hidden_dim),
+                        );
                     }
                 }
             } else if matches!(&lw.w_gate, GpuWeightBuf::F16Raw(_))
@@ -4852,6 +4981,16 @@ impl CudaBackend {
                             "matvec_q8_aligned_f32 down L{layer_idx}: {e}",
                         ))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q8_aligned_f32",
+                            "down",
+                            hidden_dim,
+                            inter_dim,
+                        );
+                    }
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
@@ -4910,6 +5049,16 @@ impl CudaBackend {
                             "matvec_q4_aligned_f32_residual down L{layer_idx}: {e}",
                         ))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q4_aligned_f32_residual",
+                            "down",
+                            hidden_dim,
+                            inter_dim,
+                        );
+                    }
                     ffn_in_place = true;
                     {
                         use std::sync::OnceLock;
@@ -4947,6 +5096,16 @@ impl CudaBackend {
                             "matvec_q4_aligned_f32 down L{layer_idx}: {e}",
                         ))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q4_aligned_f32",
+                            "down",
+                            hidden_dim,
+                            inter_dim,
+                        );
+                    }
                 } else {
                     // Fallback: quantize + dp4a (2 dispatches).
                     unsafe {
@@ -5224,6 +5383,16 @@ impl CudaBackend {
                         "matvec_q8_aligned_f32_swiglu down L{layer_idx}: {e}",
                     ))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q8_aligned_f32_swiglu",
+                        "down",
+                        hidden_dim,
+                        inter_dim,
+                    );
+                }
             } else {
                 // Fallback: separate SwiGLU + quantize + dp4a (3 dispatches).
                 {
@@ -5306,6 +5475,16 @@ impl CudaBackend {
                         "matvec_q4_aligned_f32_swiglu_residual down L{layer_idx}: {e}",
                     ))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q4_aligned_f32_swiglu_residual",
+                        "down",
+                        hidden_dim,
+                        inter_dim,
+                    );
+                }
                 ffn_in_place = true;
                 {
                     use std::sync::OnceLock;
@@ -5344,6 +5523,16 @@ impl CudaBackend {
                         "matvec_q4_aligned_f32_swiglu down L{layer_idx}: {e}",
                     ))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q4_aligned_f32_swiglu",
+                        "down",
+                        hidden_dim,
+                        inter_dim,
+                    );
+                }
             } else {
                 // Fallback: separate SwiGLU + quantize + dp4a (3 dispatches).
                 {
@@ -5978,6 +6167,15 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_f32_gates_banked L{layer_idx}: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route_dims(
+                            &SEEN,
+                            || "matvec_f32_gates_banked",
+                            "gdn_gates_f32",
+                            || (2 * p.num_heads, hidden_dim),
+                        );
+                    }
                 } else {
                     unsafe {
                         launch_matvec(
@@ -6094,6 +6292,15 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("gdn_ab_bank_q8 L{layer_idx}: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route_dims(
+                            &SEEN,
+                            || "matvec_q8_0_q8_1_banked",
+                            "gdn_alpha_beta",
+                            || (2 * p.num_heads, hidden_dim),
+                        );
+                    }
                 } else {
                     unsafe {
                         launch_matvec_preq8_1_split(
@@ -6300,6 +6507,15 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("gdn_ab_q8bank L{layer_idx}: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route_dims(
+                            &SEEN,
+                            || "matvec_q8_0_q8_1_banked",
+                            "gdn_alpha_beta",
+                            || (2 * p.num_heads, hidden_dim),
+                        );
+                    }
                     ab_banked = true;
                 }
                 if !ab_banked {
@@ -7666,6 +7882,16 @@ impl CudaBackend {
                             "matvec_q5k_split_residual L{layer_idx}: {e}"
                         ))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q5k_split_q8_1_residual",
+                            "gdn_ssm_out",
+                            hidden_dim,
+                            p.value_dim,
+                        );
+                    }
                     ssm_residual_folded = true;
                 } else {
                     let mv_fn = st.kernels.matvec_q5k_split.as_ref().ok_or_else(|| {
@@ -7690,6 +7916,16 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q5k_split L{layer_idx}: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q5k_split_q8_1",
+                            "gdn_ssm_out",
+                            hidden_dim,
+                            p.value_dim,
+                        );
+                    }
                 }
                 {
                     use std::sync::OnceLock;
@@ -9498,6 +9734,15 @@ impl CudaBackend {
                         st.algo_cache.get(vocab_size, hidden_dim),
                     )?;
                 }
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(
+                        &SEEN,
+                        || "matvec_f16_cublas_gemm_ex_preconverted",
+                        vocab_size,
+                        hidden_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -9595,6 +9840,10 @@ impl CudaBackend {
                     }
                 });
             }
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_head_route(&SEEN, || "matvec_q6k_split_q8_1", vocab_size, hidden_dim);
+            }
             return Ok(());
         }
 
@@ -9650,6 +9899,10 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec_q4_aligned_q8_1 output_proj: {e}",))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, || "matvec_q4_aligned_q8_1", vocab_size, hidden_dim);
+                }
             }
         } else if let Some(ref proj_q4) = st.globals.output_proj_q4 {
             let out_dim = vocab_size as u32;
@@ -9664,14 +9917,6 @@ impl CudaBackend {
                     st.kernels.mul_mat_vec_q_q4_0.as_ref(),
                     st.scratch.input_q8_1.as_mut(),
                 ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q4RAW: Once = Once::new();
-                    TRACE_ONCE_Q4RAW.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q4_0 output_proj (raw): ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
                     let quant_grid = (in_dim + 31) / 32;
                     let quant_cfg = CudarcLaunchConfig {
                         grid_dim: (quant_grid, 1, 1),
@@ -9712,6 +9957,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 output_proj Q4 raw: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_q_q4_0", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
             }
@@ -9747,6 +9996,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec output_proj Q4_0 row launch: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
                 Q4F32ActKernel::Nr4 | Q4F32ActKernel::Nr8 => {
@@ -9780,6 +10033,21 @@ impl CudaBackend {
                                 "matvec output_proj Q4_0 smem-wide launch: {e}"
                             ))
                         })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_head_route(
+                                &SEEN,
+                                || {
+                                    if nr == 8 {
+                                        "matvec_q4_0_smem_nr8"
+                                    } else {
+                                        "matvec_q4_0_smem_nr4"
+                                    }
+                                },
+                                vocab_size,
+                                hidden_dim,
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -9808,6 +10076,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec output_proj Q4_0 smem launch: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "matvec_q4_0_smem", vocab_size, hidden_dim);
+                    }
                 } else {
                     let mv_block = matvec_block_size();
                     let launch_cfg = CudarcLaunchConfig {
@@ -9829,6 +10101,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec output_proj Q4_0 launch: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
+                    }
                 }
             } else {
                 let mv_block = matvec_block_size();
@@ -9851,6 +10127,10 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec output_proj Q4_0 launch: {e}"))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
+                }
             }
         } else if let Some(ref proj_f16) = st.globals.output_proj_f16 {
             // F16 output projection: cuBLAS HGEMV (cublasGemmEx N=1).
@@ -9868,6 +10148,15 @@ impl CudaBackend {
                     st.algo_cache.get(vocab_size, hidden_dim),
                 )?;
             }
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_head_route(
+                    &SEEN,
+                    || "matvec_f16_cublas_gemm_ex",
+                    vocab_size,
+                    hidden_dim,
+                );
+            }
         } else if let Some(ref proj_q8_split) = st.globals.output_proj_q8_split {
             // OUTPUT_PROJ_SPLIT: Q8 split (SoA) layout for output_proj.
             // Use the dedicated `matvec_q8_split_output_proj_nr32` kernel which
@@ -9883,6 +10172,8 @@ impl CudaBackend {
             // remains the default.
             let out_dim_u32 = vocab_size as u32;
             let in_dim_u32 = hidden_dim as u32;
+            // The name is read off the handle that launched, inside the latch, so
+            // the announced name cannot drift from the kernel that ran.
             let (split_mv_fn, mv_grid): (&CudaFunction, u32) =
                 if let Some(proj_fn) = pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr) {
                     let nr = st.output_proj_nr;
@@ -9936,6 +10227,15 @@ impl CudaBackend {
                         .launch(mv_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q8_split output_proj: {e}",)))?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(
+                        &SEEN,
+                        || split_output_proj_kernel_name(&st.kernels, split_mv_fn),
+                        vocab_size,
+                        hidden_dim,
+                    );
+                }
             } else {
                 return Err(RuntimeError::Compute(
                     "output_proj_q8_split present but quantize kernel unavailable".into(),
@@ -9948,17 +10248,20 @@ impl CudaBackend {
 
             // Path 0: Q8Aligned + pre-quantized Q8_1 input (NR=2, dp4a).
             // Q8_SCALE_HW: prefer halfword-scale variant for output_proj.
-            let aligned_mv_fn = if st.kernels.use_q8_scale_hw {
+            // The variant this returns is the one that launches; its name is read
+            // back off that handle inside the latch.
+            let plain_aligned = || st.kernels.matvec_q8_aligned_q8_1.as_ref();
+            let aligned_mv = if st.kernels.use_q8_scale_hw {
                 st.kernels
                     .matvec_q8_aligned_q8_1_hw
                     .as_ref()
-                    .or(st.kernels.matvec_q8_aligned_q8_1.as_ref())
+                    .or_else(plain_aligned)
             } else {
-                st.kernels.matvec_q8_aligned_q8_1.as_ref()
+                plain_aligned()
             };
             if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
-                aligned_mv_fn,
+                aligned_mv,
                 st.scratch.input_q8_1.as_mut(),
             ) {
                 let quant_grid = q8_1_quant_grid(in_dim_u32);
@@ -10000,6 +10303,26 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 output_proj: {e}"))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(
+                        &SEEN,
+                        || {
+                            if st
+                                .kernels
+                                .matvec_q8_aligned_q8_1_hw
+                                .as_ref()
+                                .is_some_and(|f| std::ptr::eq(f, mv_fn))
+                            {
+                                "matvec_q8_aligned_q8_1_hw"
+                            } else {
+                                "matvec_q8_aligned_q8_1"
+                            }
+                        },
+                        vocab_size,
+                        hidden_dim,
+                    );
+                }
             } else {
                 // Fallback: on-the-fly x quantization. The padded layout has
                 // exactly one kernel that reads it.
@@ -10028,6 +10351,10 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec output_proj Q8_0 aligned launch: {e}"))
                 })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, || "matvec_q8_0_aligned", vocab_size, hidden_dim);
+                }
             }
         } else if let Some(ref proj_q8) = st.globals.output_proj_q8 {
             // Q8_0 output projection: dp4a (native Q8_0, ~1.06 B/elem).
@@ -10045,14 +10372,6 @@ impl CudaBackend {
                     st.kernels.mul_mat_vec_q_q8_0.as_ref(),
                     st.scratch.input_q8_1.as_mut(),
                 ) {
-                    use std::sync::Once;
-                    static TRACE_ONCE_Q8RAW: Once = Once::new();
-                    TRACE_ONCE_Q8RAW.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_q_q8_0 output_proj (raw): ACTIVE (grid={}, in_dim={})",
-                            vocab_size, hidden_dim
-                        ));
-                    });
                     let quant_grid = (in_dim_u32 + 31) / 32;
                     let quant_cfg = CudarcLaunchConfig {
                         grid_dim: (quant_grid, 1, 1),
@@ -10091,6 +10410,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 output_proj raw: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_q_q8_0", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
             }
@@ -10119,6 +10442,21 @@ impl CudaBackend {
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}")))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_head_route(
+                    &SEEN,
+                    || {
+                        if std::ptr::eq(q8_fn, &st.kernels.matvec_q8_0) {
+                            "matvec_q8_0"
+                        } else {
+                            "matvec_q8_0_dp4a"
+                        }
+                    },
+                    vocab_size,
+                    hidden_dim,
+                );
+            }
         } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
             // Path -1: BF16 output_proj matvec dispatch.
             // Gated by `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` (canonical default ON)
@@ -10144,16 +10482,6 @@ impl CudaBackend {
                 && !super::moe::moe_decode_f32_ffn_enabled()
             {
                 if let Some(mv_fn) = st.kernels.mul_mat_vec_f_bf16.as_ref() {
-                    // tracer: emit a single one-shot log so
-                    // operators can confirm the dispatch path is active.
-                    use std::sync::Once;
-                    static TRACE_ONCE: Once = Once::new();
-                    TRACE_ONCE.call_once(|| {
-                        super::decode::cuda_log_force(format!(
-                            "[CUDA] mul_mat_vec_f_bf16 output_proj: ACTIVE (grid={}, ncols2={}, stride={})",
-                            vocab_size, hidden_dim / 2, hidden_dim
-                        ));
-                    });
                     let nrows_x = vocab_size as i32;
                     let ncols_x = hidden_dim as i32;
                     debug_assert!(
@@ -10182,6 +10510,10 @@ impl CudaBackend {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_f_bf16 output_proj launch: {e}"))
                     })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_head_route(&SEEN, || "mul_mat_vec_f_bf16", vocab_size, hidden_dim);
+                    }
                     return Ok(());
                 }
                 // mul_mat_vec_f_bf16 kernel not loaded — fall through to
@@ -10205,7 +10537,7 @@ impl CudaBackend {
             // closed (or the GemmEx call fails at runtime), this dispatches
             // via the legacy `matvec_bf16` kernel instead of aborting the
             // generation.
-            unsafe {
+            let bf16_route = unsafe {
                 launch_bf16_matvec_with_fallback(
                     &self.device,
                     &st.kernels,
@@ -10216,7 +10548,25 @@ impl CudaBackend {
                     vocab_size,
                     hidden_dim,
                     "output_proj",
-                )?;
+                )?
+            };
+            // One latch per dispatch site, each naming the route that launched:
+            // a call that falls back to the legacy kernel still announces it,
+            // and neither line is read off gate state after the fact.
+            match bf16_route {
+                Bf16MatvecRoute::HgemvBf16 => {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(
+                        &SEEN,
+                        || "matvec_bf16_cublas_gemm_ex",
+                        vocab_size,
+                        hidden_dim,
+                    );
+                }
+                Bf16MatvecRoute::MatvecBf16 => {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, || "matvec_bf16", vocab_size, hidden_dim);
+                }
             }
         } else {
             let cfg = GemvConfig {
@@ -10238,6 +10588,10 @@ impl CudaBackend {
                 )
             }
             .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}")))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_head_route(&SEEN, || "matvec_f32_cublas_gemv", vocab_size, hidden_dim);
+            }
         }
 
         Ok(())
@@ -10521,6 +10875,10 @@ unsafe fn launch_matvec(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q8_0 {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "mul_mat_vec_q_q8_0", label, out_dim, in_dim);
+                }
                 return Ok(());
             }
         }
@@ -10571,6 +10929,10 @@ unsafe fn launch_matvec(
                 .arg(&in_dim_u32)
                 .launch(mv_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q8_0_q8_1 {label}: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q8_0_q8_1", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -10601,6 +10963,10 @@ unsafe fn launch_matvec(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec Q8_0 smem {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q8_0_smem", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -10630,6 +10996,10 @@ unsafe fn launch_matvec(
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("hgemv Q8_0 {label} launch: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "hgemv_q8_0", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -10672,6 +11042,22 @@ unsafe fn launch_matvec(
             .arg(&in_dim_u32)
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 {label} launch: {e}",)))?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(
+                &SEEN,
+                || {
+                    if kernels.matvec_q8_0_dp4a.is_some() {
+                        "matvec_q8_0_dp4a"
+                    } else {
+                        "matvec_q8_0"
+                    }
+                },
+                label,
+                out_dim,
+                in_dim,
+            );
+        }
         return Ok(());
     }
 
@@ -10728,6 +11114,10 @@ unsafe fn launch_matvec(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("mul_mat_vec_q_q4_0 {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "mul_mat_vec_q_q4_0", label, out_dim, in_dim);
+                }
                 return Ok(());
             }
         }
@@ -10783,6 +11173,19 @@ unsafe fn launch_matvec(
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
                     .map_err(|e| RuntimeError::Compute(format!("matvec_q4_dp4a {label}: {e}",)))?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || match weight {
+                            GpuWeightBuf::Q4Aligned(_) => "matvec_q4_aligned_q8_1",
+                            _ => "matvec_q4_0_dp4a",
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -10823,6 +11226,10 @@ unsafe fn launch_matvec(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec Q4_0 row {label} launch: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "matvec_q4_0", label, out_dim, in_dim);
+                }
                 return Ok(());
             }
             Q4F32ActKernel::Nr4 | Q4F32ActKernel::Nr8 => {
@@ -10855,6 +11262,22 @@ unsafe fn launch_matvec(
                                 "matvec Q4_0 smem-wide {label} launch: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || {
+                                if nr == 8 {
+                                    "matvec_q4_0_smem_nr8"
+                                } else {
+                                    "matvec_q4_0_smem_nr4"
+                                }
+                            },
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -10890,6 +11313,10 @@ unsafe fn launch_matvec(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec Q4_0 smem {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q4_0_smem", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -10918,6 +11345,10 @@ unsafe fn launch_matvec(
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("hgemv Q4_0 {label} launch: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "hgemv_q4_0", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -10956,6 +11387,10 @@ unsafe fn launch_matvec(
             .arg(&in_dim_u32)
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("matvec Q4_0 {label} launch: {e}",)))?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(&SEEN, || "matvec_q4_0", label, out_dim, in_dim);
+        }
         return Ok(());
     }
 
@@ -11015,12 +11450,29 @@ unsafe fn launch_matvec(
                             "matvec_bf16_v4 (nr={nr}) {label} launch: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if nr == 1 {
+                                "matvec_bf16_v4_nr1"
+                            } else {
+                                "matvec_bf16_v4"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
         return launch_bf16_matvec_with_fallback(
             device, kernels, w_bf16, input, output, scratch, out_dim, in_dim, label,
-        );
+        )
+        .map(|_| ());
     }
 
     // HGEMV path: cuBLAS with pre-dequanted F16 weights.
@@ -11108,6 +11560,20 @@ unsafe fn launch_matvec(
             .arg(&in_dim_u32)
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("matvec_ct4 {label} launch: {e}")))?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(
+                &SEEN,
+                || match tpb {
+                    160 => "matvec_ct4_q8_1_t160",
+                    192 => "matvec_ct4_q8_1_t192",
+                    _ => "matvec_ct4_q8_1",
+                },
+                label,
+                out_dim,
+                in_dim,
+            );
+        }
         return Ok(());
     }
 
@@ -11127,6 +11593,10 @@ unsafe fn launch_matvec(
                 .blas
                 .gemv(cfg, w_f32, input, output)
                 .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV {label}: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_f32_cublas_gemv", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             // Custom F16 matvec kernel (dequant f16→f32 on the fly).
@@ -11148,6 +11618,10 @@ unsafe fn launch_matvec(
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec F16 {label} launch: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_f16", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::Bf16Raw(w_bf16) => {
             // I-BF16 Phase-3 fallback: only reached when input_f16_scratch is
@@ -11173,6 +11647,10 @@ unsafe fn launch_matvec(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec BF16 fallback {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_bf16", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             let out_dim_u32 = out_dim as u32;
@@ -11231,6 +11709,24 @@ unsafe fn launch_matvec(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if kernels.use_q8_scale_hw
+                                && kernels.matvec_q8_aligned_q8_1_hw.is_some()
+                            {
+                                "matvec_q8_aligned_q8_1_hw"
+                            } else {
+                                "matvec_q8_aligned_q8_1"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
             } else {
                 // Fallback: Q8_0 aligned dp4a with on-the-fly x quantization (NR=2).
                 let q8a_fn = kernels
@@ -11256,6 +11752,16 @@ unsafe fn launch_matvec(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec Q8_0 aligned {label} launch: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || q8_aligned_fallback_kernel_name(kernels, q8a_fn),
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
             }
         }
         // Q8Raw fallback: dp4a or v1 scalar (smem kernel not available).
@@ -11277,6 +11783,10 @@ unsafe fn launch_matvec(
                     .arg(&(in_dim as u32))
                     .launch(launch_cfg)
                     .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 dp4a {label}: {e}")))?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "matvec_q8_0_dp4a", label, out_dim, in_dim);
+                }
             } else {
                 let mv_block = matvec_block_size();
                 let launch_cfg = CudarcLaunchConfig {
@@ -11294,6 +11804,10 @@ unsafe fn launch_matvec(
                     .arg(&(in_dim as u32))
                     .launch(launch_cfg)
                     .map_err(|e| RuntimeError::Compute(format!("matvec Q8_0 v1 {label}: {e}")))?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "matvec_q8_0", label, out_dim, in_dim);
+                }
             }
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
@@ -11316,6 +11830,10 @@ unsafe fn launch_matvec(
                 .arg(&in_dim_u32)
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec Q4_0 {label} launch: {e}",)))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q4_0", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::Q4Aligned(_) => {
             // Should not reach here — Q4Aligned is handled by early-return above.
@@ -11421,6 +11939,16 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec_q8_0_q8_1_residual {label}: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_q8_0_q8_1_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
             return Ok(());
         }
 
@@ -11452,6 +11980,16 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec+residual Q8_0 smem {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_q8_0_smem_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
             return Ok(());
         }
 
@@ -11483,6 +12021,10 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("hgemv+residual Q8_0 {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "hgemv_q8_0_residual", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -11529,6 +12071,22 @@ unsafe fn launch_matvec_residual(
             .map_err(|e| {
                 RuntimeError::Compute(format!("matvec+residual Q8_0 {label} launch: {e}",))
             })?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(
+                &SEEN,
+                || {
+                    if kernels.matvec_q8_0_dp4a_residual.is_some() {
+                        "matvec_q8_0_dp4a_residual"
+                    } else {
+                        "matvec_q8_0_residual"
+                    }
+                },
+                label,
+                out_dim,
+                in_dim,
+            );
+        }
         return Ok(());
     }
 
@@ -11597,6 +12155,19 @@ unsafe fn launch_matvec_residual(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q4_dp4a_residual {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || match weight {
+                            GpuWeightBuf::Q4Aligned(_) => "matvec_q4_aligned_q8_1_residual",
+                            _ => "matvec_q4_0_dp4a_residual",
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -11637,6 +12208,16 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec+residual Q4_0 smem {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_q4_0_smem_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
             return Ok(());
         }
 
@@ -11668,6 +12249,10 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("hgemv+residual Q4_0 {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "hgemv_q4_0_residual", label, out_dim, in_dim);
+            }
             return Ok(());
         }
 
@@ -11693,6 +12278,10 @@ unsafe fn launch_matvec_residual(
             .map_err(|e| {
                 RuntimeError::Compute(format!("matvec+residual Q4_0 {label} launch: {e}",))
             })?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(&SEEN, || "matvec_q4_0_residual", label, out_dim, in_dim);
+        }
         return Ok(());
     }
 
@@ -11798,6 +12387,20 @@ unsafe fn launch_matvec_residual(
             .map_err(|e| {
                 RuntimeError::Compute(format!("matvec_ct4_residual {label} launch: {e}"))
             })?;
+        {
+            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            announce_matvec_route(
+                &SEEN,
+                || match tpb {
+                    160 => "matvec_ct4_q8_1_residual_t160",
+                    192 => "matvec_ct4_q8_1_residual_t192",
+                    _ => "matvec_ct4_q8_1_residual",
+                },
+                label,
+                out_dim,
+                in_dim,
+            );
+        }
         return Ok(());
     }
 
@@ -11820,6 +12423,16 @@ unsafe fn launch_matvec_residual(
             device.blas.gemv(cfg, w_f32, input, output).map_err(|e| {
                 RuntimeError::Compute(format!("cuBLAS GEMV+residual {label}: {e}",))
             })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_f32_cublas_gemv_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
             let out_dim_u32 = out_dim as u32;
@@ -11882,6 +12495,24 @@ unsafe fn launch_matvec_residual(
                             "matvec_q8_aligned_q8_1_residual {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if kernels.use_q8_scale_hw
+                                && kernels.matvec_q8_aligned_q8_1_hw_residual.is_some()
+                            {
+                                "matvec_q8_aligned_q8_1_hw_residual"
+                            } else {
+                                "matvec_q8_aligned_q8_1_residual"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
             } else {
                 // Fallback: Q8_0 aligned dp4a residual with on-the-fly x quantization.
                 let q8a_fn = kernels
@@ -11910,6 +12541,16 @@ unsafe fn launch_matvec_residual(
                             "matvec+residual Q8_0 aligned {label} launch: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || q8_aligned_fallback_residual_kernel_name(kernels, q8a_fn),
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
             }
         }
         // Q8Raw fallback: dp4a or v1 scalar residual (unreachable — handled above).
@@ -11941,6 +12582,22 @@ unsafe fn launch_matvec_residual(
                         "matvec+residual Q8_0 fallback {label} launch: {e}",
                     ))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || {
+                        if kernels.matvec_q8_0_dp4a_residual.is_some() {
+                            "matvec_q8_0_dp4a_residual"
+                        } else {
+                            "matvec_q8_0_residual"
+                        }
+                    },
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
             let mv_block = matvec_block_size();
@@ -11964,6 +12621,10 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec+residual F16 {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_f16_residual", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::Bf16Raw(w_bf16) => {
             // BF16Raw fused matvec+residual: mirrors F16Raw path.
@@ -11988,6 +12649,10 @@ unsafe fn launch_matvec_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec+residual BF16 {label} launch: {e}",))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_bf16_residual", label, out_dim, in_dim);
+            }
         }
         // Q4Raw fallback: scalar Q4_0 residual (unreachable — handled above).
         GpuWeightBuf::Q4Raw(w_q4) => {
@@ -12014,6 +12679,10 @@ unsafe fn launch_matvec_residual(
                         "matvec+residual Q4_0 fallback {label} launch: {e}",
                     ))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q4_0_residual", label, out_dim, in_dim);
+            }
         }
         GpuWeightBuf::Q4Aligned(_) => {
             // Should not reach here — Q4Aligned is handled by early-return above.
@@ -12128,6 +12797,10 @@ unsafe fn launch_matvec_preq8_1(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q8_0_q8_1 preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "matvec_q8_0_q8_1", label, out_dim, in_dim);
+                }
                 return Ok(());
             }
         }
@@ -12159,6 +12832,16 @@ unsafe fn launch_matvec_preq8_1(
                                 "matvec_q8_aligned_q8_1_mmvq preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q8_aligned_q8_1_mmvq",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12193,6 +12876,24 @@ unsafe fn launch_matvec_preq8_1(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q8_aligned_q8_1 preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if kernels.use_q8_scale_hw
+                                && kernels.matvec_q8_aligned_q8_1_hw.is_some()
+                            {
+                                "matvec_q8_aligned_q8_1_hw"
+                            } else {
+                                "matvec_q8_aligned_q8_1"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12216,6 +12917,16 @@ unsafe fn launch_matvec_preq8_1(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q4_aligned_q8_1 preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q4_aligned_q8_1",
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12239,6 +12950,10 @@ unsafe fn launch_matvec_preq8_1(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q4_0_dp4a preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(&SEEN, || "matvec_q4_0_dp4a", label, out_dim, in_dim);
+                }
                 return Ok(());
             }
         }
@@ -12297,6 +13012,16 @@ unsafe fn launch_matvec_preq8_1_residual(
                             "matvec_q8_0_q8_1_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q8_0_q8_1_residual",
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12328,6 +13053,16 @@ unsafe fn launch_matvec_preq8_1_residual(
                                 "matvec_q8_aligned_q8_1_mmvq_residual preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q8_aligned_q8_1_mmvq_residual",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12362,6 +13097,24 @@ unsafe fn launch_matvec_preq8_1_residual(
                             "matvec_q8_aligned_q8_1_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if kernels.use_q8_scale_hw
+                                && kernels.matvec_q8_aligned_q8_1_hw_residual.is_some()
+                            {
+                                "matvec_q8_aligned_q8_1_hw_residual"
+                            } else {
+                                "matvec_q8_aligned_q8_1_residual"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12388,6 +13141,16 @@ unsafe fn launch_matvec_preq8_1_residual(
                             "matvec_q4_aligned_q8_1_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q4_aligned_q8_1_residual",
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12414,6 +13177,16 @@ unsafe fn launch_matvec_preq8_1_residual(
                             "matvec_q4_0_dp4a_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_q4_0_dp4a_residual",
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12508,6 +13281,15 @@ unsafe fn launch_matvec_preq8_1_q4_bank4(
         .arg(&in_dim_u32)
         .launch(mv_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_bank4 {label}: {e}")))?;
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route_dims(
+            &SEEN,
+            || "matvec_q4_split_q8_1_locked_bank4",
+            label,
+            || (dims[0] + dims[1] + dims[2] + dims[3], in_dim),
+        );
+    }
     Ok(())
 }
 
@@ -12589,6 +13371,15 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
         .arg(&in_dim_u32)
         .launch(mv_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_banked {label}: {e}")))?;
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route_dims(
+            &SEEN,
+            || locked_banked_kernel_name(kernels, mv_fn),
+            label,
+            || (out_a_dim + out_b_dim, in_dim),
+        );
+    }
     Ok(())
 }
 
@@ -12635,6 +13426,16 @@ unsafe fn launch_matvec_q4_1_preq8_1(
                 .arg(&in_dim_u32)
                 .launch(mv_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1_residual {label}: {e}")))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_q4_1_q8_1_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
         }
         None => {
             let mv_fn = kernels.matvec_q4_1.as_ref().ok_or_else(|| {
@@ -12650,6 +13451,10 @@ unsafe fn launch_matvec_q4_1_preq8_1(
                 .arg(&in_dim_u32)
                 .launch(mv_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q4_1 {label}: {e}")))?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_q4_1_q8_1", label, out_dim, in_dim);
+            }
         }
     }
     {
@@ -12706,6 +13511,16 @@ unsafe fn launch_matvec_preq8_1_split(
                                 "matvec_q8_split_q8_1_mmvq preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q8_split_q8_1_mmvq",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12741,6 +13556,22 @@ unsafe fn launch_matvec_preq8_1_split(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q8_split_q8_1 preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if use_fast {
+                                "matvec_q8_split_q8_1_v4"
+                            } else {
+                                "matvec_q8_split_q8_1"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12777,6 +13608,16 @@ unsafe fn launch_matvec_preq8_1_split(
                                 "matvec_q4_split_q8_1_mmvq preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q4_split_q8_1_mmvq",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12813,6 +13654,22 @@ unsafe fn launch_matvec_preq8_1_split(
                     .map_err(|e| {
                         RuntimeError::Compute(format!("matvec_q4_split_q8_1 preq {label}: {e}",))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if kernels.use_soa_locked {
+                                "matvec_q4_split_q8_1_locked"
+                            } else {
+                                "matvec_q4_split_q8_1"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12869,6 +13726,16 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                                 "matvec_q8_split_q8_1_mmvq_residual preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q8_split_q8_1_mmvq_residual",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12905,6 +13772,22 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                             "matvec_q8_split_q8_1_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || {
+                            if use_fast {
+                                "matvec_q8_split_q8_1_v4_residual"
+                            } else {
+                                "matvec_q8_split_q8_1_residual"
+                            }
+                        },
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -12938,6 +13821,16 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                                 "matvec_q4_split_q8_1_mmvq_residual preq {label}: {e}",
                             ))
                         })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_q4_split_q8_1_mmvq_residual",
+                            label,
+                            out_dim,
+                            in_dim,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -12992,6 +13885,16 @@ unsafe fn launch_matvec_preq8_1_residual_split(
                             "matvec_q4_split_q8_1_residual preq {label}: {e}",
                         ))
                     })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || q4_split_residual_kernel_name(kernels, mv_fn),
+                        label,
+                        out_dim,
+                        in_dim,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -13841,6 +14744,145 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
     }
 }
 
+/// Name the output-head kernel a branch dispatched, once per process.
+///
+/// `seen` is that branch's own `OnceLock`, so each head route reports itself
+/// exactly once and only under `LUMEN_CUDA_VERBOSE`. Both the name selection
+/// and the formatting run inside the latch initializer, so after each site's
+/// first visit a dispatch that does not announce pays one atomic load; the
+/// first visit also reads the verbosity flag once.
+fn announce_head_route(
+    seen: &std::sync::OnceLock<()>,
+    kernel: impl FnOnce() -> &'static str,
+    vocab_size: usize,
+    hidden_dim: usize,
+) {
+    super::decode::announce_route_once(seen, || {
+        let kernel = kernel();
+        format!("[CUDA] {kernel}: ACTIVE (output_proj, vocab={vocab_size}, in={hidden_dim})")
+    });
+}
+
+/// Name the locked banked Q4 split kernel behind `launched`, by identity with
+/// the handles it could have been resolved from.
+///
+/// All four slots load the symbol `matvec_q4_split_q8_1_locked_banked`; they
+/// differ only in the `THREADS_PER_BLOCK` / `LUMEN_Q4_V4LOAD` codegen the
+/// source was compiled under, which the `[B160]` and `[V4LOAD]` markers
+/// already report. The identity check is here so that a slot loading some
+/// other symbol, added to the selection above, cannot be announced under a
+/// kernel it never launched.
+fn locked_banked_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q4_split_q8_1_locked_banked_b160_v4)
+        || is(&kernels.matvec_q4_split_q8_1_locked_banked_b160)
+        || is(&kernels.matvec_q4_split_q8_1_locked_banked_v4)
+        || is(&kernels.matvec_q4_split_q8_1_locked_banked)
+    {
+        "matvec_q4_split_q8_1_locked_banked"
+    } else {
+        "matvec_q4_split_q8_1_locked_banked_unmapped"
+    }
+}
+
+/// Name the Q4 split residual kernel behind `launched`. The NR=1 down-projection
+/// variant is a recompile of the locked residual source under a different `NR`,
+/// so it carries the same symbol; `[CUDA] Q4_DOWN_NR1` reports the grid it ran.
+fn q4_split_residual_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q4_split_q8_1_locked_residual_nr1)
+        || is(&kernels.matvec_q4_split_q8_1_locked_residual)
+    {
+        "matvec_q4_split_q8_1_locked_residual"
+    } else if is(&kernels.matvec_q4_split_q8_1_residual) {
+        "matvec_q4_split_q8_1_residual"
+    } else {
+        "matvec_q4_split_unmapped"
+    }
+}
+
+/// Name the Q8 aligned fallback kernel behind `launched`: the dispatch walks
+/// `matvec_q8_0_aligned` → `matvec_q8_0_dp4a` → the always-present
+/// `matvec_q8_0`, so the handle alone says which of the three ran.
+fn q8_aligned_fallback_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q8_0_aligned) {
+        "matvec_q8_0_aligned"
+    } else if is(&kernels.matvec_q8_0_dp4a) {
+        "matvec_q8_0_dp4a"
+    } else if std::ptr::eq(&kernels.matvec_q8_0, launched) {
+        "matvec_q8_0"
+    } else {
+        "matvec_q8_0_unmapped"
+    }
+}
+
+/// The residual sibling of `q8_aligned_fallback_kernel_name`, over the
+/// `matvec_q8_0_aligned_residual` → `matvec_q8_0_dp4a_residual` →
+/// `matvec_q8_0_residual` walk.
+fn q8_aligned_fallback_residual_kernel_name(
+    kernels: &KernelSet,
+    launched: &CudaFunction,
+) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q8_0_aligned_residual) {
+        "matvec_q8_0_aligned_residual"
+    } else if is(&kernels.matvec_q8_0_dp4a_residual) {
+        "matvec_q8_0_dp4a_residual"
+    } else if std::ptr::eq(&kernels.matvec_q8_0_residual, launched) {
+        "matvec_q8_0_residual"
+    } else {
+        "matvec_q8_0_residual_unmapped"
+    }
+}
+
+/// Name the decode matvec kernel a dispatch site actually launched, once per
+/// process.
+///
+/// `seen` is that site's own `OnceLock`, so each route reports itself exactly
+/// once and only under `LUMEN_CUDA_VERBOSE`. Both the name selection and the
+/// formatting run inside the latch initializer, so after each site's first
+/// visit a dispatch that does not announce pays one atomic load; the first
+/// visit also reads the verbosity flag once. That matters here: a decode token
+/// launches on the order of a thousand kernels, so anything paid per launch is
+/// paid a thousand times a token, verbose or not.
+///
+/// `kernel` names the CUDA symbol the loader resolved the handle from, not the
+/// `KernelSet` field holding it — several fields load one symbol from
+/// differently-configured sources, and two fields load under names of their
+/// own. The cuBLAS-backed routes have no device symbol and name the host-side
+/// route that ran.
+fn announce_matvec_route(
+    seen: &std::sync::OnceLock<()>,
+    kernel: impl FnOnce() -> &'static str,
+    label: &str,
+    out_dim: usize,
+    in_dim: usize,
+) {
+    super::decode::announce_route_once(seen, || {
+        crate::runtime_defaults::matvec_route_line(kernel(), label, out_dim, in_dim)
+    });
+}
+
+/// `announce_matvec_route` for a site whose dimensions have to be computed.
+///
+/// The plain helper takes the dimensions by value, so a site that reaches it
+/// with an expression -- a banked launch summing the rows it covers -- does
+/// that arithmetic on every launch, latched or not. Here the whole `(out, in)`
+/// pair is a closure the latch initializer calls, so a dispatch that does not
+/// announce evaluates nothing.
+fn announce_matvec_route_dims(
+    seen: &std::sync::OnceLock<()>,
+    kernel: impl FnOnce() -> &'static str,
+    label: &str,
+    dims: impl FnOnce() -> (usize, usize),
+) {
+    super::decode::announce_route_once(seen, || {
+        let (out_dim, in_dim) = dims();
+        crate::runtime_defaults::matvec_route_line(kernel(), label, out_dim, in_dim)
+    });
+}
+
 /// pick the output_proj SPLIT matvec kernel matching the requested NR.
 ///
 /// Returns `None` when `nr == 32` (caller should use the legacy
@@ -13856,6 +14898,32 @@ fn pick_output_proj_nr_kernel(kernels: &KernelSet, nr: u32) -> Option<&CudaFunct
         64 => kernels.matvec_q8_split_output_proj_nr64.as_ref(),
         128 => kernels.matvec_q8_split_output_proj_nr128.as_ref(),
         _ => None,
+    }
+}
+
+/// Name the split output-head kernel behind `launched`, by identity with
+/// the handles it could have been resolved from.
+///
+/// `matvec_q8_split_q8_1` is the answer for both the NR=2 request and the
+/// generic fallback: they dispatch the same kernel. A handle matching none of
+/// them is reported as unmapped rather than guessed at, so a split kernel
+/// added to `pick_output_proj_nr_kernel` has to be added to this mapping too.
+fn split_output_proj_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q8_split_output_proj_nr8) {
+        "matvec_q8_split_output_proj_nr8"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr16) {
+        "matvec_q8_split_output_proj_nr16"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr64) {
+        "matvec_q8_split_output_proj_nr64"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr128) {
+        "matvec_q8_split_output_proj_nr128"
+    } else if is(&kernels.matvec_q8_split_output_proj) {
+        "matvec_q8_split_output_proj_nr32"
+    } else if is(&kernels.matvec_q8_split_q8_1) {
+        "matvec_q8_split_q8_1"
+    } else {
+        "matvec_q8_split_unmapped"
     }
 }
 
@@ -13939,6 +15007,16 @@ unsafe fn launch_hgemv_f16(
         return Err(RuntimeError::Compute(format!(
             "cublasGemmEx HGEMV {label}: status={status:?}",
         )));
+    }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }
@@ -14025,6 +15103,16 @@ unsafe fn launch_hgemv_f16_residual(
             "cublasGemmEx HGEMV residual {label}: status={status:?}",
         )));
     }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex_residual",
+            label,
+            out_dim,
+            in_dim,
+        );
+    }
     Ok(())
 }
 
@@ -14036,6 +15124,20 @@ unsafe fn launch_hgemv_f16_residual(
 enum Bf16LaunchOutcome {
     Success,
     CublasFailure(cublas_sys::cublasStatus_t),
+}
+
+/// Which of `launch_bf16_matvec_with_fallback`'s two dispatch sites ran.
+///
+/// The wrapper composes several gates and can still fall back mid-call, so
+/// the route is only knowable from inside. Re-reading the gates afterwards
+/// reads process-wide state this very call may have just armed, which is a
+/// different question from "what launched".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bf16MatvecRoute {
+    /// cuBLAS BF16 GemmEx with N=1.
+    HgemvBf16,
+    /// The per-block `matvec_bf16` kernel.
+    MatvecBf16,
 }
 
 /// Launch cuBLAS HGEMV-style call for BF16 weights: `output[out_dim] = W_bf16[out_dim, in_dim]^T * input_f32[in_dim]`.
@@ -14173,6 +15275,16 @@ unsafe fn launch_hgemv_bf16(
     if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         return Ok(Bf16LaunchOutcome::CublasFailure(status));
     }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_bf16_cublas_gemm_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
+    }
     Ok(Bf16LaunchOutcome::Success)
 }
 
@@ -14302,6 +15414,16 @@ unsafe fn launch_hgemv_bf16_residual(
     if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         return Ok(Bf16LaunchOutcome::CublasFailure(status));
     }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_bf16_cublas_gemm_ex_residual",
+            label,
+            out_dim,
+            in_dim,
+        );
+    }
     Ok(Bf16LaunchOutcome::Success)
 }
 
@@ -14346,6 +15468,10 @@ unsafe fn launch_legacy_matvec_bf16(
         .arg(&in_dim_u32)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("matvec_bf16 fallback {label} launch: {e}",)))?;
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(&SEEN, || "matvec_bf16", label, out_dim, in_dim);
+    }
     Ok(())
 }
 
@@ -14390,6 +15516,10 @@ unsafe fn launch_legacy_matvec_bf16_residual(
         .map_err(|e| {
             RuntimeError::Compute(format!("matvec_bf16_residual fallback {label} launch: {e}",))
         })?;
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(&SEEN, || "matvec_bf16_residual", label, out_dim, in_dim);
+    }
     Ok(())
 }
 
@@ -14404,8 +15534,9 @@ unsafe fn launch_legacy_matvec_bf16_residual(
 /// opt-out, the startup capability probe, and any previously-armed
 /// runtime fallback. Callers never have to re-derive the gate.
 ///
-/// Returns `Ok(())` on success — either GemmEx succeeded, or the
-/// fallback legacy launch succeeded. Setup errors (F32->BF16 input
+/// Returns the route that launched — `HgemvBf16` when GemmEx succeeded,
+/// `MatvecBf16` when the legacy launch served the call, whether because a
+/// gate was closed or because GemmEx failed mid-call. Setup errors (F32->BF16 input
 /// conversion, scratch buffer issues, residual copy) propagate
 /// unchanged via the `Result` arm so the standard error path handles
 /// them. A `CublasFailure` from `launch_hgemv_bf16` does NOT propagate:
@@ -14424,7 +15555,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
     out_dim: usize,
     in_dim: usize,
     label: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<Bf16MatvecRoute, RuntimeError> {
     // UNIFORM-F32 CUDA MoE DECODE (env LUMEN_CUDA_MOE_DECODE_F32, MoE-gated):
     // when ON, bypass the cuBLAS GemmEx F16-tensor-core downcast and dispatch the
     // F32-exact `matvec_bf16` kernel (lossless bf16→f32 upcast + F32 accumulate)
@@ -14442,7 +15573,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
             in_dim,
             label,
         )? {
-            Bf16LaunchOutcome::Success => return Ok(()),
+            Bf16LaunchOutcome::Success => return Ok(Bf16MatvecRoute::HgemvBf16),
             Bf16LaunchOutcome::CublasFailure(status) => {
                 arm_bf16_gemmex_runtime_fallback(label, status);
                 // fall through to the legacy launch below
@@ -14452,6 +15583,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
     launch_legacy_matvec_bf16(
         device, kernels, w_bf16, input_f32, output_f32, out_dim, in_dim, label,
     )
+    .map(|()| Bf16MatvecRoute::MatvecBf16)
 }
 
 /// BF16 matvec+residual wrapper. Same contract as
@@ -14509,6 +15641,16 @@ unsafe fn launch_bf16_matvec_residual_with_fallback(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec_bf16_v4_nr1_residual {label}: {e}"))
                 })?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_bf16_v4_nr1_residual",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
             return Ok(());
         }
     }
@@ -14694,6 +15836,16 @@ unsafe fn launch_hgemv_f16_preconverted(
             "cublasGemmEx HGEMV preconverted {label}: status={status:?}",
         )));
     }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex_preconverted",
+            label,
+            out_dim,
+            in_dim,
+        );
+    }
     Ok(())
 }
 
@@ -14867,6 +16019,16 @@ unsafe fn launch_hgemv_f16_batched(
             "cublasGemmBatchedEx HGEMV {label}: status={status:?}",
         )));
     }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_batched_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
+    }
     Ok(())
 }
 
@@ -14927,6 +16089,16 @@ unsafe fn launch_hgemv_f16_batched_precomputed(
         return Err(RuntimeError::Compute(format!(
             "cublasGemmBatchedEx precomputed HGEMV {label}: status={status:?}",
         )));
+    }
+    {
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_batched_ex_precomputed",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }

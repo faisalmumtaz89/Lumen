@@ -9,6 +9,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **The dense decode matvec routes name themselves under
+  `LUMEN_CUDA_VERBOSE`**: on CUDA, every place a dense model's single-token
+  decode path picks a matvec kernel and launches it now writes one
+  `[CUDA] <kernel>: ACTIVE (first at <site>, out=<rows>, in=<cols>)` line to
+  stderr the first time that choice is taken — the Q4/Q8/Q5_K/Q4_1/CT4/F16/BF16
+  projection ladders, their split-layout and banked variants, the fused gate+up
+  GLU kernels, the fused-norm F32 projections, the F32 GDN gate and Q5_K
+  `ssm_out` launches, and the cuBLAS routes that stand in for a kernel. Which
+  kernel served a decode matvec can now be read off the run instead of inferred
+  from the environment; before, only the decode-attention and output-head
+  routes said anything, so a change to a decode matvec kernel left no trace in
+  the log at all. The MoE expert dispatches (gate/up/down in `moe.rs`)
+  announce nothing yet; a mixture-of-experts run names the attention, GDN and
+  output-head routes it shares with dense models and nothing of its experts.
+
+  The name is the CUDA symbol the loader resolved, not the field the handle
+  is stored in: several fields load one symbol from differently-configured
+  sources (the locked Q4 banked and residual kernels), and a few load under a
+  name of their own (`matvec_q5k_split_q8_1`, `matvec_q4_1_q8_1`,
+  `matvec_ct4_q8_1`). Most dispatches name their kernel off the same
+  condition that resolved the handle. Four do not, because no single condition
+  names them: the banked-Q4 selection whose candidate handles share one loaded
+  symbol, the Q4 split residual selection that tells the locked symbol from the
+  unlocked one, and the two `.or().unwrap_or()` walks down the Q8 aligned
+  fallbacks. Those read the name back off the handle that launched by pointer
+  identity, and a handle matching no known slot is named `..._unmapped` rather
+  than guessed at. A cuBLAS-backed route has no device symbol to name, so it
+  names the host-side route and says as much in the name itself —
+  `matvec_f16_cublas_gemm_ex`, `matvec_f32_cublas_gemv`,
+  `matvec_f16_cublas_gemm_batched_ex` — leaving the bare `hgemv_q8_0` and
+  `hgemv_q4_0` shapes to the kernels of those names that really exist. Codegen
+  variants of one symbol keep their own existing markers (`[B160]`,
+  `[V4LOAD]`, `Q4_DOWN_NR1`).
+
+  Numerical computation and dispatch parameters are unchanged. Each site has
+  its own latch: with the flag off nothing is formatted, and after a site's
+  first visit a dispatch pays one atomic load — which matters here, because a
+  decode token launches on the order of a thousand kernels. The line's format
+  lives in `runtime_defaults` rather than the feature-gated `cuda` module, so
+  the test that pins it runs in the default `cargo test` and not only under
+  `--features cuda`.
+
+- **The three env-gated output-head routes join the announcement**: the
+  `mul_mat_vec_q_q4_0`, `mul_mat_vec_q_q8_0` and `mul_mat_vec_f_bf16` head
+  dispatches each printed a one-shot line of their own shape, before the
+  launch and outside the `ACTIVE` grammar the other head routes use, so a run
+  taking one of them carried no readable head route at all. They now announce
+  through the same helper as every other head route, after the launch that
+  proves the route ran. `cuda_log_force`, which existed only for those three
+  lines, is gone.
+
+- **The decode-attention and output-head routes name themselves under
+  `LUMEN_CUDA_VERBOSE`**: on CUDA, the decode-attention variant that was
+  dispatched (split-K partial + merge, with its chunk count and whether the
+  count is context-scaled or fixed; tiled; or single-block) and the output-head
+  kernel that computed the logits each write one `ACTIVE` line to stderr the
+  first time that route dispatches, naming the kernel the branch launched
+  rather than the handle it was reached through. The cuBLAS-backed head
+  routes — `matvec_f32_cublas_gemv`, `hgemv_f16`, `hgemv_f16_preconverted`
+  and `hgemv_bf16` — name the host-side route that ran rather than a device
+  kernel symbol, because cuBLAS selects its own kernels; every other name is a
+  kernel symbol in the tree. A route that only shows up later — the output head
+  falling back to `matvec_bf16` after a cuBLAS failure, say — carries its own
+  line and its own latch, so it announces itself when it happens instead of
+  being suppressed by an earlier one. Which route a run took
+  can now be read off the run rather than inferred from the environment.
+  Numerical computation and dispatch parameters are unchanged; each line is a
+  one-time log write per process, and with the flag off a dispatch formats
+  nothing: after each route's first visit it pays one atomic load, and that
+  first visit also reads the verbosity flag once.
+
 - **Exact-F32 prefill attention is computed as tiled cuBLAS SGEMM**: on CUDA,
   `LUMEN_CUDA_ATTN_PRECISE=3` — exact-F32 Q·Kᵀ and P·V, the default for every
   supported production class — is now evaluated as two strided-batched F32
