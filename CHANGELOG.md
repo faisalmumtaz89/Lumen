@@ -20,9 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   kernel served a decode matvec can now be read off the run instead of inferred
   from the environment; before, only the decode-attention and output-head
   routes said anything, so a change to a decode matvec kernel left no trace in
-  the log at all. The MoE decode path announces nothing yet: the expert
-  gate/up/down dispatches are untouched, so a mixture-of-experts run still says
-  only which flags resolved.
+  the log at all. The MoE expert dispatches (gate/up/down in `moe.rs`)
+  announce nothing yet; a mixture-of-experts run names the attention, GDN and
+  output-head routes it shares with dense models and nothing of its experts.
 
   The name is the CUDA symbol the loader resolved, not the field the handle
   is stored in: several fields load one symbol from differently-configured
@@ -30,8 +30,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   name of their own (`matvec_q5k_split_q8_1`, `matvec_q4_1_q8_1`,
   `matvec_ct4_q8_1`). Most dispatches name their kernel off the same
   condition that resolved the handle. Four do not, because no single condition
-  names them: the two banked-Q4 selections whose candidate handles share one
-  loaded symbol, and the two `.or().unwrap_or()` walks down the Q8 aligned
+  names them: the banked-Q4 selection whose candidate handles share one loaded
+  symbol, the Q4 split residual selection that tells the locked symbol from the
+  unlocked one, and the two `.or().unwrap_or()` walks down the Q8 aligned
   fallbacks. Those read the name back off the handle that launched by pointer
   identity, and a handle matching no known slot is named `..._unmapped` rather
   than guessed at. A cuBLAS-backed route has no device symbol to name, so it
