@@ -9,6 +9,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **The decode matvec routes name themselves under `LUMEN_CUDA_VERBOSE`**: on
+  CUDA, every place the single-token decode path picks a matvec kernel and
+  launches it now writes one `[CUDA] <kernel>: ACTIVE (first at <site>,
+  out=<rows>, in=<cols>)` line to stderr the first time that choice is taken —
+  the Q4/Q8/Q5_K/Q4_1/CT4/F16/BF16 projection ladders, their split-layout and
+  banked variants, the fused gate+up GLU kernels, the F32 GDN gate and Q5_K
+  `ssm_out` launches, and the cuBLAS GEMV/HGEMV routes that stand in for a
+  kernel. Which kernel served a decode matvec can now be read off the run
+  instead of inferred from the environment; before, only the decode-attention
+  and output-head routes said anything, so a change to a decode matvec kernel
+  left no trace in the log at all.
+
+  The name is the CUDA symbol the loader resolved, not the field the handle
+  is stored in: several fields load one symbol from differently-configured
+  sources (the locked Q4 banked and residual kernels), and a few load under a
+  name of their own (`matvec_q5k_split_q8_1`, `matvec_q4_1_q8_1`,
+  `matvec_ct4_q8_1`). Where one dispatch can launch any of several handles,
+  the name is read back off the handle that launched by pointer identity, and
+  a handle matching no known slot is named `..._unmapped` rather than guessed
+  at. The cuBLAS-backed routes name the host-side route that ran, because
+  cuBLAS picks its own kernels. Codegen variants of one symbol keep their own
+  existing markers (`[B160]`, `[V4LOAD]`, `Q4_DOWN_NR1`).
+
+  Numerical computation and dispatch parameters are unchanged. Each site has
+  its own latch: with the flag off nothing is formatted, and after a site's
+  first visit a dispatch pays one atomic load — which matters here, because a
+  decode token launches on the order of a thousand kernels.
+
 - **The decode-attention and output-head routes name themselves under
   `LUMEN_CUDA_VERBOSE`**: on CUDA, the decode-attention variant that was
   dispatched (split-K partial + merge, with its chunk count and whether the
