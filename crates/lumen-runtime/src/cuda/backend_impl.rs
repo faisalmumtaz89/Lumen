@@ -9500,7 +9500,7 @@ impl CudaBackend {
                 }
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "hgemv_f16_preconverted", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "hgemv_f16_preconverted", vocab_size, hidden_dim);
                 }
                 return Ok(());
             }
@@ -9601,7 +9601,7 @@ impl CudaBackend {
             }
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, "matvec_q6k_split_q8_1", vocab_size, hidden_dim);
+                announce_head_route(&SEEN, || "matvec_q6k_split_q8_1", vocab_size, hidden_dim);
             }
             return Ok(());
         }
@@ -9660,7 +9660,7 @@ impl CudaBackend {
                 })?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "matvec_q4_aligned_q8_1", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "matvec_q4_aligned_q8_1", vocab_size, hidden_dim);
                 }
             }
         } else if let Some(ref proj_q4) = st.globals.output_proj_q4 {
@@ -9761,7 +9761,7 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_head_route(&SEEN, "matvec_q4_0", vocab_size, hidden_dim);
+                        announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
                     }
                     return Ok(());
                 }
@@ -9800,10 +9800,12 @@ impl CudaBackend {
                             static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                             announce_head_route(
                                 &SEEN,
-                                if nr == 8 {
-                                    "matvec_q4_0_smem_nr8"
-                                } else {
-                                    "matvec_q4_0_smem_nr4"
+                                || {
+                                    if nr == 8 {
+                                        "matvec_q4_0_smem_nr8"
+                                    } else {
+                                        "matvec_q4_0_smem_nr4"
+                                    }
                                 },
                                 vocab_size,
                                 hidden_dim,
@@ -9839,7 +9841,7 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_head_route(&SEEN, "matvec_q4_0_smem", vocab_size, hidden_dim);
+                        announce_head_route(&SEEN, || "matvec_q4_0_smem", vocab_size, hidden_dim);
                     }
                 } else {
                     let mv_block = matvec_block_size();
@@ -9864,7 +9866,7 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_head_route(&SEEN, "matvec_q4_0", vocab_size, hidden_dim);
+                        announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
                     }
                 }
             } else {
@@ -9890,7 +9892,7 @@ impl CudaBackend {
                 })?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "matvec_q4_0", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "matvec_q4_0", vocab_size, hidden_dim);
                 }
             }
         } else if let Some(ref proj_f16) = st.globals.output_proj_f16 {
@@ -9911,7 +9913,7 @@ impl CudaBackend {
             }
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, "hgemv_f16", vocab_size, hidden_dim);
+                announce_head_route(&SEEN, || "hgemv_f16", vocab_size, hidden_dim);
             }
         } else if let Some(ref proj_q8_split) = st.globals.output_proj_q8_split {
             // OUTPUT_PROJ_SPLIT: Q8 split (SoA) layout for output_proj.
@@ -9928,33 +9930,17 @@ impl CudaBackend {
             // remains the default.
             let out_dim_u32 = vocab_size as u32;
             let in_dim_u32 = hidden_dim as u32;
-            // The kernel symbol travels with the handle the branch resolved, so the
-            // announced name cannot drift from the kernel that launches.
-            let (split_mv_fn, mv_grid, split_mv_name): (&CudaFunction, u32, &'static str) =
+            // The name is read off the handle that launched, inside the latch, so
+            // the announced name cannot drift from the kernel that ran.
+            let (split_mv_fn, mv_grid): (&CudaFunction, u32) =
                 if let Some(proj_fn) = pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr) {
                     let nr = st.output_proj_nr;
-                    // `pick_output_proj_nr_kernel` answers for exactly these NRs.
-                    let name = match nr {
-                        2 => "matvec_q8_split_q8_1",
-                        8 => "matvec_q8_split_output_proj_nr8",
-                        16 => "matvec_q8_split_output_proj_nr16",
-                        64 => "matvec_q8_split_output_proj_nr64",
-                        _ => "matvec_q8_split_output_proj_nr128",
-                    };
-                    (proj_fn, (out_dim_u32 + nr - 1) / nr, name)
+                    (proj_fn, (out_dim_u32 + nr - 1) / nr)
                 } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
                     // NR=32 variant. Grid = ceil(out_dim / 32).
-                    (
-                        proj_fn,
-                        (out_dim_u32 + 31) / 32,
-                        "matvec_q8_split_output_proj_nr32",
-                    )
+                    (proj_fn, (out_dim_u32 + 31) / 32)
                 } else if let Some(ref generic_fn) = st.kernels.matvec_q8_split_q8_1 {
-                    (
-                        generic_fn,
-                        dp4a_q8_1_grid(out_dim_u32),
-                        "matvec_q8_split_q8_1",
-                    )
+                    (generic_fn, dp4a_q8_1_grid(out_dim_u32))
                 } else {
                     return Err(RuntimeError::Compute(
                         "output_proj_q8_split present but no split matvec kernel available".into(),
@@ -10001,7 +9987,12 @@ impl CudaBackend {
                 .map_err(|e| RuntimeError::Compute(format!("matvec_q8_split output_proj: {e}",)))?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, split_mv_name, vocab_size, hidden_dim);
+                    announce_head_route(
+                        &SEEN,
+                        || split_output_proj_kernel_name(&st.kernels, split_mv_fn),
+                        vocab_size,
+                        hidden_dim,
+                    );
                 }
             } else {
                 return Err(RuntimeError::Compute(
@@ -10015,24 +10006,18 @@ impl CudaBackend {
 
             // Path 0: Q8Aligned + pre-quantized Q8_1 input (NR=2, dp4a).
             // Q8_SCALE_HW: prefer halfword-scale variant for output_proj.
-            // Handle and name are resolved together: the variant this returns is
-            // the one that launches and the one that is named.
-            let plain_aligned = || {
-                st.kernels
-                    .matvec_q8_aligned_q8_1
-                    .as_ref()
-                    .map(|f| (f, "matvec_q8_aligned_q8_1"))
-            };
+            // The variant this returns is the one that launches; its name is read
+            // back off that handle inside the latch.
+            let plain_aligned = || st.kernels.matvec_q8_aligned_q8_1.as_ref();
             let aligned_mv = if st.kernels.use_q8_scale_hw {
                 st.kernels
                     .matvec_q8_aligned_q8_1_hw
                     .as_ref()
-                    .map(|f| (f, "matvec_q8_aligned_q8_1_hw"))
                     .or_else(plain_aligned)
             } else {
                 plain_aligned()
             };
-            if let (Some(quant_fn), Some((mv_fn, aligned_mv_name)), Some(ref mut q8_1_buf)) = (
+            if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
                 aligned_mv,
                 st.scratch.input_q8_1.as_mut(),
@@ -10078,7 +10063,23 @@ impl CudaBackend {
                 })?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, aligned_mv_name, vocab_size, hidden_dim);
+                    announce_head_route(
+                        &SEEN,
+                        || {
+                            if st
+                                .kernels
+                                .matvec_q8_aligned_q8_1_hw
+                                .as_ref()
+                                .is_some_and(|f| std::ptr::eq(f, mv_fn))
+                            {
+                                "matvec_q8_aligned_q8_1_hw"
+                            } else {
+                                "matvec_q8_aligned_q8_1"
+                            }
+                        },
+                        vocab_size,
+                        hidden_dim,
+                    );
                 }
             } else {
                 // Fallback: on-the-fly x quantization. The padded layout has
@@ -10110,7 +10111,7 @@ impl CudaBackend {
                 })?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "matvec_q8_0_aligned", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "matvec_q8_0_aligned", vocab_size, hidden_dim);
                 }
             }
         } else if let Some(ref proj_q8) = st.globals.output_proj_q8 {
@@ -10179,10 +10180,11 @@ impl CudaBackend {
                 }
             }
 
-            let (q8_fn, q8_name) = match st.kernels.matvec_q8_0_dp4a.as_ref() {
-                Some(dp4a_fn) => (dp4a_fn, "matvec_q8_0_dp4a"),
-                None => (&st.kernels.matvec_q8_0, "matvec_q8_0"),
-            };
+            let q8_fn = st
+                .kernels
+                .matvec_q8_0_dp4a
+                .as_ref()
+                .unwrap_or(&st.kernels.matvec_q8_0);
             let grid = matvec_q8_0_grid(out_dim_u32);
             let shmem = 0u32;
             let launch_cfg = CudarcLaunchConfig {
@@ -10204,7 +10206,18 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}")))?;
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, q8_name, vocab_size, hidden_dim);
+                announce_head_route(
+                    &SEEN,
+                    || {
+                        if std::ptr::eq(q8_fn, &st.kernels.matvec_q8_0) {
+                            "matvec_q8_0"
+                        } else {
+                            "matvec_q8_0_dp4a"
+                        }
+                    },
+                    vocab_size,
+                    hidden_dim,
+                );
             }
         } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
             // Path -1: BF16 output_proj matvec dispatch.
@@ -10311,11 +10324,11 @@ impl CudaBackend {
             match bf16_route {
                 Bf16MatvecRoute::HgemvBf16 => {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "hgemv_bf16", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "hgemv_bf16", vocab_size, hidden_dim);
                 }
                 Bf16MatvecRoute::MatvecBf16 => {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, "matvec_bf16", vocab_size, hidden_dim);
+                    announce_head_route(&SEEN, || "matvec_bf16", vocab_size, hidden_dim);
                 }
             }
         } else {
@@ -10340,7 +10353,7 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}")))?;
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, "matvec_f32_cublas_gemv", vocab_size, hidden_dim);
+                announce_head_route(&SEEN, || "matvec_f32_cublas_gemv", vocab_size, hidden_dim);
             }
         }
 
@@ -13949,14 +13962,17 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
 /// Name the output-head kernel a branch dispatched, once per process.
 ///
 /// `seen` is that branch's own `OnceLock`, so each head route reports itself
-/// exactly once and only under `LUMEN_CUDA_VERBOSE`.
+/// exactly once and only under `LUMEN_CUDA_VERBOSE`. Both the name selection
+/// and the formatting run inside the latch initializer, so a dispatch that
+/// does not announce pays the latch check alone.
 fn announce_head_route(
     seen: &std::sync::OnceLock<()>,
-    kernel: &str,
+    kernel: impl FnOnce() -> &'static str,
     vocab_size: usize,
     hidden_dim: usize,
 ) {
     super::decode::announce_route_once(seen, || {
+        let kernel = kernel();
         format!("[CUDA] {kernel}: ACTIVE (output_proj, vocab={vocab_size}, in={hidden_dim})")
     });
 }
@@ -13976,6 +13992,28 @@ fn pick_output_proj_nr_kernel(kernels: &KernelSet, nr: u32) -> Option<&CudaFunct
         64 => kernels.matvec_q8_split_output_proj_nr64.as_ref(),
         128 => kernels.matvec_q8_split_output_proj_nr128.as_ref(),
         _ => None,
+    }
+}
+
+/// Name the split output-head kernel behind `launched`, by identity with
+/// the handles it could have been resolved from.
+///
+/// `matvec_q8_split_q8_1` is the answer for both the NR=2 request and the
+/// generic fallback: they dispatch the same kernel.
+fn split_output_proj_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
+    let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
+    if is(&kernels.matvec_q8_split_output_proj_nr8) {
+        "matvec_q8_split_output_proj_nr8"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr16) {
+        "matvec_q8_split_output_proj_nr16"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr64) {
+        "matvec_q8_split_output_proj_nr64"
+    } else if is(&kernels.matvec_q8_split_output_proj_nr128) {
+        "matvec_q8_split_output_proj_nr128"
+    } else if is(&kernels.matvec_q8_split_output_proj) {
+        "matvec_q8_split_output_proj_nr32"
+    } else {
+        "matvec_q8_split_q8_1"
     }
 }
 

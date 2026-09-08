@@ -15,10 +15,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   count is context-scaled or fixed; tiled; or single-block) and the output-head
   kernel that computed the logits each write one `ACTIVE` line to stderr the
   first time that route dispatches, naming the kernel the branch launched
-  rather than the handle it was reached through. A route that only shows up
-  later — the output head falling back to `matvec_bf16` after a cuBLAS failure,
-  say — carries its own line and its own latch, so it announces itself when it
-  happens instead of being suppressed by an earlier one. Which route a run took
+  rather than the handle it was reached through. The cuBLAS-backed head
+  routes — `matvec_f32_cublas_gemv`, `hgemv_f16`, `hgemv_f16_preconverted`
+  and `hgemv_bf16` — name the host-side route that ran rather than a device
+  kernel symbol, because cuBLAS selects its own kernels; every other name is a
+  kernel symbol in the tree. A route that only shows up later — the output head
+  falling back to `matvec_bf16` after a cuBLAS failure, say — carries its own
+  line and its own latch, so it announces itself when it happens instead of
+  being suppressed by an earlier one. Which route a run took
   can now be read off the run rather than inferred from the environment.
   Numerical computation and dispatch parameters are unchanged; each line is a
   one-time log write per process, and with the flag off a dispatch pays one
