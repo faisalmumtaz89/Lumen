@@ -14000,7 +14000,9 @@ fn pick_output_proj_nr_kernel(kernels: &KernelSet, nr: u32) -> Option<&CudaFunct
 /// the handles it could have been resolved from.
 ///
 /// `matvec_q8_split_q8_1` is the answer for both the NR=2 request and the
-/// generic fallback: they dispatch the same kernel.
+/// generic fallback: they dispatch the same kernel. A handle matching none of
+/// them is reported as unmapped rather than guessed at, so a split kernel
+/// added to `pick_output_proj_nr_kernel` has to be added to this mapping too.
 fn split_output_proj_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -> &'static str {
     let is = |slot: &Option<CudaFunction>| slot.as_ref().is_some_and(|f| std::ptr::eq(f, launched));
     if is(&kernels.matvec_q8_split_output_proj_nr8) {
@@ -14013,8 +14015,10 @@ fn split_output_proj_kernel_name(kernels: &KernelSet, launched: &CudaFunction) -
         "matvec_q8_split_output_proj_nr128"
     } else if is(&kernels.matvec_q8_split_output_proj) {
         "matvec_q8_split_output_proj_nr32"
-    } else {
+    } else if is(&kernels.matvec_q8_split_q8_1) {
         "matvec_q8_split_q8_1"
+    } else {
+        "matvec_q8_split_unmapped"
     }
 }
 

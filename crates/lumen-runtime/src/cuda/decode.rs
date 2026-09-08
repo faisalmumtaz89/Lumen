@@ -62,11 +62,12 @@ pub(crate) fn cuda_log_force(msg: String) {
 
 /// Name the route a dispatch site actually took, once per process.
 ///
-/// `seen` is that site's own `OnceLock`: the first call claims it and, when
-/// `LUMEN_CUDA_VERBOSE` is on, writes `line()` to stderr; every later call
-/// returns immediately. `line` is only built when the gate is open, so a
-/// silent run pays one atomic load per site and formats nothing. Returns
-/// whether this call was the one that claimed `seen`.
+/// `seen` is that site's own `OnceLock`: the first call claims it, reads the
+/// verbosity flag once, and — when `LUMEN_CUDA_VERBOSE` is on — writes
+/// `line()` to stderr; every later call returns immediately. `line` is only
+/// built when the gate is open, so a silent run formats nothing and, after
+/// each site's first visit, pays one atomic load. Returns whether this call
+/// was the one that claimed `seen`.
 ///
 /// The write is a `writeln!` whose error is dropped: an announcement is
 /// diagnostic, and a closed or full stderr must not take a generation down.
