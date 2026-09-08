@@ -67,6 +67,9 @@ pub(crate) fn cuda_log_force(msg: String) {
 /// returns immediately. `line` is only built when the gate is open, so a
 /// silent run pays one atomic load per site and formats nothing. Returns
 /// whether this call was the one that claimed `seen`.
+///
+/// The write is a `writeln!` whose error is dropped: an announcement is
+/// diagnostic, and a closed or full stderr must not take a generation down.
 #[inline]
 pub(crate) fn announce_route_once(
     seen: &std::sync::OnceLock<()>,
@@ -76,7 +79,8 @@ pub(crate) fn announce_route_once(
     seen.get_or_init(|| {
         claimed = true;
         if cuda_verbose() {
-            eprintln!("{}", line());
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "{}", line());
         }
     });
     claimed

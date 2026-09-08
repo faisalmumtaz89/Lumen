@@ -14,9 +14,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   dispatched (split-K partial + merge, with its chunk count and whether the
   count is context-scaled or fixed; tiled; or single-block) and the output-head
   kernel that computed the logits each write one `ACTIVE` line to stderr the
-  first time they run, so a route can be read off a run instead of inferred.
-  Output, timing and every dispatch are unchanged, and nothing is written
-  without the flag.
+  first time that route dispatches, naming the kernel the branch launched
+  rather than the handle it was reached through. A route that only shows up
+  later — the output head falling back to `matvec_bf16` after a cuBLAS failure,
+  say — carries its own line and its own latch, so it announces itself when it
+  happens instead of being suppressed by an earlier one. Which route a run took
+  can now be read off the run rather than inferred from the environment.
+  Numerical computation and dispatch parameters are unchanged; each line is a
+  one-time log write per process, and with the flag off a dispatch pays one
+  atomic load and formats nothing.
 
 - **Exact-F32 prefill attention is computed as tiled cuBLAS SGEMM**: on CUDA,
   `LUMEN_CUDA_ATTN_PRECISE=3` — exact-F32 Q·Kᵀ and P·V, the default for every

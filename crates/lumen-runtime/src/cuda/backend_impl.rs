@@ -9601,7 +9601,7 @@ impl CudaBackend {
             }
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, "matvec_q6k_head", vocab_size, hidden_dim);
+                announce_head_route(&SEEN, "matvec_q6k_split_q8_1", vocab_size, hidden_dim);
             }
             return Ok(());
         }
@@ -9928,33 +9928,37 @@ impl CudaBackend {
             // remains the default.
             let out_dim_u32 = vocab_size as u32;
             let in_dim_u32 = hidden_dim as u32;
-            let (split_mv_fn, mv_grid): (&CudaFunction, u32) =
+            // The kernel symbol travels with the handle the branch resolved, so the
+            // announced name cannot drift from the kernel that launches.
+            let (split_mv_fn, mv_grid, split_mv_name): (&CudaFunction, u32, &'static str) =
                 if let Some(proj_fn) = pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr) {
                     let nr = st.output_proj_nr;
-                    (proj_fn, (out_dim_u32 + nr - 1) / nr)
-                } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
-                    // NR=32 variant. Grid = ceil(out_dim / 32).
-                    (proj_fn, (out_dim_u32 + 31) / 32)
-                } else if let Some(ref generic_fn) = st.kernels.matvec_q8_split_q8_1 {
-                    (generic_fn, dp4a_q8_1_grid(out_dim_u32))
-                } else {
-                    return Err(RuntimeError::Compute(
-                        "output_proj_q8_split present but no split matvec kernel available".into(),
-                    ));
-                };
-            let split_mv_name: &str =
-                if pick_output_proj_nr_kernel(&st.kernels, st.output_proj_nr).is_some() {
-                    match st.output_proj_nr {
+                    // `pick_output_proj_nr_kernel` answers for exactly these NRs.
+                    let name = match nr {
                         2 => "matvec_q8_split_q8_1",
                         8 => "matvec_q8_split_output_proj_nr8",
                         16 => "matvec_q8_split_output_proj_nr16",
                         64 => "matvec_q8_split_output_proj_nr64",
                         _ => "matvec_q8_split_output_proj_nr128",
-                    }
-                } else if st.kernels.matvec_q8_split_output_proj.is_some() {
-                    "matvec_q8_split_output_proj_nr32"
+                    };
+                    (proj_fn, (out_dim_u32 + nr - 1) / nr, name)
+                } else if let Some(ref proj_fn) = st.kernels.matvec_q8_split_output_proj {
+                    // NR=32 variant. Grid = ceil(out_dim / 32).
+                    (
+                        proj_fn,
+                        (out_dim_u32 + 31) / 32,
+                        "matvec_q8_split_output_proj_nr32",
+                    )
+                } else if let Some(ref generic_fn) = st.kernels.matvec_q8_split_q8_1 {
+                    (
+                        generic_fn,
+                        dp4a_q8_1_grid(out_dim_u32),
+                        "matvec_q8_split_q8_1",
+                    )
                 } else {
-                    "matvec_q8_split_q8_1"
+                    return Err(RuntimeError::Compute(
+                        "output_proj_q8_split present but no split matvec kernel available".into(),
+                    ));
                 };
             if let (Some(quant_fn), Some(ref mut q8_1_buf)) = (
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
@@ -10011,23 +10015,26 @@ impl CudaBackend {
 
             // Path 0: Q8Aligned + pre-quantized Q8_1 input (NR=2, dp4a).
             // Q8_SCALE_HW: prefer halfword-scale variant for output_proj.
-            let aligned_mv_fn = if st.kernels.use_q8_scale_hw {
+            // Handle and name are resolved together: the variant this returns is
+            // the one that launches and the one that is named.
+            let plain_aligned = || {
+                st.kernels
+                    .matvec_q8_aligned_q8_1
+                    .as_ref()
+                    .map(|f| (f, "matvec_q8_aligned_q8_1"))
+            };
+            let aligned_mv = if st.kernels.use_q8_scale_hw {
                 st.kernels
                     .matvec_q8_aligned_q8_1_hw
                     .as_ref()
-                    .or(st.kernels.matvec_q8_aligned_q8_1.as_ref())
+                    .map(|f| (f, "matvec_q8_aligned_q8_1_hw"))
+                    .or_else(plain_aligned)
             } else {
-                st.kernels.matvec_q8_aligned_q8_1.as_ref()
+                plain_aligned()
             };
-            let aligned_mv_name =
-                if st.kernels.use_q8_scale_hw && st.kernels.matvec_q8_aligned_q8_1_hw.is_some() {
-                    "matvec_q8_aligned_q8_1_hw"
-                } else {
-                    "matvec_q8_aligned_q8_1"
-                };
-            if let (Some(quant_fn), Some(mv_fn), Some(ref mut q8_1_buf)) = (
+            if let (Some(quant_fn), Some((mv_fn, aligned_mv_name)), Some(ref mut q8_1_buf)) = (
                 st.kernels.quantize_f32_to_q8_1.as_ref(),
-                aligned_mv_fn,
+                aligned_mv,
                 st.scratch.input_q8_1.as_mut(),
             ) {
                 let quant_grid = q8_1_quant_grid(in_dim_u32);
@@ -10172,15 +10179,9 @@ impl CudaBackend {
                 }
             }
 
-            let q8_fn = st
-                .kernels
-                .matvec_q8_0_dp4a
-                .as_ref()
-                .unwrap_or(&st.kernels.matvec_q8_0);
-            let q8_name = if st.kernels.matvec_q8_0_dp4a.is_some() {
-                "matvec_q8_0_dp4a"
-            } else {
-                "matvec_q8_0"
+            let (q8_fn, q8_name) = match st.kernels.matvec_q8_0_dp4a.as_ref() {
+                Some(dp4a_fn) => (dp4a_fn, "matvec_q8_0_dp4a"),
+                None => (&st.kernels.matvec_q8_0, "matvec_q8_0"),
             };
             let grid = matvec_q8_0_grid(out_dim_u32);
             let shmem = 0u32;
@@ -10291,7 +10292,7 @@ impl CudaBackend {
             // closed (or the GemmEx call fails at runtime), this dispatches
             // via the legacy `matvec_bf16` kernel instead of aborting the
             // generation.
-            unsafe {
+            let bf16_route = unsafe {
                 launch_bf16_matvec_with_fallback(
                     &self.device,
                     &st.kernels,
@@ -10302,20 +10303,20 @@ impl CudaBackend {
                     vocab_size,
                     hidden_dim,
                     "output_proj",
-                )?;
-            }
-            {
-                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(
-                    &SEEN,
-                    if bf16_gemmex_enabled() && !moe_decode_f32_enabled() {
-                        "hgemv_bf16"
-                    } else {
-                        "matvec_bf16"
-                    },
-                    vocab_size,
-                    hidden_dim,
-                );
+                )?
+            };
+            // One latch per dispatch site, each naming the route that launched:
+            // a call that falls back to the legacy kernel still announces it,
+            // and neither line is read off gate state after the fact.
+            match bf16_route {
+                Bf16MatvecRoute::HgemvBf16 => {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, "hgemv_bf16", vocab_size, hidden_dim);
+                }
+                Bf16MatvecRoute::MatvecBf16 => {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, "matvec_bf16", vocab_size, hidden_dim);
+                }
             }
         } else {
             let cfg = GemvConfig {
@@ -10339,7 +10340,7 @@ impl CudaBackend {
             .map_err(|e| RuntimeError::Compute(format!("cuBLAS GEMV output_proj: {e}")))?;
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, "cublas_gemv_f32", vocab_size, hidden_dim);
+                announce_head_route(&SEEN, "matvec_f32_cublas_gemv", vocab_size, hidden_dim);
             }
         }
 
@@ -11123,7 +11124,8 @@ unsafe fn launch_matvec(
         }
         return launch_bf16_matvec_with_fallback(
             device, kernels, w_bf16, input, output, scratch, out_dim, in_dim, label,
-        );
+        )
+        .map(|_| ());
     }
 
     // HGEMV path: cuBLAS with pre-dequanted F16 weights.
@@ -14156,6 +14158,20 @@ enum Bf16LaunchOutcome {
     CublasFailure(cublas_sys::cublasStatus_t),
 }
 
+/// Which of `launch_bf16_matvec_with_fallback`'s two dispatch sites ran.
+///
+/// The wrapper composes several gates and can still fall back mid-call, so
+/// the route is only knowable from inside. Re-reading the gates afterwards
+/// reads process-wide state this very call may have just armed, which is a
+/// different question from "what launched".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bf16MatvecRoute {
+    /// cuBLAS BF16 GemmEx with N=1.
+    HgemvBf16,
+    /// The per-block `matvec_bf16` kernel.
+    MatvecBf16,
+}
+
 /// Launch cuBLAS HGEMV-style call for BF16 weights: `output[out_dim] = W_bf16[out_dim, in_dim]^T * input_f32[in_dim]`.
 ///
 /// Mirrors `launch_hgemv_f16` but with CUDA_R_16BF data types and
@@ -14522,8 +14538,9 @@ unsafe fn launch_legacy_matvec_bf16_residual(
 /// opt-out, the startup capability probe, and any previously-armed
 /// runtime fallback. Callers never have to re-derive the gate.
 ///
-/// Returns `Ok(())` on success — either GemmEx succeeded, or the
-/// fallback legacy launch succeeded. Setup errors (F32->BF16 input
+/// Returns the route that launched — `HgemvBf16` when GemmEx succeeded,
+/// `MatvecBf16` when the legacy launch served the call, whether because a
+/// gate was closed or because GemmEx failed mid-call. Setup errors (F32->BF16 input
 /// conversion, scratch buffer issues, residual copy) propagate
 /// unchanged via the `Result` arm so the standard error path handles
 /// them. A `CublasFailure` from `launch_hgemv_bf16` does NOT propagate:
@@ -14542,7 +14559,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
     out_dim: usize,
     in_dim: usize,
     label: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<Bf16MatvecRoute, RuntimeError> {
     // UNIFORM-F32 CUDA MoE DECODE (env LUMEN_CUDA_MOE_DECODE_F32, MoE-gated):
     // when ON, bypass the cuBLAS GemmEx F16-tensor-core downcast and dispatch the
     // F32-exact `matvec_bf16` kernel (lossless bf16→f32 upcast + F32 accumulate)
@@ -14560,7 +14577,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
             in_dim,
             label,
         )? {
-            Bf16LaunchOutcome::Success => return Ok(()),
+            Bf16LaunchOutcome::Success => return Ok(Bf16MatvecRoute::HgemvBf16),
             Bf16LaunchOutcome::CublasFailure(status) => {
                 arm_bf16_gemmex_runtime_fallback(label, status);
                 // fall through to the legacy launch below
@@ -14570,6 +14587,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
     launch_legacy_matvec_bf16(
         device, kernels, w_bf16, input_f32, output_f32, out_dim, in_dim, label,
     )
+    .map(|()| Bf16MatvecRoute::MatvecBf16)
 }
 
 /// BF16 matvec+residual wrapper. Same contract as
