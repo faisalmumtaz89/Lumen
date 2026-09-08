@@ -25,12 +25,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   is stored in: several fields load one symbol from differently-configured
   sources (the locked Q4 banked and residual kernels), and a few load under a
   name of their own (`matvec_q5k_split_q8_1`, `matvec_q4_1_q8_1`,
-  `matvec_ct4_q8_1`). Where one dispatch can launch any of several handles,
-  the name is read back off the handle that launched by pointer identity, and
-  a handle matching no known slot is named `..._unmapped` rather than guessed
-  at. The cuBLAS-backed routes name the host-side route that ran, because
-  cuBLAS picks its own kernels. Codegen variants of one symbol keep their own
-  existing markers (`[B160]`, `[V4LOAD]`, `Q4_DOWN_NR1`).
+  `matvec_ct4_q8_1`). Most dispatches name their kernel off the same
+  condition that resolved the handle. Four do not, because no single condition
+  names them: the two banked-Q4 selections whose candidate handles share one
+  loaded symbol, and the two `.or().unwrap_or()` walks down the Q8 aligned
+  fallbacks. Those read the name back off the handle that launched by pointer
+  identity, and a handle matching no known slot is named `..._unmapped` rather
+  than guessed at. The cuBLAS-backed routes name the host-side route that ran,
+  because cuBLAS picks its own kernels. Codegen variants of one symbol keep
+  their own existing markers (`[B160]`, `[V4LOAD]`, `Q4_DOWN_NR1`).
 
   Numerical computation and dispatch parameters are unchanged. Each site has
   its own latch: with the flag off nothing is formatted, and after a site's

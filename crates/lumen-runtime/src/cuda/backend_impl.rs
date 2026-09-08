@@ -6130,12 +6130,11 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_matvec_route(
+                        announce_matvec_route_dims(
                             &SEEN,
                             || "matvec_f32_gates_banked",
                             "gdn_gates_f32",
-                            2 * p.num_heads,
-                            hidden_dim,
+                            || (2 * p.num_heads, hidden_dim),
                         );
                     }
                 } else {
@@ -6256,12 +6255,11 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_matvec_route(
+                        announce_matvec_route_dims(
                             &SEEN,
                             || "matvec_q8_0_q8_1_banked",
                             "gdn_alpha_beta",
-                            2 * p.num_heads,
-                            hidden_dim,
+                            || (2 * p.num_heads, hidden_dim),
                         );
                     }
                 } else {
@@ -6472,12 +6470,11 @@ impl CudaBackend {
                     })?;
                     {
                         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                        announce_matvec_route(
+                        announce_matvec_route_dims(
                             &SEEN,
                             || "matvec_q8_0_q8_1_banked",
                             "gdn_alpha_beta",
-                            2 * p.num_heads,
-                            hidden_dim,
+                            || (2 * p.num_heads, hidden_dim),
                         );
                     }
                     ab_banked = true;
@@ -13232,12 +13229,11 @@ unsafe fn launch_matvec_preq8_1_q4_bank4(
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_bank4 {label}: {e}")))?;
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(
+        announce_matvec_route_dims(
             &SEEN,
             || "matvec_q4_split_q8_1_locked_bank4",
             label,
-            dims[0] + dims[1] + dims[2] + dims[3],
-            in_dim,
+            || (dims[0] + dims[1] + dims[2] + dims[3], in_dim),
         );
     }
     Ok(())
@@ -13323,12 +13319,11 @@ unsafe fn launch_matvec_preq8_1_q4_banked(
         .map_err(|e| RuntimeError::Compute(format!("matvec_q4_split_q8_1_banked {label}: {e}")))?;
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(
+        announce_matvec_route_dims(
             &SEEN,
             || locked_banked_kernel_name(kernels, mv_fn),
             label,
-            out_a_dim + out_b_dim,
-            in_dim,
+            || (out_a_dim + out_b_dim, in_dim),
         );
     }
     Ok(())
@@ -14821,6 +14816,25 @@ fn announce_matvec_route(
     in_dim: usize,
 ) {
     super::decode::announce_route_once(seen, || {
+        matvec_route_line(kernel(), label, out_dim, in_dim)
+    });
+}
+
+/// `announce_matvec_route` for a site whose dimensions have to be computed.
+///
+/// The plain helper takes the dimensions by value, so a site that reaches it
+/// with an expression -- a banked launch summing the rows it covers -- does
+/// that arithmetic on every launch, latched or not. Here the whole `(out, in)`
+/// pair is a closure the latch initializer calls, so a dispatch that does not
+/// announce evaluates nothing.
+fn announce_matvec_route_dims(
+    seen: &std::sync::OnceLock<()>,
+    kernel: impl FnOnce() -> &'static str,
+    label: &str,
+    dims: impl FnOnce() -> (usize, usize),
+) {
+    super::decode::announce_route_once(seen, || {
+        let (out_dim, in_dim) = dims();
         matvec_route_line(kernel(), label, out_dim, in_dim)
     });
 }
