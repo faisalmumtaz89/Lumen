@@ -2304,6 +2304,16 @@ impl CudaBackend {
                             "wq",
                         )?;
                     }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wq",
+                            wq_od,
+                            hidden_dim,
+                        );
+                    }
                 }
                 if let GpuWeightBuf::F32(ref wk_f32) = lw.wk {
                     unsafe {
@@ -2320,6 +2330,16 @@ impl CudaBackend {
                             "wk",
                         )?;
                     }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wk",
+                            kv_dim,
+                            hidden_dim,
+                        );
+                    }
                 }
                 if let GpuWeightBuf::F32(ref wv_f32) = lw.wv {
                     unsafe {
@@ -2335,6 +2355,16 @@ impl CudaBackend {
                             hidden_dim,
                             "wv",
                         )?;
+                    }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "fused_norm_matvec_f32",
+                            "wv",
+                            kv_dim,
+                            hidden_dim,
+                        );
                     }
                 }
             } else if matches!(&lw.wq, GpuWeightBuf::F16Raw(_))
@@ -4397,6 +4427,15 @@ impl CudaBackend {
                             inter_dim,
                             hidden_dim,
                         )?;
+                    }
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route_dims(
+                            &SEEN,
+                            || "fused_norm_dual_matvec_f32",
+                            "ffn_gate_up",
+                            || (2 * inter_dim, hidden_dim),
+                        );
                     }
                 }
             } else if matches!(&lw.w_gate, GpuWeightBuf::F16Raw(_))
@@ -9697,7 +9736,12 @@ impl CudaBackend {
                 }
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, || "hgemv_f16_preconverted", vocab_size, hidden_dim);
+                    announce_head_route(
+                        &SEEN,
+                        || "matvec_f16_cublas_gemm_ex_preconverted",
+                        vocab_size,
+                        hidden_dim,
+                    );
                 }
                 return Ok(());
             }
@@ -10106,7 +10150,12 @@ impl CudaBackend {
             }
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                announce_head_route(&SEEN, || "hgemv_f16", vocab_size, hidden_dim);
+                announce_head_route(
+                    &SEEN,
+                    || "matvec_f16_cublas_gemm_ex",
+                    vocab_size,
+                    hidden_dim,
+                );
             }
         } else if let Some(ref proj_q8_split) = st.globals.output_proj_q8_split {
             // OUTPUT_PROJ_SPLIT: Q8 split (SoA) layout for output_proj.
@@ -10507,7 +10556,12 @@ impl CudaBackend {
             match bf16_route {
                 Bf16MatvecRoute::HgemvBf16 => {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_head_route(&SEEN, || "hgemv_bf16", vocab_size, hidden_dim);
+                    announce_head_route(
+                        &SEEN,
+                        || "matvec_bf16_cublas_gemm_ex",
+                        vocab_size,
+                        hidden_dim,
+                    );
                 }
                 Bf16MatvecRoute::MatvecBf16 => {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -14782,16 +14836,6 @@ fn q8_aligned_fallback_residual_kernel_name(
     }
 }
 
-/// The one place the decode matvec route line is spelled.
-///
-/// The shape is a contract with whatever reads a run's log back: a kernel name,
-/// then `: ACTIVE`, then the site the route was first taken at and the matvec's
-/// dimensions. Nothing else on the line, and no wording that reads as a route
-/// the run declined.
-fn matvec_route_line(kernel: &str, label: &str, out_dim: usize, in_dim: usize) -> String {
-    format!("[CUDA] {kernel}: ACTIVE (first at {label}, out={out_dim}, in={in_dim})")
-}
-
 /// Name the decode matvec kernel a dispatch site actually launched, once per
 /// process.
 ///
@@ -14816,7 +14860,7 @@ fn announce_matvec_route(
     in_dim: usize,
 ) {
     super::decode::announce_route_once(seen, || {
-        matvec_route_line(kernel(), label, out_dim, in_dim)
+        crate::runtime_defaults::matvec_route_line(kernel(), label, out_dim, in_dim)
     });
 }
 
@@ -14835,39 +14879,8 @@ fn announce_matvec_route_dims(
 ) {
     super::decode::announce_route_once(seen, || {
         let (out_dim, in_dim) = dims();
-        matvec_route_line(kernel(), label, out_dim, in_dim)
+        crate::runtime_defaults::matvec_route_line(kernel(), label, out_dim, in_dim)
     });
-}
-
-#[cfg(test)]
-mod matvec_route_line_tests {
-    //! The route line is read by a parser outside this repo: it accepts
-    //! `[CUDA] <kernel>: ACTIVE` for a kernel token from a known family and
-    //! rejects the line outright on any of the loader's own qualifiers.
-
-    use super::matvec_route_line;
-
-    #[test]
-    fn names_the_kernel_the_site_and_the_shape() {
-        assert_eq!(
-            matvec_route_line("matvec_q4_split_q8_1", "gate", 17408, 5120),
-            "[CUDA] matvec_q4_split_q8_1: ACTIVE (first at gate, out=17408, in=5120)"
-        );
-    }
-
-    #[test]
-    fn carries_no_qualifier_that_voids_the_line() {
-        let line = matvec_route_line("matvec_q5k_split_q8_1_residual", "gdn_ssm_out", 5120, 4096);
-        assert!(line.starts_with("[CUDA] matvec_"), "{line}");
-        for voided in [
-            " set but ",
-            " unrecognized",
-            " defaults OFF",
-            " clone skipped: ",
-        ] {
-            assert!(!line.contains(voided), "{line} carries {voided:?}");
-        }
-    }
 }
 
 /// pick the output_proj SPLIT matvec kernel matching the requested NR.
@@ -14997,7 +15010,13 @@ unsafe fn launch_hgemv_f16(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_f16", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }
@@ -15086,7 +15105,13 @@ unsafe fn launch_hgemv_f16_residual(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_f16_residual", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex_residual",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }
@@ -15252,7 +15277,13 @@ unsafe fn launch_hgemv_bf16(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_bf16", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_bf16_cublas_gemm_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(Bf16LaunchOutcome::Success)
 }
@@ -15385,7 +15416,13 @@ unsafe fn launch_hgemv_bf16_residual(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_bf16_residual", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_bf16_cublas_gemm_ex_residual",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(Bf16LaunchOutcome::Success)
 }
@@ -15801,7 +15838,13 @@ unsafe fn launch_hgemv_f16_preconverted(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_f16_preconverted", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_ex_preconverted",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }
@@ -15978,7 +16021,13 @@ unsafe fn launch_hgemv_f16_batched(
     }
     {
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        announce_matvec_route(&SEEN, || "hgemv_f16_batched", label, out_dim, in_dim);
+        announce_matvec_route(
+            &SEEN,
+            || "matvec_f16_cublas_gemm_batched_ex",
+            label,
+            out_dim,
+            in_dim,
+        );
     }
     Ok(())
 }
@@ -16045,7 +16094,7 @@ unsafe fn launch_hgemv_f16_batched_precomputed(
         static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         announce_matvec_route(
             &SEEN,
-            || "hgemv_f16_batched_precomputed",
+            || "matvec_f16_cublas_gemm_batched_ex_precomputed",
             label,
             out_dim,
             in_dim,

@@ -9,17 +9,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
-- **The decode matvec routes name themselves under `LUMEN_CUDA_VERBOSE`**: on
-  CUDA, every place the single-token decode path picks a matvec kernel and
-  launches it now writes one `[CUDA] <kernel>: ACTIVE (first at <site>,
-  out=<rows>, in=<cols>)` line to stderr the first time that choice is taken —
-  the Q4/Q8/Q5_K/Q4_1/CT4/F16/BF16 projection ladders, their split-layout and
-  banked variants, the fused gate+up GLU kernels, the F32 GDN gate and Q5_K
-  `ssm_out` launches, and the cuBLAS GEMV/HGEMV routes that stand in for a
-  kernel. Which kernel served a decode matvec can now be read off the run
-  instead of inferred from the environment; before, only the decode-attention
-  and output-head routes said anything, so a change to a decode matvec kernel
-  left no trace in the log at all.
+- **The dense decode matvec routes name themselves under
+  `LUMEN_CUDA_VERBOSE`**: on CUDA, every place a dense model's single-token
+  decode path picks a matvec kernel and launches it now writes one
+  `[CUDA] <kernel>: ACTIVE (first at <site>, out=<rows>, in=<cols>)` line to
+  stderr the first time that choice is taken — the Q4/Q8/Q5_K/Q4_1/CT4/F16/BF16
+  projection ladders, their split-layout and banked variants, the fused gate+up
+  GLU kernels, the fused-norm F32 projections, the F32 GDN gate and Q5_K
+  `ssm_out` launches, and the cuBLAS routes that stand in for a kernel. Which
+  kernel served a decode matvec can now be read off the run instead of inferred
+  from the environment; before, only the decode-attention and output-head
+  routes said anything, so a change to a decode matvec kernel left no trace in
+  the log at all. The MoE decode path announces nothing yet: the expert
+  gate/up/down dispatches are untouched, so a mixture-of-experts run still says
+  only which flags resolved.
 
   The name is the CUDA symbol the loader resolved, not the field the handle
   is stored in: several fields load one symbol from differently-configured
@@ -31,14 +34,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   loaded symbol, and the two `.or().unwrap_or()` walks down the Q8 aligned
   fallbacks. Those read the name back off the handle that launched by pointer
   identity, and a handle matching no known slot is named `..._unmapped` rather
-  than guessed at. The cuBLAS-backed routes name the host-side route that ran,
-  because cuBLAS picks its own kernels. Codegen variants of one symbol keep
-  their own existing markers (`[B160]`, `[V4LOAD]`, `Q4_DOWN_NR1`).
+  than guessed at. A cuBLAS-backed route has no device symbol to name, so it
+  names the host-side route and says as much in the name itself —
+  `matvec_f16_cublas_gemm_ex`, `matvec_f32_cublas_gemv`,
+  `matvec_f16_cublas_gemm_batched_ex` — leaving the bare `hgemv_q8_0` and
+  `hgemv_q4_0` shapes to the kernels of those names that really exist. Codegen
+  variants of one symbol keep their own existing markers (`[B160]`,
+  `[V4LOAD]`, `Q4_DOWN_NR1`).
 
   Numerical computation and dispatch parameters are unchanged. Each site has
   its own latch: with the flag off nothing is formatted, and after a site's
   first visit a dispatch pays one atomic load — which matters here, because a
-  decode token launches on the order of a thousand kernels.
+  decode token launches on the order of a thousand kernels. The line's format
+  lives in `runtime_defaults` rather than the feature-gated `cuda` module, so
+  the test that pins it runs in the default `cargo test` and not only under
+  `--features cuda`.
 
 - **The three env-gated output-head routes join the announcement**: the
   `mul_mat_vec_q_q4_0`, `mul_mat_vec_q_q8_0` and `mul_mat_vec_f_bf16` head

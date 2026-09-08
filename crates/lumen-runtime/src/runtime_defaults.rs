@@ -4383,3 +4383,48 @@ pub fn q4_down_nr1() -> bool {
         Err(_) => canonical_default_on(),
     })
 }
+
+/// The one place the CUDA decode matvec route line is spelled.
+///
+/// It lives here rather than beside the dispatches it describes because it is a
+/// pure string function and the `cuda` module is feature-gated: the format is a
+/// contract with whatever reads a run's log back, and a contract whose test only
+/// compiles under `--features cuda` is one the default test run never checks.
+///
+/// The shape: a kernel name, then `: ACTIVE`, then the site the route was first
+/// taken at and the matvec's dimensions. Nothing else on the line, and no
+/// wording that reads as a route the run declined.
+pub fn matvec_route_line(kernel: &str, label: &str, out_dim: usize, in_dim: usize) -> String {
+    format!("[CUDA] {kernel}: ACTIVE (first at {label}, out={out_dim}, in={in_dim})")
+}
+
+#[cfg(test)]
+mod matvec_route_line_tests {
+    //! The route line is read by a parser outside this repo: it accepts
+    //! `[CUDA] <kernel>: ACTIVE` for a kernel token from a known family and
+    //! rejects the line outright on any of the loader's own qualifiers.
+
+    use super::matvec_route_line;
+
+    #[test]
+    fn names_the_kernel_the_site_and_the_shape() {
+        assert_eq!(
+            matvec_route_line("matvec_q4_split_q8_1", "gate", 17408, 5120),
+            "[CUDA] matvec_q4_split_q8_1: ACTIVE (first at gate, out=17408, in=5120)"
+        );
+    }
+
+    #[test]
+    fn carries_no_qualifier_that_voids_the_line() {
+        let line = matvec_route_line("matvec_q5k_split_q8_1_residual", "gdn_ssm_out", 5120, 4096);
+        assert!(line.starts_with("[CUDA] matvec_"), "{line}");
+        for voided in [
+            " set but ",
+            " unrecognized",
+            " defaults OFF",
+            " clone skipped: ",
+        ] {
+            assert!(!line.contains(voided), "{line} carries {voided:?}");
+        }
+    }
+}
