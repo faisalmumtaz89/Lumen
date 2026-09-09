@@ -8100,6 +8100,1064 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// One slice of a prefill: embed `tokens`, run every layer over them at
+    /// positions from `pos_start`, and leave the slice's hidden states in
+    /// `pf.x`. The KV caches advance by the slice; the GDN recurrent state
+    /// continues from the previous slice.
+    fn prefill_slice(
+        &self,
+        st: &mut MutableState,
+        pf: &mut super::prefill::PrefillScratch,
+        mut gdn_pf: Option<&mut super::prefill::GdnPrefillScratch>,
+        tokens: &[u32],
+        pos_start: usize,
+    ) -> Result<(), RuntimeError> {
+        let hp = self.hp()?;
+        let hidden_dim = hp.hidden_dim as usize;
+        let num_heads = hp.num_heads as usize;
+        let num_kv_heads = hp.num_kv_heads as usize;
+        let head_dim = hp.head_dim as usize;
+        let inter_dim = hp.intermediate_dim as usize;
+        let num_layers = hp.num_layers as usize;
+        let eps = hp.norm_eps;
+        let theta = hp.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let batch = tokens.len();
+
+        // Upload token IDs to GPU.
+        self.device.htod_copy_into(tokens, &mut pf.token_ids_gpu)?;
+
+        // Step 1: Batch embed all tokens into [batch, hidden_dim].
+        unsafe {
+            // The F32 embedding slot is a 1-element placeholder whenever a
+            // raw variant is resident; a raw scheme without a matching batch
+            // arm below would gather out of bounds from it.
+            debug_assert!(
+                st.globals.embedding_q8.is_some()
+                    || st.globals.embedding_f16.is_some()
+                    || st.globals.embedding_bf16.is_some()
+                    || st.globals.embedding_q4.is_some()
+                    || st.globals.embedding.len() > 1,
+                "batched embed would read the placeholder F32 embedding"
+            );
+            super::prefill::launch_embed_batch(
+                &self.device,
+                &st.kernels,
+                &st.globals.embedding,
+                st.globals.embedding_q8.as_ref(),
+                st.globals.embedding_f16.as_ref(),
+                st.globals.embedding_bf16.as_ref(),
+                st.globals.embedding_q4.as_ref(),
+                &pf.token_ids_gpu,
+                &mut pf.x,
+                batch,
+                hidden_dim,
+            )?;
+        }
+
+        // Step 2: Process all layers with batched GEMM for projections.
+        for layer_idx in 0..num_layers {
+            let lw = &st.layer_weights_cache[layer_idx];
+
+            // ---- GDN LAYER: batched projections + sequential state update ----
+            if lw.layer_type == 1 {
+                self.prefill_gdn_layer(
+                    layer_idx,
+                    batch,
+                    st,
+                    pf,
+                    gdn_pf.as_deref_mut().unwrap(),
+                    eps,
+                )?;
+                continue;
+            }
+
+            // ---- STANDARD ATTENTION LAYER ----
+
+            // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
+            unsafe {
+                super::prefill::launch_rmsnorm_batched(
+                    &self.device,
+                    &st.kernels,
+                    &pf.x,
+                    &lw.attn_norm,
+                    &mut pf.normed,
+                    eps,
+                    batch,
+                    hidden_dim,
+                )?;
+            }
+
+            // 2b. Batched QKV projections via GEMM (no F16 caches for precision match).
+            let has_qgate_fusion_pf = lw.attn_q_norm.is_some();
+            if has_qgate_fusion_pf {
+                // Q+gate fusion: project wq to [batch, q_dim*2], then deinterleave.
+                let q_gate_dim = q_dim * 2;
+                let (pf_q_gate, pf_gate_buf) = pf.q_gate.as_mut().ok_or_else(|| {
+                    RuntimeError::Compute("Q+gate prefill scratch missing".into())
+                })?;
+                unsafe {
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wq,
+                        None,
+                        &pf.normed,
+                        pf_q_gate,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        q_gate_dim,
+                        hidden_dim,
+                        "wq_qgate",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wk,
+                        None,
+                        &pf.normed,
+                        &mut pf.k,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        kv_dim,
+                        hidden_dim,
+                        "wk",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wv,
+                        None,
+                        &pf.normed,
+                        &mut pf.v,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        kv_dim,
+                        hidden_dim,
+                        "wv",
+                    )?;
+                }
+                // Batched deinterleave: treat batch as (batch * num_heads) total heads.
+                // deinterleave_qgate works on [total_heads * head_dim * 2] -> [total_heads * head_dim] + [...]
+                // This works because per-head interleaving is contiguous across tokens.
+                if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
+                    let block = 256u32;
+                    let hd = head_dim as u32;
+                    let total_heads = (batch * num_heads) as u32;
+                    let total_q = batch * q_dim;
+                    let grid = ((total_q as u32) + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(deinterleave_fn)
+                            .arg(&*pf_q_gate)
+                            .arg(&mut pf.q)
+                            .arg(&mut *pf_gate_buf)
+                            .arg(&hd)
+                            .arg(&total_heads)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("deinterleave_qgate prefill: {e}"))
+                    })?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires deinterleave_qgate kernel".into(),
+                    ));
+                }
+                // Batched per-head RMSNorm on Q and K.
+                if let Some(ref q_norm_w) = lw.attn_q_norm {
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
+                    let hd = head_dim as u32;
+                    let total_heads = (batch * num_heads) as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32;
+                    let shared_bytes = (block / 32) * 4;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (total_heads, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut pf.q)
+                            .arg(q_norm_w)
+                            .arg(&total_heads)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head Q prefill: {e}"))
+                    })?;
+                }
+                if let Some(ref k_norm_w) = lw.attn_k_norm {
+                    let norm_fn =
+                        st.kernels
+                            .rmsnorm_per_head_inplace
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Compute(
+                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
+                                )
+                            })?;
+                    let hd = head_dim as u32;
+                    let total_kv_heads = (batch * num_kv_heads) as u32;
+                    let block = (head_dim as u32).min(1024).max(32);
+                    let block = (block / 32) * 32;
+                    let shared_bytes = (block / 32) * 4;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (total_kv_heads, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(norm_fn)
+                            .arg(&mut pf.k)
+                            .arg(k_norm_w)
+                            .arg(&total_kv_heads)
+                            .arg(&hd)
+                            .arg(&eps)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("rmsnorm_per_head K prefill: {e}"))
+                    })?;
+                }
+                // Store gate_buf for later sigmoid gating after attention.
+                // We'll use it after flash attention, before the output projection.
+                // For now, store in a local variable that persists through the layer scope.
+                // Apply sigmoid gating after attention (step 2e below).
+                // NOTE: pf_gate_buf needs to survive until after attention. Since we're in
+                // the same loop iteration scope, it's alive until the end of this block.
+
+                // Continue to RoPE (step 2c) -- Q and K are now deinterleaved and normalized.
+                // We don't add QKV bias for Q+gate layers (Qwen3.5 has no QKV bias).
+
+                // Skip bias section for qgate layers (handled above).
+                // Continue to step 2c...
+
+                // 2c. Batched RoPE (within qgate branch)
+                let rotary_dim_pf = hp.rotary_dim.unwrap_or(0) as u32;
+                // [ROPEPROBE] dump pre/post-rope Q for full-attn layers (last token,
+                // head 0, first 16 dims) to compare vs llama.cpp Qcur_normed/Qcur.
+                let ropeprobe = moe_probe_enabled();
+                let qd = num_heads * head_dim;
+                if ropeprobe && batch > 1 {
+                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let o = (batch - 1) * qd;
+                    eprintln!("[ROPEPROBE] layer={layer_idx} rotary_dim={rotary_dim_pf} head_dim={head_dim} neox={} PRE q_h0[0..16]={:?}",
+                        hp.rope_neox, &qh[o..o + 16.min(qd)]);
+                }
+                unsafe {
+                    super::prefill::launch_rope_batched(
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.q,
+                        &mut pf.k,
+                        pos_start,
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        theta,
+                        hp.rope_neox,
+                        rotary_dim_pf,
+                    )?;
+                }
+                if ropeprobe && batch > 1 {
+                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let o = (batch - 1) * qd;
+                    // dump dims 0..8, 30..38, 62..70 to see split-half (d,d+32) pairing
+                    let s = |a: usize, b: usize| qh[o + a..o + b.min(qd)].to_vec();
+                    eprintln!(
+                        "[ROPEPROBE] layer={layer_idx} POST q_h0 d0-7={:?} d30-37={:?} d62-69={:?}",
+                        s(0, 8),
+                        s(30, 38),
+                        s(62, 70)
+                    );
+                    // post-rope K (cached) + V, last token, kv-head 0, first 3
+                    let kvd = num_kv_heads * head_dim;
+                    let kh = self.device.dtoh_copy(&pf.k)?;
+                    let vh = self.device.dtoh_copy(&pf.v)?;
+                    let ko = (batch - 1) * kvd;
+                    eprintln!(
+                        "[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
+                        &kh[ko..ko + 3.min(kvd)],
+                        &vh[ko..ko + 3.min(kvd)]
+                    );
+                    // whole-buffer sumsq (LAYOUT-INDEPENDENT) for Q/K/V across all tokens.
+                    let ss =
+                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
+                    eprintln!(
+                        "[QKVSS] layer={layer_idx} q_sumsq={:.4} k_sumsq={:.4} v_sumsq={:.4}",
+                        ss(&qh[..batch * qd]),
+                        ss(&kh[..batch * kvd]),
+                        ss(&vh[..batch * kvd])
+                    );
+                }
+
+                // 2d. Batch KV cache write
+                let kv_cache = &mut st.kv_caches[layer_idx];
+                unsafe {
+                    super::prefill::launch_kv_cache_write_batch(
+                        &self.device,
+                        &st.kernels,
+                        &mut kv_cache.k_cache,
+                        &pf.k,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        kv_cache.max_seq_len,
+                        head_dim,
+                    )?;
+                    super::prefill::launch_kv_cache_write_batch(
+                        &self.device,
+                        &st.kernels,
+                        &mut kv_cache.v_cache,
+                        &pf.v,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        kv_cache.max_seq_len,
+                        head_dim,
+                    )?;
+                }
+                kv_cache.advance_seq_len_by(batch);
+
+                // 2e. Flash Attention
+                //
+                // Dispatch priority (first match wins):
+                // 1. batch >= 16 with the WMMA kernels loaded: the
+                // LUMEN_CUDA_ATTN_PRECISE selector below picks the variant
+                // (mode 3, the production default, is exact F32 — tiled cuBLAS
+                // SGEMM when that route is enabled, else the scalar kernel).
+                // 2. Scalar Br=4 fallback (batch < 16, or no WMMA kernels).
+                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs this site's prefill
+                // attention on the F32 scalar Br=4 kernel, whatever the
+                // selector says.
+                let force_scalar_attn = crate::runtime_defaults::force_scalar_attn_enabled();
+                // Prefill full-attention precision selector. 0=WMMA F16,
+                // 1=qkf32 (exact QK^T), 2=pvf32 (exact P@V), 3=both exact
+                // (full F32). Unset resolves to the ratified per-class default
+                // (3 for every production class); 0/1/2/4 remain available for
+                // carrier A/B.
+                let attn_precise = crate::runtime_defaults::attn_precise_selected();
+                unsafe {
+                    if !force_scalar_attn
+                        && batch >= 16
+                        && attn_precise == 3
+                        && pf.attn_scores.is_some()
+                    {
+                        // Mode 3 (both matmuls exact F32) on the tiled cuBLAS
+                        // SGEMM route: the score block was sized before the
+                        // layer loop under exactly this condition, so its
+                        // presence is the whole decision. It needs no WMMA
+                        // kernel. Without it, mode 3 is the scalar kernel in
+                        // the selector below.
+                        super::prefill::launch_flash_attention_sgemm(
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            &mut pf.attn_scores,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
+                        )?;
+                    } else if !force_scalar_attn
+                        && batch >= 16
+                        && st.kernels.flash_attention_wmma.is_some()
+                    {
+                        match attn_precise {
+                            1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_variant(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                    true,
+                                )?;
+                            }
+                            2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_variant(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                    false,
+                                )?;
+                            }
+                            3 => {
+                                // Both exact == full F32 on the one-warp-per-row
+                                // scalar kernel: the tiled SGEMM route above did
+                                // not take this layer (switch off, its kernel
+                                // absent, or its score block not allocated).
+                                super::prefill::launch_flash_attention_br4(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                )?;
+                            }
+                            4 if st.kernels.flash_attention_wmma_split.is_some() => {
+                                super::prefill::launch_flash_attention_wmma_split(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                )?;
+                            }
+                            _ => {
+                                super::prefill::launch_flash_attention_wmma(
+                                    &self.device,
+                                    &st.kernels,
+                                    &pf.q,
+                                    kv_cache,
+                                    &mut pf.attn_out,
+                                    batch,
+                                    num_heads,
+                                    num_kv_heads,
+                                    head_dim,
+                                    pos_start,
+                                )?;
+                            }
+                        }
+                    } else {
+                        super::prefill::launch_flash_attention_br4(
+                            &self.device,
+                            &st.kernels,
+                            &pf.q,
+                            kv_cache,
+                            &mut pf.attn_out,
+                            batch,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            pos_start,
+                        )?;
+                    }
+                }
+
+                // [ATTNPROBE] dump raw attention output (pre-gate) for full-attn
+                // layers (last token, head 0, first 3 dims) vs llama attn_pregate.
+                if ropeprobe && batch > 1 {
+                    let ah = self.device.dtoh_copy(&pf.attn_out)?;
+                    let o = (batch - 1) * qd;
+                    eprintln!(
+                        "[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}",
+                        &ah[o..o + 3.min(qd)]
+                    );
+                }
+
+                // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
+                //
+                // FIX-3: write through pf.q (sized [batch * q_dim], unused after
+                // attention) then memcpy back to attn_out. Previously the temp was
+                // pf.normed which is sized [batch * hidden_dim]; that overflowed for
+                // Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`, corrupting
+                // adjacent GPU memory and producing gibberish output.
+                if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
+                    let total_elems = (batch * q_dim) as u32;
+                    let block = 256u32;
+                    let grid = (total_elems + block - 1) / block;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // Use pf.q as temp output (sized [batch * q_dim], free until next layer).
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(sigmoid_fn)
+                            .arg(&*pf_gate_buf)
+                            .arg(&pf.attn_out)
+                            .arg(&mut pf.q)
+                            .arg(&total_elems)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill: {e}")))?;
+                    // Copy q -> attn_out (both [batch * q_dim])
+                    self.device
+                        .stream
+                        .memcpy_dtod(&pf.q, &mut pf.attn_out)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}"))
+                        })?;
+                } else {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate fusion requires sigmoid_mul kernel".into(),
+                    ));
+                }
+
+                // 2f. Output projection + residual
+                unsafe {
+                    super::prefill::launch_gemm_residual(
+                        &self.device,
+                        &st.kernels,
+                        &lw.wo,
+                        None,
+                        &pf.attn_out,
+                        &pf.x,
+                        &mut pf.attn_proj,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        hidden_dim,
+                        q_dim,
+                        "wo",
+                    )?;
+                }
+
+                // 2g-2j. FFN (same as standard path) — MoE branch OR
+                // dense. See `prefill_moe_ffn_layer` doc-comment for context.
+                let is_moe_layer = lw.moe_layer_blob.is_some();
+                if is_moe_layer {
+                    self.prefill_moe_ffn_layer(layer_idx, batch, st, pf, eps)?;
+                } else {
+                    unsafe {
+                        super::prefill::launch_rmsnorm_batched(
+                            &self.device,
+                            &st.kernels,
+                            &pf.attn_proj,
+                            &lw.ffn_norm,
+                            &mut pf.normed,
+                            eps,
+                            batch,
+                            hidden_dim,
+                        )?;
+                        super::prefill::launch_gemm_projection(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_gate,
+                            None,
+                            &pf.normed,
+                            &mut pf.gate,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
+                            &mut pf.dequant_f16,
+                            batch,
+                            inter_dim,
+                            hidden_dim,
+                            "gate",
+                        )?;
+                        super::prefill::launch_gemm_projection(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_up,
+                            None,
+                            &pf.normed,
+                            &mut pf.up,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
+                            &mut pf.dequant_f16,
+                            batch,
+                            inter_dim,
+                            hidden_dim,
+                            "up",
+                        )?;
+                    }
+                    unsafe {
+                        super::prefill::launch_swiglu_batched(
+                            &self.device,
+                            &st.kernels,
+                            &mut pf.gate,
+                            &pf.up,
+                            batch,
+                            inter_dim,
+                        )?;
+                    }
+                    unsafe {
+                        super::prefill::launch_gemm_projection(
+                            &self.device,
+                            &st.kernels,
+                            &lw.w_down,
+                            None,
+                            &pf.gate,
+                            &mut pf.down,
+                            &mut pf.dequant_f32,
+                            &mut pf.activation_f16,
+                            &mut pf.dequant_f16,
+                            batch,
+                            hidden_dim,
+                            inter_dim,
+                            "down",
+                        )?;
+                    }
+                    unsafe {
+                        super::prefill::launch_residual_add_batched(
+                            &self.device,
+                            &st.kernels,
+                            &mut pf.attn_proj,
+                            &pf.down,
+                            batch,
+                            hidden_dim,
+                        )?;
+                    }
+                    self.device
+                        .stream
+                        .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
+                        })?;
+                }
+                continue; // Skip the standard path below
+            }
+
+            unsafe {
+                super::prefill::launch_gemm_projection(
+                    &self.device,
+                    &st.kernels,
+                    &lw.wq,
+                    None,
+                    &pf.normed,
+                    &mut pf.q,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch,
+                    q_dim,
+                    hidden_dim,
+                    "wq",
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device,
+                    &st.kernels,
+                    &lw.wk,
+                    None,
+                    &pf.normed,
+                    &mut pf.k,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch,
+                    kv_dim,
+                    hidden_dim,
+                    "wk",
+                )?;
+                super::prefill::launch_gemm_projection(
+                    &self.device,
+                    &st.kernels,
+                    &lw.wv,
+                    None,
+                    &pf.normed,
+                    &mut pf.v,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch,
+                    kv_dim,
+                    hidden_dim,
+                    "wv",
+                )?;
+            }
+
+            // QKV bias (Qwen2-family, prefill).
+            if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
+                let block = 256u32;
+                unsafe {
+                    if let Some(ref bq) = lw.bq {
+                        let total = (batch * q_dim) as u32;
+                        let dim_u32 = q_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.q)
+                            .arg(bq)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bq prefill: {e}"))
+                            })?;
+                    }
+                    if let Some(ref bk) = lw.bk {
+                        let total = (batch * kv_dim) as u32;
+                        let dim_u32 = kv_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.k)
+                            .arg(bk)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bk prefill: {e}"))
+                            })?;
+                    }
+                    if let Some(ref bv) = lw.bv {
+                        let total = (batch * kv_dim) as u32;
+                        let dim_u32 = kv_dim as u32;
+                        let g = (total + block - 1) / block;
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.bias_add_batched)
+                            .arg(&mut pf.v)
+                            .arg(bv)
+                            .arg(&total)
+                            .arg(&dim_u32)
+                            .launch(CudarcLaunchConfig {
+                                grid_dim: (g, 1, 1),
+                                block_dim: (block, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .map_err(|e| {
+                                RuntimeError::Compute(format!("bias_add_batched bv prefill: {e}"))
+                            })?;
+                    }
+                }
+            }
+
+            // 2c. Batched RoPE with per-token positions.
+            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
+            unsafe {
+                super::prefill::launch_rope_batched(
+                    &self.device,
+                    &st.kernels,
+                    &mut pf.q,
+                    &mut pf.k,
+                    pos_start,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    theta,
+                    hp.rope_neox,
+                    rotary_dim,
+                )?;
+            }
+
+            // 2d. Batch KV cache write for all tokens at once.
+            let kv_cache = &mut st.kv_caches[layer_idx];
+            unsafe {
+                super::prefill::launch_kv_cache_write_batch(
+                    &self.device,
+                    &st.kernels,
+                    &mut kv_cache.k_cache,
+                    &pf.k,
+                    pos_start,
+                    batch,
+                    num_kv_heads,
+                    kv_cache.max_seq_len,
+                    head_dim,
+                )?;
+                super::prefill::launch_kv_cache_write_batch(
+                    &self.device,
+                    &st.kernels,
+                    &mut kv_cache.v_cache,
+                    &pf.v,
+                    pos_start,
+                    batch,
+                    num_kv_heads,
+                    kv_cache.max_seq_len,
+                    head_dim,
+                )?;
+            }
+            kv_cache.advance_seq_len_by(batch);
+
+            // 2e. Flash Attention: single kernel for ALL tokens with causal masking.
+            //
+            // Dispatch priority (first match wins):
+            // 1. FA2 block-skip (P1-3, env-gated). Long-context win via
+            // mask block-skip; uses Split-K when seq_len >= FA2_SPLITK_MIN_SEQ.
+            // 2. Tensor-core WMMA (SM 80+): 16x16 tiles via mma.sync PTX.
+            // Uses F16 tensor cores for QK^T and PV, up to 16x throughput
+            // over scalar F32 on A100.
+            // 3. Scalar Br=4 fallback: 4 queries/block, warp-level parallelism.
+            // Used when batch < 16 (not enough queries for a full WMMA tile).
+            unsafe {
+                if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
+                    // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
+                    // this secondary prefill-attention dispatch as well, so the
+                    // eventual default change is complete across both sites.
+                    // Mode 3 runs the scalar kernel here: the tiled SGEMM route
+                    // is dispatched on the fused Q+gate site only, which is the
+                    // site every artifact the converter produces takes.
+                    let attn_precise = crate::runtime_defaults::attn_precise_selected();
+                    match attn_precise {
+                        1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_variant(
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                                true,
+                            )?;
+                        }
+                        2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_variant(
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                                false,
+                            )?;
+                        }
+                        3 => {
+                            super::prefill::launch_flash_attention_br4(
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                            )?;
+                        }
+                        4 if st.kernels.flash_attention_wmma_split.is_some() => {
+                            super::prefill::launch_flash_attention_wmma_split(
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                            )?;
+                        }
+                        _ => {
+                            super::prefill::launch_flash_attention_wmma(
+                                &self.device,
+                                &st.kernels,
+                                &pf.q,
+                                kv_cache,
+                                &mut pf.attn_out,
+                                batch,
+                                num_heads,
+                                num_kv_heads,
+                                head_dim,
+                                pos_start,
+                            )?;
+                        }
+                    }
+                } else {
+                    super::prefill::launch_flash_attention_br4(
+                        &self.device,
+                        &st.kernels,
+                        &pf.q,
+                        kv_cache,
+                        &mut pf.attn_out,
+                        batch,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        pos_start,
+                    )?;
+                }
+            }
+
+            // 2f. Batched output projection + residual via GEMM (no F16 caches).
+            unsafe {
+                super::prefill::launch_gemm_residual(
+                    &self.device,
+                    &st.kernels,
+                    &lw.wo,
+                    None,
+                    &pf.attn_out,
+                    &pf.x,
+                    &mut pf.attn_proj,
+                    &mut pf.dequant_f32,
+                    &mut pf.activation_f16,
+                    &mut pf.dequant_f16,
+                    batch,
+                    hidden_dim,
+                    q_dim,
+                    "wo",
+                )?;
+            }
+
+            // 2g-2j. FFN — MoE branch OR dense.
+            //
+            // See `prefill_moe_ffn_layer` doc-comment for the design-gap
+            // that this branch closes. For dense models (Qwen3.5-9B,
+            // Qwen2.5-7B/14B), `lw.moe_layer_blob` is always `None` so the
+            // dense branch runs unchanged — byte-identical to the prior
+            // path.
+            let is_moe_layer = lw.moe_layer_blob.is_some();
+            if is_moe_layer {
+                self.prefill_moe_ffn_layer(layer_idx, batch, st, pf, eps)?;
+            } else {
+                // 2g. FFN: batched RMSNorm + GEMM gate/up (always F32 path for precision).
+                unsafe {
+                    super::prefill::launch_rmsnorm_batched(
+                        &self.device,
+                        &st.kernels,
+                        &pf.attn_proj,
+                        &lw.ffn_norm,
+                        &mut pf.normed,
+                        eps,
+                        batch,
+                        hidden_dim,
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_gate,
+                        None,
+                        &pf.normed,
+                        &mut pf.gate,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        inter_dim,
+                        hidden_dim,
+                        "gate",
+                    )?;
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_up,
+                        None,
+                        &pf.normed,
+                        &mut pf.up,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        inter_dim,
+                        hidden_dim,
+                        "up",
+                    )?;
+                }
+
+                // 2h. Batched SwiGLU (standard path, no F16 fusion).
+                unsafe {
+                    super::prefill::launch_swiglu_batched(
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.gate,
+                        &pf.up,
+                        batch,
+                        inter_dim,
+                    )?;
+                }
+
+                // 2i. Batched down projection via GEMM (no F16 caches).
+                unsafe {
+                    super::prefill::launch_gemm_projection(
+                        &self.device,
+                        &st.kernels,
+                        &lw.w_down,
+                        None,
+                        &pf.gate,
+                        &mut pf.down,
+                        &mut pf.dequant_f32,
+                        &mut pf.activation_f16,
+                        &mut pf.dequant_f16,
+                        batch,
+                        hidden_dim,
+                        inter_dim,
+                        "down",
+                    )?;
+                }
+
+                // 2j. Batched residual add: x = attn_proj + down.
+                // Write result directly to pf.x (eliminates the separate memcpy_dtod).
+                unsafe {
+                    super::prefill::launch_residual_add_batched(
+                        &self.device,
+                        &st.kernels,
+                        &mut pf.attn_proj,
+                        &pf.down,
+                        batch,
+                        hidden_dim,
+                    )?;
+                }
+                self.device
+                    .stream
+                    .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Batched GDN prefill for a single GDN layer.
     ///
     /// Implements the 15-step GDN prefill pipeline matching Metal's
@@ -18813,11 +19871,9 @@ impl ComputeBackend for CudaBackend {
         let head_dim = hp.head_dim as usize;
         let inter_dim = hp.intermediate_dim as usize;
         let num_layers = hp.num_layers as usize;
-        let eps = hp.norm_eps;
-        let theta = hp.rope_params.as_ref().map(|r| r.theta).unwrap_or(10000.0);
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let batch = tokens.len();
+        let total = tokens.len();
         let vocab = hp.vocab_size as usize;
         if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
             return Err(RuntimeError::Compute(format!(
@@ -18835,11 +19891,17 @@ impl ComputeBackend for CudaBackend {
             }
         };
 
-        if batch == 0 {
+        if total == 0 {
             return Err(RuntimeError::Compute("empty prompt".into()));
         }
 
         let pos_start = kv.seq_len();
+        // The prompt runs through the layers in slices of at most
+        // `PREFILL_SLICE_TOKENS`, every slice through one scratch sized for the
+        // slice, so prefill memory is bounded whatever the prompt length; the
+        // KV caches and the GDN recurrent state carry across slices as they do
+        // across tokens.
+        let slice_len = total.min(super::prefill::PREFILL_SLICE_TOKENS);
 
         let mut state_guard = self.state.lock().unwrap();
         let st = state_guard
@@ -18854,6 +19916,22 @@ impl ComputeBackend for CudaBackend {
                     .into(),
             ));
         }
+        // The device caches are sized at init (`LUMEN_CUDA_MAX_SEQ_LEN` can cap
+        // them below the session's context); the KV write kernel does not bound
+        // its position, so the whole prompt is checked here, before any slice
+        // has written.
+        let capacity = st
+            .kv_caches
+            .iter()
+            .map(|c| c.max_seq_len)
+            .min()
+            .unwrap_or(0);
+        if pos_start + total > capacity {
+            return Err(RuntimeError::KvCache(format!(
+                "prefill of {total} tokens at position {pos_start} would exceed max_seq_len {capacity} \
+                 of the device KV cache"
+            )));
+        }
 
         // Resolve GDN dims up-front so the shared dequant scratch is
         // sized correctly for models whose `qkv_dim` exceeds `inter_dim`
@@ -18866,7 +19944,7 @@ impl ComputeBackend for CudaBackend {
             None
         };
 
-        // Allocate batch-sized scratch buffers. Q+gate fusion (attn_q_norm
+        // Allocate slice-sized scratch buffers. Q+gate fusion (attn_q_norm
         // present) projects wq at out = q_dim * 2, so the shared dequant
         // scratch must budget the doubled matrix on those models.
         let qgate_fused = st
@@ -18875,7 +19953,7 @@ impl ComputeBackend for CudaBackend {
             .any(|lw| lw.attn_q_norm.is_some());
         let mut pf = super::prefill::alloc_prefill_scratch(
             &self.device,
-            batch,
+            slice_len,
             hidden_dim,
             q_dim,
             kv_dim,
@@ -18892,7 +19970,7 @@ impl ComputeBackend for CudaBackend {
             self.ensure_gdn_scratch(st)?;
             Some(super::prefill::alloc_gdn_prefill_scratch(
                 &self.device,
-                batch,
+                slice_len,
                 gdn_params.qkv_dim,
                 gdn_params.num_heads,
                 gdn_params.value_dim,
@@ -18914,7 +19992,7 @@ impl ComputeBackend for CudaBackend {
         // then runs on the scalar kernel, which needs no scratch.
         pf.attn_scores = None;
         if !crate::runtime_defaults::force_scalar_attn_enabled()
-            && batch >= 16
+            && slice_len >= 16
             && crate::runtime_defaults::attn_precise_selected() == 3
             && crate::runtime_defaults::attn_prefill_sgemm_enabled()
             && st.kernels.attn_softmax_causal.is_some()
@@ -18924,1037 +20002,27 @@ impl ComputeBackend for CudaBackend {
         {
             pf.attn_scores = super::prefill::alloc_attn_score_block(
                 &self.device,
-                super::prefill::attn_score_block_elems(batch, num_heads, num_kv_heads, pos_start),
-            );
-        }
-
-        // Upload token IDs to GPU.
-        self.device.htod_copy_into(tokens, &mut pf.token_ids_gpu)?;
-
-        // Step 1: Batch embed all tokens into [batch, hidden_dim].
-        unsafe {
-            // The F32 embedding slot is a 1-element placeholder whenever a
-            // raw variant is resident; a raw scheme without a matching batch
-            // arm below would gather out of bounds from it.
-            debug_assert!(
-                st.globals.embedding_q8.is_some()
-                    || st.globals.embedding_f16.is_some()
-                    || st.globals.embedding_bf16.is_some()
-                    || st.globals.embedding_q4.is_some()
-                    || st.globals.embedding.len() > 1,
-                "batched embed would read the placeholder F32 embedding"
-            );
-            super::prefill::launch_embed_batch(
-                &self.device,
-                &st.kernels,
-                &st.globals.embedding,
-                st.globals.embedding_q8.as_ref(),
-                st.globals.embedding_f16.as_ref(),
-                st.globals.embedding_bf16.as_ref(),
-                st.globals.embedding_q4.as_ref(),
-                &pf.token_ids_gpu,
-                &mut pf.x,
-                batch,
-                hidden_dim,
-            )?;
-        }
-
-        // Step 2: Process all layers with batched GEMM for projections.
-        for layer_idx in 0..num_layers {
-            let lw = &st.layer_weights_cache[layer_idx];
-
-            // ---- GDN LAYER: batched projections + sequential state update ----
-            if lw.layer_type == 1 {
-                self.prefill_gdn_layer(
-                    layer_idx,
-                    batch,
-                    st,
-                    &mut pf,
-                    gdn_pf.as_mut().unwrap(),
-                    eps,
-                )?;
-                continue;
-            }
-
-            // ---- STANDARD ATTENTION LAYER ----
-
-            // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
-            unsafe {
-                super::prefill::launch_rmsnorm_batched(
-                    &self.device,
-                    &st.kernels,
-                    &pf.x,
-                    &lw.attn_norm,
-                    &mut pf.normed,
-                    eps,
-                    batch,
-                    hidden_dim,
-                )?;
-            }
-
-            // 2b. Batched QKV projections via GEMM (no F16 caches for precision match).
-            let has_qgate_fusion_pf = lw.attn_q_norm.is_some();
-            if has_qgate_fusion_pf {
-                // Q+gate fusion: project wq to [batch, q_dim*2], then deinterleave.
-                let q_gate_dim = q_dim * 2;
-                let mut pf_q_gate: CudaSlice<f32> = self.device.alloc_zeros(batch * q_gate_dim)?;
-                let mut pf_gate_buf: CudaSlice<f32> = self.device.alloc_zeros(batch * q_dim)?;
-                unsafe {
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wq,
-                        None,
-                        &pf.normed,
-                        &mut pf_q_gate,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        q_gate_dim,
-                        hidden_dim,
-                        "wq_qgate",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wk,
-                        None,
-                        &pf.normed,
-                        &mut pf.k,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        kv_dim,
-                        hidden_dim,
-                        "wk",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wv,
-                        None,
-                        &pf.normed,
-                        &mut pf.v,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        kv_dim,
-                        hidden_dim,
-                        "wv",
-                    )?;
-                }
-                // Batched deinterleave: treat batch as (batch * num_heads) total heads.
-                // deinterleave_qgate works on [total_heads * head_dim * 2] -> [total_heads * head_dim] + [...]
-                // This works because per-head interleaving is contiguous across tokens.
-                if let Some(ref deinterleave_fn) = st.kernels.deinterleave_qgate {
-                    let block = 256u32;
-                    let hd = head_dim as u32;
-                    let total_heads = (batch * num_heads) as u32;
-                    let total_q = batch * q_dim;
-                    let grid = ((total_q as u32) + block - 1) / block;
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(deinterleave_fn)
-                            .arg(&pf_q_gate)
-                            .arg(&mut pf.q)
-                            .arg(&mut pf_gate_buf)
-                            .arg(&hd)
-                            .arg(&total_heads)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("deinterleave_qgate prefill: {e}"))
-                    })?;
-                } else {
-                    return Err(RuntimeError::Compute(
-                        "Q+gate fusion requires deinterleave_qgate kernel".into(),
-                    ));
-                }
-                // Batched per-head RMSNorm on Q and K.
-                if let Some(ref q_norm_w) = lw.attn_q_norm {
-                    let norm_fn =
-                        st.kernels
-                            .rmsnorm_per_head_inplace
-                            .as_ref()
-                            .ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
-                                )
-                            })?;
-                    let hd = head_dim as u32;
-                    let total_heads = (batch * num_heads) as u32;
-                    let block = (head_dim as u32).min(1024).max(32);
-                    let block = (block / 32) * 32;
-                    let shared_bytes = (block / 32) * 4;
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (total_heads, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(norm_fn)
-                            .arg(&mut pf.q)
-                            .arg(q_norm_w)
-                            .arg(&total_heads)
-                            .arg(&hd)
-                            .arg(&eps)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("rmsnorm_per_head Q prefill: {e}"))
-                    })?;
-                }
-                if let Some(ref k_norm_w) = lw.attn_k_norm {
-                    let norm_fn =
-                        st.kernels
-                            .rmsnorm_per_head_inplace
-                            .as_ref()
-                            .ok_or_else(|| {
-                                RuntimeError::Compute(
-                                    "Q+gate fusion requires rmsnorm_per_head_inplace kernel".into(),
-                                )
-                            })?;
-                    let hd = head_dim as u32;
-                    let total_kv_heads = (batch * num_kv_heads) as u32;
-                    let block = (head_dim as u32).min(1024).max(32);
-                    let block = (block / 32) * 32;
-                    let shared_bytes = (block / 32) * 4;
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (total_kv_heads, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(norm_fn)
-                            .arg(&mut pf.k)
-                            .arg(k_norm_w)
-                            .arg(&total_kv_heads)
-                            .arg(&hd)
-                            .arg(&eps)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("rmsnorm_per_head K prefill: {e}"))
-                    })?;
-                }
-                // Store gate_buf for later sigmoid gating after attention.
-                // We'll use it after flash attention, before the output projection.
-                // For now, store in a local variable that persists through the layer scope.
-                // Apply sigmoid gating after attention (step 2e below).
-                // NOTE: pf_gate_buf needs to survive until after attention. Since we're in
-                // the same loop iteration scope, it's alive until the end of this block.
-
-                // Continue to RoPE (step 2c) -- Q and K are now deinterleaved and normalized.
-                // We don't add QKV bias for Q+gate layers (Qwen3.5 has no QKV bias).
-
-                // Skip bias section for qgate layers (handled above).
-                // Continue to step 2c...
-
-                // 2c. Batched RoPE (within qgate branch)
-                let rotary_dim_pf = hp.rotary_dim.unwrap_or(0) as u32;
-                // [ROPEPROBE] dump pre/post-rope Q for full-attn layers (last token,
-                // head 0, first 16 dims) to compare vs llama.cpp Qcur_normed/Qcur.
-                let ropeprobe = moe_probe_enabled();
-                let qd = num_heads * head_dim;
-                if ropeprobe && batch > 1 {
-                    let qh = self.device.dtoh_copy(&pf.q)?;
-                    let o = (batch - 1) * qd;
-                    eprintln!("[ROPEPROBE] layer={layer_idx} rotary_dim={rotary_dim_pf} head_dim={head_dim} neox={} PRE q_h0[0..16]={:?}",
-                        hp.rope_neox, &qh[o..o + 16.min(qd)]);
-                }
-                unsafe {
-                    super::prefill::launch_rope_batched(
-                        &self.device,
-                        &st.kernels,
-                        &mut pf.q,
-                        &mut pf.k,
-                        pos_start,
-                        batch,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        theta,
-                        hp.rope_neox,
-                        rotary_dim_pf,
-                    )?;
-                }
-                if ropeprobe && batch > 1 {
-                    let qh = self.device.dtoh_copy(&pf.q)?;
-                    let o = (batch - 1) * qd;
-                    // dump dims 0..8, 30..38, 62..70 to see split-half (d,d+32) pairing
-                    let s = |a: usize, b: usize| qh[o + a..o + b.min(qd)].to_vec();
-                    eprintln!(
-                        "[ROPEPROBE] layer={layer_idx} POST q_h0 d0-7={:?} d30-37={:?} d62-69={:?}",
-                        s(0, 8),
-                        s(30, 38),
-                        s(62, 70)
-                    );
-                    // post-rope K (cached) + V, last token, kv-head 0, first 3
-                    let kvd = num_kv_heads * head_dim;
-                    let kh = self.device.dtoh_copy(&pf.k)?;
-                    let vh = self.device.dtoh_copy(&pf.v)?;
-                    let ko = (batch - 1) * kvd;
-                    eprintln!(
-                        "[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
-                        &kh[ko..ko + 3.min(kvd)],
-                        &vh[ko..ko + 3.min(kvd)]
-                    );
-                    // whole-buffer sumsq (LAYOUT-INDEPENDENT) for Q/K/V across all tokens.
-                    let ss =
-                        |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-                    eprintln!(
-                        "[QKVSS] layer={layer_idx} q_sumsq={:.4} k_sumsq={:.4} v_sumsq={:.4}",
-                        ss(&qh[..batch * qd]),
-                        ss(&kh[..batch * kvd]),
-                        ss(&vh[..batch * kvd])
-                    );
-                }
-
-                // 2d. Batch KV cache write
-                let kv_cache = &mut st.kv_caches[layer_idx];
-                unsafe {
-                    super::prefill::launch_kv_cache_write_batch(
-                        &self.device,
-                        &st.kernels,
-                        &mut kv_cache.k_cache,
-                        &pf.k,
-                        pos_start,
-                        batch,
-                        num_kv_heads,
-                        kv_cache.max_seq_len,
-                        head_dim,
-                    )?;
-                    super::prefill::launch_kv_cache_write_batch(
-                        &self.device,
-                        &st.kernels,
-                        &mut kv_cache.v_cache,
-                        &pf.v,
-                        pos_start,
-                        batch,
-                        num_kv_heads,
-                        kv_cache.max_seq_len,
-                        head_dim,
-                    )?;
-                }
-                kv_cache.advance_seq_len_by(batch);
-
-                // 2e. Flash Attention
-                //
-                // Dispatch priority (first match wins):
-                // 1. batch >= 16 with the WMMA kernels loaded: the
-                // LUMEN_CUDA_ATTN_PRECISE selector below picks the variant
-                // (mode 3, the production default, is exact F32 — tiled cuBLAS
-                // SGEMM when that route is enabled, else the scalar kernel).
-                // 2. Scalar Br=4 fallback (batch < 16, or no WMMA kernels).
-                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs this site's prefill
-                // attention on the F32 scalar Br=4 kernel, whatever the
-                // selector says.
-                let force_scalar_attn = crate::runtime_defaults::force_scalar_attn_enabled();
-                // Prefill full-attention precision selector. 0=WMMA F16,
-                // 1=qkf32 (exact QK^T), 2=pvf32 (exact P@V), 3=both exact
-                // (full F32). Unset resolves to the ratified per-class default
-                // (3 for every production class); 0/1/2/4 remain available for
-                // carrier A/B.
-                let attn_precise = crate::runtime_defaults::attn_precise_selected();
-                unsafe {
-                    if !force_scalar_attn
-                        && batch >= 16
-                        && attn_precise == 3
-                        && pf.attn_scores.is_some()
-                    {
-                        // Mode 3 (both matmuls exact F32) on the tiled cuBLAS
-                        // SGEMM route: the score block was sized before the
-                        // layer loop under exactly this condition, so its
-                        // presence is the whole decision. It needs no WMMA
-                        // kernel. Without it, mode 3 is the scalar kernel in
-                        // the selector below.
-                        super::prefill::launch_flash_attention_sgemm(
-                            &self.device,
-                            &st.kernels,
-                            &pf.q,
-                            kv_cache,
-                            &mut pf.attn_out,
-                            &mut pf.attn_scores,
-                            batch,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            pos_start,
-                        )?;
-                    } else if !force_scalar_attn
-                        && batch >= 16
-                        && st.kernels.flash_attention_wmma.is_some()
-                    {
-                        match attn_precise {
-                            1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                    true,
-                                )?;
-                            }
-                            2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                    false,
-                                )?;
-                            }
-                            3 => {
-                                // Both exact == full F32 on the one-warp-per-row
-                                // scalar kernel: the tiled SGEMM route above did
-                                // not take this layer (switch off, its kernel
-                                // absent, or its score block not allocated).
-                                super::prefill::launch_flash_attention_br4(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                            4 if st.kernels.flash_attention_wmma_split.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_split(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                            _ => {
-                                super::prefill::launch_flash_attention_wmma(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                        }
-                    } else {
-                        super::prefill::launch_flash_attention_br4(
-                            &self.device,
-                            &st.kernels,
-                            &pf.q,
-                            kv_cache,
-                            &mut pf.attn_out,
-                            batch,
-                            num_heads,
-                            num_kv_heads,
-                            head_dim,
-                            pos_start,
-                        )?;
-                    }
-                }
-
-                // [ATTNPROBE] dump raw attention output (pre-gate) for full-attn
-                // layers (last token, head 0, first 3 dims) vs llama attn_pregate.
-                if ropeprobe && batch > 1 {
-                    let ah = self.device.dtoh_copy(&pf.attn_out)?;
-                    let o = (batch - 1) * qd;
-                    eprintln!(
-                        "[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}",
-                        &ah[o..o + 3.min(qd)]
-                    );
-                }
-
-                // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
-                //
-                // FIX-3: write through pf.q (sized [batch * q_dim], unused after
-                // attention) then memcpy back to attn_out. Previously the temp was
-                // pf.normed which is sized [batch * hidden_dim]; that overflowed for
-                // Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`, corrupting
-                // adjacent GPU memory and producing gibberish output.
-                if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
-                    let total_elems = (batch * q_dim) as u32;
-                    let block = 256u32;
-                    let grid = (total_elems + block - 1) / block;
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (grid, 1, 1),
-                        block_dim: (block, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    // Use pf.q as temp output (sized [batch * q_dim], free until next layer).
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(sigmoid_fn)
-                            .arg(&pf_gate_buf)
-                            .arg(&pf.attn_out)
-                            .arg(&mut pf.q)
-                            .arg(&total_elems)
-                            .launch(launch_cfg)
-                    }
-                    .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill: {e}")))?;
-                    // Copy q -> attn_out (both [batch * q_dim])
-                    self.device
-                        .stream
-                        .memcpy_dtod(&pf.q, &mut pf.attn_out)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}"))
-                        })?;
-                } else {
-                    return Err(RuntimeError::Compute(
-                        "Q+gate fusion requires sigmoid_mul kernel".into(),
-                    ));
-                }
-
-                // 2f. Output projection + residual
-                unsafe {
-                    super::prefill::launch_gemm_residual(
-                        &self.device,
-                        &st.kernels,
-                        &lw.wo,
-                        None,
-                        &pf.attn_out,
-                        &pf.x,
-                        &mut pf.attn_proj,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        hidden_dim,
-                        q_dim,
-                        "wo",
-                    )?;
-                }
-
-                // 2g-2j. FFN (same as standard path) — MoE branch OR
-                // dense. See `prefill_moe_ffn_layer` doc-comment for context.
-                let is_moe_layer = lw.moe_layer_blob.is_some();
-                if is_moe_layer {
-                    self.prefill_moe_ffn_layer(layer_idx, batch, st, &mut pf, eps)?;
-                } else {
-                    unsafe {
-                        super::prefill::launch_rmsnorm_batched(
-                            &self.device,
-                            &st.kernels,
-                            &pf.attn_proj,
-                            &lw.ffn_norm,
-                            &mut pf.normed,
-                            eps,
-                            batch,
-                            hidden_dim,
-                        )?;
-                        super::prefill::launch_gemm_projection(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_gate,
-                            None,
-                            &pf.normed,
-                            &mut pf.gate,
-                            &mut pf.dequant_f32,
-                            &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch,
-                            inter_dim,
-                            hidden_dim,
-                            "gate",
-                        )?;
-                        super::prefill::launch_gemm_projection(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_up,
-                            None,
-                            &pf.normed,
-                            &mut pf.up,
-                            &mut pf.dequant_f32,
-                            &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch,
-                            inter_dim,
-                            hidden_dim,
-                            "up",
-                        )?;
-                    }
-                    unsafe {
-                        super::prefill::launch_swiglu_batched(
-                            &self.device,
-                            &st.kernels,
-                            &mut pf.gate,
-                            &pf.up,
-                            batch,
-                            inter_dim,
-                        )?;
-                    }
-                    unsafe {
-                        super::prefill::launch_gemm_projection(
-                            &self.device,
-                            &st.kernels,
-                            &lw.w_down,
-                            None,
-                            &pf.gate,
-                            &mut pf.down,
-                            &mut pf.dequant_f32,
-                            &mut pf.activation_f16,
-                            &mut pf.dequant_f16,
-                            batch,
-                            hidden_dim,
-                            inter_dim,
-                            "down",
-                        )?;
-                    }
-                    unsafe {
-                        super::prefill::launch_residual_add_batched(
-                            &self.device,
-                            &st.kernels,
-                            &mut pf.attn_proj,
-                            &pf.down,
-                            batch,
-                            hidden_dim,
-                        )?;
-                    }
-                    self.device
-                        .stream
-                        .memcpy_dtod(&pf.attn_proj, &mut pf.x)
-                        .map_err(|e| {
-                            RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
-                        })?;
-                }
-                continue; // Skip the standard path below
-            }
-
-            unsafe {
-                super::prefill::launch_gemm_projection(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wq,
-                    None,
-                    &pf.normed,
-                    &mut pf.q,
-                    &mut pf.dequant_f32,
-                    &mut pf.activation_f16,
-                    &mut pf.dequant_f16,
-                    batch,
-                    q_dim,
-                    hidden_dim,
-                    "wq",
-                )?;
-                super::prefill::launch_gemm_projection(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wk,
-                    None,
-                    &pf.normed,
-                    &mut pf.k,
-                    &mut pf.dequant_f32,
-                    &mut pf.activation_f16,
-                    &mut pf.dequant_f16,
-                    batch,
-                    kv_dim,
-                    hidden_dim,
-                    "wk",
-                )?;
-                super::prefill::launch_gemm_projection(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wv,
-                    None,
-                    &pf.normed,
-                    &mut pf.v,
-                    &mut pf.dequant_f32,
-                    &mut pf.activation_f16,
-                    &mut pf.dequant_f16,
-                    batch,
-                    kv_dim,
-                    hidden_dim,
-                    "wv",
-                )?;
-            }
-
-            // QKV bias (Qwen2-family, prefill).
-            if lw.bq.is_some() || lw.bk.is_some() || lw.bv.is_some() {
-                let block = 256u32;
-                unsafe {
-                    if let Some(ref bq) = lw.bq {
-                        let total = (batch * q_dim) as u32;
-                        let dim_u32 = q_dim as u32;
-                        let g = (total + block - 1) / block;
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.q)
-                            .arg(bq)
-                            .arg(&total)
-                            .arg(&dim_u32)
-                            .launch(CudarcLaunchConfig {
-                                grid_dim: (g, 1, 1),
-                                block_dim: (block, 1, 1),
-                                shared_mem_bytes: 0,
-                            })
-                            .map_err(|e| {
-                                RuntimeError::Compute(format!("bias_add_batched bq prefill: {e}"))
-                            })?;
-                    }
-                    if let Some(ref bk) = lw.bk {
-                        let total = (batch * kv_dim) as u32;
-                        let dim_u32 = kv_dim as u32;
-                        let g = (total + block - 1) / block;
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.k)
-                            .arg(bk)
-                            .arg(&total)
-                            .arg(&dim_u32)
-                            .launch(CudarcLaunchConfig {
-                                grid_dim: (g, 1, 1),
-                                block_dim: (block, 1, 1),
-                                shared_mem_bytes: 0,
-                            })
-                            .map_err(|e| {
-                                RuntimeError::Compute(format!("bias_add_batched bk prefill: {e}"))
-                            })?;
-                    }
-                    if let Some(ref bv) = lw.bv {
-                        let total = (batch * kv_dim) as u32;
-                        let dim_u32 = kv_dim as u32;
-                        let g = (total + block - 1) / block;
-                        self.device
-                            .stream
-                            .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.v)
-                            .arg(bv)
-                            .arg(&total)
-                            .arg(&dim_u32)
-                            .launch(CudarcLaunchConfig {
-                                grid_dim: (g, 1, 1),
-                                block_dim: (block, 1, 1),
-                                shared_mem_bytes: 0,
-                            })
-                            .map_err(|e| {
-                                RuntimeError::Compute(format!("bias_add_batched bv prefill: {e}"))
-                            })?;
-                    }
-                }
-            }
-
-            // 2c. Batched RoPE with per-token positions.
-            let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
-            unsafe {
-                super::prefill::launch_rope_batched(
-                    &self.device,
-                    &st.kernels,
-                    &mut pf.q,
-                    &mut pf.k,
-                    pos_start,
-                    batch,
+                // The block serves every slice; the last slice attends over the
+                // longest key range, so it is sized for that one.
+                super::prefill::attn_score_block_elems(
+                    slice_len,
                     num_heads,
                     num_kv_heads,
-                    head_dim,
-                    theta,
-                    hp.rope_neox,
-                    rotary_dim,
-                )?;
-            }
+                    pos_start + total - slice_len,
+                ),
+            );
+        }
 
-            // 2d. Batch KV cache write for all tokens at once.
-            let kv_cache = &mut st.kv_caches[layer_idx];
-            unsafe {
-                super::prefill::launch_kv_cache_write_batch(
-                    &self.device,
-                    &st.kernels,
-                    &mut kv_cache.k_cache,
-                    &pf.k,
-                    pos_start,
-                    batch,
-                    num_kv_heads,
-                    kv_cache.max_seq_len,
-                    head_dim,
-                )?;
-                super::prefill::launch_kv_cache_write_batch(
-                    &self.device,
-                    &st.kernels,
-                    &mut kv_cache.v_cache,
-                    &pf.v,
-                    pos_start,
-                    batch,
-                    num_kv_heads,
-                    kv_cache.max_seq_len,
-                    head_dim,
-                )?;
-            }
-            kv_cache.advance_seq_len_by(batch);
-
-            // 2e. Flash Attention: single kernel for ALL tokens with causal masking.
-            //
-            // Dispatch priority (first match wins):
-            // 1. FA2 block-skip (P1-3, env-gated). Long-context win via
-            // mask block-skip; uses Split-K when seq_len >= FA2_SPLITK_MIN_SEQ.
-            // 2. Tensor-core WMMA (SM 80+): 16x16 tiles via mma.sync PTX.
-            // Uses F16 tensor cores for QK^T and PV, up to 16x throughput
-            // over scalar F32 on A100.
-            // 3. Scalar Br=4 fallback: 4 queries/block, warp-level parallelism.
-            // Used when batch < 16 (not enough queries for a full WMMA tile).
-            unsafe {
-                if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
-                    // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
-                    // this secondary prefill-attention dispatch as well, so the
-                    // eventual default change is complete across both sites.
-                    // Mode 3 runs the scalar kernel here: the tiled SGEMM route
-                    // is dispatched on the fused Q+gate site only, which is the
-                    // site every artifact the converter produces takes.
-                    let attn_precise = crate::runtime_defaults::attn_precise_selected();
-                    match attn_precise {
-                        1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                                true,
-                            )?;
-                        }
-                        2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                                false,
-                            )?;
-                        }
-                        3 => {
-                            super::prefill::launch_flash_attention_br4(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                        4 if st.kernels.flash_attention_wmma_split.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_split(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                        _ => {
-                            super::prefill::launch_flash_attention_wmma(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                    }
-                } else {
-                    super::prefill::launch_flash_attention_br4(
-                        &self.device,
-                        &st.kernels,
-                        &pf.q,
-                        kv_cache,
-                        &mut pf.attn_out,
-                        batch,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        pos_start,
-                    )?;
-                }
-            }
-
-            // 2f. Batched output projection + residual via GEMM (no F16 caches).
-            unsafe {
-                super::prefill::launch_gemm_residual(
-                    &self.device,
-                    &st.kernels,
-                    &lw.wo,
-                    None,
-                    &pf.attn_out,
-                    &pf.x,
-                    &mut pf.attn_proj,
-                    &mut pf.dequant_f32,
-                    &mut pf.activation_f16,
-                    &mut pf.dequant_f16,
-                    batch,
-                    hidden_dim,
-                    q_dim,
-                    "wo",
-                )?;
-            }
-
-            // 2g-2j. FFN — MoE branch OR dense.
-            //
-            // See `prefill_moe_ffn_layer` doc-comment for the design-gap
-            // that this branch closes. For dense models (Qwen3.5-9B,
-            // Qwen2.5-7B/14B), `lw.moe_layer_blob` is always `None` so the
-            // dense branch runs unchanged — byte-identical to the prior
-            // path.
-            let is_moe_layer = lw.moe_layer_blob.is_some();
-            if is_moe_layer {
-                self.prefill_moe_ffn_layer(layer_idx, batch, st, &mut pf, eps)?;
-            } else {
-                // 2g. FFN: batched RMSNorm + GEMM gate/up (always F32 path for precision).
-                unsafe {
-                    super::prefill::launch_rmsnorm_batched(
-                        &self.device,
-                        &st.kernels,
-                        &pf.attn_proj,
-                        &lw.ffn_norm,
-                        &mut pf.normed,
-                        eps,
-                        batch,
-                        hidden_dim,
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_gate,
-                        None,
-                        &pf.normed,
-                        &mut pf.gate,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        inter_dim,
-                        hidden_dim,
-                        "gate",
-                    )?;
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_up,
-                        None,
-                        &pf.normed,
-                        &mut pf.up,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        inter_dim,
-                        hidden_dim,
-                        "up",
-                    )?;
-                }
-
-                // 2h. Batched SwiGLU (standard path, no F16 fusion).
-                unsafe {
-                    super::prefill::launch_swiglu_batched(
-                        &self.device,
-                        &st.kernels,
-                        &mut pf.gate,
-                        &pf.up,
-                        batch,
-                        inter_dim,
-                    )?;
-                }
-
-                // 2i. Batched down projection via GEMM (no F16 caches).
-                unsafe {
-                    super::prefill::launch_gemm_projection(
-                        &self.device,
-                        &st.kernels,
-                        &lw.w_down,
-                        None,
-                        &pf.gate,
-                        &mut pf.down,
-                        &mut pf.dequant_f32,
-                        &mut pf.activation_f16,
-                        &mut pf.dequant_f16,
-                        batch,
-                        hidden_dim,
-                        inter_dim,
-                        "down",
-                    )?;
-                }
-
-                // 2j. Batched residual add: x = attn_proj + down.
-                // Write result directly to pf.x (eliminates the separate memcpy_dtod).
-                unsafe {
-                    super::prefill::launch_residual_add_batched(
-                        &self.device,
-                        &st.kernels,
-                        &mut pf.attn_proj,
-                        &pf.down,
-                        batch,
-                        hidden_dim,
-                    )?;
-                }
-                self.device
-                    .stream
-                    .memcpy_dtod(&pf.attn_proj, &mut pf.x)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
-                    })?;
-            }
+        let mut last_len = 0;
+        for (i, slice) in tokens.chunks(slice_len).enumerate() {
+            self.prefill_slice(
+                st,
+                &mut pf,
+                gdn_pf.as_mut(),
+                slice,
+                pos_start + i * slice_len,
+            )?;
+            last_len = slice.len();
         }
 
         // Step 3: Extract last token's hidden state into decode scratch.
@@ -19964,7 +20032,7 @@ impl ComputeBackend for CudaBackend {
                 &st.kernels,
                 &pf.x,
                 &mut st.scratch.x_gpu,
-                batch - 1,
+                last_len - 1,
                 hidden_dim,
             )?;
         }
@@ -19974,7 +20042,7 @@ impl ComputeBackend for CudaBackend {
         let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
 
         // Step 5: Advance host-side KV cache seq_len to match GPU state.
-        for _ in 0..batch {
+        for _ in 0..total {
             kv.advance_seq_len()?;
         }
 
