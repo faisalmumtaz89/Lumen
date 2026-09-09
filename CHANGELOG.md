@@ -32,6 +32,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   causality at tile edges under grouped-query attention, and to a reference
   across key tiles.
 
+### Fixed
+
+- **The scalar prefill attention kernel's key-tile loop ends with a warp
+  barrier** — a lane that had finished a tile's weighted sum could write the
+  next tile's score into a slot a slower lane was still reading; the
+  sanitizer's race check reported ten such hazards on the kernel and reports
+  none now. Output is unchanged.
+
 ## [0.27.0] — 2026-09-09
 
 ### Fixed

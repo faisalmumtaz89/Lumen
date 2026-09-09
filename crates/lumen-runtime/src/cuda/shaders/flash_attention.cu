@@ -397,6 +397,9 @@ extern "C" __global__ void flash_attention_causal_br4(
 
         m_prev = m_new;
         l_prev = l_new;
+        // The next tile's scores overwrite slots a slower lane may still be
+        // summing.
+        __syncwarp(0xffffffff);
     }
 
     // Final normalization
