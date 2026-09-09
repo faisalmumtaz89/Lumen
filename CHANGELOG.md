@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Removed
+
+- **The F16 tensor-core prefill attention kernels and `LUMEN_CUDA_ATTN_PRECISE`**
+  — prefill full attention on CUDA is computed in exact F32 only, as every
+  shipped model already did: the tiled cuBLAS route for prefills of 16 tokens
+  or more on the fused Q+gate layers, the scalar kernel otherwise. The four
+  F16 tensor-core kernels the other modes selected are deleted with the mode
+  switch (`LUMEN_CUDA_ATTN_PRECISE`, `LUMEN_CUDA_ATTN_PRECISE_DBG`), and with
+  them the resolver that sent a caller who never set the model's layer count
+  to the F16 kernel. That kernel packed the probability operand of its P·V
+  product in an order that does not match the `m16n8k16` PTX fragment layout:
+  with equal scores, query 0 of a 16-row tile at position 0 read the value
+  stored at position 8, a key from its future. A
+  test now holds the remaining scalar kernel to exact causality at tile edges.
+  Output on the shipped models is unchanged; an environment that set either
+  variable now sets an unknown one, which the startup registry check reports.
+
 ## [0.27.0] — 2026-09-09
 
 ### Fixed

@@ -8450,35 +8450,13 @@ impl CudaBackend {
                 kv_cache.advance_seq_len_by(batch);
 
                 // 2e. Flash Attention
-                //
-                // Dispatch priority (first match wins):
-                // 1. batch >= 16 with the WMMA kernels loaded: the
-                // LUMEN_CUDA_ATTN_PRECISE selector below picks the variant
-                // (mode 3, the production default, is exact F32 — tiled cuBLAS
-                // SGEMM when that route is enabled, else the scalar kernel).
-                // 2. Scalar Br=4 fallback (batch < 16, or no WMMA kernels).
-                // LUMEN_CUDA_FORCE_SCALAR_ATTN=1 runs this site's prefill
-                // attention on the F32 scalar Br=4 kernel, whatever the
-                // selector says.
-                let force_scalar_attn = crate::runtime_defaults::force_scalar_attn_enabled();
-                // Prefill full-attention precision selector. 0=WMMA F16,
-                // 1=qkf32 (exact QK^T), 2=pvf32 (exact P@V), 3=both exact
-                // (full F32). Unset resolves to the ratified per-class default
-                // (3 for every production class); 0/1/2/4 remain available for
-                // carrier A/B.
-                let attn_precise = crate::runtime_defaults::attn_precise_selected();
                 unsafe {
-                    if !force_scalar_attn
-                        && batch >= 16
-                        && attn_precise == 3
-                        && pf.attn_scores.is_some()
-                    {
-                        // Mode 3 (both matmuls exact F32) on the tiled cuBLAS
-                        // SGEMM route: the score block was sized before the
-                        // layer loop under exactly this condition, so its
-                        // presence is the whole decision. It needs no WMMA
-                        // kernel. Without it, mode 3 is the scalar kernel in
-                        // the selector below.
+                    if batch >= 16 && pf.attn_scores.is_some() {
+                        // The score block was sized before the layer loop
+                        // under exactly the conditions the tiled route needs,
+                        // so its presence is the whole decision; without it
+                        // the scalar kernel computes the same exact-F32
+                        // attention.
                         super::prefill::launch_flash_attention_sgemm(
                             &self.device,
                             &st.kernels,
@@ -8492,88 +8470,6 @@ impl CudaBackend {
                             head_dim,
                             pos_start,
                         )?;
-                    } else if !force_scalar_attn
-                        && batch >= 16
-                        && st.kernels.flash_attention_wmma.is_some()
-                    {
-                        match attn_precise {
-                            1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                    true,
-                                )?;
-                            }
-                            2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_variant(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                    false,
-                                )?;
-                            }
-                            3 => {
-                                // Both exact == full F32 on the one-warp-per-row
-                                // scalar kernel: the tiled SGEMM route above did
-                                // not take this layer (switch off, its kernel
-                                // absent, or its score block not allocated).
-                                super::prefill::launch_flash_attention_br4(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                            4 if st.kernels.flash_attention_wmma_split.is_some() => {
-                                super::prefill::launch_flash_attention_wmma_split(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                            _ => {
-                                super::prefill::launch_flash_attention_wmma(
-                                    &self.device,
-                                    &st.kernels,
-                                    &pf.q,
-                                    kv_cache,
-                                    &mut pf.attn_out,
-                                    batch,
-                                    num_heads,
-                                    num_kv_heads,
-                                    head_dim,
-                                    pos_start,
-                                )?;
-                            }
-                        }
                     } else {
                         super::prefill::launch_flash_attention_br4(
                             &self.device,
@@ -8920,112 +8816,19 @@ impl CudaBackend {
             kv_cache.advance_seq_len_by(batch);
 
             // 2e. Flash Attention: single kernel for ALL tokens with causal masking.
-            //
-            // Dispatch priority (first match wins):
-            // 1. FA2 block-skip (P1-3, env-gated). Long-context win via
-            // mask block-skip; uses Split-K when seq_len >= FA2_SPLITK_MIN_SEQ.
-            // 2. Tensor-core WMMA (SM 80+): 16x16 tiles via mma.sync PTX.
-            // Uses F16 tensor cores for QK^T and PV, up to 16x throughput
-            // over scalar F32 on A100.
-            // 3. Scalar Br=4 fallback: 4 queries/block, warp-level parallelism.
-            // Used when batch < 16 (not enough queries for a full WMMA tile).
             unsafe {
-                if batch >= 16 && st.kernels.flash_attention_wmma.is_some() {
-                    // WMMA-PRECISION-FIX-RCA: honor LUMEN_CUDA_ATTN_PRECISE on
-                    // this secondary prefill-attention dispatch as well, so the
-                    // eventual default change is complete across both sites.
-                    // Mode 3 runs the scalar kernel here: the tiled SGEMM route
-                    // is dispatched on the fused Q+gate site only, which is the
-                    // site every artifact the converter produces takes.
-                    let attn_precise = crate::runtime_defaults::attn_precise_selected();
-                    match attn_precise {
-                        1 if st.kernels.flash_attention_wmma_qkf32.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                                true,
-                            )?;
-                        }
-                        2 if st.kernels.flash_attention_wmma_pvf32.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_variant(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                                false,
-                            )?;
-                        }
-                        3 => {
-                            super::prefill::launch_flash_attention_br4(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                        4 if st.kernels.flash_attention_wmma_split.is_some() => {
-                            super::prefill::launch_flash_attention_wmma_split(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                        _ => {
-                            super::prefill::launch_flash_attention_wmma(
-                                &self.device,
-                                &st.kernels,
-                                &pf.q,
-                                kv_cache,
-                                &mut pf.attn_out,
-                                batch,
-                                num_heads,
-                                num_kv_heads,
-                                head_dim,
-                                pos_start,
-                            )?;
-                        }
-                    }
-                } else {
-                    super::prefill::launch_flash_attention_br4(
-                        &self.device,
-                        &st.kernels,
-                        &pf.q,
-                        kv_cache,
-                        &mut pf.attn_out,
-                        batch,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        pos_start,
-                    )?;
-                }
+                super::prefill::launch_flash_attention_br4(
+                    &self.device,
+                    &st.kernels,
+                    &pf.q,
+                    kv_cache,
+                    &mut pf.attn_out,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    pos_start,
+                )?;
             }
 
             // 2f. Batched output projection + residual via GEMM (no F16 caches).
@@ -19986,14 +19789,13 @@ impl ComputeBackend for CudaBackend {
         // advances that cache's length before it reaches the attention
         // dispatch while the host-side length only advances after the last
         // layer. It exists exactly when the dispatch will take that route:
-        // mode 3 selected, the switch on, the softmax kernel built, a fused
-        // Q+gate attention layer present, 16 tokens or more, and no forced
-        // scalar attention. A refused allocation leaves it `None`, and mode 3
-        // then runs on the scalar kernel, which needs no scratch.
+        // the switch on, the softmax kernel built, a fused Q+gate attention
+        // layer present, 16 tokens or more, and no forced scalar attention. A
+        // refused allocation leaves it `None`, and the attention then runs on
+        // the scalar kernel, which needs no scratch.
         pf.attn_scores = None;
         if !crate::runtime_defaults::force_scalar_attn_enabled()
             && slice_len >= 16
-            && crate::runtime_defaults::attn_precise_selected() == 3
             && crate::runtime_defaults::attn_prefill_sgemm_enabled()
             && st.kernels.attn_softmax_causal.is_some()
             && st.layer_weights_cache.iter().any(|lw| {

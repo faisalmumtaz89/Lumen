@@ -1,9 +1,7 @@
 //! Diagnostic: print exactly what the runtime-default resolvers see for a given
-//! LBC — the `output_proj_quant` fed to `set_model_dense_quant`, the layer
-//! count fed to `set_model_block_count`, the MoE flag, and the resolved
-//! `attn_precise_default()`. Used by the GQ-014 27B fix validation to confirm
-//! the quant-aware attention-precision default fires correctly for the actual
-//! registry-pulled LBC (not just hand-set hints).
+//! LBC — the `output_proj_quant` fed to `set_model_dense_quant`, the primary
+//! quant scheme, the layer count fed to `set_model_block_count`, the MoE flag,
+//! and the resolved defaults that depend on them.
 //!
 //! Usage: cargo run --release --example dump_quant_hint -- <path-to.lbc>
 
@@ -36,10 +34,6 @@ fn main() {
     println!(
         "  model_dense_quant()                           = {:?}",
         rd::model_dense_quant_pub()
-    );
-    println!(
-        "  attn_precise_default()                        = {}",
-        rd::attn_precise_default()
     );
     println!(
         "  gdn_decode_via_prefill_default()              = {}",

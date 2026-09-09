@@ -2077,8 +2077,7 @@ fn run_with_async(
     // default remains 0 µs — CLI is fork-deterministic.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
     // PRIMARY (bulk) quant — body attn/FFN scheme, NOT output_proj (which is
-    // Q8_0 for both 27B-q4 and 27B-q8). Drives the per-quant attention-precision
-    // default (27B q4/q8/bf16 all -> pvf32; quant unset -> legacy WMMA).
+    // Q8_0 for both 27B-q4 and 27B-q8).
     lumen_runtime::runtime_defaults::set_model_primary_quant(
         provider.lbc().header.quantization.scheme,
     );
@@ -2203,8 +2202,7 @@ fn run_with_sync(
     // defaults BEFORE any backend constructor runs.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
     // PRIMARY (bulk) quant — body attn/FFN scheme, NOT output_proj (which is
-    // Q8_0 for both 27B-q4 and 27B-q8). Drives the per-quant attention-precision
-    // default (27B q4/q8/bf16 all -> pvf32; quant unset -> legacy WMMA).
+    // Q8_0 for both 27B-q4 and 27B-q8).
     lumen_runtime::runtime_defaults::set_model_primary_quant(
         provider.lbc().header.quantization.scheme,
     );
@@ -2376,8 +2374,7 @@ fn run_with_mmap(
     // see the AsyncWeightProvider branch for rationale.
     lumen_runtime::runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
     // PRIMARY (bulk) quant — body attn/FFN scheme, NOT output_proj (which is
-    // Q8_0 for both 27B-q4 and 27B-q8). Drives the per-quant attention-precision
-    // default (27B q4/q8/bf16 all -> pvf32; quant unset -> legacy WMMA).
+    // Q8_0 for both 27B-q4 and 27B-q8).
     lumen_runtime::runtime_defaults::set_model_primary_quant(
         provider.lbc().header.quantization.scheme,
     );

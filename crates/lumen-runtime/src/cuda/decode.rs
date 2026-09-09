@@ -386,22 +386,6 @@ pub(crate) struct KernelSet {
     pub(crate) gdn_phase4_register_resident_f64accum: Option<CudaFunction>,
     pub(crate) gdn_rmsnorm_silu_gate_f64accum: Option<CudaFunction>,
 
-    // Tensor-core Flash Attention (WMMA via inline PTX, SM 80+).
-    // 16x16 query tiles via mma.sync.aligned.m16n8k16 for QK^T and PV.
-    // Optional: compilation requires SM 8.0+; falls back to scalar flash_attention_br4 if unavailable.
-    pub(crate) flash_attention_wmma: Option<CudaFunction>,
-
-    // Precision-localization / fix variants of the WMMA prefill attention
-    // (WMMA-PRECISION-FIX-RCA). Dispatched via env from backend_impl; no-op
-    // when unset. `qkf32` = exact scalar F32 QK^T + F16-WMMA P@V; `pvf32` =
-    // F16-WMMA QK^T + exact scalar F32 P@V. Used to isolate whether the
-    // token-flipping F16 precision loss is in the QK^T or P@V operands.
-    pub(crate) flash_attention_wmma_qkf32: Option<CudaFunction>,
-    pub(crate) flash_attention_wmma_pvf32: Option<CudaFunction>,
-    // Performant fix: split-F16 (hi+lo) operands on BOTH QK^T and P@V,
-    // recovering ~20-bit mantissa while staying on tensor cores.
-    pub(crate) flash_attention_wmma_split: Option<CudaFunction>,
-
     // Tiled two-phase argmax variants (default ON; LUMEN_CUDA_ARGMAX_TILED=0 opts out;
     // byte-identical output — see argmax.cu). Option: absent => single-block.
     pub(crate) argmax_f32_tile_phase1: Option<CudaFunction>,
@@ -971,7 +955,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     // pair measured slightly slower on the RTX 5090, unlike the tiled kernel.
     let load_splitk = load_fn;
 
-    // For kernels needing SM 80+ features (dp4a, WMMA tensor cores).
+    // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch(source, "compute_80")?;
         module.load_function(name).map_err(|e| {
@@ -1299,31 +1283,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         matvec_q8_0_v4_residual: load_fn_sm80(
             shaders::MATVEC_Q8_0_V4_KERNEL_SOURCE,
             "matvec_q8_0_v4_residual",
-        )
-        .ok(),
-        flash_attention_wmma: match load_fn_sm80(
-            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
-            "flash_attention_wmma",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!("[CUDA] WMMA flash attention: FAILED: {e}");
-                None
-            }
-        },
-        flash_attention_wmma_qkf32: load_fn_sm80(
-            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
-            "flash_attention_wmma_qkf32",
-        )
-        .ok(),
-        flash_attention_wmma_pvf32: load_fn_sm80(
-            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
-            "flash_attention_wmma_pvf32",
-        )
-        .ok(),
-        flash_attention_wmma_split: load_fn_sm80(
-            shaders::FLASH_ATTENTION_WMMA_KERNEL_SOURCE,
-            "flash_attention_wmma_split",
         )
         .ok(),
         argmax_f32: load_fn(shaders::ARGMAX_KERNEL_SOURCE, "argmax_f32")?,
@@ -4512,103 +4471,6 @@ pub(crate) fn flash_attention_br4_block_size() -> u32 {
 /// Layout: q_rows[4][head_dim] + s_tiles[4][FA_BC].
 pub(crate) fn flash_attention_br4_shared_bytes(head_dim: u32) -> u32 {
     FA_BR * (head_dim + FA_BC) * 4
-}
-
-// ------------------------------------------------------------------
-// WMMA Flash Attention constants and helpers (must match flash_attention_wmma.cu)
-// ------------------------------------------------------------------
-
-/// Query tile rows for WMMA variant (must match FA_TC_BR in flash_attention_wmma.cu).
-pub(crate) const FA_TC_BR: u32 = 16;
-
-/// KV tile columns for WMMA variant (must match FA_TC_BC in flash_attention_wmma.cu).
-pub(crate) const FA_TC_BC: u32 = 16;
-
-/// Block size for flash_attention_wmma (128 threads = 4 warps).
-pub(crate) fn flash_attention_wmma_block_size() -> u32 {
-    128
-}
-
-/// Shared memory bytes for flash_attention_wmma.
-///
-/// Layout:
-/// half Q_sh[BR * head_dim] = BR * hd * 2 bytes
-/// half KV_sh[BC * head_dim] = BC * hd * 2 bytes (reused for K then V)
-/// float S_sh[BR * BC] = BR * BC * 4 bytes
-/// half P_sh[BR * BC] = BR * BC * 2 bytes
-/// float O_acc[BR * head_dim] = BR * hd * 4 bytes
-/// float rowmax[BR] = BR * 4 bytes
-/// float rowsum[BR] = BR * 4 bytes
-pub(crate) fn flash_attention_wmma_shared_bytes(head_dim: u32) -> u32 {
-    let br = FA_TC_BR;
-    let bc = FA_TC_BC;
-    let hd = head_dim;
-
-    let q_sh = br * hd * 2; // half Q_sh[BR][hd]
-    let kv_sh = bc * hd * 2; // half KV_sh[BC][hd]
-    let s_sh = br * bc * 4; // float S_sh[BR][BC]
-    let p_sh = br * bc * 2; // half P_sh[BR][BC]
-    let o_acc = br * hd * 4; // float O_acc[BR][hd]
-    let rowmax = br * 4; // float rowmax[BR]
-    let rowsum = br * 4; // float rowsum[BR]
-
-    q_sh + kv_sh + s_sh + p_sh + o_acc + rowmax + rowsum
-}
-
-/// Shared memory bytes for flash_attention_wmma_qkf32 (precision-localization).
-///
-/// Layout: Q_f32[BR*hd]*4 + K_f32[BC*hd]*4 + S[BR*BC]*4 + P_f16[BR*BC]*2
-///       + V_f16[BC*hd]*2 + O_acc[BR*hd]*4 + rowmax[BR]*4 + rowsum[BR]*4
-pub(crate) fn flash_attention_wmma_qkf32_shared_bytes(head_dim: u32) -> u32 {
-    let br = FA_TC_BR;
-    let bc = FA_TC_BC;
-    let hd = head_dim;
-    (br * hd * 4)
-        + (bc * hd * 4)
-        + (br * bc * 4)
-        + (br * bc * 2)
-        + (bc * hd * 2)
-        + (br * hd * 4)
-        + (br * 4)
-        + (br * 4)
-}
-
-/// Shared memory bytes for flash_attention_wmma_pvf32 (precision-localization).
-///
-/// Layout: Q_f16[BR*hd]*2 + KV_f16[BC*hd]*2 + S[BR*BC]*4 + V_f32[BC*hd]*4
-///       + O_acc[BR*hd]*4 + rowmax[BR]*4 + rowsum[BR]*4
-pub(crate) fn flash_attention_wmma_pvf32_shared_bytes(head_dim: u32) -> u32 {
-    let br = FA_TC_BR;
-    let bc = FA_TC_BC;
-    let hd = head_dim;
-    (br * hd * 2)
-        + (bc * hd * 2)
-        + (br * bc * 4)
-        + (bc * hd * 4)
-        + (br * hd * 4)
-        + (br * 4)
-        + (br * 4)
-}
-
-/// Shared memory bytes for flash_attention_wmma_split (performant fix).
-///
-/// Layout: Qhi[BR*hd]*2 + Qlo[BR*hd]*2 + KVhi[BC*hd]*2 + KVlo[BC*hd]*2
-///       + S[BR*BC]*4 + Phi[BR*BC]*2 + Plo[BR*BC]*2 + O_acc[BR*hd]*4
-///       + rowmax[BR]*4 + rowsum[BR]*4   (KV buffers reused for K then V)
-pub(crate) fn flash_attention_wmma_split_shared_bytes(head_dim: u32) -> u32 {
-    let br = FA_TC_BR;
-    let bc = FA_TC_BC;
-    let hd = head_dim;
-    (br * hd * 2)
-        + (br * hd * 2)
-        + (bc * hd * 2)
-        + (bc * hd * 2)
-        + (br * bc * 4)
-        + (br * bc * 2)
-        + (br * bc * 2)
-        + (br * hd * 4)
-        + (br * 4)
-        + (br * 4)
 }
 
 // ------------------------------------------------------------------

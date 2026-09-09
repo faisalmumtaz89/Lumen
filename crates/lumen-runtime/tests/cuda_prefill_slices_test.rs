@@ -6,12 +6,9 @@
 //! full slice and no tail, on an attention-only model and on the GDN/attention
 //! hybrid. A prompt the device KV cache cannot hold is refused.
 //!
-//! Its own binary because the prefill attention route is chosen once per
-//! process: the tests pin the exact-F32 attention mode production takes
-//! (`LUMEN_CUDA_ATTN_PRECISE=3`) before any backend exists. Neither synthetic
-//! model carries per-head Q/K norms, so within that mode every slice runs the
-//! scalar kernel; the tiled SGEMM kernel the 27B takes is covered by the
-//! real-model checks, not here. Requires a CUDA GPU:
+//! Neither synthetic model carries per-head Q/K norms, so every slice runs
+//! the scalar attention kernel; the tiled kernel the 27B takes is covered by
+//! the real-model checks, not here. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_prefill_slices_test
 #![cfg(feature = "cuda")]
@@ -29,10 +26,8 @@ use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-static ROUTE: Once = Once::new();
 const CONTEXT: usize = 8192;
 const CASES: [(usize, usize); 6] = [
     (2048, 700),
@@ -42,16 +37,6 @@ const CASES: [(usize, usize); 6] = [
     (4096, 2048),
     (4097, 2500),
 ];
-
-/// Pin the exact-F32 attention mode, once, before any backend can resolve it.
-fn pin_route() {
-    ROUTE.call_once(|| std::env::set_var("LUMEN_CUDA_ATTN_PRECISE", "3"));
-    assert_eq!(
-        lumen_runtime::runtime_defaults::attn_precise_selected(),
-        3,
-        "the exact-F32 attention mode"
-    );
-}
 
 fn open(lbc: &[u8], label: &str) -> SyncWeightProvider {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -100,7 +85,6 @@ fn kv_config(provider: &SyncWeightProvider, max_seq_len: usize) -> KvCacheConfig
 
 /// Every case in one call and in two calls, on the given model bytes.
 fn check(lbc: &[u8], label: &str) {
-    pin_route();
     let provider = open(lbc, label);
     let (Some(cuda_a), Some(cuda_b)) = (backend(&provider), backend(&provider)) else {
         return;
@@ -181,7 +165,6 @@ fn gdn_hybrid_prefill_result_does_not_depend_on_slice_boundaries() {
 /// as a KV-cache error, however large the host cache is.
 #[test]
 fn prefill_refuses_a_prompt_the_device_kv_cache_cannot_hold() {
-    pin_route();
     let provider = open(&build_gdn_hybrid_lbc(), "capacity");
     let Some(cuda) = backend(&provider) else {
         return;
