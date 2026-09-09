@@ -61,6 +61,10 @@ pub(crate) struct PrefillScratch {
     /// its kernel did not load, or the allocation failed — the dispatcher
     /// then takes the scalar attention, which needs no score scratch.
     pub attn_scores: Option<CudaSlice<f32>>,
+    /// Q+gate fusion temporaries: the fused projection `[batch, q_dim * 2]`
+    /// and the deinterleaved gate `[batch, q_dim]`. Present when a layer fuses
+    /// Q and gate.
+    pub q_gate: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     /// Output projection + residual: [batch, hidden_dim].
     pub attn_proj: CudaSlice<f32>,
     /// Gate FFN: [batch, inter_dim].
@@ -216,6 +220,14 @@ pub(crate) fn alloc_prefill_scratch(
         v: device.alloc_zeros(batch * kv_dim)?,
         attn_out: device.alloc_zeros(batch * q_dim)?,
         attn_scores: None,
+        q_gate: if qgate_fused {
+            Some((
+                device.alloc_zeros(batch * q_dim * 2)?,
+                device.alloc_zeros(batch * q_dim)?,
+            ))
+        } else {
+            None
+        },
         attn_proj: device.alloc_zeros(batch * hidden_dim)?,
         gate: device.alloc_zeros(batch * inter_dim)?,
         up: device.alloc_zeros(batch * inter_dim)?,
@@ -254,9 +266,9 @@ pub(crate) fn alloc_attn_score_block(
 /// Tokens per prefill slice. A prompt longer than this runs through the
 /// layers in slices, each through one scratch sized for the slice, so the
 /// per-token scratch is bounded by this and not by the prompt: on the 27B
-/// dense model it measures 0.7–0.9 MB per token, so a slice takes at most
-/// ~1.8 GB, which fits beside the weights and a 16k-token KV cache on a 32 GB
-/// card. The tiled attention's score block still grows with the prompt
+/// dense model it measures about 0.55 MB per token over a fixed ~0.6 GB, so a
+/// slice takes at most ~1.8 GB, which fits beside the weights and a 16k-token
+/// KV cache on a 32 GB card. The tiled attention's score block still grows with the prompt
 /// (`group × min(slice, 512) × keys` F32: ~200 MB at 16k keys on the 27B).
 /// Prompts up to this length run as one slice, exactly as before.
 pub(crate) const PREFILL_SLICE_TOKENS: usize = 2048;

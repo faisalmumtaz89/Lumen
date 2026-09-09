@@ -8194,8 +8194,9 @@ impl CudaBackend {
             if has_qgate_fusion_pf {
                 // Q+gate fusion: project wq to [batch, q_dim*2], then deinterleave.
                 let q_gate_dim = q_dim * 2;
-                let mut pf_q_gate: CudaSlice<f32> = self.device.alloc_zeros(batch * q_gate_dim)?;
-                let mut pf_gate_buf: CudaSlice<f32> = self.device.alloc_zeros(batch * q_dim)?;
+                let (pf_q_gate, pf_gate_buf) = pf.q_gate.as_mut().ok_or_else(|| {
+                    RuntimeError::Compute("Q+gate prefill scratch missing".into())
+                })?;
                 unsafe {
                     super::prefill::launch_gemm_projection(
                         &self.device,
@@ -8203,7 +8204,7 @@ impl CudaBackend {
                         &lw.wq,
                         None,
                         &pf.normed,
-                        &mut pf_q_gate,
+                        pf_q_gate,
                         &mut pf.dequant_f32,
                         &mut pf.activation_f16,
                         &mut pf.dequant_f16,
@@ -8261,9 +8262,9 @@ impl CudaBackend {
                         self.device
                             .stream
                             .launch_builder(deinterleave_fn)
-                            .arg(&pf_q_gate)
+                            .arg(&*pf_q_gate)
                             .arg(&mut pf.q)
-                            .arg(&mut pf_gate_buf)
+                            .arg(&mut *pf_gate_buf)
                             .arg(&hd)
                             .arg(&total_heads)
                             .launch(launch_cfg)
@@ -8621,7 +8622,7 @@ impl CudaBackend {
                         self.device
                             .stream
                             .launch_builder(sigmoid_fn)
-                            .arg(&pf_gate_buf)
+                            .arg(&*pf_gate_buf)
                             .arg(&pf.attn_out)
                             .arg(&mut pf.q)
                             .arg(&total_elems)
@@ -19915,6 +19916,21 @@ impl ComputeBackend for CudaBackend {
                     .into(),
             ));
         }
+        // The device caches are sized at init (`LUMEN_CUDA_MAX_SEQ_LEN` can cap
+        // them below the session's context); the KV write kernel does not bound
+        // its position, so the whole prompt is checked here, before any slice
+        // has written.
+        let capacity = st
+            .kv_caches
+            .iter()
+            .map(|c| c.max_seq_len)
+            .min()
+            .unwrap_or(0);
+        if pos_start + total > capacity {
+            return Err(RuntimeError::KvCache(format!(
+                "prefill of {total} tokens at position {pos_start} would exceed max_seq_len {capacity}"
+            )));
+        }
 
         // Resolve GDN dims up-front so the shared dequant scratch is
         // sized correctly for models whose `qkv_dim` exceeds `inter_dim`
@@ -19996,6 +20012,7 @@ impl ComputeBackend for CudaBackend {
             );
         }
 
+        let mut last_len = 0;
         for (i, slice) in tokens.chunks(slice_len).enumerate() {
             self.prefill_slice(
                 st,
@@ -20004,6 +20021,7 @@ impl ComputeBackend for CudaBackend {
                 slice,
                 pos_start + i * slice_len,
             )?;
+            last_len = slice.len();
         }
 
         // Step 3: Extract last token's hidden state into decode scratch.
@@ -20013,7 +20031,7 @@ impl ComputeBackend for CudaBackend {
                 &st.kernels,
                 &pf.x,
                 &mut st.scratch.x_gpu,
-                (total - 1) % slice_len,
+                last_len - 1,
                 hidden_dim,
             )?;
         }

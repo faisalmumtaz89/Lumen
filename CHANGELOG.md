@@ -9,24 +9,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
-- **Prefill memory no longer grows with the prompt** — the batched prefill
-  allocated every per-token scratch buffer for the whole prompt at once (about
-  0.7–0.9 MB per token on the 27B dense model), so on a 32 GB card the longest
-  prompt it could take fell with the context length (about 11k tokens at a 12k
-  context, 5k at 16k) and a longer one failed in prefill with
-  `CUDA_ERROR_OUT_OF_MEMORY`. The prompt now runs through the layers in slices
-  of at most 2,048 tokens, every slice through one scratch sized for the slice;
-  the KV caches and the GDN recurrent state carry across slices as they do
-  across tokens. On the RTX 5090 at a 16k context a 15k-token prompt prefills
-  in about 1.9 GB of scratch where a 5k-token one used to fail (the tiled
-  attention's score block still grows with the prompt, about 200 MB at 16k
-  tokens). A prompt up to 2,048 tokens runs exactly as before; a longer one is
-  computed in the same arithmetic with different launch shapes, and the GDN
-  recurrence rounds its F64 state to F32 at each slice boundary instead of
-  once, so its logits differ a little from the single-launch result: on 36
-  prompts of 2.8k–15k tokens the first generated token's logits moved by at
-  most 0.03 with the same argmax on every one, and a long greedy continuation
-  can resolve a later near-tie differently.
+- **Prefill's per-token scratch no longer grows with the prompt** — the
+  batched prefill allocated every per-token scratch buffer for the whole
+  prompt at once (about 0.55 MB per token over a fixed 0.6 GB on the 27B dense
+  model), so on a 32 GB card the longest prompt it could take fell with the
+  context length: at a 12k context a 7.5k-token prompt passed and an 11.5k one
+  failed in prefill with `CUDA_ERROR_OUT_OF_MEMORY`; at 16k, 3.8k passed and
+  5k failed. The prompt now runs through the layers in slices of at most
+  2,048 tokens, every slice through one scratch sized for the slice; the KV
+  caches and the GDN recurrent state carry across slices as they do across
+  tokens. On the RTX 5090 at a 16k context a 15k-token prompt prefills in
+  about 1.9 GB of scratch (the tiled attention's score block still grows with
+  the prompt, about 200 MB at 16k tokens). A prompt up to 2,048 tokens runs
+  exactly as before; a longer one is computed in the same arithmetic with
+  different launch shapes, and the GDN recurrence rounds its F64 state to F32
+  at each slice boundary instead of once, so its logits differ a little from
+  the single-launch result: on 36 prompts of 2.1k–7.6k tokens the first
+  generated token kept the same argmax on every one with its top-1 logit
+  within 0.03 of the single-launch value, and a long greedy continuation can
+  resolve a later near-tie differently. A prompt that would overrun the
+  device KV cache is now refused before any slice writes.
 
 ## [0.26.0] — 2026-09-09
 

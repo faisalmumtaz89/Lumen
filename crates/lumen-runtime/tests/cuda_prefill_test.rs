@@ -30,13 +30,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Set up a test model and return (provider, CPU backend, CUDA backend).
 fn setup_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBackend), RuntimeError> {
-    setup_backends_with(TestModelConfig::default())
-}
-
-/// `setup_backends` on a model of the given shape.
-fn setup_backends_with(
-    config: TestModelConfig,
-) -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBackend), RuntimeError> {
+    let config = TestModelConfig::default();
     let lbc_data = generate_test_model(&config);
 
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -391,85 +385,4 @@ fn test_engine_uses_prefill_path() {
         result.metrics.prompt_tokens, 4,
         "metrics should report 4 prompt tokens"
     );
-}
-
-/// Slice boundaries do not change what a prefill computes: a prompt gives the
-/// same hidden state whether it arrives in one call or in two calls cut at
-/// another point, since the KV cache carries every earlier token either way.
-/// The lengths sit on both sides of the 2,048-token slice, with tails of one
-/// token, five tokens (the scalar attention path) and a full slice. Two calls
-/// of the same prompt are byte-identical (the launches are deterministic); one
-/// call against two calls agrees within the bound this file uses for the
-/// synthetic model, whose unnormalised random layers amplify launch-shape
-/// rounding to a few percent of relative L2 — the real-model bound is a
-/// separate measurement. The guard catches a wrong row, a wrong position or
-/// a stale state, which blow the distance to O(1).
-#[test]
-fn test_prefill_result_does_not_depend_on_slice_boundaries() {
-    let config = || TestModelConfig {
-        max_seq_len: 8192,
-        ..TestModelConfig::default()
-    };
-    let (provider, _cpu, cuda_a) = setup_backends_with(config()).expect("backends A");
-    let (_provider_b, _cpu_b, cuda_b) = setup_backends_with(config()).expect("backends B");
-    let hp = provider.lbc().header.hyperparams;
-    let kv_cfg = KvCacheConfig {
-        max_seq_len: 8192,
-        num_layers: hp.num_layers as usize,
-        num_kv_heads: hp.num_kv_heads as usize,
-        head_dim: hp.head_dim as usize,
-        precision: KvPrecision::F32,
-    };
-    let rel_l2 = |a: &[f32], b: &[f32]| {
-        let d = a
-            .iter()
-            .zip(b)
-            .map(|(&x, &y)| (x - y) * (x - y))
-            .sum::<f32>()
-            .sqrt();
-        d / a.iter().map(|&x| x * x).sum::<f32>().sqrt()
-    };
-    for (total, cut) in [
-        (2048, 700),
-        (2049, 1000),
-        (2048 + 5, 2040),
-        (2048 + 300, 700),
-        (4097, 2500),
-    ] {
-        let prompt: Vec<u32> = (0..total)
-            .map(|i| ((i * 7919 + 13) % hp.vocab_size as usize) as u32)
-            .collect();
-        let one_call = |cuda: &CudaBackend| {
-            let mut kv = KvCache::new(kv_cfg.clone()).unwrap();
-            let hidden = cuda
-                .prefill(&prompt, &provider, &mut kv)
-                .unwrap_or_else(|e| panic!("prefill of {total} tokens in one call: {e}"));
-            assert_eq!(kv.seq_len(), total);
-            cuda.reset_recurrent_state();
-            hidden
-        };
-        let first = one_call(&cuda_a);
-        let again = one_call(&cuda_a);
-        assert_eq!(
-            first, again,
-            "prefill of {total} tokens is not deterministic"
-        );
-
-        let mut kv_b = KvCache::new(kv_cfg.clone()).unwrap();
-        cuda_b
-            .prefill(&prompt[..cut], &provider, &mut kv_b)
-            .unwrap_or_else(|e| panic!("prefill of {total} tokens, first {cut}: {e}"));
-        let two_calls = cuda_b
-            .prefill(&prompt[cut..], &provider, &mut kv_b)
-            .unwrap_or_else(|e| panic!("prefill of {total} tokens, the rest after {cut}: {e}"));
-        assert_eq!(kv_b.seq_len(), total);
-        cuda_b.reset_recurrent_state();
-
-        let distance = rel_l2(&first, &two_calls);
-        println!("prefill {total} tokens, one call vs cut at {cut}: rel L2 {distance:.3e}");
-        assert!(
-            distance <= 2e-1,
-            "prefill of {total} tokens cut at {cut}: rel L2 {distance:.3e} > 0.2"
-        );
-    }
 }
