@@ -251,6 +251,14 @@ pub(crate) fn alloc_attn_score_block(
     }
 }
 
+/// Tokens per prefill slice. A prompt longer than this runs through the
+/// layers in slices, each through one scratch sized for the slice, so prefill
+/// memory is bounded by this and not by the prompt: on the 27B dense model the
+/// per-token scratch measures 0.7–0.9 MB, so a slice takes at most ~1.8 GB,
+/// which fits beside the weights and a 16k-token KV cache on a 32 GB card.
+/// Prompts up to this length run as one slice, exactly as before.
+pub(crate) const PREFILL_SLICE_TOKENS: usize = 2048;
+
 /// Element count of the tiled prefill attention's score block for one
 /// prefill: `group × min(batch, ATTN_PREFILL_SGEMM_ROWS) × (pos_start +
 /// batch)` F32. The block is reused across every KV head and every layer, so
