@@ -2681,18 +2681,9 @@ fn mask_logits_in_place(logits: &mut [f32], ids: &[u32]) {
     }
 }
 
-/// `LUMEN_BENCH_TOKEN_IDS=1` — `lumen-server` non-streaming responses
-/// additionally carry the raw generated token-id array, the finish reason,
-/// and the per-request EOS set, under a top-level `lumen_bench` object. A
-/// bench surface for comparing end-of-generation behaviour across engines on
-/// the ids themselves rather than on re-tokenised text; unset means shipping
-/// responses, byte for byte.
-///
-/// Exact-value: `1` only. `true`, `on`, `0` and an empty value are all off,
-/// so a bench surface cannot be armed by a truthy-looking typo.
 /// `LUMEN_BENCH_TOP2=1`: a bench surface that records, for every generated token, the
-/// token the greedy step chose and the runner-up with both logits (the engine's own
-/// numbers, read on the host from the logits the decode step produced). Off by default;
+/// argmax of the logits as the session received them and the runner-up with both logits
+/// (the engine's own numbers; the selected token is the token-id record's entry). Off by default;
 /// it moves greedy decode off the on-device argmax route onto the host-logits route,
 /// which runs the same kernels and costs one vocabulary-sized copy per token. Implies
 /// `LUMEN_BENCH_TOKEN_IDS`. Read once per process.
@@ -2702,7 +2693,7 @@ pub fn bench_top2_enabled() -> bool {
         let on = env_is_exactly_one("LUMEN_BENCH_TOP2");
         if on {
             eprintln!(
-                "[BENCH] TOP2=ON: responses carry the chosen token and the runner-up with \
+                "[BENCH] TOP2=ON: responses carry the argmax and the runner-up with \
                  both logits per generated token (greedy decode on the host-logits route)"
             );
         }
@@ -2710,6 +2701,15 @@ pub fn bench_top2_enabled() -> bool {
     })
 }
 
+/// `LUMEN_BENCH_TOKEN_IDS=1` — `lumen-server` non-streaming responses
+/// additionally carry the raw generated token-id array, the finish reason,
+/// and the per-request EOS set, under a top-level `lumen_bench` object. A
+/// bench surface for comparing end-of-generation behaviour across engines on
+/// the ids themselves rather than on re-tokenised text; unset means shipping
+/// responses, byte for byte.
+///
+/// Exact-value: `1` only. `true`, `on`, `0` and an empty value are all off,
+/// so a bench surface cannot be armed by a truthy-looking typo.
 pub fn bench_token_ids_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

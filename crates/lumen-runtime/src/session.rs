@@ -84,19 +84,6 @@ pub struct SuffixPrefillResult {
     pub prefill_time: Duration,
 }
 
-/// Owns one generation's state. Holds `(tokens, KV, sampler, recurrent state)`.
-///
-/// Lifecycle:
-/// 1. `new(config, hyperparams, sampling)` -- allocates KV, seeds RNG.
-/// 2. `extend(prompt, backend, weights)` -- prefills the prompt into KV and
-///    leaves the first logits ready for sampling.
-/// 3. `next_token(backend, weights)` -- returns one token at a time, advancing
-///    KV state.
-/// 4. `stream(backend, weights, max_tokens, eos)` -- iterator wrapper over
-///    repeated `next_token` calls.
-///
-/// `truncate_to` and `common_prefix_len` round out the API for prompt-cache
-/// callers (P1-2 lands on top of these).
 /// One generated token as the top-2 bench surface saw it: the argmax of the logits as the
 /// session received them from the backend and the runner-up, with both logits — before the
 /// host-side EOG mask, penalties and sampling, which may select a different token (the CUDA
@@ -148,6 +135,19 @@ impl BenchTop2 {
     }
 }
 
+/// Owns one generation's state. Holds `(tokens, KV, sampler, recurrent state)`.
+///
+/// Lifecycle:
+/// 1. `new(config, hyperparams, sampling)` -- allocates KV, seeds RNG.
+/// 2. `extend(prompt, backend, weights)` -- prefills the prompt into KV and
+///    leaves the first logits ready for sampling.
+/// 3. `next_token(backend, weights)` -- returns one token at a time, advancing
+///    KV state.
+/// 4. `stream(backend, weights, max_tokens, eos)` -- iterator wrapper over
+///    repeated `next_token` calls.
+///
+/// `truncate_to` and `common_prefix_len` round out the API for prompt-cache
+/// callers (P1-2 lands on top of these).
 pub struct Session {
     config: RuntimeConfig,
     hyperparams: ModelHyperparams,
@@ -1274,12 +1274,6 @@ impl Session {
         })
     }
 
-    /// Produce one token by sampling the pending logits (if any) or by
-    /// running one decode step and sampling that.
-    ///
-    /// Decode dispatch is the same three-way split the engine used to do
-    /// inline: GPU-resident greedy -> GPU-resident sampling -> CPU forward
-    /// pass.
     /// Arm or disarm the top-2 bench surface (`LUMEN_BENCH_TOP2`). Arming forces the
     /// host-logits route for every following token so the runner-up is observable.
     pub fn set_bench_top2(&mut self, on: bool) {
@@ -1300,6 +1294,12 @@ impl Session {
         }
     }
 
+    /// Produce one token by sampling the pending logits (if any) or by
+    /// running one decode step and sampling that.
+    ///
+    /// Decode dispatch is the same three-way split the engine used to do
+    /// inline: GPU-resident greedy -> GPU-resident sampling -> CPU forward
+    /// pass.
     pub fn next_token(
         &mut self,
         backend: &dyn ComputeBackend,

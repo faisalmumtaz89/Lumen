@@ -1122,6 +1122,10 @@ pub async fn collect_chat(
     Ok(body)
 }
 
+/// The bench record the engine emits: generated ids, the EOS set, and under
+/// `LUMEN_BENCH_TOP2` the per-token top-2 entries.
+pub(crate) type BenchRecord = (Vec<u32>, Vec<u32>, Vec<lumen_runtime::session::BenchTop2>);
+
 /// Attach the bench token-id surface (`LUMEN_BENCH_TOKEN_IDS=1`) to a finished
 /// response body as a top-level `lumen_bench` object. `finish_reason` uses
 /// the OpenAI vocabulary on every route, so the object reads the same on
@@ -1131,11 +1135,6 @@ pub async fn collect_chat(
 /// emitted none on this path, the request fails rather than returning a body
 /// that silently lacks the surface. When the flag is off this is a no-op and
 /// the body is byte-identical.
-///
-/// (`BenchRecord` below is the record the engine emits: generated ids, the EOS
-/// set, and under `LUMEN_BENCH_TOP2` the per-token top-2 entries.)
-pub(crate) type BenchRecord = (Vec<u32>, Vec<u32>, Vec<lumen_runtime::session::BenchTop2>);
-
 pub(crate) fn attach_bench_token_ids(
     body: &mut serde_json::Value,
     bench_ids: Option<BenchRecord>,
