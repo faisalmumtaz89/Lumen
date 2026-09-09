@@ -535,7 +535,7 @@ pub fn sample_logits(
 /// preserves the deterministic total order over NaN/±inf. Note that
 /// `Iterator::max_by` would instead return the LAST maximal element (highest
 /// index), which is why it is not used here.
-fn argmax(logits: &[f32]) -> usize {
+pub(crate) fn argmax(logits: &[f32]) -> usize {
     let mut best: Option<(usize, f32)> = None;
     for (i, &v) in logits.iter().enumerate() {
         match best {

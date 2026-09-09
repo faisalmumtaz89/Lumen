@@ -1484,16 +1484,13 @@ impl<'a> Iterator for TokenStream<'a> {
 /// path. Returns 0 on empty input; ties broken via
 /// `f32::total_cmp` to match the runtime's `sampling::argmax` convention.
 ///
-/// Kept local to session.rs because the `sampling::argmax` helper is private
-/// and the strict-validation path is the only other caller. Exposing the
-/// existing helper would widen the sampler's API surface without need.
+/// The sampler's own argmax (`sampling::argmax`): ties resolve to the lowest
+/// index, the convention the greedy sampler, the device argmax kernel and the
+/// top-2 bench record share. This path used `Iterator::max_by`, which keeps
+/// the LAST maximum, so a tied logit vector validated against a different
+/// token than generation would have produced.
 fn argmax_token(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    crate::sampling::argmax(logits) as u32
 }
 
 /// Execute a single forward pass through all layers for one token.
@@ -2587,6 +2584,11 @@ mod tests {
     fn argmax_token_picks_max_index() {
         let logits = vec![0.1, 0.9, 0.5, -1.0, 0.95];
         assert_eq!(argmax_token(&logits), 4);
+    }
+
+    #[test]
+    fn argmax_token_breaks_ties_to_the_lowest_index_like_generation() {
+        assert_eq!(argmax_token(&[2.0, 2.0, 1.0]), 0);
     }
 
     #[test]
