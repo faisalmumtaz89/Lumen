@@ -2895,7 +2895,7 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 /// `cublasSetMathMode` with `CUBLAS_TF32_TENSOR_OP_MATH` (or building this
 /// through `cublasGemmEx` with a `_FAST_TF32` compute type) would silently
 /// break the exact-F32 contract these two calls stand on, and with it the
-/// precision policy the mode-3 default exists to enforce.**
+/// exact-F32 prefill attention.**
 ///
 /// # Evaluation order
 ///

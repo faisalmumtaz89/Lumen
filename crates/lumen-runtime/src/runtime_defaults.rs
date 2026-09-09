@@ -166,8 +166,8 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
 
 /// Records the EXACT **primary / bulk** model quant scheme
 /// (`lbc.header.quantization.scheme` — the body attention+FFN weight scheme),
-/// which is what the per-quant resolvers read to distinguish Q4_0 from Q8_0
-/// within the 27B (64-layer) dense class. This is a SEPARATE signal from
+/// which is what the per-quant resolvers read to distinguish Q4_0 from Q8_0.
+/// This is a SEPARATE signal from
 /// `set_model_dense_quant` (fed `output_proj_quant`): the lm_head is kept at
 /// higher precision than the body in GGUF, so `output_proj_quant` is Q8_0 for
 /// BOTH 27B-q4 and 27B-q8 and cannot tell them apart — the body scheme can.
@@ -203,9 +203,9 @@ pub fn model_dense_quant_pub() -> Option<QuantScheme> {
 
 /// Records the loaded model's transformer block count (9B = 32 layers,
 /// 27B = 64). Called from the CLI / server alongside `set_model_dense_quant`.
-/// This is the model-SIZE discriminator the per-class defaults need: 9B and
-/// 27B are otherwise indistinguishable to the resolvers (both dense + same
-/// quant hints). 0 = never set (legacy-safe fallback).
+/// This is the model-SIZE discriminator: 9B and 27B are otherwise
+/// indistinguishable to the resolvers (both dense + same quant hints).
+/// 0 = never set.
 pub fn set_model_block_count(num_layers: u32) {
     MODEL_BLOCK_COUNT.store(num_layers, Ordering::Relaxed);
 }
@@ -693,68 +693,23 @@ pub fn gdn_ab_f16_default() -> bool {
 /// `LUMEN_CUDA_GDN_AB_F16=1` (alpha/beta projection → F16, collapsing the L0
 /// ~20% projection divergence), GDN-decode == GDN-prefill BY CONSTRUCTION.
 ///
-/// MoE-default-ON (2026-06-09 GQ validation: the parity stack makes MoE q8/q4
-/// PRISTINE and clears bf16 gross garble). DENSE-default-ON for NON-BF16
-/// quants since 2026-06-10 (validated N≥3 byte-deterministic):
-/// the same per-step recurrence drift accumulates on dense over long
-/// generations — 9B-q8 GQ-004 verylong 0/3 (deterministic N=3, stuck at token
-/// cap in a DD-REP/CHARSPAM attractor) flips to 3/3 with clean EOS under
-/// via-prefill ALONE (N=5 incl. 27B; 27b-q4 goes PRISTINE); decode tok/s flat
-/// (-0.6%). AB_F16/CONVSTATE_PARITY stay MoE-only (dense ablation:
-/// unnecessary; CONVSTATE-without-AB is harmful).
-///
-/// **DENSE BF16 ≥33-layer NOW ON (2026-06-12 follow-up analysis, supersedes the
-/// 2026-06-10 ablation):** the old ablation found via-prefill-alone CORRUPTS
-/// dense bf16 (9b-bf16 4/15·0/8·0/3, 27b-bf16 0✓/3✗) — but that was measured
-/// "alone" on the PRE-pvf32 binary. The follow-up analysis proved via-prefill must be
-/// paired with AP=2 for the 27B-bf16 class: AP=2 alone leaves a genuine
-/// long-form Moka stutter; via-prefill alone leaves the prefill-attention
-/// near-tie; the COMBINATION (mirroring the validated 9b-bf16 stack) heals
-/// GQ-014 4/8→8/8 (N=3) AND restores GQ-004 verylong to 3/3. The 27B-bf16
-/// carve-out is removed accordingly (see the resolver body). 9B-bf16 was
-/// already ON via the ≤32 carve-back and is byte-unchanged.
+/// On for every model class: the per-step GDN decode recurrence drifts over
+/// long generations into a repetition attractor, on MoE and dense models
+/// alike, and running each decode step's recurrence through the prefill
+/// kernel does not, at a flat decode rate. The dense BF16 classes were
+/// measured last, alongside an F16 tensor-core prefill attention that has
+/// since been removed; prefill attention is exact F32 throughout now.
 /// Set `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` to override either way.
 pub fn gdn_decode_via_prefill_default() -> bool {
-    // 27B-bf16 carve-OUT REMOVED (2026-06-12 follow-up analysis).
-    // via-prefill is now ON for ALL
-    // classes — MoE, every dense quant, and dense bf16 at any layer count.
-    //
-    // History of this predicate:
-    //   * MoE + dense non-bf16: always ON (validated; the per-step GDN
-    //     recurrence drift accumulates into a DD-REP/CHARSPAM attractor over
-    //     long gens — 9B-q8 GQ-004 0/3→3/3 under via-prefill alone).
-    //   * 9B-bf16 (≤32 layers): ON since the 2026-06-11 carve-back (on the
-    //     pvf32 binary, via-prefill HEALS the 9B-bf16 verylong attractor
-    //     1/3→3/3, N=3 byte-identical, matches llama.cpp bf16).
-    //   * 27B-bf16 (>32 layers): was the SOLE carve-OUT (returned false),
-    //     because on the PRE-pvf32 binary via-prefill ALONE regressed it. The
-    //     follow-up analysis proved that boundary OBSOLETE: paired with exact
-    //     prefill attention,
-    //     via-prefill ON is REQUIRED — it removes the genuine long-form Moka
-    //     stutter (GQ-004 back to 3/3) and the `<think>` reasoning-leak entry,
-    //     while AP=2 fixes the prefill-attention near-ties. Both levers are
-    //     load-bearing and independent; together they mirror the validated
-    //     9b-bf16 winning stack and take 27b-bf16 GQ-014 4/8→8/8 (N=3). The
-    //     prior "short 15/15→14/15" regression was measured at AP=0+viapre;
-    //     with AP=2 the 27b-bf16 short gate is pristine 15/15.
-    //
-    // The predicate is therefore now unconditional ON. The branches below are
-    // retained as documentation of the (now-collapsed) per-class structure so
-    // future evidence can re-split a class back OUT without reconstructing the
-    // reasoning. CUDA-only: the SOLE consumer is `gdn_decode_via_prefill_`
-    // `enabled()` in `cuda/backend_impl.rs` (`#[cfg(feature = "cuda")]`); Metal
-    // runs its OWN GDN decode path (`metal/gdn.rs` megakernel/dual-gates tiers)
-    // and never reads this resolver or `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL`, so
-    // removing the carve-out is a provable no-op on the Metal/CPU build.
-    // `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` overrides either way.
+    // The factored form names the classes that were measured separately;
+    // every term is on. CUDA-only: the sole consumer is
+    // `gdn_decode_via_prefill_enabled()` in `cuda/backend_impl.rs`; Metal runs
+    // its own GDN decode path and never reads this resolver or the variable.
     let dense_bf16 = MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16;
     let small = {
         let l = model_block_count();
         l > 0 && l <= 32
     };
-    // 27B-bf16 large carve-out removed: `|| (dense_bf16 && large)` folded in,
-    // making the expression total. Kept factored for readability + future
-    // re-split.
     model_is_moe() || !dense_bf16 || small || (dense_bf16 && !small)
 }
 
@@ -1148,9 +1103,8 @@ pub fn attn_tiled_codegen_default_for(
 }
 
 /// `LUMEN_CUDA_FORCE_SCALAR_ATTN=1`: run the fused Q+gate prefill attention
-/// on the one-warp-per-row scalar kernel, whatever the tiled route says. The
-/// dispatch for attention without per-head q/k norms
-/// does not read it. Read once.
+/// on the one-warp-per-row scalar kernel, whatever the tiled route says: the
+/// score-block sizing reads it and leaves the block unallocated. Read once.
 pub fn force_scalar_attn_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LUMEN_CUDA_FORCE_SCALAR_ATTN").as_deref() == Ok("1"))
@@ -2912,8 +2866,7 @@ mod tests {
             "dense 9B bf16 (<=32 layers) -> via-prefill ON (PRESERVED, validated stack)"
         );
 
-        // 27B bf16 (>32 layers): ON — THE CHANGE. Previously the sole carve-OUT
-        // (returned false); follow-up analysis proved it must be ON, paired with AP=2.
+        // 27B bf16 (>32 layers): ON.
         reset_for_tests();
         set_model_block_count(64);
         set_model_dense_quant(QuantScheme::Bf16);

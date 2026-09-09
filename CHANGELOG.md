@@ -10,19 +10,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Removed
 
 - **The F16 tensor-core prefill attention kernels and `LUMEN_CUDA_ATTN_PRECISE`**
-  — prefill full attention on CUDA is computed in exact F32 only, as every
-  shipped model already did: the tiled cuBLAS route for prefills of 16 tokens
-  or more on the fused Q+gate layers, the scalar kernel otherwise. The four
-  F16 tensor-core kernels the other modes selected are deleted with the mode
-  switch (`LUMEN_CUDA_ATTN_PRECISE`, `LUMEN_CUDA_ATTN_PRECISE_DBG`), and with
-  them the resolver that sent a caller who never set the model's layer count
-  to the F16 kernel. That kernel packed the probability operand of its P·V
-  product in an order that does not match the `m16n8k16` PTX fragment layout:
-  with equal scores, query 0 of a 16-row tile at position 0 read the value
-  stored at position 8, a key from its future. A
-  test now holds the remaining scalar kernel to exact causality at tile edges.
-  Output on the shipped models is unchanged; an environment that set either
-  variable now sets an unknown one, which the startup registry check reports.
+  — prefill full attention on CUDA is computed in exact F32 only: the tiled
+  cuBLAS route for prefills of 16 tokens or more on the fused Q+gate layers,
+  the scalar kernel otherwise. The mode switch (`LUMEN_CUDA_ATTN_PRECISE`,
+  `LUMEN_CUDA_ATTN_PRECISE_DBG`) and the four F16 tensor-core kernels behind
+  its other modes are deleted, and with them the resolver that sent a caller
+  to the F16 kernel when the model's layer count was never set (a library
+  caller, not the CLI or server) or when a 27B-class model's body scheme was
+  not Q4_0, Q8_0 or BF16 (a locally converted F16 or K-quant artifact). Every
+  registry model already took the exact route, and its output is unchanged.
+  The F16 kernels built their `m16n8k16` A fragments from a layout table that
+  swaps two of the four registers, in both the score and the value products
+  of all four kernels; with equal scores, query 0 of a 16-row tile at
+  position 0 read the value stored at position 8, a key from its future. The
+  callers named above now get exact attention, allocate the tiled route's
+  score block (about 100 MB at a 12k-token prompt, refused gracefully to the
+  scalar kernel), and lose the tensor-core prefill; an environment that sets
+  either variable now sets an unknown one, which the CLI and server report at
+  startup. The scalar kernel's barrier after its query load is a warp barrier:
+  each warp reads back only its own rows. Tests hold that kernel to exact
+  causality at tile edges under grouped-query attention, and to a reference
+  across key tiles.
 
 ## [0.27.0] — 2026-09-09
 
