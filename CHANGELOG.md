@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-09-09
+
 ### Added
 
 - **`LUMEN_BENCH_TOP2=1`** — a bench surface: non-streaming responses carry
@@ -1169,6 +1171,14 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.25.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.14.0...v0.15.0
