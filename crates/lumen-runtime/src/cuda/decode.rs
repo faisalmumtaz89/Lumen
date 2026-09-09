@@ -4408,7 +4408,7 @@ pub(crate) fn attn_tiled_codegen_selection(
 pub(crate) fn attn_splitk_codegen() -> &'static str {
     use std::sync::OnceLock;
     static SEL: OnceLock<&'static str> = OnceLock::new();
-    *SEL.get_or_init(|| {
+    SEL.get_or_init(|| {
         match std::env::var("LUMEN_CUDA_ATTN_SPLITK_CODEGEN")
             .ok()
             .as_deref()
