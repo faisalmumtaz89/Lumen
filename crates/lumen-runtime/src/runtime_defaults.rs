@@ -2106,6 +2106,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_BENCH_SCALE",
     "LUMEN_BENCH_TOKENS",
     "LUMEN_BENCH_TOKEN_IDS",
+    "LUMEN_BENCH_TOP2",
     "LUMEN_BENCH_WARMUP",
     "LUMEN_CACHE_DIR",
     "LUMEN_CHAT_ENABLE_THINKING",
@@ -2689,6 +2690,26 @@ fn mask_logits_in_place(logits: &mut [f32], ids: &[u32]) {
 ///
 /// Exact-value: `1` only. `true`, `on`, `0` and an empty value are all off,
 /// so a bench surface cannot be armed by a truthy-looking typo.
+/// `LUMEN_BENCH_TOP2=1`: a bench surface that records, for every generated token, the
+/// token the greedy step chose and the runner-up with both logits (the engine's own
+/// numbers, read on the host from the logits the decode step produced). Off by default;
+/// it moves greedy decode off the on-device argmax route onto the host-logits route,
+/// which runs the same kernels and costs one vocabulary-sized copy per token. Implies
+/// `LUMEN_BENCH_TOKEN_IDS`. Read once per process.
+pub fn bench_top2_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = env_is_exactly_one("LUMEN_BENCH_TOP2");
+        if on {
+            eprintln!(
+                "[BENCH] TOP2=ON: responses carry the chosen token and the runner-up with \
+                 both logits per generated token (greedy decode on the host-logits route)"
+            );
+        }
+        on
+    })
+}
+
 pub fn bench_token_ids_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -4381,6 +4402,7 @@ mod tests {
         "LUMEN_BENCH_SCALE",
         "LUMEN_BENCH_TOKENS",
         "LUMEN_BENCH_TOKEN_IDS",
+        "LUMEN_BENCH_TOP2",
         "LUMEN_BENCH_WARMUP",
         "LUMEN_CACHE_DIR",
         "LUMEN_CHAT_ENABLE_THINKING",

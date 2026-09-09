@@ -209,6 +209,9 @@ pub enum TokenEvent {
     BenchTokenIds {
         generated_token_ids: Vec<u32>,
         eos_token_ids: Vec<u32>,
+        /// `LUMEN_BENCH_TOP2=1`: per generated token, the chosen token and the runner-up
+        /// with both logits (empty when that surface is off).
+        top2: Vec<lumen_runtime::session::BenchTop2>,
     },
     /// Generation ended cleanly. `finish_reason` is one of
     /// `"stop"` (EOS or stop sequence), `"length"` (max tokens reached),
@@ -889,6 +892,9 @@ pub struct EngineWorker {
     /// Bench surface (`LUMEN_BENCH_TOKEN_IDS=1`), resolved once at spawn so
     /// the marker line is on the log before the first request.
     bench_token_ids: bool,
+    /// Bench surface (`LUMEN_BENCH_TOP2=1`), resolved once at spawn; implies the token-id
+    /// surface and moves greedy decode onto the host-logits route.
+    bench_top2: bool,
 }
 
 impl EngineWorker {
@@ -967,7 +973,9 @@ impl EngineWorker {
             inbox_capacity: capacity,
             disk_kv,
             breakdown: Arc::clone(&breakdown),
-            bench_token_ids: lumen_runtime::runtime_defaults::bench_token_ids_enabled(),
+            bench_token_ids: lumen_runtime::runtime_defaults::bench_token_ids_enabled()
+                || lumen_runtime::runtime_defaults::bench_top2_enabled(),
+            bench_top2: lumen_runtime::runtime_defaults::bench_top2_enabled(),
         };
         // The fixed-horizon EOG mask (`LUMEN_BENCH_MASK_EOG`) is parsed and
         // range-checked here, before the listener exists, so a malformed or
@@ -1004,7 +1012,10 @@ impl EngineWorker {
             SamplingParams::default(),
         );
         let mut session = match session {
-            Ok(s) => s,
+            Ok(mut s) => {
+                s.set_bench_top2(self.bench_top2);
+                s
+            }
             Err(e) => {
                 // Drain inbox with errors and shut down.
                 while let Some(job) = self.inbox.blocking_recv() {
@@ -1141,7 +1152,8 @@ impl EngineWorker {
                     self.hyperparams,
                     SamplingParams::default(),
                 ) {
-                    Ok(s) => {
+                    Ok(mut s) => {
+                        s.set_bench_top2(self.bench_top2);
                         session = s;
                         if let Err(e) = session.validate_backend(self.backend.as_ref()) {
                             eprintln!(
@@ -1874,6 +1886,7 @@ impl EngineWorker {
                     // reader compares against what the engine used to decide
                     // stopping, not a re-derived set.
                     eos_token_ids: request.eos_token_ids.clone(),
+                    top2: session.take_bench_top2(),
                 },
             );
         }

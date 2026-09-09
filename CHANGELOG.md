@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **`LUMEN_BENCH_TOP2=1`** — a bench surface: non-streaming responses carry
+  `lumen_bench.top2`, per generated token the chosen token and the runner-up
+  with both logits, read on the host from the logits the decode step produced.
+  It exists so a greedy flip between two decode routes can be judged in the
+  engine's own numbers (a near-tie when each route's runner-up is the other's
+  choice within the routes' numerical spread) instead of against another
+  engine's distribution. Implies `LUMEN_BENCH_TOKEN_IDS`; greedy decode takes
+  the host-logits route while it is on.
+
 ### Changed
 
 - **Three Blackwell decode defaults promoted for the dense Q4_0 cell** — on a
