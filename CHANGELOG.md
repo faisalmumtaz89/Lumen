@@ -10,9 +10,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Added
 
 - **`LUMEN_BENCH_TOP2=1`** — a bench surface: non-streaming responses carry
-  `lumen_bench.top2`, per generated token the argmax of the raw logits and the
-  runner-up with both logits, read on the host from the logits the decode step
-  produced (the selected token is the token-id record's entry; they coincide
+  `lumen_bench.top2`, per generated token the argmax of the logits as the session received
+  them and the runner-up with both logits, before host-side masking, penalties
+  and sampling (the selected token is the token-id record's entry; they coincide
   under greedy decode with penalties off, the configuration the surface is for).
   It exists so a greedy flip between two decode routes can be judged in the
   engine's own numbers (a near-tie when each route's runner-up is the other's

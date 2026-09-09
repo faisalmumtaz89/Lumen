@@ -97,9 +97,11 @@ pub struct SuffixPrefillResult {
 ///
 /// `truncate_to` and `common_prefix_len` round out the API for prompt-cache
 /// callers (P1-2 lands on top of these).
-/// One generated token as the top-2 bench surface saw it: the argmax of the RAW logits the
-/// decode step produced and the runner-up, with both logits — before the EOG mask, penalties
-/// and sampling, which may select a different token (the selected token is the matching entry
+/// One generated token as the top-2 bench surface saw it: the argmax of the logits as the
+/// session received them from the backend and the runner-up, with both logits — before the
+/// host-side EOG mask, penalties and sampling, which may select a different token (the CUDA
+/// decode path applies its device-side EOG mask before readback, so those logits are already
+/// masked) (the selected token is the matching entry
 /// of the token-id record). Under greedy decode with penalties off and no mask the argmax is
 /// the selected token; that is the configuration the surface is meant for. A greedy flip
 /// between two routes is a near-tie exactly when each route's runner-up is the other's
