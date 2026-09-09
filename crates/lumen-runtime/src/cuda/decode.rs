@@ -198,6 +198,9 @@ pub(crate) struct KernelSet {
     // availability — though eligible automatic selections may still be
     // served by the split-K pair.
     pub(crate) attention_decode_tiled: Option<CudaFunction>,
+    /// Which NVRTC target `attention_decode_tiled` was compiled for (`attn_tiled_codegen`), so
+    /// the dispatch announces the compiled variant it actually runs.
+    pub(crate) attention_decode_tiled_codegen: &'static str,
 
     // Split-K decode-attention pair (sequence-parallel twin of the tiled
     // kernel, `LUMEN_CUDA_ATTN_SPLITK` — model-aware default: ON for Q8_0-
@@ -926,6 +929,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
+    // The tiled decode-attention kernel at the target `LUMEN_CUDA_ATTN_TILED_CODEGEN` selects:
+    // NVRTC's default (the shipping route) unless `ptx80` / `ptx120` name an explicit virtual
+    // target. Same source, same math options; only the code generation differs. Experiment.
+    let tiled_codegen = attn_tiled_codegen();
+    let load_tiled = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
+        let module = match tiled_codegen {
+            "ptx80" => device.compile_and_load_with_arch(source, "compute_80")?,
+            "ptx120" => device.compile_and_load_with_arch(source, "compute_120")?,
+            _ => device.compile_and_load(source)?,
+        };
+        if tiled_codegen != "default" {
+            cuda_log!(
+                "[CUDA] {name}: compiled for {}",
+                attn_tiled_codegen_target(tiled_codegen)
+            );
+        }
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+    };
+
     // For kernels needing SM 80+ features (dp4a, WMMA tensor cores).
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch(source, "compute_80")?;
@@ -977,6 +1001,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     };
 
     let kernels = KernelSet {
+        attention_decode_tiled_codegen: tiled_codegen,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
@@ -1043,7 +1068,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // Optional: log a warning if NVRTC compile fails so the gate sees
         // the unavailability and operators learn the long-context path is
         // disabled on this device.
-        attention_decode_tiled: match load_fn(
+        attention_decode_tiled: match load_tiled(
             shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
             "attention_decode_tiled",
         ) {
@@ -4253,6 +4278,30 @@ mod attention_decode_tiled_const_tests {
         assert_eq!(ATTN_DECODE_TILED_T_C, ATTN_DECODE_TILED_BLOCK_DIM);
     }
 
+    #[test]
+    fn tiled_codegen_selection_names_its_target_and_route() {
+        use super::{attention_decode_tiled_route_name, attn_tiled_codegen_target};
+        assert_eq!(attn_tiled_codegen_target("default"), "default");
+        assert_eq!(attn_tiled_codegen_target("ptx80"), "compute_80");
+        assert_eq!(attn_tiled_codegen_target("ptx120"), "compute_120");
+        assert_eq!(
+            attention_decode_tiled_route_name("default"),
+            "attention_decode_tiled"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("ptx80"),
+            "attention_decode_tiled_ptx80"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("ptx120"),
+            "attention_decode_tiled_ptx120"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("anything"),
+            "attention_decode_tiled"
+        );
+    }
+
     /// 5120/32 = 160 Q8_1 blocks over 1024/32 = 32 warps = 5 CTAs (the name); 4096 → 4,
     /// 2048 → 2; a dim that does not divide evenly rounds up so no block is left unwritten.
     #[test]
@@ -4264,6 +4313,48 @@ mod attention_decode_tiled_const_tests {
         assert_eq!(rmsnorm_q8_1_cta5_grid(1024, rmsnorm_block_size(1024)), 1);
         assert_eq!(rmsnorm_q8_1_cta5_grid(5152, 1024), 6);
         assert_eq!(rmsnorm_q8_1_cta5_grid(5120, 1024) * 32, 160);
+    }
+}
+
+/// `LUMEN_CUDA_ATTN_TILED_CODEGEN`: the NVRTC target `attention_decode_tiled` is compiled for —
+/// `ptx80` (compute_80) or `ptx120` (compute_120); anything else, or unset, is NVRTC's default
+/// target, the shipping route. The kernel source and math options are unchanged; only the
+/// generated code differs (NVRTC 13.3 emits a 3632-instruction kernel at its default sm_75
+/// target and a 2520-instruction one at compute_120 for the same source). Default OFF; an
+/// experiment after the tiled route lost 6 % at context on the driver 610 / CUDA 13.3 box.
+/// Read once per process.
+pub(crate) fn attn_tiled_codegen() -> &'static str {
+    use std::sync::OnceLock;
+    static SEL: OnceLock<&'static str> = OnceLock::new();
+    *SEL.get_or_init(|| {
+        match std::env::var("LUMEN_CUDA_ATTN_TILED_CODEGEN")
+            .ok()
+            .as_deref()
+        {
+            Some("ptx80") => "ptx80",
+            Some("ptx120") => "ptx120",
+            _ => "default",
+        }
+    })
+}
+
+/// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
+pub(crate) fn attn_tiled_codegen_target(codegen: &str) -> &'static str {
+    match codegen {
+        "ptx80" => "compute_80",
+        "ptx120" => "compute_120",
+        _ => "default",
+    }
+}
+
+/// The route identifier the tiled dispatch announces for a codegen selection: the plain kernel
+/// name on the default target, a suffixed one for an explicit target, so the census can tell
+/// the compiled variants apart (the CUDA symbol is the same in all three).
+pub(crate) fn attention_decode_tiled_route_name(codegen: &str) -> &'static str {
+    match codegen {
+        "ptx80" => "attention_decode_tiled_ptx80",
+        "ptx120" => "attention_decode_tiled_ptx120",
+        _ => "attention_decode_tiled",
     }
 }
 

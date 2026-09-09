@@ -2249,7 +2249,10 @@ pub(crate) unsafe fn launch_attention_decode_gated(
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 super::decode::announce_route_once(&SEEN, || {
-                    format!("[CUDA] attention_decode_tiled: ACTIVE (head_dim={head_dim})")
+                    let codegen = kernels.attention_decode_tiled_codegen;
+                    let name = super::decode::attention_decode_tiled_route_name(codegen);
+                    let target = super::decode::attn_tiled_codegen_target(codegen);
+                    format!("[CUDA] {name}: ACTIVE (head_dim={head_dim}, target={target})")
                 });
             }
         }
