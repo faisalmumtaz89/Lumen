@@ -701,6 +701,9 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
+    // rmsnorm_to_q8_1_cta5: the same fusion over ceil(blocks/warps) CTAs, one Q8_1 block per
+    // warp; each CTA repeats the reduction. Byte-identical output. LUMEN_CUDA_RMSNORM_Q8_CTA5=1.
+    pub(crate) rmsnorm_to_q8_1_cta5: Option<CudaFunction>,
 
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
@@ -2559,6 +2562,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        rmsnorm_to_q8_1_cta5: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_cta5",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5: FAILED: {e}");
+                None
+            }
+        },
         // Qwen3.5 Q+gate fusion kernels (full-attention layers)
         deinterleave_qgate: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "deinterleave_qgate")
         {
@@ -4203,6 +4219,41 @@ mod attention_decode_tiled_const_tests {
     fn tc_equals_block_dim_for_one_lane_per_position() {
         assert_eq!(ATTN_DECODE_TILED_T_C, ATTN_DECODE_TILED_BLOCK_DIM);
     }
+
+    /// 5120/32 = 160 Q8_1 blocks over 1024/32 = 32 warps = 5 CTAs (the name); 4096 → 4,
+    /// 2048 → 2; a dim that does not divide evenly rounds up so no block is left unwritten.
+    #[test]
+    fn rmsnorm_q8_1_cta5_grid_covers_every_block() {
+        use super::{rmsnorm_block_size, rmsnorm_q8_1_cta5_grid};
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, rmsnorm_block_size(5120)), 5);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(4096, rmsnorm_block_size(4096)), 4);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(2048, rmsnorm_block_size(2048)), 2);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(1024, rmsnorm_block_size(1024)), 1);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5152, 1024), 6);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, 1024) * 32, 160);
+    }
+}
+
+/// `LUMEN_CUDA_RMSNORM_Q8_CTA5=1`: launch the fused RMSNorm+Q8_1 quantization over
+/// `rmsnorm_q8_1_cta5_grid` CTAs instead of one. Default OFF (the single-block kernel).
+/// Read once per process.
+pub(crate) fn rmsnorm_q8_cta5_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_RMSNORM_Q8_CTA5").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Grid for `rmsnorm_to_q8_1_cta5`: one CTA per `block_size / 32` Q8_1 blocks, so every warp
+/// quantizes at most one block. `dim` is a multiple of 32; `block_size` a multiple of 32.
+pub(crate) fn rmsnorm_q8_1_cta5_grid(dim: usize, block_size: u32) -> u32 {
+    let blocks = (dim / 32) as u32;
+    let warps = (block_size / 32).max(1);
+    blocks.div_ceil(warps).max(1)
 }
 
 /// Block size for RMSNorm: use min(dim, 1024), rounded down to a multiple of 32.

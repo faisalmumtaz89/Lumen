@@ -2613,15 +2613,13 @@ impl CudaBackend {
                             );
                         }
                     }
-                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (fused_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_ATTN_NORM,
+                        "attn_norm",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -3811,15 +3809,13 @@ impl CudaBackend {
             {
                 // 1. Fused RMSNorm + Q8_1 quantize: attn_proj -> shared q8_1 buffer.
                 {
-                    let rms_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (rms_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_FFN_NORM_GLU,
+                        "ffn_norm_glu",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -4577,15 +4573,13 @@ impl CudaBackend {
 
                 // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
                 if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (fused_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_FFN_NORM,
+                        "ffn_norm",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -6035,14 +6029,13 @@ impl CudaBackend {
                 })?;
             }
 
-            let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+            let (fused_fn, lc) = rmsnorm_q8_1_launch(
+                &st.kernels,
+                hidden_dim,
+                &RMSNORM_Q8_SEEN_GDN_ATTN_NORM,
+                "gdn_attn_norm",
+            );
             let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-            let bs = rmsnorm_block_size(hidden_dim);
-            let lc = CudarcLaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (bs, 1, 1),
-                shared_mem_bytes: rmsnorm_shared_bytes(bs),
-            };
             let dim = hidden_dim as u32;
             unsafe {
                 self.device
@@ -14742,6 +14735,60 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
         _ => false,
     }
+}
+
+static RMSNORM_Q8_SEEN_ATTN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_FFN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_FFN_NORM_GLU: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_GDN_ATTN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The fused RMSNorm+Q8_1 kernel a norm site launches, with its launch config.
+///
+/// The single-block `rmsnorm_to_q8_1` unless `LUMEN_CUDA_RMSNORM_Q8_CTA5=1` and
+/// `rmsnorm_to_q8_1_cta5` loaded, which spreads the same arithmetic over
+/// `rmsnorm_q8_1_cta5_grid` CTAs (byte-identical output). Callers have already
+/// established that `rmsnorm_to_q8_1` is present. The site announces the kernel
+/// it takes once per process under `LUMEN_CUDA_VERBOSE`, `seen` being that site's
+/// own latch.
+fn rmsnorm_q8_1_launch<'k>(
+    kernels: &'k KernelSet,
+    dim: usize,
+    seen: &'static std::sync::OnceLock<()>,
+    label: &str,
+) -> (&'k CudaFunction, CudarcLaunchConfig) {
+    let block_size = rmsnorm_block_size(dim);
+    let shared_bytes = rmsnorm_shared_bytes(block_size);
+    let cta5 = if super::decode::rmsnorm_q8_cta5_enabled() {
+        kernels.rmsnorm_to_q8_1_cta5.as_ref()
+    } else {
+        None
+    };
+    let (f, grid, name) = match cta5 {
+        Some(f) => (
+            f,
+            super::decode::rmsnorm_q8_1_cta5_grid(dim, block_size),
+            "rmsnorm_to_q8_1_cta5",
+        ),
+        None => (
+            kernels
+                .rmsnorm_to_q8_1
+                .as_ref()
+                .expect("rmsnorm_q8_1_launch: caller checked rmsnorm_to_q8_1 is loaded"),
+            1,
+            "rmsnorm_to_q8_1",
+        ),
+    };
+    super::decode::announce_route_once(seen, || {
+        format!("[CUDA] {name}: ACTIVE (first at {label}, dim={dim}, ctas={grid})")
+    });
+    (
+        f,
+        CudarcLaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        },
+    )
 }
 
 /// Name the output-head kernel a branch dispatched, once per process.
