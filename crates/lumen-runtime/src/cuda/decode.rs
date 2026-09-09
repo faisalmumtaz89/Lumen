@@ -941,18 +941,31 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .unwrap_or(0);
         attn_tiled_codegen_selection(cc_major, device.nvrtc_can_target(120))
     };
+    // An explicit target the toolkit or driver refuses falls back to NVRTC's default target —
+    // the pre-promotion build — rather than leaving the kernel absent; the fallback is announced
+    // and the KernelSet records the target that actually loaded.
+    let tiled_codegen = std::cell::Cell::new(tiled_codegen);
     let load_tiled = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
-        let module = match tiled_codegen {
-            "ptx80" => device.compile_and_load_with_arch(source, "compute_80")?,
-            "ptx120" => device.compile_and_load_with_arch(source, "compute_120")?,
+        let selected = tiled_codegen.get();
+        let module = match selected {
+            "ptx80" | "ptx120" => {
+                let arch = attn_tiled_codegen_target(selected);
+                match device.compile_and_load_with_arch(source, arch) {
+                    Ok(m) => {
+                        cuda_log!("[CUDA] {name}: compiled for {arch}");
+                        m
+                    }
+                    Err(e) => {
+                        cuda_log!(
+                            "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
+                        );
+                        tiled_codegen.set("default");
+                        device.compile_and_load(source)?
+                    }
+                }
+            }
             _ => device.compile_and_load(source)?,
         };
-        if tiled_codegen != "default" {
-            cuda_log!(
-                "[CUDA] {name}: compiled for {}",
-                attn_tiled_codegen_target(tiled_codegen)
-            );
-        }
         module
             .load_function(name)
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
@@ -1029,7 +1042,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     };
 
     let kernels = KernelSet {
-        attention_decode_tiled_codegen: tiled_codegen,
+        attention_decode_tiled_codegen: tiled_codegen.get(),
         attention_decode_splitk_codegen: splitk_codegen,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
@@ -4378,7 +4391,8 @@ pub(crate) fn attn_tiled_codegen_selection(
     {
         Some("ptx80") => "ptx80",
         Some("ptx120") => "ptx120",
-        Some("default") => "default",
+        // the kill-switch spellings every default-ON knob honours, and the explicit word
+        Some("default") | Some("0") | Some("off") | Some("false") | Some("no") => "default",
         _ => crate::runtime_defaults::attn_tiled_codegen_default(cc_major, nvrtc_can_target_120),
     }
 }

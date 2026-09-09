@@ -388,6 +388,12 @@ fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_2048() {
 }
 
 #[test]
+fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_4096() {
+    // Qwen3.5-9B's hidden width; a 9B Q4_0 artifact with F32 GDN alpha/beta takes the dual there.
+    rmsnorm_dual_case(4096, 34);
+}
+
+#[test]
 fn rmsnorm_to_q8_1_cta5_normed_covers_a_partial_final_cta() {
     // 5152 / 32 = 161 blocks over 32 warps: six CTAs, the last one owning a single block; the
     // plain rmsnorm writes all 5152 normalized values and so must the dual kernel.

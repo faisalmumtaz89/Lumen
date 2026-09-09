@@ -1230,7 +1230,7 @@ pub fn attn_splitk_default_for(
 /// Q4_0 dense body on compute capability 12.x — the one cell it is measured
 /// on (source-fidelity Qwen3.8-27B Q4_0, RTX 5090: +4.10 % decode, byte-
 /// identical, r3-022/023/024; the device twin tests pin both kernels bitwise
-/// to the single-block original at dims 2048/4096/5120). OFF on every other
+/// to the single-block original at dims 2048/4096/5120/5152). OFF on every other
 /// capability and body class because the launch shape is unmeasured there,
 /// not because it is known to be slow. Follows the canonical-defaults
 /// master switch; `=1` still forces it on anywhere.

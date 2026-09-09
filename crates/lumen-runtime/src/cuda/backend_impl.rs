@@ -16731,6 +16731,13 @@ impl ComputeBackend for CudaBackend {
         match self.device.compute_capability() {
             Ok((cc_major, cc_minor)) => {
                 crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
+                if cc_major == 12 {
+                    eprintln!(
+                        "[CUDA] cc {cc_major}.{cc_minor}: for a Q4_0 dense body the split-K decode-attention pair, \
+                         the dual-output norm route and the compute_120 tiled kernel default ON here (measured on cc 12.0; \
+                         LUMEN_CUDA_ATTN_SPLITK=0 / LUMEN_CUDA_NORM_CTA5_DUAL=0 / LUMEN_CUDA_ATTN_TILED_CODEGEN=0 opt out)"
+                    );
+                }
                 if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
                 {
                     eprintln!(
@@ -16743,7 +16750,9 @@ impl ComputeBackend for CudaBackend {
             Err(e) => {
                 crate::runtime_defaults::set_device_cc_major(0);
                 eprintln!(
-                    "[CUDA] compute-capability query failed ({e}): LUMEN_CUDA_SOA_LOCKED defaults OFF"
+                    "[CUDA] compute-capability query failed ({e}): every capability-keyed default resolves \
+                     as on an unmeasured device — LUMEN_CUDA_SOA_LOCKED OFF, and on a Q4_0 dense body the \
+                     split-K pair, the dual-output norm route and the compute_120 tiled kernel OFF (set =1 / =ptx120 to force)"
                 );
             }
         }

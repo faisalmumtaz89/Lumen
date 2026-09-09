@@ -22,8 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   byte-identical; the same source is 2,520 instructions at compute_120 against
   3,632 at NVRTC's default target). Every other capability and body class is
   unchanged: the defaults key on the one cell each was gated on, and each
-  keeps its kill-switch (`=0` / `=default`) and follows
-  `LUMEN_CUDA_LEGACY_DEFAULTS`. The backend records the device capability
+  keeps its kill-switch (`=0`) and follows
+  `LUMEN_CUDA_LEGACY_DEFAULTS`. The defaults key on the capability's major
+  (12.x, measured on 12.0). A compute_120 build the toolkit or driver refuses
+  falls back to NVRTC's default target and says so. The backend records the device capability
   before it compiles the decode kernels, so a capability-keyed default is
   already resolved when the split-K pair decides whether to load. The
   split-K pair compiled for compute_120 (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`)
