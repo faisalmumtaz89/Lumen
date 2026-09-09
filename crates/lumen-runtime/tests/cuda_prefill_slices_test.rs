@@ -2,36 +2,56 @@
 //! same hidden state whether it arrives in one call or in two calls cut at
 //! another point, since the KV cache and the GDN recurrent state carry every
 //! earlier token either way. Lengths sit on both sides of the 2,048-token
-//! slice, with tails of one token, five tokens (the scalar attention path) and
-//! a full slice, on an attention-only model and on the GDN/attention hybrid.
+//! slice, with tails of one token, five tokens (the scalar attention path), a
+//! full slice and no tail, on an attention-only model and on the GDN/attention
+//! hybrid. A prompt the device KV cache cannot hold is refused.
 //!
 //! Its own binary because the prefill attention route is chosen once per
-//! process: the tests pin the exact-F32 route production takes
-//! (`LUMEN_CUDA_ATTN_PRECISE=3`) before any backend exists. Requires a CUDA GPU:
+//! process: the tests pin the exact-F32 attention mode production takes
+//! (`LUMEN_CUDA_ATTN_PRECISE=3`) before any backend exists. Neither synthetic
+//! model carries per-head Q/K norms, so within that mode every slice runs the
+//! scalar kernel; the tiled SGEMM kernel the 27B takes is covered by the
+//! real-model checks, not here. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_prefill_slices_test
 #![cfg(feature = "cuda")]
 
 mod common;
 
-use common::gdn_hybrid::{build_gdn_hybrid_lbc_with, gdn_model_hyperparams_with};
+use common::gdn_hybrid::{
+    build_gdn_hybrid_lbc, build_gdn_hybrid_lbc_with, gdn_model_hyperparams_with,
+};
 use lumen_format::test_model::{generate_test_model, TestModelConfig};
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::cuda::CudaBackend;
+use lumen_runtime::error::RuntimeError;
 use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+static ROUTE: Once = Once::new();
 const CONTEXT: usize = 8192;
-const CASES: [(usize, usize); 5] = [
+const CASES: [(usize, usize); 6] = [
     (2048, 700),
     (2049, 1000),
     (2048 + 5, 2040),
     (2048 + 300, 700),
+    (4096, 2048),
     (4097, 2500),
 ];
+
+/// Pin the exact-F32 attention mode, once, before any backend can resolve it.
+fn pin_route() {
+    ROUTE.call_once(|| std::env::set_var("LUMEN_CUDA_ATTN_PRECISE", "3"));
+    assert_eq!(
+        lumen_runtime::runtime_defaults::attn_precise_selected(),
+        3,
+        "the exact-F32 attention mode"
+    );
+}
 
 fn open(lbc: &[u8], label: &str) -> SyncWeightProvider {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -67,26 +87,26 @@ fn backend(provider: &SyncWeightProvider) -> Option<CudaBackend> {
     Some(cuda)
 }
 
-/// Every case in one call and in two calls, on the given model bytes.
-fn check(lbc: &[u8], label: &str) {
-    std::env::set_var("LUMEN_CUDA_ATTN_PRECISE", "3");
-    let provider = open(lbc, label);
-    let (Some(cuda_a), Some(cuda_b)) = (backend(&provider), backend(&provider)) else {
-        return;
-    };
-    assert_eq!(
-        lumen_runtime::runtime_defaults::attn_precise_selected(),
-        3,
-        "the exact-F32 attention route"
-    );
+fn kv_config(provider: &SyncWeightProvider, max_seq_len: usize) -> KvCacheConfig {
     let hp = provider.lbc().header.hyperparams;
-    let kv_cfg = KvCacheConfig {
-        max_seq_len: CONTEXT,
+    KvCacheConfig {
+        max_seq_len,
         num_layers: hp.num_layers as usize,
         num_kv_heads: hp.num_kv_heads as usize,
         head_dim: hp.head_dim as usize,
         precision: KvPrecision::F32,
+    }
+}
+
+/// Every case in one call and in two calls, on the given model bytes.
+fn check(lbc: &[u8], label: &str) {
+    pin_route();
+    let provider = open(lbc, label);
+    let (Some(cuda_a), Some(cuda_b)) = (backend(&provider), backend(&provider)) else {
+        return;
     };
+    let hp = provider.lbc().header.hyperparams;
+    let kv_cfg = kv_config(&provider, CONTEXT);
     let rel_l2 = |a: &[f32], b: &[f32]| {
         let d = a
             .iter()
@@ -153,5 +173,38 @@ fn gdn_hybrid_prefill_result_does_not_depend_on_slice_boundaries() {
     check(
         &build_gdn_hybrid_lbc_with(gdn_model_hyperparams_with(CONTEXT as u32)),
         "gdn-hybrid",
+    );
+}
+
+/// The device KV cache is sized by the model's context at init. A prefill that
+/// fills it exactly succeeds; one more token is refused before any slice writes,
+/// as a KV-cache error, however large the host cache is.
+#[test]
+fn prefill_refuses_a_prompt_the_device_kv_cache_cannot_hold() {
+    pin_route();
+    let provider = open(&build_gdn_hybrid_lbc(), "capacity");
+    let Some(cuda) = backend(&provider) else {
+        return;
+    };
+    let hp = provider.lbc().header.hyperparams;
+    let device_len = hp.max_seq_len as usize;
+    let mut kv = KvCache::new(kv_config(&provider, CONTEXT)).unwrap();
+    let prompt: Vec<u32> = (0..device_len + 1)
+        .map(|i| ((i * 7919 + 13) % hp.vocab_size as usize) as u32)
+        .collect();
+    cuda.prefill(&prompt[..device_len], &provider, &mut kv)
+        .unwrap_or_else(|e| panic!("prefill that fills the device cache exactly: {e}"));
+    assert_eq!(kv.seq_len(), device_len);
+    let err = cuda
+        .prefill(&prompt[device_len..], &provider, &mut kv)
+        .expect_err("a prefill past the device cache must be refused");
+    assert!(
+        matches!(&err, RuntimeError::KvCache(msg) if msg.contains("would exceed max_seq_len")),
+        "expected a KV-cache refusal, got: {err}"
+    );
+    assert_eq!(
+        kv.seq_len(),
+        device_len,
+        "a refused prefill advances nothing"
     );
 }

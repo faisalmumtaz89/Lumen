@@ -19928,7 +19928,8 @@ impl ComputeBackend for CudaBackend {
             .unwrap_or(0);
         if pos_start + total > capacity {
             return Err(RuntimeError::KvCache(format!(
-                "prefill of {total} tokens at position {pos_start} would exceed max_seq_len {capacity}"
+                "prefill of {total} tokens at position {pos_start} would exceed max_seq_len {capacity} \
+                 of the device KV cache"
             )));
         }
 
