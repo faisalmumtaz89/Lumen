@@ -51,9 +51,12 @@ fn rng_next(state: &mut u64) -> u64 {
     *state >> 33
 }
 
-/// A uniform value in [-1, 1) with 9 bits of resolution.
+/// A uniform value in [-1, 1) with a full 24-bit mantissa, so a product of two such values is
+/// NOT exactly representable in f32 and `sum_sq += val * val` differs between a fused and an
+/// unfused multiply-add: a test input coarse enough to make `val * val` exact (9 bits) cannot
+/// tell the two apart (review 2026-09-09, MAJOR-3).
 fn rand_unit(s: &mut u64) -> f32 {
-    ((rng_next(s) % 512) as f32 - 256.0) / 256.0
+    ((rng_next(s) & 0xff_ffff) as f32 / 8_388_608.0) - 1.0
 }
 
 /// f16 bits of a positive f32 in the normal range (round-nearest-even on the fraction).
@@ -320,7 +323,8 @@ fn rmsnorm_dual_case(dim: usize, seed: u64) {
 
     // the dual kernel
     let mut normed_dual: CudaSlice<f32> = stream.clone_htod(&vec![f32::NAN; dim]).unwrap();
-    let mut q8_dual: CudaSlice<u8> = stream.clone_htod(&vec![0xA5u8; out_bytes]).unwrap();
+    // different poison from q8_ref: two kernels that both wrote nothing must not compare equal
+    let mut q8_dual: CudaSlice<u8> = stream.clone_htod(&vec![0x5Au8; out_bytes]).unwrap();
     let cfg = LaunchConfig {
         grid_dim: (cta5_grid(dim, block_size), 1, 1),
         block_dim: (block_size, 1, 1),
@@ -353,6 +357,18 @@ fn rmsnorm_dual_case(dim: usize, seed: u64) {
         stream.clone_dtoh(&q8_ref).unwrap(),
         stream.clone_dtoh(&q8_dual).unwrap(),
     );
+    assert!(
+        qr.iter().any(|&b| b != 0xA5),
+        "the single-block kernel wrote nothing at dim {dim}"
+    );
+    assert!(
+        qd.iter().any(|&b| b != 0x5A),
+        "the dual kernel wrote nothing at dim {dim}"
+    );
+    assert!(
+        nd.iter().all(|v| !v.is_nan()),
+        "the dual kernel left part of normed unwritten at dim {dim}"
+    );
     for (i, (a, b)) in qr.iter().zip(&qd).enumerate() {
         assert_eq!(
             a, b,
@@ -369,4 +385,11 @@ fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_5120() {
 #[test]
 fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_2048() {
     rmsnorm_dual_case(2048, 32);
+}
+
+#[test]
+fn rmsnorm_to_q8_1_cta5_normed_covers_a_partial_final_cta() {
+    // 5152 / 32 = 161 blocks over 32 warps: six CTAs, the last one owning a single block; the
+    // plain rmsnorm writes all 5152 normalized values and so must the dual kernel.
+    rmsnorm_dual_case(5152, 33);
 }
