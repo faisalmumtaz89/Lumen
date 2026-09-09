@@ -441,11 +441,29 @@ fn test_prefill_result_does_not_depend_on_slice_boundaries() {
         assert_eq!(kv_b.seq_len(), total);
         cuda_b.reset_recurrent_state();
 
-        assert_f32_close(
-            &format!("prefill_{total}_cut_{cut}"),
-            &one_call,
-            &two_calls,
-            1e-3,
+        // Both sides are the same CUDA kernels on the same weights; only the
+        // launch shapes differ, so this holds far tighter than the CPU-reference
+        // tolerance `assert_f32_close` applies.
+        let diff_l2 = one_call
+            .iter()
+            .zip(&two_calls)
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt();
+        let ref_l2 = one_call.iter().map(|&a| a * a).sum::<f32>().sqrt();
+        let max_abs = one_call
+            .iter()
+            .zip(&two_calls)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "prefill {total} tokens cut at {cut}: rel L2 {:.3e}, max |diff| {max_abs:.3e}",
+            diff_l2 / ref_l2
+        );
+        assert!(
+            diff_l2 <= 1e-3 * ref_l2,
+            "prefill of {total} tokens cut at {cut}: rel L2 {:.3e} > 1e-3 (max |diff| {max_abs:.3e})",
+            diff_l2 / ref_l2
         );
     }
 }

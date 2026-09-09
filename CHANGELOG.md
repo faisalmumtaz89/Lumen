@@ -18,10 +18,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   of at most 2,048 tokens, every slice through one scratch sized for the slice;
   the KV caches and the GDN recurrent state carry across slices as they do
   across tokens. On the RTX 5090 at a 16k context a 15k-token prompt prefills
-  in about 1.9 GB of scratch where a 5k-token one used to fail. A prompt up to
-  2,048 tokens runs exactly as before; a longer one is computed in the same
-  arithmetic with different launch shapes, so its logits can differ from the
-  single-launch result at the last rounding digit.
+  in about 1.9 GB of scratch where a 5k-token one used to fail (the tiled
+  attention's score block still grows with the prompt, about 200 MB at 16k
+  tokens). A prompt up to 2,048 tokens runs exactly as before; a longer one is
+  computed in the same arithmetic with different launch shapes, and the GDN
+  recurrence rounds its F64 state to F32 at each slice boundary instead of
+  once, so its logits differ a little from the single-launch result: on 36
+  prompts of 2.8k–15k tokens the first generated token's logits moved by at
+  most 0.03 with the same argmax on every one, and a long greedy continuation
+  can resolve a later near-tie differently.
 
 ## [0.26.0] — 2026-09-09
 
