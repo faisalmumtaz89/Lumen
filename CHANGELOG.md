@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-09-09
+
 ### Fixed
 
 - **Prefill's per-token scratch no longer grows with the prompt** — the
@@ -1224,6 +1226,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.27.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...v0.24.0
