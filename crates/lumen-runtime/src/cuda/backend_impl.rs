@@ -6004,7 +6004,15 @@ impl CudaBackend {
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
             // the two scratch fields are accessed sequentially. F32 source
             // gates (gdn_ab_f32) need the same F32 `normed` for their SGEMVs.
-            if gdn_ab_f16 || gdn_ab_f32 {
+            // LUMEN_CUDA_NORM_CTA5_DUAL: the one CTA5 launch that writes both `normed` and
+            // the Q8_1 blocks, in place of the plain rmsnorm + fused pair. Same reduction,
+            // same normalize expression, same quantization => both outputs byte-identical.
+            let dual_fn = if (gdn_ab_f16 || gdn_ab_f32) && super::decode::norm_cta5_dual_enabled() {
+                st.kernels.rmsnorm_to_q8_1_cta5_normed.as_ref()
+            } else {
+                None
+            };
+            if (gdn_ab_f16 || gdn_ab_f32) && dual_fn.is_none() {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -6029,26 +6037,58 @@ impl CudaBackend {
                 })?;
             }
 
-            let (fused_fn, lc) = rmsnorm_q8_1_launch(
-                &st.kernels,
-                hidden_dim,
-                &RMSNORM_Q8_SEEN_GDN_ATTN_NORM,
-                "gdn_attn_norm",
-            );
-            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
             let dim = hidden_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(fused_fn)
-                    .arg(&st.scratch.x_gpu)
-                    .arg(&lw.attn_norm)
-                    .arg(&mut *q8_1_buf)
-                    .arg(&eps)
-                    .arg(&dim)
-                    .launch(lc)
+            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+            if let Some(dual_fn) = dual_fn {
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let grid = super::decode::rmsnorm_q8_1_cta5_grid(hidden_dim, block_size);
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: rmsnorm_shared_bytes(block_size),
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(dual_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN rmsnorm_to_q8_1_cta5_normed L{layer_idx}: {e}"
+                    ))
+                })?;
+                super::decode::announce_route_once(&RMSNORM_Q8_SEEN_GDN_ATTN_NORM, || {
+                    format!("[CUDA] rmsnorm_to_q8_1_cta5_normed: ACTIVE (first at gdn_attn_norm, dim={hidden_dim}, ctas={grid})")
+                });
+            } else {
+                let (fused_fn, lc) = rmsnorm_q8_1_launch(
+                    &st.kernels,
+                    hidden_dim,
+                    &RMSNORM_Q8_SEEN_GDN_ATTN_NORM,
+                    "gdn_attn_norm",
+                );
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}"))
+                })?;
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}")))?;
 
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.

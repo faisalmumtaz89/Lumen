@@ -707,6 +707,10 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1_cta5: the same fusion over ceil(blocks/warps) CTAs, one Q8_1 block per
     // warp; each CTA repeats the reduction. Byte-identical output. LUMEN_CUDA_RMSNORM_Q8_CTA5=1.
     pub(crate) rmsnorm_to_q8_1_cta5: Option<CudaFunction>,
+    // rmsnorm_to_q8_1_cta5_normed: the CTA5 fusion that also writes the normalized F32
+    // vector, replacing the plain rmsnorm + fused pair at the GDN input norm.
+    // LUMEN_CUDA_NORM_CTA5_DUAL=1 (implies the CTA5 route at every fused norm site).
+    pub(crate) rmsnorm_to_q8_1_cta5_normed: Option<CudaFunction>,
 
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
@@ -2591,6 +2595,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 None
             }
         },
+        rmsnorm_to_q8_1_cta5_normed: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_cta5_normed",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5_normed: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5_normed: FAILED: {e}");
+                None
+            }
+        },
         // Qwen3.5 Q+gate fusion kernels (full-attention layers)
         deinterleave_qgate: match load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "deinterleave_qgate")
         {
@@ -4277,6 +4294,21 @@ pub(crate) fn rmsnorm_q8_cta5_enabled() -> bool {
     *FLAG.get_or_init(|| {
         matches!(
             std::env::var("LUMEN_CUDA_RMSNORM_Q8_CTA5").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        ) || norm_cta5_dual_enabled()
+    })
+}
+
+/// `LUMEN_CUDA_NORM_CTA5_DUAL=1`: at the GDN input norm, one `rmsnorm_to_q8_1_cta5_normed`
+/// launch writes both the normalized F32 vector and the Q8_1 blocks, replacing the plain
+/// `rmsnorm` + fused pair; implies the CTA5 route at every fused norm site. Default OFF.
+/// Read once per process.
+pub(crate) fn norm_cta5_dual_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_NORM_CTA5_DUAL").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })

@@ -253,3 +253,118 @@ fn matvec_q4_0_dp4a_t160_is_bitwise_at_k5120_with_a_ragged_row_count() {
     // 67 rows: the last CTA owns three rows and hits the out_dim guard.
     q4_exactk_case(67, 5120, 22);
 }
+
+// ── rmsnorm + rmsnorm_to_q8_1 vs rmsnorm_to_q8_1_cta5_normed ───────────────────────────────
+
+fn rmsnorm_dual_case(dim: usize, seed: u64) {
+    let (ctx, stream) = create_context();
+    let q8_mod = ctx
+        .load_module(compile_ptx(
+            lumen_runtime::cuda::shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            false,
+        ))
+        .expect("load rmsnorm_q8_1 module");
+    let norm_mod = ctx
+        .load_module(compile_ptx(
+            lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE,
+            false,
+        ))
+        .expect("load norm module");
+    let plain = norm_mod.load_function("rmsnorm").unwrap();
+    let single = q8_mod.load_function("rmsnorm_to_q8_1").unwrap();
+    let dual = q8_mod.load_function("rmsnorm_to_q8_1_cta5_normed").unwrap();
+
+    let mut s = seed;
+    let x: Vec<f32> = (0..dim).map(|_| rand_unit(&mut s) * 3.0).collect();
+    let w: Vec<f32> = (0..dim).map(|_| 0.5 + rand_unit(&mut s).abs()).collect();
+    let x_gpu = stream.clone_htod(&x).unwrap();
+    let w_gpu = stream.clone_htod(&w).unwrap();
+    let eps = 1e-6f32;
+    let dim_u32 = dim as u32;
+    let block_size = rmsnorm_block_size(dim);
+    let shared = (block_size / 32) * 4;
+    let one = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared,
+    };
+
+    // the pair the dual kernel replaces
+    let mut normed_ref: CudaSlice<f32> = stream.alloc_zeros(dim).unwrap();
+    unsafe {
+        stream
+            .launch_builder(&plain)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut normed_ref)
+            .arg(&eps)
+            .arg(&dim_u32)
+            .launch(one)
+            .unwrap();
+    }
+    let out_bytes = dim / 32 * 36;
+    let mut q8_ref: CudaSlice<u8> = stream.clone_htod(&vec![0xA5u8; out_bytes]).unwrap();
+    unsafe {
+        stream
+            .launch_builder(&single)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut q8_ref)
+            .arg(&eps)
+            .arg(&dim_u32)
+            .launch(one)
+            .unwrap();
+    }
+
+    // the dual kernel
+    let mut normed_dual: CudaSlice<f32> = stream.clone_htod(&vec![f32::NAN; dim]).unwrap();
+    let mut q8_dual: CudaSlice<u8> = stream.clone_htod(&vec![0xA5u8; out_bytes]).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (cta5_grid(dim, block_size), 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    unsafe {
+        stream
+            .launch_builder(&dual)
+            .arg(&x_gpu)
+            .arg(&w_gpu)
+            .arg(&mut normed_dual)
+            .arg(&mut q8_dual)
+            .arg(&eps)
+            .arg(&dim_u32)
+            .launch(cfg)
+            .unwrap();
+    }
+    let (nr, nd) = (
+        stream.clone_dtoh(&normed_ref).unwrap(),
+        stream.clone_dtoh(&normed_dual).unwrap(),
+    );
+    for (i, (a, b)) in nr.iter().zip(&nd).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "dim {dim}: normed[{i}] dual {b} != plain {a}"
+        );
+    }
+    let (qr, qd) = (
+        stream.clone_dtoh(&q8_ref).unwrap(),
+        stream.clone_dtoh(&q8_dual).unwrap(),
+    );
+    for (i, (a, b)) in qr.iter().zip(&qd).enumerate() {
+        assert_eq!(
+            a, b,
+            "dim {dim}: Q8_1 byte {i} dual {b:#04x} != single {a:#04x}"
+        );
+    }
+}
+
+#[test]
+fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_5120() {
+    rmsnorm_dual_case(5120, 31);
+}
+
+#[test]
+fn rmsnorm_to_q8_1_cta5_normed_is_bitwise_both_kernels_it_replaces_at_2048() {
+    rmsnorm_dual_case(2048, 32);
+}
