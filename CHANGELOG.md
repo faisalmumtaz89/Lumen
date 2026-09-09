@@ -12,8 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Three opt-in arms retired after the Blackwell promotion** — the levers
   measured and not promoted in the round that shipped 0.25.0 go, with their
   kernels and flags: the 160-thread exact-K launch of the raw Q4_0 dp4a matvec
-  (`LUMEN_CUDA_Q4_RAW_EXACTK`, `matvec_q4_0_dp4a_t160`; measured within the
-  run-to-run band, +0.24 % decode),
+  (`LUMEN_CUDA_Q4_RAW_EXACTK`, `matvec_q4_0_dp4a_t160`; measured inside the
+  round's noise band),
   the explicit NVRTC target for the split-K decode-attention pair
   (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`; measured slower at `compute_120`, the
   pair keeps NVRTC's default target), and the separate switch for the multi-CTA
@@ -28,8 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Strict suffix validation ties resolve like generation** — the argmax the
   `--strict-suffix-validation` path computed kept the last maximal logit while
   the sampler, the device argmax kernel and the top-2 bench record keep the
-  first, so a tied logit vector could validate against a token generation would
-  not have produced. One convention now.
+  first, so a tied logit vector could validate against a token that generation
+  would not have produced. One convention now.
 - **The single-block attention kernel's shared-memory notice says what it
   caps** — when the driver declines the dynamic shared-memory opt-in the line no
   longer reads as a decode ceiling: it names the single-block kernel and says
