@@ -208,6 +208,8 @@ pub(crate) struct KernelSet {
     // the split-K route to dispatch.
     pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
     pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
+    /// Which NVRTC target the split-K pair was compiled for (`attn_splitk_codegen`).
+    pub(crate) attention_decode_splitk_codegen: &'static str,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
     #[allow(dead_code)]
@@ -950,6 +952,26 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
+    // The split-K decode-attention pair at the target `LUMEN_CUDA_ATTN_SPLITK_CODEGEN` selects,
+    // the same way. Both kernels of the pair come from one source and one target.
+    let splitk_codegen = attn_splitk_codegen();
+    let load_splitk = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
+        let module = match splitk_codegen {
+            "ptx80" => device.compile_and_load_with_arch(source, "compute_80")?,
+            "ptx120" => device.compile_and_load_with_arch(source, "compute_120")?,
+            _ => device.compile_and_load(source)?,
+        };
+        if splitk_codegen != "default" {
+            cuda_log!(
+                "[CUDA] {name}: compiled for {}",
+                attn_tiled_codegen_target(splitk_codegen)
+            );
+        }
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+    };
+
     // For kernels needing SM 80+ features (dp4a, WMMA tensor cores).
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch(source, "compute_80")?;
@@ -1002,6 +1024,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
 
     let kernels = KernelSet {
         attention_decode_tiled_codegen: tiled_codegen,
+        attention_decode_splitk_codegen: splitk_codegen,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
@@ -1084,7 +1107,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
         },
         attention_decode_splitk_partial: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_fn(
+            match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
                 "attention_decode_splitk_partial",
             ) {
@@ -1098,7 +1121,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             None
         },
         attention_decode_splitk_merge: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_fn(
+            match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
                 "attention_decode_splitk_merge",
             ) {
@@ -4300,6 +4323,21 @@ mod attention_decode_tiled_const_tests {
             attention_decode_tiled_route_name("anything"),
             "attention_decode_tiled"
         );
+        use super::attention_decode_splitk_route_names;
+        assert_eq!(
+            attention_decode_splitk_route_names("ptx120"),
+            (
+                "attention_decode_splitk_partial_ptx120",
+                "attention_decode_splitk_merge_ptx120"
+            )
+        );
+        assert_eq!(
+            attention_decode_splitk_route_names("default"),
+            (
+                "attention_decode_splitk_partial",
+                "attention_decode_splitk_merge"
+            )
+        );
     }
 
     /// 5120/32 = 160 Q8_1 blocks over 1024/32 = 32 warps = 5 CTAs (the name); 4096 → 4,
@@ -4336,6 +4374,45 @@ pub(crate) fn attn_tiled_codegen() -> &'static str {
             _ => "default",
         }
     })
+}
+
+/// `LUMEN_CUDA_ATTN_SPLITK_CODEGEN`: the NVRTC target the split-K decode-attention pair
+/// (`attention_decode_splitk_partial` + `_merge`) is compiled for — `ptx80` / `ptx120`, else
+/// NVRTC's default. Same rule and reason as `attn_tiled_codegen` (NVRTC 13.3: 4264 instructions
+/// for the pair at the default target, 3496 at compute_120). Default OFF. Read once per process.
+pub(crate) fn attn_splitk_codegen() -> &'static str {
+    use std::sync::OnceLock;
+    static SEL: OnceLock<&'static str> = OnceLock::new();
+    *SEL.get_or_init(|| {
+        match std::env::var("LUMEN_CUDA_ATTN_SPLITK_CODEGEN")
+            .ok()
+            .as_deref()
+        {
+            Some("ptx80") => "ptx80",
+            Some("ptx120") => "ptx120",
+            _ => "default",
+        }
+    })
+}
+
+/// The route identifiers the split-K dispatch announces for a codegen selection: the plain
+/// pair on the default target, suffixed names for an explicit target — both kernels, since the
+/// census harvests the merge kernel off the `merge=` field.
+pub(crate) fn attention_decode_splitk_route_names(codegen: &str) -> (&'static str, &'static str) {
+    match codegen {
+        "ptx80" => (
+            "attention_decode_splitk_partial_ptx80",
+            "attention_decode_splitk_merge_ptx80",
+        ),
+        "ptx120" => (
+            "attention_decode_splitk_partial_ptx120",
+            "attention_decode_splitk_merge_ptx120",
+        ),
+        _ => (
+            "attention_decode_splitk_partial",
+            "attention_decode_splitk_merge",
+        ),
+    }
 }
 
 /// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
