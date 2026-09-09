@@ -6,26 +6,42 @@
 //!     a dim whose block count does not divide by the warp count;
 //!   * `matvec_q4_0_dp4a_t160` (160 threads at K=5120) against `matvec_q4_0_dp4a` (256).
 //!
-//! Random inputs, the production compile options, and a bit-for-bit comparison of every
-//! output byte. Requires a CUDA GPU:
+//! Random inputs, the production compile options (the norm kernels at NVRTC's default target with
+//! no options, the dp4a family at the device's `dp4a_arch` with the raw `--use_fast_math`), and a
+//! bit-for-bit comparison of every output byte. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_kernel_twins_bitwise_test
 #![cfg(feature = "cuda")]
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use cudarc::nvrtc::{compile_ptx, compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
 
-fn compile_ptx(src: &str, fast_math: bool) -> cudarc::nvrtc::Ptx {
+/// The norm kernels as production loads them (`decode::load_fn` -> `ffi::compile_and_load`):
+/// NVRTC's default target, no options.
+fn compile_norm(src: &str) -> cudarc::nvrtc::Ptx {
+    compile_ptx(src).unwrap_or_else(|e| panic!("NVRTC compile failed: {e:?}"))
+}
+
+/// The dp4a family as production loads it (`decode::load_fn_sm80_fast_math` ->
+/// `ffi::compile_and_load_with_arch_fast_math`): the target `CudaDevice::dp4a_arch` picks for
+/// THIS device from the loaded toolkit, and the raw `--use_fast_math` flag (cudarc's
+/// `use_fast_math` field would add only `--fmad=true`).
+fn compile_dp4a(src: &str) -> cudarc::nvrtc::Ptx {
+    let arch = lumen_runtime::cuda::ffi::CudaDevice::new(0)
+        .expect("CUDA device")
+        .dp4a_arch()
+        .expect("NVRTC target query")
+        .expect("this device runs the dp4a family");
     compile_ptx_with_opts(
         src,
         CompileOptions {
-            arch: Some("compute_80"),
-            use_fast_math: Some(fast_math),
+            arch: Some(arch),
+            options: vec!["--use_fast_math".to_string()],
             ..Default::default()
         },
     )
-    .unwrap_or_else(|e| panic!("NVRTC compile failed: {e:?}"))
+    .unwrap_or_else(|e| panic!("NVRTC compile failed ({arch}): {e:?}"))
 }
 
 fn create_context() -> (Arc<CudaContext>, Arc<CudaStream>) {
@@ -76,10 +92,7 @@ fn cta5_grid(dim: usize, block_size: u32) -> u32 {
 
 fn rmsnorm_q8_1_case(dim: usize, seed: u64) {
     let (ctx, stream) = create_context();
-    let ptx = compile_ptx(
-        lumen_runtime::cuda::shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
-        false,
-    );
+    let ptx = compile_norm(lumen_runtime::cuda::shaders::RMSNORM_Q8_1_KERNEL_SOURCE);
     let module = ctx.load_module(ptx).expect("load rmsnorm_q8_1 module");
     let single = module.load_function("rmsnorm_to_q8_1").unwrap();
     let cta5 = module.load_function("rmsnorm_to_q8_1_cta5").unwrap();
@@ -192,10 +205,7 @@ fn random_q8_1(in_dim: usize, s: &mut u64) -> Vec<u8> {
 
 fn q4_exactk_case(out_dim: usize, in_dim: usize, seed: u64) {
     let (ctx, stream) = create_context();
-    let ptx = compile_ptx(
-        lumen_runtime::cuda::shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
-        true,
-    );
+    let ptx = compile_dp4a(lumen_runtime::cuda::shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE);
     let module = ctx.load_module(ptx).expect("load matvec_q4_0_dp4a module");
     let full = module.load_function("matvec_q4_0_dp4a").unwrap();
     let t160 = module.load_function("matvec_q4_0_dp4a_t160").unwrap();
@@ -259,15 +269,13 @@ fn matvec_q4_0_dp4a_t160_is_bitwise_at_k5120_with_a_ragged_row_count() {
 fn rmsnorm_dual_case(dim: usize, seed: u64) {
     let (ctx, stream) = create_context();
     let q8_mod = ctx
-        .load_module(compile_ptx(
+        .load_module(compile_norm(
             lumen_runtime::cuda::shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
-            false,
         ))
         .expect("load rmsnorm_q8_1 module");
     let norm_mod = ctx
-        .load_module(compile_ptx(
+        .load_module(compile_norm(
             lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE,
-            false,
         ))
         .expect("load norm module");
     let plain = norm_mod.load_function("rmsnorm").unwrap();
