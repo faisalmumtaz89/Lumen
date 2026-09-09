@@ -1131,8 +1131,9 @@ pub async fn collect_chat(
 /// emitted none on this path, the request fails rather than returning a body
 /// that silently lacks the surface. When the flag is off this is a no-op and
 /// the body is byte-identical.
-/// The bench record the engine emits: generated ids, the EOS set, and (under
-/// `LUMEN_BENCH_TOP2`) the per-token top-2 entries.
+///
+/// (`BenchRecord` below is the record the engine emits: generated ids, the EOS
+/// set, and under `LUMEN_BENCH_TOP2` the per-token top-2 entries.)
 pub(crate) type BenchRecord = (Vec<u32>, Vec<u32>, Vec<lumen_runtime::session::BenchTop2>);
 
 pub(crate) fn attach_bench_token_ids(
@@ -1339,8 +1340,8 @@ mod bench_token_ids_surface_tests {
         assert!(push < eos_check, "the id record must precede the EOS check");
     }
 
-    /// Off leaves the body byte-identical; armed without ids fails rather
-    /// than returning a body without the surface.
+    /// The top-2 entries surface as `[argmax, logit, runner_up, runner_up_logit]`
+    /// arrays, and an empty record adds no key.
     #[test]
     fn top2_entries_surface_as_arrays_when_present() {
         let mut body = json!({"id": "x"});
@@ -1372,6 +1373,8 @@ mod bench_token_ids_surface_tests {
         );
     }
 
+    /// Off leaves the body byte-identical; armed without ids fails rather
+    /// than returning a body without the surface.
     #[test]
     fn off_is_a_no_op_and_armed_without_ids_fails() {
         let mut body = json!({"a": 1});

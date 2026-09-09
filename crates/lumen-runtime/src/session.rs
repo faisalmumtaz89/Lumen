@@ -113,8 +113,8 @@ pub struct BenchTop2 {
 }
 
 impl BenchTop2 {
-    /// The top two of `logits` by value; ties resolve to the lower index, the order
-    /// `Logits::argmax` picks. Empty logits give zeros.
+    /// The top two of `logits` by value; ties resolve to the lower index, the order the greedy
+    /// sampler (`sampling::argmax`) and the device argmax kernel pick. Empty logits give zeros.
     pub fn of(logits: &[f32]) -> Self {
         let (mut best, mut best_v) = (0usize, f32::NEG_INFINITY);
         let (mut second, mut second_v) = (0usize, f32::NEG_INFINITY);

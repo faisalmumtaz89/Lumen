@@ -113,8 +113,10 @@ pub fn sample_token_with_state(
 /// the veto. `anti_restate` is NOT part of `penalties_active()` (it is a
 /// deterministic post-argmax veto, not a logit penalty), so it must be tested
 /// explicitly here. Dense models keep `anti_restate=false`, so this term leaves
-/// every non-MoE greedy path byte-identical, and CUDA was already on the CPU
-/// path (`gpu_argmax=false`) so its behaviour is unchanged.
+/// every non-MoE greedy path byte-identical. (CUDA advertises `gpu_argmax` once
+/// its weights are preloaded and `LUMEN_CUDA_GPU_SAMPLE` is on, its default, so
+/// it does take the on-device argmax route; the device kernel and the host
+/// sampler break ties the same way, to the lowest index.)
 pub fn use_gpu_greedy_predicate(
     params: &SamplingParams,
     gpu_resident: bool,

@@ -16732,10 +16732,16 @@ impl ComputeBackend for CudaBackend {
             Ok((cc_major, cc_minor)) => {
                 crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
                 if cc_major == 12 {
+                    // The body class is recorded before the backend is built, so this is the
+                    // resolution for the model being loaded (the legacy switch included).
+                    let on = |b: bool| if b { "ON" } else { "OFF" };
                     eprintln!(
-                        "[CUDA] cc {cc_major}.{cc_minor}: for a Q4_0 dense body the split-K decode-attention pair, \
-                         the dual-output norm route and the compute_120 tiled kernel default ON here (measured on cc 12.0; \
-                         LUMEN_CUDA_ATTN_SPLITK=0 / LUMEN_CUDA_NORM_CTA5_DUAL=0 / LUMEN_CUDA_ATTN_TILED_CODEGEN=0 opt out)"
+                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed defaults for this model — split-K decode \
+                         attention {}, dual-output norm route {}, compute_120 tiled kernel {} (measured on cc 12.0; \
+                         LUMEN_CUDA_ATTN_SPLITK / LUMEN_CUDA_NORM_CTA5_DUAL / LUMEN_CUDA_ATTN_TILED_CODEGEN override)",
+                        on(crate::runtime_defaults::attn_splitk_default()),
+                        on(crate::runtime_defaults::norm_cta5_dual_default()),
+                        on(crate::runtime_defaults::attn_tiled_codegen_default(cc_major.clamp(0, 255) as u8, self.device.nvrtc_can_target(120)) == "ptx120"),
                     );
                 }
                 if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
