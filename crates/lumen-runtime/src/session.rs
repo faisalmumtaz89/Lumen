@@ -1480,20 +1480,11 @@ impl<'a> Iterator for TokenStream<'a> {
     }
 }
 
-/// Deterministic argmax over a logits slice for the strict-suffix-validation
-/// path. Returns 0 on empty input; ties broken via
-/// `f32::total_cmp` to match the runtime's `sampling::argmax` convention.
-///
-/// Kept local to session.rs because the `sampling::argmax` helper is private
-/// and the strict-validation path is the only other caller. Exposing the
-/// existing helper would widen the sampler's API surface without need.
+/// Deterministic argmax for the strict-suffix-validation path: delegates to
+/// `sampling::argmax`, so a tie validates against the token generation would
+/// have produced (the lowest index).
 fn argmax_token(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    crate::sampling::argmax(logits) as u32
 }
 
 /// Execute a single forward pass through all layers for one token.
@@ -2590,14 +2581,17 @@ mod tests {
     }
 
     #[test]
-    fn argmax_token_total_cmp_handles_nan() {
-        // NaN should not win against finite values via `total_cmp`. The
-        // NaN's bit-pattern (positive non-signaling) places it AFTER all
-        // finite values in `total_cmp`'s ordering, so an all-NaN-plus-one
-        // slice would return the NaN index — but mixed slices with finite
-        // maxima compare cleanly.
-        let logits = vec![0.5, 1.0, 0.3];
-        assert_eq!(argmax_token(&logits), 1);
+    fn argmax_token_breaks_ties_to_the_lowest_index_like_generation() {
+        assert_eq!(argmax_token(&[2.0, 2.0, 1.0]), 0);
+    }
+
+    #[test]
+    fn argmax_token_orders_a_nan_logit_above_every_finite_one() {
+        // `total_cmp` places a positive NaN after every finite value, so a NaN logit is the
+        // argmax — deterministically, the same answer generation gives. A NaN logit is a
+        // defect upstream of the sampler; this pins that the two paths agree on it.
+        assert_eq!(argmax_token(&[0.5, f32::NAN, 1.0]), 1);
+        assert_eq!(argmax_token(&[0.5, 1.0, 0.3]), 1);
     }
 
     /// Strict-suffix-validation succeeds when the suffix-prefill path matches

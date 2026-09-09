@@ -7,6 +7,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Removed
+
+- **Three opt-in arms retired after the Blackwell promotion** — the levers
+  measured and not promoted in the round that shipped 0.25.0 go, with their
+  kernels and flags: the 160-thread exact-K launch of the raw Q4_0 dp4a matvec
+  (`LUMEN_CUDA_Q4_RAW_EXACTK`, `matvec_q4_0_dp4a_t160`; measured inside the
+  round's noise band),
+  the explicit NVRTC target for the split-K decode-attention pair
+  (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`; measured slower at `compute_120`, the
+  pair keeps NVRTC's default target), and the separate switch for the multi-CTA
+  fused norm (`LUMEN_CUDA_RMSNORM_Q8_CTA5`; the multi-CTA route ships with the
+  dual-output norm route and follows `LUMEN_CUDA_NORM_CTA5_DUAL`). The split-K
+  dispatch announcement no longer carries a `target=` field. Every default is
+  unchanged; an environment that set one of the three flags now sets an
+  unknown variable, which the startup registry check reports.
+
+### Fixed
+
+- **Strict suffix validation ties resolve like generation** — the argmax the
+  `--strict-suffix-validation` path computed kept the last maximal logit while
+  the sampler, the device argmax kernel and the top-2 bench record keep the
+  first, so a tied logit vector could validate against a token that generation
+  would not have produced. One convention now.
+- **The single-block attention kernel's shared-memory notice says what it
+  caps** — when the driver declines the dynamic shared-memory opt-in the line no
+  longer reads as a decode ceiling: it names the single-block kernel and says
+  the tiled and split-K routes, which serve decode by default, are unaffected.
+
 ## [0.25.0] — 2026-09-09
 
 ### Added

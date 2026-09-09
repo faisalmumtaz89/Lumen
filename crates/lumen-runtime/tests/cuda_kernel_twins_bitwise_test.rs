@@ -1,13 +1,16 @@
 //! Device-side byte-identity tests for kernel twins that claim the ORIGINAL kernel's output
-//! bytes from a different launch geometry:
+//! bytes from a different launch geometry or a different compile target:
 //!
 //!   * `rmsnorm_to_q8_1_cta5` (ceil(blocks/warps) CTAs, one Q8_1 block per warp, the reduction
 //!     repeated per CTA) against `rmsnorm_to_q8_1` (one block), at dims 2048 / 4096 / 5120 and
 //!     a dim whose block count does not divide by the warp count;
-//!   * `matvec_q4_0_dp4a_t160` (160 threads at K=5120) against `matvec_q4_0_dp4a` (256).
+//!   * `rmsnorm_to_q8_1_cta5_normed` (the dual-output launch) against the plain `rmsnorm` and
+//!     `rmsnorm_to_q8_1` pair it replaces, at dims 2048 / 4096 / 5120 / 5152;
+//!   * `attention_decode_tiled` and the split-K pair compiled for NVRTC's default target,
+//!     `compute_80` and `compute_120`, against one another.
 //!
 //! Random inputs, the production compile options (the norm kernels at NVRTC's default target with
-//! no options, the dp4a family at the explicit `compute_80` target with the raw `--use_fast_math`), and a
+//! no options, the attention kernels at each target with the production options), and a
 //! bit-for-bit comparison of every output byte. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_kernel_twins_bitwise_test
@@ -21,21 +24,6 @@ use std::sync::Arc;
 /// NVRTC's default target, no options.
 fn compile_norm(src: &str) -> cudarc::nvrtc::Ptx {
     compile_ptx(src).unwrap_or_else(|e| panic!("NVRTC compile failed: {e:?}"))
-}
-
-/// The dp4a family as production loads it (`decode::load_fn_sm80_fast_math` ->
-/// `ffi::compile_and_load_with_arch_fast_math`): the explicit `compute_80` target and the raw
-/// `--use_fast_math` flag (cudarc's `use_fast_math` field would add only `--fmad=true`).
-fn compile_dp4a(src: &str) -> cudarc::nvrtc::Ptx {
-    compile_ptx_with_opts(
-        src,
-        CompileOptions {
-            arch: Some("compute_80"),
-            options: vec!["--use_fast_math".to_string()],
-            ..Default::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("NVRTC compile failed (compute_80): {e:?}"))
 }
 
 fn create_context() -> (Arc<CudaContext>, Arc<CudaStream>) {
@@ -54,23 +42,9 @@ fn rng_next(state: &mut u64) -> u64 {
 /// A uniform value in [-1, 1) with a full 24-bit mantissa, so a product of two such values is
 /// NOT exactly representable in f32 and `sum_sq += val * val` differs between a fused and an
 /// unfused multiply-add: a test input coarse enough to make `val * val` exact (9 bits) cannot
-/// tell the two apart (review 2026-09-09, MAJOR-3).
+/// tell the two apart.
 fn rand_unit(s: &mut u64) -> f32 {
     ((rng_next(s) & 0xff_ffff) as f32 / 8_388_608.0) - 1.0
-}
-
-/// f16 bits of a positive f32 in the normal range (round-nearest-even on the fraction).
-fn f16_bits(val: f32) -> u16 {
-    let bits = val.to_bits();
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    assert!((1..31).contains(&exp), "test values must be f16-normal");
-    let frac = bits & 0x7f_ffff;
-    let mut f16 = ((exp as u32) << 10) | (frac >> 13);
-    let round_bits = frac & 0x1fff;
-    if round_bits > 0x1000 || (round_bits == 0x1000 && (f16 & 1) == 1) {
-        f16 += 1;
-    }
-    f16 as u16
 }
 
 // ── rmsnorm_to_q8_1 vs rmsnorm_to_q8_1_cta5 ────────────────────────────────────────────────
@@ -161,104 +135,6 @@ fn rmsnorm_to_q8_1_cta5_is_bitwise_the_single_block_kernel_at_2048() {
 fn rmsnorm_to_q8_1_cta5_covers_a_partial_final_cta() {
     // 5152 / 32 = 161 blocks over 32 warps: six CTAs, the last one owning a single block.
     rmsnorm_q8_1_case(5152, 4);
-}
-
-// ── matvec_q4_0_dp4a vs matvec_q4_0_dp4a_t160 ──────────────────────────────────────────────
-
-const Q4_BLOCK_BYTES: usize = 18;
-const Q8_1_BLOCK_BYTES: usize = 36;
-
-fn random_q4_rows(out_dim: usize, in_dim: usize, s: &mut u64) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(out_dim * in_dim / 32 * Q4_BLOCK_BYTES);
-    for _ in 0..out_dim * in_dim / 32 {
-        let d = 0.002 + (rng_next(s) % 64) as f32 * 0.0005;
-        bytes.extend_from_slice(&f16_bits(d).to_le_bytes());
-        for _ in 0..16 {
-            bytes.push((rng_next(s) % 256) as u8);
-        }
-    }
-    bytes
-}
-
-fn random_q8_1(in_dim: usize, s: &mut u64) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(in_dim / 32 * Q8_1_BLOCK_BYTES);
-    for _ in 0..in_dim / 32 {
-        let q: Vec<i8> = (0..32)
-            .map(|_| (rng_next(s) % 255) as i32 as i8)
-            .map(|v| v.max(-127))
-            .collect();
-        let scale = 0.004 + (rng_next(s) % 64) as f32 * 0.001;
-        let sum: i32 = q.iter().map(|&v| v as i32).sum();
-        let weighted = scale * sum as f32;
-        bytes.extend_from_slice(&f16_bits(scale).to_le_bytes());
-        // the sum field may be negative: sign bit on top of the magnitude's f16
-        let mag = f16_bits(weighted.abs().max(1e-4));
-        let sum_bits = if weighted < 0.0 { mag | 0x8000 } else { mag };
-        bytes.extend_from_slice(&sum_bits.to_le_bytes());
-        bytes.extend(q.iter().map(|&v| v as u8));
-    }
-    bytes
-}
-
-fn q4_exactk_case(out_dim: usize, in_dim: usize, seed: u64) {
-    let (ctx, stream) = create_context();
-    let ptx = compile_dp4a(lumen_runtime::cuda::shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE);
-    let module = ctx.load_module(ptx).expect("load matvec_q4_0_dp4a module");
-    let full = module.load_function("matvec_q4_0_dp4a").unwrap();
-    let t160 = module.load_function("matvec_q4_0_dp4a_t160").unwrap();
-
-    let mut s = seed;
-    let w = random_q4_rows(out_dim, in_dim, &mut s);
-    let x = random_q8_1(in_dim, &mut s);
-    let w_gpu = stream.clone_htod(&w).unwrap();
-    let x_gpu = stream.clone_htod(&x).unwrap();
-    let out_u32 = out_dim as u32;
-    let in_u32 = in_dim as u32;
-    let grid = (out_dim as u32).div_ceil(4);
-
-    let mut outs: Vec<Vec<f32>> = Vec::new();
-    for (f, threads) in [(&full, 256u32), (&t160, 160u32)] {
-        let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_dim).unwrap();
-        let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(f)
-                .arg(&w_gpu)
-                .arg(&x_gpu)
-                .arg(&mut out_gpu)
-                .arg(&out_u32)
-                .arg(&in_u32)
-                .launch(cfg)
-                .unwrap();
-        }
-        outs.push(stream.clone_dtoh(&out_gpu).unwrap());
-    }
-    assert!(
-        outs[0].iter().any(|v| *v != 0.0),
-        "the 256-thread kernel produced all zeros"
-    );
-    for (i, (a, b)) in outs[0].iter().zip(&outs[1]).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "row {i}: t160 {b} != 256-thread {a} (out_dim={out_dim}, in_dim={in_dim})"
-        );
-    }
-}
-
-#[test]
-fn matvec_q4_0_dp4a_t160_is_bitwise_the_256_thread_kernel_at_k5120() {
-    q4_exactk_case(64, 5120, 21);
-}
-
-#[test]
-fn matvec_q4_0_dp4a_t160_is_bitwise_at_k5120_with_a_ragged_row_count() {
-    // 67 rows: the last CTA owns three rows and hits the out_dim guard.
-    q4_exactk_case(67, 5120, 22);
 }
 
 // ── rmsnorm + rmsnorm_to_q8_1 vs rmsnorm_to_q8_1_cta5_normed ───────────────────────────────
@@ -512,6 +388,8 @@ fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_at_the_context_shapes(
 }
 
 // ── attention_decode_splitk_partial + _merge across NVRTC targets ──────────────────────────
+// The pair ships at NVRTC's default target (an explicit compute_120 measured slower); this
+// keeps a future re-target a pure code-generation change, with the bits pinned in advance.
 
 fn splitk_ptx(arch: Option<&'static str>) -> cudarc::nvrtc::Ptx {
     let src = lumen_runtime::cuda::shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE;
