@@ -11121,13 +11121,19 @@ unsafe fn launch_matvec(
         ) {
             // Check which kernel to use: aligned or unaligned.
             let (mv_fn_opt, w_ptr) = match weight {
-                GpuWeightBuf::Q4Aligned(w) => {
-                    (kernels.matvec_q4_aligned_q8_1.as_ref(), w as &CudaSlice<u8>)
+                GpuWeightBuf::Q4Aligned(w) => (
+                    kernels
+                        .matvec_q4_aligned_q8_1
+                        .as_ref()
+                        .map(|f| (f, DP4A_Q4_BLOCK_DIM, "matvec_q4_aligned_q8_1")),
+                    w as &CudaSlice<u8>,
+                ),
+                GpuWeightBuf::Q4Raw(w) => {
+                    (raw_q4_dp4a_kernel(kernels, in_dim), w as &CudaSlice<u8>)
                 }
-                GpuWeightBuf::Q4Raw(w) => (kernels.matvec_q4_0_dp4a.as_ref(), w as &CudaSlice<u8>),
                 _ => unreachable!(),
             };
-            if let Some(mv_fn) = mv_fn_opt {
+            if let Some((mv_fn, mv_block_dim, mv_name)) = mv_fn_opt {
                 let in_dim_u32 = in_dim as u32;
                 let out_dim_u32 = out_dim as u32;
 
@@ -11149,11 +11155,11 @@ unsafe fn launch_matvec(
                         RuntimeError::Compute(format!("quantize_f32_to_q8_1 Q4 {label}: {e}",))
                     })?;
 
-                // Step 2: dp4a matvec with Q8_1 input (NR=4, 256 threads).
+                // Step 2: dp4a matvec with Q8_1 input (NR=4; 256 threads, or 160 at exact K).
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                    block_dim: (mv_block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 device
@@ -11168,16 +11174,13 @@ unsafe fn launch_matvec(
                     .map_err(|e| RuntimeError::Compute(format!("matvec_q4_dp4a {label}: {e}",)))?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_matvec_route(
-                        &SEEN,
-                        || match weight {
-                            GpuWeightBuf::Q4Aligned(_) => "matvec_q4_aligned_q8_1",
-                            _ => "matvec_q4_0_dp4a",
-                        },
-                        label,
-                        out_dim,
-                        in_dim,
-                    );
+                    static SEEN_T160: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    let seen = if mv_block_dim == DP4A_Q4_BLOCK_DIM {
+                        &SEEN
+                    } else {
+                        &SEEN_T160
+                    };
+                    announce_matvec_route(seen, || mv_name, label, out_dim, in_dim);
                 }
                 return Ok(());
             }
@@ -12924,11 +12927,11 @@ unsafe fn launch_matvec_preq8_1(
             }
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
-            if let Some(mv_fn) = kernels.matvec_q4_0_dp4a.as_ref() {
+            if let Some((mv_fn, block_dim, name)) = raw_q4_dp4a_kernel(kernels, in_dim) {
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                    block_dim: (block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 device
@@ -12940,12 +12943,16 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q4_0_dp4a preq {label}: {e}",))
-                    })?;
+                    .map_err(|e| RuntimeError::Compute(format!("{name} preq {label}: {e}",)))?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_matvec_route(&SEEN, || "matvec_q4_0_dp4a", label, out_dim, in_dim);
+                    static SEEN_T160: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    let seen = if block_dim == DP4A_Q4_BLOCK_DIM {
+                        &SEEN
+                    } else {
+                        &SEEN_T160
+                    };
+                    announce_matvec_route(seen, || name, label, out_dim, in_dim);
                 }
                 return Ok(());
             }
@@ -14735,6 +14742,33 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
         _ => false,
     }
+}
+
+/// The raw Q4_0 dp4a matvec a site launches for `in_dim`, with its block size and name.
+///
+/// `matvec_q4_0_dp4a_t160` when `LUMEN_CUDA_Q4_RAW_EXACTK=1`, it loaded, and `in_dim / 32`
+/// is exactly its 160 threads — the one K at which thread ib owns block ib in both kernels
+/// and the output bytes are the 256-thread kernel's. Every other K, and the flag off, is
+/// `matvec_q4_0_dp4a` at 256 threads. `None` when neither loaded.
+fn raw_q4_dp4a_kernel(
+    kernels: &KernelSet,
+    in_dim: usize,
+) -> Option<(&CudaFunction, u32, &'static str)> {
+    if super::decode::q4_raw_exactk_enabled()
+        && (in_dim / 32) as u32 == super::decode::DP4A_Q4_T160_BLOCK_DIM
+    {
+        if let Some(f) = kernels.matvec_q4_0_dp4a_t160.as_ref() {
+            return Some((
+                f,
+                super::decode::DP4A_Q4_T160_BLOCK_DIM,
+                "matvec_q4_0_dp4a_t160",
+            ));
+        }
+    }
+    kernels
+        .matvec_q4_0_dp4a
+        .as_ref()
+        .map(|f| (f, DP4A_Q4_BLOCK_DIM, "matvec_q4_0_dp4a"))
 }
 
 static RMSNORM_Q8_SEEN_ATTN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();

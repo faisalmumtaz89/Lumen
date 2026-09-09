@@ -468,6 +468,9 @@ pub(crate) struct KernelSet {
     // NR=4 rows/block, 256 threads. SM 6.1+.
     pub(crate) matvec_q4_0_dp4a: Option<CudaFunction>,
     pub(crate) matvec_q4_0_dp4a_residual: Option<CudaFunction>,
+    // matvec_q4_0_dp4a at exact K: 160 threads for K=5120 (the three idle warps of the
+    // 256-thread launch removed), byte-identical there. LUMEN_CUDA_Q4_RAW_EXACTK=1.
+    pub(crate) matvec_q4_0_dp4a_t160: Option<CudaFunction>,
 
     // Q4Aligned + Q8_1 input dp4a kernels (NR=4).
     // Combines aligned int* nibble loads (20-byte blocks) with pre-quantized Q8_1 input.
@@ -1702,6 +1705,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_0_dp4a_t160: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
+            "matvec_q4_0_dp4a_t160",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_t160: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_t160: FAILED: {e}");
                 None
             }
         },
@@ -4233,6 +4249,24 @@ mod attention_decode_tiled_const_tests {
         assert_eq!(rmsnorm_q8_1_cta5_grid(5120, 1024) * 32, 160);
     }
 }
+
+/// `LUMEN_CUDA_Q4_RAW_EXACTK=1`: at K=5120 launch the raw Q4_0 dp4a matvec with 160
+/// threads (`matvec_q4_0_dp4a_t160`) instead of 256, dropping the three warps that own
+/// no block at that K. Default OFF. Read once per process.
+pub(crate) fn q4_raw_exactk_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_RAW_EXACTK").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Threads of `matvec_q4_0_dp4a_t160`; it is launched only when `in_dim / 32` equals
+/// this, the one K at which its accumulation order is the 256-thread kernel's.
+pub(crate) const DP4A_Q4_T160_BLOCK_DIM: u32 = 160;
 
 /// `LUMEN_CUDA_RMSNORM_Q8_CTA5=1`: launch the fused RMSNorm+Q8_1 quantization over
 /// `rmsnorm_q8_1_cta5_grid` CTAs instead of one. Default OFF (the single-block kernel).
