@@ -321,9 +321,9 @@ extern "C" __global__ void flash_attention_causal_br4(
     for (unsigned int d = lane; d < head_dim; d += FA_WARP_SIZE) {
         q_shmem[d] = q_head[d];
     }
-    // Need block sync since different warps write to different shmem regions
-    // and we read from our own region after this point.
-    __syncthreads();
+    // Each warp reads back only its own rows; the warps that own no query
+    // row have already returned.
+    __syncwarp(0xffffffff);
 
     // Initialize output
     for (unsigned int d = lane; d < head_dim; d += FA_WARP_SIZE) {
@@ -397,6 +397,9 @@ extern "C" __global__ void flash_attention_causal_br4(
 
         m_prev = m_new;
         l_prev = l_new;
+        // The next tile's scores overwrite slots a slower lane may still be
+        // summing.
+        __syncwarp(0xffffffff);
     }
 
     // Final normalization

@@ -15,12 +15,11 @@ use lumen_format::quantization::QuantScheme;
 
 /// Prefill full-attention P@V precision mode (diagnostic, no-op when unset).
 ///
-/// Mirrors CUDA's `LUMEN_CUDA_ATTN_PRECISE` (exact-F32 P@V attention variant).
+/// Selects an exact-F32 P@V attention variant.
 /// The default prefill P@V kernel `attention_output_tiled` truncates the softmax
 /// probabilities P and V to F16 simdgroup-matrix operands (F32 accumulate). Since
 /// P ∈ [0,1], the F16 mantissa cannot represent the near-1.0 dominant weight plus
-/// the small tail, distorting the V-weighted sum — the same mantissa defect the
-/// CUDA RCA localized to P@V.
+/// the small tail, distorting the V-weighted sum.
 ///
 /// `LUMEN_METAL_ATTN_PRECISE=2` routes the prefill P@V to the exact-F32 scalar
 /// kernel `attention_output_batched`, which accumulates `(float)P * (float)V` with

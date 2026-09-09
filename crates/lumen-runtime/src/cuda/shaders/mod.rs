@@ -216,15 +216,6 @@ pub const FLASH_ATTENTION_KERNEL_SOURCE: &str = include_str!("flash_attention.cu
 /// Causal row softmax for the tiled (SGEMM) prefill attention.
 pub const ATTN_SOFTMAX_CAUSAL_KERNEL_SOURCE: &str = include_str!("attn_softmax_causal.cu");
 
-/// Tensor-core Flash Attention v2 (WMMA via inline PTX, SM 80+).
-///
-/// Uses `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` for the QK^T and
-/// PV matrix multiplies, providing up to 16x throughput over scalar F32 on A100.
-/// Falls back to `flash_attention_f16_scalar` on SM < 80 (F16 storage, F32 compute).
-///
-/// Kernels: `flash_attention_wmma` (tensor core, Br=16), `flash_attention_f16_scalar` (F16 fallback).
-pub const FLASH_ATTENTION_WMMA_KERNEL_SOURCE: &str = include_str!("flash_attention_wmma.cu");
-
 /// Q8_0 v4 matvec: dp4a INT8 dot product + cooperative x quantization + K-tiling.
 /// NR=4 rows/block, 128 threads, 256-element K-tiles. Requires SM 6.1+ (dp4a).
 pub const MATVEC_Q8_0_V4_KERNEL_SOURCE: &str = include_str!("matvec_q8_0_v4.cu");

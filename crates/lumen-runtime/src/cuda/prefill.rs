@@ -247,7 +247,7 @@ pub(crate) fn alloc_prefill_scratch(
 
 /// The tiled prefill attention's score block, or `None` when the device
 /// refuses it: the refusal is printed once and costs that route, not the
-/// request, since mode 3 then runs on the scalar kernel. `None` in means a
+/// request, since the attention then runs on the scalar kernel. `None` in means a
 /// geometry the route cannot host (see [`attn_score_block_elems`]).
 pub(crate) fn alloc_attn_score_block(
     device: &CudaDevice,
@@ -2895,7 +2895,7 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 /// `cublasSetMathMode` with `CUBLAS_TF32_TENSOR_OP_MATH` (or building this
 /// through `cublasGemmEx` with a `_FAST_TF32` compute type) would silently
 /// break the exact-F32 contract these two calls stand on, and with it the
-/// precision policy the mode-3 default exists to enforce.**
+/// exact-F32 prefill attention.**
 ///
 /// # Evaluation order
 ///
@@ -2907,10 +2907,10 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 /// guarantees bit-wise reproducibility only within a toolkit version on a
 /// given architecture and SM count.
 ///
-/// Dispatched as `LUMEN_CUDA_ATTN_PRECISE` mode 3 on the fused Q+gate prefill
-/// path only (`attn_q_norm` present — every artifact today's converter
-/// produces: qwen35 / qwen35moe). A layer without per-head q/k norms takes the
-/// plain prefill dispatch, which keeps the WMMA/scalar kernels.
+/// Dispatched on the fused Q+gate prefill path only (`attn_q_norm` present —
+/// every artifact today's converter produces: qwen35 / qwen35moe). A layer
+/// without per-head q/k norms takes the plain prefill dispatch, which runs the
+/// scalar kernel.
 ///
 /// `scores` is the block `alloc_prefill_scratch` sized for this prefill; it
 /// is never allocated here (see the check below for why).
@@ -3181,277 +3181,6 @@ pub(crate) unsafe fn launch_flash_attention_br4(
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("flash_attention_br4 launch: {e}")))?;
 
-    Ok(())
-}
-
-/// Launch WMMA tensor-core Flash Attention for all tokens in a prefill batch.
-///
-/// Uses `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` for QK^T and PV
-/// matrix multiplies, providing up to 16x throughput over scalar F32 on A100.
-///
-/// Grid: (num_heads, ceil(batch / 16), 1)
-/// Block: (128, 1, 1) -- 4 warps of 32 threads
-///
-/// # Arguments
-///
-/// Same as `launch_flash_attention_br4`.
-///
-/// # Safety
-///
-/// Same as `launch_flash_attention_br4`.
-pub(crate) unsafe fn launch_flash_attention_wmma(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
-    attn_out: &mut CudaSlice<f32>,
-    batch: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    pos_start: usize,
-) -> Result<(), RuntimeError> {
-    use super::decode::{
-        flash_attention_wmma_block_size, flash_attention_wmma_shared_bytes, FA_TC_BR,
-    };
-
-    let q_dim = num_heads * head_dim;
-    let needed = batch * q_dim;
-    if q_batch.len() < needed {
-        return Err(RuntimeError::Compute(format!(
-            "flash_attention_wmma: q_batch too small: have {} elements, \
-             need {} (batch={batch}, q_dim={q_dim})",
-            q_batch.len(),
-            needed,
-        )));
-    }
-    if attn_out.len() < needed {
-        return Err(RuntimeError::Compute(format!(
-            "flash_attention_wmma: attn_out too small: have {} elements, \
-             need {} (batch={batch}, q_dim={q_dim})",
-            attn_out.len(),
-            needed,
-        )));
-    }
-
-    let block_size = flash_attention_wmma_block_size();
-    let shared_bytes = flash_attention_wmma_shared_bytes(head_dim as u32);
-    let q_tiles = (batch as u32 + FA_TC_BR - 1) / FA_TC_BR;
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (num_heads as u32, q_tiles, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: shared_bytes,
-    };
-
-    let batch_u32 = batch as u32;
-    let nh = num_heads as u32;
-    let nkvh = num_kv_heads as u32;
-    let hd = head_dim as u32;
-    let ps = pos_start as u32;
-    let msl = kv_cache.max_seq_len as u32;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    let wmma_fn = kernels.flash_attention_wmma.as_ref().ok_or_else(|| {
-        RuntimeError::Compute(
-            "flash_attention_wmma: kernel not available (SM 8.0+ required)".into(),
-        )
-    })?;
-
-    device
-        .stream
-        .launch_builder(wmma_fn)
-        .arg(q_batch)
-        .arg(&kv_cache.k_cache)
-        .arg(&kv_cache.v_cache)
-        .arg(attn_out)
-        .arg(&batch_u32)
-        .arg(&nh)
-        .arg(&nkvh)
-        .arg(&hd)
-        .arg(&ps)
-        .arg(&msl)
-        .arg(&scale)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma launch: {e}")))?;
-
-    Ok(())
-}
-
-/// Launch a precision-localization WMMA attention variant (qkf32 or pvf32).
-///
-/// `variant` selects the kernel/shared-bytes pair. Same buffer constraints and
-/// launch geometry as `launch_flash_attention_wmma`; only the per-tile matmul
-/// precision differs (see flash_attention_wmma.cu). Diagnostic-only.
-///
-/// # Safety
-/// Same as `launch_flash_attention_wmma`.
-pub(crate) unsafe fn launch_flash_attention_wmma_variant(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
-    attn_out: &mut CudaSlice<f32>,
-    batch: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    pos_start: usize,
-    qkf32: bool,
-) -> Result<(), RuntimeError> {
-    use super::decode::{
-        flash_attention_wmma_block_size, flash_attention_wmma_pvf32_shared_bytes,
-        flash_attention_wmma_qkf32_shared_bytes, FA_TC_BR,
-    };
-
-    let q_dim = num_heads * head_dim;
-    let needed = batch * q_dim;
-    if q_batch.len() < needed || attn_out.len() < needed {
-        return Err(RuntimeError::Compute(format!(
-            "flash_attention_wmma_variant: buffer too small (need {needed})"
-        )));
-    }
-
-    let block_size = flash_attention_wmma_block_size();
-    let shared_bytes = if qkf32 {
-        flash_attention_wmma_qkf32_shared_bytes(head_dim as u32)
-    } else {
-        flash_attention_wmma_pvf32_shared_bytes(head_dim as u32)
-    };
-    let q_tiles = (batch as u32 + FA_TC_BR - 1) / FA_TC_BR;
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (num_heads as u32, q_tiles, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: shared_bytes,
-    };
-
-    let batch_u32 = batch as u32;
-    let nh = num_heads as u32;
-    let nkvh = num_kv_heads as u32;
-    let hd = head_dim as u32;
-    let ps = pos_start as u32;
-    let msl = kv_cache.max_seq_len as u32;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    let kfn = if qkf32 {
-        kernels.flash_attention_wmma_qkf32.as_ref()
-    } else {
-        kernels.flash_attention_wmma_pvf32.as_ref()
-    }
-    .ok_or_else(|| {
-        RuntimeError::Compute("flash_attention_wmma_variant: kernel not available".into())
-    })?;
-
-    // Opt the variant kernel into its dynamic-smem requirement. NVRTC kernels
-    // default to a conservative max dynamic shared size; the qkf32 variant
-    // (~30 KB at head_dim=128) can exceed it, yielding CUDA_ERROR_INVALID_VALUE
-    // at launch. Raising the cap to exactly the requested bytes is the
-    // codebase-blessed pattern (cf. opt_in_attention_decode_dyn_shmem).
-    {
-        use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-        let setres = kfn.set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            shared_bytes as i32,
-        );
-        static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DBG.get_or_init(|| std::env::var("LUMEN_CUDA_ATTN_PRECISE_DBG").as_deref() == Ok("1")) {
-            eprintln!(
-                "[ATTNPRECISE] variant qkf32={qkf32} head_dim={head_dim} \
-                 shared_bytes={shared_bytes} batch={batch} num_heads={num_heads} \
-                 set_attr_ok={}",
-                setres.is_ok()
-            );
-        }
-    }
-
-    device
-        .stream
-        .launch_builder(kfn)
-        .arg(q_batch)
-        .arg(&kv_cache.k_cache)
-        .arg(&kv_cache.v_cache)
-        .arg(attn_out)
-        .arg(&batch_u32)
-        .arg(&nh)
-        .arg(&nkvh)
-        .arg(&hd)
-        .arg(&ps)
-        .arg(&msl)
-        .arg(&scale)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma_variant launch: {e}")))?;
-
-    Ok(())
-}
-
-/// Launch the split-F16 (hi+lo) WMMA attention fix. Same buffer constraints
-/// and geometry as `launch_flash_attention_wmma`; QK^T and P@V each run as 3
-/// F16 tensor-core MMAs over split operands, recovering ~20-bit mantissa.
-///
-/// # Safety
-/// Same as `launch_flash_attention_wmma`.
-pub(crate) unsafe fn launch_flash_attention_wmma_split(
-    device: &CudaDevice,
-    kernels: &KernelSet,
-    q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
-    attn_out: &mut CudaSlice<f32>,
-    batch: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    pos_start: usize,
-) -> Result<(), RuntimeError> {
-    use super::decode::{
-        flash_attention_wmma_block_size, flash_attention_wmma_split_shared_bytes, FA_TC_BR,
-    };
-    let q_dim = num_heads * head_dim;
-    let needed = batch * q_dim;
-    if q_batch.len() < needed || attn_out.len() < needed {
-        return Err(RuntimeError::Compute(format!(
-            "flash_attention_wmma_split: buffer too small (need {needed})"
-        )));
-    }
-    let block_size = flash_attention_wmma_block_size();
-    let shared_bytes = flash_attention_wmma_split_shared_bytes(head_dim as u32);
-    let q_tiles = (batch as u32 + FA_TC_BR - 1) / FA_TC_BR;
-    let launch_cfg = CudarcLaunchConfig {
-        grid_dim: (num_heads as u32, q_tiles, 1),
-        block_dim: (block_size, 1, 1),
-        shared_mem_bytes: shared_bytes,
-    };
-    let batch_u32 = batch as u32;
-    let nh = num_heads as u32;
-    let nkvh = num_kv_heads as u32;
-    let hd = head_dim as u32;
-    let ps = pos_start as u32;
-    let msl = kv_cache.max_seq_len as u32;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    let kfn = kernels.flash_attention_wmma_split.as_ref().ok_or_else(|| {
-        RuntimeError::Compute("flash_attention_wmma_split: kernel not available".into())
-    })?;
-    {
-        use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-        let _ = kfn.set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            shared_bytes as i32,
-        );
-    }
-    device
-        .stream
-        .launch_builder(kfn)
-        .arg(q_batch)
-        .arg(&kv_cache.k_cache)
-        .arg(&kv_cache.v_cache)
-        .arg(attn_out)
-        .arg(&batch_u32)
-        .arg(&nh)
-        .arg(&nkvh)
-        .arg(&hd)
-        .arg(&ps)
-        .arg(&msl)
-        .arg(&scale)
-        .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("flash_attention_wmma_split launch: {e}")))?;
     Ok(())
 }
 
