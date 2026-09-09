@@ -321,9 +321,9 @@ extern "C" __global__ void flash_attention_causal_br4(
     for (unsigned int d = lane; d < head_dim; d += FA_WARP_SIZE) {
         q_shmem[d] = q_head[d];
     }
-    // Need block sync since different warps write to different shmem regions
-    // and we read from our own region after this point.
-    __syncthreads();
+    // Each warp reads back only its own rows; the warps that own no query
+    // row have already returned.
+    __syncwarp(0xffffffff);
 
     // Initialize output
     for (unsigned int d = lane; d < head_dim; d += FA_WARP_SIZE) {
