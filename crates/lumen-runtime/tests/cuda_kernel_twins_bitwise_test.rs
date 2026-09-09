@@ -504,3 +504,145 @@ fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_at_the_context_shapes(
     tiled_attention_case(1300, 46);
     tiled_attention_case(2600, 47);
 }
+
+// ── attention_decode_splitk_partial + _merge across NVRTC targets ──────────────────────────
+
+fn splitk_ptx(arch: Option<&'static str>) -> cudarc::nvrtc::Ptx {
+    let src = lumen_runtime::cuda::shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE;
+    match arch {
+        None => compile_ptx(src).unwrap_or_else(|e| panic!("NVRTC compile failed: {e:?}")),
+        Some(a) => compile_ptx_with_opts(
+            src,
+            CompileOptions {
+                arch: Some(a),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("NVRTC compile failed ({a}): {e:?}")),
+    }
+}
+
+/// The pair as production launches it (`prefill::launch_attention_decode_splitk`): the partial
+/// over `num_heads * chunks` CTAs writing m/l/o scratch, then the merge over `num_heads` CTAs.
+/// Every partial scratch value and every merged output value must be bit-equal across targets.
+fn splitk_case(seq_len: u32, chunks: u32, seed: u64) {
+    let (ctx, stream) = create_context();
+    let (num_heads, num_kv_heads, head_dim, max_seq_len) = (24u32, 4u32, 256u32, 4096u32);
+    let block = 128u32;
+    let shared = (8 + 128 + head_dim) * 4;
+    let scale = 1.0f32 / 16.0;
+
+    let mut s = seed;
+    let q: Vec<f32> = (0..num_heads * head_dim)
+        .map(|_| rand_unit(&mut s))
+        .collect();
+    let cache = (num_kv_heads * max_seq_len * head_dim) as usize;
+    let k: Vec<f32> = (0..cache).map(|_| rand_unit(&mut s)).collect();
+    let v: Vec<f32> = (0..cache).map(|_| rand_unit(&mut s)).collect();
+    let q_gpu = stream.clone_htod(&q).unwrap();
+    let k_gpu = stream.clone_htod(&k).unwrap();
+    let v_gpu = stream.clone_htod(&v).unwrap();
+
+    let mut results: Vec<(String, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+    for (label, arch) in [
+        ("default", None),
+        ("compute_80", Some("compute_80")),
+        ("compute_120", Some("compute_120")),
+    ] {
+        let module = ctx
+            .load_module(splitk_ptx(arch))
+            .unwrap_or_else(|e| panic!("load split-K pair ({label}): {e:?}"));
+        let partial = module
+            .load_function("attention_decode_splitk_partial")
+            .unwrap();
+        let merge = module
+            .load_function("attention_decode_splitk_merge")
+            .unwrap();
+        let n_part = (num_heads * chunks) as usize;
+        let mut m_part: CudaSlice<f32> = stream.clone_htod(&vec![f32::NAN; n_part]).unwrap();
+        let mut l_part: CudaSlice<f32> = stream.clone_htod(&vec![f32::NAN; n_part]).unwrap();
+        let mut o_part: CudaSlice<f32> = stream
+            .clone_htod(&vec![f32::NAN; n_part * head_dim as usize])
+            .unwrap();
+        let mut out: CudaSlice<f32> = stream
+            .clone_htod(&vec![f32::NAN; (num_heads * head_dim) as usize])
+            .unwrap();
+        unsafe {
+            stream
+                .launch_builder(&partial)
+                .arg(&q_gpu)
+                .arg(&k_gpu)
+                .arg(&v_gpu)
+                .arg(&mut m_part)
+                .arg(&mut l_part)
+                .arg(&mut o_part)
+                .arg(&num_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&seq_len)
+                .arg(&max_seq_len)
+                .arg(&scale)
+                .arg(&chunks)
+                .launch(LaunchConfig {
+                    grid_dim: (num_heads * chunks, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: shared,
+                })
+                .unwrap();
+            stream
+                .launch_builder(&merge)
+                .arg(&m_part)
+                .arg(&l_part)
+                .arg(&o_part)
+                .arg(&mut out)
+                .arg(&num_heads)
+                .arg(&head_dim)
+                .arg(&chunks)
+                .launch(LaunchConfig {
+                    grid_dim: (num_heads, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        let o = stream.clone_dtoh(&out).unwrap();
+        assert!(
+            o.iter().all(|x| x.is_finite()),
+            "{label}: non-finite merged output at seq_len {seq_len}"
+        );
+        results.push((
+            label.to_string(),
+            stream.clone_dtoh(&m_part).unwrap(),
+            stream.clone_dtoh(&l_part).unwrap(),
+            stream.clone_dtoh(&o_part).unwrap(),
+            o,
+        ));
+    }
+    let base = &results[0];
+    for other in &results[1..] {
+        for (what, a, b) in [
+            ("m_part", &base.1, &other.1),
+            ("l_part", &base.2, &other.2),
+            ("o_part", &base.3, &other.3),
+            ("out", &base.4, &other.4),
+        ] {
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "seq_len {seq_len} chunks {chunks}: {what}[{i}] {} {y} != {} {x}",
+                    other.0,
+                    base.0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_decode_splitk_pair_is_bitwise_across_nvrtc_targets() {
+    splitk_case(330, 3, 51);
+    splitk_case(1300, 11, 52);
+    splitk_case(2600, 21, 53);
+    splitk_case(4096, 32, 54); // the chunk cap
+}
