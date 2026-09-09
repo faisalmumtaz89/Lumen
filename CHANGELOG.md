@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Prefill memory no longer grows with the prompt** — the batched prefill
+  allocated every per-token scratch buffer for the whole prompt at once (about
+  0.7–0.9 MB per token on the 27B dense model), so on a 32 GB card the longest
+  prompt it could take fell with the context length (about 11k tokens at a 12k
+  context, 5k at 16k) and a longer one failed in prefill with
+  `CUDA_ERROR_OUT_OF_MEMORY`. The prompt now runs through the layers in slices
+  of at most 2,048 tokens, every slice through one scratch sized for the slice;
+  the KV caches and the GDN recurrent state carry across slices as they do
+  across tokens. On the RTX 5090 at a 16k context a 15k-token prompt prefills
+  in about 1.9 GB of scratch where a 5k-token one used to fail. A prompt up to
+  2,048 tokens runs exactly as before; a longer one is computed in the same
+  arithmetic with different launch shapes, so its logits can differ from the
+  single-launch result at the last rounding digit.
+
 ## [0.26.0] — 2026-09-09
 
 ### Removed
