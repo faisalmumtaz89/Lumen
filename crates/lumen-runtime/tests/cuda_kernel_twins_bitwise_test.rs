@@ -1,12 +1,16 @@
 //! Device-side byte-identity tests for kernel twins that claim the ORIGINAL kernel's output
-//! bytes from a different launch geometry:
+//! bytes from a different launch geometry or a different compile target:
 //!
 //!   * `rmsnorm_to_q8_1_cta5` (ceil(blocks/warps) CTAs, one Q8_1 block per warp, the reduction
 //!     repeated per CTA) against `rmsnorm_to_q8_1` (one block), at dims 2048 / 4096 / 5120 and
 //!     a dim whose block count does not divide by the warp count;
+//!   * `rmsnorm_to_q8_1_cta5_normed` (the dual-output launch) against the plain `rmsnorm` and
+//!     `rmsnorm_to_q8_1` pair it replaces, at dims 2048 / 4096 / 5120 / 5152;
+//!   * `attention_decode_tiled` and the split-K pair compiled for NVRTC's default target,
+//!     `compute_80` and `compute_120`, against one another.
 //!
 //! Random inputs, the production compile options (the norm kernels at NVRTC's default target with
-//! no options, the dp4a family at the explicit `compute_80` target with the raw `--use_fast_math`), and a
+//! no options, the attention kernels at each target with the production options), and a
 //! bit-for-bit comparison of every output byte. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_kernel_twins_bitwise_test
@@ -38,7 +42,7 @@ fn rng_next(state: &mut u64) -> u64 {
 /// A uniform value in [-1, 1) with a full 24-bit mantissa, so a product of two such values is
 /// NOT exactly representable in f32 and `sum_sq += val * val` differs between a fused and an
 /// unfused multiply-add: a test input coarse enough to make `val * val` exact (9 bits) cannot
-/// tell the two apart (review 2026-09-09, MAJOR-3).
+/// tell the two apart.
 fn rand_unit(s: &mut u64) -> f32 {
     ((rng_next(s) & 0xff_ffff) as f32 / 8_388_608.0) - 1.0
 }

@@ -12,7 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Three opt-in arms retired after the Blackwell promotion** — the levers
   measured and not promoted in the round that shipped 0.25.0 go, with their
   kernels and flags: the 160-thread exact-K launch of the raw Q4_0 dp4a matvec
-  (`LUMEN_CUDA_Q4_RAW_EXACTK`, `matvec_q4_0_dp4a_t160`; below the claim floor),
+  (`LUMEN_CUDA_Q4_RAW_EXACTK`, `matvec_q4_0_dp4a_t160`; measured within the
+  run-to-run band, +0.24 % decode),
   the explicit NVRTC target for the split-K decode-attention pair
   (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`; measured slower at `compute_120`, the
   pair keeps NVRTC's default target), and the separate switch for the multi-CTA
