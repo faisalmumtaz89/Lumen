@@ -3795,10 +3795,10 @@ pub(crate) const ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN: u32 = 40_950;
 /// Inclusive ceiling on `seq_len` for the single-block `attention_decode`
 /// kernel.
 ///
-/// Kept as a public crate API even after because it documents the
-/// structural invariant that drives the gate threshold default
-/// ([`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`] sits ~10% below this value)
-/// and is the documented operator-facing constant in the tiled-decode
+/// Kept as a public crate API because it is the single-block kernel's
+/// structural ceiling ([`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`] is 0, so the
+/// tiled route serves every length by default and this ceiling binds only a
+/// forced single-block dispatch) and is the documented operator-facing constant in the tiled-decode
 /// acceptance criterion. Used in tests to verify the gate cutover falls
 /// inside the single-block kernel's serviceable range.
 #[allow(dead_code)]

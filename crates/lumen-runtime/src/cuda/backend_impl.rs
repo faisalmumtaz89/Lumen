@@ -11168,9 +11168,7 @@ unsafe fn launch_matvec(
                         .map(|f| (f, DP4A_Q4_BLOCK_DIM, "matvec_q4_aligned_q8_1")),
                     w as &CudaSlice<u8>,
                 ),
-                GpuWeightBuf::Q4Raw(w) => {
-                    (raw_q4_dp4a_kernel(kernels, in_dim), w as &CudaSlice<u8>)
-                }
+                GpuWeightBuf::Q4Raw(w) => (raw_q4_dp4a_kernel(kernels), w as &CudaSlice<u8>),
                 _ => unreachable!(),
             };
             if let Some((mv_fn, mv_block_dim, mv_name)) = mv_fn_opt {
@@ -12967,7 +12965,7 @@ unsafe fn launch_matvec_preq8_1(
             }
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
-            if let Some((mv_fn, block_dim, name)) = raw_q4_dp4a_kernel(kernels, in_dim) {
+            if let Some((mv_fn, block_dim, name)) = raw_q4_dp4a_kernel(kernels) {
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
@@ -14786,10 +14784,7 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
 
 /// The raw Q4_0 dp4a matvec a site launches, with its block size and name: `matvec_q4_0_dp4a`
 /// at 256 threads, `None` when it did not load.
-fn raw_q4_dp4a_kernel(
-    kernels: &KernelSet,
-    _in_dim: usize,
-) -> Option<(&CudaFunction, u32, &'static str)> {
+fn raw_q4_dp4a_kernel(kernels: &KernelSet) -> Option<(&CudaFunction, u32, &'static str)> {
     kernels
         .matvec_q4_0_dp4a
         .as_ref()

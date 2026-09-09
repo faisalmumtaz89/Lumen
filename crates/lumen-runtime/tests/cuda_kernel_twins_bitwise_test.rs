@@ -388,6 +388,8 @@ fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_at_the_context_shapes(
 }
 
 // ── attention_decode_splitk_partial + _merge across NVRTC targets ──────────────────────────
+// The pair ships at NVRTC's default target (an explicit compute_120 measured slower); this
+// keeps a future re-target a pure code-generation change, with the bits pinned in advance.
 
 fn splitk_ptx(arch: Option<&'static str>) -> cudarc::nvrtc::Ptx {
     let src = lumen_runtime::cuda::shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE;
