@@ -4479,7 +4479,11 @@ pub(crate) fn rmsnorm_q8_cta5_enabled() -> bool {
 /// `rmsnorm` + fused pair; implies the CTA5 route at every fused norm site. `=1` forces it on,
 /// `=0` off; unset resolves through [`crate::runtime_defaults::norm_cta5_dual_default`] (ON for
 /// a Q4_0 dense body on capability 12.x, the measured cell). Read once per process, at the
-/// first decode launch — after the backend has recorded the device capability.
+/// first decode launch — after the backend has recorded the device capability. Process-wide,
+/// like the capability and body-class hints it reads: a process that decodes one model on one
+/// device (the CLI and the server) resolves it once and correctly; a process that initialises a
+/// second model or device afterwards keeps the first resolution (and `rmsnorm_q8_cta5_enabled`
+/// keeps its implied one), so it must set the flag explicitly.
 pub(crate) fn norm_cta5_dual_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

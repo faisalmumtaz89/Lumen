@@ -16,7 +16,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   the one-CTA-per-head tiled kernel collapses at context and the pair is the
   difference between 60.7 and 79.4 tok/s at 1,024 tokens in / 128 out); the
   multi-CTA fused norm route with the dual-output launch at the GDN input norm
-  (`LUMEN_CUDA_NORM_CTA5_DUAL`, +4.10 % decode, byte-identical); and the tiled
+  (`LUMEN_CUDA_NORM_CTA5_DUAL`, +4.10 % decode, byte-identical); and, for that same body class, the tiled
   decode-attention kernel compiled for `compute_120` when NVRTC can emit it
   (`LUMEN_CUDA_ATTN_TILED_CODEGEN`, +9.6 % at 1,300 tokens on the tiled route,
   byte-identical; the same source is 2,520 instructions at compute_120 against

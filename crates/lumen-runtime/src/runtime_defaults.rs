@@ -1200,12 +1200,28 @@ pub fn attn_splitk_enabled() -> bool {
 /// dense bodies everywhere, Q4_0 dense bodies on compute capability 12.x,
 /// never MoE, all under the canonical-defaults master switch.
 pub fn attn_splitk_default() -> bool {
-    if model_is_moe() || !canonical_default_on() {
+    attn_splitk_default_for(
+        model_dense_quant(),
+        model_is_moe(),
+        device_cc_major(),
+        canonical_default_on(),
+    )
+}
+
+/// [`attn_splitk_default`] with every input explicit (the process wrappers feed the globals;
+/// tests feed values).
+pub fn attn_splitk_default_for(
+    quant: Option<QuantScheme>,
+    moe: bool,
+    cc_major: u8,
+    canonical: bool,
+) -> bool {
+    if moe || !canonical {
         return false;
     }
-    match model_dense_quant() {
+    match quant {
         Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16) => true,
-        Some(QuantScheme::Q4_0) => device_cc_major() == 12,
+        Some(QuantScheme::Q4_0) => cc_major == 12,
         _ => false,
     }
 }
@@ -1219,10 +1235,22 @@ pub fn attn_splitk_default() -> bool {
 /// not because it is known to be slow. Follows the canonical-defaults
 /// master switch; `=1` still forces it on anywhere.
 pub fn norm_cta5_dual_default() -> bool {
-    !model_is_moe()
-        && matches!(model_dense_quant(), Some(QuantScheme::Q4_0))
-        && device_cc_major() == 12
-        && canonical_default_on()
+    norm_cta5_dual_default_for(
+        model_dense_quant(),
+        model_is_moe(),
+        device_cc_major(),
+        canonical_default_on(),
+    )
+}
+
+/// [`norm_cta5_dual_default`] with every input explicit.
+pub fn norm_cta5_dual_default_for(
+    quant: Option<QuantScheme>,
+    moe: bool,
+    cc_major: u8,
+    canonical: bool,
+) -> bool {
+    !moe && matches!(quant, Some(QuantScheme::Q4_0)) && cc_major == 12 && canonical
 }
 
 /// The NVRTC target the tiled decode-attention kernel is compiled for when
@@ -1234,9 +1262,36 @@ pub fn norm_cta5_dual_default() -> bool {
 /// route, byte-identical (r3-025/028); the compute_80 control was null, so
 /// the gain is the target, not the recompile. Only this kernel: the GDN
 /// kernels grow at compute_120, so the policy is per kernel, not per process.
-/// Follows the canonical-defaults master switch.
+/// And only the measured cell — a Q4_0 dense body — like the other two
+/// promoted defaults: an MoE or Q8/BF16 model on the same card keeps NVRTC's
+/// default target until it is gated there. Follows the canonical-defaults
+/// master switch. Resolved at kernel compilation, after the CLI/server have
+/// recorded the model's body class and before the backend records the
+/// capability (which is why the capability is a parameter here).
 pub fn attn_tiled_codegen_default(cc_major: u8, nvrtc_can_target_120: bool) -> &'static str {
-    if cc_major == 12 && nvrtc_can_target_120 && canonical_default_on() {
+    attn_tiled_codegen_default_for(
+        model_dense_quant(),
+        model_is_moe(),
+        cc_major,
+        nvrtc_can_target_120,
+        canonical_default_on(),
+    )
+}
+
+/// [`attn_tiled_codegen_default`] with every input explicit.
+pub fn attn_tiled_codegen_default_for(
+    quant: Option<QuantScheme>,
+    moe: bool,
+    cc_major: u8,
+    nvrtc_can_target_120: bool,
+    canonical: bool,
+) -> &'static str {
+    if !moe
+        && matches!(quant, Some(QuantScheme::Q4_0))
+        && cc_major == 12
+        && nvrtc_can_target_120
+        && canonical
+    {
         "ptx120"
     } else {
         "default"
@@ -3622,8 +3677,11 @@ mod tests {
     }
 
     #[test]
-    fn tiled_codegen_defaults_to_compute_120_only_where_it_can_be_emitted() {
+    fn tiled_codegen_defaults_to_compute_120_only_for_the_measured_cell() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
         assert_eq!(attn_tiled_codegen_default(12, true), "ptx120");
         assert_eq!(
             attn_tiled_codegen_default(12, false),
@@ -3633,30 +3691,50 @@ mod tests {
         for cc in [0u8, 8, 9, 10, 13] {
             assert_eq!(attn_tiled_codegen_default(cc, true), "default", "cc {cc}.x");
         }
+        set_model_is_moe(true);
+        assert_eq!(
+            attn_tiled_codegen_default(12, true),
+            "default",
+            "MoE keeps NVRTC's default target"
+        );
+        set_model_is_moe(false);
+        set_model_primary_quant(QuantScheme::Q8_0);
+        assert_eq!(
+            attn_tiled_codegen_default(12, true),
+            "default",
+            "Q8_0 body is unmeasured"
+        );
+        reset_for_tests();
     }
 
     #[test]
     fn legacy_defaults_switch_off_every_promoted_default() {
-        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_tests();
-        set_model_primary_quant(QuantScheme::Q4_0);
-        set_model_is_moe(false);
-        set_device_cc_major(12);
-        let saved = std::env::var("LUMEN_CUDA_LEGACY_DEFAULTS").ok();
-        std::env::set_var("LUMEN_CUDA_LEGACY_DEFAULTS", "1");
-        // `legacy_defaults_enabled` is cached per process; a test process that already
-        // resolved it sees the cached value, so assert through the resolvers only when
-        // the cache agrees with the env just set.
-        if legacy_defaults_enabled() {
-            assert!(!attn_splitk_default());
-            assert!(!norm_cta5_dual_default());
-            assert_eq!(attn_tiled_codegen_default(12, true), "default");
-        }
-        match saved {
-            Some(v) => std::env::set_var("LUMEN_CUDA_LEGACY_DEFAULTS", v),
-            None => std::env::remove_var("LUMEN_CUDA_LEGACY_DEFAULTS"),
-        }
-        reset_for_tests();
+        // Through the explicit-input resolvers: the process-wide legacy cache cannot be toggled
+        // inside one test process without leaking into its siblings.
+        let q4 = Some(QuantScheme::Q4_0);
+        assert!(attn_splitk_default_for(q4, false, 12, true));
+        assert!(
+            !attn_splitk_default_for(q4, false, 12, false),
+            "legacy switch: split-K off"
+        );
+        assert!(norm_cta5_dual_default_for(q4, false, 12, true));
+        assert!(
+            !norm_cta5_dual_default_for(q4, false, 12, false),
+            "legacy switch: dual norm off"
+        );
+        assert_eq!(
+            attn_tiled_codegen_default_for(q4, false, 12, true, true),
+            "ptx120"
+        );
+        assert_eq!(
+            attn_tiled_codegen_default_for(q4, false, 12, true, false),
+            "default",
+            "legacy switch: default target"
+        );
+        assert!(
+            !attn_splitk_default_for(Some(QuantScheme::Q8_0), false, 8, false),
+            "legacy switch: Q8 pair off too"
+        );
     }
 
     #[test]
