@@ -7,7 +7,7 @@
 //!   * `matvec_q4_0_dp4a_t160` (160 threads at K=5120) against `matvec_q4_0_dp4a` (256).
 //!
 //! Random inputs, the production compile options (the norm kernels at NVRTC's default target with
-//! no options, the dp4a family at the device's `dp4a_arch` with the raw `--use_fast_math`), and a
+//! no options, the dp4a family at the explicit `compute_80` target with the raw `--use_fast_math`), and a
 //! bit-for-bit comparison of every output byte. Requires a CUDA GPU:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_kernel_twins_bitwise_test
@@ -24,24 +24,18 @@ fn compile_norm(src: &str) -> cudarc::nvrtc::Ptx {
 }
 
 /// The dp4a family as production loads it (`decode::load_fn_sm80_fast_math` ->
-/// `ffi::compile_and_load_with_arch_fast_math`): the target `CudaDevice::dp4a_arch` picks for
-/// THIS device from the loaded toolkit, and the raw `--use_fast_math` flag (cudarc's
-/// `use_fast_math` field would add only `--fmad=true`).
+/// `ffi::compile_and_load_with_arch_fast_math`): the explicit `compute_80` target and the raw
+/// `--use_fast_math` flag (cudarc's `use_fast_math` field would add only `--fmad=true`).
 fn compile_dp4a(src: &str) -> cudarc::nvrtc::Ptx {
-    let arch = lumen_runtime::cuda::ffi::CudaDevice::new(0)
-        .expect("CUDA device")
-        .dp4a_arch()
-        .expect("NVRTC target query")
-        .expect("this device runs the dp4a family");
     compile_ptx_with_opts(
         src,
         CompileOptions {
-            arch: Some(arch),
+            arch: Some("compute_80"),
             options: vec!["--use_fast_math".to_string()],
             ..Default::default()
         },
     )
-    .unwrap_or_else(|e| panic!("NVRTC compile failed ({arch}): {e:?}"))
+    .unwrap_or_else(|e| panic!("NVRTC compile failed (compute_80): {e:?}"))
 }
 
 fn create_context() -> (Arc<CudaContext>, Arc<CudaStream>) {
