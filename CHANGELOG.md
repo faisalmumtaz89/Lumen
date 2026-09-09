@@ -20,23 +20,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   not Q4_0, Q8_0 or BF16 (a locally converted F16 or K-quant artifact). Every
   registry model already took the exact route, and its output is unchanged.
   The F16 kernels built their `m16n8k16` A fragments from a layout table that
-  swaps two of the four registers, in both the score and the value products
-  of all four kernels; with equal scores, query 0 of a 16-row tile at
-  position 0 read the value stored at position 8, a key from its future. The
-  callers named above now get exact attention, allocate the tiled route's
-  score block (about 100 MB at a 12k-token prompt, refused gracefully to the
-  scalar kernel), and lose the tensor-core prefill; an environment that sets
+  swaps two of the four registers, at every tensor-core product of all four
+  kernels (both products of the default and split kernels, the one product
+  each half-exact kernel kept on tensor cores); with equal scores, query 0 of
+  a 16-row tile at position 0 read the value stored at position 8, a key from
+  its future. The callers named above now get exact attention, allocate the
+  tiled route's score block when that route is selected (group × min(prompt,
+  512) × keys × 4 bytes, refused gracefully to the scalar kernel), and lose
+  the tensor-core prefill; an environment that sets
   either variable now sets an unknown one, which the CLI and server report at
-  startup. The scalar kernel's barrier after its query load is a warp barrier:
-  each warp reads back only its own rows. Tests hold that kernel to exact
-  causality at tile edges under grouped-query attention, and to a reference
-  across key tiles.
+  startup. Tests hold the scalar kernel to exact causality at tile edges
+  under grouped-query attention, and to a reference across key tiles.
 
 ### Fixed
 
-- **The scalar prefill attention kernel's key-tile loop ends with a warp
-  barrier** — a lane that had finished a tile's weighted sum could write the
-  next tile's score into a slot a slower lane was still reading; the
+- **The scalar prefill attention kernel synchronises its warps, not its
+  block** — the block barrier after its query load sat in code the warps
+  without a query row had already left; each warp reads back only its own
+  rows, so it is a warp barrier now. The key-tile loop ends with another: a
+  lane that had finished a tile's weighted sum could write the next tile's
+  score or padding into a slot a slower lane was still reading. The
   sanitizer's race check reported ten such hazards on the kernel and reports
   none now. Output is unchanged.
 

@@ -15,7 +15,7 @@ use lumen_runtime::cuda::shaders::FLASH_ATTENTION_KERNEL_SOURCE;
 
 const NUM_HEADS: u32 = 4;
 const NUM_KV_HEADS: u32 = 2;
-const HEAD_DIM: u32 = 64;
+const HEAD_DIM: u32 = 128;
 const MAX_SEQ_LEN: u32 = 96;
 const FA_BC: u32 = 32;
 const FA_BR: u32 = 4;
@@ -34,8 +34,8 @@ const CASES: [(u32, u32); 7] = [
 
 const _: () = {
     assert!(
-        HEAD_DIM <= MAX_SEQ_LEN,
-        "the one-hot fill covers every allowed key"
+        MAX_SEQ_LEN <= HEAD_DIM,
+        "every key has its own marker dimension"
     );
     let mut i = 0;
     while i < CASES.len() {
@@ -120,7 +120,7 @@ fn scalar_kernel_is_causal() {
     let k = vec![0.0f32; NUM_KV_HEADS as usize * kv_len];
     let mut v = vec![0.0f32; k.len()];
     for kv in 0..NUM_KV_HEADS {
-        for p in 0..MAX_SEQ_LEN.min(HEAD_DIM) {
+        for p in 0..MAX_SEQ_LEN {
             v[kv as usize * kv_len + (p * HEAD_DIM + p) as usize] = (kv + 1) as f32;
         }
     }

@@ -182,7 +182,7 @@ pub fn set_model_primary_quant(scheme: QuantScheme) {
 /// Reports the EXACT primary/bulk model quant scheme recorded by
 /// `set_model_primary_quant`, or `None` if the setter was never called (legacy
 /// caller / no LBC opened). Used by the per-quant resolvers to distinguish
-/// Q4_0 from Q8_0 within the 27B (64-layer) dense class. One relaxed atomic
+/// Q4_0 from Q8_0. One relaxed atomic
 /// load + a `from_u8` decode.
 pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     let tag = MODEL_PRIMARY_QUANT_SCHEME.load(Ordering::Relaxed);
@@ -203,9 +203,9 @@ pub fn model_dense_quant_pub() -> Option<QuantScheme> {
 
 /// Records the loaded model's transformer block count (9B = 32 layers,
 /// 27B = 64). Called from the CLI / server alongside `set_model_dense_quant`.
-/// This is the model-SIZE discriminator: 9B and 27B are otherwise
-/// indistinguishable to the resolvers (both dense + same quant hints).
-/// 0 = never set.
+/// 9B and 27B are otherwise indistinguishable to the resolvers (both dense +
+/// same quant hints); no shipped default depends on the count today, so it
+/// is recorded for a class that later evidence splits by size. 0 = never set.
 pub fn set_model_block_count(num_layers: u32) {
     MODEL_BLOCK_COUNT.store(num_layers, Ordering::Relaxed);
 }
@@ -701,8 +701,8 @@ pub fn gdn_ab_f16_default() -> bool {
 /// since been removed; prefill attention is exact F32 throughout now.
 /// Set `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL=0|1` to override either way.
 pub fn gdn_decode_via_prefill_default() -> bool {
-    // The factored form names the classes that were measured separately;
-    // every term is on. CUDA-only: the sole consumer is
+    // Every term is on, so this returns true on every path; the factored form
+    // names the classes that were measured separately. CUDA-only: the sole consumer is
     // `gdn_decode_via_prefill_enabled()` in `cuda/backend_impl.rs`; Metal runs
     // its own GDN decode path and never reads this resolver or the variable.
     let dense_bf16 = MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16;
