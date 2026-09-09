@@ -135,6 +135,16 @@ impl CudaDevice {
         Ok(dp4a_arch_for(major * 10 + minor, &supported))
     }
 
+    /// Whether the loaded NVRTC lists `compute_<cc>` among its targets (`cc` as
+    /// `major * 10 + minor`, e.g. 120). A failed query is `false`: a default
+    /// that keys on this then stays on NVRTC's default target rather than
+    /// asking for one the toolkit cannot emit.
+    pub fn nvrtc_can_target(&self, cc: i32) -> bool {
+        nvrtc_supported_archs()
+            .map(|archs| archs.contains(&cc))
+            .unwrap_or(false)
+    }
+
     /// Compile CUDA source targeting a specific SM architecture.
     ///
     /// Used for kernels requiring specific hardware features (e.g., tensor cores

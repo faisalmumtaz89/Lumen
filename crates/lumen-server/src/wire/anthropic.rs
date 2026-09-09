@@ -889,7 +889,7 @@ pub async fn collect_messages(
     let mut completion_tokens = 0usize;
     let mut finish = FinishReason::Stop;
     // Bench surface (LUMEN_BENCH_TOKEN_IDS): (generated ids, eos set).
-    let mut bench_ids: Option<(Vec<u32>, Vec<u32>)> = None;
+    let mut bench_ids: Option<super::openai::BenchRecord> = None;
 
     while let Some(evt) = rx.recv().await {
         match evt {
@@ -897,8 +897,9 @@ pub async fn collect_messages(
             TokenEvent::BenchTokenIds {
                 generated_token_ids,
                 eos_token_ids,
+                top2,
             } => {
-                bench_ids = Some((generated_token_ids, eos_token_ids));
+                bench_ids = Some((generated_token_ids, eos_token_ids, top2));
             }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);

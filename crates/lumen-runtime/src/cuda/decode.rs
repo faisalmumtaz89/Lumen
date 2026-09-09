@@ -198,6 +198,9 @@ pub(crate) struct KernelSet {
     // availability — though eligible automatic selections may still be
     // served by the split-K pair.
     pub(crate) attention_decode_tiled: Option<CudaFunction>,
+    /// Which NVRTC target `attention_decode_tiled` was compiled for (`attn_tiled_codegen`), so
+    /// the dispatch announces the compiled variant it actually runs.
+    pub(crate) attention_decode_tiled_codegen: &'static str,
 
     // Split-K decode-attention pair (sequence-parallel twin of the tiled
     // kernel, `LUMEN_CUDA_ATTN_SPLITK` — model-aware default: ON for Q8_0-
@@ -205,6 +208,8 @@ pub(crate) struct KernelSet {
     // the split-K route to dispatch.
     pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
     pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
+    /// Which NVRTC target the split-K pair was compiled for (`attn_splitk_codegen`).
+    pub(crate) attention_decode_splitk_codegen: &'static str,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
     #[allow(dead_code)]
@@ -468,6 +473,9 @@ pub(crate) struct KernelSet {
     // NR=4 rows/block, 256 threads. SM 6.1+.
     pub(crate) matvec_q4_0_dp4a: Option<CudaFunction>,
     pub(crate) matvec_q4_0_dp4a_residual: Option<CudaFunction>,
+    // matvec_q4_0_dp4a at exact K: 160 threads for K=5120 (the three idle warps of the
+    // 256-thread launch removed), byte-identical there. LUMEN_CUDA_Q4_RAW_EXACTK=1.
+    pub(crate) matvec_q4_0_dp4a_t160: Option<CudaFunction>,
 
     // Q4Aligned + Q8_1 input dp4a kernels (NR=4).
     // Combines aligned int* nibble loads (20-byte blocks) with pre-quantized Q8_1 input.
@@ -701,6 +709,13 @@ pub(crate) struct KernelSet {
     // rmsnorm_to_q8_1: RMSNorm + Q8_1 quantize in one kernel.
     // Replaces rmsnorm + quantize_f32_to_q8_1 at 2 sites/layer (attn_norm, ffn_norm).
     pub(crate) rmsnorm_to_q8_1: Option<CudaFunction>,
+    // rmsnorm_to_q8_1_cta5: the same fusion over ceil(blocks/warps) CTAs, one Q8_1 block per
+    // warp; each CTA repeats the reduction. Byte-identical output. LUMEN_CUDA_RMSNORM_Q8_CTA5=1.
+    pub(crate) rmsnorm_to_q8_1_cta5: Option<CudaFunction>,
+    // rmsnorm_to_q8_1_cta5_normed: the CTA5 fusion that also writes the normalized F32
+    // vector, replacing the plain rmsnorm + fused pair at the GDN input norm.
+    // LUMEN_CUDA_NORM_CTA5_DUAL=1 (implies the CTA5 route at every fused norm site).
+    pub(crate) rmsnorm_to_q8_1_cta5_normed: Option<CudaFunction>,
 
     // Qwen3.5 Q+gate fusion kernels (full-attention layers only).
     // deinterleave_qgate: Split [Q_h0, gate_h0, Q_h1, gate_h1, ...] -> Q + gate.
@@ -916,6 +931,66 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
+    // The tiled decode-attention kernel at the target `LUMEN_CUDA_ATTN_TILED_CODEGEN` selects,
+    // or the per-device default (compute_120 on capability 12.x when NVRTC can emit it, NVRTC's
+    // default elsewhere). Same source, same math options; only the code generation differs.
+    let tiled_codegen = {
+        let cc_major = device
+            .compute_capability()
+            .map(|(major, _)| major.clamp(0, 255) as u8)
+            .unwrap_or(0);
+        attn_tiled_codegen_selection(cc_major, device.nvrtc_can_target(120))
+    };
+    // An explicit target the toolkit or driver refuses falls back to NVRTC's default target —
+    // the pre-promotion build — rather than leaving the kernel absent; the fallback is announced
+    // and the KernelSet records the target that actually loaded.
+    let tiled_codegen = std::cell::Cell::new(tiled_codegen);
+    let load_tiled = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
+        let selected = tiled_codegen.get();
+        let module = match selected {
+            "ptx80" | "ptx120" => {
+                let arch = attn_tiled_codegen_target(selected);
+                match device.compile_and_load_with_arch(source, arch) {
+                    Ok(m) => {
+                        cuda_log!("[CUDA] {name}: compiled for {arch}");
+                        m
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
+                        );
+                        tiled_codegen.set("default");
+                        device.compile_and_load(source)?
+                    }
+                }
+            }
+            _ => device.compile_and_load(source)?,
+        };
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+    };
+
+    // The split-K decode-attention pair at the target `LUMEN_CUDA_ATTN_SPLITK_CODEGEN` selects,
+    // the same way. Both kernels of the pair come from one source and one target.
+    let splitk_codegen = attn_splitk_codegen();
+    let load_splitk = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
+        let module = match splitk_codegen {
+            "ptx80" => device.compile_and_load_with_arch(source, "compute_80")?,
+            "ptx120" => device.compile_and_load_with_arch(source, "compute_120")?,
+            _ => device.compile_and_load(source)?,
+        };
+        if splitk_codegen != "default" {
+            cuda_log!(
+                "[CUDA] {name}: compiled for {}",
+                attn_tiled_codegen_target(splitk_codegen)
+            );
+        }
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+    };
+
     // For kernels needing SM 80+ features (dp4a, WMMA tensor cores).
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch(source, "compute_80")?;
@@ -966,7 +1041,27 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         })
     };
 
+    // The tiled kernel loads before the KernelSet records its target, so a fallback inside
+    // `load_tiled` is what the announcements report.
+    let attention_decode_tiled = match load_tiled(
+        shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
+        "attention_decode_tiled",
+    ) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            cuda_log!(
+                "[CUDA] attention_decode_tiled: FAILED ({e}); \
+                 long-context decode (seq_len > {}) will error at dispatch \
+                 (eligible automatic calls may use split-K)",
+                ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
+            );
+            None
+        }
+    };
+
     let kernels = KernelSet {
+        attention_decode_tiled_codegen: tiled_codegen.get(),
+        attention_decode_splitk_codegen: splitk_codegen,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
@@ -1033,23 +1128,9 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // Optional: log a warning if NVRTC compile fails so the gate sees
         // the unavailability and operators learn the long-context path is
         // disabled on this device.
-        attention_decode_tiled: match load_fn(
-            shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-            "attention_decode_tiled",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!(
-                    "[CUDA] attention_decode_tiled: FAILED ({e}); \
-                     long-context decode (seq_len > {}) will error at dispatch \
-                     (eligible automatic calls may use split-K)",
-                    ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
-                );
-                None
-            }
-        },
+        attention_decode_tiled,
         attention_decode_splitk_partial: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_fn(
+            match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
                 "attention_decode_splitk_partial",
             ) {
@@ -1063,7 +1144,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             None
         },
         attention_decode_splitk_merge: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_fn(
+            match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
                 "attention_decode_splitk_merge",
             ) {
@@ -1699,6 +1780,19 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] matvec_q4_0_dp4a_residual: FAILED: {e}");
+                None
+            }
+        },
+        matvec_q4_0_dp4a_t160: match load_fn_sm80_fast_math(
+            shaders::MATVEC_Q4_0_DP4A_KERNEL_SOURCE,
+            "matvec_q4_0_dp4a_t160",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_t160: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] matvec_q4_0_dp4a_t160: FAILED: {e}");
                 None
             }
         },
@@ -2556,6 +2650,32 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             }
             Err(e) => {
                 cuda_log!("[CUDA] rmsnorm_to_q8_1: FAILED: {e}");
+                None
+            }
+        },
+        rmsnorm_to_q8_1_cta5: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_cta5",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5: FAILED: {e}");
+                None
+            }
+        },
+        rmsnorm_to_q8_1_cta5_normed: match load_fn(
+            shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
+            "rmsnorm_to_q8_1_cta5_normed",
+        ) {
+            Ok(f) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5_normed: OK");
+                Some(f)
+            }
+            Err(e) => {
+                cuda_log!("[CUDA] rmsnorm_to_q8_1_cta5_normed: FAILED: {e}");
                 None
             }
         },
@@ -4203,6 +4323,203 @@ mod attention_decode_tiled_const_tests {
     fn tc_equals_block_dim_for_one_lane_per_position() {
         assert_eq!(ATTN_DECODE_TILED_T_C, ATTN_DECODE_TILED_BLOCK_DIM);
     }
+
+    #[test]
+    fn tiled_codegen_selection_names_its_target_and_route() {
+        use super::{attention_decode_tiled_route_name, attn_tiled_codegen_target};
+        assert_eq!(attn_tiled_codegen_target("default"), "default");
+        assert_eq!(attn_tiled_codegen_target("ptx80"), "compute_80");
+        assert_eq!(attn_tiled_codegen_target("ptx120"), "compute_120");
+        assert_eq!(
+            attention_decode_tiled_route_name("default"),
+            "attention_decode_tiled"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("ptx80"),
+            "attention_decode_tiled_ptx80"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("ptx120"),
+            "attention_decode_tiled_ptx120"
+        );
+        assert_eq!(
+            attention_decode_tiled_route_name("anything"),
+            "attention_decode_tiled"
+        );
+        use super::attention_decode_splitk_route_names;
+        assert_eq!(
+            attention_decode_splitk_route_names("ptx120"),
+            (
+                "attention_decode_splitk_partial_ptx120",
+                "attention_decode_splitk_merge_ptx120"
+            )
+        );
+        assert_eq!(
+            attention_decode_splitk_route_names("default"),
+            (
+                "attention_decode_splitk_partial",
+                "attention_decode_splitk_merge"
+            )
+        );
+    }
+
+    /// 5120/32 = 160 Q8_1 blocks over 1024/32 = 32 warps = 5 CTAs (the name); 4096 → 4,
+    /// 2048 → 2; a dim that does not divide evenly rounds up so no block is left unwritten.
+    #[test]
+    fn rmsnorm_q8_1_cta5_grid_covers_every_block() {
+        use super::{rmsnorm_block_size, rmsnorm_q8_1_cta5_grid};
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, rmsnorm_block_size(5120)), 5);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(4096, rmsnorm_block_size(4096)), 4);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(2048, rmsnorm_block_size(2048)), 2);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(1024, rmsnorm_block_size(1024)), 1);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5152, 1024), 6);
+        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, 1024) * 32, 160);
+    }
+}
+
+/// `LUMEN_CUDA_ATTN_TILED_CODEGEN`: the NVRTC target `attention_decode_tiled` is compiled for —
+/// `ptx80` (compute_80), `ptx120` (compute_120) or `default` (NVRTC's default target); unset
+/// resolves per device through [`crate::runtime_defaults::attn_tiled_codegen_default`]:
+/// compute_120 on a capability-12.x device whose NVRTC can emit it, NVRTC's default elsewhere.
+/// The kernel source and math options are unchanged; only the generated code differs (NVRTC
+/// 13.3 emits a 3632-instruction kernel at its default sm_75 target and a 2520-instruction one
+/// at compute_120 for the same source). Resolved once, at kernel compilation, from the device
+/// being compiled for; the selection is kept on the `KernelSet` for the dispatch announcements.
+pub(crate) fn attn_tiled_codegen_selection(
+    cc_major: u8,
+    nvrtc_can_target_120: bool,
+) -> &'static str {
+    match std::env::var("LUMEN_CUDA_ATTN_TILED_CODEGEN")
+        .ok()
+        .as_deref()
+    {
+        Some("ptx80") => "ptx80",
+        Some("ptx120") => "ptx120",
+        // the kill-switch spellings every default-ON knob honours, and the explicit word
+        Some("default") | Some("0") | Some("off") | Some("false") | Some("no") => "default",
+        _ => crate::runtime_defaults::attn_tiled_codegen_default(cc_major, nvrtc_can_target_120),
+    }
+}
+
+/// `LUMEN_CUDA_ATTN_SPLITK_CODEGEN`: the NVRTC target the split-K decode-attention pair
+/// (`attention_decode_splitk_partial` + `_merge`) is compiled for — `ptx80` / `ptx120`, else
+/// NVRTC's default. Same rule and reason as `attn_tiled_codegen` (NVRTC 13.3: 4264 instructions
+/// for the pair at the default target, 3496 at compute_120). Default OFF. Read once per process.
+pub(crate) fn attn_splitk_codegen() -> &'static str {
+    use std::sync::OnceLock;
+    static SEL: OnceLock<&'static str> = OnceLock::new();
+    SEL.get_or_init(|| {
+        match std::env::var("LUMEN_CUDA_ATTN_SPLITK_CODEGEN")
+            .ok()
+            .as_deref()
+        {
+            Some("ptx80") => "ptx80",
+            Some("ptx120") => "ptx120",
+            _ => "default",
+        }
+    })
+}
+
+/// The route identifiers the split-K dispatch announces for a codegen selection: the plain
+/// pair on the default target, suffixed names for an explicit target — both kernels, since the
+/// census harvests the merge kernel off the `merge=` field.
+pub(crate) fn attention_decode_splitk_route_names(codegen: &str) -> (&'static str, &'static str) {
+    match codegen {
+        "ptx80" => (
+            "attention_decode_splitk_partial_ptx80",
+            "attention_decode_splitk_merge_ptx80",
+        ),
+        "ptx120" => (
+            "attention_decode_splitk_partial_ptx120",
+            "attention_decode_splitk_merge_ptx120",
+        ),
+        _ => (
+            "attention_decode_splitk_partial",
+            "attention_decode_splitk_merge",
+        ),
+    }
+}
+
+/// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
+pub(crate) fn attn_tiled_codegen_target(codegen: &str) -> &'static str {
+    match codegen {
+        "ptx80" => "compute_80",
+        "ptx120" => "compute_120",
+        _ => "default",
+    }
+}
+
+/// The route identifier the tiled dispatch announces for a codegen selection: the plain kernel
+/// name on the default target, a suffixed one for an explicit target, so the census can tell
+/// the compiled variants apart (the CUDA symbol is the same in all three).
+pub(crate) fn attention_decode_tiled_route_name(codegen: &str) -> &'static str {
+    match codegen {
+        "ptx80" => "attention_decode_tiled_ptx80",
+        "ptx120" => "attention_decode_tiled_ptx120",
+        _ => "attention_decode_tiled",
+    }
+}
+
+/// `LUMEN_CUDA_Q4_RAW_EXACTK=1`: at K=5120 launch the raw Q4_0 dp4a matvec with 160
+/// threads (`matvec_q4_0_dp4a_t160`) instead of 256, dropping the three warps that own
+/// no block at that K. Default OFF. Read once per process.
+pub(crate) fn q4_raw_exactk_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_Q4_RAW_EXACTK").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Threads of `matvec_q4_0_dp4a_t160`; it is launched only when `in_dim / 32` equals
+/// this, the one K at which its accumulation order is the 256-thread kernel's.
+pub(crate) const DP4A_Q4_T160_BLOCK_DIM: u32 = 160;
+
+/// `LUMEN_CUDA_RMSNORM_Q8_CTA5=1`: launch the fused RMSNorm+Q8_1 quantization over
+/// `rmsnorm_q8_1_cta5_grid` CTAs instead of one. Default OFF (the single-block kernel).
+/// Read once per process.
+pub(crate) fn rmsnorm_q8_cta5_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("LUMEN_CUDA_RMSNORM_Q8_CTA5").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        ) || norm_cta5_dual_enabled()
+    })
+}
+
+/// `LUMEN_CUDA_NORM_CTA5_DUAL`: at the GDN input norm, one `rmsnorm_to_q8_1_cta5_normed`
+/// launch writes both the normalized F32 vector and the Q8_1 blocks, replacing the plain
+/// `rmsnorm` + fused pair; implies the CTA5 route at every fused norm site. `=1` forces it on,
+/// `=0` off; unset resolves through [`crate::runtime_defaults::norm_cta5_dual_default`] (ON for
+/// a Q4_0 dense body on capability 12.x, the measured cell). Read once per process, at the
+/// first decode launch — after the backend has recorded the device capability. Process-wide,
+/// like the capability and body-class hints it reads: a process that decodes one model on one
+/// device (the CLI and the server) resolves it once and correctly; a process that initialises a
+/// second model or device afterwards keeps the first resolution (and `rmsnorm_q8_cta5_enabled`
+/// keeps its implied one), so it must set the flag explicitly.
+pub(crate) fn norm_cta5_dual_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(
+        || match std::env::var("LUMEN_CUDA_NORM_CTA5_DUAL").ok().as_deref() {
+            Some("1") | Some("true") | Some("yes") | Some("on") => true,
+            Some("0") | Some("false") | Some("no") | Some("off") => false,
+            _ => crate::runtime_defaults::norm_cta5_dual_default(),
+        },
+    )
+}
+
+/// Grid for `rmsnorm_to_q8_1_cta5`: one CTA per `block_size / 32` Q8_1 blocks, so every warp
+/// quantizes at most one block. `dim` is a multiple of 32; `block_size` a multiple of 32.
+pub(crate) fn rmsnorm_q8_1_cta5_grid(dim: usize, block_size: u32) -> u32 {
+    let blocks = (dim / 32) as u32;
+    let warps = (block_size / 32).max(1);
+    blocks.div_ceil(warps).max(1)
 }
 
 /// Block size for RMSNorm: use min(dim, 1024), rounded down to a multiple of 32.

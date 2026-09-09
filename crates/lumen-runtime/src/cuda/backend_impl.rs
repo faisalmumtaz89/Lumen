@@ -2613,15 +2613,13 @@ impl CudaBackend {
                             );
                         }
                     }
-                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (fused_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_ATTN_NORM,
+                        "attn_norm",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -3811,15 +3809,13 @@ impl CudaBackend {
             {
                 // 1. Fused RMSNorm + Q8_1 quantize: attn_proj -> shared q8_1 buffer.
                 {
-                    let rms_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (rms_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_FFN_NORM_GLU,
+                        "ffn_norm_glu",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -4577,15 +4573,13 @@ impl CudaBackend {
 
                 // Fused RMSNorm + Q8_1 for FFN: saves 1 dispatch per layer.
                 if ffn_use_preq && st.kernels.rmsnorm_to_q8_1.is_some() {
-                    let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
+                    let (fused_fn, launch_cfg) = rmsnorm_q8_1_launch(
+                        &st.kernels,
+                        hidden_dim,
+                        &RMSNORM_Q8_SEEN_FFN_NORM,
+                        "ffn_norm",
+                    );
                     let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-                    let block_size = rmsnorm_block_size(hidden_dim);
-                    let shared_bytes = rmsnorm_shared_bytes(block_size);
-                    let launch_cfg = CudarcLaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (block_size, 1, 1),
-                        shared_mem_bytes: shared_bytes,
-                    };
                     let dim = hidden_dim as u32;
                     unsafe {
                         self.device
@@ -6010,7 +6004,15 @@ impl CudaBackend {
             // — negligible cost. Done BEFORE the `q8_1_buf` mutable borrow so
             // the two scratch fields are accessed sequentially. F32 source
             // gates (gdn_ab_f32) need the same F32 `normed` for their SGEMVs.
-            if gdn_ab_f16 || gdn_ab_f32 {
+            // LUMEN_CUDA_NORM_CTA5_DUAL: the one CTA5 launch that writes both `normed` and
+            // the Q8_1 blocks, in place of the plain rmsnorm + fused pair. Same reduction,
+            // same normalize expression, same quantization => both outputs byte-identical.
+            let dual_fn = if (gdn_ab_f16 || gdn_ab_f32) && super::decode::norm_cta5_dual_enabled() {
+                st.kernels.rmsnorm_to_q8_1_cta5_normed.as_ref()
+            } else {
+                None
+            };
+            if (gdn_ab_f16 || gdn_ab_f32) && dual_fn.is_none() {
                 let block_size = rmsnorm_block_size(hidden_dim);
                 let shared_bytes = rmsnorm_shared_bytes(block_size);
                 let launch_cfg = CudarcLaunchConfig {
@@ -6035,27 +6037,58 @@ impl CudaBackend {
                 })?;
             }
 
-            let fused_fn = st.kernels.rmsnorm_to_q8_1.as_ref().unwrap();
-            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
-            let bs = rmsnorm_block_size(hidden_dim);
-            let lc = CudarcLaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (bs, 1, 1),
-                shared_mem_bytes: rmsnorm_shared_bytes(bs),
-            };
             let dim = hidden_dim as u32;
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(fused_fn)
-                    .arg(&st.scratch.x_gpu)
-                    .arg(&lw.attn_norm)
-                    .arg(&mut *q8_1_buf)
-                    .arg(&eps)
-                    .arg(&dim)
-                    .launch(lc)
+            let q8_1_buf = st.scratch.input_q8_1.as_mut().unwrap();
+            if let Some(dual_fn) = dual_fn {
+                let block_size = rmsnorm_block_size(hidden_dim);
+                let grid = super::decode::rmsnorm_q8_1_cta5_grid(hidden_dim, block_size);
+                let lc = CudarcLaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: rmsnorm_shared_bytes(block_size),
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(dual_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut st.scratch.normed)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "GDN rmsnorm_to_q8_1_cta5_normed L{layer_idx}: {e}"
+                    ))
+                })?;
+                super::decode::announce_route_once(&RMSNORM_Q8_SEEN_GDN_ATTN_NORM, || {
+                    format!("[CUDA] rmsnorm_to_q8_1_cta5_normed: ACTIVE (first at gdn_attn_norm, dim={hidden_dim}, ctas={grid})")
+                });
+            } else {
+                let (fused_fn, lc) = rmsnorm_q8_1_launch(
+                    &st.kernels,
+                    hidden_dim,
+                    &RMSNORM_Q8_SEEN_GDN_ATTN_NORM,
+                    "gdn_attn_norm",
+                );
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(fused_fn)
+                        .arg(&st.scratch.x_gpu)
+                        .arg(&lw.attn_norm)
+                        .arg(&mut *q8_1_buf)
+                        .arg(&eps)
+                        .arg(&dim)
+                        .launch(lc)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}"))
+                })?;
             }
-            .map_err(|e| RuntimeError::Compute(format!("GDN rmsnorm_to_q8_1 L{layer_idx}: {e}")))?;
 
             // QKV matvec with pre-quantized input.
             // split-layout: prefer Q8/Q4 split siblings for the fused QKV weight.
@@ -11128,13 +11161,19 @@ unsafe fn launch_matvec(
         ) {
             // Check which kernel to use: aligned or unaligned.
             let (mv_fn_opt, w_ptr) = match weight {
-                GpuWeightBuf::Q4Aligned(w) => {
-                    (kernels.matvec_q4_aligned_q8_1.as_ref(), w as &CudaSlice<u8>)
+                GpuWeightBuf::Q4Aligned(w) => (
+                    kernels
+                        .matvec_q4_aligned_q8_1
+                        .as_ref()
+                        .map(|f| (f, DP4A_Q4_BLOCK_DIM, "matvec_q4_aligned_q8_1")),
+                    w as &CudaSlice<u8>,
+                ),
+                GpuWeightBuf::Q4Raw(w) => {
+                    (raw_q4_dp4a_kernel(kernels, in_dim), w as &CudaSlice<u8>)
                 }
-                GpuWeightBuf::Q4Raw(w) => (kernels.matvec_q4_0_dp4a.as_ref(), w as &CudaSlice<u8>),
                 _ => unreachable!(),
             };
-            if let Some(mv_fn) = mv_fn_opt {
+            if let Some((mv_fn, mv_block_dim, mv_name)) = mv_fn_opt {
                 let in_dim_u32 = in_dim as u32;
                 let out_dim_u32 = out_dim as u32;
 
@@ -11156,11 +11195,11 @@ unsafe fn launch_matvec(
                         RuntimeError::Compute(format!("quantize_f32_to_q8_1 Q4 {label}: {e}",))
                     })?;
 
-                // Step 2: dp4a matvec with Q8_1 input (NR=4, 256 threads).
+                // Step 2: dp4a matvec with Q8_1 input (NR=4; 256 threads, or 160 at exact K).
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                    block_dim: (mv_block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 device
@@ -11175,16 +11214,13 @@ unsafe fn launch_matvec(
                     .map_err(|e| RuntimeError::Compute(format!("matvec_q4_dp4a {label}: {e}",)))?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_matvec_route(
-                        &SEEN,
-                        || match weight {
-                            GpuWeightBuf::Q4Aligned(_) => "matvec_q4_aligned_q8_1",
-                            _ => "matvec_q4_0_dp4a",
-                        },
-                        label,
-                        out_dim,
-                        in_dim,
-                    );
+                    static SEEN_T160: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    let seen = if mv_block_dim == DP4A_Q4_BLOCK_DIM {
+                        &SEEN
+                    } else {
+                        &SEEN_T160
+                    };
+                    announce_matvec_route(seen, || mv_name, label, out_dim, in_dim);
                 }
                 return Ok(());
             }
@@ -12931,11 +12967,11 @@ unsafe fn launch_matvec_preq8_1(
             }
         }
         GpuWeightBuf::Q4Raw(w_q4) => {
-            if let Some(mv_fn) = kernels.matvec_q4_0_dp4a.as_ref() {
+            if let Some((mv_fn, block_dim, name)) = raw_q4_dp4a_kernel(kernels, in_dim) {
                 let mv_grid = dp4a_q4_grid(out_dim_u32);
                 let mv_cfg = CudarcLaunchConfig {
                     grid_dim: (mv_grid, 1, 1),
-                    block_dim: (DP4A_Q4_BLOCK_DIM, 1, 1),
+                    block_dim: (block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 device
@@ -12947,12 +12983,16 @@ unsafe fn launch_matvec_preq8_1(
                     .arg(&out_dim_u32)
                     .arg(&in_dim_u32)
                     .launch(mv_cfg)
-                    .map_err(|e| {
-                        RuntimeError::Compute(format!("matvec_q4_0_dp4a preq {label}: {e}",))
-                    })?;
+                    .map_err(|e| RuntimeError::Compute(format!("{name} preq {label}: {e}",)))?;
                 {
                     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    announce_matvec_route(&SEEN, || "matvec_q4_0_dp4a", label, out_dim, in_dim);
+                    static SEEN_T160: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    let seen = if block_dim == DP4A_Q4_BLOCK_DIM {
+                        &SEEN
+                    } else {
+                        &SEEN_T160
+                    };
+                    announce_matvec_route(seen, || name, label, out_dim, in_dim);
                 }
                 return Ok(());
             }
@@ -14742,6 +14782,87 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
         _ => false,
     }
+}
+
+/// The raw Q4_0 dp4a matvec a site launches for `in_dim`, with its block size and name.
+///
+/// `matvec_q4_0_dp4a_t160` when `LUMEN_CUDA_Q4_RAW_EXACTK=1`, it loaded, and `in_dim / 32`
+/// is exactly its 160 threads — the one K at which thread ib owns block ib in both kernels
+/// and the output bytes are the 256-thread kernel's. Every other K, and the flag off, is
+/// `matvec_q4_0_dp4a` at 256 threads. `None` when neither loaded.
+fn raw_q4_dp4a_kernel(
+    kernels: &KernelSet,
+    in_dim: usize,
+) -> Option<(&CudaFunction, u32, &'static str)> {
+    if super::decode::q4_raw_exactk_enabled()
+        && (in_dim / 32) as u32 == super::decode::DP4A_Q4_T160_BLOCK_DIM
+    {
+        if let Some(f) = kernels.matvec_q4_0_dp4a_t160.as_ref() {
+            return Some((
+                f,
+                super::decode::DP4A_Q4_T160_BLOCK_DIM,
+                "matvec_q4_0_dp4a_t160",
+            ));
+        }
+    }
+    kernels
+        .matvec_q4_0_dp4a
+        .as_ref()
+        .map(|f| (f, DP4A_Q4_BLOCK_DIM, "matvec_q4_0_dp4a"))
+}
+
+static RMSNORM_Q8_SEEN_ATTN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_FFN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_FFN_NORM_GLU: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static RMSNORM_Q8_SEEN_GDN_ATTN_NORM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The fused RMSNorm+Q8_1 kernel a norm site launches, with its launch config.
+///
+/// The single-block `rmsnorm_to_q8_1` unless `LUMEN_CUDA_RMSNORM_Q8_CTA5=1` and
+/// `rmsnorm_to_q8_1_cta5` loaded, which spreads the same arithmetic over
+/// `rmsnorm_q8_1_cta5_grid` CTAs (byte-identical output). Callers have already
+/// established that `rmsnorm_to_q8_1` is present. The site announces the kernel
+/// it takes once per process under `LUMEN_CUDA_VERBOSE`, `seen` being that site's
+/// own latch.
+fn rmsnorm_q8_1_launch<'k>(
+    kernels: &'k KernelSet,
+    dim: usize,
+    seen: &'static std::sync::OnceLock<()>,
+    label: &str,
+) -> (&'k CudaFunction, CudarcLaunchConfig) {
+    let block_size = rmsnorm_block_size(dim);
+    let shared_bytes = rmsnorm_shared_bytes(block_size);
+    let cta5 = if super::decode::rmsnorm_q8_cta5_enabled() {
+        kernels.rmsnorm_to_q8_1_cta5.as_ref()
+    } else {
+        None
+    };
+    let (f, grid, name) = match cta5 {
+        Some(f) => (
+            f,
+            super::decode::rmsnorm_q8_1_cta5_grid(dim, block_size),
+            "rmsnorm_to_q8_1_cta5",
+        ),
+        None => (
+            kernels
+                .rmsnorm_to_q8_1
+                .as_ref()
+                .expect("rmsnorm_q8_1_launch: caller checked rmsnorm_to_q8_1 is loaded"),
+            1,
+            "rmsnorm_to_q8_1",
+        ),
+    };
+    super::decode::announce_route_once(seen, || {
+        format!("[CUDA] {name}: ACTIVE (first at {label}, dim={dim}, ctas={grid})")
+    });
+    (
+        f,
+        CudarcLaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        },
+    )
 }
 
 /// Name the output-head kernel a branch dispatched, once per process.
@@ -16604,6 +16725,43 @@ impl ComputeBackend for CudaBackend {
         // (default ON; `LUMEN_CUDA_PTX_CACHE=0` disables), a warm cache turns
         // this ~252-module NVRTC compile from a multi-minute cold start into a
         // sub-second `cuModuleLoadData` sweep. Time it and report cache hits.
+        // The lever defaults read the device's compute capability, and so do the kernel
+        // compilation below (the split-K pair is loaded only when its default is on, the tiled
+        // kernel's target follows the capability), so it is recorded before anything asks.
+        match self.device.compute_capability() {
+            Ok((cc_major, cc_minor)) => {
+                crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
+                if cc_major == 12 {
+                    // The body class is recorded before the backend is built, so this is the
+                    // resolution for the model being loaded (the legacy switch included).
+                    let on = |b: bool| if b { "ON" } else { "OFF" };
+                    eprintln!(
+                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed defaults for this model — split-K decode \
+                         attention {}, dual-output norm route {}, compute_120 tiled kernel {} (measured on cc 12.0; \
+                         LUMEN_CUDA_ATTN_SPLITK / LUMEN_CUDA_NORM_CTA5_DUAL / LUMEN_CUDA_ATTN_TILED_CODEGEN override)",
+                        on(crate::runtime_defaults::attn_splitk_default()),
+                        on(crate::runtime_defaults::norm_cta5_dual_default()),
+                        on(crate::runtime_defaults::attn_tiled_codegen_default(cc_major.clamp(0, 255) as u8, self.device.nvrtc_can_target(120)) == "ptx120"),
+                    );
+                }
+                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
+                {
+                    eprintln!(
+                        "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
+                         Q4 split dispatch (the locked kernel is only measured on cc 8.x/9.x; set =1 to force, \
+                         or LUMEN_CUDA_Q4_SPLIT=1 for the split path alone)"
+                    );
+                }
+            }
+            Err(e) => {
+                crate::runtime_defaults::set_device_cc_major(0);
+                eprintln!(
+                    "[CUDA] compute-capability query failed ({e}): every capability-keyed default resolves \
+                     as on an unmeasured device — LUMEN_CUDA_SOA_LOCKED OFF, and on a Q4_0 dense body the \
+                     split-K pair, the dual-output norm route and the compute_120 tiled kernel OFF (set =1 / =ptx120 to force)"
+                );
+            }
+        }
         let kernel_compile_start = std::time::Instant::now();
         let mut kernels = decode::compile_all_kernels(&self.device)?;
         {
@@ -17086,26 +17244,6 @@ impl ComputeBackend for CudaBackend {
         // `use_q4_split` (the SoA buffers must exist for the locked kernel to
         // read). Default resolved by `soa_locked_default` (ON for quantised
         // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
-        // The lever defaults below read the device's compute capability.
-        match self.device.compute_capability() {
-            Ok((cc_major, cc_minor)) => {
-                crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
-                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
-                {
-                    eprintln!(
-                        "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
-                         Q4 split dispatch (the locked kernel is only measured on cc 8.x/9.x; set =1 to force, \
-                         or LUMEN_CUDA_Q4_SPLIT=1 for the split path alone)"
-                    );
-                }
-            }
-            Err(e) => {
-                crate::runtime_defaults::set_device_cc_major(0);
-                eprintln!(
-                    "[CUDA] compute-capability query failed ({e}): LUMEN_CUDA_SOA_LOCKED defaults OFF"
-                );
-            }
-        }
         let use_soa_locked = env_truthy_or_default(
             "LUMEN_CUDA_SOA_LOCKED",
             crate::runtime_defaults::soa_locked_default,

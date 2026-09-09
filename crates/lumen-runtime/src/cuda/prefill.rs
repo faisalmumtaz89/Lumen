@@ -2087,7 +2087,7 @@ unsafe fn launch_attention_decode_splitk(
 /// the dispatch that emitted it plus the policy that produced it — `scaled`
 /// (count grows with `seq_len`, capped) or `fixed`
 /// (`LUMEN_CUDA_ATTN_SPLITK_SCALE=0`).
-fn announce_splitk_route(head_dim: u32, seq_len: u32) {
+fn announce_splitk_route(codegen: &'static str, head_dim: u32, seq_len: u32) {
     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     super::decode::announce_route_once(&SEEN, || {
         let policy = if crate::runtime_defaults::attn_splitk_scale_with_context() {
@@ -2096,9 +2096,11 @@ fn announce_splitk_route(head_dim: u32, seq_len: u32) {
             "fixed"
         };
         let chunks = attn_splitk_chunks(seq_len);
+        let (partial, merge) = super::decode::attention_decode_splitk_route_names(codegen);
+        let target = super::decode::attn_tiled_codegen_target(codegen);
         format!(
-            "[CUDA] attention_decode_splitk_partial: ACTIVE (chunks={chunks} {policy}, \
-             head_dim={head_dim}, merge=attention_decode_splitk_merge)"
+            "[CUDA] {partial}: ACTIVE (chunks={chunks} {policy}, \
+             head_dim={head_dim}, merge={merge}, target={target})"
         )
     });
 }
@@ -2171,7 +2173,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                     max_seq_len,
                     scale,
                 )?;
-                announce_splitk_route(head_dim, seq_len);
+                announce_splitk_route(kernels.attention_decode_splitk_codegen, head_dim, seq_len);
                 return Ok(AttentionDecodeVariant::SplitK);
             }
         }
@@ -2249,7 +2251,10 @@ pub(crate) unsafe fn launch_attention_decode_gated(
             {
                 static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 super::decode::announce_route_once(&SEEN, || {
-                    format!("[CUDA] attention_decode_tiled: ACTIVE (head_dim={head_dim})")
+                    let codegen = kernels.attention_decode_tiled_codegen;
+                    let name = super::decode::attention_decode_tiled_route_name(codegen);
+                    let target = super::decode::attn_tiled_codegen_target(codegen);
+                    format!("[CUDA] {name}: ACTIVE (head_dim={head_dim}, target={target})")
                 });
             }
         }

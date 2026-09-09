@@ -163,3 +163,229 @@ extern "C" __global__ void rmsnorm_to_q8_1(
         block_out[4 + lane_id] = (char)(qi & 0xFF);
     }
 }
+
+// ============================================================================
+// rmsnorm_to_q8_1_cta5: the same fusion spread over several CTAs.
+//
+// The single-block kernel above serialises the quantization of dim/32 blocks
+// over its warps: at dim=5120 with 1024 threads that is 160 blocks over 32
+// warps, five iterations per warp. Here the grid holds ceil(num_blocks /
+// num_warps) CTAs and every CTA quantizes at most ONE block per warp.
+//
+// Each CTA repeats the sum-of-squares reduction in full, with the SAME thread
+// assignment and the SAME reduction order as the single-block kernel (the
+// loop, the warp shuffles and the cross-warp pass are identical, and blockDim
+// is the same), so every CTA arrives at the bit-identical rms. The per-block
+// quantization arithmetic is unchanged. The output is therefore byte-identical
+// to rmsnorm_to_q8_1; only which CTA writes each block differs. The price is
+// the repeated reduction (dim floats re-read per CTA, L2-resident).
+//
+// Dispatch: grid = (ceil((dim/32) / (block_size/32))), block = (block_size),
+// same shared memory as rmsnorm_to_q8_1. dim MUST be a multiple of 32.
+// ============================================================================
+
+extern "C" __global__ void rmsnorm_to_q8_1_cta5(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    char* __restrict__ output_q8_1,
+    float eps,
+    unsigned int dim)
+{
+    extern __shared__ float shared[];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_size = blockDim.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane_id = tid & 31u;
+    const unsigned int num_warps = block_size >> 5;
+
+    // ---- Phase 1: sum-of-squares, identical to rmsnorm_to_q8_1 ----
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += block_size) {
+        float val = x[i];
+        sum_sq += val * val;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    if (lane_id == 0) {
+        shared[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    float total = 0.0f;
+    if (warp_id == 0) {
+        total = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total = warp_reduce_sum(total);
+    }
+
+    // ---- Phase 2: broadcast rms_scale ----
+    if (tid == 0) {
+        float rms = 1.0f / sqrtf(total / (float)dim + eps);
+        shared[0] = rms;
+    }
+    __syncthreads();
+    float rms = shared[0];
+
+    // ---- Phase 3: this CTA's share of the blocks, one per warp ----
+    const unsigned int num_blocks = dim >> 5;
+    const unsigned int blk = blockIdx.x * num_warps + warp_id;
+    if (blk >= num_blocks) {
+        return;
+    }
+    {
+        unsigned int base = blk * WARP_SIZE;
+        unsigned int idx = base + lane_id;
+
+        float val = x[idx] * rms * weight[idx];
+
+        float amax = val < 0.0f ? -val : val;
+        float tmp;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 16);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 8);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 4);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 2);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 1);
+        amax = tmp > amax ? tmp : amax;
+
+        float scale = amax / 127.0f;
+        float scale_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(val * scale_inv);
+        qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+
+        float qi_f = (float)qi;
+        float qsum = qi_f;
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+
+        float weighted_sum = scale * qsum;
+
+        char* block_out = output_q8_1 + (unsigned long long)blk * Q8_1_BYTES;
+        if (lane_id == 0) {
+            unsigned short d_f16 = f32_to_f16_bits(scale);
+            block_out[0] = (char)(d_f16 & 0xFF);
+            block_out[1] = (char)((d_f16 >> 8) & 0xFF);
+            unsigned short s_f16 = f32_to_f16_bits(weighted_sum);
+            block_out[2] = (char)(s_f16 & 0xFF);
+            block_out[3] = (char)((s_f16 >> 8) & 0xFF);
+        }
+        block_out[4 + lane_id] = (char)(qi & 0xFF);
+    }
+}
+
+// ============================================================================
+// rmsnorm_to_q8_1_cta5_normed: the CTA5 fusion that also writes the
+// normalized F32 vector.
+//
+// The GDN input-norm site needs BOTH the Q8_1 blocks (for the QKV/gate matvecs)
+// and the F32 normalized vector (for the alpha/beta projections), and launched
+// the plain `rmsnorm` kernel (norm.cu) for the latter before the fusion. That
+// kernel's reduction and its normalize expression, out[i] = x[i] * rms *
+// weight[i], are the ones this fusion already evaluates for `val`, so each CTA
+// writes its own disjoint 32-element slices of `normed` from the same `val`
+// before quantizing them. Both outputs are byte-identical to the two kernels
+// they replace; one launch instead of two.
+//
+// Dispatch as rmsnorm_to_q8_1_cta5. `normed` must not alias `x`.
+// ============================================================================
+
+extern "C" __global__ void rmsnorm_to_q8_1_cta5_normed(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ normed,          // [dim] the normalized F32 vector, x * rms * weight
+    char* __restrict__ output_q8_1,
+    float eps,
+    unsigned int dim)
+{
+    extern __shared__ float shared[];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_size = blockDim.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane_id = tid & 31u;
+    const unsigned int num_warps = block_size >> 5;
+
+    // ---- Phase 1: sum-of-squares, identical to rmsnorm_to_q8_1 ----
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += block_size) {
+        float val = x[i];
+        sum_sq += val * val;
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    if (lane_id == 0) {
+        shared[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    float total = 0.0f;
+    if (warp_id == 0) {
+        total = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+        total = warp_reduce_sum(total);
+    }
+
+    // ---- Phase 2: broadcast rms_scale ----
+    if (tid == 0) {
+        float rms = 1.0f / sqrtf(total / (float)dim + eps);
+        shared[0] = rms;
+    }
+    __syncthreads();
+    float rms = shared[0];
+
+    // ---- Phase 3: this CTA's share of the blocks, one per warp ----
+    const unsigned int num_blocks = dim >> 5;
+    const unsigned int blk = blockIdx.x * num_warps + warp_id;
+    if (blk >= num_blocks) {
+        return;
+    }
+    {
+        unsigned int base = blk * WARP_SIZE;
+        unsigned int idx = base + lane_id;
+
+        float val = x[idx] * rms * weight[idx];
+        normed[idx] = val;
+
+        float amax = val < 0.0f ? -val : val;
+        float tmp;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 16);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 8);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 4);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 2);
+        amax = tmp > amax ? tmp : amax;
+        tmp = __shfl_xor_sync(0xffffffff, amax, 1);
+        amax = tmp > amax ? tmp : amax;
+
+        float scale = amax / 127.0f;
+        float scale_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(val * scale_inv);
+        qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+
+        float qi_f = (float)qi;
+        float qsum = qi_f;
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 16);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 8);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 4);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 2);
+        qsum += __shfl_xor_sync(0xffffffff, qsum, 1);
+
+        float weighted_sum = scale * qsum;
+
+        char* block_out = output_q8_1 + (unsigned long long)blk * Q8_1_BYTES;
+        if (lane_id == 0) {
+            unsigned short d_f16 = f32_to_f16_bits(scale);
+            block_out[0] = (char)(d_f16 & 0xFF);
+            block_out[1] = (char)((d_f16 >> 8) & 0xFF);
+            unsigned short s_f16 = f32_to_f16_bits(weighted_sum);
+            block_out[2] = (char)(s_f16 & 0xFF);
+            block_out[3] = (char)((s_f16 >> 8) & 0xFF);
+        }
+        block_out[4 + lane_id] = (char)(qi & 0xFF);
+    }
+}

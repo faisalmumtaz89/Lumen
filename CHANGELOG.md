@@ -7,7 +7,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **`LUMEN_BENCH_TOP2=1`** — a bench surface: non-streaming responses carry
+  `lumen_bench.top2`, per generated token the argmax of the logits as the session received
+  them and the runner-up with both logits, before host-side masking, penalties
+  and sampling (the selected token is the token-id record's entry; they coincide
+  under greedy decode with penalties off, the configuration the surface is for).
+  It exists so a greedy flip between two decode routes can be judged in the
+  engine's own numbers (a near-tie when each route's runner-up is the other's
+  choice within the routes' numerical spread) instead of against another
+  engine's distribution. Implies `LUMEN_BENCH_TOKEN_IDS`; greedy decode takes
+  the host-logits route while it is on.
+
 ### Changed
+
+- **Three Blackwell decode defaults promoted for the dense Q4_0 cell** — on a
+  compute-capability-12.x device (RTX 5090) a Q4_0 dense model now takes, by
+  default: the context-scaled split-K decode-attention pair
+  (`LUMEN_CUDA_ATTN_SPLITK`, previously Q8_0/BF16 bodies only — on the 5090
+  the one-CTA-per-head tiled kernel collapses at context and the pair is the
+  difference between 60.7 and 79.4 tok/s at 1,024 tokens in / 128 out); the
+  multi-CTA fused norm route with the dual-output launch at the GDN input norm
+  (`LUMEN_CUDA_NORM_CTA5_DUAL`, +4.10 % decode, byte-identical); and, for that same body class, the tiled
+  decode-attention kernel compiled for `compute_120` when NVRTC can emit it
+  (`LUMEN_CUDA_ATTN_TILED_CODEGEN`, +9.6 % at 1,300 tokens on the tiled route,
+  byte-identical; the same source is 2,520 instructions at compute_120 against
+  3,632 at NVRTC's default target). Every other capability and body class is
+  unchanged: the defaults key on the one cell each was gated on, and each
+  keeps its kill-switch (`=0`) and follows
+  `LUMEN_CUDA_LEGACY_DEFAULTS`. The defaults key on the capability's major
+  (12.x, measured on 12.0). A compute_120 build the toolkit or driver refuses
+  falls back to NVRTC's default target and says so. The backend records the device capability
+  before it compiles the decode kernels, so a capability-keyed default is
+  already resolved when the split-K pair decides whether to load. The
+  split-K pair compiled for compute_120 (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`)
+  stays an experiment: measured −0.36 %.
 
 - **The dense decode matvec routes name themselves under
   `LUMEN_CUDA_VERBOSE`**: on CUDA, every place a dense model's single-token

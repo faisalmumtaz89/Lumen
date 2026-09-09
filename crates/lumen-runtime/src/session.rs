@@ -84,6 +84,57 @@ pub struct SuffixPrefillResult {
     pub prefill_time: Duration,
 }
 
+/// One generated token as the top-2 bench surface saw it: the argmax of the logits as the
+/// session received them from the backend and the runner-up, with both logits — before the
+/// host-side EOG mask, penalties and sampling, which may select a different token (the CUDA
+/// decode path applies its device-side EOG mask before readback, so those logits are already
+/// masked) (the selected token is the matching entry
+/// of the token-id record). Under greedy decode with penalties off and no mask the argmax is
+/// the selected token; that is the configuration the surface is meant for. A greedy flip
+/// between two routes is a near-tie exactly when each route's runner-up is the other's
+/// choice and the two logits sit within the routes' numerical spread.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BenchTop2 {
+    pub argmax: u32,
+    pub logit: f32,
+    pub runner_up: u32,
+    pub runner_up_logit: f32,
+}
+
+impl BenchTop2 {
+    /// The top two of `logits` by value; ties resolve to the lower index, the order the greedy
+    /// sampler (`sampling::argmax`) and the device argmax kernel pick. Empty logits give zeros.
+    pub fn of(logits: &[f32]) -> Self {
+        let (mut best, mut best_v) = (0usize, f32::NEG_INFINITY);
+        let (mut second, mut second_v) = (0usize, f32::NEG_INFINITY);
+        for (i, &v) in logits.iter().enumerate() {
+            if v.total_cmp(&best_v) == std::cmp::Ordering::Greater {
+                second = best;
+                second_v = best_v;
+                best = i;
+                best_v = v;
+            } else if v.total_cmp(&second_v) == std::cmp::Ordering::Greater {
+                second = i;
+                second_v = v;
+            }
+        }
+        if logits.is_empty() {
+            return Self {
+                argmax: 0,
+                logit: 0.0,
+                runner_up: 0,
+                runner_up_logit: 0.0,
+            };
+        }
+        Self {
+            argmax: best as u32,
+            logit: best_v,
+            runner_up: second as u32,
+            runner_up_logit: second_v,
+        }
+    }
+}
+
 /// Owns one generation's state. Holds `(tokens, KV, sampler, recurrent state)`.
 ///
 /// Lifecycle:
@@ -113,6 +164,10 @@ pub struct Session {
     /// When `Some`, `next_token` samples and clears; when `None`, it executes
     /// one decode step first.
     pending_logits: Option<Logits>,
+    /// Bench surface: when `Some`, every token is sampled from host logits (never the
+    /// on-device argmax) and the chosen token plus the runner-up, with both logits, are
+    /// recorded here in order. `None` when the surface is off.
+    bench_top2: Option<Vec<BenchTop2>>,
     /// Per-layer timings collected when `config.collect_per_layer_timings`
     /// is on. The engine wrapper drains these for back-compat reporting.
     timings: Vec<PerLayerTiming>,
@@ -150,6 +205,7 @@ impl Session {
             sampling,
             sampler_state: SamplerState::new(),
             pending_logits: None,
+            bench_top2: None,
             timings: Vec::new(),
             prefill_time: Duration::ZERO,
             decode_time: Duration::ZERO,
@@ -1218,6 +1274,26 @@ impl Session {
         })
     }
 
+    /// Arm or disarm the top-2 bench surface (`LUMEN_BENCH_TOP2`). Arming forces the
+    /// host-logits route for every following token so the runner-up is observable.
+    pub fn set_bench_top2(&mut self, on: bool) {
+        self.bench_top2 = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// The top-2 record so far, leaving the surface armed with an empty record.
+    pub fn take_bench_top2(&mut self) -> Vec<BenchTop2> {
+        match self.bench_top2.as_mut() {
+            Some(v) => std::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
+    fn record_top2(&mut self, logits: &Logits) {
+        if let Some(rec) = self.bench_top2.as_mut() {
+            rec.push(BenchTop2::of(&logits.data));
+        }
+    }
+
     /// Produce one token by sampling the pending logits (if any) or by
     /// running one decode step and sampling that.
     ///
@@ -1248,11 +1324,13 @@ impl Session {
         // `pending_logits` at exactly the position this call must sample.
         if self.pending_logits.is_none() && !self.tokens.is_empty() {
             let caps = backend.caps();
+            // An armed top-2 bench surface takes the logits route too, so it counts as a
+            // switch off the pipelined-greedy route for the same reconciliation.
             let switching_off_greedy = !crate::engine::use_gpu_greedy_predicate(
                 &self.sampling,
                 caps.gpu_resident,
                 caps.gpu_argmax,
-            );
+            ) || self.bench_top2.is_some();
             if switching_off_greedy && backend.reconcile_speculative_tail(&mut self.kv)? {
                 let history = std::mem::take(&mut self.tokens);
                 self.truncate_to(0);
@@ -1266,6 +1344,7 @@ impl Session {
                 // Path A -- sample the logits left by `extend` (or a previous
                 // GPU-decode step). No backend call needed.
                 let start = Instant::now();
+                self.record_top2(&logits);
                 let token = sample_token_with_state(
                     &mut logits,
                     &self.sampling,
@@ -1287,11 +1366,13 @@ impl Session {
                 let caps = backend.caps();
                 // disable GPU-argmax fast path when a penalty is
                 // active (must apply penalty on CPU before argmax).
+                // The top-2 bench surface needs the logits on the host, so it takes the
+                // logits route even for a greedy request (same kernels, one copy per token).
                 let use_gpu_greedy = crate::engine::use_gpu_greedy_predicate(
                     &self.sampling,
                     caps.gpu_resident,
                     caps.gpu_argmax,
-                );
+                ) && self.bench_top2.is_none();
 
                 let start = Instant::now();
                 let token = if use_gpu_greedy {
@@ -1302,6 +1383,7 @@ impl Session {
                 } else if caps.gpu_resident {
                     // GPU returns logits; sample on CPU. KV advanced inside.
                     let mut logits = backend.decode_token(prev, weights, &mut self.kv)?;
+                    self.record_top2(&logits);
                     sample_token_with_state(
                         &mut logits,
                         &self.sampling,
@@ -1321,6 +1403,7 @@ impl Session {
                     )?;
                     self.kv.advance_seq_len()?;
                     let mut logits = backend.compute_final(&x)?;
+                    self.record_top2(&logits);
                     sample_token_with_state(
                         &mut logits,
                         &self.sampling,
@@ -1568,6 +1651,28 @@ mod tests {
             max_seq_len,
             collect_per_layer_timings: false,
         }
+    }
+
+    #[test]
+    fn arming_the_top2_surface_empties_the_record_at_every_request_boundary() {
+        let (_provider, _backend, hp) = synthetic_setup();
+        let mut sess = Session::new(baseline_config(64), hp, SamplingParams::default()).unwrap();
+        sess.set_bench_top2(true);
+        sess.record_top2(&Logits {
+            data: vec![0.5, 2.0, 1.0],
+        });
+        assert_eq!(sess.take_bench_top2().len(), 1);
+        sess.record_top2(&Logits {
+            data: vec![0.5, 2.0, 1.0],
+        });
+        sess.set_bench_top2(true); // a new request: whatever a cancelled one left is gone
+        assert!(sess.take_bench_top2().is_empty());
+        sess.set_bench_top2(false);
+        sess.record_top2(&Logits { data: vec![1.0] });
+        assert!(
+            sess.take_bench_top2().is_empty(),
+            "disarmed: nothing recorded"
+        );
     }
 
     #[test]
@@ -2901,5 +3006,24 @@ mod tests {
             "empty-suffix: post-state must decode the SAME first-4 tokens \
              as a cold prefill on the same prompt (cold={cold_tokens:?}, warm={warm_tokens:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod bench_top2_tests {
+    use super::BenchTop2;
+
+    #[test]
+    fn top2_picks_the_argmax_and_the_runner_up() {
+        let r = BenchTop2::of(&[0.1, 3.5, 2.0, 3.4]);
+        assert_eq!((r.argmax, r.runner_up), (1, 3));
+        assert_eq!((r.logit, r.runner_up_logit), (3.5, 3.4));
+    }
+
+    #[test]
+    fn top2_ties_resolve_to_the_lower_index_like_argmax() {
+        let r = BenchTop2::of(&[2.0, 2.0, 1.0]);
+        assert_eq!((r.argmax, r.runner_up), (0, 1));
+        assert_eq!(BenchTop2::of(&[]).argmax, 0);
     }
 }

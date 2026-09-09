@@ -1018,7 +1018,7 @@ pub async fn collect_chat(
     let mut completion_tokens = 0usize;
     let mut finish = FinishReason::Stop;
     // Bench surface (LUMEN_BENCH_TOKEN_IDS): (generated ids, eos set).
-    let mut bench_ids: Option<(Vec<u32>, Vec<u32>)> = None;
+    let mut bench_ids: Option<BenchRecord> = None;
 
     while let Some(evt) = rx.recv().await {
         match evt {
@@ -1026,8 +1026,9 @@ pub async fn collect_chat(
             TokenEvent::BenchTokenIds {
                 generated_token_ids,
                 eos_token_ids,
+                top2,
             } => {
-                bench_ids = Some((generated_token_ids, eos_token_ids));
+                bench_ids = Some((generated_token_ids, eos_token_ids, top2));
             }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
@@ -1121,6 +1122,10 @@ pub async fn collect_chat(
     Ok(body)
 }
 
+/// The bench record the engine emits: generated ids, the EOS set, and under
+/// `LUMEN_BENCH_TOP2` the per-token top-2 entries.
+pub(crate) type BenchRecord = (Vec<u32>, Vec<u32>, Vec<lumen_runtime::session::BenchTop2>);
+
 /// Attach the bench token-id surface (`LUMEN_BENCH_TOKEN_IDS=1`) to a finished
 /// response body as a top-level `lumen_bench` object. `finish_reason` uses
 /// the OpenAI vocabulary on every route, so the object reads the same on
@@ -1132,11 +1137,12 @@ pub async fn collect_chat(
 /// the body is byte-identical.
 pub(crate) fn attach_bench_token_ids(
     body: &mut serde_json::Value,
-    bench_ids: Option<(Vec<u32>, Vec<u32>)>,
+    bench_ids: Option<BenchRecord>,
     finish: FinishReason,
 ) -> Result<(), ServerError> {
     attach_bench_token_ids_if(
-        lumen_runtime::runtime_defaults::bench_token_ids_enabled(),
+        lumen_runtime::runtime_defaults::bench_token_ids_enabled()
+            || lumen_runtime::runtime_defaults::bench_top2_enabled(),
         body,
         bench_ids,
         finish,
@@ -1148,13 +1154,13 @@ pub(crate) fn attach_bench_token_ids(
 fn attach_bench_token_ids_if(
     enabled: bool,
     body: &mut serde_json::Value,
-    bench_ids: Option<(Vec<u32>, Vec<u32>)>,
+    bench_ids: Option<BenchRecord>,
     finish: FinishReason,
 ) -> Result<(), ServerError> {
     if !enabled {
         return Ok(());
     }
-    let Some((generated, eos)) = bench_ids else {
+    let Some((generated, eos, top2)) = bench_ids else {
         return Err(ServerError::Internal(
             "LUMEN_BENCH_TOKEN_IDS=1 but the engine emitted no token-id record on \
              this path. Refusing to return a response without the requested surface."
@@ -1164,15 +1170,21 @@ fn attach_bench_token_ids_if(
     let obj = body
         .as_object_mut()
         .expect("response body is a JSON object");
-    obj.insert(
-        "lumen_bench".to_string(),
-        json!({
-            "generated_token_ids": generated,
-            "generated_token_count": generated.len(),
-            "finish_reason": finish.as_openai(),
-            "eos_token_ids": eos,
-        }),
-    );
+    let mut bench = json!({
+        "generated_token_ids": generated,
+        "generated_token_count": generated.len(),
+        "finish_reason": finish.as_openai(),
+        "eos_token_ids": eos,
+    });
+    if !top2.is_empty() {
+        // [argmax, logit, runner_up, runner_up_logit] per generated token, in order; the
+        // argmax is of the raw logits, the selected token is generated_token_ids[i].
+        bench["top2"] = json!(top2
+            .iter()
+            .map(|t| json!([t.argmax, t.logit, t.runner_up, t.runner_up_logit]))
+            .collect::<Vec<_>>());
+    }
+    obj.insert("lumen_bench".to_string(), bench);
     Ok(())
 }
 
@@ -1246,7 +1258,7 @@ pub async fn collect_completion(
     let mut completion_tokens = 0usize;
     let mut finish = FinishReason::Stop;
     // Bench surface (LUMEN_BENCH_TOKEN_IDS): (generated ids, eos set).
-    let mut bench_ids: Option<(Vec<u32>, Vec<u32>)> = None;
+    let mut bench_ids: Option<BenchRecord> = None;
 
     while let Some(evt) = rx.recv().await {
         match evt {
@@ -1254,8 +1266,9 @@ pub async fn collect_completion(
             TokenEvent::BenchTokenIds {
                 generated_token_ids,
                 eos_token_ids,
+                top2,
             } => {
-                bench_ids = Some((generated_token_ids, eos_token_ids));
+                bench_ids = Some((generated_token_ids, eos_token_ids, top2));
             }
             TokenEvent::Token { delta_text, .. } => {
                 let (safe_text, hit_stop) = stop_matcher.push(&delta_text);
@@ -1326,6 +1339,39 @@ mod bench_token_ids_surface_tests {
         assert!(push < eos_check, "the id record must precede the EOS check");
     }
 
+    /// The top-2 entries surface as `[argmax, logit, runner_up, runner_up_logit]`
+    /// arrays, and an empty record adds no key.
+    #[test]
+    fn top2_entries_surface_as_arrays_when_present() {
+        let mut body = json!({"id": "x"});
+        let t = lumen_runtime::session::BenchTop2 {
+            argmax: 7,
+            logit: 1.5,
+            runner_up: 9,
+            runner_up_logit: 1.25,
+        };
+        attach_bench_token_ids_if(
+            true,
+            &mut body,
+            Some((vec![7], vec![2], vec![t])),
+            FinishReason::Stop,
+        )
+        .unwrap();
+        assert_eq!(body["lumen_bench"]["top2"], json!([[7, 1.5, 9, 1.25]]));
+        let mut plain = json!({"id": "x"});
+        attach_bench_token_ids_if(
+            true,
+            &mut plain,
+            Some((vec![7], vec![2], vec![])),
+            FinishReason::Stop,
+        )
+        .unwrap();
+        assert!(
+            plain["lumen_bench"].get("top2").is_none(),
+            "no entries, no key"
+        );
+    }
+
     /// Off leaves the body byte-identical; armed without ids fails rather
     /// than returning a body without the surface.
     #[test]
@@ -1338,7 +1384,7 @@ mod bench_token_ids_surface_tests {
         attach_bench_token_ids_if(
             false,
             &mut body,
-            Some((vec![1], vec![2])),
+            Some((vec![1], vec![2], vec![])),
             FinishReason::Stop,
         )
         .expect("off ignores ids");
@@ -1359,7 +1405,7 @@ mod bench_token_ids_surface_tests {
         attach_bench_token_ids_if(
             true,
             &mut body,
-            Some((vec![9, 42, 248046], vec![248046, 248044])),
+            Some((vec![9, 42, 248046], vec![248046, 248044], vec![])),
             FinishReason::Stop,
         )
         .unwrap();
@@ -1387,7 +1433,7 @@ mod bench_token_ids_surface_tests {
         attach_bench_token_ids_if(
             true,
             &mut body,
-            Some((vec![], vec![])),
+            Some((vec![], vec![], vec![])),
             FinishReason::Length,
         )
         .unwrap();
