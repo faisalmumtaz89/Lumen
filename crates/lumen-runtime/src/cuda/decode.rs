@@ -956,7 +956,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                         m
                     }
                     Err(e) => {
-                        cuda_log!(
+                        eprintln!(
                             "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
                         );
                         tiled_codegen.set("default");
@@ -1041,6 +1041,24 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         })
     };
 
+    // The tiled kernel loads before the KernelSet records its target, so a fallback inside
+    // `load_tiled` is what the announcements report.
+    let attention_decode_tiled = match load_tiled(
+        shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
+        "attention_decode_tiled",
+    ) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            cuda_log!(
+                "[CUDA] attention_decode_tiled: FAILED ({e}); \
+                 long-context decode (seq_len > {}) will error at dispatch \
+                 (eligible automatic calls may use split-K)",
+                ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
+            );
+            None
+        }
+    };
+
     let kernels = KernelSet {
         attention_decode_tiled_codegen: tiled_codegen.get(),
         attention_decode_splitk_codegen: splitk_codegen,
@@ -1110,21 +1128,7 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // Optional: log a warning if NVRTC compile fails so the gate sees
         // the unavailability and operators learn the long-context path is
         // disabled on this device.
-        attention_decode_tiled: match load_tiled(
-            shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-            "attention_decode_tiled",
-        ) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                cuda_log!(
-                    "[CUDA] attention_decode_tiled: FAILED ({e}); \
-                     long-context decode (seq_len > {}) will error at dispatch \
-                     (eligible automatic calls may use split-K)",
-                    ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
-                );
-                None
-            }
-        },
+        attention_decode_tiled,
         attention_decode_splitk_partial: if crate::runtime_defaults::attn_splitk_enabled() {
             match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,

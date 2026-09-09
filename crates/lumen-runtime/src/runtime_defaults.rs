@@ -2713,7 +2713,11 @@ pub fn bench_top2_enabled() -> bool {
 pub fn bench_token_ids_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = env_is_exactly_one("LUMEN_BENCH_TOKEN_IDS");
+        // LUMEN_BENCH_TOP2 implies this surface (its record is aligned with the token ids), so
+        // every guard that reads this — the streaming/stop-sequence refusal, the attach step —
+        // sees the implication without each spelling it out.
+        let on =
+            env_is_exactly_one("LUMEN_BENCH_TOKEN_IDS") || env_is_exactly_one("LUMEN_BENCH_TOP2");
         if on {
             eprintln!(
                 "[BENCH] TOKEN_IDS=ON: responses carry raw generated token ids + \

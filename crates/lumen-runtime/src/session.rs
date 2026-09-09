@@ -97,13 +97,16 @@ pub struct SuffixPrefillResult {
 ///
 /// `truncate_to` and `common_prefix_len` round out the API for prompt-cache
 /// callers (P1-2 lands on top of these).
-/// One generated token as the top-2 bench surface saw it: the argmax of the logits the
-/// decode step produced, and the runner-up, with both logits. A greedy flip between two
-/// routes is a near-tie exactly when each route's runner-up is the other's choice and the
-/// two logits sit within the routes' numerical spread.
+/// One generated token as the top-2 bench surface saw it: the argmax of the RAW logits the
+/// decode step produced and the runner-up, with both logits — before the EOG mask, penalties
+/// and sampling, which may select a different token (the selected token is the matching entry
+/// of the token-id record). Under greedy decode with penalties off and no mask the argmax is
+/// the selected token; that is the configuration the surface is meant for. A greedy flip
+/// between two routes is a near-tie exactly when each route's runner-up is the other's
+/// choice and the two logits sit within the routes' numerical spread.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BenchTop2 {
-    pub token: u32,
+    pub argmax: u32,
     pub logit: f32,
     pub runner_up: u32,
     pub runner_up_logit: f32,
@@ -128,14 +131,14 @@ impl BenchTop2 {
         }
         if logits.is_empty() {
             return Self {
-                token: 0,
+                argmax: 0,
                 logit: 0.0,
                 runner_up: 0,
                 runner_up_logit: 0.0,
             };
         }
         Self {
-            token: best as u32,
+            argmax: best as u32,
             logit: best_v,
             runner_up: second as u32,
             runner_up_logit: second_v,
@@ -1319,11 +1322,13 @@ impl Session {
         // `pending_logits` at exactly the position this call must sample.
         if self.pending_logits.is_none() && !self.tokens.is_empty() {
             let caps = backend.caps();
+            // An armed top-2 bench surface takes the logits route too, so it counts as a
+            // switch off the pipelined-greedy route for the same reconciliation.
             let switching_off_greedy = !crate::engine::use_gpu_greedy_predicate(
                 &self.sampling,
                 caps.gpu_resident,
                 caps.gpu_argmax,
-            );
+            ) || self.bench_top2.is_some();
             if switching_off_greedy && backend.reconcile_speculative_tail(&mut self.kv)? {
                 let history = std::mem::take(&mut self.tokens);
                 self.truncate_to(0);
@@ -1644,6 +1649,28 @@ mod tests {
             max_seq_len,
             collect_per_layer_timings: false,
         }
+    }
+
+    #[test]
+    fn arming_the_top2_surface_empties_the_record_at_every_request_boundary() {
+        let (_provider, _backend, hp) = synthetic_setup();
+        let mut sess = Session::new(baseline_config(64), hp, SamplingParams::default()).unwrap();
+        sess.set_bench_top2(true);
+        sess.record_top2(&Logits {
+            data: vec![0.5, 2.0, 1.0],
+        });
+        assert_eq!(sess.take_bench_top2().len(), 1);
+        sess.record_top2(&Logits {
+            data: vec![0.5, 2.0, 1.0],
+        });
+        sess.set_bench_top2(true); // a new request: whatever a cancelled one left is gone
+        assert!(sess.take_bench_top2().is_empty());
+        sess.set_bench_top2(false);
+        sess.record_top2(&Logits { data: vec![1.0] });
+        assert!(
+            sess.take_bench_top2().is_empty(),
+            "disarmed: nothing recorded"
+        );
     }
 
     #[test]
@@ -2987,14 +3014,14 @@ mod bench_top2_tests {
     #[test]
     fn top2_picks_the_argmax_and_the_runner_up() {
         let r = BenchTop2::of(&[0.1, 3.5, 2.0, 3.4]);
-        assert_eq!((r.token, r.runner_up), (1, 3));
+        assert_eq!((r.argmax, r.runner_up), (1, 3));
         assert_eq!((r.logit, r.runner_up_logit), (3.5, 3.4));
     }
 
     #[test]
     fn top2_ties_resolve_to_the_lower_index_like_argmax() {
         let r = BenchTop2::of(&[2.0, 2.0, 1.0]);
-        assert_eq!((r.token, r.runner_up), (0, 1));
-        assert_eq!(BenchTop2::of(&[]).token, 0);
+        assert_eq!((r.argmax, r.runner_up), (0, 1));
+        assert_eq!(BenchTop2::of(&[]).argmax, 0);
     }
 }

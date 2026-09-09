@@ -1177,10 +1177,11 @@ fn attach_bench_token_ids_if(
         "eos_token_ids": eos,
     });
     if !top2.is_empty() {
-        // [token, logit, runner_up, runner_up_logit] per generated token, in order.
+        // [argmax, logit, runner_up, runner_up_logit] per generated token, in order; the
+        // argmax is of the raw logits, the selected token is generated_token_ids[i].
         bench["top2"] = json!(top2
             .iter()
-            .map(|t| json!([t.token, t.logit, t.runner_up, t.runner_up_logit]))
+            .map(|t| json!([t.argmax, t.logit, t.runner_up, t.runner_up_logit]))
             .collect::<Vec<_>>());
     }
     obj.insert("lumen_bench".to_string(), bench);
@@ -1344,7 +1345,7 @@ mod bench_token_ids_surface_tests {
     fn top2_entries_surface_as_arrays_when_present() {
         let mut body = json!({"id": "x"});
         let t = lumen_runtime::session::BenchTop2 {
-            token: 7,
+            argmax: 7,
             logit: 1.5,
             runner_up: 9,
             runner_up_logit: 1.25,

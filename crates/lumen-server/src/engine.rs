@@ -1092,6 +1092,10 @@ impl EngineWorker {
         let panic_budget = max_panics_in_window();
         let mut recent_panics: VecDeque<Instant> = VecDeque::with_capacity(panic_budget + 1);
         while let Some(job) = self.inbox.blocking_recv() {
+            // The top-2 bench record is per request: a cancelled or failed job leaves its
+            // entries in the session, so the record is emptied (and the surface re-armed) at
+            // every job boundary rather than only drained on a clean completion.
+            session.set_bench_top2(self.bench_top2);
             // Snapshot the reply sender BEFORE moving `job` into
             // `process_job` so the panic arm can publish a clean
             // 503-shaped `Error` event to the in-flight client.  The
