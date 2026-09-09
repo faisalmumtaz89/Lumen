@@ -1,5 +1,10 @@
+<p align="center">
+  <img src="docs/assets/lumen.png" alt="Lumen" width="720">
+</p>
+
 # Lumen
 
+[servelumen.com](https://servelumen.com) ·
 [Getting started](docs/getting-started.md) ·
 [Models](docs/support.md) ·
 [Server](docs/server.md) ·
