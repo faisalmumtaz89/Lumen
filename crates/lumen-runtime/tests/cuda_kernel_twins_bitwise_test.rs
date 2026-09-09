@@ -393,3 +393,114 @@ fn rmsnorm_to_q8_1_cta5_normed_covers_a_partial_final_cta() {
     // plain rmsnorm writes all 5152 normalized values and so must the dual kernel.
     rmsnorm_dual_case(5152, 33);
 }
+
+// ── attention_decode_tiled: NVRTC default target vs compute_80 vs compute_120 ──────────────
+//
+// The same source compiled for a different virtual target (LUMEN_CUDA_ATTN_TILED_CODEGEN) is
+// a different instruction stream through the driver's JIT; the gate showed the greedy output
+// unchanged, this compares the kernel's own output bits on the production geometry.
+
+fn attention_decode_tiled_ptx(arch: Option<&'static str>) -> cudarc::nvrtc::Ptx {
+    let src = lumen_runtime::cuda::shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE;
+    match arch {
+        None => compile_ptx(src).unwrap_or_else(|e| panic!("NVRTC compile failed: {e:?}")),
+        Some(a) => compile_ptx_with_opts(
+            src,
+            CompileOptions {
+                arch: Some(a),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("NVRTC compile failed ({a}): {e:?}")),
+    }
+}
+
+fn tiled_attention_case(seq_len: u32, seed: u64) {
+    let (ctx, stream) = create_context();
+    let (num_heads, num_kv_heads, head_dim, max_seq_len) = (24u32, 4u32, 256u32, 4096u32);
+    let block = 128u32; // decode::ATTN_DECODE_TILED_BLOCK_DIM
+    let shared = (8 + 128 + head_dim) * 4; // decode::attention_decode_tiled_shared_bytes
+    let scale = 1.0f32 / 16.0;
+
+    let mut s = seed;
+    let q: Vec<f32> = (0..num_heads * head_dim)
+        .map(|_| rand_unit(&mut s))
+        .collect();
+    let cache = (num_kv_heads * max_seq_len * head_dim) as usize;
+    let k: Vec<f32> = (0..cache).map(|_| rand_unit(&mut s)).collect();
+    let v: Vec<f32> = (0..cache).map(|_| rand_unit(&mut s)).collect();
+    let q_gpu = stream.clone_htod(&q).unwrap();
+    let k_gpu = stream.clone_htod(&k).unwrap();
+    let v_gpu = stream.clone_htod(&v).unwrap();
+
+    let mut outs: Vec<(String, Vec<f32>)> = Vec::new();
+    for (label, arch) in [
+        ("default", None),
+        ("compute_80", Some("compute_80")),
+        ("compute_120", Some("compute_120")),
+    ] {
+        let module = ctx
+            .load_module(attention_decode_tiled_ptx(arch))
+            .unwrap_or_else(|e| panic!("load attention_decode_tiled ({label}): {e:?}"));
+        let f = module.load_function("attention_decode_tiled").unwrap();
+        let mut out: CudaSlice<f32> = stream
+            .clone_htod(&vec![f32::NAN; (num_heads * head_dim) as usize])
+            .unwrap();
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        unsafe {
+            stream
+                .launch_builder(&f)
+                .arg(&q_gpu)
+                .arg(&k_gpu)
+                .arg(&v_gpu)
+                .arg(&mut out)
+                .arg(&num_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&seq_len)
+                .arg(&max_seq_len)
+                .arg(&scale)
+                .launch(cfg)
+                .unwrap();
+        }
+        let host = stream.clone_dtoh(&out).unwrap();
+        assert!(
+            host.iter().all(|x| x.is_finite()),
+            "{label}: non-finite output at seq_len {seq_len}"
+        );
+        outs.push((label.to_string(), host));
+    }
+    let (ref base_label, ref base) = outs[0];
+    for (label, host) in &outs[1..] {
+        for (i, (a, b)) in base.iter().zip(host).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "seq_len {seq_len}: out[{i}] {label} {b} != {base_label} {a}"
+            );
+        }
+    }
+}
+
+#[test]
+fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_inside_one_tile() {
+    tiled_attention_case(1, 41);
+    tiled_attention_case(127, 42);
+}
+
+#[test]
+fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_at_tile_boundaries() {
+    tiled_attention_case(128, 43);
+    tiled_attention_case(129, 44);
+}
+
+#[test]
+fn attention_decode_tiled_is_bitwise_across_nvrtc_targets_at_the_context_shapes() {
+    tiled_attention_case(330, 45);
+    tiled_attention_case(1300, 46);
+    tiled_attention_case(2600, 47);
+}
