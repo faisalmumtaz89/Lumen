@@ -393,45 +393,59 @@ fn test_engine_uses_prefill_path() {
     );
 }
 
-/// A prompt longer than one prefill slice gives the same hidden state whether
-/// it arrives in one call or in two calls that cut it at a different point:
-/// slice boundaries only change how many tokens share a launch, and the KV
-/// cache carries every earlier token either way.
+/// A prompt gives the same hidden state whether it arrives in one call or in
+/// two calls cut at another point: slice boundaries only change how many
+/// tokens share a launch, and the KV cache carries every earlier token either
+/// way. The lengths sit on both sides of the 2,048-token slice, with tails of
+/// one token, five tokens (the scalar attention path) and a full slice.
 #[test]
 fn test_prefill_result_does_not_depend_on_slice_boundaries() {
     let config = || TestModelConfig {
-        max_seq_len: 4096,
+        max_seq_len: 8192,
         ..TestModelConfig::default()
     };
     let (provider, _cpu, cuda_a) = setup_backends_with(config()).expect("backends A");
     let (_provider_b, _cpu_b, cuda_b) = setup_backends_with(config()).expect("backends B");
     let hp = provider.lbc().header.hyperparams;
-    let total = 2048 + 300;
-    let prompt: Vec<u32> = (0..total)
-        .map(|i| ((i * 7919 + 13) % hp.vocab_size as usize) as u32)
-        .collect();
     let kv_cfg = KvCacheConfig {
-        max_seq_len: 4096,
+        max_seq_len: 8192,
         num_layers: hp.num_layers as usize,
         num_kv_heads: hp.num_kv_heads as usize,
         head_dim: hp.head_dim as usize,
         precision: KvPrecision::F32,
     };
+    for (total, cut) in [
+        (2048, 700),
+        (2049, 1000),
+        (2048 + 5, 2040),
+        (2048 + 300, 700),
+        (4097, 2500),
+    ] {
+        let prompt: Vec<u32> = (0..total)
+            .map(|i| ((i * 7919 + 13) % hp.vocab_size as usize) as u32)
+            .collect();
+        let mut kv_a = KvCache::new(kv_cfg.clone()).unwrap();
+        let one_call = cuda_a
+            .prefill(&prompt, &provider, &mut kv_a)
+            .unwrap_or_else(|e| panic!("prefill of {total} tokens in one call: {e}"));
+        assert_eq!(kv_a.seq_len(), total);
+        cuda_a.reset_recurrent_state();
 
-    let mut kv_a = KvCache::new(kv_cfg.clone()).unwrap();
-    let one_call = cuda_a
-        .prefill(&prompt, &provider, &mut kv_a)
-        .expect("prefill in one call");
-    assert_eq!(kv_a.seq_len(), total);
+        let mut kv_b = KvCache::new(kv_cfg.clone()).unwrap();
+        cuda_b
+            .prefill(&prompt[..cut], &provider, &mut kv_b)
+            .unwrap_or_else(|e| panic!("prefill of {total} tokens, first {cut}: {e}"));
+        let two_calls = cuda_b
+            .prefill(&prompt[cut..], &provider, &mut kv_b)
+            .unwrap_or_else(|e| panic!("prefill of {total} tokens, the rest after {cut}: {e}"));
+        assert_eq!(kv_b.seq_len(), total);
+        cuda_b.reset_recurrent_state();
 
-    let mut kv_b = KvCache::new(kv_cfg).unwrap();
-    cuda_b
-        .prefill(&prompt[..700], &provider, &mut kv_b)
-        .expect("prefill, first call");
-    let two_calls = cuda_b
-        .prefill(&prompt[700..], &provider, &mut kv_b)
-        .expect("prefill, second call");
-    assert_eq!(kv_b.seq_len(), total);
-
-    assert_f32_close("prefill_slice_boundaries", &one_call, &two_calls, 1e-3);
+        assert_f32_close(
+            &format!("prefill_{total}_cut_{cut}"),
+            &one_call,
+            &two_calls,
+            1e-3,
+        );
+    }
 }
