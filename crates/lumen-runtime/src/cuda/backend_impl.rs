@@ -16725,6 +16725,28 @@ impl ComputeBackend for CudaBackend {
         // (default ON; `LUMEN_CUDA_PTX_CACHE=0` disables), a warm cache turns
         // this ~252-module NVRTC compile from a multi-minute cold start into a
         // sub-second `cuModuleLoadData` sweep. Time it and report cache hits.
+        // The lever defaults read the device's compute capability, and so do the kernel
+        // compilation below (the split-K pair is loaded only when its default is on, the tiled
+        // kernel's target follows the capability), so it is recorded before anything asks.
+        match self.device.compute_capability() {
+            Ok((cc_major, cc_minor)) => {
+                crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
+                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
+                {
+                    eprintln!(
+                        "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
+                         Q4 split dispatch (the locked kernel is only measured on cc 8.x/9.x; set =1 to force, \
+                         or LUMEN_CUDA_Q4_SPLIT=1 for the split path alone)"
+                    );
+                }
+            }
+            Err(e) => {
+                crate::runtime_defaults::set_device_cc_major(0);
+                eprintln!(
+                    "[CUDA] compute-capability query failed ({e}): LUMEN_CUDA_SOA_LOCKED defaults OFF"
+                );
+            }
+        }
         let kernel_compile_start = std::time::Instant::now();
         let mut kernels = decode::compile_all_kernels(&self.device)?;
         {
@@ -17207,26 +17229,6 @@ impl ComputeBackend for CudaBackend {
         // `use_q4_split` (the SoA buffers must exist for the locked kernel to
         // read). Default resolved by `soa_locked_default` (ON for quantised
         // dense, OFF for MoE/BF16); `LUMEN_CUDA_SOA_LOCKED=0` forces OFF.
-        // The lever defaults below read the device's compute capability.
-        match self.device.compute_capability() {
-            Ok((cc_major, cc_minor)) => {
-                crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
-                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
-                {
-                    eprintln!(
-                        "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
-                         Q4 split dispatch (the locked kernel is only measured on cc 8.x/9.x; set =1 to force, \
-                         or LUMEN_CUDA_Q4_SPLIT=1 for the split path alone)"
-                    );
-                }
-            }
-            Err(e) => {
-                crate::runtime_defaults::set_device_cc_major(0);
-                eprintln!(
-                    "[CUDA] compute-capability query failed ({e}): LUMEN_CUDA_SOA_LOCKED defaults OFF"
-                );
-            }
-        }
         let use_soa_locked = env_truthy_or_default(
             "LUMEN_CUDA_SOA_LOCKED",
             crate::runtime_defaults::soa_locked_default,

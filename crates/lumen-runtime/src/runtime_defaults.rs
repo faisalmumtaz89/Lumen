@@ -1178,21 +1178,68 @@ pub fn q4_split_wo_probe_enabled() -> bool {
 /// forces on; unset resolves model-aware: ON for Q8_0-body and BF16-body
 /// dense models (the classes the engine A/Bs + full GQ/DET gates banked, at
 /// a fixed 4 chunks: Q8 +0.195 ms/tok on A100-SXM, BF16 +0.298 ms/tok on
-/// H100), following the canonical-defaults master switch. Q4-body models
-/// stay on the tiled route — the gates run FAILED Q4 quality with split-K
-/// on (near-tie perturbation lands on the noisier quant), so widening
-/// further is a separate, gated decision.
+/// H100), following the canonical-defaults master switch. Q4_0-body dense
+/// models take the pair on compute capability 12.x as well: on the RTX 5090
+/// the tiled route is the kernel that collapses at context (one CTA per
+/// head, 24 CTAs on a 170-SM card) and the pair, context-scaled, was gated
+/// there at +34.39 % at 1,300 tokens and +67 % at 2,600 with the 48-token
+/// greedy output byte-identical to the tiled route's (r2-016; the 1,024-in /
+/// 128-out board: 60.7 -> 79.4 tok/s). On every other capability Q4 bodies
+/// stay on the tiled route: an earlier Q4 quality gate on the A100 failed
+/// with the (then fixed 4-chunk) pair on, and nothing has been measured there
+/// since. `=0` opts a Blackwell Q4 run back out.
 pub fn attn_splitk_enabled() -> bool {
     match std::env::var("LUMEN_CUDA_ATTN_SPLITK") {
         Ok(v) if v == "0" => false,
         Ok(v) if v == "1" => true,
-        _ => {
-            matches!(
-                model_dense_quant(),
-                Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16)
-            ) && !model_is_moe()
-                && canonical_default_on()
-        }
+        _ => attn_splitk_default(),
+    }
+}
+
+/// The model-aware default behind [`attn_splitk_enabled`]: Q8_0 and BF16
+/// dense bodies everywhere, Q4_0 dense bodies on compute capability 12.x,
+/// never MoE, all under the canonical-defaults master switch.
+pub fn attn_splitk_default() -> bool {
+    if model_is_moe() || !canonical_default_on() {
+        return false;
+    }
+    match model_dense_quant() {
+        Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16) => true,
+        Some(QuantScheme::Q4_0) => device_cc_major() == 12,
+        _ => false,
+    }
+}
+
+/// Per-process default for `LUMEN_CUDA_NORM_CTA5_DUAL` when unset: ON for a
+/// Q4_0 dense body on compute capability 12.x — the one cell it is measured
+/// on (source-fidelity Qwen3.8-27B Q4_0, RTX 5090: +4.10 % decode, byte-
+/// identical, r3-022/023/024; the device twin tests pin both kernels bitwise
+/// to the single-block original at dims 2048/4096/5120). OFF on every other
+/// capability and body class because the launch shape is unmeasured there,
+/// not because it is known to be slow. Follows the canonical-defaults
+/// master switch; `=1` still forces it on anywhere.
+pub fn norm_cta5_dual_default() -> bool {
+    !model_is_moe()
+        && matches!(model_dense_quant(), Some(QuantScheme::Q4_0))
+        && device_cc_major() == 12
+        && canonical_default_on()
+}
+
+/// The NVRTC target the tiled decode-attention kernel is compiled for when
+/// `LUMEN_CUDA_ATTN_TILED_CODEGEN` is unset: `ptx120` (compute_120) on a
+/// compute capability 12.x device whose NVRTC lists that target, else NVRTC's
+/// default. Measured on the RTX 5090 with CUDA 13.3: the same source emits
+/// 2,520 instructions at compute_120 against 3,632 at the default sm_75
+/// target, +9.6 % decode at 1,300 tokens and +14.7 % at 2,600 on the tiled
+/// route, byte-identical (r3-025/028); the compute_80 control was null, so
+/// the gain is the target, not the recompile. Only this kernel: the GDN
+/// kernels grow at compute_120, so the policy is per kernel, not per process.
+/// Follows the canonical-defaults master switch.
+pub fn attn_tiled_codegen_default(cc_major: u8, nvrtc_can_target_120: bool) -> &'static str {
+    if cc_major == 12 && nvrtc_can_target_120 && canonical_default_on() {
+        "ptx120"
+    } else {
+        "default"
     }
 }
 
@@ -3512,6 +3559,102 @@ mod tests {
                 !soa_locked_default(),
                 "cc {cc}.x is not measured-good (0 = query failed): OFF"
             );
+        }
+        reset_for_tests();
+    }
+
+    #[test]
+    fn q4_dense_takes_split_k_only_on_blackwell() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(12);
+        assert!(
+            attn_splitk_default(),
+            "Q4_0 dense on cc 12.x: the pair is the measured route"
+        );
+        for cc in [0u8, 7, 8, 9, 10, 11, 13] {
+            set_device_cc_major(cc);
+            assert!(
+                !attn_splitk_default(),
+                "Q4_0 dense on cc {cc}.x is unmeasured: tiled"
+            );
+        }
+        set_device_cc_major(12);
+        set_model_is_moe(true);
+        assert!(
+            !attn_splitk_default(),
+            "MoE never takes the pair by default"
+        );
+        set_model_is_moe(false);
+        set_model_primary_quant(QuantScheme::Q8_0);
+        set_device_cc_major(8);
+        assert!(
+            attn_splitk_default(),
+            "Q8_0 dense keeps the pair on every capability"
+        );
+        reset_for_tests();
+    }
+
+    #[test]
+    fn norm_dual_defaults_on_for_the_measured_cell_only() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(12);
+        assert!(
+            norm_cta5_dual_default(),
+            "Q4_0 dense on cc 12.x: measured +4.10 %"
+        );
+        for cc in [0u8, 8, 9, 10] {
+            set_device_cc_major(cc);
+            assert!(!norm_cta5_dual_default(), "cc {cc}.x is unmeasured: OFF");
+        }
+        set_device_cc_major(12);
+        set_model_primary_quant(QuantScheme::Q8_0);
+        assert!(!norm_cta5_dual_default(), "Q8_0 body is unmeasured: OFF");
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(true);
+        assert!(!norm_cta5_dual_default(), "MoE: OFF");
+        reset_for_tests();
+    }
+
+    #[test]
+    fn tiled_codegen_defaults_to_compute_120_only_where_it_can_be_emitted() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(attn_tiled_codegen_default(12, true), "ptx120");
+        assert_eq!(
+            attn_tiled_codegen_default(12, false),
+            "default",
+            "NVRTC without the target"
+        );
+        for cc in [0u8, 8, 9, 10, 13] {
+            assert_eq!(attn_tiled_codegen_default(cc, true), "default", "cc {cc}.x");
+        }
+    }
+
+    #[test]
+    fn legacy_defaults_switch_off_every_promoted_default() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(12);
+        let saved = std::env::var("LUMEN_CUDA_LEGACY_DEFAULTS").ok();
+        std::env::set_var("LUMEN_CUDA_LEGACY_DEFAULTS", "1");
+        // `legacy_defaults_enabled` is cached per process; a test process that already
+        // resolved it sees the cached value, so assert through the resolvers only when
+        // the cache agrees with the env just set.
+        if legacy_defaults_enabled() {
+            assert!(!attn_splitk_default());
+            assert!(!norm_cta5_dual_default());
+            assert_eq!(attn_tiled_codegen_default(12, true), "default");
+        }
+        match saved {
+            Some(v) => std::env::set_var("LUMEN_CUDA_LEGACY_DEFAULTS", v),
+            None => std::env::remove_var("LUMEN_CUDA_LEGACY_DEFAULTS"),
         }
         reset_for_tests();
     }

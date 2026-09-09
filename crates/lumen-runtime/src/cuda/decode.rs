@@ -931,10 +931,16 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
-    // The tiled decode-attention kernel at the target `LUMEN_CUDA_ATTN_TILED_CODEGEN` selects:
-    // NVRTC's default (the shipping route) unless `ptx80` / `ptx120` name an explicit virtual
-    // target. Same source, same math options; only the code generation differs. Experiment.
-    let tiled_codegen = attn_tiled_codegen();
+    // The tiled decode-attention kernel at the target `LUMEN_CUDA_ATTN_TILED_CODEGEN` selects,
+    // or the per-device default (compute_120 on capability 12.x when NVRTC can emit it, NVRTC's
+    // default elsewhere). Same source, same math options; only the code generation differs.
+    let tiled_codegen = {
+        let cc_major = device
+            .compute_capability()
+            .map(|(major, _)| major.clamp(0, 255) as u8)
+            .unwrap_or(0);
+        attn_tiled_codegen_selection(cc_major, device.nvrtc_can_target(120))
+    };
     let load_tiled = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = match tiled_codegen {
             "ptx80" => device.compile_and_load_with_arch(source, "compute_80")?,
@@ -4355,25 +4361,26 @@ mod attention_decode_tiled_const_tests {
 }
 
 /// `LUMEN_CUDA_ATTN_TILED_CODEGEN`: the NVRTC target `attention_decode_tiled` is compiled for —
-/// `ptx80` (compute_80) or `ptx120` (compute_120); anything else, or unset, is NVRTC's default
-/// target, the shipping route. The kernel source and math options are unchanged; only the
-/// generated code differs (NVRTC 13.3 emits a 3632-instruction kernel at its default sm_75
-/// target and a 2520-instruction one at compute_120 for the same source). Default OFF; an
-/// experiment after the tiled route lost 6 % at context on the driver 610 / CUDA 13.3 box.
-/// Read once per process.
-pub(crate) fn attn_tiled_codegen() -> &'static str {
-    use std::sync::OnceLock;
-    static SEL: OnceLock<&'static str> = OnceLock::new();
-    *SEL.get_or_init(|| {
-        match std::env::var("LUMEN_CUDA_ATTN_TILED_CODEGEN")
-            .ok()
-            .as_deref()
-        {
-            Some("ptx80") => "ptx80",
-            Some("ptx120") => "ptx120",
-            _ => "default",
-        }
-    })
+/// `ptx80` (compute_80), `ptx120` (compute_120) or `default` (NVRTC's default target); unset
+/// resolves per device through [`crate::runtime_defaults::attn_tiled_codegen_default`]:
+/// compute_120 on a capability-12.x device whose NVRTC can emit it, NVRTC's default elsewhere.
+/// The kernel source and math options are unchanged; only the generated code differs (NVRTC
+/// 13.3 emits a 3632-instruction kernel at its default sm_75 target and a 2520-instruction one
+/// at compute_120 for the same source). Resolved once, at kernel compilation, from the device
+/// being compiled for; the selection is kept on the `KernelSet` for the dispatch announcements.
+pub(crate) fn attn_tiled_codegen_selection(
+    cc_major: u8,
+    nvrtc_can_target_120: bool,
+) -> &'static str {
+    match std::env::var("LUMEN_CUDA_ATTN_TILED_CODEGEN")
+        .ok()
+        .as_deref()
+    {
+        Some("ptx80") => "ptx80",
+        Some("ptx120") => "ptx120",
+        Some("default") => "default",
+        _ => crate::runtime_defaults::attn_tiled_codegen_default(cc_major, nvrtc_can_target_120),
+    }
 }
 
 /// `LUMEN_CUDA_ATTN_SPLITK_CODEGEN`: the NVRTC target the split-K decode-attention pair
@@ -4467,19 +4474,22 @@ pub(crate) fn rmsnorm_q8_cta5_enabled() -> bool {
     })
 }
 
-/// `LUMEN_CUDA_NORM_CTA5_DUAL=1`: at the GDN input norm, one `rmsnorm_to_q8_1_cta5_normed`
+/// `LUMEN_CUDA_NORM_CTA5_DUAL`: at the GDN input norm, one `rmsnorm_to_q8_1_cta5_normed`
 /// launch writes both the normalized F32 vector and the Q8_1 blocks, replacing the plain
-/// `rmsnorm` + fused pair; implies the CTA5 route at every fused norm site. Default OFF.
-/// Read once per process.
+/// `rmsnorm` + fused pair; implies the CTA5 route at every fused norm site. `=1` forces it on,
+/// `=0` off; unset resolves through [`crate::runtime_defaults::norm_cta5_dual_default`] (ON for
+/// a Q4_0 dense body on capability 12.x, the measured cell). Read once per process, at the
+/// first decode launch — after the backend has recorded the device capability.
 pub(crate) fn norm_cta5_dual_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        matches!(
-            std::env::var("LUMEN_CUDA_NORM_CTA5_DUAL").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+    *FLAG.get_or_init(
+        || match std::env::var("LUMEN_CUDA_NORM_CTA5_DUAL").ok().as_deref() {
+            Some("1") | Some("true") | Some("yes") | Some("on") => true,
+            Some("0") | Some("false") | Some("no") | Some("off") => false,
+            _ => crate::runtime_defaults::norm_cta5_dual_default(),
+        },
+    )
 }
 
 /// Grid for `rmsnorm_to_q8_1_cta5`: one CTA per `block_size / 32` Q8_1 blocks, so every warp

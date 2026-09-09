@@ -9,6 +9,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **Three Blackwell decode defaults promoted for the dense Q4_0 cell** — on a
+  compute-capability-12.x device (RTX 5090) a Q4_0 dense model now takes, by
+  default: the context-scaled split-K decode-attention pair
+  (`LUMEN_CUDA_ATTN_SPLITK`, previously Q8_0/BF16 bodies only — on the 5090
+  the one-CTA-per-head tiled kernel collapses at context and the pair is the
+  difference between 60.7 and 79.4 tok/s at 1,024 tokens in / 128 out); the
+  multi-CTA fused norm route with the dual-output launch at the GDN input norm
+  (`LUMEN_CUDA_NORM_CTA5_DUAL`, +4.10 % decode, byte-identical); and the tiled
+  decode-attention kernel compiled for `compute_120` when NVRTC can emit it
+  (`LUMEN_CUDA_ATTN_TILED_CODEGEN`, +9.6 % at 1,300 tokens on the tiled route,
+  byte-identical; the same source is 2,520 instructions at compute_120 against
+  3,632 at NVRTC's default target). Every other capability and body class is
+  unchanged: the defaults key on the one cell each was gated on, and each
+  keeps its kill-switch (`=0` / `=default`) and follows
+  `LUMEN_CUDA_LEGACY_DEFAULTS`. The backend records the device capability
+  before it compiles the decode kernels, so a capability-keyed default is
+  already resolved when the split-K pair decides whether to load. The
+  split-K pair compiled for compute_120 (`LUMEN_CUDA_ATTN_SPLITK_CODEGEN`)
+  stays an experiment: measured −0.36 %.
+
 - **The dense decode matvec routes name themselves under
   `LUMEN_CUDA_VERBOSE`**: on CUDA, every place a dense model's single-token
   decode path picks a matvec kernel and launches it now writes one
