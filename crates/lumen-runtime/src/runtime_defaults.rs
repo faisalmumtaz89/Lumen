@@ -1201,6 +1201,25 @@ pub fn attn_splitk_gqa6_default() -> bool {
     )
 }
 
+/// The identity of the binary this runtime is linked into — the version the
+/// binary prints (`v0.30.0-6-g4045592`), recorded by the binary's `main`
+/// through [`set_build_identity`] because the crate's own `option_env!` sees
+/// only its package version. Read by the diagnostics that stamp their output.
+pub fn build_identity() -> &'static str {
+    BUILD_IDENTITY
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// Record the binary's version string once, at startup. Later calls are
+/// ignored, so the first (the binary's own) wins.
+pub fn set_build_identity(identity: &str) {
+    let _ = BUILD_IDENTITY.set(identity.to_string());
+}
+
+static BUILD_IDENTITY: OnceLock<String> = OnceLock::new();
+
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`: the split-count bound the
 /// GQA-shared pair serves, `ATTN_SPLITK_GQA6_S_MAX` (1024 chunks of 16 keys,
 /// 16,384 KV positions, 24.2 MiB of scratch on a 24-head model) unless set;

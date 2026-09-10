@@ -2713,7 +2713,7 @@ fn dump_attention_call(
         AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
         AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
     };
-    let engine = option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
         "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
     );

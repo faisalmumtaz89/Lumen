@@ -945,6 +945,9 @@ fn main() -> ExitCode {
     // sees "did you mean LUMEN_CUDA_GDN_REGISTER_RESIDENT?" at a glance.
     let _warnings = lumen_runtime::runtime_defaults::validate_lumen_env_vars();
     lumen_runtime::runtime_defaults::mark_validator_ran();
+    lumen_runtime::runtime_defaults::set_build_identity(
+        option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
 
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_args(&raw) {

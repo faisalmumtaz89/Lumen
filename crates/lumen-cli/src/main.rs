@@ -34,6 +34,9 @@ fn main() {
     // (`lumen-server::bin::main`) calls `set_path_is_server(true)`.
     let _warnings = lumen_runtime::runtime_defaults::validate_lumen_env_vars();
     lumen_runtime::runtime_defaults::mark_validator_ran();
+    lumen_runtime::runtime_defaults::set_build_identity(
+        option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
 
     let args: Vec<String> = std::env::args().collect();
 

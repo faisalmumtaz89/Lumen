@@ -37,10 +37,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   (`256` reproduces the v0.30.0 behaviour).
 - **The GQA-shared merge sums its numerator in eight lanes** (chunk `c` into
   lane `c mod 8`, then a fixed tree) instead of one serial chain over up to
-  1,024 partials. Deterministic, and on real activations at 5k and 11k keys
-  the pair's worst coordinate error against a float64 reference drops from
-  8.7e-5 to 7.0e-6. The output is a near-tie with the serial form, not
-  byte-identical, above 48 keys.
+  1,024 partials. Deterministic, and on real activations the pair's worst
+  coordinate error against a float64 reference drops from 8.7e-5 to 7.0e-6
+  at 5k keys and from 5.2e-5 to 2.2e-5 at 11k. The output is a near-tie with
+  the serial form, not byte-identical, above 48 keys.
 
 
 ## [0.30.0] — 2026-09-10
