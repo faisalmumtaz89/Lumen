@@ -21,7 +21,7 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::shaders::{
     ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE, ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-    KV_CACHE_F16_KERNEL_SOURCE,
+    KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
 };
 use lumen_runtime::cuda::{
     attn_splitk_gqa6_chunks, attn_splitk_gqa6_merge_shared_bytes,
@@ -33,13 +33,13 @@ use lumen_runtime::cuda::{
 
 const NUM_HEADS: u32 = 24;
 const NUM_KV_HEADS: u32 = 4;
-const MAX_SEQ_LEN: u32 = 8_192;
+const MAX_SEQ_LEN: u32 = 16_384;
 const SCALE: f32 = 0.0625;
 
 /// Either side of one GQA-shared chunk (16), one tiled tile (128), the
-/// board shape and a multi-tile context.
+/// board shapes, and the pair's served bound (16,384 keys) and the key before it.
 const LENGTHS: &[u32] = &[
-    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4096, 4097, 8192,
+    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4096, 4097, 8192, 12288, 16383, 16384,
 ];
 
 fn try_device() -> Option<CudaDevice> {
@@ -522,4 +522,155 @@ fn the_widening_read_is_exact() {
             }
         }
     }
+}
+
+/// The fused Q/K/V prep writer: its half twin must produce the same Q, gate
+/// and K outputs bit for bit (the store type touches only the cache stores),
+/// write the round-to-nearest-even halves of exactly the values the F32 kernel
+/// stores, and count exactly the values that do not fit.
+#[test]
+fn the_fused_prep_half_twin_matches_the_f32_kernel_and_rounds_its_stores() {
+    let Some(dev) = try_device() else { return };
+    let module = dev
+        .compile_and_load(QGATE_FUSION_KERNEL_SOURCE)
+        .expect("compile fused prep");
+    let f32_fn = module.load_function("attn_prep_fused").expect("f32 fused");
+    let f16_fn = module
+        .load_function("attn_prep_fused_kvf16")
+        .expect("half fused");
+    let (nqh, nkv, hd, msl, pos) = (6u32, 1u32, 256u32, 8u32, 3u32);
+    let (eps, theta, rotary_dim) = (1e-6f32, 10_000.0f32, 64u32);
+    let mut s = 0x0005_0910_F16A_0004u64;
+    let qgate: Vec<f32> = (0..(nqh * hd * 2) as usize)
+        .map(|_| rand_unit(&mut s))
+        .collect();
+    let q_norm: Vec<f32> = (0..hd as usize)
+        .map(|_| 0.5 + rand_unit(&mut s) * 0.25)
+        .collect();
+    let k_norm: Vec<f32> = (0..hd as usize)
+        .map(|_| 0.5 + rand_unit(&mut s) * 0.25)
+        .collect();
+    // A V whose values straddle the half range, so the count is exercised.
+    let k_in: Vec<f32> = (0..(nkv * hd) as usize)
+        .map(|_| rand_unit(&mut s))
+        .collect();
+    let v_in: Vec<f32> = (0..(nkv * hd) as usize)
+        .map(|i| {
+            if i % 5 == 0 {
+                rand_unit(&mut s) * 100_000.0
+            } else {
+                rand_unit(&mut s)
+            }
+        })
+        .collect();
+    let expected_count = v_in.iter().filter(|x| !(x.abs() < 65_520.0)).count() as u32;
+    assert!(expected_count > 0);
+
+    let run = |half: bool| -> (
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<u16>,
+        Vec<u16>,
+        u32,
+    ) {
+        let qgate_g = dev.htod_copy(&qgate).unwrap();
+        let mut q_g = dev.alloc_zeros::<f32>((nqh * hd) as usize).unwrap();
+        let mut gate_g = dev.alloc_zeros::<f32>((nqh * hd) as usize).unwrap();
+        let mut k_g = dev.htod_copy(&k_in).unwrap();
+        let v_g = dev.htod_copy(&v_in).unwrap();
+        let qn_g = dev.htod_copy(&q_norm).unwrap();
+        let kn_g = dev.htod_copy(&k_norm).unwrap();
+        let cache_len = (nkv * msl * hd) as usize;
+        let cfg = LaunchConfig {
+            grid_dim: (nqh + 2 * nkv, 1, 1),
+            block_dim: (hd, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut kc32 = dev.alloc_zeros::<f32>(cache_len).unwrap();
+        let mut vc32 = dev.alloc_zeros::<f32>(cache_len).unwrap();
+        let mut kc16 = dev.alloc_zeros::<u16>(cache_len).unwrap();
+        let mut vc16 = dev.alloc_zeros::<u16>(cache_len).unwrap();
+        let mut overflow = dev.alloc_zeros::<u32>(1).unwrap();
+        unsafe {
+            if half {
+                dev.stream
+                    .launch_builder(&f16_fn)
+                    .arg(&qgate_g)
+                    .arg(&mut q_g)
+                    .arg(&mut gate_g)
+                    .arg(&mut k_g)
+                    .arg(&v_g)
+                    .arg(&qn_g)
+                    .arg(&kn_g)
+                    .arg(&mut kc16)
+                    .arg(&mut vc16)
+                    .arg(&mut overflow)
+                    .arg(&pos)
+                    .arg(&msl)
+                    .arg(&nqh)
+                    .arg(&nkv)
+                    .arg(&hd)
+                    .arg(&eps)
+                    .arg(&theta)
+                    .arg(&rotary_dim)
+                    .launch(cfg)
+                    .expect("half fused launch");
+            } else {
+                dev.stream
+                    .launch_builder(&f32_fn)
+                    .arg(&qgate_g)
+                    .arg(&mut q_g)
+                    .arg(&mut gate_g)
+                    .arg(&mut k_g)
+                    .arg(&v_g)
+                    .arg(&qn_g)
+                    .arg(&kn_g)
+                    .arg(&mut kc32)
+                    .arg(&mut vc32)
+                    .arg(&pos)
+                    .arg(&msl)
+                    .arg(&nqh)
+                    .arg(&nkv)
+                    .arg(&hd)
+                    .arg(&eps)
+                    .arg(&theta)
+                    .arg(&rotary_dim)
+                    .launch(cfg)
+                    .expect("f32 fused launch");
+            }
+        }
+        dev.synchronize().unwrap();
+        (
+            dev.dtoh_copy(&q_g).unwrap(),
+            dev.dtoh_copy(&gate_g).unwrap(),
+            dev.dtoh_copy(&k_g).unwrap(),
+            dev.dtoh_copy(&kc32).unwrap(),
+            dev.dtoh_copy(&vc32).unwrap(),
+            dev.dtoh_copy(&kc16).unwrap(),
+            dev.dtoh_copy(&vc16).unwrap(),
+            dev.dtoh_copy(&overflow).unwrap()[0],
+        )
+    };
+    let a = run(false);
+    let b = run(true);
+    assert_eq!(bits(&a.0), bits(&b.0), "Q differs");
+    assert_eq!(bits(&a.1), bits(&b.1), "gate differs");
+    assert_eq!(bits(&a.2), bits(&b.2), "K differs");
+    let slot = (pos * hd) as usize..((pos + 1) * hd) as usize;
+    for (i, (f, h)) in a.3[slot.clone()].iter().zip(&b.5[slot.clone()]).enumerate() {
+        assert_eq!(*h, f32_to_f16_bits(*f), "K cache dim {i}: {f:e}");
+    }
+    for (i, (f, h)) in a.4[slot.clone()].iter().zip(&b.6[slot.clone()]).enumerate() {
+        let want = f32_to_f16_bits(*f);
+        if f.is_nan() {
+            assert!((h & 0x7c00) == 0x7c00 && (h & 0x3ff) != 0);
+        } else {
+            assert_eq!(*h, want, "V cache dim {i}: {f:e}");
+        }
+    }
+    assert!(b.5[..slot.start].iter().all(|&h| h == 0) && b.6[..slot.start].iter().all(|&h| h == 0));
+    assert_eq!(b.7, expected_count, "overflow count from the fused writer");
 }

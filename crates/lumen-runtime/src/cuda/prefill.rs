@@ -4807,7 +4807,8 @@ const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes_f16() == 14_768);
 /// pair), the tiled kernel for everything else. The single-block and per-head
 /// split-K routes have no half twin, so the tiled threshold and force knobs
 /// do not apply here; a context past the pair's bound hands off to the tiled
-/// kernel exactly as the F32 router does.
+/// half kernel (the F32 router hands off to the per-query-head split-K pair,
+/// which has no half twin).
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_attention_decode_routed_f16(
     device: &CudaDevice,

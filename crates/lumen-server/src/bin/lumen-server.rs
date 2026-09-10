@@ -877,7 +877,11 @@ async fn run(args: Args) -> Result<(), String> {
             wire_global_tensors_and_raw(&mut cpu, &provider.globals(), false, false, false, false);
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
-            (Box::new(cpu), KvPrecision::F32)
+            // The CPU cache stores whatever precision the session asks for.
+            (
+                Box::new(cpu),
+                resolve_kv_precision(args.kv_precision, KvPrecision::F32),
+            )
         }
         BackendChoice::Auto => {
             return Err("internal: select_backend should have resolved Auto".to_string());

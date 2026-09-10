@@ -1256,15 +1256,19 @@ fn kv_cache_for<'a>(
 }
 
 /// Half store only: refuse to continue once a writer counted a value that
-/// does not fit in half — the cache would hold ±Inf and every later logit
-/// would be NaN. One 4-byte copy.
+/// does not fit in half — the store then holds ±Inf (or NaN) at that slot and
+/// every later logit computed over it is poisoned. Called after every prefill
+/// readback, after every streaming logits readback and after every decode
+/// token's readback, so no output computed from a poisoned cache leaves the
+/// backend. One 4-byte copy at a point that is already synchronised.
 fn check_kv_f16_overflow(device: &CudaDevice, st: &MutableState) -> Result<(), RuntimeError> {
     if let Some(counter) = st.kv_f16_overflow.as_ref() {
         let n = device.dtoh_copy(counter)?.first().copied().unwrap_or(0);
         if n > 0 {
             return Err(RuntimeError::Compute(format!(
-                "16-bit KV cache overflow: {n} value(s) exceeded the half range (|x| >= 65,520) \
-                 and would be stored as Inf; rerun with --kv-precision f32"
+                "16-bit KV cache: {n} key/value element(s) did not fit in half (|x| >= 65,520, \
+                 or not finite) and were stored as Inf/NaN; the generation is refused. Rerun \
+                 with --kv-precision f32"
             )));
         }
     }
@@ -1335,9 +1339,9 @@ fn write_kv_batch(
 
 /// The F32 view a prefill reader takes: the store itself when it is F32,
 /// otherwise the half store's positions `0..count` widened into the shared
-/// widening buffers, allocated on first use at the cache's full capacity
-/// (one pair for every layer; the readers see the F32 layout with a position
-/// stride of `count`).
+/// widening buffers `init()` allocated at the cache's full capacity (one pair
+/// for every layer; the readers see the F32 layout with a position stride of
+/// `count`).
 fn kv_view_for_prefill<'a>(
     device: &CudaDevice,
     kernels: &decode::KernelSet,
@@ -1354,27 +1358,10 @@ fn kv_view_for_prefill<'a>(
             let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("16-bit KV cache read without its kernels".into())
             })?;
-            if widen.is_none() {
-                let floats = kv_cache.num_kv_heads * kv_cache.max_seq_len * kv_cache.head_dim;
-                let needed = 2 * floats as u64 * 4;
-                let free = device.free_memory().unwrap_or(usize::MAX) as u64;
-                if free < needed {
-                    return Err(RuntimeError::Compute(format!(
-                        "16-bit KV cache: the prefill widening buffers need {} MB, {} MB free",
-                        needed / (1024 * 1024),
-                        free / (1024 * 1024)
-                    )));
-                }
-                *widen = Some((
-                    device.alloc_zeros::<f32>(floats)?,
-                    device.alloc_zeros::<f32>(floats)?,
-                ));
-                eprintln!(
-                    "[CUDA mem] KV widening buffers for the prefill readers: {} MB (kv=f16)",
-                    needed / (1024 * 1024)
-                );
-            }
-            let out = widen.as_mut().expect("allocated above");
+            // Allocated at init with the half store; never here.
+            let out = widen.as_mut().ok_or_else(|| {
+                RuntimeError::Compute("16-bit KV cache without its widening buffers".into())
+            })?;
             unsafe {
                 super::prefill::launch_kv_widen_f16(
                     device,
@@ -1405,6 +1392,7 @@ fn resolve_split_clone_budget(
     device: &CudaDevice,
     hp: &ModelHyperparams,
     attention_layers: usize,
+    kv_bytes_per_element: usize,
 ) -> ResolvedSplitBudget {
     // Free VRAM at the clone call site (preload_weights, which runs after
     // init() has already allocated the KV caches).
@@ -1421,16 +1409,15 @@ fn resolve_split_clone_budget(
         .map(|cap| model_max_seq_len.min(cap))
         .unwrap_or(model_max_seq_len);
 
-    // KV reserve == the per-layer F32 K+V alloc, summed over the ATTENTION layers.
-    // KvCacheGpu allocs `num_kv_heads * max_seq_len * head_dim` f32 elems for K and
-    // the same for V, per layer. F32 => 4 bytes/elem.
-    const KV_DTYPE_BYTES: usize = 4; // KvCacheGpu k/v_cache: alloc_zeros::<f32>
+    // KV reserve == the per-layer K+V alloc, summed over the ATTENTION layers.
+    // KvCacheGpu allocs `num_kv_heads * max_seq_len * head_dim` elems for K and
+    // the same for V, per layer, at the store's element size (4 B F32, 2 B half).
     let kv_reserve_bytes = attention_layers
         .saturating_mul(effective_max_seq_len)
         .saturating_mul(hp.num_kv_heads as usize)
         .saturating_mul(hp.head_dim as usize)
         .saturating_mul(2) // K and V
-        .saturating_mul(KV_DTYPE_BYTES);
+        .saturating_mul(kv_bytes_per_element);
 
     // `free_mem_bytes` was read in `preload_weights`, after `init` allocated
     // the KV caches, so it is already net of KV; the reserve is reported for
@@ -11893,9 +11880,9 @@ impl CudaBackend {
             p.record_token();
         }
         kv.advance_seq_len()?;
-        if st.decode_token_count % 64 == 0 {
-            check_kv_f16_overflow(&self.device, st)?;
-        }
+        // The logits/argmax copy above already synchronised the stream, so this
+        // 4-byte read costs no extra sync; every token is checked.
+        check_kv_f16_overflow(&self.device, st)?;
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
     }
@@ -11970,9 +11957,9 @@ impl CudaBackend {
         let token_host = self.device.dtoh_copy(&st.argmax_result)?;
         let token = token_host.first().copied().unwrap_or(0);
         kv.advance_seq_len()?;
-        if st.decode_token_count % 64 == 0 {
-            check_kv_f16_overflow(&self.device, st)?;
-        }
+        // The logits/argmax copy above already synchronised the stream, so this
+        // 4-byte read costs no extra sync; every token is checked.
+        check_kv_f16_overflow(&self.device, st)?;
         st.decode_token_count += 1;
         Ok(token)
     }
@@ -18286,6 +18273,15 @@ impl ComputeBackend for CudaBackend {
         // The KV caches are allocated in `preload_weights()`, once the layer
         // types are known: only the full-attention layers get one. `init()`
         // compiles the write kernel they share and records the capacity.
+        if self.kv_precision == KvPrecision::F16
+            && head_dim % (crate::cuda::ATTN_DECODE_TILED_BLOCK_DIM as usize) != 0
+        {
+            return Err(RuntimeError::Unsupported(format!(
+                "16-bit KV cache: the half decode-attention readers need head_dim to be a \
+                 multiple of {} (this model has {head_dim}); use --kv-precision f32",
+                crate::cuda::ATTN_DECODE_TILED_BLOCK_DIM
+            )));
+        }
         let kv_module = super::kv_cache::compile_kv_module(&self.device, self.kv_precision)?;
         let kv_caches: Vec<Option<KvCacheGpu>> = (0..num_layers).map(|_| None).collect();
         eprintln!(
@@ -18590,7 +18586,24 @@ impl ComputeBackend for CudaBackend {
             } else {
                 None
             },
-            kv_widen: None,
+            // The prefill readers' widened F32 pair, allocated here at the
+            // cache's capacity so no prefill ever allocates mid-layer (a
+            // failure there would leave a layer's cache advanced and the rest
+            // not). 2 x capacity x kv_heads x head_dim x 4 bytes: 128 MB at
+            // 16,384 positions on Qwen3.8-27B.
+            kv_widen: if self.kv_precision == KvPrecision::F16 {
+                let floats = num_kv_heads * max_seq_len * head_dim;
+                eprintln!(
+                    "[CUDA mem] KV widening buffers for the prefill readers: {} MB (kv=f16)",
+                    (2 * floats * 4) / (1024 * 1024)
+                );
+                Some((
+                    self.device.alloc_zeros::<f32>(floats)?,
+                    self.device.alloc_zeros::<f32>(floats)?,
+                ))
+            } else {
+                None
+            },
             globals,
             layer_weights_cache: Vec::new(),
             logits_gpu,
@@ -19828,6 +19841,9 @@ impl ComputeBackend for CudaBackend {
         // 4. Sync + readback logits.
         self.device.synchronize()?;
         let logits_host = self.device.dtoh_copy(&st.logits_gpu)?;
+        // The streaming path writes the half store in compute_layer; refuse here,
+        // before its logits leave, if any value did not fit.
+        check_kv_f16_overflow(&self.device, st)?;
 
         Ok(Logits { data: logits_host })
     }
@@ -20196,6 +20212,8 @@ impl ComputeBackend for CudaBackend {
         // Step 4: Single sync + readback.
         self.device.synchronize()?;
         let result = self.device.dtoh_copy(&st.scratch.x_gpu)?;
+        // A half store: refuse before any logit computed from a poisoned cache leaves.
+        check_kv_f16_overflow(&self.device, st)?;
 
         // Step 5: Advance host-side KV cache seq_len to match GPU state.
         for _ in 0..total {
@@ -20585,6 +20603,7 @@ impl ComputeBackend for CudaBackend {
                     &self.device,
                     &hp_copy,
                     attention_layer_count(&cache),
+                    self.kv_precision.bytes_per_element(),
                 );
                 let mem_before_q8_split = budget.free_mem_bytes;
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
@@ -20789,6 +20808,7 @@ impl ComputeBackend for CudaBackend {
                     &self.device,
                     &hp_copy,
                     attention_layer_count(&cache),
+                    self.kv_precision.bytes_per_element(),
                 );
                 let mem_before_q4_split = budget.free_mem_bytes;
                 let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {

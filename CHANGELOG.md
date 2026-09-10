@@ -13,7 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round
   to nearest even on the way in and count every value that does not fit,
-  refusing the generation rather than storing an infinity; the decode
+  and the engine refuses the generation at the next readback rather than
+  emitting an output computed over the poisoned slot; the decode
   readers are half twins of the F32 kernels (the GQA-shared pair's partial
   and the tiled kernel) that widen on load and keep the F32 arithmetic and
   order, so on half-representable inputs they reproduce the F32 kernels bit

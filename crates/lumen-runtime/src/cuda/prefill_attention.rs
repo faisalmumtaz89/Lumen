@@ -1526,7 +1526,7 @@ mod tests {
             }
         };
         let (num_heads, num_kv_heads, head_dim) = (24usize, 4usize, 256usize);
-        let max_seq_len = 4200usize;
+        let max_seq_len = 16_400usize;
         let cache = num_kv_heads * max_seq_len * head_dim;
         let q: Vec<f32> = (0..num_heads * head_dim)
             .map(|i| ((i as f32) * 0.011 + 0.7).sin() * 4.0)
@@ -1588,7 +1588,7 @@ mod tests {
         let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let mut out16 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        for seq_len in [1u32, 16, 129, 330, 1300, 2600, 4097] {
+        for seq_len in [1u32, 16, 129, 330, 1300, 2600, 4097, 16_384, 16_385] {
             let a = unsafe {
                 super::super::prefill::launch_attention_decode_gated(
                     &device,
@@ -1636,17 +1636,29 @@ mod tests {
                 .iter()
                 .map(|x| x.to_bits())
                 .collect();
-            assert!(
-                matches!(
-                    (a, b),
-                    (V::Tiled, V::TiledF16) | (V::SplitKGqa6, V::SplitKGqa6F16)
-                ),
-                "at seq_len {seq_len} the F32 store took {a:?} and the half store {b:?}"
-            );
-            assert_eq!(
-                got32, got16,
-                "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
-            );
+            // Past the pair's bound the F32 store takes the per-query-head pair
+            // (when it loaded) and the half store the tiled half kernel: two
+            // reduction orders, so a tolerance there instead of bit identity.
+            match (a, b) {
+                (V::Tiled, V::TiledF16) | (V::SplitKGqa6, V::SplitKGqa6F16) => {
+                    assert_eq!(
+                        got32, got16,
+                        "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
+                    );
+                }
+                (V::SplitK, V::TiledF16) => {
+                    let worst = got32
+                        .iter()
+                        .zip(&got16)
+                        .map(|(x, y)| (f32::from_bits(*x) - f32::from_bits(*y)).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        worst <= 1e-4,
+                        "past the bound at {seq_len}: max |diff| {worst:e}"
+                    );
+                }
+                other => panic!("at seq_len {seq_len} the stores took {other:?}"),
+            }
         }
     }
 }
