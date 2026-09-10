@@ -2067,6 +2067,7 @@ const _: () =
 const _: () =
     assert!(ATTN_SPLITK_GQA6_DIM_TILES * ATTN_DECODE_TILED_BLOCK_DIM == ATTN_SPLITK_GQA6_HEAD_DIM);
 const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes() <= 49152);
+const _: () = assert!(attn_splitk_gqa6_merge_shared_bytes(ATTN_SPLITK_GQA6_S_MAX) <= 49152);
 
 /// The longest context the GQA-shared pair can serve at the compile-time
 /// bound. Past it the chunk count would exceed the scratch bound and a chunk
@@ -2712,8 +2713,9 @@ fn dump_attention_call(
         AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
         AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
     };
+    let engine = option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     let meta = format!(
-        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
+        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
     );
     std::fs::write(stem.with_extension("json"), meta).map_err(io)
 }
@@ -4607,6 +4609,50 @@ mod attn_splitk_gqa6_tests {
             "nothing raises the bound past the constant"
         );
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+    }
+
+    /// One past the served bound is the shape exclusion — the message the
+    /// operator reads when a generation crosses it.
+    #[test]
+    fn one_past_the_served_bound_is_the_shape_exclusion() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+        let cap = attn_splitk_gqa6_max_seq_len();
+        assert_eq!(cap, 16_384);
+        assert_eq!(
+            splitk_gqa6_exclusion_reason(
+                false,
+                AttentionDecodeVariant::Tiled,
+                ample_scratch(),
+                true,
+                true,
+                super::attn_splitk_chunks(cap + 1),
+                HEADS,
+                KV,
+                HD,
+                cap + 1,
+                ATTN_SPLITK_GQA6_S_MAX,
+            ),
+            Some(SplitKGqa6Exclusion::Shape)
+        );
+        assert_eq!(
+            splitk_gqa6_exclusion_reason(
+                false,
+                AttentionDecodeVariant::Tiled,
+                ample_scratch(),
+                true,
+                true,
+                super::attn_splitk_chunks(cap),
+                HEADS,
+                KV,
+                HD,
+                cap,
+                ATTN_SPLITK_GQA6_S_MAX,
+            ),
+            None
+        );
     }
 
     #[test]

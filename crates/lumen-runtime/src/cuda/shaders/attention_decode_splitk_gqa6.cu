@@ -74,7 +74,7 @@
 
 #define GQA6_NEG_INF (-3.402823466e+38f)
 #define GQA6_HD       256u
-#define GQA6_MERGE_LANES 8u       // independent numerator accumulators in the merge
+#define GQA6_MERGE_LANES 8u       // independent numerator accumulators in the merge (the tree below sums exactly eight)
 #define GQA6_G        6u
 #define GQA6_BLOCK    128u
 #define GQA6_WARPS    (GQA6_BLOCK / 32u)
@@ -343,9 +343,16 @@ extern "C" __global__ void attention_decode_splitk_merge_gqa6_f32(
             acc[i] += op[(unsigned long long)(c + i) * GQA6_HD + d] * s_alpha[c + i];
         }
     }
-    for (unsigned int i = 0; c + i < num_chunks; i++) {
-        acc[i] += op[(unsigned long long)(c + i) * GQA6_HD + d] * s_alpha[c + i];
+    // Tail: the same lanes, compile-time indices only, so `acc` stays in
+    // registers (a runtime index into a local array demotes it to local
+    // memory).
+#pragma unroll
+    for (unsigned int i = 0; i < GQA6_MERGE_LANES; i++) {
+        if (c + i < num_chunks) {
+            acc[i] += op[(unsigned long long)(c + i) * GQA6_HD + d] * s_alpha[c + i];
+        }
     }
+    static_assert(GQA6_MERGE_LANES == 8u, "the merge's lane tree sums exactly eight lanes");
     const float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
                     + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
     attn_out[head * GQA6_HD + d] = sum * inv_l;

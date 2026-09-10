@@ -179,7 +179,10 @@ fn run_single_block(
         .load_function("attention_decode")
         .expect("Failed to load attention_decode function");
 
-    // Opt-in to extended dyn-shmem so we can serve up to seq_len=40_950.
+    // Opt in to the extended dynamic shared memory the long lengths need.
+    // A driver may decline (the RTX 5090 on 610.57.04 does), in which case a
+    // launch past the default 48 KiB cap fails; the caller asks
+    // `single_block_extended_shmem` before choosing such a length.
     use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
     let _ = func.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 163_840);
 
@@ -218,6 +221,21 @@ fn run_single_block(
 
     device.synchronize().expect("sync");
     device.dtoh_copy(&out_gpu).expect("dtoh")
+}
+
+/// Whether this device and driver grant the single-block kernel the extended
+/// dynamic shared memory its longest lengths need. The production launcher
+/// makes the same request and keeps to the default cap when it is declined.
+fn single_block_extended_shmem(device: &CudaDevice) -> bool {
+    use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+    let module = device
+        .compile_and_load(ATTENTION_KERNEL_SOURCE)
+        .expect("Failed to compile single-block kernel");
+    let func = module
+        .load_function("attention_decode")
+        .expect("Failed to load attention_decode function");
+    func.set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 163_840)
+        .is_ok()
 }
 
 /// Launch the tiled `attention_decode_tiled` kernel and return host output.
@@ -801,10 +819,18 @@ fn tiled_decode_matches_single_block_at_default_threshold() {
     };
     // Cross-validates tiled vs single-block at seq_len = 36_864 (the
     // original ATTN_DECODE_TILED_DEFAULT_THRESHOLD; lowered to 0 by the
-    // empirical "tiled-faster-everywhere" data). Single-block can still
-    // serve this seq_len (40_950 ceiling); both should match.
+    // empirical "tiled-faster-everywhere" data) where the driver grants the
+    // extended dynamic shared memory that length needs, else at the longest
+    // length the default 48 KiB cap serves — (49_152 / 4) - 8 = 12_280, the
+    // same ceiling the production launcher keeps to when the opt-in is
+    // declined (RTX 5090, driver 610.57.04).
     let (num_heads, num_kv_heads, head_dim, max_seq_len) = (4u32, 1u32, 128u32, 65_536u32);
-    let seq_len = 36_864u32;
+    let seq_len = if single_block_extended_shmem(&device) {
+        36_864u32
+    } else {
+        eprintln!("single-block extended shared memory declined; cross-validating at 12_280");
+        12_280u32
+    };
     let scale = 1.0 / (head_dim as f32).sqrt();
     let (q, k, v) = gen_inputs(num_heads, num_kv_heads, head_dim, max_seq_len, 0xDEADBEEF);
     let single = run_single_block(

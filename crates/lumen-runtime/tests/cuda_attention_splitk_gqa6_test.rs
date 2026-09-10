@@ -54,9 +54,12 @@ use lumen_runtime::cuda::{
 const MAX_SEQ_LEN: u32 = 16_384;
 const SCALE: f32 = 0.0625; // 1 / sqrt(256)
 
-/// Roughly five times the largest error the pair produced against F64 over
-/// this length set (4.33e-7, bound by the wide-score-spread inputs at 4,096
-/// keys), so a real regression trips it and F32 noise does not.
+/// Absolute tolerance against the float64 reference. Every run prints the
+/// observed maximum per length (`f64-reference …` lines) so the headroom is a
+/// recorded number: at the 2026-09-10 sweep to 16,384 keys the largest was
+/// well under this bound on the RTX 5090 (see the box logs kept with the
+/// campaign record). Never widen this to absorb a storage change; give a
+/// changed input format its own reference instead.
 const MAX_ABS_ERR_VS_F64: f64 = 2e-6;
 /// The two routes are each within ~4e-7 of F64, so they agree with each other
 /// to about 1e-6.
@@ -430,6 +433,12 @@ fn gqa6_matches_the_f64_reference_at_every_length() {
             let got = run_gqa6(&dev, g, &gpu, seq_len, attn_splitk_gqa6_chunks(seq_len));
             let (err, at) = max_abs_err(&got, &want)
                 .unwrap_or_else(|e| panic!("{} seq_len {seq_len}: {e}", g.label()));
+            // The observed maximum is part of the record: the tolerance's
+            // headroom is read off these lines, never assumed.
+            eprintln!(
+                "f64-reference {} seq_len {seq_len}: max abs error {err:.3e}",
+                g.label()
+            );
             assert!(
                 err <= MAX_ABS_ERR_VS_F64,
                 "{} seq_len {seq_len}: max abs error {err:.3e} at element {at} \
