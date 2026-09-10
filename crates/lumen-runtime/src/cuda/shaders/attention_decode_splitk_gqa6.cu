@@ -74,6 +74,7 @@
 
 #define GQA6_NEG_INF (-3.402823466e+38f)
 #define GQA6_HD       256u
+#define GQA6_MERGE_LANES 8u       // independent numerator accumulators in the merge
 #define GQA6_G        6u
 #define GQA6_BLOCK    128u
 #define GQA6_WARPS    (GQA6_BLOCK / 32u)
@@ -324,11 +325,28 @@ extern "C" __global__ void attention_decode_splitk_merge_gqa6_f32(
     const float l_total = gqa6_block_sum(ls, scr, tid);
     const float inv_l = (l_total > 0.0f) ? (1.0f / l_total) : 0.0f;
 
+    // The numerator runs over every chunk. Eight independent lanes, chunk c
+    // into lane c % 8, then a fixed tree: the rounding-error growth of the
+    // serial sum drops with the chain length (S/8 + 3 terms deep instead of
+    // S), and the order stays fixed, so the result is deterministic. Real
+    // activations at 5k and 11k keys put the serial form's worst coordinate
+    // error at 8.7e-5 against 2.0e-5 for the per-query-head pair.
     const float* op = o_part + (unsigned long long)head * num_chunks * GQA6_HD;
     const unsigned int d = dt * GQA6_BLOCK + tid;
-    float acc = 0.0f;
-    for (unsigned int c = 0; c < num_chunks; c++) {
-        acc += op[(unsigned long long)c * GQA6_HD + d] * s_alpha[c];
+    float acc[GQA6_MERGE_LANES];
+#pragma unroll
+    for (unsigned int i = 0; i < GQA6_MERGE_LANES; i++) acc[i] = 0.0f;
+    unsigned int c = 0;
+    for (; c + GQA6_MERGE_LANES <= num_chunks; c += GQA6_MERGE_LANES) {
+#pragma unroll
+        for (unsigned int i = 0; i < GQA6_MERGE_LANES; i++) {
+            acc[i] += op[(unsigned long long)(c + i) * GQA6_HD + d] * s_alpha[c + i];
+        }
     }
-    attn_out[head * GQA6_HD + d] = acc * inv_l;
+    for (unsigned int i = 0; c + i < num_chunks; i++) {
+        acc[i] += op[(unsigned long long)(c + i) * GQA6_HD + d] * s_alpha[c + i];
+    }
+    const float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+                    + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    attn_out[head * GQA6_HD + d] = sum * inv_l;
 }
