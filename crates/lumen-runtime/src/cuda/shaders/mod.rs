@@ -210,9 +210,6 @@ pub const PREFILL_NORM_KERNEL_SOURCE: &str = include_str!("prefill_norm.cu");
 /// Batched RoPE kernel (per-token position offsets).
 pub const PREFILL_ROPE_KERNEL_SOURCE: &str = include_str!("prefill_rope.cu");
 
-/// Batched KV cache scatter-write kernel (write N tokens at once).
-pub const PREFILL_KV_KERNEL_SOURCE: &str = include_str!("prefill_kv.cu");
-
 /// Batched elementwise kernels (SwiGLU, residual_add, extract/scatter row).
 pub const PREFILL_ELEMENTWISE_KERNEL_SOURCE: &str = include_str!("prefill_elementwise.cu");
 
