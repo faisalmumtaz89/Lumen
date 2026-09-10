@@ -2465,13 +2465,14 @@ fn splitk_gqa6_exclusion_reason(
     None
 }
 
-/// Say once per reason why an eligible-looking dispatch kept the
-/// per-query-head pair after `LUMEN_CUDA_ATTN_SPLITK_GQA6=1` loaded the
-/// GQA-shared one.
+/// Say once per reason why an eligible-looking dispatch declined the
+/// GQA-shared pair after the loader built it (by default on the measured
+/// cell, or under `LUMEN_CUDA_ATTN_SPLITK_GQA6=1`).
 ///
 /// Short contexts and every geometry the specialised kernels do not serve
-/// are expected exclusions, not failures — but an operator who set the flag
-/// and sees no ACTIVE line needs the reason without reading the dispatcher.
+/// are expected exclusions, not failures — but an operator who expects the
+/// pair and sees no ACTIVE line needs the reason without reading the
+/// dispatcher.
 ///
 /// The line carries no kernel symbol at all — not the route that declined and
 /// not the one that serves the token instead. A census harvests route names by

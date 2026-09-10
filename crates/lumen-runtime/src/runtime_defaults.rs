@@ -1154,7 +1154,7 @@ pub const ATTN_SPLITK_CHUNK_POSITIONS: u32 = 128;
 /// and what [`attn_splitk_scale_with_context`] returns to when opted out.
 pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
 
-/// `LUMEN_CUDA_ATTN_SPLITK_GQA6=1`: serve the eligible full-attention decode
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA6`: serve the eligible full-attention decode
 /// step with the GQA-shared split-K pair
 /// (`attention_decode_splitk_partial_gqa6_f32` +
 /// `attention_decode_splitk_merge_gqa6_f32`) instead of the per-query-head
@@ -1163,18 +1163,53 @@ pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
 /// K and V read is a 16-byte load; the merge computes each chunk's rescale
 /// once instead of once per output dimension.
 ///
-/// OFF unless set. Eligibility is narrow — six query heads per KV head
-/// (24/4, 12/2 and 6/1 alike), head_dim 256, and a context the chunk cap
-/// covers — and every other shape
-/// keeps its existing route, so the flag is a no-op elsewhere. The chunk
-/// partition and both reduction orders differ from the per-query-head pair,
-/// which makes the two a near-tie rather than byte-identical.
+/// Unset, [`attn_splitk_gqa6_default`] decides: ON for a Q4_0 dense body on
+/// compute capability 12.x, the one cell it is measured on, OFF elsewhere.
+/// `0`/`off`/`false`/`no` switch it off, `1`/`on`/`true`/`yes` force it on
+/// wherever the pair is eligible (either case), and any other spelling falls
+/// to the default (the kill-switch dialect every default-ON knob honours).
+/// Eligibility is narrow — six query heads per KV head (24/4, 12/2 and 6/1
+/// alike), head_dim 256, and a context the chunk cap covers — and every other
+/// shape keeps its existing route, so the setting is a no-op elsewhere. The
+/// chunk partition and both reduction orders differ from the per-query-head
+/// pair, which makes the two a near-tie rather than byte-identical.
 ///
-/// Read once: the loader consults it while building the kernel set and the
-/// scratch allocator consults it at init.
+/// The loader consults it once while building the kernel set; the scratch
+/// allocator keys off the loaded pair.
 pub fn attn_splitk_gqa6_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6").as_deref() == Ok("1"))
+    let value = std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    match value.as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => false,
+        Some("1") | Some("on") | Some("true") | Some("yes") => true,
+        _ => attn_splitk_gqa6_default(),
+    }
+}
+
+/// The model- and device-aware default behind [`attn_splitk_gqa6_enabled`]:
+/// a Q4_0 dense body on compute capability 12.x (source-fidelity Qwen3.8-27B
+/// Q4_0 on the RTX 5090: 82.59 → 85.56 tok/s at 1,024 in / 128 out on the
+/// promoted build), never MoE, all under the canonical-defaults master switch. Every other cell is
+/// unmeasured and stays on the per-query-head pair.
+pub fn attn_splitk_gqa6_default() -> bool {
+    attn_splitk_gqa6_default_for(
+        model_dense_quant(),
+        model_is_moe(),
+        device_cc_major(),
+        canonical_default_on(),
+    )
+}
+
+/// [`attn_splitk_gqa6_default`] with every input explicit (the process
+/// wrappers feed the globals; tests feed values).
+pub fn attn_splitk_gqa6_default_for(
+    quant: Option<QuantScheme>,
+    moe: bool,
+    cc_major: u8,
+    canonical: bool,
+) -> bool {
+    !moe && canonical && cc_major == 12 && matches!(quant, Some(QuantScheme::Q4_0))
 }
 
 /// `LUMEN_CUDA_ATTN_SPLITK_SCALE` (default ON, canonical): size the split-K
@@ -3462,6 +3497,72 @@ mod tests {
             !attn_splitk_default_for(Some(QuantScheme::Q8_0), false, 8, false),
             "legacy switch: Q8 pair off too"
         );
+        assert!(attn_splitk_gqa6_default_for(q4, false, 12, true));
+        assert!(
+            !attn_splitk_gqa6_default_for(q4, false, 12, false),
+            "legacy switch: GQA-shared pair off"
+        );
+    }
+
+    #[test]
+    fn gqa6_default_is_the_measured_cell_only() {
+        let q4 = Some(QuantScheme::Q4_0);
+        assert!(attn_splitk_gqa6_default_for(q4, false, 12, true));
+        for cc in [0u8, 7, 8, 9, 10, 11, 13] {
+            assert!(
+                !attn_splitk_gqa6_default_for(q4, false, cc, true),
+                "compute capability {cc}.x is unmeasured"
+            );
+        }
+        for quant in [
+            Some(QuantScheme::Q8_0),
+            Some(QuantScheme::Bf16),
+            Some(QuantScheme::F16),
+            None,
+        ] {
+            assert!(
+                !attn_splitk_gqa6_default_for(quant, false, 12, true),
+                "{quant:?} body is unmeasured"
+            );
+        }
+        assert!(!attn_splitk_gqa6_default_for(q4, true, 12, true), "MoE off");
+    }
+
+    #[test]
+    fn gqa6_env_is_a_kill_switch_over_the_default() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        set_model_primary_quant(QuantScheme::Q4_0);
+        set_model_is_moe(false);
+        set_device_cc_major(12);
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
+        assert!(attn_splitk_gqa6_enabled(), "measured cell: on when unset");
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "0");
+        assert!(!attn_splitk_gqa6_enabled(), "=0 switches the pair off");
+        for off in ["off", "false", "no", "OFF", "False", " 0 "] {
+            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", off);
+            assert!(
+                !attn_splitk_gqa6_enabled(),
+                "={off:?} switches the pair off"
+            );
+        }
+        for other in ["", "garbage", "01", "2"] {
+            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", other);
+            assert!(
+                attn_splitk_gqa6_enabled(),
+                "={other:?} is neither spelling and falls to the default"
+            );
+        }
+        set_device_cc_major(8);
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
+        assert!(
+            !attn_splitk_gqa6_enabled(),
+            "unmeasured card: off when unset"
+        );
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "1");
+        assert!(attn_splitk_gqa6_enabled(), "=1 forces it on");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
+        reset_for_tests();
     }
 
     #[test]
