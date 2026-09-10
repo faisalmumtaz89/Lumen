@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-09-10
+
 ### Changed
 
 - **The GQA-shared decode-attention pair is the default for a Q4_0 dense body
@@ -1337,6 +1339,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.30.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.26.0...v0.27.0
