@@ -1973,7 +1973,7 @@ pub(crate) unsafe fn launch_attention_decode_tiled(
 /// Upper bound on the split-K decode-attention split count. Single source for
 /// the scratch sizing (`GpuScratch::attn_splitk`); the partial-pass grid uses
 /// [`attn_splitk_chunks`] for the token's actual context.
-pub(crate) const ATTN_SPLITK_S_MAX: u32 = 32;
+pub const ATTN_SPLITK_S_MAX: u32 = 32;
 const _: () = assert!(crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS <= ATTN_SPLITK_S_MAX);
 
 /// The split count for a decode step over `seq_len` KV positions: one chunk
@@ -1991,7 +1991,7 @@ const _: () = assert!(crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS <= ATTN_
 /// 170-SM card); scaling with the context keeps every chunk's serial walk
 /// bounded up to the cap. A count of 1 means the caller takes the tiled kernel when it
 /// loaded: one chunk plus a merge is the tiled walk with an extra launch.
-pub(crate) fn attn_splitk_chunks(seq_len: u32) -> u32 {
+pub fn attn_splitk_chunks(seq_len: u32) -> u32 {
     if !crate::runtime_defaults::attn_splitk_scale_with_context() {
         return crate::runtime_defaults::ATTN_SPLITK_FIXED_CHUNKS;
     }
@@ -2013,6 +2013,103 @@ fn attn_splitk_chunk_count(seq_len: u32, chunk_positions: u32) -> u32 {
 /// (same 128-lane slot addressing as the tiled kernel, 8 slots max).
 fn attention_decode_splitk_supports_head_dim(head_dim: u32) -> bool {
     head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0 && head_dim <= 1024
+}
+
+// ---------------------------------------------------------------------------
+// GQA-shared split-K pair (`LUMEN_CUDA_ATTN_SPLITK_GQA6`)
+// ---------------------------------------------------------------------------
+
+/// Query heads per KV head the GQA-shared partial pass is specialised for:
+/// it forms all six of a group's scores from one register-resident K row.
+pub const ATTN_SPLITK_GQA6_GQA_RATIO: u32 = 6;
+
+/// Head dimension the GQA-shared partial pass is specialised for: 256 is two
+/// `float4` per lane across a 32-lane warp, both in the QK phase and in the
+/// two dimensions each of the 128 threads owns in the PV phase.
+pub const ATTN_SPLITK_GQA6_HEAD_DIM: u32 = 256;
+
+/// KV positions per chunk of the GQA-shared partial pass. The whole chunk's
+/// scores for one query head live in one warp's lanes, so a chunk cannot
+/// exceed 32; 16 is what the geometry measured fastest at, and it is what
+/// puts enough CTAs on the card (4 KV heads x 69 chunks = 276 at a context of
+/// 1,100, against 170 SMs).
+pub const ATTN_SPLITK_GQA6_CHUNK: u32 = 16;
+
+/// Upper bound on the GQA-shared split count, and with it the scratch: the
+/// partial pass writes `num_heads * S * head_dim` floats, 6 MiB at this bound
+/// for a 24-head, 256-dimension model.
+pub const ATTN_SPLITK_GQA6_S_MAX: u32 = 256;
+
+/// CTAs per query head in the GQA-shared merge: each owns one block's worth
+/// of the head's dimensions, one dimension per thread. Splitting the head
+/// this way halves each CTA's accumulation and doubles the grid, which one
+/// CTA per head leaves at 24 on a 170-SM card; the price is evaluating the S
+/// rescale factors once per tile instead of once per head. The merge measures
+/// 4.1 µs at a context of 1,100.
+pub const ATTN_SPLITK_GQA6_DIM_TILES: u32 = ATTN_SPLITK_GQA6_HEAD_DIM / ATTN_DECODE_TILED_BLOCK_DIM;
+
+// The kernel's safety rests on these three, and each would fail silently:
+// a chunk longer than a warp leaves the softmax normalising only the first
+// 32 positions while the PV loop folds the rest in un-normalised; tiles that
+// do not cover the head exactly either drop dimensions or write past the
+// head into its neighbour's output row; and shared memory over the default
+// cap needs an opt-in the launcher does not perform.
+const _: () = assert!(ATTN_SPLITK_GQA6_CHUNK <= 32);
+const _: () =
+    assert!(ATTN_SPLITK_GQA6_DIM_TILES * ATTN_DECODE_TILED_BLOCK_DIM == ATTN_SPLITK_GQA6_HEAD_DIM);
+const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes() <= 49152);
+
+/// The longest context the GQA-shared pair serves. Past it the chunk count
+/// would exceed the scratch bound and a chunk would outgrow the 32 lanes its
+/// softmax runs on, so the caller keeps the per-query-head pair instead —
+/// nothing is truncated.
+pub const fn attn_splitk_gqa6_max_seq_len() -> u32 {
+    ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK
+}
+
+/// The GQA-shared split count for `seq_len`: one chunk per
+/// [`ATTN_SPLITK_GQA6_CHUNK`] positions. The kernels then divide `seq_len`
+/// evenly into that count, and `ceil(n / ceil(n / c)) <= c` guarantees the
+/// span they walk never exceeds the chunk length.
+pub fn attn_splitk_gqa6_chunks(seq_len: u32) -> u32 {
+    seq_len.div_ceil(ATTN_SPLITK_GQA6_CHUNK).max(1)
+}
+
+/// Shape eligibility for the GQA-shared pair: any model whose query heads
+/// come in groups of [`ATTN_SPLITK_GQA6_GQA_RATIO`] per KV head at
+/// [`ATTN_SPLITK_GQA6_HEAD_DIM`] dimensions, up to
+/// [`attn_splitk_gqa6_max_seq_len`] KV positions. The kernels index by group,
+/// not by an absolute head count, so 24 query heads over 4 KV heads and 12
+/// over 2 are the same work per CTA and differ only in grid height.
+pub fn attention_decode_splitk_gqa6_supports(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+) -> bool {
+    num_kv_heads != 0
+        && num_heads == num_kv_heads * ATTN_SPLITK_GQA6_GQA_RATIO
+        && head_dim == ATTN_SPLITK_GQA6_HEAD_DIM
+        && seq_len >= 1
+        && seq_len <= attn_splitk_gqa6_max_seq_len()
+}
+
+/// Dynamic shared bytes for the GQA-shared partial pass: the six staged Q
+/// rows, the staged V tile, the `[6][C]` score block, and the per-head
+/// (m, l) pair. 22'960 B at the shipped chunk length, inside the 48 KiB
+/// default cap, so no shared-memory opt-in is needed.
+pub const fn attn_splitk_gqa6_partial_shared_bytes() -> u32 {
+    (ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_HEAD_DIM
+        + ATTN_SPLITK_GQA6_CHUNK * ATTN_SPLITK_GQA6_HEAD_DIM
+        + ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_CHUNK
+        + 12)
+        * 4
+}
+
+/// Dynamic shared bytes for the GQA-shared merge: one rescale factor per
+/// chunk plus the four-warp reduction scratch.
+pub const fn attn_splitk_gqa6_merge_shared_bytes(chunks: u32) -> u32 {
+    (chunks + 4) * 4
 }
 
 /// Launch the split-K decode-attention pair (`LUMEN_CUDA_ATTN_SPLITK`):
@@ -2103,6 +2200,88 @@ unsafe fn launch_attention_decode_splitk(
     Ok(())
 }
 
+/// Launch the GQA-shared split-K decode-attention pair
+/// (`LUMEN_CUDA_ATTN_SPLITK_GQA6`): a partial pass on a
+/// `(S, num_kv_heads)` grid, then a `(num_heads, dim_tiles)` merge. Shares
+/// the sibling pair's buffer contract and its `(m, l, o)` scratch, but with
+/// the larger split count [`attn_splitk_gqa6_chunks`] returns — the caller
+/// must have sized the scratch for it.
+///
+/// # Safety
+///
+/// Same buffer / shape constraints as the underlying kernels. The shape must
+/// already satisfy [`attention_decode_splitk_gqa6_supports`] and the scratch
+/// must hold `num_heads * S * head_dim` floats; the caller checks both.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_splitk_gqa6(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<f32>,
+    v_cache: &CudaSlice<f32>,
+    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<(), RuntimeError> {
+    let (partial_fn, merge_fn) = match (
+        kernels.attention_decode_splitk_partial_gqa6.as_ref(),
+        kernels.attention_decode_splitk_merge_gqa6.as_ref(),
+    ) {
+        (Some(p), Some(m)) => (p, m),
+        _ => {
+            return Err(RuntimeError::Compute(
+                "attention_decode_splitk_gqa6: kernels not available".into(),
+            ))
+        }
+    };
+    let s: u32 = attn_splitk_gqa6_chunks(seq_len);
+    let chunk = ATTN_SPLITK_GQA6_CHUNK;
+    let (m_part, l_part, o_part) = scratch;
+    device
+        .stream
+        .launch_builder(partial_fn)
+        .arg(q)
+        .arg(k_cache)
+        .arg(v_cache)
+        .arg(&mut *m_part)
+        .arg(&mut *l_part)
+        .arg(&mut *o_part)
+        .arg(&seq_len)
+        .arg(&max_seq_len)
+        .arg(&scale)
+        .arg(&s)
+        .arg(&chunk)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (s, num_kv_heads, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
+        })
+        .map_err(|e| {
+            RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f32: {e}"))
+        })?;
+    device
+        .stream
+        .launch_builder(merge_fn)
+        .arg(&*m_part)
+        .arg(&*l_part)
+        .arg(&*o_part)
+        .arg(attn_out)
+        .arg(&s)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads, ATTN_SPLITK_GQA6_DIM_TILES, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(s),
+        })
+        .map_err(|e| {
+            RuntimeError::Compute(format!("attention_decode_splitk_merge_gqa6_f32: {e}"))
+        })?;
+    Ok(())
+}
+
 /// Name the split-K decode-attention pair on its first dispatch.
 ///
 /// The chunk count moves with the context, so the line reports the count of
@@ -2121,6 +2300,201 @@ fn announce_splitk_route(head_dim: u32, seq_len: u32) {
         format!(
             "[CUDA] attention_decode_splitk_partial: ACTIVE (chunks={chunks} {policy}, \
              head_dim={head_dim}, merge=attention_decode_splitk_merge)"
+        )
+    });
+}
+
+/// Name the GQA-shared split-K pair on its first dispatch.
+///
+/// The chunk length is fixed, so the line reports the count the dispatch that
+/// emitted it derived from its context, alongside the geometry the pair is
+/// specialised for.
+fn announce_splitk_gqa6_route(num_heads: u32, num_kv_heads: u32, head_dim: u32, seq_len: u32) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        let chunks = attn_splitk_gqa6_chunks(seq_len);
+        format!(
+            "[CUDA] attention_decode_splitk_partial_gqa6_f32: ACTIVE (kv=f32, \
+             q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
+             seq_len={seq_len}, chunks={chunks}, chunk={chunk}, block={block}, \
+             merge=attention_decode_splitk_merge_gqa6_f32)",
+            chunk = ATTN_SPLITK_GQA6_CHUNK,
+            block = ATTN_DECODE_TILED_BLOCK_DIM,
+        )
+    });
+}
+
+/// Why a loaded GQA-shared pair will not serve a dispatch.
+///
+/// Each variant is a branch of [`launch_attention_decode_gated`] that sends
+/// the token somewhere else, and each gets its own announcement latch, so an
+/// operator running one process through several shapes hears every distinct
+/// reason rather than only the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitKGqa6Exclusion {
+    ForcedTiled,
+    SingleBlockThreshold,
+    NoScratch,
+    ShippingPairAbsent,
+    HeadDim,
+    OneChunkContext,
+    Shape,
+    ScratchTooSmall,
+}
+
+impl SplitKGqa6Exclusion {
+    /// Every variant, for the tests to walk. Maintained by hand: the assert
+    /// below catches a list that has fallen behind the enum's last variant,
+    /// and the exhaustive match in `latch` refuses a variant with no latch;
+    /// a variant added with its arms but left out of this list is not caught.
+    const ALL: [Self; 8] = [
+        Self::ForcedTiled,
+        Self::SingleBlockThreshold,
+        Self::NoScratch,
+        Self::ShippingPairAbsent,
+        Self::HeadDim,
+        Self::OneChunkContext,
+        Self::Shape,
+        Self::ScratchTooSmall,
+    ];
+
+    /// This reason's own announcement latch.
+    ///
+    /// An exhaustive match rather than an index into an array: a variant
+    /// added to the enum then fails to compile here, where an index would
+    /// have compiled and panicked out of bounds the first time the new
+    /// reason was announced — inside a diagnostic, under a flag, which is
+    /// the worst place to learn about it.
+    fn latch(self) -> &'static std::sync::OnceLock<()> {
+        static FORCED_TILED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static SINGLE_BLOCK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static NO_SCRATCH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static PAIR_ABSENT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static HEAD_DIM: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static ONE_CHUNK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static SHAPE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static SCRATCH_TOO_SMALL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        match self {
+            Self::ForcedTiled => &FORCED_TILED,
+            Self::SingleBlockThreshold => &SINGLE_BLOCK,
+            Self::NoScratch => &NO_SCRATCH,
+            Self::ShippingPairAbsent => &PAIR_ABSENT,
+            Self::HeadDim => &HEAD_DIM,
+            Self::OneChunkContext => &ONE_CHUNK,
+            Self::Shape => &SHAPE,
+            Self::ScratchTooSmall => &SCRATCH_TOO_SMALL,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::ForcedTiled => "LUMEN_CUDA_DECODE_TILED forces the tiled kernel",
+            Self::SingleBlockThreshold => {
+                "the decode-attention threshold selected the single-block kernel"
+            }
+            Self::NoScratch => "this dispatch site supplies no split-K scratch",
+            Self::ShippingPairAbsent => "the split-K pair this route rides did not load",
+            Self::HeadDim => "head_dim is outside the split-K route's range",
+            Self::OneChunkContext => "a one-chunk context hands off to the tiled kernel",
+            Self::Shape => {
+                "the pair serves 6 query heads per KV head at head_dim 256, \
+                 up to 4096 KV positions"
+            }
+            Self::ScratchTooSmall => {
+                "the split-K scratch is sized for the per-query-head split count"
+            }
+        }
+    }
+}
+
+// Catches an `ALL` that has fallen behind the enum's last variant. It cannot
+// catch a variant appended after that one — `latch`'s exhaustive match is what
+// closes that case.
+const _: () =
+    assert!(SplitKGqa6Exclusion::ALL.len() == SplitKGqa6Exclusion::ScratchTooSmall as usize + 1);
+
+/// Which exclusion applies to this dispatch, or `None` when the GQA-shared
+/// pair serves it.
+///
+/// The arms are in the order [`launch_attention_decode_gated`] takes its
+/// decisions, so one call before any route is chosen covers every way out —
+/// including the ones that never enter the split-K block.
+///
+/// PURE function of its inputs — the caller resolves `shipping_chunks` (which
+/// reads the environment) and passes it in.
+#[allow(clippy::too_many_arguments)]
+fn splitk_gqa6_exclusion_reason(
+    force_tiled: bool,
+    variant: AttentionDecodeVariant,
+    scratch_o_floats: Option<usize>,
+    splitk_pair_loaded: bool,
+    tiled_loaded: bool,
+    shipping_chunks: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+) -> Option<SplitKGqa6Exclusion> {
+    use SplitKGqa6Exclusion as X;
+    if force_tiled {
+        return Some(X::ForcedTiled);
+    }
+    if variant != AttentionDecodeVariant::Tiled {
+        return Some(X::SingleBlockThreshold);
+    }
+    let Some(o_floats) = scratch_o_floats else {
+        return Some(X::NoScratch);
+    };
+    if !splitk_pair_loaded {
+        return Some(X::ShippingPairAbsent);
+    }
+    if !attention_decode_splitk_supports_head_dim(head_dim) {
+        return Some(X::HeadDim);
+    }
+    if shipping_chunks <= 1 && tiled_loaded {
+        return Some(X::OneChunkContext);
+    }
+    if !attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len) {
+        return Some(X::Shape);
+    }
+    let needed =
+        (num_heads as usize) * (attn_splitk_gqa6_chunks(seq_len) as usize) * (head_dim as usize);
+    if o_floats < needed {
+        return Some(X::ScratchTooSmall);
+    }
+    None
+}
+
+/// Say once per reason why an eligible-looking dispatch kept the
+/// per-query-head pair after `LUMEN_CUDA_ATTN_SPLITK_GQA6=1` loaded the
+/// GQA-shared one.
+///
+/// Short contexts and every geometry the specialised kernels do not serve
+/// are expected exclusions, not failures — but an operator who set the flag
+/// and sees no ACTIVE line needs the reason without reading the dispatcher.
+///
+/// The line carries no kernel symbol at all — not the route that declined and
+/// not the one that serves the token instead. A census harvests route names by
+/// substring, so either would let a declined dispatch be counted as one that
+/// happened. Which route serves the token depends on the reason: the tiled or
+/// single-block kernel when the split-K route is not entered at all, the
+/// per-query-head pair when it is and only this pass is declined; whichever it
+/// is announces itself on its own line.
+fn announce_splitk_gqa6_excluded(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    reason: SplitKGqa6Exclusion,
+) {
+    // One latch per reason: a process that meets several shapes reports each
+    // of them once, not just whichever came first.
+    let why = reason.message();
+    super::decode::announce_route_once(reason.latch(), || {
+        format!(
+            "[CUDA] split-K GQA-shared pair: EXCLUDED ({why}; \
+             q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
+             seq_len={seq_len})"
         )
     });
 }
@@ -2162,6 +2536,31 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     let threshold = decode_tiled_threshold();
     let mut variant = attention_decode_variant(seq_len, force_tiled, threshold);
 
+    // Say once why a loaded GQA-shared pair will not serve this dispatch.
+    // Asked here, before any route is taken, so that every way out reaches
+    // the operator who set the flag — including the ones that never enter
+    // the split-K block below.
+    let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
+        && kernels.attention_decode_splitk_merge_gqa6.is_some();
+    let scratch_o_floats = splitk_scratch.as_ref().map(|s| s.2.len());
+    if gqa6_loaded {
+        if let Some(reason) = splitk_gqa6_exclusion_reason(
+            force_tiled,
+            variant,
+            scratch_o_floats,
+            kernels.attention_decode_splitk_partial.is_some()
+                && kernels.attention_decode_splitk_merge.is_some(),
+            kernels.attention_decode_tiled.is_some(),
+            attn_splitk_chunks(seq_len),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+        ) {
+            announce_splitk_gqa6_excluded(num_heads, num_kv_heads, head_dim, seq_len, reason);
+        }
+    }
+
     // Split-K upgrade: applies only to the AUTO Tiled selection — an explicit
     // `LUMEN_CUDA_DECODE_TILED=1` still forces the tiled kernel, and a
     // SingleBlock selection (including the threshold opt-out) is untouched.
@@ -2178,6 +2577,42 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                 && (attn_splitk_chunks(seq_len) > 1
                     || kernels.attention_decode_tiled.is_none())
             {
+                // GQA-shared upgrade within the split-K route: same inputs,
+                // same scratch, same output — one CTA per (KV head, chunk)
+                // instead of per (query head, chunk). Only for the geometry
+                // the kernels are specialised for and a context the chunk
+                // cap covers; every other shape keeps the pair below, so
+                // nothing is silently truncated. A decline was already
+                // explained above.
+                if gqa6_loaded
+                    && attention_decode_splitk_gqa6_supports(
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        seq_len,
+                    )
+                    && scratch.2.len()
+                        >= (num_heads as usize)
+                            * (attn_splitk_gqa6_chunks(seq_len) as usize)
+                            * (head_dim as usize)
+                {
+                    launch_attention_decode_splitk_gqa6(
+                        device,
+                        kernels,
+                        q,
+                        k_cache,
+                        v_cache,
+                        scratch,
+                        attn_out,
+                        num_heads,
+                        num_kv_heads,
+                        seq_len,
+                        max_seq_len,
+                        scale,
+                    )?;
+                    announce_splitk_gqa6_route(num_heads, num_kv_heads, head_dim, seq_len);
+                    return Ok(AttentionDecodeVariant::SplitKGqa6);
+                }
                 launch_attention_decode_splitk(
                     device,
                     kernels,
@@ -2217,9 +2652,9 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     }
 
     match variant {
-        // SplitK returns early from the upgrade block above; the selector
-        // never produces it here.
-        AttentionDecodeVariant::SplitK => unreachable!(),
+        // Both split-K variants return early from the upgrade block above;
+        // the selector never produces them here.
+        AttentionDecodeVariant::SplitK | AttentionDecodeVariant::SplitKGqa6 => unreachable!(),
         AttentionDecodeVariant::SingleBlock => {
             // Single-block fast path (existing kernel, byte-identical to the
             // the prior dispatch when force_tiled = false and
@@ -3668,5 +4103,315 @@ mod attn_splitk_chunk_tests {
             }
             assert_eq!(next, seq_len, "seq_len={seq_len}: chunks left a tail");
         }
+    }
+}
+
+#[cfg(test)]
+mod attn_splitk_gqa6_tests {
+    //! Shape and exclusion-reason tests for the GQA-shared split-K pair.
+    //! Hardware-independent: both predicates are pure Rust, and the reason
+    //! function takes the environment-derived shipping split count as an
+    //! argument rather than resolving it.
+
+    use super::{
+        attention_decode_splitk_gqa6_supports, attn_splitk_gqa6_chunks,
+        attn_splitk_gqa6_max_seq_len, splitk_gqa6_exclusion_reason, SplitKGqa6Exclusion,
+        ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
+        ATTN_SPLITK_GQA6_S_MAX,
+    };
+    use crate::cuda::decode::AttentionDecodeVariant;
+
+    /// The Qwen3.8-27B full-attention shape, and the scratch a 4096-position
+    /// cache gets: enough for every eligible context.
+    const HEADS: u32 = 24;
+    const KV: u32 = 4;
+    const HD: u32 = ATTN_SPLITK_GQA6_HEAD_DIM;
+    fn ample_scratch() -> Option<usize> {
+        Some((HEADS * ATTN_SPLITK_GQA6_S_MAX * HD) as usize)
+    }
+
+    /// Every argument set to a value that takes the route, so each test
+    /// perturbs exactly one thing.
+    fn reason_for_eligible() -> Option<SplitKGqa6Exclusion> {
+        splitk_gqa6_exclusion_reason(
+            false,
+            AttentionDecodeVariant::Tiled,
+            ample_scratch(),
+            true,
+            true,
+            9, // the shipping count at 1,100 positions
+            HEADS,
+            KV,
+            HD,
+            1100,
+        )
+    }
+
+    #[test]
+    fn the_eligible_dispatch_has_no_exclusion_reason() {
+        assert_eq!(reason_for_eligible(), None);
+    }
+
+    #[test]
+    fn every_way_out_of_the_route_has_its_own_reason() {
+        use SplitKGqa6Exclusion as X;
+        let cases: [(&str, X, Option<X>); 8] = [
+            (
+                "forced tiled",
+                X::ForcedTiled,
+                splitk_gqa6_exclusion_reason(
+                    true,
+                    AttentionDecodeVariant::Tiled,
+                    ample_scratch(),
+                    true,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    HD,
+                    1100,
+                ),
+            ),
+            (
+                "single-block threshold",
+                X::SingleBlockThreshold,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::SingleBlock,
+                    ample_scratch(),
+                    true,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    HD,
+                    1100,
+                ),
+            ),
+            (
+                "no scratch (a prefill dispatch site)",
+                X::NoScratch,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    None,
+                    true,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    HD,
+                    1100,
+                ),
+            ),
+            (
+                "shipping pair absent",
+                X::ShippingPairAbsent,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    ample_scratch(),
+                    false,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    HD,
+                    1100,
+                ),
+            ),
+            (
+                "head_dim the split-K route declines",
+                X::HeadDim,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    ample_scratch(),
+                    true,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    100,
+                    1100,
+                ),
+            ),
+            (
+                // A context short enough that the shipping split count is
+                // one: the tiled kernel takes the token without the dispatch
+                // ever entering the split-K block.
+                "one-chunk context",
+                X::OneChunkContext,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    ample_scratch(),
+                    true,
+                    true,
+                    1,
+                    HEADS,
+                    KV,
+                    HD,
+                    64,
+                ),
+            ),
+            (
+                "geometry the kernels do not serve",
+                X::Shape,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    ample_scratch(),
+                    true,
+                    true,
+                    9,
+                    32,
+                    4,
+                    HD,
+                    1100,
+                ),
+            ),
+            (
+                "scratch sized for the other split count",
+                X::ScratchTooSmall,
+                splitk_gqa6_exclusion_reason(
+                    false,
+                    AttentionDecodeVariant::Tiled,
+                    Some((HEADS * 32 * HD) as usize),
+                    true,
+                    true,
+                    9,
+                    HEADS,
+                    KV,
+                    HD,
+                    1100,
+                ),
+            ),
+        ];
+        for (what, want, got) in cases {
+            assert_eq!(got, Some(want), "{what}");
+        }
+        // Every variant is reachable, and each has its own latch slot.
+        let reached: Vec<X> = cases.iter().map(|(_, w, _)| *w).collect();
+        for x in SplitKGqa6Exclusion::ALL {
+            assert!(
+                reached.contains(&x),
+                "{x:?} is unreachable from the dispatcher"
+            );
+        }
+        for (i, a) in SplitKGqa6Exclusion::ALL.iter().enumerate() {
+            for b in SplitKGqa6Exclusion::ALL.iter().skip(i + 1) {
+                assert!(
+                    !std::ptr::eq(a.latch(), b.latch()),
+                    "{a:?} and {b:?} share a latch, so one would silence the other"
+                );
+            }
+        }
+    }
+
+    /// A one-chunk context with no tiled kernel to hand off to stays on the
+    /// split-K route, so the GQA-shared pair may still take it.
+    #[test]
+    fn a_one_chunk_context_without_a_tiled_kernel_is_not_excluded() {
+        assert_eq!(
+            splitk_gqa6_exclusion_reason(
+                false,
+                AttentionDecodeVariant::Tiled,
+                ample_scratch(),
+                true,
+                false,
+                1,
+                HEADS,
+                KV,
+                HD,
+                64,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_supported_scope_is_six_query_heads_per_kv_head_at_head_dim_256() {
+        for (heads, kv) in [(24, 4), (12, 2), (6, 1), (48, 8)] {
+            assert!(
+                attention_decode_splitk_gqa6_supports(heads, kv, HD, 1100),
+                "{heads} query heads over {kv} KV heads is a 6:1 group"
+            );
+        }
+        for (heads, kv) in [(24, 8), (32, 4), (24, 3), (24, 0)] {
+            assert!(
+                !attention_decode_splitk_gqa6_supports(heads, kv, HD, 1100),
+                "{heads} over {kv} is not a 6:1 group"
+            );
+        }
+        for hd in [64, 128, 192, 512] {
+            assert!(!attention_decode_splitk_gqa6_supports(HEADS, KV, hd, 1100));
+        }
+    }
+
+    #[test]
+    fn the_context_bound_is_the_scratch_bound() {
+        let cap = attn_splitk_gqa6_max_seq_len();
+        assert_eq!(cap, ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK);
+        assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, cap));
+        assert!(!attention_decode_splitk_gqa6_supports(
+            HEADS,
+            KV,
+            HD,
+            cap + 1
+        ));
+        assert!(!attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 0));
+        assert_eq!(attn_splitk_gqa6_chunks(cap), ATTN_SPLITK_GQA6_S_MAX);
+    }
+
+    /// The kernels give one warp to a query head's whole chunk and stage that
+    /// many V rows in shared, so the walk must never outgrow the chunk.
+    #[test]
+    fn no_eligible_context_makes_a_chunk_outgrow_its_warp() {
+        for seq_len in 1..=attn_splitk_gqa6_max_seq_len() {
+            let s = attn_splitk_gqa6_chunks(seq_len);
+            assert!(s <= ATTN_SPLITK_GQA6_S_MAX, "seq_len={seq_len}: S={s}");
+            let span = seq_len.div_ceil(s);
+            assert!(
+                span <= ATTN_SPLITK_GQA6_CHUNK && span <= 32,
+                "seq_len={seq_len}: span={span}"
+            );
+        }
+    }
+
+    /// The kernel repeats the group size, head dimension and block width as
+    /// its own `#define`s, and NVRTC never sees the Rust constants. The two
+    /// are bound here rather than by a `const _`, because the shader is a
+    /// string: a retune on one side that misses the other fails this test
+    /// instead of launching a kernel whose shared-memory layout disagrees
+    /// with the bytes the host requested.
+    #[test]
+    fn the_shader_defines_match_the_host_constants() {
+        let src = crate::cuda::shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE;
+        for (name, want) in [
+            ("GQA6_HD", ATTN_SPLITK_GQA6_HEAD_DIM),
+            ("GQA6_G", super::ATTN_SPLITK_GQA6_GQA_RATIO),
+            ("GQA6_BLOCK", super::ATTN_DECODE_TILED_BLOCK_DIM),
+        ] {
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&format!("#define {name} ")))
+                .unwrap_or_else(|| panic!("the shader no longer defines {name}"));
+            let got: u32 = line
+                .split_whitespace()
+                .nth(2)
+                .and_then(|v| v.trim_end_matches('u').parse().ok())
+                .unwrap_or_else(|| panic!("cannot read a value out of `{line}`"));
+            assert_eq!(got, want, "#define {name} disagrees with the host constant");
+        }
+    }
+
+    /// The merge's CTAs must tile the head exactly, one dimension per thread.
+    #[test]
+    fn the_merge_tiles_cover_the_head_exactly() {
+        assert_eq!(
+            ATTN_SPLITK_GQA6_DIM_TILES * super::ATTN_DECODE_TILED_BLOCK_DIM,
+            ATTN_SPLITK_GQA6_HEAD_DIM
+        );
     }
 }

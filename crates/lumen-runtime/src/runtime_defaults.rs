@@ -1154,6 +1154,29 @@ pub const ATTN_SPLITK_CHUNK_POSITIONS: u32 = 128;
 /// and what [`attn_splitk_scale_with_context`] returns to when opted out.
 pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
 
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA6=1`: serve the eligible full-attention decode
+/// step with the GQA-shared split-K pair
+/// (`attention_decode_splitk_partial_gqa6_f32` +
+/// `attention_decode_splitk_merge_gqa6_f32`) instead of the per-query-head
+/// pair. One CTA per (KV head, chunk) fetches each K and V row once for the
+/// whole six-query-head group rather than once per query head, and every Q,
+/// K and V read is a 16-byte load; the merge computes each chunk's rescale
+/// once instead of once per output dimension.
+///
+/// OFF unless set. Eligibility is narrow — six query heads per KV head
+/// (24/4, 12/2 and 6/1 alike), head_dim 256, and a context the chunk cap
+/// covers — and every other shape
+/// keeps its existing route, so the flag is a no-op elsewhere. The chunk
+/// partition and both reduction orders differ from the per-query-head pair,
+/// which makes the two a near-tie rather than byte-identical.
+///
+/// Read once: the loader consults it while building the kernel set and the
+/// scratch allocator consults it at init.
+pub fn attn_splitk_gqa6_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6").as_deref() == Ok("1"))
+}
+
 /// `LUMEN_CUDA_ATTN_SPLITK_SCALE` (default ON, canonical): size the split-K
 /// decode-attention split count from the context. `=0` pins the fixed count
 /// [`ATTN_SPLITK_FIXED_CHUNKS`] at every context, the configuration the
@@ -1903,6 +1926,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_PREP_FUSE",
     "LUMEN_CUDA_ATTN_SPLITK",
     "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+    "LUMEN_CUDA_ATTN_SPLITK_GQA6",
     "LUMEN_CUDA_ATTN_SPLITK_SCALE",
     "LUMEN_CUDA_ATTN_TILED_CODEGEN",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
@@ -4095,6 +4119,7 @@ mod tests {
         "LUMEN_CUDA_ATTN_PREP_FUSE",
         "LUMEN_CUDA_ATTN_SPLITK",
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6",
         "LUMEN_CUDA_ATTN_SPLITK_SCALE",
         "LUMEN_CUDA_ATTN_TILED_CODEGEN",
         "LUMEN_CUDA_F16_CACHE",
