@@ -1156,7 +1156,7 @@ pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
 
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6`: serve the eligible full-attention decode
 /// step with the GQA-shared split-K pair
-/// (`attention_decode_splitk_partial_gqa6_f32` +
+/// (`attention_decode_splitk_partial_gqa6_loop_f32` +
 /// `attention_decode_splitk_merge_gqa6_f32`) instead of the per-query-head
 /// pair. One CTA per (KV head, chunk) fetches each K and V row once for the
 /// whole six-query-head group rather than once per query head, and every Q,

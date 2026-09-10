@@ -921,7 +921,7 @@ pub(crate) struct KernelSet {
 /// The kernels a half-typed KV store is read and written with. Loaded as a
 /// group or not at all.
 pub(crate) struct KvF16Kernels {
-    /// `attention_decode_splitk_partial_gqa6_f16`; the F32 merge consumes its partials.
+    /// `attention_decode_splitk_partial_gqa6_loop_f16`; the F32 merge consumes its partials.
     pub(crate) splitk_partial_gqa6: CudaFunction,
     /// `attention_decode_splitk_partial_f16`, the per-query-head pair's partial; the F32
     /// merge consumes its partials. The twin of the route the F32 router takes outside the
@@ -1072,7 +1072,7 @@ pub(crate) fn compile_all_kernels(
         crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
             splitk_partial_gqa6: load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_partial_gqa6_f16",
+                "attention_decode_splitk_partial_gqa6_loop_f16",
             )?,
             splitk_partial: load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
@@ -1198,11 +1198,11 @@ pub(crate) fn compile_all_kernels(
         attention_decode_splitk_partial_gqa6: if load_splitk_gqa6 {
             match load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_partial_gqa6_f32",
+                "attention_decode_splitk_partial_gqa6_loop_f32",
             ) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
+                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_loop_f32: FAILED ({e})");
                     None
                 }
             }
@@ -4031,7 +4031,7 @@ pub(crate) enum AttentionDecodeVariant {
     SplitKGqa6,
     /// `attention_decode_tiled_f16`: the tiled kernel reading a half store.
     TiledF16,
-    /// `attention_decode_splitk_partial_gqa6_f16` + the F32 merge, on a half store.
+    /// `attention_decode_splitk_partial_gqa6_loop_f16` + the F32 merge, on a half store.
     SplitKGqa6F16,
     /// `attention_decode_splitk_partial_f16` + the F32 merge, on a half store.
     SplitKF16,

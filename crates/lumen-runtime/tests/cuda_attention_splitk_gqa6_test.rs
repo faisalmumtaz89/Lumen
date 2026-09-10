@@ -1,5 +1,5 @@
 //! Correctness suite for the GQA-shared split-K decode-attention pair
-//! (`attention_decode_splitk_partial_gqa6_f32` +
+//! (`attention_decode_splitk_partial_gqa6_loop_f32` +
 //! `attention_decode_splitk_merge_gqa6_f32`, `LUMEN_CUDA_ATTN_SPLITK_GQA6`).
 //!
 //! Requires the `cuda` feature; the GPU cases are skipped where there is no
@@ -262,7 +262,7 @@ fn run_gqa6_at(
         .compile_and_load(ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE)
         .expect("compile GQA-shared pair");
     let partial = module
-        .load_function("attention_decode_splitk_partial_gqa6_f32")
+        .load_function("attention_decode_splitk_partial_gqa6_loop_f32")
         .expect("partial");
     let merge = module
         .load_function("attention_decode_splitk_merge_gqa6_f32")

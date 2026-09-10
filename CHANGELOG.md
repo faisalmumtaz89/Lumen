@@ -24,7 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   3,968; 24,576 and 32,768 keys now served. `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
   and `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` set the policy;
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
-  set, restores the bounded form as an A/B control.
+  set, restores the bounded form as an A/B control. The partials are new
+  kernels and carry new names (`attention_decode_splitk_partial_gqa6_loop_f32`
+  / `_loop_f16`); the merge (`attention_decode_splitk_merge_gqa6_f32`) is
+  unchanged, and the route lines name the new symbols.
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round
@@ -107,7 +110,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Added
 
 - **`LUMEN_CUDA_ATTN_SPLITK_GQA6`, a GQA-shared decode-attention pair
-  (default off)** — `attention_decode_splitk_partial_gqa6_f32` and
+  (default off)** — `attention_decode_splitk_partial_gqa6_loop_f32` and
   `attention_decode_splitk_merge_gqa6_f32` serve the split-K decode selection
   on models whose query heads come in groups of six per KV head at `head_dim`
   256, at contexts up to 4,096. The shipping split-K partial pass runs one CTA

@@ -277,7 +277,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
     for &seq_len in LENGTHS {
         let a = run_gqa6_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_f32",
+            "attention_decode_splitk_partial_gqa6_loop_f32",
             attn_splitk_gqa6_partial_shared_bytes(),
             &q,
             &k32,
@@ -287,7 +287,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
         );
         let b = run_gqa6_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_f16",
+            "attention_decode_splitk_partial_gqa6_loop_f16",
             attn_splitk_gqa6_partial_shared_bytes_f16(),
             &q,
             &k16,
@@ -804,7 +804,7 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
     for &seq_len in &[2817u32, 4097, 6144, 12288, 16384] {
         let a = run_gqa6_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_f32",
+            "attention_decode_splitk_partial_gqa6_loop_f32",
             attn_splitk_gqa6_partial_shared_bytes(),
             &q,
             &k32,
@@ -814,7 +814,7 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
         );
         let b = run_gqa6_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_f16",
+            "attention_decode_splitk_partial_gqa6_loop_f16",
             attn_splitk_gqa6_partial_shared_bytes_f16(),
             &q,
             &k16,

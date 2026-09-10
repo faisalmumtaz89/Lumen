@@ -2355,7 +2355,9 @@ unsafe fn launch_attention_decode_splitk_gqa6(
             shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
         })
         .map_err(|e| {
-            RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f32: {e}"))
+            RuntimeError::Compute(format!(
+                "attention_decode_splitk_partial_gqa6_loop_f32: {e}"
+            ))
         })?;
     device
         .stream
@@ -2408,7 +2410,7 @@ fn announce_splitk_gqa6_route(num_heads: u32, num_kv_heads: u32, head_dim: u32, 
     super::decode::announce_route_once(&SEEN, || {
         let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, false);
         format!(
-            "[CUDA] attention_decode_splitk_partial_gqa6_f32: ACTIVE (kv=f32, \
+            "[CUDA] attention_decode_splitk_partial_gqa6_loop_f32: ACTIVE (kv=f32, \
              q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
              seq_len={seq_len}, chunks={chunks}, partition={partition}, tile={tile}, \
              one_tile_max={one_tile}, target={target}, block={block}, \
@@ -2812,9 +2814,9 @@ fn dump_attention_call(
         AttentionDecodeVariant::SingleBlock => "attention_decode",
         AttentionDecodeVariant::Tiled => "attention_decode_tiled",
         AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
-        AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
+        AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_loop_f32",
         AttentionDecodeVariant::TiledF16 => "attention_decode_tiled_f16",
-        AttentionDecodeVariant::SplitKGqa6F16 => "attention_decode_splitk_partial_gqa6_f16",
+        AttentionDecodeVariant::SplitKGqa6F16 => "attention_decode_splitk_partial_gqa6_loop_f16",
         AttentionDecodeVariant::SplitKF16 => "attention_decode_splitk_partial_f16",
     };
     let engine = crate::runtime_defaults::build_identity();
@@ -4971,7 +4973,7 @@ mod attn_splitk_gqa6_tests {
 // bytes.
 // ---------------------------------------------------------------------------
 
-/// Dynamic shared bytes of `attention_decode_splitk_partial_gqa6_f16`: the Q
+/// Dynamic shared bytes of `attention_decode_splitk_partial_gqa6_loop_f16`: the Q
 /// block as F32, the V tile as halves, the score block and the (m, l) slots.
 pub const fn attn_splitk_gqa6_partial_shared_bytes_f16() -> u32 {
     (ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_HEAD_DIM
@@ -5251,7 +5253,9 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
             shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes_f16(),
         })
         .map_err(|e| {
-            RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f16: {e}"))
+            RuntimeError::Compute(format!(
+                "attention_decode_splitk_partial_gqa6_loop_f16: {e}"
+            ))
         })?;
     device
         .stream
@@ -5323,7 +5327,7 @@ fn announce_splitk_gqa6_route_f16(num_heads: u32, num_kv_heads: u32, head_dim: u
     super::decode::announce_route_once(&SEEN, || {
         let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, true);
         format!(
-            "[CUDA] attention_decode_splitk_partial_gqa6_f16: ACTIVE (kv=f16, \
+            "[CUDA] attention_decode_splitk_partial_gqa6_loop_f16: ACTIVE (kv=f16, \
              q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
              seq_len={seq_len}, chunks={chunks}, partition={partition}, tile={tile}, \
              one_tile_max={one_tile}, target={target}, block={block}, \

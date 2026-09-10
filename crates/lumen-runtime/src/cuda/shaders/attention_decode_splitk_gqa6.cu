@@ -408,7 +408,7 @@ __device__ __forceinline__ void gqa6_loop_range(
         kb = gqa6_h4_to_f4(rb.x, rb.y);                                                             \
     }
 
-extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_f32(
+extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_loop_f32(
     const float* __restrict__ q,
     const float* __restrict__ k_cache,
     const float* __restrict__ v_cache,
@@ -424,7 +424,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_par
     GQA6_LOOP_BODY(false, GQA6_KLOAD_F32)
 }
 
-extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_f16(
+extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_loop_f16(
     const float* __restrict__ q,
     const unsigned short* __restrict__ k_cache,
     const unsigned short* __restrict__ v_cache,
