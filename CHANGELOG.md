@@ -9,6 +9,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **The GQA-shared decode-attention pair serves any context the cache holds,
+  with fixed scratch and no route switch.** Its partial pass is now a tile
+  loop: up to a one-tile bound (176 tiles of 16 keys on the F32 store, 256 on
+  the half store) each CTA takes one tile, bit-identical to every release
+  since v0.29.0; above it the split count is held at 128 and each CTA walks a
+  balanced run of whole tiles with the tiled kernel's running-max recurrence.
+  The split-K scratch is 3.0 MiB (F32) / 4.1 MiB (half) on Qwen3.8-27B at any
+  context instead of growing with it (24.2 MiB at 16,384), and a generation
+  that crosses 16,384 keys no longer hands off to the per-query-head pair.
+  Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
+  2,600 keys, −21 % at 6,144, −27 % at 16,384, never slower at any measured
+  context; half store −17 % at 6,144, −29 % at 16,384, +8 % in one cell at
+  3,968; 24,576 and 32,768 keys now served. `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
+  and `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` set the policy;
+  `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
+  set, restores the bounded form as an A/B control.
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round
@@ -48,8 +64,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   instead of 8.6 GB, and the F16 dequant-cache and clone budgets see the
   memory freed. The per-layer capacity and `LUMEN_CUDA_MAX_SEQ_LEN` are
   unchanged.
-- **The GQA-shared decode-attention pair now serves contexts up to 16,384
-  KV positions** — its split-count bound rises from 256 to 1,024 chunks of
+- **The GQA-shared decode-attention pair's bounded form serves contexts up
+  to 16,384 KV positions** (superseded in this release by the tile loop above,
+  which keeps this form below the one-tile bound and as the A/B control) — its
+  split-count bound rises from 256 to 1,024 chunks of
   16 keys (`ATTN_SPLITK_GQA6_S_MAX`), so a generation past 4,096 keys no
   longer falls back to the per-query-head pair, which reads every K and V row
   once per query head (at 6,144 keys that fallback cost 1.6 ms of a 13.1 ms

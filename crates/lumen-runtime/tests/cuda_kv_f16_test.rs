@@ -24,7 +24,7 @@ use lumen_runtime::cuda::shaders::{
     ATTENTION_DECODE_TILED_KERNEL_SOURCE, KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
 };
 use lumen_runtime::cuda::{
-    attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_merge_shared_bytes,
+    attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
     attn_splitk_gqa6_partial_shared_bytes, attn_splitk_gqa6_partial_shared_bytes_f16,
     ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
     ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
@@ -163,6 +163,7 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
     k: &CudaSlice<K>,
     v: &CudaSlice<K>,
     seq_len: u32,
+    geometry: (u32, u32),
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let module = dev
         .compile_and_load(ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE)
@@ -171,13 +172,12 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
     let merge = module
         .load_function("attention_decode_splitk_merge_gqa6_f32")
         .expect("merge");
-    let chunks = attn_splitk_gqa6_chunks(seq_len);
+    let (chunks, partition) = geometry;
     let n_part = (NUM_HEADS * chunks) as usize;
     let mut m_part = nan_filled(dev, n_part);
     let mut l_part = nan_filled(dev, n_part);
     let mut o_part = nan_filled(dev, n_part * HEAD_DIM as usize);
     let mut out = nan_filled(dev, (NUM_HEADS * HEAD_DIM) as usize);
-    let chunk = GQA6_CHUNK;
     let max_seq_len = MAX_SEQ_LEN;
     let scale = SCALE;
     unsafe {
@@ -193,7 +193,7 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
             .arg(&max_seq_len)
             .arg(&scale)
             .arg(&chunks)
-            .arg(&chunk)
+            .arg(&partition)
             .launch(LaunchConfig {
                 grid_dim: (chunks, NUM_KV_HEADS, 1),
                 block_dim: (BLOCK_DIM, 1, 1),
@@ -283,6 +283,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
             &k32,
             &v32,
             seq_len,
+            attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1),
         );
         let b = run_gqa6_partial(
             &dev,
@@ -292,6 +293,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
             &k16,
             &v16,
             seq_len,
+            attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1),
         );
         assert!(
             a.3.iter().all(|x| x.is_finite()),
@@ -771,6 +773,54 @@ fn the_half_per_head_partial_reproduces_the_f32_partial_bit_for_bit() {
             &k16,
             &v16,
             seq_len,
+        );
+        assert!(
+            a.3.iter().all(|x| x.is_finite()),
+            "F32 output not finite at {seq_len}"
+        );
+        assert_eq!(bits(&a.0), bits(&b.0), "m differs at seq_len {seq_len}");
+        assert_eq!(bits(&a.1), bits(&b.1), "l differs at seq_len {seq_len}");
+        assert_eq!(bits(&a.2), bits(&b.2), "o differs at seq_len {seq_len}");
+        assert_eq!(
+            bits(&a.3),
+            bits(&b.3),
+            "merged output differs at seq_len {seq_len}"
+        );
+    }
+}
+
+/// The whole-tile partition: the half partial reproduces the F32 partial bit
+/// for bit at the shipped target too, at the balanced partition's boundary
+/// contexts and past the old bound.
+#[test]
+fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
+    let Some(dev) = try_device() else { return };
+    let inp = make_inputs(0x0005_0911_F16A_0006);
+    let q = dev.htod_copy(&inp.q).unwrap();
+    let k32 = dev.htod_copy(&inp.k).unwrap();
+    let v32 = dev.htod_copy(&inp.v).unwrap();
+    let k16 = dev.htod_copy(&inp.k16).unwrap();
+    let v16 = dev.htod_copy(&inp.v16).unwrap();
+    for &seq_len in &[2817u32, 4097, 6144, 12288, 16384] {
+        let a = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_f32",
+            attn_splitk_gqa6_partial_shared_bytes(),
+            &q,
+            &k32,
+            &v32,
+            seq_len,
+            (128, 1),
+        );
+        let b = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_f16",
+            attn_splitk_gqa6_partial_shared_bytes_f16(),
+            &q,
+            &k16,
+            &v16,
+            seq_len,
+            (128, 1),
         );
         assert!(
             a.3.iter().all(|x| x.is_finite()),

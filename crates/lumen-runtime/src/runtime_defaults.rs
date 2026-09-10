@@ -1220,26 +1220,71 @@ pub fn set_build_identity(identity: &str) {
 
 static BUILD_IDENTITY: OnceLock<String> = OnceLock::new();
 
-/// `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`: the split-count bound the
-/// GQA-shared pair serves, `ATTN_SPLITK_GQA6_S_MAX` (1024 chunks of 16 keys,
-/// 16,384 KV positions, 24.2 MiB of scratch on a 24-head model) unless set;
-/// the launcher clamps values above the constant down to it, and `0` or an
-/// unparsable value falls to the constant. Lowering it
-/// shrinks the scratch and hands longer contexts to the per-query-head pair
-/// exactly where the dispatcher stops — `256` reproduces the v0.29.0/v0.30.0
-/// behaviour (4,096 positions).
-pub fn attn_splitk_gqa6_max_chunks() -> u32 {
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`: the A/B control for the
+/// one-tile-per-CTA form the GQA-shared pair took through the r5 bound raise.
+/// Unset (the default) means no bound: the pair walks tiles in a loop with the
+/// split count held at [`attn_splitk_gqa6_target`] and serves any context the
+/// cache holds. Set to `n`, the pair runs one tile per CTA up to `n` chunks of
+/// 16 keys (clamped to `ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`) with the scratch
+/// sized for `n`, and a longer context hands off to the per-query-head pair
+/// exactly as before the loop — `256` reproduces the v0.29.0/v0.30.0
+/// behaviour (4,096 positions), `1024` the r5 bound raise (16,384). `0` or an
+/// unparsable value is unset.
+pub fn attn_splitk_gqa6_max_chunks() -> Option<u32> {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT)
+        .map(|n| n.min(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT))
 }
 
-/// The compile-time split-count bound of the GQA-shared pair, mirrored here
-/// so the env resolver stays free of the CUDA module (the CUDA launcher
+/// The compile-time split-count ceiling of the GQA-shared pair (the merge's
+/// shared block and the largest scratch any policy may ask for), mirrored
+/// here so the env resolver stays free of the CUDA module (the CUDA launcher
 /// asserts the two agree).
 pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
+
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`: up to this many 16-key tiles the
+/// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
+/// above it the CTAs walk whole tiles at the fixed target. The default is per
+/// store, from the RTX 5090 sweeps (r5 step 3, rounds 4–8): 176 on the F32
+/// store (never slower than the one-tile form below it, faster above), 256 on
+/// the half store (whose one-tile kernel runs six CTAs per SM and keeps a
+/// one-wave edge to 255 tiles; the loop's worst cell is then +8 % at 3,968
+/// keys, elsewhere −10 to −29 %). Clamped to
+/// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
+pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
+    std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(if half_store {
+            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16
+        } else {
+            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
+        })
+        .min(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT)
+}
+
+/// `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET`: the split count the GQA-shared pair
+/// holds above the one-tile bound; each CTA walks a balanced run of whole
+/// tiles. Default 128: on the RTX 5090 within 4 % of the best measured count
+/// at every context from 6,144 to 32,768 keys on both stores (r5 step 3,
+/// round 5); 64 starves the machine, 176+ splits too finely. The scratch is
+/// sized for `max(one-tile bound, target)` chunks and never grows with the
+/// context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
+pub fn attn_splitk_gqa6_target() -> u32 {
+    std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(ATTN_SPLITK_GQA6_TARGET_DEFAULT)
+        .min(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT)
+}
+
+pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT: u32 = 176;
+pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16: u32 = 256;
+pub const ATTN_SPLITK_GQA6_TARGET_DEFAULT: u32 = 128;
 
 /// [`attn_splitk_gqa6_default`] with every input explicit (the process
 /// wrappers feed the globals; tests feed values).
@@ -3571,26 +3616,61 @@ mod tests {
     }
 
     #[test]
-    fn gqa6_max_chunks_reads_the_env_and_falls_to_the_constant() {
+    fn gqa6_max_chunks_is_unset_by_default_and_clamps_when_set() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
-        assert_eq!(
-            attn_splitk_gqa6_max_chunks(),
-            ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
-        );
-        for (v, want) in [("256", 256), (" 512 ", 512), ("4096", 4096)] {
+        assert_eq!(attn_splitk_gqa6_max_chunks(), None);
+        for (v, want) in [
+            ("256", 256),
+            (" 512 ", 512),
+            ("4096", ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT),
+        ] {
             std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", v);
-            assert_eq!(attn_splitk_gqa6_max_chunks(), want, "={v:?}");
+            assert_eq!(attn_splitk_gqa6_max_chunks(), Some(want), "={v:?}");
         }
         for v in ["0", "", "garbage", "-1", "1.5"] {
             std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", v);
-            assert_eq!(
-                attn_splitk_gqa6_max_chunks(),
-                ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT,
-                "={v:?} falls to the constant"
-            );
+            assert_eq!(attn_splitk_gqa6_max_chunks(), None, "={v:?}");
         }
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+    }
+
+    #[test]
+    fn gqa6_policy_knobs_default_per_store_and_clamp() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
+        assert_eq!(
+            attn_splitk_gqa6_one_tile_max(false),
+            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
+        );
+        assert_eq!(
+            attn_splitk_gqa6_one_tile_max(true),
+            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16
+        );
+        assert_eq!(attn_splitk_gqa6_target(), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE", "4096");
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", " 96 ");
+        assert_eq!(
+            attn_splitk_gqa6_one_tile_max(false),
+            ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
+        );
+        assert_eq!(
+            attn_splitk_gqa6_one_tile_max(true),
+            ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
+        );
+        assert_eq!(attn_splitk_gqa6_target(), 96);
+        for v in ["0", "garbage", ""] {
+            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE", v);
+            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", v);
+            assert_eq!(
+                attn_splitk_gqa6_one_tile_max(false),
+                ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
+            );
+            assert_eq!(attn_splitk_gqa6_target(), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
+        }
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
     }
 
     #[test]

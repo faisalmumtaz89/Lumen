@@ -18012,9 +18012,13 @@ impl ComputeBackend for CudaBackend {
                         1,
                     );
                 let s = if gqa6 {
-                    let ctx =
-                        (max_seq_len as u32).min(super::prefill::attn_splitk_gqa6_served_seq_len());
-                    (super::prefill::attn_splitk_gqa6_chunks(ctx) as usize)
+                    // The loop policy bounds the split count whatever the
+                    // context (176 / 128 by default: 3.0 MiB on 24 heads); the
+                    // A/B control sizes it for its one-tile bound instead.
+                    (super::prefill::attn_splitk_gqa6_scratch_chunks(
+                        max_seq_len as u32,
+                        self.kv_precision == KvPrecision::F16,
+                    ) as usize)
                         .max(super::prefill::ATTN_SPLITK_S_MAX as usize)
                 } else {
                     super::prefill::ATTN_SPLITK_S_MAX as usize
