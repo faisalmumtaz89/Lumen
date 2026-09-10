@@ -17574,15 +17574,20 @@ impl ComputeBackend for CudaBackend {
                 crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
                 if cc_major == 12 {
                     // The body class is recorded before the backend is built, so this is the
-                    // resolution for the model being loaded (the legacy switch included).
+                    // resolution in force for the model being loaded: the capability-keyed
+                    // default, the legacy switch and any per-variable override folded in.
                     let on = |b: bool| if b { "ON" } else { "OFF" };
                     eprintln!(
-                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed defaults for this model — split-K decode \
-                         attention {}, dual-output norm route {}, compute_120 tiled kernel {} (measured on cc 12.0; \
-                         LUMEN_CUDA_ATTN_SPLITK / LUMEN_CUDA_NORM_CTA5_DUAL / LUMEN_CUDA_ATTN_TILED_CODEGEN override)",
-                        on(crate::runtime_defaults::attn_splitk_default()),
-                        on(crate::runtime_defaults::norm_cta5_dual_default()),
-                        on(crate::runtime_defaults::attn_tiled_codegen_default(cc_major.clamp(0, 255) as u8, self.device.nvrtc_can_target(120)) == "ptx120"),
+                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed routes for this model — split-K decode \
+                         attention {}, GQA-shared split-K pair {}, dual-output norm route {}, compute_120 tiled \
+                         kernel {} (defaults measured on cc 12.0; LUMEN_CUDA_ATTN_SPLITK / \
+                         LUMEN_CUDA_ATTN_SPLITK_GQA6 / LUMEN_CUDA_NORM_CTA5_DUAL / LUMEN_CUDA_ATTN_TILED_CODEGEN \
+                         override, and this line shows the result)",
+                        on(crate::runtime_defaults::attn_splitk_enabled()),
+                        on(crate::runtime_defaults::attn_splitk_enabled()
+                            && crate::runtime_defaults::attn_splitk_gqa6_enabled()),
+                        on(super::decode::norm_cta5_dual_enabled()),
+                        on(super::decode::attn_tiled_codegen_selection(cc_major.clamp(0, 255) as u8, self.device.nvrtc_can_target(120)) == "ptx120"),
                     );
                 }
                 if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()

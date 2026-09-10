@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **The GQA-shared decode-attention pair is the default for a Q4_0 dense body
+  on compute capability 12.x** — `LUMEN_CUDA_ATTN_SPLITK_GQA6` now resolves
+  like the other capability-keyed defaults: ON for that cell (the one it is
+  measured on: source-fidelity Qwen3.8-27B Q4_0 on the RTX 5090), OFF on every
+  other capability and body class, `=0` a kill-switch that leaves the pair
+  unloaded and the split-K scratch at its smaller size, `=1` an opt-in
+  wherever the pair is eligible. The startup capability line now reports the
+  resolution in force for every capability-keyed route (default, legacy switch
+  and override folded in) instead of the bare defaults. On the promoted build,
+  Qwen3.8-27B Q4_0 on an RTX 5090 at 1,024 in / 128 out: 82.59 → 85.56 tok/s.
+  The greedy stream is a near-tie with the per-query-head pair rather than
+  byte-identical (see the 0.29.0 entry), so the release quality record now
+  compares against the previous default under the near-tie rule.
+
 ## [0.29.0] — 2026-09-10
 
 ### Added

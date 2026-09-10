@@ -210,7 +210,8 @@ pub(crate) struct KernelSet {
     pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
 
     // GQA-shared split-K decode-attention pair
-    // (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, OFF unless set): one CTA per (KV head,
+    // (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, ON by default for a Q4_0 dense body on
+    // compute capability 12.x, OFF elsewhere): one CTA per (KV head,
     // chunk) instead of per (query head, chunk). Loaded only when the split-K
     // route itself is enabled, since it is an alternative implementation of
     // that route; both must be present for it to dispatch.
@@ -3867,7 +3868,8 @@ pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result
 //     kernels + scratch are present and the shape is eligible — see
 //     `launch_attention_decode_gated` in prefill.rs.
 //   - GQA-shared split-K pair `attention_decode_splitk_*_gqa6_f32`
-//     (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, OFF unless set): serves the split-K
+//     (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, ON by default for a Q4_0 dense body on
+//     compute capability 12.x, OFF elsewhere): serves the split-K
 //     selection instead of the pair above on the one geometry it is
 //     specialised for (6 query heads per KV head, head_dim 256, a context
 //     the chunk cap covers).
