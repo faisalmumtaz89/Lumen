@@ -2763,6 +2763,68 @@ fn dump_attention_call(
     std::fs::write(stem.with_extension("json"), meta).map_err(io)
 }
 
+/// The split-K choice the decode routers share: one function decides, from
+/// the selector's variant, the knobs, the loaded F32 kernels and the shape,
+/// whether this dispatch takes the GQA-shared pair, the per-query-head pair
+/// or neither — and both routers launch that choice with their own store's
+/// kernels. One decision, so the two stores can never diverge on availability
+/// or shape (a half store's twins load as a group, but the F32 pairs they
+/// merge with are optional and are checked here for both).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SplitKChoice {
+    Gqa6,
+    PerHead,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_attention_splitk_choice(
+    kernels: &KernelSet,
+    variant: AttentionDecodeVariant,
+    force_tiled: bool,
+    scratch_o_floats: Option<usize>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+) -> Option<SplitKChoice> {
+    // Split-K upgrade: applies only to the AUTO Tiled selection — an explicit
+    // `LUMEN_CUDA_DECODE_TILED=1` still forces the tiled kernel, and a
+    // SingleBlock selection (including the threshold opt-out) is untouched.
+    // Requires caller-supplied scratch, both kernels, and an eligible shape;
+    // anything else falls through to the existing selection.
+    if variant != AttentionDecodeVariant::Tiled || force_tiled {
+        return None;
+    }
+    let scratch_o_floats = scratch_o_floats?;
+    if !(kernels.attention_decode_splitk_partial.is_some()
+        && kernels.attention_decode_splitk_merge.is_some()
+        && attention_decode_splitk_supports_head_dim(head_dim)
+        // One chunk plus a merge is the tiled walk with an extra launch, so a
+        // one-chunk context hands off to the tiled kernel, but only when that
+        // kernel is there to take it.
+        && (attn_splitk_chunks(seq_len) > 1 || kernels.attention_decode_tiled.is_none()))
+    {
+        return None;
+    }
+    // GQA-shared upgrade within the split-K route: same inputs, same scratch,
+    // same output — one CTA per (KV head, chunk) instead of per (query head,
+    // chunk). Only for the geometry the kernels are specialised for and a
+    // context the chunk cap covers; every other shape keeps the pair below,
+    // so nothing is silently truncated.
+    let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
+        && kernels.attention_decode_splitk_merge_gqa6.is_some();
+    if gqa6_loaded
+        && attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len)
+        && scratch_o_floats
+            >= (num_heads as usize)
+                * (attn_splitk_gqa6_chunks(seq_len) as usize)
+                * (head_dim as usize)
+    {
+        return Some(SplitKChoice::Gqa6);
+    }
+    Some(SplitKChoice::PerHead)
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_attention_decode_routed(
     device: &CudaDevice,
@@ -2809,77 +2871,56 @@ unsafe fn launch_attention_decode_routed(
         }
     }
 
-    // Split-K upgrade: applies only to the AUTO Tiled selection — an explicit
-    // `LUMEN_CUDA_DECODE_TILED=1` still forces the tiled kernel, and a
-    // SingleBlock selection (including the threshold opt-out) is untouched.
-    // Requires caller-supplied scratch, both kernels, and an eligible shape;
-    // anything else falls through to the existing selection.
-    if variant == AttentionDecodeVariant::Tiled && !force_tiled {
-        if let Some(scratch) = splitk_scratch {
-            if kernels.attention_decode_splitk_partial.is_some()
-                && kernels.attention_decode_splitk_merge.is_some()
-                && attention_decode_splitk_supports_head_dim(head_dim)
-                // One chunk plus a merge is the tiled walk with an extra
-                // launch, so a one-chunk context hands off to the tiled
-                // kernel, but only when that kernel is there to take it.
-                && (attn_splitk_chunks(seq_len) > 1
-                    || kernels.attention_decode_tiled.is_none())
-            {
-                // GQA-shared upgrade within the split-K route: same inputs,
-                // same scratch, same output — one CTA per (KV head, chunk)
-                // instead of per (query head, chunk). Only for the geometry
-                // the kernels are specialised for and a context the chunk
-                // cap covers; every other shape keeps the pair below, so
-                // nothing is silently truncated. A decline was already
-                // explained above.
-                if gqa6_loaded
-                    && attention_decode_splitk_gqa6_supports(
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        seq_len,
-                    )
-                    && scratch.2.len()
-                        >= (num_heads as usize)
-                            * (attn_splitk_gqa6_chunks(seq_len) as usize)
-                            * (head_dim as usize)
-                {
-                    launch_attention_decode_splitk_gqa6(
-                        device,
-                        kernels,
-                        q,
-                        k_cache,
-                        v_cache,
-                        scratch,
-                        attn_out,
-                        num_heads,
-                        num_kv_heads,
-                        seq_len,
-                        max_seq_len,
-                        scale,
-                    )?;
-                    announce_splitk_gqa6_route(num_heads, num_kv_heads, head_dim, seq_len);
-                    return Ok(AttentionDecodeVariant::SplitKGqa6);
-                }
-                launch_attention_decode_splitk(
-                    device,
-                    kernels,
-                    q,
-                    k_cache,
-                    v_cache,
-                    scratch,
-                    attn_out,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    max_seq_len,
-                    scale,
-                )?;
-                announce_splitk_route(head_dim, seq_len);
-                return Ok(AttentionDecodeVariant::SplitK);
-            }
+    match decode_attention_splitk_choice(
+        kernels,
+        variant,
+        force_tiled,
+        scratch_o_floats,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+    ) {
+        Some(SplitKChoice::Gqa6) => {
+            let scratch = splitk_scratch.expect("a split-K choice implies scratch");
+            launch_attention_decode_splitk_gqa6(
+                device,
+                kernels,
+                q,
+                k_cache,
+                v_cache,
+                scratch,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+                max_seq_len,
+                scale,
+            )?;
+            announce_splitk_gqa6_route(num_heads, num_kv_heads, head_dim, seq_len);
+            return Ok(AttentionDecodeVariant::SplitKGqa6);
         }
+        Some(SplitKChoice::PerHead) => {
+            let scratch = splitk_scratch.expect("a split-K choice implies scratch");
+            launch_attention_decode_splitk(
+                device,
+                kernels,
+                q,
+                k_cache,
+                v_cache,
+                scratch,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                max_seq_len,
+                scale,
+            )?;
+            announce_splitk_route(head_dim, seq_len);
+            return Ok(AttentionDecodeVariant::SplitK);
+        }
+        None => {}
     }
 
     // hardware-compat guard: the tiled kernel requires
@@ -4838,15 +4879,17 @@ unsafe fn launch_attention_decode_routed_f16(
 
     // The same one-time explanation the F32 router gives when a loaded
     // GQA-shared pair will not serve this dispatch.
-    let gqa6_loaded = kernels.attention_decode_splitk_merge_gqa6.is_some();
+    let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
+        && kernels.attention_decode_splitk_merge_gqa6.is_some();
     let scratch_o_floats = splitk_scratch.as_ref().map(|s| s.2.len());
     if gqa6_loaded {
         if let Some(reason) = splitk_gqa6_exclusion_reason(
             force_tiled,
             variant,
             scratch_o_floats,
-            kernels.attention_decode_splitk_merge.is_some(),
-            true,
+            kernels.attention_decode_splitk_partial.is_some()
+                && kernels.attention_decode_splitk_merge.is_some(),
+            kernels.attention_decode_tiled.is_some(),
             attn_splitk_chunks(seq_len),
             num_heads,
             num_kv_heads,
@@ -4858,62 +4901,58 @@ unsafe fn launch_attention_decode_routed_f16(
         }
     }
 
-    if variant == AttentionDecodeVariant::Tiled && !force_tiled {
-        if let Some(scratch) = splitk_scratch {
-            if kernels.attention_decode_splitk_merge.is_some()
-                && attention_decode_splitk_supports_head_dim(head_dim)
-                && attn_splitk_chunks(seq_len) > 1
-            {
-                if gqa6_loaded
-                    && attention_decode_splitk_gqa6_supports(
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        seq_len,
-                    )
-                    && scratch.2.len()
-                        >= (num_heads as usize)
-                            * (attn_splitk_gqa6_chunks(seq_len) as usize)
-                            * (head_dim as usize)
-                {
-                    launch_attention_decode_splitk_gqa6_f16(
-                        device,
-                        kernels,
-                        f16,
-                        q,
-                        k_cache,
-                        v_cache,
-                        scratch,
-                        attn_out,
-                        num_heads,
-                        num_kv_heads,
-                        seq_len,
-                        max_seq_len,
-                        scale,
-                    )?;
-                    announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len);
-                    return Ok(AttentionDecodeVariant::SplitKGqa6F16);
-                }
-                launch_attention_decode_splitk_f16(
-                    device,
-                    kernels,
-                    f16,
-                    q,
-                    k_cache,
-                    v_cache,
-                    scratch,
-                    attn_out,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    max_seq_len,
-                    scale,
-                )?;
-                announce_splitk_route_f16(head_dim, seq_len);
-                return Ok(AttentionDecodeVariant::SplitKF16);
-            }
+    match decode_attention_splitk_choice(
+        kernels,
+        variant,
+        force_tiled,
+        scratch_o_floats,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+    ) {
+        Some(SplitKChoice::Gqa6) => {
+            let scratch = splitk_scratch.expect("a split-K choice implies scratch");
+            launch_attention_decode_splitk_gqa6_f16(
+                device,
+                kernels,
+                f16,
+                q,
+                k_cache,
+                v_cache,
+                scratch,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+                max_seq_len,
+                scale,
+            )?;
+            announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len);
+            return Ok(AttentionDecodeVariant::SplitKGqa6F16);
         }
+        Some(SplitKChoice::PerHead) => {
+            let scratch = splitk_scratch.expect("a split-K choice implies scratch");
+            launch_attention_decode_splitk_f16(
+                device,
+                kernels,
+                f16,
+                q,
+                k_cache,
+                v_cache,
+                scratch,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                max_seq_len,
+                scale,
+            )?;
+            announce_splitk_route_f16(head_dim, seq_len);
+            return Ok(AttentionDecodeVariant::SplitKF16);
+        }
+        None => {}
     }
 
     match variant {
