@@ -2631,19 +2631,20 @@ fn attention_dump_config() -> Option<&'static (std::path::PathBuf, Vec<u32>)> {
     CONFIG
         .get_or_init(|| {
             let raw = std::env::var("LUMEN_CUDA_ATTN_DUMP").ok()?;
-            let (dir, lengths) = raw.rsplit_once(':')?;
-            let lengths: Vec<u32> = lengths
-                .split(',')
-                .map(|n| n.trim().parse::<u32>())
-                .collect::<Result<_, _>>()
-                .ok()?;
-            if dir.is_empty() || lengths.is_empty() {
+            let parsed = raw.rsplit_once(':').and_then(|(dir, lengths)| {
+                let lengths: Vec<u32> = lengths
+                    .split(',')
+                    .map(|n| n.trim().parse::<u32>().ok())
+                    .collect::<Option<_>>()?;
+                (!dir.is_empty() && !lengths.is_empty())
+                    .then(|| (std::path::PathBuf::from(dir), lengths))
+            });
+            if parsed.is_none() {
                 eprintln!(
                     "[CUDA] LUMEN_CUDA_ATTN_DUMP={raw:?}: want <dir>:<seq_len>[,<seq_len>...]; ignored"
                 );
-                return None;
             }
-            Some((std::path::PathBuf::from(dir), lengths))
+            parsed
         })
         .as_ref()
 }
