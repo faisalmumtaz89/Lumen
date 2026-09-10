@@ -17697,7 +17697,26 @@ impl ComputeBackend for CudaBackend {
             attn_splitk: if kernels.attention_decode_splitk_partial.is_some()
                 && kernels.attention_decode_splitk_merge.is_some()
             {
-                let s = super::prefill::ATTN_SPLITK_S_MAX as usize;
+                // The GQA-shared pair shares this scratch but splits the
+                // context far more finely, so when it loaded for a geometry
+                // it serves the buffers are sized for its split count at this
+                // context instead. One allocation, at init, either way.
+                let gqa6 = kernels.attention_decode_splitk_partial_gqa6.is_some()
+                    && kernels.attention_decode_splitk_merge_gqa6.is_some()
+                    && super::prefill::attention_decode_splitk_gqa6_supports(
+                        num_heads as u32,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        1,
+                    );
+                let s = if gqa6 {
+                    let ctx =
+                        (max_seq_len as u32).min(super::prefill::attn_splitk_gqa6_max_seq_len());
+                    (super::prefill::attn_splitk_gqa6_chunks(ctx) as usize)
+                        .max(super::prefill::ATTN_SPLITK_S_MAX as usize)
+                } else {
+                    super::prefill::ATTN_SPLITK_S_MAX as usize
+                };
                 match (
                     self.device.alloc_zeros::<f32>(num_heads * s),
                     self.device.alloc_zeros::<f32>(num_heads * s),
