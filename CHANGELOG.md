@@ -17,6 +17,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **KV caches are allocated for the attention layers only.** The CUDA backend
+  allocated a full F32 K and V cache for every layer, GDN layers included,
+  which never read one; the caches are now allocated at weight load, once the
+  layer types are known, for the layers that use them. On Qwen3.8-27B (64
+  layers, 16 of them attention) at a 16,384-token context that is 2.1 GB
+  instead of 8.6 GB, and the F16 dequant-cache and clone budgets see the
+  memory freed. The per-layer capacity and `LUMEN_CUDA_MAX_SEQ_LEN` are
+  unchanged.
 - **The GQA-shared decode-attention pair now serves contexts up to 16,384
   KV positions** — its split-count bound rises from 256 to 1,024 chunks of
   16 keys (`ATTN_SPLITK_GQA6_S_MAX`), so a generation past 4,096 keys no
