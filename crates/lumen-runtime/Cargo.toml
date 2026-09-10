@@ -65,3 +65,10 @@ serde = "1"
 
 [lints]
 workspace = true
+
+# Standalone NVRTC A/B harness for the decode-attention split-K variants.
+# Compiles and launches the kernels itself; it does not touch the engine's
+# dispatch. `required-features` keeps it out of every build that has no CUDA.
+[[example]]
+name = "attn_decode_ab"
+required-features = ["cuda"]
