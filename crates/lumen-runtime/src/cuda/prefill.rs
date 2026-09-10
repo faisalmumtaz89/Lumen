@@ -2584,6 +2584,155 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<AttentionDecodeVariant, RuntimeError> {
+    let variant = launch_attention_decode_routed(
+        device,
+        kernels,
+        q,
+        k_cache,
+        v_cache,
+        splitk_scratch,
+        attn_out,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
+    )?;
+    if let Some((dir, lengths)) = attention_dump_config() {
+        if lengths.contains(&seq_len) {
+            dump_attention_call(
+                device,
+                dir,
+                q,
+                k_cache,
+                v_cache,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                max_seq_len,
+                scale,
+                variant,
+            )?;
+        }
+    }
+    Ok(variant)
+}
+
+/// `LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,<seq_len>...]`, parsed once: the
+/// directory the decode-attention dump writes into and the sequence lengths
+/// it writes at. `None` when unset or malformed (a malformed value is said
+/// once and ignored, so a typo can never stall a decode).
+fn attention_dump_config() -> Option<&'static (std::path::PathBuf, Vec<u32>)> {
+    static CONFIG: std::sync::OnceLock<Option<(std::path::PathBuf, Vec<u32>)>> =
+        std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let raw = std::env::var("LUMEN_CUDA_ATTN_DUMP").ok()?;
+            let (dir, lengths) = raw.rsplit_once(':')?;
+            let lengths: Vec<u32> = lengths
+                .split(',')
+                .map(|n| n.trim().parse::<u32>())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            if dir.is_empty() || lengths.is_empty() {
+                eprintln!(
+                    "[CUDA] LUMEN_CUDA_ATTN_DUMP={raw:?}: want <dir>:<seq_len>[,<seq_len>...]; ignored"
+                );
+                return None;
+            }
+            Some((std::path::PathBuf::from(dir), lengths))
+        })
+        .as_ref()
+}
+
+/// Write one decode-attention call to `dir`: `attn-<seq_len>-<call>.json`
+/// (shape, scale, the route that served) beside the raw little-endian F32
+/// files `.q.f32` (`[num_heads, head_dim]`), `.k.f32` and `.v.f32` (the live
+/// `[num_kv_heads, seq_len, head_dim]` region of the cache) and `.out.f32`
+/// (the route's output, `[num_heads, head_dim]`). The call counter runs over
+/// the process, so the attention layers of one token appear in order. A
+/// diagnostic for replaying real activations through a reference; it copies
+/// the cache to the host and is not for a measured run.
+#[allow(clippy::too_many_arguments)]
+fn dump_attention_call(
+    device: &CudaDevice,
+    dir: &std::path::Path,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<f32>,
+    v_cache: &CudaSlice<f32>,
+    attn_out: &CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+    variant: AttentionDecodeVariant,
+) -> Result<(), RuntimeError> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALL: AtomicU32 = AtomicU32::new(0);
+    let call = CALL.fetch_add(1, Ordering::Relaxed);
+    let io = |e: std::io::Error| RuntimeError::Compute(format!("attention dump: {e}"));
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let stem = dir.join(format!("attn-{seq_len}-{call:04}"));
+    let (nh, nkv, hd, sl, msl) = (
+        num_heads as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+        seq_len as usize,
+        max_seq_len as usize,
+    );
+    let write_f32 = |suffix: &str, data: &[f32]| -> Result<(), RuntimeError> {
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for x in data {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(stem.with_extension(suffix), bytes).map_err(io)
+    };
+    let q_host: Vec<f32> = device.dtoh_copy_view(&q.slice(0..nh * hd))?;
+    write_f32("q.f32", &q_host)?;
+    for (name, cache) in [("k.f32", k_cache), ("v.f32", v_cache)] {
+        let mut host = Vec::with_capacity(nkv * sl * hd);
+        for kv in 0..nkv {
+            let base = kv * msl * hd;
+            let region: Vec<f32> = device.dtoh_copy_view(&cache.slice(base..base + sl * hd))?;
+            host.extend_from_slice(&region);
+        }
+        write_f32(name, &host)?;
+    }
+    let out_host: Vec<f32> = device.dtoh_copy_view(&attn_out.slice(0..nh * hd))?;
+    write_f32("out.f32", &out_host)?;
+    let route = match variant {
+        AttentionDecodeVariant::SingleBlock => "attention_decode",
+        AttentionDecodeVariant::Tiled => "attention_decode_tiled",
+        AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
+        AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
+    };
+    let meta = format!(
+        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
+    );
+    std::fs::write(stem.with_extension("json"), meta).map_err(io)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_routed(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<f32>,
+    v_cache: &CudaSlice<f32>,
+    splitk_scratch: Option<&mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<AttentionDecodeVariant, RuntimeError> {
     let force_tiled = decode_tiled_force_enabled();
     let threshold = decode_tiled_threshold();
     let mut variant = attention_decode_variant(seq_len, force_tiled, threshold);

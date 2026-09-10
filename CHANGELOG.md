@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **`LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,...]`**, a diagnostic that writes one
+  decode-attention call's inputs (Q, the live K/V cache region) and the
+  serving route's output as raw F32 beside a JSON header, at the listed
+  sequence lengths, so real activations can be replayed through a float64
+  reference. Off unless set.
+
 ### Changed
 
 - **The GQA-shared decode-attention pair now serves contexts up to 16,384
