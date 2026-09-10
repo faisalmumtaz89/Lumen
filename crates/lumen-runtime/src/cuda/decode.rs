@@ -209,6 +209,14 @@ pub(crate) struct KernelSet {
     pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
     pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
 
+    // GQA-shared split-K decode-attention pair
+    // (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, OFF unless set): one CTA per (KV head,
+    // chunk) instead of per (query head, chunk). Loaded only when the split-K
+    // route itself is enabled, since it is an alternative implementation of
+    // that route; both must be present for it to dispatch.
+    pub(crate) attention_decode_splitk_partial_gqa6: Option<CudaFunction>,
+    pub(crate) attention_decode_splitk_merge_gqa6: Option<CudaFunction>,
+
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
     #[allow(dead_code)]
     pub(crate) gemm_f32: CudaFunction,
@@ -955,6 +963,11 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
     // pair measured slightly slower on the RTX 5090, unlike the tiled kernel.
     let load_splitk = load_fn;
 
+    // The GQA-shared pair is an alternative implementation of the split-K
+    // route, so it loads only where that route can be selected at all.
+    let load_splitk_gqa6 = crate::runtime_defaults::attn_splitk_enabled()
+        && crate::runtime_defaults::attn_splitk_gqa6_enabled();
+
     // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load_with_arch(source, "compute_80")?;
@@ -1114,6 +1127,34 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_merge: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        attention_decode_splitk_partial_gqa6: if load_splitk_gqa6 {
+            match load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_gqa6_f32",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        attention_decode_splitk_merge_gqa6: if load_splitk_gqa6 {
+            match load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                "attention_decode_splitk_merge_gqa6_f32",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_merge_gqa6_f32: FAILED ({e})");
                     None
                 }
             }
@@ -3825,6 +3866,11 @@ pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result
 //     model-aware default): upgrades the AUTO Tiled selection when the
 //     kernels + scratch are present and the shape is eligible — see
 //     `launch_attention_decode_gated` in prefill.rs.
+//   - GQA-shared split-K pair `attention_decode_splitk_*_gqa6_f32`
+//     (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, OFF unless set): serves the split-K
+//     selection instead of the pair above on the one geometry it is
+//     specialised for (6 query heads per KV head, head_dim 256, a context
+//     the chunk cap covers).
 //
 // `attention_decode_variant(seq_len, force_tiled, threshold)` decides
 // SingleBlock vs Tiled; the split-K upgrade layers on top at the gated
@@ -3832,10 +3878,10 @@ pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result
 // `launch_attention_decode_gated` (prefill.rs).
 
 /// KV tile width for `attention_decode_tiled` (must match `T_C` in the kernel).
-pub(crate) const ATTN_DECODE_TILED_T_C: u32 = 128;
+pub const ATTN_DECODE_TILED_T_C: u32 = 128;
 
 /// Block dim for `attention_decode_tiled` (must match `BLOCK_DIM` in the kernel).
-pub(crate) const ATTN_DECODE_TILED_BLOCK_DIM: u32 = 128;
+pub const ATTN_DECODE_TILED_BLOCK_DIM: u32 = 128;
 
 /// Shared memory bytes for `attention_decode_tiled`.
 ///
@@ -3916,6 +3962,10 @@ pub(crate) enum AttentionDecodeVariant {
     /// caller supplied split-K scratch. Explicit `LUMEN_CUDA_DECODE_TILED=1`
     /// or a SingleBlock threshold opt-out takes precedence.
     SplitK,
+    /// The GQA-shared split-K pair (`LUMEN_CUDA_ATTN_SPLITK_GQA6`), chosen in
+    /// place of [`Self::SplitK`] when that route is selected, the pair loaded,
+    /// and the shape is one it serves.
+    SplitKGqa6,
 }
 
 /// Pure gate predicate. Unit-testable; mirrors the established pattern of

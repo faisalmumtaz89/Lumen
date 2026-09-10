@@ -7,6 +7,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **`LUMEN_CUDA_ATTN_SPLITK_GQA6`, a GQA-shared decode-attention pair
+  (default off)** — `attention_decode_splitk_partial_gqa6_f32` and
+  `attention_decode_splitk_merge_gqa6_f32` serve the split-K decode selection
+  on models whose query heads come in groups of six per KV head at `head_dim`
+  256, at contexts up to 4,096. The shipping split-K partial pass runs one CTA
+  per (query head, chunk), so it fetches every K and V row once per query head
+  — six times over for such a group — and reads V one scalar at a time. The
+  new pair runs one CTA per (KV head, chunk): a warp owns a position while
+  lanes own dimensions, the K row stays in registers while all six of the
+  group's scores are formed from it, the V tile is staged once in shared, and
+  every Q, K and V read is a 16-byte load. The merge computes each chunk's
+  rescale once rather than once per output dimension, which matters because
+  this decomposition splits the context far more finely.
+
+  Whole-token, Qwen3.8-27B Q4_0 on an RTX 5090 with the SM clock pinned:
+  **82.5 → 85.4 tok/s** at 1,024 in / 128 out (three sessions on successive
+  builds of this change: 82.48–82.56 → 85.40–85.50, five runs each leg, CV
+  within 0.04 %), and **+3.5 to +3.6 %** at a 1,300-token context
+  (86.6 tok/s), +3.3 % at 330 and +3.7 % at 2,600, on two gated sessions.
+
+  Per layer, partial plus merge at 1,100 keys, median of 200 launches:
+  **10.0 µs against 26.3 µs** with the working set warm in L2 and **16.4 µs
+  against 49.2–50.8 µs** with it evicted to DRAM, the two states that bracket live
+  decode. Achieved bandwidth over the useful K and V rises from 0.18 to
+  0.55 TB/s evicted, and the partial pass's theoretical L2 sector demand falls
+  from 77.8 to 11.9 MiB — 78.2 to 13.6 MiB counting the merge — against
+  8.6 MiB of useful K and V. Averaged over the partial pass's global loads,
+  sectors per request rise from 9.5 to 16.0, 16.0 being one fully coalesced
+  128-bit load per warp; the incumbent's compiled partial pass has 280
+  scalar-load instruction sites and the new one has none. The partial pass
+  uses 72 registers per thread and the merge 40, neither spilling.
+
+  Largest absolute error against an F64 reference over contexts from 1 to
+  4,096 is 4.3e-7 — bound by the wide-score-spread inputs at 4,096 keys;
+  uniform inputs peak at 9.6e-8 — below the 8.2e-7 of the pair it replaces on
+  the same input set. The reduction order nonetheless differs, and the outputs
+  are a near-tie rather than byte-identical: at a 1,300-token context the
+  48-token greedy output is byte-identical to the route it replaces, while on
+  the 1,024-token board prompt the two diverge at the third token, on a
+  mutual-runner-up flip with margins of 0.028 and 0.035 logits. **The flag is
+  off for that reason** — because the output is a near-tie, not because the
+  speed is unproven.
+
+  Under the flag the split count is `ceil(seq_len / 16)`, not the count
+  `LUMEN_CUDA_ATTN_SPLITK_CHUNK` and `LUMEN_CUDA_ATTN_SPLITK_SCALE` derive;
+  those two still decide whether the split-K route is entered at all. The
+  split-K scratch grows with the finer split — about 0.75 to 6 MiB at 24 heads
+  and `head_dim` 256 — allocated once at init when the flag is set.
+
+  Every other geometry, and any context past the chunk cap, keeps the existing
+  pair; with `LUMEN_CUDA_VERBOSE=1` a dispatch that declines the new route says
+  once, per distinct reason, why.
+
 ## [0.28.0] — 2026-09-10
 
 ### Removed

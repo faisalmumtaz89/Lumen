@@ -109,6 +109,15 @@ pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str = include_str!("attention_d
 /// class (cross-chunk merge order).
 pub const ATTENTION_DECODE_SPLITK_KERNEL_SOURCE: &str = include_str!("attention_decode_splitk.cu");
 
+/// GQA-shared split-K decode attention: same two-pass (m, l, o) contract as
+/// the pair above, but one CTA per (KV head, chunk), so each K and V row is
+/// fetched once for the whole 6-query-head group instead of once per query
+/// head, in 16-byte loads throughout. Specialised for 6 query heads per KV
+/// head and head_dim 256; selected via `LUMEN_CUDA_ATTN_SPLITK_GQA6`.
+/// Near-tie class (a different reduction order again).
+pub const ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE: &str =
+    include_str!("attention_decode_splitk_gqa6.cu");
+
 /// Tiled GEMM F32 kernels for batched prefill (32x32 tiles, shared memory).
 pub const GEMM_F32_KERNEL_SOURCE: &str = include_str!("gemm_f32.cu");
 
