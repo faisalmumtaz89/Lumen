@@ -51,7 +51,7 @@ use lumen_runtime::cuda::{
     ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM,
 };
 
-const MAX_SEQ_LEN: u32 = 4096;
+const MAX_SEQ_LEN: u32 = 16_384;
 const SCALE: f32 = 0.0625; // 1 / sqrt(256)
 
 /// Roughly five times the largest error the pair produced against F64 over
@@ -66,7 +66,8 @@ const MAX_ABS_ERR_VS_SHIPPING: f64 = 2e-6;
 /// play: the single-position case, either side of one GQA-shared chunk (16),
 /// either side of one shipping tile (128), the board shape, and the cap.
 const LENGTHS: &[u32] = &[
-    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4095, 4096,
+    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4095, 4096, 4097, 6144, 8192, 12288,
+    16383, 16384,
 ];
 
 /// A query-head / KV-head pair the dispatcher admits: any 6:1 group.

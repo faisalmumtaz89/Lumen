@@ -2036,9 +2036,16 @@ pub const ATTN_SPLITK_GQA6_HEAD_DIM: u32 = 256;
 pub const ATTN_SPLITK_GQA6_CHUNK: u32 = 16;
 
 /// Upper bound on the GQA-shared split count, and with it the scratch: the
-/// partial pass writes `num_heads * S * head_dim` floats, 6 MiB at this bound
-/// for a 24-head, 256-dimension model.
-pub const ATTN_SPLITK_GQA6_S_MAX: u32 = 256;
+/// partial pass writes `num_heads * S * head_dim` floats (24 MiB at this bound
+/// for a 24-head, 256-dimension model, 24.2 MiB with each chunk's running max
+/// and sum), covering 16,384 KV positions at the
+/// shipped chunk length. `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` lowers the
+/// bound a process serves ([`attn_splitk_gqa6_chunk_bound`]); nothing raises
+/// it past this constant. Through v0.30.0 the bound was 256 (4,096 positions),
+/// past which a running generation fell back to the per-query-head pair,
+/// which reads every K and V row once per query head: at 6,144 keys that
+/// fallback cost 1.6 ms of a 13.1 ms decode token on the RTX 5090.
+pub const ATTN_SPLITK_GQA6_S_MAX: u32 = 1024;
 
 /// CTAs per query head in the GQA-shared merge: each owns one block's worth
 /// of the head's dimensions, one dimension per thread. Splitting the head
@@ -2056,15 +2063,32 @@ pub const ATTN_SPLITK_GQA6_DIM_TILES: u32 = ATTN_SPLITK_GQA6_HEAD_DIM / ATTN_DEC
 // cap needs an opt-in the launcher does not perform.
 const _: () = assert!(ATTN_SPLITK_GQA6_CHUNK <= 32);
 const _: () =
+    assert!(ATTN_SPLITK_GQA6_S_MAX == crate::runtime_defaults::ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT);
+const _: () =
     assert!(ATTN_SPLITK_GQA6_DIM_TILES * ATTN_DECODE_TILED_BLOCK_DIM == ATTN_SPLITK_GQA6_HEAD_DIM);
 const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes() <= 49152);
 
-/// The longest context the GQA-shared pair serves. Past it the chunk count
-/// would exceed the scratch bound and a chunk would outgrow the 32 lanes its
-/// softmax runs on, so the caller keeps the per-query-head pair instead —
-/// nothing is truncated.
+/// The longest context the GQA-shared pair can serve at the compile-time
+/// bound. Past it the chunk count would exceed the scratch bound and a chunk
+/// would outgrow the 32 lanes its softmax runs on, so the caller keeps the
+/// per-query-head pair instead — nothing is truncated.
 pub const fn attn_splitk_gqa6_max_seq_len() -> u32 {
     ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK
+}
+
+/// The split-count bound this process serves: `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
+/// clamped to `1..=ATTN_SPLITK_GQA6_S_MAX`, the constant when unset or unparsable.
+/// The eligibility test and the scratch allocator read the same bound, so a
+/// lowered bound shrinks the scratch and hands longer contexts to the
+/// per-query-head pair exactly where the dispatcher stops.
+pub fn attn_splitk_gqa6_chunk_bound() -> u32 {
+    crate::runtime_defaults::attn_splitk_gqa6_max_chunks().clamp(1, ATTN_SPLITK_GQA6_S_MAX)
+}
+
+/// The longest context the GQA-shared pair serves in this process:
+/// [`attn_splitk_gqa6_chunk_bound`] chunks of [`ATTN_SPLITK_GQA6_CHUNK`].
+pub fn attn_splitk_gqa6_served_seq_len() -> u32 {
+    attn_splitk_gqa6_chunk_bound() * ATTN_SPLITK_GQA6_CHUNK
 }
 
 /// The GQA-shared split count for `seq_len`: one chunk per
@@ -2087,11 +2111,30 @@ pub fn attention_decode_splitk_gqa6_supports(
     head_dim: u32,
     seq_len: u32,
 ) -> bool {
+    attention_decode_splitk_gqa6_supports_within(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        attn_splitk_gqa6_chunk_bound(),
+    )
+}
+
+/// [`attention_decode_splitk_gqa6_supports`] with the chunk bound explicit: a
+/// pure function of its arguments, so a test can state the bound it means
+/// without touching the process environment.
+pub const fn attention_decode_splitk_gqa6_supports_within(
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    chunk_bound: u32,
+) -> bool {
     num_kv_heads != 0
         && num_heads == num_kv_heads * ATTN_SPLITK_GQA6_GQA_RATIO
         && head_dim == ATTN_SPLITK_GQA6_HEAD_DIM
         && seq_len >= 1
-        && seq_len <= attn_splitk_gqa6_max_seq_len()
+        && seq_len <= chunk_bound * ATTN_SPLITK_GQA6_CHUNK
 }
 
 /// Dynamic shared bytes for the GQA-shared partial pass: the six staged Q
@@ -2398,7 +2441,8 @@ impl SplitKGqa6Exclusion {
             Self::OneChunkContext => "a one-chunk context hands off to the tiled kernel",
             Self::Shape => {
                 "the pair serves 6 query heads per KV head at head_dim 256, \
-                 up to 4096 KV positions"
+                 up to its chunk bound of KV positions (16384 at the shipped \
+                 bound; LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS lowers it)"
             }
             Self::ScratchTooSmall => {
                 "the split-K scratch is sized for the per-query-head split count"
@@ -2434,6 +2478,7 @@ fn splitk_gqa6_exclusion_reason(
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
+    chunk_bound: u32,
 ) -> Option<SplitKGqa6Exclusion> {
     use SplitKGqa6Exclusion as X;
     if force_tiled {
@@ -2454,7 +2499,13 @@ fn splitk_gqa6_exclusion_reason(
     if shipping_chunks <= 1 && tiled_loaded {
         return Some(X::OneChunkContext);
     }
-    if !attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len) {
+    if !attention_decode_splitk_gqa6_supports_within(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        chunk_bound,
+    ) {
         return Some(X::Shape);
     }
     let needed =
@@ -2557,6 +2608,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
             num_kv_heads,
             head_dim,
             seq_len,
+            attn_splitk_gqa6_chunk_bound(),
         ) {
             announce_splitk_gqa6_excluded(num_heads, num_kv_heads, head_dim, seq_len, reason);
         }
@@ -4115,8 +4167,9 @@ mod attn_splitk_gqa6_tests {
     //! argument rather than resolving it.
 
     use super::{
-        attention_decode_splitk_gqa6_supports, attn_splitk_gqa6_chunks,
-        attn_splitk_gqa6_max_seq_len, splitk_gqa6_exclusion_reason, SplitKGqa6Exclusion,
+        attention_decode_splitk_gqa6_supports, attention_decode_splitk_gqa6_supports_within,
+        attn_splitk_gqa6_chunk_bound, attn_splitk_gqa6_chunks, attn_splitk_gqa6_max_seq_len,
+        attn_splitk_gqa6_served_seq_len, splitk_gqa6_exclusion_reason, SplitKGqa6Exclusion,
         ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
         ATTN_SPLITK_GQA6_S_MAX,
     };
@@ -4145,6 +4198,7 @@ mod attn_splitk_gqa6_tests {
             KV,
             HD,
             1100,
+            ATTN_SPLITK_GQA6_S_MAX,
         )
     }
 
@@ -4171,6 +4225,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4187,6 +4242,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4203,6 +4259,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4219,6 +4276,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4235,6 +4293,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     100,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4254,6 +4313,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     64,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4270,6 +4330,7 @@ mod attn_splitk_gqa6_tests {
                     4,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
             (
@@ -4286,6 +4347,7 @@ mod attn_splitk_gqa6_tests {
                     KV,
                     HD,
                     1100,
+                    ATTN_SPLITK_GQA6_S_MAX,
                 ),
             ),
         ];
@@ -4326,6 +4388,7 @@ mod attn_splitk_gqa6_tests {
                 KV,
                 HD,
                 64,
+                ATTN_SPLITK_GQA6_S_MAX,
             ),
             None
         );
@@ -4335,33 +4398,97 @@ mod attn_splitk_gqa6_tests {
     fn the_supported_scope_is_six_query_heads_per_kv_head_at_head_dim_256() {
         for (heads, kv) in [(24, 4), (12, 2), (6, 1), (48, 8)] {
             assert!(
-                attention_decode_splitk_gqa6_supports(heads, kv, HD, 1100),
+                attention_decode_splitk_gqa6_supports_within(
+                    heads,
+                    kv,
+                    HD,
+                    1100,
+                    ATTN_SPLITK_GQA6_S_MAX
+                ),
                 "{heads} query heads over {kv} KV heads is a 6:1 group"
             );
         }
         for (heads, kv) in [(24, 8), (32, 4), (24, 3), (24, 0)] {
             assert!(
-                !attention_decode_splitk_gqa6_supports(heads, kv, HD, 1100),
+                !attention_decode_splitk_gqa6_supports_within(
+                    heads,
+                    kv,
+                    HD,
+                    1100,
+                    ATTN_SPLITK_GQA6_S_MAX
+                ),
                 "{heads} over {kv} is not a 6:1 group"
             );
         }
         for hd in [64, 128, 192, 512] {
-            assert!(!attention_decode_splitk_gqa6_supports(HEADS, KV, hd, 1100));
+            assert!(!attention_decode_splitk_gqa6_supports_within(
+                HEADS,
+                KV,
+                hd,
+                1100,
+                ATTN_SPLITK_GQA6_S_MAX
+            ));
         }
     }
 
     #[test]
+    fn the_served_bound_follows_the_env_inside_the_compile_time_bound() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+        assert_eq!(attn_splitk_gqa6_chunk_bound(), ATTN_SPLITK_GQA6_S_MAX);
+        assert_eq!(
+            attn_splitk_gqa6_served_seq_len(),
+            attn_splitk_gqa6_max_seq_len()
+        );
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "256");
+        assert_eq!(attn_splitk_gqa6_chunk_bound(), 256);
+        assert_eq!(attn_splitk_gqa6_served_seq_len(), 4096, "the v0.30.0 bound");
+        assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 4096));
+        assert!(
+            !attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 4097),
+            "past the lowered bound the per-query-head pair serves"
+        );
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "99999");
+        assert_eq!(
+            attn_splitk_gqa6_chunk_bound(),
+            ATTN_SPLITK_GQA6_S_MAX,
+            "nothing raises the bound past the constant"
+        );
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+    }
+
+    #[test]
     fn the_context_bound_is_the_scratch_bound() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
         let cap = attn_splitk_gqa6_max_seq_len();
         assert_eq!(cap, ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK);
-        assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, cap));
-        assert!(!attention_decode_splitk_gqa6_supports(
+        assert_eq!(cap, 16_384);
+        assert!(attention_decode_splitk_gqa6_supports_within(
             HEADS,
             KV,
             HD,
-            cap + 1
+            cap,
+            ATTN_SPLITK_GQA6_S_MAX
         ));
-        assert!(!attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 0));
+        assert!(!attention_decode_splitk_gqa6_supports_within(
+            HEADS,
+            KV,
+            HD,
+            cap + 1,
+            ATTN_SPLITK_GQA6_S_MAX
+        ));
+        assert!(!attention_decode_splitk_gqa6_supports_within(
+            HEADS,
+            KV,
+            HD,
+            0,
+            ATTN_SPLITK_GQA6_S_MAX
+        ));
         assert_eq!(attn_splitk_gqa6_chunks(cap), ATTN_SPLITK_GQA6_S_MAX);
     }
 

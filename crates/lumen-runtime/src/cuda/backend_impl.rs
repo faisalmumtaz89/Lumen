@@ -17716,7 +17716,7 @@ impl ComputeBackend for CudaBackend {
                     );
                 let s = if gqa6 {
                     let ctx =
-                        (max_seq_len as u32).min(super::prefill::attn_splitk_gqa6_max_seq_len());
+                        (max_seq_len as u32).min(super::prefill::attn_splitk_gqa6_served_seq_len());
                     (super::prefill::attn_splitk_gqa6_chunks(ctx) as usize)
                         .max(super::prefill::ATTN_SPLITK_S_MAX as usize)
                 } else {

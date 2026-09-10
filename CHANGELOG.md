@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **The GQA-shared decode-attention pair now serves contexts up to 16,384
+  KV positions** — its split-count bound rises from 256 to 1,024 chunks of
+  16 keys (`ATTN_SPLITK_GQA6_S_MAX`), so a generation past 4,096 keys no
+  longer falls back to the per-query-head pair, which reads every K and V row
+  once per query head (at 6,144 keys that fallback cost 1.6 ms of a 13.1 ms
+  decode token on an RTX 5090, against 0.8 ms for the same work in the
+  comparators' kernels). The split-K scratch is sized to the smaller of the
+  context and the bound, up to 24.2 MiB on a 24-head, head_dim-256 model. New
+  `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` lowers the bound a process serves
+  (`256` reproduces the v0.30.0 behaviour).
+
+
 ## [0.30.0] — 2026-09-10
 
 ### Changed
