@@ -1636,9 +1636,8 @@ mod tests {
                 .iter()
                 .map(|x| x.to_bits())
                 .collect();
-            // Past the pair's bound the F32 store takes the per-query-head pair
-            // (when it loaded) and the half store the tiled half kernel: two
-            // reduction orders, so a tolerance there instead of bit identity.
+            // Past the pair's bound both stores take the per-query-head pair
+            // (when it loaded), each with its own store's kernel.
             match (a, b) {
                 (V::Tiled, V::TiledF16) | (V::SplitKGqa6, V::SplitKGqa6F16) => {
                     assert_eq!(
@@ -1646,15 +1645,10 @@ mod tests {
                         "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
                     );
                 }
-                (V::SplitK, V::TiledF16) => {
-                    let worst = got32
-                        .iter()
-                        .zip(&got16)
-                        .map(|(x, y)| (f32::from_bits(*x) - f32::from_bits(*y)).abs())
-                        .fold(0.0f32, f32::max);
-                    assert!(
-                        worst <= 1e-4,
-                        "past the bound at {seq_len}: max |diff| {worst:e}"
+                (V::SplitK, V::SplitKF16) => {
+                    assert_eq!(
+                        got32, got16,
+                        "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
                     );
                 }
                 other => panic!("at seq_len {seq_len} the stores took {other:?}"),

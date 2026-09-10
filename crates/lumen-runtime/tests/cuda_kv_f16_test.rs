@@ -20,11 +20,11 @@
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::shaders::{
-    ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE, ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-    KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
+    ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE, ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
+    ATTENTION_DECODE_TILED_KERNEL_SOURCE, KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
 };
 use lumen_runtime::cuda::{
-    attn_splitk_gqa6_chunks, attn_splitk_gqa6_merge_shared_bytes,
+    attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_merge_shared_bytes,
     attn_splitk_gqa6_partial_shared_bytes, attn_splitk_gqa6_partial_shared_bytes_f16,
     ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
     ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
@@ -673,4 +673,116 @@ fn the_fused_prep_half_twin_matches_the_f32_kernel_and_rounds_its_stores() {
     }
     assert!(b.5[..slot.start].iter().all(|&h| h == 0) && b.6[..slot.start].iter().all(|&h| h == 0));
     assert_eq!(b.7, expected_count, "overflow count from the fused writer");
+}
+
+/// The per-query-head split-K partial's half twin over the given caches:
+/// (m, l, o) and the merged output.
+fn run_splitk_partial<K: cudarc::driver::DeviceRepr>(
+    dev: &CudaDevice,
+    partial_name: &str,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<K>,
+    v: &CudaSlice<K>,
+    seq_len: u32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let module = dev
+        .compile_and_load(ATTENTION_DECODE_SPLITK_KERNEL_SOURCE)
+        .expect("compile per-head pair");
+    let partial = module.load_function(partial_name).expect("partial");
+    let merge = module
+        .load_function("attention_decode_splitk_merge")
+        .expect("merge");
+    let chunks = attn_splitk_chunks(seq_len);
+    let n_part = (NUM_HEADS * chunks) as usize;
+    let mut m_part = nan_filled(dev, n_part);
+    let mut l_part = nan_filled(dev, n_part);
+    let mut o_part = nan_filled(dev, n_part * HEAD_DIM as usize);
+    let mut out = nan_filled(dev, (NUM_HEADS * HEAD_DIM) as usize);
+    let (nh, nkv, hd, msl, scale) = (NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, SCALE);
+    unsafe {
+        dev.stream
+            .launch_builder(&partial)
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(&mut m_part)
+            .arg(&mut l_part)
+            .arg(&mut o_part)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&seq_len)
+            .arg(&msl)
+            .arg(&scale)
+            .arg(&chunks)
+            .launch(LaunchConfig {
+                grid_dim: (NUM_HEADS * chunks, 1, 1),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: (8 + HEAD_DIM + T_C) * 4,
+            })
+            .expect("per-head partial launch");
+        dev.stream
+            .launch_builder(&merge)
+            .arg(&m_part)
+            .arg(&l_part)
+            .arg(&o_part)
+            .arg(&mut out)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&chunks)
+            .launch(LaunchConfig {
+                grid_dim: (NUM_HEADS, 1, 1),
+                block_dim: (BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .expect("per-head merge launch");
+    }
+    dev.synchronize().expect("sync");
+    (
+        dev.dtoh_copy(&m_part).unwrap(),
+        dev.dtoh_copy(&l_part).unwrap(),
+        dev.dtoh_copy(&o_part).unwrap(),
+        dev.dtoh_copy(&out).unwrap(),
+    )
+}
+
+#[test]
+fn the_half_per_head_partial_reproduces_the_f32_partial_bit_for_bit() {
+    let Some(dev) = try_device() else { return };
+    let inp = make_inputs(0x0005_0910_F16A_0005);
+    let q = dev.htod_copy(&inp.q).unwrap();
+    let k32 = dev.htod_copy(&inp.k).unwrap();
+    let v32 = dev.htod_copy(&inp.v).unwrap();
+    let k16 = dev.htod_copy(&inp.k16).unwrap();
+    let v16 = dev.htod_copy(&inp.v16).unwrap();
+    for &seq_len in LENGTHS {
+        let a = run_splitk_partial(
+            &dev,
+            "attention_decode_splitk_partial",
+            &q,
+            &k32,
+            &v32,
+            seq_len,
+        );
+        let b = run_splitk_partial(
+            &dev,
+            "attention_decode_splitk_partial_f16",
+            &q,
+            &k16,
+            &v16,
+            seq_len,
+        );
+        assert!(
+            a.3.iter().all(|x| x.is_finite()),
+            "F32 output not finite at {seq_len}"
+        );
+        assert_eq!(bits(&a.0), bits(&b.0), "m differs at seq_len {seq_len}");
+        assert_eq!(bits(&a.1), bits(&b.1), "l differs at seq_len {seq_len}");
+        assert_eq!(bits(&a.2), bits(&b.2), "o differs at seq_len {seq_len}");
+        assert_eq!(
+            bits(&a.3),
+            bits(&b.3),
+            "merged output differs at seq_len {seq_len}"
+        );
+    }
 }

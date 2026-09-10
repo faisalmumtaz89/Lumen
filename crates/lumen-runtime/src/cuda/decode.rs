@@ -923,6 +923,10 @@ pub(crate) struct KernelSet {
 pub(crate) struct KvF16Kernels {
     /// `attention_decode_splitk_partial_gqa6_f16`; the F32 merge consumes its partials.
     pub(crate) splitk_partial_gqa6: CudaFunction,
+    /// `attention_decode_splitk_partial_f16`, the per-query-head pair's partial; the F32
+    /// merge consumes its partials. The twin of the route the F32 router takes outside the
+    /// GQA-shared pair's window.
+    pub(crate) splitk_partial: CudaFunction,
     /// `attention_decode_tiled_f16`, the reader for every context the pair does not serve.
     pub(crate) tiled: CudaFunction,
     /// `kv_cache_write_batch_f16` (prefill).
@@ -1069,6 +1073,10 @@ pub(crate) fn compile_all_kernels(
             splitk_partial_gqa6: load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
                 "attention_decode_splitk_partial_gqa6_f16",
+            )?,
+            splitk_partial: load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_f16",
             )?,
             tiled: load_tiled(
                 shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
@@ -4025,6 +4033,8 @@ pub(crate) enum AttentionDecodeVariant {
     TiledF16,
     /// `attention_decode_splitk_partial_gqa6_f16` + the F32 merge, on a half store.
     SplitKGqa6F16,
+    /// `attention_decode_splitk_partial_f16` + the F32 merge, on a half store.
+    SplitKF16,
 }
 
 /// Pure gate predicate. Unit-testable; mirrors the established pattern of

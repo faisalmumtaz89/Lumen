@@ -2754,6 +2754,7 @@ fn dump_attention_call(
         AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
         AttentionDecodeVariant::TiledF16 => "attention_decode_tiled_f16",
         AttentionDecodeVariant::SplitKGqa6F16 => "attention_decode_splitk_partial_gqa6_f16",
+        AttentionDecodeVariant::SplitKF16 => "attention_decode_splitk_partial_f16",
     };
     let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
@@ -2903,7 +2904,9 @@ unsafe fn launch_attention_decode_routed(
         // the selector never produces them here.
         AttentionDecodeVariant::SplitK | AttentionDecodeVariant::SplitKGqa6 => unreachable!(),
         // The half routes belong to the half router; this one takes F32 bytes.
-        AttentionDecodeVariant::TiledF16 | AttentionDecodeVariant::SplitKGqa6F16 => unreachable!(),
+        AttentionDecodeVariant::TiledF16
+        | AttentionDecodeVariant::SplitKGqa6F16
+        | AttentionDecodeVariant::SplitKF16 => unreachable!(),
         AttentionDecodeVariant::SingleBlock => {
             // Single-block fast path (existing kernel, byte-identical to the
             // the prior dispatch when force_tiled = false and
@@ -4802,13 +4805,14 @@ pub const fn attn_splitk_gqa6_partial_shared_bytes_f16() -> u32 {
 }
 const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes_f16() == 14_768);
 
-/// Route a decode step over a half store. Two readers: the GQA-shared pair
-/// for the geometry and context it serves (the same admission as the F32
-/// pair), the tiled kernel for everything else. The single-block and per-head
-/// split-K routes have no half twin, so the tiled threshold and force knobs
-/// do not apply here; a context past the pair's bound hands off to the tiled
-/// half kernel (the F32 router hands off to the per-query-head split-K pair,
-/// which has no half twin).
+/// Route a decode step over a half store: the same admission sequence as the
+/// F32 router, each route replaced by its half twin. The force knob is
+/// honoured; the split-K upgrade applies to the automatic tiled selection with
+/// the same scratch, kernel and shape conditions; the GQA-shared twin serves
+/// the pair's geometry and window and the per-query-head twin every other
+/// shape the F32 router hands to that pair; the tiled twin serves the rest.
+/// The single-block route has no half twin, so a threshold that would select
+/// it is refused at init (the store is never built) and here as a defence.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_attention_decode_routed_f16(
     device: &CudaDevice,
@@ -4828,50 +4832,200 @@ unsafe fn launch_attention_decode_routed_f16(
     let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
         RuntimeError::Compute("16-bit KV cache dispatched without its kernels".into())
     })?;
-    if let Some(scratch) = splitk_scratch {
-        if kernels.attention_decode_splitk_merge_gqa6.is_some()
-            && attn_splitk_chunks(seq_len) > 1
-            && attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len)
-            && scratch.2.len()
-                >= (num_heads as usize)
-                    * (attn_splitk_gqa6_chunks(seq_len) as usize)
-                    * (head_dim as usize)
-        {
-            announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len);
-            launch_attention_decode_splitk_gqa6_f16(
+    let force_tiled = decode_tiled_force_enabled();
+    let threshold = decode_tiled_threshold();
+    let variant = attention_decode_variant(seq_len, force_tiled, threshold);
+
+    // The same one-time explanation the F32 router gives when a loaded
+    // GQA-shared pair will not serve this dispatch.
+    let gqa6_loaded = kernels.attention_decode_splitk_merge_gqa6.is_some();
+    let scratch_o_floats = splitk_scratch.as_ref().map(|s| s.2.len());
+    if gqa6_loaded {
+        if let Some(reason) = splitk_gqa6_exclusion_reason(
+            force_tiled,
+            variant,
+            scratch_o_floats,
+            kernels.attention_decode_splitk_merge.is_some(),
+            true,
+            attn_splitk_chunks(seq_len),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            attn_splitk_gqa6_chunk_bound(),
+        ) {
+            announce_splitk_gqa6_excluded(num_heads, num_kv_heads, head_dim, seq_len, reason);
+        }
+    }
+
+    if variant == AttentionDecodeVariant::Tiled && !force_tiled {
+        if let Some(scratch) = splitk_scratch {
+            if kernels.attention_decode_splitk_merge.is_some()
+                && attention_decode_splitk_supports_head_dim(head_dim)
+                && attn_splitk_chunks(seq_len) > 1
+            {
+                if gqa6_loaded
+                    && attention_decode_splitk_gqa6_supports(
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        seq_len,
+                    )
+                    && scratch.2.len()
+                        >= (num_heads as usize)
+                            * (attn_splitk_gqa6_chunks(seq_len) as usize)
+                            * (head_dim as usize)
+                {
+                    launch_attention_decode_splitk_gqa6_f16(
+                        device,
+                        kernels,
+                        f16,
+                        q,
+                        k_cache,
+                        v_cache,
+                        scratch,
+                        attn_out,
+                        num_heads,
+                        num_kv_heads,
+                        seq_len,
+                        max_seq_len,
+                        scale,
+                    )?;
+                    announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len);
+                    return Ok(AttentionDecodeVariant::SplitKGqa6F16);
+                }
+                launch_attention_decode_splitk_f16(
+                    device,
+                    kernels,
+                    f16,
+                    q,
+                    k_cache,
+                    v_cache,
+                    scratch,
+                    attn_out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    max_seq_len,
+                    scale,
+                )?;
+                announce_splitk_route_f16(head_dim, seq_len);
+                return Ok(AttentionDecodeVariant::SplitKF16);
+            }
+        }
+    }
+
+    match variant {
+        AttentionDecodeVariant::SingleBlock => Err(RuntimeError::Compute(format!(
+            "16-bit KV cache: the single-block decode-attention route has no half twin \
+             (LUMEN_CUDA_DECODE_TILED_THRESHOLD={threshold} selected it at seq_len {seq_len}); \
+             unset the threshold or use --kv-precision f32"
+        ))),
+        _ => {
+            if !attention_decode_tiled_supports_head_dim(head_dim) {
+                return Err(RuntimeError::Compute(format!(
+                    "16-bit KV cache: no half reader serves head_dim {head_dim}"
+                )));
+            }
+            announce_tiled_route_f16(head_dim, seq_len);
+            launch_attention_decode_tiled_f16(
                 device,
-                kernels,
                 f16,
                 q,
                 k_cache,
                 v_cache,
-                scratch,
                 attn_out,
                 num_heads,
                 num_kv_heads,
+                head_dim,
                 seq_len,
                 max_seq_len,
                 scale,
             )?;
-            return Ok(AttentionDecodeVariant::SplitKGqa6F16);
+            Ok(AttentionDecodeVariant::TiledF16)
         }
     }
-    announce_tiled_route_f16(head_dim, seq_len);
-    launch_attention_decode_tiled_f16(
-        device,
-        f16,
-        q,
-        k_cache,
-        v_cache,
-        attn_out,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        seq_len,
-        max_seq_len,
-        scale,
-    )?;
-    Ok(AttentionDecodeVariant::TiledF16)
+}
+
+/// The per-query-head split-K pair on a half store: the half partial, the
+/// shipped F32 merge, the same split count and scratch as the F32 pair.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_splitk_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    f16: &super::decode::KvF16Kernels,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<u16>,
+    v_cache: &CudaSlice<u16>,
+    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<(), RuntimeError> {
+    let s: u32 = attn_splitk_chunks(seq_len);
+    let merge_fn = kernels
+        .attention_decode_splitk_merge
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("attention_decode_splitk_f16: merge not available".into())
+        })?;
+    let shared_bytes = attention_decode_tiled_shared_bytes(head_dim);
+    let (m_part, l_part, o_part) = scratch;
+    device
+        .stream
+        .launch_builder(&f16.splitk_partial)
+        .arg(q)
+        .arg(k_cache)
+        .arg(v_cache)
+        .arg(&mut *m_part)
+        .arg(&mut *l_part)
+        .arg(&mut *o_part)
+        .arg(&num_heads)
+        .arg(&num_kv_heads)
+        .arg(&head_dim)
+        .arg(&seq_len)
+        .arg(&max_seq_len)
+        .arg(&scale)
+        .arg(&s)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads * s, 1, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        })
+        .map_err(|e| RuntimeError::Compute(format!("attention_decode_splitk_partial_f16: {e}")))?;
+    device
+        .stream
+        .launch_builder(merge_fn)
+        .arg(&*m_part)
+        .arg(&*l_part)
+        .arg(&*o_part)
+        .arg(attn_out)
+        .arg(&num_heads)
+        .arg(&head_dim)
+        .arg(&s)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads, 1, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        })
+        .map_err(|e| RuntimeError::Compute(format!("attention_decode_splitk_merge: {e}")))?;
+    Ok(())
+}
+
+fn announce_splitk_route_f16(head_dim: u32, seq_len: u32) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        let chunks = attn_splitk_chunks(seq_len);
+        format!(
+            "[CUDA] attention_decode_splitk_partial_f16: ACTIVE (kv=f16, chunks={chunks}, \
+             head_dim={head_dim}, seq_len={seq_len}, merge=attention_decode_splitk_merge)"
+        )
+    });
 }
 
 /// The GQA-shared pair on a half store: the half partial, the shipped F32

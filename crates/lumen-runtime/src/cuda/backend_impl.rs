@@ -18282,6 +18282,15 @@ impl ComputeBackend for CudaBackend {
                 crate::cuda::ATTN_DECODE_TILED_BLOCK_DIM
             )));
         }
+        if self.kv_precision == KvPrecision::F16
+            && decode::decode_tiled_threshold() != decode::ATTN_DECODE_TILED_DEFAULT_THRESHOLD
+        {
+            return Err(RuntimeError::Unsupported(format!(
+                "16-bit KV cache: LUMEN_CUDA_DECODE_TILED_THRESHOLD={} selects the single-block \
+                 decode-attention route, which has no half twin; unset it or use --kv-precision f32",
+                decode::decode_tiled_threshold()
+            )));
+        }
         let kv_module = super::kv_cache::compile_kv_module(&self.device, self.kv_precision)?;
         let kv_caches: Vec<Option<KvCacheGpu>> = (0..num_layers).map(|_| None).collect();
         eprintln!(
