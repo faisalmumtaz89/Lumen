@@ -899,11 +899,11 @@ struct MutableState {
     /// The storage every cache is allocated in.
     kv_precision: KvPrecision,
     /// Half store only: the count of values a writer could not fit in half
-    /// (see kv_cache_f16.cu). Read at the first decode token after a prefill
-    /// and every 64 tokens after that; a non-zero count refuses the generation.
+    /// (see kv_cache_f16.cu). Read after every prefill, streaming and decode
+    /// readback; a non-zero count refuses the generation.
     kv_f16_overflow: Option<CudaSlice<u32>>,
     /// Half store only: the F32 buffers the prefill readers work on, one pair
-    /// shared by every layer, allocated on first use at the cache's capacity.
+    /// shared by every layer, allocated at init at the cache's capacity.
     kv_widen: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     /// GPU-resident global tensors.
     globals: GpuGlobals,
