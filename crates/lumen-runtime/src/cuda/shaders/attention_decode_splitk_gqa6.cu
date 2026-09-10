@@ -357,3 +357,187 @@ extern "C" __global__ void attention_decode_splitk_merge_gqa6_f32(
                     + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
     attn_out[head * GQA6_HD + d] = sum * inv_l;
 }
+
+// --------------------------------------------------------------------------
+// 16-bit K/V twin of the partial. The same tile geometry, the same register
+// layout, the same reduction order: a lane owns dims [4 lane, 4 lane + 4) and
+// [128 + 4 lane, ...) of the K row exactly as above, so the six dots are
+// formed in the F32 kernel's order from widened halves (widening is exact, one
+// PTX instruction). The V tile is staged as halves (C * 256 * 2 bytes instead
+// of * 4) and widened on read in the PV loop, so the CTA's shared footprint is
+// 14'768 B at C = 16 against 22'960 B for the F32 kernel. Partials are F32 and
+// the F32 merge above consumes them unchanged. On half-representable inputs
+// the two partials are bit-identical.
+// --------------------------------------------------------------------------
+
+__device__ __forceinline__ float gqa6_h2f(unsigned int h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)(h & 0xffffu)));
+    return f;
+}
+
+// Four packed halves (two 32-bit words, low half first) -> float4.
+__device__ __forceinline__ float4 gqa6_h4_to_f4(unsigned int lo, unsigned int hi) {
+    float4 o;
+    o.x = gqa6_h2f(lo);
+    o.y = gqa6_h2f(lo >> 16);
+    o.z = gqa6_h2f(hi);
+    o.w = gqa6_h2f(hi >> 16);
+    return o;
+}
+
+extern "C" __global__ void attention_decode_splitk_partial_gqa6_f16(
+    const float* __restrict__ q,                    // [num_heads * 256]
+    const unsigned short* __restrict__ k_cache,     // [num_kv_heads, max_seq_len, 256] half bits
+    const unsigned short* __restrict__ v_cache,     // [num_kv_heads, max_seq_len, 256] half bits
+    float* __restrict__ m_part,                     // [num_heads * S]
+    float* __restrict__ l_part,                     // [num_heads * S]
+    float* __restrict__ o_part,                     // [num_heads * S * 256]
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks,                        // S
+    unsigned int chunk_cap)                         // C
+{
+    const unsigned int chunk = blockIdx.x;
+    const unsigned int kv_h  = blockIdx.y;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int lane  = tid & 31u;
+    const unsigned int warp  = tid >> 5;
+
+    const unsigned int chunk_span = (seq_len + num_chunks - 1u) / num_chunks;
+    const unsigned int p0 = chunk * chunk_span;
+    unsigned int span = 0u;
+    if (p0 < seq_len) {
+        unsigned int p1 = p0 + chunk_span;
+        if (p1 > seq_len) p1 = seq_len;
+        span = p1 - p0;
+    }
+
+    // Empty chunk: block-uniform, the whole CTA returns before any barrier.
+    if (span == 0u) {
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            unsigned int head = kv_h * GQA6_G + g;
+            unsigned long long base =
+                ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+            o_part[base + tid] = 0.0f;
+            o_part[base + tid + GQA6_BLOCK] = 0.0f;
+        }
+        if (tid < GQA6_G) {
+            unsigned int head = kv_h * GQA6_G + tid;
+            m_part[head * num_chunks + chunk] = GQA6_NEG_INF;
+            l_part[head * num_chunks + chunk] = 0.0f;
+        }
+        return;
+    }
+
+    // Shared layout: s_q [6][256] F32, s_vh [C][256] halves (C * 128 floats of
+    // space), then the score block and the (m, l) slots as in the F32 kernel.
+    // 16-byte aligned: s_q starts at 0, s_vh at 6144 B, s_score at
+    // 6144 + C * 512 B — a multiple of 16 for every C.
+    extern __shared__ __align__(16) float smem[];
+    float* s_q = smem;                                               // [6][256]
+    unsigned short* s_vh = reinterpret_cast<unsigned short*>(s_q + GQA6_G * GQA6_HD); // [C][256]
+    float* s_score = s_q + GQA6_G * GQA6_HD + (chunk_cap * GQA6_HD) / 2u;  // [6][C]
+    float* s_m = s_score + GQA6_G * chunk_cap;                       // [6]
+    float* s_l = s_m + GQA6_G;                                       // [6]
+
+    const unsigned long long kv_base =
+        (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)GQA6_HD;
+
+    // Both staging streams are issued before the barrier so their loads overlap.
+    {
+        const float4* q4src =
+            reinterpret_cast<const float4*>(q + (unsigned long long)kv_h * GQA6_G * GQA6_HD);
+        float4* q4dst = reinterpret_cast<float4*>(s_q);
+        for (unsigned int i = tid; i < (GQA6_G * GQA6_HD) / 4u; i += GQA6_BLOCK) {
+            q4dst[i] = q4src[i];
+        }
+        // V tile as halves: eight halves (16 bytes) per thread per step.
+        const uint4* v8src = reinterpret_cast<const uint4*>(
+            v_cache + kv_base + (unsigned long long)p0 * (unsigned long long)GQA6_HD);
+        uint4* v8dst = reinterpret_cast<uint4*>(s_vh);
+        const unsigned int nv8 = span * (GQA6_HD / 8u);
+        for (unsigned int i = tid; i < nv8; i += GQA6_BLOCK) {
+            v8dst[i] = v8src[i];
+        }
+    }
+    __syncthreads();
+
+    // Q stays in registers for the whole QK phase: 2 float4 per head per lane.
+    float4 qa[GQA6_G];
+    float4 qb[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        const float4* q4 = reinterpret_cast<const float4*>(s_q + g * GQA6_HD);
+        qa[g] = q4[lane];
+        qb[g] = q4[32u + lane];
+    }
+
+    // QK: a warp per position; two 8-byte loads per lane per K row, widened
+    // into the same float4 pairs the F32 kernel reads.
+    for (unsigned int j = warp; j < span; j += GQA6_WARPS) {
+        const uint2* k2 = reinterpret_cast<const uint2*>(
+            k_cache + kv_base + (unsigned long long)(p0 + j) * (unsigned long long)GQA6_HD);
+        const uint2 ra = k2[lane];
+        const uint2 rb = k2[32u + lane];
+        const float4 ka = gqa6_h4_to_f4(ra.x, ra.y);
+        const float4 kb = gqa6_h4_to_f4(rb.x, rb.y);
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            float dot = qa[g].x * ka.x + qa[g].y * ka.y + qa[g].z * ka.z + qa[g].w * ka.w;
+            dot += qb[g].x * kb.x + qb[g].y * kb.y + qb[g].z * kb.z + qb[g].w * kb.w;
+            dot = gqa6_warp_sum(dot) * scale;
+            if (lane == 0u) s_score[g * chunk_cap + j] = dot;
+        }
+    }
+    __syncthreads();
+
+    // Softmax: one warp per query head, four warps over six heads.
+    for (unsigned int g = warp; g < GQA6_G; g += GQA6_WARPS) {
+        float s = (lane < span) ? s_score[g * chunk_cap + lane] : GQA6_NEG_INF;
+        float m = gqa6_warp_max(s);
+        float p = (lane < span) ? expf(s - m) : 0.0f;
+        float l = gqa6_warp_sum(p);
+        if (lane < span) s_score[g * chunk_cap + lane] = p;
+        if (lane == 0u) {
+            s_m[g] = m;
+            s_l[g] = l;
+        }
+    }
+    __syncthreads();
+
+    // PV: thread t owns dims t and t+128; ascending positions; each staged V
+    // half is widened once and feeds all six heads.
+    float acc0[GQA6_G];
+    float acc1[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        acc0[g] = 0.0f;
+        acc1[g] = 0.0f;
+    }
+    for (unsigned int j = 0; j < span; j++) {
+        const float v0 = gqa6_h2f(s_vh[j * GQA6_HD + tid]);
+        const float v1 = gqa6_h2f(s_vh[j * GQA6_HD + tid + GQA6_BLOCK]);
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            const float p = s_score[g * chunk_cap + j];
+            acc0[g] += p * v0;
+            acc1[g] += p * v1;
+        }
+    }
+
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        unsigned int head = kv_h * GQA6_G + g;
+        unsigned long long base = ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+        o_part[base + tid] = acc0[g];
+        o_part[base + tid + GQA6_BLOCK] = acc1[g];
+    }
+    if (tid < GQA6_G) {
+        unsigned int head = kv_h * GQA6_G + tid;
+        m_part[head * num_chunks + chunk] = s_m[tid];
+        l_part[head * num_chunks + chunk] = s_l[tid];
+    }
+}

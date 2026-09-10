@@ -9,6 +9,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
+  `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
+  attention layer's K and V cache is stored as IEEE half: the writers round
+  to nearest even on the way in and count every value that does not fit,
+  refusing the generation rather than storing an infinity; the decode
+  readers are half twins of the F32 kernels (the GQA-shared pair's partial
+  and the tiled kernel) that widen on load and keep the F32 arithmetic and
+  order, so on half-representable inputs they reproduce the F32 kernels bit
+  for bit; the prefill readers work on the cache widened to F32 into one
+  shared buffer pair. The storage rounding is the only numerical change:
+  on real Qwen3.8-27B activations at 5k and 11k keys the half-stored
+  attention output differs from the F32-stored one by a relative L2 of
+  about 2e-4 (7.5e-4 worst per call). The cache takes half the bytes
+  (1.07 GB instead of 2.15 GB at 16,384 positions on Qwen3.8-27B) and the
+  decode-attention kernels read half the bytes. Off unless set; the F32
+  store is unchanged.
+
 - **`LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,...]`**, a diagnostic that writes one
   decode-attention call's inputs (Q, the live K/V cache region) and the
   serving route's output as raw F32 beside a JSON header, at the listed

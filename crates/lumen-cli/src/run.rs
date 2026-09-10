@@ -647,11 +647,10 @@ pub(crate) fn run_inference(args: &[String]) {
                 session_save_path = Some(val.clone());
             }
             "--kv-precision" => {
-                // explicit KV cache precision.
-                // Metal backend stores KV in F16 (validated by
-                // backend.validate_kv_precision); CUDA backend stores KV in
-                // F32. Passing the wrong precision now produces a clean error
-                // instead of silent corruption.
+                // explicit KV cache precision. Metal stores KV in F16 only;
+                // CUDA stores F32 by default and F16 on request; CPU F32.
+                // A precision a backend cannot hold is refused before any
+                // cache is allocated (backend.validate_kv_precision).
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
                     eprintln!("Error: --kv-precision requires a value (f16 | f32)");
@@ -1399,14 +1398,12 @@ fn resolve_kv_precision(
             }
         }
     }
-    // Backend-appropriate default. Metal pins KV to F16; CUDA and CPU both
-    // use F32. `use_cuda` is matched explicitly here even though it shares
-    // F32 with the CPU fallback, so a future CUDA-F16 path slots in cleanly
-    // (just change the CUDA arm rather than adding a new branch).
+    // Backend-appropriate default. Metal pins KV to F16; CUDA defaults to
+    // F32 (F16 is the opt-in half store); CPU uses F32.
     let default = if use_metal {
         KvPrecision::F16
     } else {
-        let _ = use_cuda; // reserved for future CUDA-F16 path; same default today
+        let _ = use_cuda; // CUDA and CPU share the F32 default
         KvPrecision::F32
     };
     if verbose {
@@ -1929,6 +1926,7 @@ fn create_backend(
     #[allow(unused_variables)] use_metal: bool,
     #[allow(unused_variables)] use_cuda: bool,
     #[allow(unused_variables)] cuda_device: usize,
+    #[allow(unused_variables)] kv_precision: KvPrecision,
     threads: usize,
     profile: bool,
     verbose: bool,
@@ -1960,8 +1958,14 @@ fn create_backend(
         // CUDA backend (cross-platform, requires --features cuda at build time).
         #[cfg(feature = "cuda")]
         if use_cuda {
-            let cuda = CudaBackend::new(cuda_device).unwrap_or_else(|e| {
+            let mut cuda = CudaBackend::new(cuda_device).unwrap_or_else(|e| {
                 eprintln!("Error: CUDA backend unavailable: {e}");
+                std::process::exit(1);
+            });
+            // The store is chosen before init(): the backend compiles the
+            // store's kernels as a group and allocates every cache in it.
+            cuda.set_kv_precision(kv_precision).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
                 std::process::exit(1);
             });
             Box::new(cuda)
@@ -2119,6 +2123,7 @@ fn run_with_async(
         use_metal,
         use_cuda,
         cuda_device,
+        kv_precision,
         threads,
         profile,
         verbose,
@@ -2245,6 +2250,7 @@ fn run_with_sync(
         use_metal,
         use_cuda,
         cuda_device,
+        kv_precision,
         threads,
         profile,
         verbose,
@@ -2649,6 +2655,7 @@ fn run_with_mmap(
         use_metal,
         use_cuda,
         cuda_device,
+        kv_precision,
         threads,
         profile,
         verbose,

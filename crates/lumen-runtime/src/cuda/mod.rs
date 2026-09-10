@@ -52,7 +52,8 @@ pub use decode::{ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C};
 pub use prefill::{
     attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_max_seq_len,
     attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_partial_shared_bytes,
-    ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
+    attn_splitk_gqa6_partial_shared_bytes_f16, ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES,
+    ATTN_SPLITK_GQA6_HEAD_DIM,
 };
 
 // ---------------------------------------------------------------------------

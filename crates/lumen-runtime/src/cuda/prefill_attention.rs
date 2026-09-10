@@ -16,7 +16,9 @@ use crate::error::RuntimeError;
 
 use super::decode::KernelSet;
 use super::ffi::CudaDevice;
+#[cfg(test)]
 use super::kv_cache::KvCacheGpu;
+use super::kv_cache::{KvRef, KvView};
 use super::prefill::{launch_attention_decode_gated, launch_extract_row, launch_scatter_row};
 
 /// Run causal attention for all tokens in a prefill batch.
@@ -36,7 +38,7 @@ use super::prefill::{launch_attention_decode_gated, launch_extract_row, launch_s
 /// * `attn_out_batch` - Output buffer, shape `[batch, q_dim]`
 /// * `q_single` - Scratch buffer for a single token's Q, shape `[q_dim]`
 /// * `attn_out_single` - Scratch buffer for a single token's attention output, shape `[q_dim]`
-/// * `kv_cache` - GPU KV cache with data for positions 0..pos_start+batch-1
+/// * `kv` - F32 view of the KV cache with data for positions 0..pos_start+batch-1
 /// * `batch` - Number of tokens in the prefill batch
 /// * `num_heads` - Number of query attention heads
 /// * `num_kv_heads` - Number of KV attention heads (for GQA)
@@ -55,7 +57,7 @@ pub fn prefill_attention_sequential(
     device: &CudaDevice,
     kernels: &KernelSet,
     q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
+    kv: &KvView<'_>,
     attn_out_batch: &mut CudaSlice<f32>,
     batch: usize,
     num_heads: usize,
@@ -117,15 +119,14 @@ pub fn prefill_attention_sequential(
         let nkvh = num_kv_heads as u32;
         let hd = head_dim as u32;
         let sl = seq_len as u32;
-        let msl = kv_cache.max_seq_len as u32;
+        let msl = kv.seq_stride as u32;
 
         unsafe {
             launch_attention_decode_gated(
                 device,
                 kernels,
                 q_single as &CudaSlice<f32>,
-                &kv_cache.k_cache,
-                &kv_cache.v_cache,
+                KvRef::F32 { k: kv.k, v: kv.v },
                 None,
                 &mut *attn_out_single,
                 nh,
@@ -233,13 +234,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 4;
         let num_heads = 2;
@@ -278,7 +280,7 @@ mod tests {
             let v_token: Vec<f32> = v_data[t * kv_dim..(t + 1) * kv_dim].to_vec();
             let k_gpu = device.htod_copy(&k_token).unwrap();
             let v_gpu = device.htod_copy(&v_token).unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         // Run the function under test.
@@ -286,7 +288,7 @@ mod tests {
             &device,
             &kernels,
             &q_batch,
-            &kv_cache,
+            &kv_cache.f32_view().unwrap(),
             &mut attn_out_batch,
             batch,
             num_heads,
@@ -363,13 +365,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 1;
         let num_heads = 2;
@@ -392,13 +395,13 @@ mod tests {
         let mut kv_cache = KvCacheGpu::new(&device, num_kv_heads, max_seq_len, head_dim).unwrap();
         let k_gpu = device.htod_copy(&k_data).unwrap();
         let v_gpu = device.htod_copy(&v_data).unwrap();
-        kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+        kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
 
         prefill_attention_sequential(
             &device,
             &kernels,
             &q_batch,
-            &kv_cache,
+            &kv_cache.f32_view().unwrap(),
             &mut attn_out_batch,
             batch,
             num_heads,
@@ -446,13 +449,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         // Simulate: 3 tokens already in cache, then prefill 2 more tokens.
         let pre_existing = 3;
@@ -480,7 +484,7 @@ mod tests {
             let v_token = &all_v[t * kv_dim..(t + 1) * kv_dim];
             let k_gpu = device.htod_copy(k_token).unwrap();
             let v_gpu = device.htod_copy(v_token).unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         // Q for the 2 new tokens.
@@ -495,7 +499,7 @@ mod tests {
             &device,
             &kernels,
             &q_batch,
-            &kv_cache,
+            &kv_cache.f32_view().unwrap(),
             &mut attn_out_batch,
             batch,
             num_heads,
@@ -567,13 +571,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 4;
         let num_heads = 2;
@@ -603,7 +608,7 @@ mod tests {
             let v_gpu = device
                 .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
                 .unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         unsafe {
@@ -611,7 +616,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut attn_out,
                 batch,
                 num_heads,
@@ -674,13 +679,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 7; // Not a multiple of 4 -- tests tail handling
         let num_heads = 2;
@@ -712,7 +718,7 @@ mod tests {
             let v_gpu = device
                 .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
                 .unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         unsafe {
@@ -720,7 +726,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut attn_out,
                 batch,
                 num_heads,
@@ -783,13 +789,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let pre_existing = 3;
         let batch = 2;
@@ -817,7 +824,7 @@ mod tests {
             let v_gpu = device
                 .htod_copy(&all_v[t * kv_dim..(t + 1) * kv_dim])
                 .unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         let q_data: Vec<f32> = (0..batch * q_dim).map(|i| (i as f32) * 0.3).collect();
@@ -830,7 +837,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut attn_out,
                 batch,
                 num_heads,
@@ -894,13 +901,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 8;
         let num_heads = 4;
@@ -930,7 +938,7 @@ mod tests {
             let v_gpu = device
                 .htod_copy(&v_data[t * kv_dim..(t + 1) * kv_dim])
                 .unwrap();
-            kv_cache.append_kv(&device, &k_gpu, &v_gpu).unwrap();
+            kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
         }
 
         // Run sequential attention (reference)
@@ -943,7 +951,7 @@ mod tests {
             &device,
             &kernels,
             &q_batch,
-            &kv_cache,
+            &kv_cache.f32_view().unwrap(),
             &mut seq_out,
             batch,
             num_heads,
@@ -964,7 +972,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut flash_out,
                 batch,
                 num_heads,
@@ -1013,13 +1021,14 @@ mod tests {
             }
         };
 
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 4;
         let num_heads = 2;
@@ -1039,7 +1048,7 @@ mod tests {
             &device,
             &kernels,
             &q_batch,
-            &kv_cache,
+            &kv_cache.f32_view().unwrap(),
             &mut attn_out_batch,
             batch,
             num_heads,
@@ -1104,13 +1113,14 @@ mod tests {
                 return;
             }
         };
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
@@ -1143,12 +1153,15 @@ mod tests {
                 }
             }
         }
-        device
-            .htod_copy_into(&k_host, &mut kv_cache.k_cache)
-            .unwrap();
-        device
-            .htod_copy_into(&v_host, &mut kv_cache.v_cache)
-            .unwrap();
+        match &mut kv_cache.store {
+            crate::cuda::kv_cache::KvStore::F32 { k, v } => {
+                device.htod_copy_into(&k_host, k).unwrap();
+                device.htod_copy_into(&v_host, v).unwrap();
+            }
+            crate::cuda::kv_cache::KvStore::F16 { .. } => {
+                unreachable!("KvCacheGpu::new allocates F32")
+            }
+        }
         kv_cache.advance_seq_len_by(kv_total);
 
         let q_batch = device.htod_copy(&q_data).unwrap();
@@ -1170,7 +1183,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut out_sgemm,
                 &mut scores,
                 batch,
@@ -1184,7 +1197,7 @@ mod tests {
                 &device,
                 &kernels,
                 &q_batch,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut out_br4,
                 batch,
                 num_heads,
@@ -1286,13 +1299,14 @@ mod tests {
                 return;
             }
         };
-        let kernels = match super::super::decode::compile_all_kernels(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
 
         let batch = 8;
         let num_heads = 2;
@@ -1312,7 +1326,7 @@ mod tests {
                 &device,
                 &kernels,
                 &small_q,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut full_out,
                 &mut scores,
                 batch,
@@ -1331,7 +1345,7 @@ mod tests {
                 &device,
                 &kernels,
                 &full_q,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut small_out,
                 &mut scores,
                 batch,
@@ -1355,7 +1369,7 @@ mod tests {
                 &device,
                 &kernels,
                 &full_q,
-                &kv_cache,
+                &kv_cache.f32_view().unwrap(),
                 &mut full_out,
                 &mut scores_none,
                 batch,
@@ -1455,5 +1469,184 @@ mod tests {
             "the four-warp fold must stay guarded"
         );
         assert_eq!(ATTN_SOFTMAX_CAUSAL_THREADS % 32, 0);
+    }
+
+    fn host_f16_bits(x: f32) -> u16 {
+        // Round to nearest even, normal range only (the inputs below are
+        // small normals).
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32;
+        let mant = b & 0x7f_ffff;
+        if x == 0.0 {
+            return sign;
+        }
+        let e = exp - 127 + 15;
+        assert!((1..0x1f).contains(&e), "test inputs must be half normals");
+        let half_m = mant >> 13;
+        let rem = mant & 0x1fff;
+        let round_up = rem > 0x1000 || (rem == 0x1000 && (half_m & 1) == 1);
+        sign | (((e as u32) << 10) | half_m) as u16 + u16::from(round_up)
+    }
+
+    fn host_f16_to_f32(h: u16) -> f32 {
+        let sign = u32::from(h & 0x8000) << 16;
+        let exp = u32::from((h >> 10) & 0x1f);
+        let mant = u32::from(h & 0x3ff);
+        assert!(exp != 0 && exp != 0x1f);
+        f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
+    }
+
+    /// The typed dispatch: the same Q over the same half-representable K/V
+    /// held in an F32 store and in a half store produces bit-identical
+    /// output, the half arm taking the half twin of whatever route the F32
+    /// arm took (the GQA-shared pair where it is loaded and admitted, the
+    /// tiled kernel otherwise).
+    #[test]
+    fn half_store_dispatch_reproduces_the_f32_store_bit_for_bit() {
+        use super::super::decode::AttentionDecodeVariant as V;
+        use crate::cuda::kv_cache::{compile_kv_module, KvCacheGpu, KvStore};
+        use crate::kv::KvPrecision;
+        if super::super::ffi::device_count().unwrap_or(0) == 0 {
+            eprintln!("Skipping test: no CUDA device");
+            return;
+        }
+        let device = match super::super::ffi::CudaDevice::new(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Skipping test: failed to init CUDA device: {e}");
+                return;
+            }
+        };
+        let kernels = match super::super::decode::compile_all_kernels(&device, KvPrecision::F16) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
+        let (num_heads, num_kv_heads, head_dim) = (24usize, 4usize, 256usize);
+        let max_seq_len = 4200usize;
+        let cache = num_kv_heads * max_seq_len * head_dim;
+        let q: Vec<f32> = (0..num_heads * head_dim)
+            .map(|i| ((i as f32) * 0.011 + 0.7).sin() * 4.0)
+            .collect();
+        let k16: Vec<u16> = (0..cache)
+            .map(|i| host_f16_bits(((i as f32) * 0.013 + 0.3).sin() * 0.5 + 0.75))
+            .collect();
+        let v16: Vec<u16> = (0..cache)
+            .map(|i| host_f16_bits(((i as f32) * 0.017 + 0.5).cos() * 0.5 + 0.75))
+            .collect();
+        let k32: Vec<f32> = k16.iter().map(|&h| host_f16_to_f32(h)).collect();
+        let v32: Vec<f32> = v16.iter().map(|&h| host_f16_to_f32(h)).collect();
+
+        let m32 = compile_kv_module(&device, KvPrecision::F32).unwrap();
+        let mut kv32 = KvCacheGpu::with_module_at(
+            &device,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            &m32,
+            KvPrecision::F32,
+        )
+        .unwrap();
+        match &mut kv32.store {
+            KvStore::F32 { k, v } => {
+                device.htod_copy_into(&k32, k).unwrap();
+                device.htod_copy_into(&v32, v).unwrap();
+            }
+            KvStore::F16 { .. } => unreachable!(),
+        }
+        let m16 = compile_kv_module(&device, KvPrecision::F16).unwrap();
+        let mut kv16 = KvCacheGpu::with_module_at(
+            &device,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            &m16,
+            KvPrecision::F16,
+        )
+        .unwrap();
+        match &mut kv16.store {
+            KvStore::F16 { k, v } => {
+                device.htod_copy_into(&k16, k).unwrap();
+                device.htod_copy_into(&v16, v).unwrap();
+            }
+            KvStore::F32 { .. } => unreachable!(),
+        }
+        assert_eq!(kv16.bytes() * 2, kv32.bytes());
+
+        let q_gpu = device.htod_copy(&q).unwrap();
+        let s_max = super::super::prefill::attn_splitk_gqa6_chunks(max_seq_len as u32) as usize;
+        let mut scratch = (
+            device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),
+            device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),
+            device
+                .alloc_zeros::<f32>(num_heads * s_max * head_dim)
+                .unwrap(),
+        );
+        let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
+        let mut out16 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        for seq_len in [1u32, 16, 129, 330, 1300, 2600, 4097] {
+            let a = unsafe {
+                super::super::prefill::launch_attention_decode_gated(
+                    &device,
+                    &kernels,
+                    &q_gpu,
+                    kv32.as_ref(),
+                    Some(&mut scratch),
+                    &mut out32,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    seq_len,
+                    max_seq_len as u32,
+                    scale,
+                )
+            }
+            .unwrap();
+            let b = unsafe {
+                super::super::prefill::launch_attention_decode_gated(
+                    &device,
+                    &kernels,
+                    &q_gpu,
+                    kv16.as_ref(),
+                    Some(&mut scratch),
+                    &mut out16,
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    seq_len,
+                    max_seq_len as u32,
+                    scale,
+                )
+            }
+            .unwrap();
+            device.synchronize().unwrap();
+            let got32: Vec<u32> = device
+                .dtoh_copy(&out32)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            let got16: Vec<u32> = device
+                .dtoh_copy(&out16)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            assert!(
+                matches!(
+                    (a, b),
+                    (V::Tiled, V::TiledF16) | (V::SplitKGqa6, V::SplitKGqa6F16)
+                ),
+                "at seq_len {seq_len} the F32 store took {a:?} and the half store {b:?}"
+            );
+            assert_eq!(
+                got32, got16,
+                "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
+            );
+        }
     }
 }

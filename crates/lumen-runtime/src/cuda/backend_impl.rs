@@ -32,7 +32,7 @@ use super::decode::{
 };
 use super::ffi::CudaDevice;
 use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
-use super::kv_cache::KvCacheGpu;
+use super::kv_cache::{KvCacheGpu, KvStore, KvView};
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
 use cudarc::cublas::{sys as cublas_sys, Gemv, GemvConfig};
@@ -896,6 +896,15 @@ struct MutableState {
     /// The KV geometry `init()` resolved, for the same late allocation.
     kv_num_kv_heads: usize,
     kv_head_dim: usize,
+    /// The storage every cache is allocated in.
+    kv_precision: KvPrecision,
+    /// Half store only: the count of values a writer could not fit in half
+    /// (see kv_cache_f16.cu). Read at the first decode token after a prefill
+    /// and every 64 tokens after that; a non-zero count refuses the generation.
+    kv_f16_overflow: Option<CudaSlice<u32>>,
+    /// Half store only: the F32 buffers the prefill readers work on, one pair
+    /// shared by every layer, allocated on first use at the cache's capacity.
+    kv_widen: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     /// GPU-resident global tensors.
     globals: GpuGlobals,
     /// GPU-resident layer weights, uploaded once via `preload_weights()`.
@@ -1226,6 +1235,7 @@ fn kv_cache_for<'a>(
     device: &CudaDevice,
     kv_caches: &'a mut [Option<KvCacheGpu>],
     kv_module: &std::sync::Arc<cudarc::driver::CudaModule>,
+    precision: KvPrecision,
     (num_kv_heads, max_seq_len, head_dim): (usize, usize, usize),
     layer_idx: usize,
 ) -> Result<&'a mut KvCacheGpu, RuntimeError> {
@@ -1233,15 +1243,153 @@ fn kv_cache_for<'a>(
         .get_mut(layer_idx)
         .ok_or_else(|| RuntimeError::Compute(format!("no KV cache slot for layer {layer_idx}")))?;
     if slot.is_none() {
-        *slot = Some(KvCacheGpu::with_module(
+        *slot = Some(KvCacheGpu::with_module_at(
             device,
             num_kv_heads,
             max_seq_len,
             head_dim,
             kv_module,
+            precision,
         )?);
     }
     Ok(slot.as_mut().expect("allocated above"))
+}
+
+/// Half store only: refuse to continue once a writer counted a value that
+/// does not fit in half — the cache would hold ±Inf and every later logit
+/// would be NaN. One 4-byte copy.
+fn check_kv_f16_overflow(device: &CudaDevice, st: &MutableState) -> Result<(), RuntimeError> {
+    if let Some(counter) = st.kv_f16_overflow.as_ref() {
+        let n = device.dtoh_copy(counter)?.first().copied().unwrap_or(0);
+        if n > 0 {
+            return Err(RuntimeError::Compute(format!(
+                "16-bit KV cache overflow: {n} value(s) exceeded the half range (|x| >= 65,520) \
+                 and would be stored as Inf; rerun with --kv-precision f32"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Write `batch` tokens' K and V (`[batch, num_kv_heads * head_dim]` F32
+/// each) into the store the cache holds, at positions `pos_start..`.
+#[allow(clippy::too_many_arguments)]
+fn write_kv_batch(
+    device: &CudaDevice,
+    kernels: &decode::KernelSet,
+    kv_cache: &mut KvCacheGpu,
+    overflow: Option<&mut CudaSlice<u32>>,
+    k_data: &CudaSlice<f32>,
+    v_data: &CudaSlice<f32>,
+    pos_start: usize,
+    batch: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(), RuntimeError> {
+    let max_seq_len = kv_cache.max_seq_len;
+    match &mut kv_cache.store {
+        KvStore::F32 { k, v } => {
+            for (cache, data) in [(k, k_data), (v, v_data)] {
+                unsafe {
+                    super::prefill::launch_kv_cache_write_batch(
+                        device,
+                        kernels,
+                        cache,
+                        data,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        max_seq_len,
+                        head_dim,
+                    )?;
+                }
+            }
+        }
+        KvStore::F16 { k, v } => {
+            let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("16-bit KV cache written without its kernels".into())
+            })?;
+            let overflow = overflow.ok_or_else(|| {
+                RuntimeError::Compute("16-bit KV cache without an overflow counter".into())
+            })?;
+            for (cache, data) in [(k, k_data), (v, v_data)] {
+                unsafe {
+                    super::prefill::launch_kv_cache_write_batch_f16(
+                        device,
+                        f16,
+                        cache,
+                        data,
+                        overflow,
+                        pos_start,
+                        batch,
+                        num_kv_heads,
+                        max_seq_len,
+                        head_dim,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The F32 view a prefill reader takes: the store itself when it is F32,
+/// otherwise the half store's positions `0..count` widened into the shared
+/// widening buffers, allocated on first use at the cache's full capacity
+/// (one pair for every layer; the readers see the F32 layout with a position
+/// stride of `count`).
+fn kv_view_for_prefill<'a>(
+    device: &CudaDevice,
+    kernels: &decode::KernelSet,
+    kv_cache: &'a KvCacheGpu,
+    widen: &'a mut Option<(CudaSlice<f32>, CudaSlice<f32>)>,
+    count: usize,
+) -> Result<KvView<'a>, RuntimeError> {
+    if let Some(view) = kv_cache.f32_view() {
+        return Ok(view);
+    }
+    match &kv_cache.store {
+        KvStore::F32 { .. } => unreachable!("f32_view covers the F32 store"),
+        KvStore::F16 { k, v } => {
+            let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
+                RuntimeError::Compute("16-bit KV cache read without its kernels".into())
+            })?;
+            if widen.is_none() {
+                let floats = kv_cache.num_kv_heads * kv_cache.max_seq_len * kv_cache.head_dim;
+                let needed = 2 * floats as u64 * 4;
+                let free = device.free_memory().unwrap_or(usize::MAX) as u64;
+                if free < needed {
+                    return Err(RuntimeError::Compute(format!(
+                        "16-bit KV cache: the prefill widening buffers need {} MB, {} MB free",
+                        needed / (1024 * 1024),
+                        free / (1024 * 1024)
+                    )));
+                }
+                *widen = Some((
+                    device.alloc_zeros::<f32>(floats)?,
+                    device.alloc_zeros::<f32>(floats)?,
+                ));
+                eprintln!(
+                    "[CUDA mem] KV widening buffers for the prefill readers: {} MB (kv=f16)",
+                    needed / (1024 * 1024)
+                );
+            }
+            let out = widen.as_mut().expect("allocated above");
+            unsafe {
+                super::prefill::launch_kv_widen_f16(
+                    device,
+                    f16,
+                    k,
+                    v,
+                    out,
+                    kv_cache.num_kv_heads,
+                    count,
+                    kv_cache.max_seq_len,
+                    kv_cache.head_dim,
+                )
+            }
+        }
+    }
 }
 
 /// The layers that own a KV cache: every layer whose type is not GDN.
@@ -1790,6 +1938,9 @@ pub struct CudaBackend {
     /// Mutable GPU state: scratch buffers, KV caches, kernels, globals.
     /// Protected by Mutex for interior mutability (compute_layer takes &self).
     state: Mutex<Option<MutableState>>,
+    /// The KV cache storage this backend allocates and loads kernels for;
+    /// set before `init()`, F32 unless the caller asked for half.
+    kv_precision: KvPrecision,
 }
 
 impl CudaBackend {
@@ -1826,7 +1977,35 @@ impl CudaBackend {
             cached_hidden_dim: 0,
             cached_vocab_size: 0,
             state: Mutex::new(None),
+            kv_precision: KvPrecision::F32,
         })
+    }
+
+    /// Choose the KV cache storage before `init()`. F32 (the default) or F16;
+    /// `init()` compiles the store's writers and readers as a group and
+    /// allocates every layer's cache in that storage. The session's
+    /// `kv_precision` must then agree (`validate_kv_precision`).
+    pub fn set_kv_precision(&mut self, precision: KvPrecision) -> Result<(), RuntimeError> {
+        match precision {
+            KvPrecision::F32 | KvPrecision::F16 => {}
+            other => {
+                return Err(RuntimeError::Unsupported(format!(
+                    "CUDA KV cache precision {other:?} is not implemented (f32 or f16)"
+                )))
+            }
+        }
+        if self.state.lock().map(|g| g.is_some()).unwrap_or(true) {
+            return Err(RuntimeError::Config(
+                "set_kv_precision must be called before init()".into(),
+            ));
+        }
+        self.kv_precision = precision;
+        Ok(())
+    }
+
+    /// The KV cache storage this backend was built for.
+    pub fn kv_precision(&self) -> KvPrecision {
+        self.kv_precision
     }
 
     /// Run a tiny `cublasGemmEx` BF16 probe to verify the tensor-core BF16
@@ -3055,6 +3234,7 @@ impl CudaBackend {
                     &self.device,
                     &mut st.kv_caches,
                     &st.kv_module,
+                    st.kv_precision,
                     (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                     layer_idx,
                 )?;
@@ -3072,10 +3252,15 @@ impl CudaBackend {
                         && !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
                         && super::decode::cuda_verbose()
                     {
-                        eprintln!("[ATTNPREP] fused prep chain ACTIVE");
+                        eprintln!(
+                            "[ATTNPREP] fused prep chain ACTIVE (kv={})",
+                            match kv_cache.precision() {
+                                KvPrecision::F16 => "f16",
+                                _ => "f32",
+                            }
+                        );
                     }
                 }
-                let fuse_fn = st.kernels.attn_prep_fused.as_ref().unwrap();
                 let pos = kv_cache.seq_len() as u32;
                 let max_seq_u32 = kv_cache.max_seq_len as u32;
                 let nqh = num_heads as u32;
@@ -3088,28 +3273,71 @@ impl CudaBackend {
                     block_dim: (hd, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                unsafe {
-                    self.device
-                        .stream
-                        .launch_builder(fuse_fn)
-                        .arg(st.scratch.q_gate.as_ref().unwrap())
-                        .arg(&mut st.scratch.q)
-                        .arg(st.scratch.gate_buf.as_mut().unwrap())
-                        .arg(&mut st.scratch.k)
-                        .arg(&st.scratch.v)
-                        .arg(lw.attn_q_norm.as_ref().unwrap())
-                        .arg(lw.attn_k_norm.as_ref().unwrap())
-                        .arg(&mut kv_cache.k_cache)
-                        .arg(&mut kv_cache.v_cache)
-                        .arg(&pos)
-                        .arg(&max_seq_u32)
-                        .arg(&nqh)
-                        .arg(&nkvh)
-                        .arg(&hd)
-                        .arg(&eps)
-                        .arg(&theta)
-                        .arg(&rotary_dim_u32)
-                        .launch(launch_cfg)
+                // The writer is typed by the store: the F32 kernel stores
+                // floats, the half twin rounds and counts what does not fit.
+                match &mut kv_cache.store {
+                    KvStore::F32 { k, v } => {
+                        let fuse_fn = st.kernels.attn_prep_fused.as_ref().unwrap();
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(fuse_fn)
+                                .arg(st.scratch.q_gate.as_ref().unwrap())
+                                .arg(&mut st.scratch.q)
+                                .arg(st.scratch.gate_buf.as_mut().unwrap())
+                                .arg(&mut st.scratch.k)
+                                .arg(&st.scratch.v)
+                                .arg(lw.attn_q_norm.as_ref().unwrap())
+                                .arg(lw.attn_k_norm.as_ref().unwrap())
+                                .arg(k)
+                                .arg(v)
+                                .arg(&pos)
+                                .arg(&max_seq_u32)
+                                .arg(&nqh)
+                                .arg(&nkvh)
+                                .arg(&hd)
+                                .arg(&eps)
+                                .arg(&theta)
+                                .arg(&rotary_dim_u32)
+                                .launch(launch_cfg)
+                        }
+                    }
+                    KvStore::F16 { k, v } => {
+                        let f16 = st.kernels.kv_f16.as_ref().ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "16-bit KV cache written without its kernels".into(),
+                            )
+                        })?;
+                        let overflow = st.kv_f16_overflow.as_mut().ok_or_else(|| {
+                            RuntimeError::Compute(
+                                "16-bit KV cache without an overflow counter".into(),
+                            )
+                        })?;
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&f16.prep_fused)
+                                .arg(st.scratch.q_gate.as_ref().unwrap())
+                                .arg(&mut st.scratch.q)
+                                .arg(st.scratch.gate_buf.as_mut().unwrap())
+                                .arg(&mut st.scratch.k)
+                                .arg(&st.scratch.v)
+                                .arg(lw.attn_q_norm.as_ref().unwrap())
+                                .arg(lw.attn_k_norm.as_ref().unwrap())
+                                .arg(k)
+                                .arg(v)
+                                .arg(overflow)
+                                .arg(&pos)
+                                .arg(&max_seq_u32)
+                                .arg(&nqh)
+                                .arg(&nkvh)
+                                .arg(&hd)
+                                .arg(&eps)
+                                .arg(&theta)
+                                .arg(&rotary_dim_u32)
+                                .launch(launch_cfg)
+                        }
+                    }
                 }
                 .map_err(|e| RuntimeError::Compute(format!("attn_prep_fused L{layer_idx}: {e}")))?;
                 // The fused kernel replaced append_kv, which also advances the
@@ -3362,11 +3590,17 @@ impl CudaBackend {
                     &self.device,
                     &mut st.kv_caches,
                     &st.kv_module,
+                    st.kv_precision,
                     (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                     layer_idx,
                 )?;
                 if !attn_prep_fused_done {
-                    kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
+                    kv_cache.append_kv(
+                        &self.device,
+                        &st.scratch.k,
+                        &st.scratch.v,
+                        st.kv_f16_overflow.as_mut(),
+                    )?;
                 }
             }
 
@@ -3407,8 +3641,7 @@ impl CudaBackend {
                         &self.device,
                         &st.kernels,
                         &st.scratch.q,
-                        &kv_cache.k_cache,
-                        &kv_cache.v_cache,
+                        kv_cache.as_ref(),
                         st.scratch.attn_splitk.as_mut(),
                         &mut st.scratch.attn_out,
                         nh,
@@ -8487,34 +8720,33 @@ impl CudaBackend {
                     &self.device,
                     &mut st.kv_caches,
                     &st.kv_module,
+                    st.kv_precision,
                     (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                     layer_idx,
                 )?;
-                unsafe {
-                    super::prefill::launch_kv_cache_write_batch(
-                        &self.device,
-                        &st.kernels,
-                        &mut kv_cache.k_cache,
-                        &pf.k,
-                        pos_start,
-                        batch,
-                        num_kv_heads,
-                        kv_cache.max_seq_len,
-                        head_dim,
-                    )?;
-                    super::prefill::launch_kv_cache_write_batch(
-                        &self.device,
-                        &st.kernels,
-                        &mut kv_cache.v_cache,
-                        &pf.v,
-                        pos_start,
-                        batch,
-                        num_kv_heads,
-                        kv_cache.max_seq_len,
-                        head_dim,
-                    )?;
-                }
+                write_kv_batch(
+                    &self.device,
+                    &st.kernels,
+                    kv_cache,
+                    st.kv_f16_overflow.as_mut(),
+                    &pf.k,
+                    &pf.v,
+                    pos_start,
+                    batch,
+                    num_kv_heads,
+                    head_dim,
+                )?;
                 kv_cache.advance_seq_len_by(batch);
+
+                // The readers take F32: the store itself, or the half store widened.
+
+                let kv_view = kv_view_for_prefill(
+                    &self.device,
+                    &st.kernels,
+                    kv_cache,
+                    &mut st.kv_widen,
+                    pos_start + batch,
+                )?;
 
                 // 2e. Flash Attention
                 unsafe {
@@ -8528,7 +8760,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &pf.q,
-                            kv_cache,
+                            &kv_view,
                             &mut pf.attn_out,
                             &mut pf.attn_scores,
                             batch,
@@ -8542,7 +8774,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &pf.q,
-                            kv_cache,
+                            &kv_view,
                             &mut pf.attn_out,
                             batch,
                             num_heads,
@@ -8859,34 +9091,33 @@ impl CudaBackend {
                 &self.device,
                 &mut st.kv_caches,
                 &st.kv_module,
+                st.kv_precision,
                 (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                 layer_idx,
             )?;
-            unsafe {
-                super::prefill::launch_kv_cache_write_batch(
-                    &self.device,
-                    &st.kernels,
-                    &mut kv_cache.k_cache,
-                    &pf.k,
-                    pos_start,
-                    batch,
-                    num_kv_heads,
-                    kv_cache.max_seq_len,
-                    head_dim,
-                )?;
-                super::prefill::launch_kv_cache_write_batch(
-                    &self.device,
-                    &st.kernels,
-                    &mut kv_cache.v_cache,
-                    &pf.v,
-                    pos_start,
-                    batch,
-                    num_kv_heads,
-                    kv_cache.max_seq_len,
-                    head_dim,
-                )?;
-            }
+            write_kv_batch(
+                &self.device,
+                &st.kernels,
+                kv_cache,
+                st.kv_f16_overflow.as_mut(),
+                &pf.k,
+                &pf.v,
+                pos_start,
+                batch,
+                num_kv_heads,
+                head_dim,
+            )?;
             kv_cache.advance_seq_len_by(batch);
+
+            // The readers take F32: the store itself, or the half store widened.
+
+            let kv_view = kv_view_for_prefill(
+                &self.device,
+                &st.kernels,
+                kv_cache,
+                &mut st.kv_widen,
+                pos_start + batch,
+            )?;
 
             // 2e. Flash Attention: single kernel for ALL tokens with causal masking.
             unsafe {
@@ -8894,7 +9125,7 @@ impl CudaBackend {
                     &self.device,
                     &st.kernels,
                     &pf.q,
-                    kv_cache,
+                    &kv_view,
                     &mut pf.attn_out,
                     batch,
                     num_heads,
@@ -11662,6 +11893,9 @@ impl CudaBackend {
             p.record_token();
         }
         kv.advance_seq_len()?;
+        if st.decode_token_count % 64 == 0 {
+            check_kv_f16_overflow(&self.device, st)?;
+        }
         st.decode_token_count += 1;
         Ok(Logits { data: logits_host })
     }
@@ -11736,6 +11970,9 @@ impl CudaBackend {
         let token_host = self.device.dtoh_copy(&st.argmax_result)?;
         let token = token_host.first().copied().unwrap_or(0);
         kv.advance_seq_len()?;
+        if st.decode_token_count % 64 == 0 {
+            check_kv_f16_overflow(&self.device, st)?;
+        }
         st.decode_token_count += 1;
         Ok(token)
     }
@@ -17682,7 +17919,7 @@ impl ComputeBackend for CudaBackend {
             }
         }
         let kernel_compile_start = std::time::Instant::now();
-        let mut kernels = decode::compile_all_kernels(&self.device)?;
+        let mut kernels = decode::compile_all_kernels(&self.device, self.kv_precision)?;
         {
             let (hits, misses) = super::ptx_cache::stats();
             let elapsed = kernel_compile_start.elapsed();
@@ -18049,14 +18286,17 @@ impl ComputeBackend for CudaBackend {
         // The KV caches are allocated in `preload_weights()`, once the layer
         // types are known: only the full-attention layers get one. `init()`
         // compiles the write kernel they share and records the capacity.
-        let kv_module = self
-            .device
-            .compile_and_load(super::shaders::KV_CACHE_KERNEL_SOURCE)?;
+        let kv_module = super::kv_cache::compile_kv_module(&self.device, self.kv_precision)?;
         let kv_caches: Vec<Option<KvCacheGpu>> = (0..num_layers).map(|_| None).collect();
         eprintln!(
             "[CUDA mem] KV caches: allocated at weight load for the attention layers only \
-             (max_seq_len={max_seq_len}, {} MB per layer)",
-            (2 * num_kv_heads * max_seq_len * head_dim * 4) / (1024 * 1024)
+             (max_seq_len={max_seq_len}, kv={}, {} MB per layer)",
+            match self.kv_precision {
+                KvPrecision::F16 => "f16",
+                _ => "f32",
+            },
+            (2 * num_kv_heads * max_seq_len * head_dim * self.kv_precision.bytes_per_element())
+                / (1024 * 1024)
         );
 
         // Pre-allocate logits buffer for the zero-sync decode path.
@@ -18344,6 +18584,13 @@ impl ComputeBackend for CudaBackend {
             kv_max_seq_len: max_seq_len,
             kv_num_kv_heads: num_kv_heads,
             kv_head_dim: head_dim,
+            kv_precision: self.kv_precision,
+            kv_f16_overflow: if self.kv_precision == KvPrecision::F16 {
+                Some(self.device.alloc_zeros::<u32>(1)?)
+            } else {
+                None
+            },
+            kv_widen: None,
             globals,
             layer_weights_cache: Vec::new(),
             logits_gpu,
@@ -18857,10 +19104,16 @@ impl ComputeBackend for CudaBackend {
                 &self.device,
                 &mut st.kv_caches,
                 &st.kv_module,
+                st.kv_precision,
                 (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                 layer_idx,
             )?;
-            kv_cache.append_kv(&self.device, &st.scratch.k, &st.scratch.v)?;
+            kv_cache.append_kv(
+                &self.device,
+                &st.scratch.k,
+                &st.scratch.v,
+                st.kv_f16_overflow.as_mut(),
+            )?;
         }
 
         // 6. Attention: decode-attention (q, k_cache, v_cache -> attn_out).
@@ -18886,8 +19139,7 @@ impl ComputeBackend for CudaBackend {
                     &self.device,
                     &st.kernels,
                     &st.scratch.q,
-                    &kv_cache.k_cache,
-                    &kv_cache.v_cache,
+                    kv_cache.as_ref(),
                     st.scratch.attn_splitk.as_mut(),
                     &mut st.scratch.attn_out,
                     nh,
@@ -19663,11 +19915,12 @@ impl ComputeBackend for CudaBackend {
     /// The F16 KV path on CUDA (option a) is a larger work item planned for
     /// a future release.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        if precision != KvPrecision::F32 {
+        if precision != self.kv_precision {
             return Err(RuntimeError::Unsupported(format!(
-                "CUDA backend KV cache is currently F32-only (requested {precision:?}); \
-                 set --kv-precision f32 explicitly or omit the flag. F16 KV on CUDA \
-                 requires the F16 dispatch path planned for a future release.",
+                "CUDA backend was built for a {:?} KV cache (requested {precision:?}); \
+                 the backend's --kv-precision / LUMEN_KV_PRECISION and the session's \
+                 must agree (f32 or f16)",
+                self.kv_precision
             )));
         }
         Ok(())
@@ -19685,6 +19938,9 @@ impl ComputeBackend for CudaBackend {
                     kv_cache.reset();
                 }
                 st.decode_token_count = 0;
+                if let Some(counter) = st.kv_f16_overflow.as_mut() {
+                    let _ = self.device.stream.memset_zeros(counter);
+                }
 
                 // Reset GDN h_states and conv_states (zeroing GPU buffers).
                 if let Some(ref mut gdn) = st.gdn_scratch_gpu {
@@ -20158,12 +20414,13 @@ impl ComputeBackend for CudaBackend {
                     st.kv_caches[layer_idx] = None;
                     continue;
                 }
-                st.kv_caches[layer_idx] = Some(KvCacheGpu::with_module(
+                st.kv_caches[layer_idx] = Some(KvCacheGpu::with_module_at(
                     &self.device,
                     hp_copy.num_kv_heads as usize,
                     st.kv_max_seq_len,
                     hp_copy.head_dim as usize,
                     &st.kv_module,
+                    st.kv_precision,
                 )?);
                 allocated += 1;
             }
@@ -20198,12 +20455,7 @@ impl ComputeBackend for CudaBackend {
             .iter()
             .filter(|layer| layer.layer_type != super::gpu_buffers::LAYER_TYPE_GDN)
             .count();
-        let kv_bytes: u64 = st
-            .kv_caches
-            .iter()
-            .flatten()
-            .map(|kv| (kv.k_cache.len() + kv.v_cache.len()) as u64 * 4)
-            .sum();
+        let kv_bytes: u64 = st.kv_caches.iter().flatten().map(|kv| kv.bytes()).sum();
         let max_seq_len = st
             .kv_caches
             .iter()

@@ -33,7 +33,7 @@ use super::decode::{
 };
 use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
-use super::kv_cache::KvCacheGpu;
+use super::kv_cache::{KvRef, KvView};
 use super::types::LaunchConfig;
 
 /// Pre-allocated GPU scratch buffers for the batched prefill path.
@@ -1830,7 +1830,7 @@ pub(crate) unsafe fn launch_attention_for_token(
     attn_out_batch: &mut CudaSlice<f32>,
     q_single: &mut CudaSlice<f32>,
     attn_out_single: &mut CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
+    kv: &KvView<'_>,
     token_idx: usize,
     q_dim: usize,
     num_heads: usize,
@@ -1850,15 +1850,14 @@ pub(crate) unsafe fn launch_attention_for_token(
     let nkvh = num_kv_heads as u32;
     let hd = head_dim as u32;
     let sl = seq_len as u32;
-    let msl = kv_cache.max_seq_len as u32;
+    let msl = kv.seq_stride as u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     launch_attention_decode_gated(
         device,
         kernels,
         q_single as &CudaSlice<f32>,
-        &kv_cache.k_cache,
-        &kv_cache.v_cache,
+        KvRef::F32 { k: kv.k, v: kv.v },
         None,
         &mut *attn_out_single,
         nh,
@@ -2574,8 +2573,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     device: &CudaDevice,
     kernels: &KernelSet,
     q: &CudaSlice<f32>,
-    k_cache: &CudaSlice<f32>,
-    v_cache: &CudaSlice<f32>,
+    kv: KvRef<'_>,
     splitk_scratch: Option<&mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
     attn_out: &mut CudaSlice<f32>,
     num_heads: u32,
@@ -2585,29 +2583,48 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<AttentionDecodeVariant, RuntimeError> {
-    let variant = launch_attention_decode_routed(
-        device,
-        kernels,
-        q,
-        k_cache,
-        v_cache,
-        splitk_scratch,
-        attn_out,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        seq_len,
-        max_seq_len,
-        scale,
-    )?;
+    // The store's type picks the router: each router's kernels take exactly
+    // the bytes that store holds, so a half store can never reach an F32
+    // kernel, nor the reverse.
+    let variant = match kv {
+        KvRef::F32 { k, v } => launch_attention_decode_routed(
+            device,
+            kernels,
+            q,
+            k,
+            v,
+            splitk_scratch,
+            attn_out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            max_seq_len,
+            scale,
+        )?,
+        KvRef::F16 { k, v } => launch_attention_decode_routed_f16(
+            device,
+            kernels,
+            q,
+            k,
+            v,
+            splitk_scratch,
+            attn_out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            max_seq_len,
+            scale,
+        )?,
+    };
     if let Some((dir, lengths)) = attention_dump_config() {
         if lengths.contains(&seq_len) {
             dump_attention_call(
                 device,
                 dir,
                 q,
-                k_cache,
-                v_cache,
+                kv,
                 attn_out,
                 num_heads,
                 num_kv_heads,
@@ -2663,8 +2680,7 @@ fn dump_attention_call(
     device: &CudaDevice,
     dir: &std::path::Path,
     q: &CudaSlice<f32>,
-    k_cache: &CudaSlice<f32>,
-    v_cache: &CudaSlice<f32>,
+    kv: KvRef<'_>,
     attn_out: &CudaSlice<f32>,
     num_heads: u32,
     num_kv_heads: u32,
@@ -2696,15 +2712,39 @@ fn dump_attention_call(
     };
     let q_host: Vec<f32> = device.dtoh_copy_view(&q.slice(0..nh * hd))?;
     write_f32("q.f32", &q_host)?;
-    for (name, cache) in [("k.f32", k_cache), ("v.f32", v_cache)] {
-        let mut host = Vec::with_capacity(nkv * sl * hd);
-        for kv in 0..nkv {
-            let base = kv * msl * hd;
-            let region: Vec<f32> = device.dtoh_copy_view(&cache.slice(base..base + sl * hd))?;
-            host.extend_from_slice(&region);
+    // The cache region as stored: F32 words, or the half bit patterns the
+    // kernel read (`.k.f16` / `.v.f16`, 16-bit little-endian). A replay of a
+    // half dump must widen exactly; the storage rounding already happened.
+    let kv_dtype = match kv {
+        KvRef::F32 { k, v } => {
+            for (name, cache) in [("k.f32", k), ("v.f32", v)] {
+                let mut host = Vec::with_capacity(nkv * sl * hd);
+                for kv_h in 0..nkv {
+                    let base = kv_h * msl * hd;
+                    let region: Vec<f32> =
+                        device.dtoh_copy_view(&cache.slice(base..base + sl * hd))?;
+                    host.extend_from_slice(&region);
+                }
+                write_f32(name, &host)?;
+            }
+            "f32"
         }
-        write_f32(name, &host)?;
-    }
+        KvRef::F16 { k, v } => {
+            for (name, cache) in [("k.f16", k), ("v.f16", v)] {
+                let mut bytes = Vec::with_capacity(nkv * sl * hd * 2);
+                for kv_h in 0..nkv {
+                    let base = kv_h * msl * hd;
+                    let region: Vec<u16> =
+                        device.dtoh_copy_view(&cache.slice(base..base + sl * hd))?;
+                    for x in &region {
+                        bytes.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                std::fs::write(stem.with_extension(name), bytes).map_err(io)?;
+            }
+            "f16"
+        }
+    };
     let out_host: Vec<f32> = device.dtoh_copy_view(&attn_out.slice(0..nh * hd))?;
     write_f32("out.f32", &out_host)?;
     let route = match variant {
@@ -2712,10 +2752,12 @@ fn dump_attention_call(
         AttentionDecodeVariant::Tiled => "attention_decode_tiled",
         AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
         AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_f32",
+        AttentionDecodeVariant::TiledF16 => "attention_decode_tiled_f16",
+        AttentionDecodeVariant::SplitKGqa6F16 => "attention_decode_splitk_partial_gqa6_f16",
     };
     let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
-        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
+        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"kv_dtype\": \"{kv_dtype}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
     );
     std::fs::write(stem.with_extension("json"), meta).map_err(io)
 }
@@ -2860,6 +2902,8 @@ unsafe fn launch_attention_decode_routed(
         // Both split-K variants return early from the upgrade block above;
         // the selector never produces them here.
         AttentionDecodeVariant::SplitK | AttentionDecodeVariant::SplitKGqa6 => unreachable!(),
+        // The half routes belong to the half router; this one takes F32 bytes.
+        AttentionDecodeVariant::TiledF16 | AttentionDecodeVariant::SplitKGqa6F16 => unreachable!(),
         AttentionDecodeVariant::SingleBlock => {
             // Single-block fast path (existing kernel, byte-identical to the
             // the prior dispatch when force_tiled = false and
@@ -3430,7 +3474,7 @@ pub(crate) unsafe fn launch_flash_attention_v2(
     device: &CudaDevice,
     kernels: &KernelSet,
     q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
+    kv: &KvView<'_>,
     attn_out: &mut CudaSlice<f32>,
     batch: usize,
     num_heads: usize,
@@ -3472,15 +3516,15 @@ pub(crate) unsafe fn launch_flash_attention_v2(
     let nkvh = num_kv_heads as u32;
     let hd = head_dim as u32;
     let ps = pos_start as u32;
-    let msl = kv_cache.max_seq_len as u32;
+    let msl = kv.seq_stride as u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     device
         .stream
         .launch_builder(&kernels.flash_attention_v2)
         .arg(q_batch)
-        .arg(&kv_cache.k_cache)
-        .arg(&kv_cache.v_cache)
+        .arg(kv.k)
+        .arg(kv.v)
         .arg(attn_out)
         .arg(&batch_u32)
         .arg(&nh)
@@ -3579,7 +3623,7 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
     device: &CudaDevice,
     kernels: &KernelSet,
     q: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
+    kv: &KvView<'_>,
     attn_out: &mut CudaSlice<f32>,
     scores: &mut Option<CudaSlice<f32>>,
     batch: usize,
@@ -3618,7 +3662,7 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
     }
     let group = num_heads / num_kv_heads;
     let q_dim = num_heads * head_dim;
-    let max_seq = kv_cache.max_seq_len;
+    let max_seq = kv.seq_stride;
     let kv_total = pos_start + batch;
     if kv_total > max_seq {
         return Err(RuntimeError::Compute(format!(
@@ -3658,8 +3702,8 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
         let s_ld = kv_len;
         for kv_h in 0..num_kv_heads {
             let h0 = kv_h * group;
-            let k_view = kv_cache.k_cache.slice(kv_h * max_seq * head_dim..);
-            let v_view = kv_cache.v_cache.slice(kv_h * max_seq * head_dim..);
+            let k_view = kv.k.slice(kv_h * max_seq * head_dim..);
+            let v_view = kv.v.slice(kv_h * max_seq * head_dim..);
             let q_view = q.slice(qb * q_dim + h0 * head_dim..);
             // S[g][i][j] = sum_d Q[i][h0+g][d] * K[j][d]: in cuBLAS's column-major
             // terms C(kv_len x rows) = K(head_dim x kv_len)^T * Q(head_dim x rows).
@@ -3758,7 +3802,7 @@ pub(crate) unsafe fn launch_flash_attention_br4(
     device: &CudaDevice,
     kernels: &KernelSet,
     q_batch: &CudaSlice<f32>,
-    kv_cache: &KvCacheGpu,
+    kv: &KvView<'_>,
     attn_out: &mut CudaSlice<f32>,
     batch: usize,
     num_heads: usize,
@@ -3801,15 +3845,15 @@ pub(crate) unsafe fn launch_flash_attention_br4(
     let nkvh = num_kv_heads as u32;
     let hd = head_dim as u32;
     let ps = pos_start as u32;
-    let msl = kv_cache.max_seq_len as u32;
+    let msl = kv.seq_stride as u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     device
         .stream
         .launch_builder(&kernels.flash_attention_br4)
         .arg(q_batch)
-        .arg(&kv_cache.k_cache)
-        .arg(&kv_cache.v_cache)
+        .arg(kv.k)
+        .arg(kv.v)
         .arg(attn_out)
         .arg(&batch_u32)
         .arg(&nh)
@@ -4738,4 +4782,334 @@ mod attn_splitk_gqa6_tests {
             ATTN_SPLITK_GQA6_HEAD_DIM
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The half store's readers and writers. Every function here takes `u16`
+// buffers and the kernels in `KernelSet::kv_f16`, which exist only when the
+// backend was built for a half store; nothing here can be reached with F32
+// bytes.
+// ---------------------------------------------------------------------------
+
+/// Dynamic shared bytes of `attention_decode_splitk_partial_gqa6_f16`: the Q
+/// block as F32, the V tile as halves, the score block and the (m, l) slots.
+pub const fn attn_splitk_gqa6_partial_shared_bytes_f16() -> u32 {
+    (ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_HEAD_DIM
+        + ATTN_SPLITK_GQA6_CHUNK * ATTN_SPLITK_GQA6_HEAD_DIM / 2
+        + ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_CHUNK
+        + 2 * ATTN_SPLITK_GQA6_GQA_RATIO)
+        * 4
+}
+const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes_f16() == 14_768);
+
+/// Route a decode step over a half store. Two readers: the GQA-shared pair
+/// for the geometry and context it serves (the same admission as the F32
+/// pair), the tiled kernel for everything else. The single-block and per-head
+/// split-K routes have no half twin, so the tiled threshold and force knobs
+/// do not apply here; a context past the pair's bound hands off to the tiled
+/// kernel exactly as the F32 router does.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_routed_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<u16>,
+    v_cache: &CudaSlice<u16>,
+    splitk_scratch: Option<&mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<AttentionDecodeVariant, RuntimeError> {
+    let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
+        RuntimeError::Compute("16-bit KV cache dispatched without its kernels".into())
+    })?;
+    if let Some(scratch) = splitk_scratch {
+        if kernels.attention_decode_splitk_merge_gqa6.is_some()
+            && attn_splitk_chunks(seq_len) > 1
+            && attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len)
+            && scratch.2.len()
+                >= (num_heads as usize)
+                    * (attn_splitk_gqa6_chunks(seq_len) as usize)
+                    * (head_dim as usize)
+        {
+            announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len);
+            launch_attention_decode_splitk_gqa6_f16(
+                device,
+                kernels,
+                f16,
+                q,
+                k_cache,
+                v_cache,
+                scratch,
+                attn_out,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+                max_seq_len,
+                scale,
+            )?;
+            return Ok(AttentionDecodeVariant::SplitKGqa6F16);
+        }
+    }
+    announce_tiled_route_f16(head_dim, seq_len);
+    launch_attention_decode_tiled_f16(
+        device,
+        f16,
+        q,
+        k_cache,
+        v_cache,
+        attn_out,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        max_seq_len,
+        scale,
+    )?;
+    Ok(AttentionDecodeVariant::TiledF16)
+}
+
+/// The GQA-shared pair on a half store: the half partial, the shipped F32
+/// merge, the same split count and scratch as the F32 pair.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_splitk_gqa6_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    f16: &super::decode::KvF16Kernels,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<u16>,
+    v_cache: &CudaSlice<u16>,
+    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<(), RuntimeError> {
+    let merge_fn = kernels
+        .attention_decode_splitk_merge_gqa6
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("attention_decode_splitk_gqa6_f16: merge not available".into())
+        })?;
+    let s: u32 = attn_splitk_gqa6_chunks(seq_len);
+    let chunk = ATTN_SPLITK_GQA6_CHUNK;
+    let (m_part, l_part, o_part) = scratch;
+    device
+        .stream
+        .launch_builder(&f16.splitk_partial_gqa6)
+        .arg(q)
+        .arg(k_cache)
+        .arg(v_cache)
+        .arg(&mut *m_part)
+        .arg(&mut *l_part)
+        .arg(&mut *o_part)
+        .arg(&seq_len)
+        .arg(&max_seq_len)
+        .arg(&scale)
+        .arg(&s)
+        .arg(&chunk)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (s, num_kv_heads, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes_f16(),
+        })
+        .map_err(|e| {
+            RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f16: {e}"))
+        })?;
+    device
+        .stream
+        .launch_builder(merge_fn)
+        .arg(&*m_part)
+        .arg(&*l_part)
+        .arg(&*o_part)
+        .arg(attn_out)
+        .arg(&s)
+        .launch(CudarcLaunchConfig {
+            grid_dim: (num_heads, ATTN_SPLITK_GQA6_DIM_TILES, 1),
+            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(s),
+        })
+        .map_err(|e| {
+            RuntimeError::Compute(format!("attention_decode_splitk_merge_gqa6_f32: {e}"))
+        })?;
+    Ok(())
+}
+
+/// The tiled kernel on a half store: the F32 launcher's geometry and shared
+/// bytes (the V tile is not staged, so nothing shrinks).
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_attention_decode_tiled_f16(
+    device: &CudaDevice,
+    f16: &super::decode::KvF16Kernels,
+    q: &CudaSlice<f32>,
+    k_cache: &CudaSlice<u16>,
+    v_cache: &CudaSlice<u16>,
+    attn_out: &mut CudaSlice<f32>,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_seq_len: u32,
+    scale: f32,
+) -> Result<(), RuntimeError> {
+    if head_dim % ATTN_DECODE_TILED_BLOCK_DIM != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "attention_decode_tiled_f16: head_dim ({head_dim}) must be divisible by \
+             BLOCK_DIM ({ATTN_DECODE_TILED_BLOCK_DIM})"
+        )));
+    }
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (num_heads, 1, 1),
+        block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: attention_decode_tiled_shared_bytes(head_dim),
+    };
+    device
+        .stream
+        .launch_builder(&f16.tiled)
+        .arg(q)
+        .arg(k_cache)
+        .arg(v_cache)
+        .arg(attn_out)
+        .arg(&num_heads)
+        .arg(&num_kv_heads)
+        .arg(&head_dim)
+        .arg(&seq_len)
+        .arg(&max_seq_len)
+        .arg(&scale)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("attention_decode_tiled_f16 launch: {e}")))?;
+    Ok(())
+}
+
+fn announce_splitk_gqa6_route_f16(num_heads: u32, num_kv_heads: u32, head_dim: u32, seq_len: u32) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        let chunks = attn_splitk_gqa6_chunks(seq_len);
+        format!(
+            "[CUDA] attention_decode_splitk_partial_gqa6_f16: ACTIVE (kv=f16, \
+             q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
+             seq_len={seq_len}, chunks={chunks}, chunk={chunk}, block={block}, \
+             merge=attention_decode_splitk_merge_gqa6_f32)",
+            chunk = ATTN_SPLITK_GQA6_CHUNK,
+            block = ATTN_DECODE_TILED_BLOCK_DIM,
+        )
+    });
+}
+
+fn announce_tiled_route_f16(head_dim: u32, seq_len: u32) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        format!(
+            "[CUDA] attention_decode_tiled_f16: ACTIVE (kv=f16, head_dim={head_dim}, \
+             seq_len={seq_len}, block={block}, tile={tile})",
+            block = ATTN_DECODE_TILED_BLOCK_DIM,
+            tile = ATTN_DECODE_TILED_BLOCK_DIM,
+        )
+    });
+}
+
+/// `kv_cache_write_batch_f16`: `batch` tokens of F32 K or V into a half
+/// store, rounding on the way in and counting what does not fit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn launch_kv_cache_write_batch_f16(
+    device: &CudaDevice,
+    f16: &super::decode::KvF16Kernels,
+    cache: &mut CudaSlice<u16>,
+    data: &CudaSlice<f32>,
+    overflow: &mut CudaSlice<u32>,
+    pos_start: usize,
+    batch: usize,
+    num_kv_heads: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+) -> Result<(), RuntimeError> {
+    let kv_dim = num_kv_heads * head_dim;
+    let total = batch * kv_dim;
+    let config = LaunchConfig::for_elements(total);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let pos_start_u32 = pos_start as u32;
+    let batch_u32 = batch as u32;
+    let nkvh = num_kv_heads as u32;
+    let msl = max_seq_len as u32;
+    let hd = head_dim as u32;
+    device
+        .stream
+        .launch_builder(&f16.write_batch)
+        .arg(cache)
+        .arg(data)
+        .arg(overflow)
+        .arg(&pos_start_u32)
+        .arg(&batch_u32)
+        .arg(&nkvh)
+        .arg(&msl)
+        .arg(&hd)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("kv_cache_write_batch_f16 launch: {e}")))?;
+    Ok(())
+}
+
+/// `kv_cache_widen_f16` for K and V: positions `0..count` of every head,
+/// widened into `[num_kv_heads, count, head_dim]` F32 buffers — the F32 cache
+/// layout with a position stride of `count`, which is what the returned view
+/// says.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn launch_kv_widen_f16<'a>(
+    device: &CudaDevice,
+    f16: &super::decode::KvF16Kernels,
+    k_cache: &CudaSlice<u16>,
+    v_cache: &CudaSlice<u16>,
+    out: &'a mut (CudaSlice<f32>, CudaSlice<f32>),
+    num_kv_heads: usize,
+    count: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+) -> Result<KvView<'a>, RuntimeError> {
+    let total = num_kv_heads * count * head_dim;
+    if out.0.len() < total || out.1.len() < total {
+        return Err(RuntimeError::Compute(format!(
+            "kv widen: {total} floats needed, buffers hold {} and {}",
+            out.0.len(),
+            out.1.len()
+        )));
+    }
+    let config = LaunchConfig::for_elements(total);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nkvh = num_kv_heads as u32;
+    let cnt = count as u32;
+    let msl = max_seq_len as u32;
+    let hd = head_dim as u32;
+    for (cache, dst, which) in [(k_cache, &mut out.0, "K"), (v_cache, &mut out.1, "V")] {
+        device
+            .stream
+            .launch_builder(&f16.widen)
+            .arg(cache)
+            .arg(dst)
+            .arg(&nkvh)
+            .arg(&cnt)
+            .arg(&msl)
+            .arg(&hd)
+            .launch(launch_cfg)
+            .map_err(|e| {
+                RuntimeError::Compute(format!("kv_cache_widen_f16 {which} launch: {e}"))
+            })?;
+    }
+    Ok(KvView {
+        k: &out.0,
+        v: &out.1,
+        seq_stride: count,
+    })
 }

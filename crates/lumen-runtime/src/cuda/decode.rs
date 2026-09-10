@@ -910,9 +910,33 @@ pub(crate) struct KernelSet {
     pub(crate) fused_glu_gemv_q4_0_prenormed_no_norm: Option<CudaFunction>,
     pub(crate) moe_shared_down_q4_0_sigmoid_accum: Option<CudaFunction>,
     pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
+
+    /// The 16-bit KV cache's kernels: present only when the backend was built
+    /// for `KvPrecision::F16`, and then every one of them loaded (`?`, never
+    /// `.ok()`), so a half-typed store always has a half-typed reader and
+    /// writer. `None` means the store is F32 and nothing here can be reached.
+    pub(crate) kv_f16: Option<KvF16Kernels>,
 }
 
-pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
+/// The kernels a half-typed KV store is read and written with. Loaded as a
+/// group or not at all.
+pub(crate) struct KvF16Kernels {
+    /// `attention_decode_splitk_partial_gqa6_f16`; the F32 merge consumes its partials.
+    pub(crate) splitk_partial_gqa6: CudaFunction,
+    /// `attention_decode_tiled_f16`, the reader for every context the pair does not serve.
+    pub(crate) tiled: CudaFunction,
+    /// `kv_cache_write_batch_f16` (prefill).
+    pub(crate) write_batch: CudaFunction,
+    /// `kv_cache_widen_f16`: the prefill readers work on a widened F32 copy.
+    pub(crate) widen: CudaFunction,
+    /// `attn_prep_fused_kvf16`, the fused decode writer.
+    pub(crate) prep_fused: CudaFunction,
+}
+
+pub(crate) fn compile_all_kernels(
+    device: &CudaDevice,
+    kv_precision: crate::kv::KvPrecision,
+) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
         module
@@ -1037,7 +1061,36 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         }
     };
 
+    // The half store's kernels load as a group, each with `?`: a store that
+    // cannot be read or written by every path that touches it is refused at
+    // init, never discovered at a dispatch.
+    let kv_f16 = match kv_precision {
+        crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
+            splitk_partial_gqa6: load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_gqa6_f16",
+            )?,
+            tiled: load_tiled(
+                shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
+                "attention_decode_tiled_f16",
+            )?,
+            write_batch: load_fn(
+                shaders::KV_CACHE_F16_KERNEL_SOURCE,
+                "kv_cache_write_batch_f16",
+            )?,
+            widen: load_fn(shaders::KV_CACHE_F16_KERNEL_SOURCE, "kv_cache_widen_f16")?,
+            prep_fused: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "attn_prep_fused_kvf16")?,
+        }),
+        crate::kv::KvPrecision::F32 => None,
+        other => {
+            return Err(RuntimeError::Unsupported(format!(
+                "CUDA KV cache precision {other:?} is not implemented"
+            )))
+        }
+    };
+
     let kernels = KernelSet {
+        kv_f16,
         attention_decode_tiled_codegen: tiled_codegen.get(),
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
@@ -3968,6 +4021,10 @@ pub(crate) enum AttentionDecodeVariant {
     /// place of [`Self::SplitK`] when that route is selected, the pair loaded,
     /// and the shape is one it serves.
     SplitKGqa6,
+    /// `attention_decode_tiled_f16`: the tiled kernel reading a half store.
+    TiledF16,
+    /// `attention_decode_splitk_partial_gqa6_f16` + the F32 merge, on a half store.
+    SplitKGqa6F16,
 }
 
 /// Pure gate predicate. Unit-testable; mirrors the established pattern of

@@ -59,6 +59,8 @@ struct Args {
     context_len: usize,
     backend: BackendChoice,
     backend_device: usize,
+    /// `--kv-precision`; `None` resolves from `LUMEN_KV_PRECISION`, then the backend default.
+    kv_precision: Option<KvPrecision>,
     inbox_size: usize,
     log_level: String,
     /// Force the heavyweight `SyncWeightProvider` (pread-into-Vec, full CPU
@@ -80,6 +82,7 @@ impl Default for Args {
             context_len: 8192,
             backend: BackendChoice::Auto,
             backend_device: 0,
+            kv_precision: None,
             inbox_size: 16,
             log_level: "info".to_string(),
             sync_provider: false,
@@ -117,6 +120,9 @@ OPTIONS:
     --backend <B>          cuda | metal | cpu
                            Default: auto (Metal on macOS, CUDA if available, else CPU)
     --backend-device <N>   GPU device ordinal (CUDA only). Default: 0
+    --kv-precision <P>     KV cache storage: f16 | f32. Default: LUMEN_KV_PRECISION,
+                           else Metal f16, CUDA f32, CPU f32. On CUDA, f16 halves
+                           the cache's bytes and its attention reads.
     --inbox-size <N>       Engine inbox capacity (in-flight job queue depth).
                            Default: 16
     --log-level <LEVEL>    error | warn | info | debug. Default: info
@@ -229,6 +235,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--log-level" => {
                 i += 1;
                 args.log_level = raw.get(i).ok_or("--log-level requires a value")?.clone();
+            }
+            "--kv-precision" => {
+                i += 1;
+                let v = raw.get(i).ok_or("--kv-precision requires a value")?;
+                args.kv_precision = Some(parse_kv_precision(v)?);
             }
             "--sync" => {
                 args.sync_provider = true;
@@ -809,8 +820,12 @@ async fn run(args: Args) -> Result<(), String> {
                 metal
                     .preload_weights(provider.as_dyn())
                     .map_err(|e| format!("Metal preload_weights: {e}"))?;
-                // KvPrecision::F16 — Metal requires F16.
-                (Box::new(metal), KvPrecision::F16)
+                // Metal holds F16 only; a requested F32 is refused by
+                // validate_kv_precision at the engine.
+                (
+                    Box::new(metal),
+                    resolve_kv_precision(args.kv_precision, KvPrecision::F16),
+                )
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -826,6 +841,11 @@ async fn run(args: Args) -> Result<(), String> {
                         args.backend_device
                     )
                 })?;
+                // The store is chosen before init(): the backend compiles the
+                // store's kernels as a group and allocates every cache in it.
+                let kv_precision = resolve_kv_precision(args.kv_precision, KvPrecision::F32);
+                cuda.set_kv_precision(kv_precision)
+                    .map_err(|e| format!("CUDA KV precision: {e}"))?;
                 // CUDA: keep the F32 dequant (skip=false) until the skip is
                 // validated on real CUDA hardware; the CPU embed fallback is
                 // statically unreachable after init(), so this holds unread
@@ -842,8 +862,7 @@ async fn run(args: Args) -> Result<(), String> {
                     .map_err(|e| format!("CUDA init: {e}"))?;
                 cuda.preload_weights(provider.as_dyn())
                     .map_err(|e| format!("CUDA preload_weights: {e}"))?;
-                // KvPrecision::F32 — CUDA requires F32 per validate_kv_precision.
-                (Box::new(cuda), KvPrecision::F32)
+                (Box::new(cuda), kv_precision)
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -929,6 +948,30 @@ async fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("axum serve: {e}"))?;
     eprintln!("[lumen-server] stopped");
     Ok(())
+}
+
+/// `--kv-precision` values: `f16` / `f32` (case-insensitive).
+fn parse_kv_precision(value: &str) -> Result<KvPrecision, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "f16" | "fp16" | "half" => Ok(KvPrecision::F16),
+        "f32" | "fp32" | "float" => Ok(KvPrecision::F32),
+        other => Err(format!("--kv-precision must be f16 or f32 (got '{other}')")),
+    }
+}
+
+/// The KV cache storage: the flag, else `LUMEN_KV_PRECISION`, else the
+/// backend's default. A malformed variable is said once and ignored.
+fn resolve_kv_precision(flag: Option<KvPrecision>, default: KvPrecision) -> KvPrecision {
+    if let Some(p) = flag {
+        return p;
+    }
+    if let Ok(raw) = std::env::var("LUMEN_KV_PRECISION") {
+        match parse_kv_precision(&raw) {
+            Ok(p) => return p,
+            Err(e) => eprintln!("[lumen-server] LUMEN_KV_PRECISION ignored: {e}"),
+        }
+    }
+    default
 }
 
 fn main() -> ExitCode {

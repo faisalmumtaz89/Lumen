@@ -434,3 +434,237 @@ extern "C" __global__ void attention_decode_tiled(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 16-bit K/V twin. The same kernel with K and V read as IEEE half and widened
+// on load (exact, one PTX instruction); every operation after the load is the
+// F32 kernel's, in the F32 kernel's order, so on half-representable inputs the
+// two produce bit-identical output. Lives in this file so the two cannot drift
+// apart unnoticed.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float tiled_h2f(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+// `tiled_qk_dot` on a half K row: four halves (8 bytes) per step, accumulated
+// in the float4 order of the F32 helper.
+__device__ __forceinline__ float tiled_qk_dot_f16(
+    const float* __restrict__ q_row,
+    const unsigned short* __restrict__ k_vec,
+    unsigned int head_dim,
+    float scale)
+{
+    float dot = 0.0f;
+    if ((head_dim & 3u) == 0u) {
+        unsigned int hd4 = head_dim >> 2;
+        const float4* q4 = reinterpret_cast<const float4*>(q_row);
+        const uint2* k2 = reinterpret_cast<const uint2*>(k_vec);
+        for (unsigned int d4 = 0; d4 < hd4; d4++) {
+            float4 q = q4[d4];
+            uint2 r = k2[d4];
+            float4 k;
+            k.x = tiled_h2f((unsigned short)(r.x & 0xffffu));
+            k.y = tiled_h2f((unsigned short)(r.x >> 16));
+            k.z = tiled_h2f((unsigned short)(r.y & 0xffffu));
+            k.w = tiled_h2f((unsigned short)(r.y >> 16));
+            dot += q.x * k.x + q.y * k.y + q.z * k.z + q.w * k.w;
+        }
+    } else {
+        for (unsigned int d = 0; d < head_dim; d++) {
+            dot += q_row[d] * tiled_h2f(k_vec[d]);
+        }
+    }
+    return dot * scale;
+}
+
+extern "C" __global__ void attention_decode_tiled_f16(
+    const float* __restrict__ q,           // [num_heads * head_dim]
+    const unsigned short* __restrict__ k_cache,   // [num_kv_heads, max_seq_len, head_dim] half bits
+    const unsigned short* __restrict__ v_cache,   // [num_kv_heads, max_seq_len, head_dim] half bits
+    float* __restrict__ attn_out,          // [num_heads * head_dim]
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int seq_len,        // current sequence length (positions 0..seq_len-1)
+    unsigned int max_seq_len,    // allocated cache dimension
+    float scale                  // 1/sqrt(head_dim)
+)
+{
+    unsigned int head = blockIdx.x;
+    if (head >= num_heads) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int block_size = blockDim.x;   // = BLOCK_DIM at launch
+
+    // Degenerate seq_len = 0: no work to do; zero the output and exit. (Defensive
+    // -- production decode always has seq_len >= 1 because the KV cache is
+    // appended BEFORE the attention call. audit Subject (B) Pass 1
+    // covers the `seq_len = 0` gate case.)
+    if (seq_len == 0u) {
+        for (unsigned int d = tid; d < head_dim; d += block_size) {
+            attn_out[head * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+
+    // GQA mapping: multiple Q heads share the same KV head.
+    unsigned int gqa_ratio = num_heads / num_kv_heads;
+    unsigned int kv_h = head / gqa_ratio;
+
+    // Base pointers for this head.
+    const float* q_head = q + head * head_dim;
+    float* out_head = attn_out + head * head_dim;
+
+    // KV cache base for this KV head (head-first layout, u64 to avoid overflow
+    // at max_seq_len * head_dim products that exceed u32 in long-context).
+    unsigned long long kv_base = (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)head_dim;
+
+    // Shared memory layout (constant in seq_len):
+    //   [0..7]:           partial[8]   -- warp-reduction scratch
+    //   [8..8+head_dim):  q_row[head_dim]
+    //   [8+head_dim..]:   s_tile[T_C]
+    //
+    // Host must set shared_mem_bytes = (8 + head_dim + T_C) * sizeof(float).
+    extern __shared__ float smem[];
+    volatile float* partial = smem;
+    float* q_row = smem + 8;
+    float* s_tile = smem + 8 + head_dim;
+
+    // ---- Phase 0: cooperatively load Q row into shmem ----
+    for (unsigned int d = tid; d < head_dim; d += block_size) {
+        q_row[d] = q_head[d];
+    }
+    __syncthreads();
+
+    // Per-thread running softmax state.
+    float m_prev = NEG_INF;
+    float l_prev = 0.0f;
+
+    // Per-thread output accumulator: each lane owns `head_dim / block_size`
+    // output dimensions (lane `tid` owns d = tid, tid + block_size, ...).
+    //
+    // We cannot declare a runtime-sized register array, so we allow up to
+    // ATTN_DECODE_TILED_MAX_SLOTS = 8 slots per lane. At BLOCK_DIM=128 this
+    // covers head_dim up to 128 * 8 = 1024 (well past any plausible head_dim
+    // a transformer would use). Slot use is bounded by `num_slots` and reads
+    // past num_slots are skipped.
+    constexpr unsigned int MAX_SLOTS = 8u;
+    float o_acc[MAX_SLOTS];
+#pragma unroll
+    for (unsigned int s = 0; s < MAX_SLOTS; s++) {
+        o_acc[s] = 0.0f;
+    }
+    unsigned int num_slots = (head_dim + block_size - 1u) / block_size;
+    // (At head_dim=256, block_size=128 -> num_slots = 2.
+    //  At head_dim=128, block_size=128 -> num_slots = 1.
+    //  At head_dim=64,  block_size=128 -> num_slots = 1 (slot 0 used by lanes
+    //                                                     [0..head_dim), others
+    //                                                     contribute 0).)
+
+    // Number of tiles to walk. ceil(seq_len / T_C).
+    unsigned int num_tiles = (seq_len + T_C - 1u) / T_C;
+
+    // ----------------------------------------------------------------------
+    // Outer loop: stream over KV tiles
+    // ----------------------------------------------------------------------
+    for (unsigned int tile = 0; tile < num_tiles; tile++) {
+        unsigned int tile_start = tile * T_C;
+        unsigned int tile_end_raw = tile_start + T_C;
+        unsigned int tile_end = (tile_end_raw < seq_len) ? tile_end_raw : seq_len;
+        unsigned int tile_len = tile_end - tile_start;
+
+        // ---- Phase A: scores for this tile ----
+        // At BLOCK_DIM=128 and T_C=128, each lane handles exactly one position.
+        // If a future T_C != BLOCK_DIM is chosen, this stride covers both
+        // cases correctly.
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            if (j < tile_len) {
+                unsigned int pos = tile_start + j;
+                const unsigned short* k_vec = k_cache + kv_base + (unsigned long long)pos * (unsigned long long)head_dim;
+                s_tile[j] = tiled_qk_dot_f16(q_row, k_vec, head_dim, scale);
+            } else {
+                // Out-of-range positions in the partial last tile: sentinel
+                // -INF so they do not influence tile_max.
+                s_tile[j] = NEG_INF;
+            }
+        }
+        __syncthreads();
+
+        // ---- Phase B: tile max (block reduction) ----
+        float local_max = NEG_INF;
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            local_max = fmaxf(local_max, s_tile[j]);
+        }
+        float tile_max = tiled_block_reduce_max(local_max, partial, tid, block_size);
+
+        // Online softmax update (per-thread; identical across all lanes
+        // because tile_max is broadcast from the block reduction).
+        float m_new = fmaxf(m_prev, tile_max);
+        float rescale = expf(m_prev - m_new);
+
+        // ---- Phase C: exp(s - m_new) into s_tile + tile_sum reduction ----
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            if (j < tile_len) {
+                s_tile[j] = expf(s_tile[j] - m_new);
+            } else {
+                s_tile[j] = 0.0f;  // out-of-range: no contribution to tile_sum
+            }
+        }
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (unsigned int j = tid; j < T_C; j += block_size) {
+            local_sum += s_tile[j];
+        }
+        float tile_sum = tiled_block_reduce_sum(local_sum, partial, tid, block_size);
+
+        float l_new = rescale * l_prev + tile_sum;
+
+        // ---- Phase D: rescale O_prev and accumulate P @ V_tile ----
+        // Each lane owns dimensions d = tid + slot * block_size for slot in
+        // [0, num_slots). Float4 path is awkward here because the lane stride
+        // (block_size = 128) is not a multiple of 4 in a vec-friendly way; we
+        // use the scalar V path (matches the V-side of FA2 prefill at
+        // `flash_attention_fa2.cu:294-302`).
+#pragma unroll
+        for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+            if (slot >= num_slots) break;
+            unsigned int d = tid + slot * block_size;
+            if (d < head_dim) {
+                float pv = 0.0f;
+                for (unsigned int j = 0; j < tile_len; j++) {
+                    unsigned int pos = tile_start + j;
+                    float v_dj = tiled_h2f(v_cache[kv_base + (unsigned long long)pos * (unsigned long long)head_dim + (unsigned long long)d]);
+                    pv += s_tile[j] * v_dj;
+                }
+                o_acc[slot] = rescale * o_acc[slot] + pv;
+            }
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+
+        // s_tile will be overwritten by the next tile's Phase A; sync to
+        // ensure all lanes have finished reading s_tile in their Phase D
+        // inner loop before any lane starts writing again.
+        __syncthreads();
+    }
+
+    // ---- Final: normalise and write output ----
+    // Defensive guard: if l_prev == 0 (degenerate, e.g. all -inf scores in a
+    // seq_len = 0 path that the early-return above already handles), we write
+    // zeros to avoid producing NaN. In the normal path l_prev > 0 always.
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
+
+#pragma unroll
+    for (unsigned int slot = 0; slot < MAX_SLOTS; slot++) {
+        if (slot >= num_slots) break;
+        unsigned int d = tid + slot * block_size;
+        if (d < head_dim) {
+            out_head[d] = o_acc[slot] * inv_l;
+        }
+    }
+}
