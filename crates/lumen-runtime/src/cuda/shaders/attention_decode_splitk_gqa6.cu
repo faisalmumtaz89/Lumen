@@ -167,10 +167,12 @@ __device__ __forceinline__ float4 gqa6_h4_to_f4(unsigned int lo, unsigned int hi
 // numbers are the one-tile form's exactly.
 // Output: (m, l, o[256]) per head per CTA, the partial format the eight-lane
 // merge below consumes.
-// Occupancy: __launch_bounds__(128, 4) for the F32 loop (four CTAs per SM, what
-// its 22,960 B of shared allow), __launch_bounds__(128, 6) for the half loop
-// (14,768 B, six CTAs, as the previous half partial ran); ptxas: 116 / 80
-// registers, no stack frame, no spills (sm_120).
+// Occupancy: __launch_bounds__(128, 4) on both loops — four CTAs per SM, what
+// the F32 loop's 22,984 B of shared allow; ptxas (sm_120): 116 / 118 registers,
+// no stack frame, no spills. The half loop's shared (14,792 B) would allow six
+// CTAs, but bounding it to six (80 registers) or five (96) was measured slower
+// or no faster at every context (r5 step 3, rounds 7–8): the register cap
+// costs more instructions than the occupancy returns.
 // A runtime guard traps a CTA whose tile would exceed 16 keys (never with a
 // correct host); NaN partials would then reach the merge.
 // --------------------------------------------------------------------------
@@ -422,7 +424,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_par
     GQA6_LOOP_BODY(false, GQA6_KLOAD_F32)
 }
 
-extern "C" __global__ void __launch_bounds__(128, 6) attention_decode_splitk_partial_gqa6_f16(
+extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_f16(
     const float* __restrict__ q,
     const unsigned short* __restrict__ k_cache,
     const unsigned short* __restrict__ v_cache,
