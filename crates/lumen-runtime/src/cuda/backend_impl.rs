@@ -19931,14 +19931,11 @@ impl ComputeBackend for CudaBackend {
         }
     }
 
-    /// CUDA stores `KvCacheGpu.k_cache` / `v_cache` in F32 unconditionally;
-    /// no F16 KV dispatch is wired through the decode/prefill kernels in this
-    /// release. Reject the mismatch up front so the
-    /// user gets an explicit error instead of silent precision drift between
-    /// the CPU `KvCache` byte layout and the GPU side.
-    ///
-    /// The F16 KV path on CUDA (option a) is a larger work item planned for
-    /// a future release.
+    /// The CUDA backend allocates every KV cache in the store it was built for
+    /// (`set_kv_precision` before `init()`: F32 by default, F16 on request), and
+    /// the session's `kv_precision` must name that same store — the host cache's
+    /// byte layout follows the session's value, so a mismatch is refused here,
+    /// before any cache is allocated, instead of surfacing as precision drift.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
         if precision != self.kv_precision {
             return Err(RuntimeError::Unsupported(format!(

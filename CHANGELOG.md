@@ -15,7 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   to nearest even on the way in and count every value that does not fit,
   and the engine refuses the generation at the next readback rather than
   emitting an output computed over the poisoned slot; the decode
-  readers are half twins of the F32 kernels (the GQA-shared pair's partial
+  readers are half twins of the F32 kernels (the GQA-shared pair's partial,
+  the per-query-head pair's partial
   and the tiled kernel) that widen on load and keep the F32 arithmetic and
   order, so on half-representable inputs they reproduce the F32 kernels bit
   for bit; the prefill readers work on the cache widened to F32 into one
@@ -35,6 +36,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- The verbose metrics block prints the decode rate and the time per output
+  token with three decimals instead of one, so a paired measurement that reads
+  it is not quantised to 0.1 tok/s (at 80 tok/s that was a 0.125 % step, wider
+  than the intervals such a measurement reports).
 - **KV caches are allocated for the attention layers only.** The CUDA backend
   allocated a full F32 K and V cache for every layer, GDN layers included,
   which never read one; the caches are now allocated at weight load, once the

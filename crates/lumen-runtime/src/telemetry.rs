@@ -194,7 +194,7 @@ impl InferenceMetrics {
         format!(
             "Prompt: {} tok, Generated: {} tok\n\
              Prefill: {:.1} tok/s ({:.1}ms)\n\
-             Decode:  {:.1} tok/s, TPOT: {:.1}ms\n\
+             Decode:  {:.3} tok/s, TPOT: {:.3}ms\n\
              I/O:     read {:.2} GiB/s, avg request {:.0} KiB\n\
              Cache:   weight hit rate {:.1}%\n\
              KV:      {}/{} tok, {:.1}/{:.1} MiB (used/allocated)\n\

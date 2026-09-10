@@ -1363,7 +1363,7 @@ fn parse_kv_precision(value: &str) -> Result<KvPrecision, String> {
 ///
 /// Backend defaults match each backend's hardcoded storage:
 /// - Metal: F16 (gpu_k_cache/gpu_v_cache are F16 only)
-/// - CUDA: F32 (KvCacheGpu is F32 only)
+/// - CUDA: F32 (the half store is opt-in: `--kv-precision f16`)
 /// - CPU (naive/SIMD): F32 (default of RuntimeConfig)
 ///
 /// Returns `None` to mean "use the existing config default" so callers do not
