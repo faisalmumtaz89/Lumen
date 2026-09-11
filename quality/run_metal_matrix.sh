@@ -15,8 +15,8 @@ CELLS=(
   "9b-bf16-metal    qwen3-5-9b-BF16.lbc"
   "9b-q8-metal      qwen3-5-9b-Q8_0.lbc"
   "9b-q4-metal      qwen3-5-9b-Q4_0.lbc"
-  "27b-bf16-metal   qwen36-BF16.lbc"
-  "27b-q4-metal     qwen36-Q4_0.lbc"
+  "27b-q4-metal     qwen3-8-27b-Q4_0.lbc"
+  "27b-q8-metal     qwen3-8-27b-Q8_0.lbc"
   "moe-q8-metal     qwen3-5-moe-35b-a3b-Q8_0.lbc"
   "moe-q4-metal     qwen3-5-moe-35b-a3b-Q4_0.lbc"
 )

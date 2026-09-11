@@ -4,7 +4,7 @@
 // KV head) and head_dim HD: the host prepends `#define DECODE_G <g>u` and
 // `#define DECODE_HD <hd>u` to this source before NVRTC sees it (G in 1..=8,
 // HD in {128, 256}). Every shipped model has HD 256: Qwen3.5-9B G = 4
-// (16 Q / 4 KV), Qwen3.6-27B and Qwen3.8-27B G = 6 (24 / 4),
+// (16 Q / 4 KV), Qwen3.8-27B G = 6 (24 / 4),
 // Qwen3.5-MoE-35B-A3B G = 8 (16 / 2).
 //
 // Two passes over split-K partials: `attention_decode_partial_{f32,f16}`

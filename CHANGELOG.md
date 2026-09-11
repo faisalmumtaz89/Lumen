@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Removed
+
+- **Qwen3.6-27B is retired from the model registry.** Qwen3.8-27B is the
+  same architecture and shapes with retrained weights and supersedes it;
+  `qwen3.6-27b` / `qwen3-6-27b` no longer resolve (`lumen pull` and `lumen run`
+  report an unsupported model), the quickstart catalog, the macOS installer
+  menu and the docs list Qwen3.8-27B in its place. An `.lbc` converted from a
+  Qwen3.6-27B GGUF still loads by path. The historical A100/H100 rows for it
+  leave `docs/support.md`; `bench/RESULTS.md` keeps its 2026-07-16 record as
+  history.
+
 ### Added
 
 - **One decode-attention kernel for every model and every context.** The

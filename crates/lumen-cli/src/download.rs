@@ -7,7 +7,7 @@
 /// Split a registry-declared GGUF path into `(url_path, local_basename)`.
 ///
 /// Registry entries may nest shards under a repo subdirectory (e.g.
-/// `"Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf"`).
+/// `"BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf"`).
 /// The subdirectory is used only on the URL side; locally every shard is
 /// cached flat under its basename so multi-shard siblings stay adjacent
 /// (which is what the multi-shard reader's auto-discovery expects).
@@ -887,14 +887,9 @@ mod tests {
 
     #[test]
     fn split_accepts_nested_shard() {
-        let (url, local) =
-            split_repo_path("Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf")
-                .unwrap();
-        assert_eq!(
-            url,
-            "Qwen_Qwen3.6-27B-bf16/Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf"
-        );
-        assert_eq!(local, "Qwen_Qwen3.6-27B-bf16-00001-of-00002.gguf");
+        let (url, local) = split_repo_path("BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf").unwrap();
+        assert_eq!(url, "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf");
+        assert_eq!(local, "Qwen3.8-27B-BF16-00001-of-00002.gguf");
     }
 
     #[test]

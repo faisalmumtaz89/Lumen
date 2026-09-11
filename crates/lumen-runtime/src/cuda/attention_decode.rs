@@ -39,7 +39,7 @@ pub const ATTN_DECODE_S_MAX: u32 = 1024;
 /// `#define DECODE_G` / `#define DECODE_HD` (the shader refuses to compile
 /// without them), and a backend compiles the module once, for the model it
 /// serves. Every shipped model has head_dim 256 — Qwen3.5-9B at a group of 4
-/// (16 query / 4 KV heads), Qwen3.6-27B and Qwen3.8-27B at 6 (24 / 4),
+/// (16 query / 4 KV heads), Qwen3.8-27B at 6 (24 / 4),
 /// Qwen3.5-MoE-35B-A3B at 8 (16 / 2); head_dim 128 serves the generated test
 /// models. Register budget at `__launch_bounds__(128, 4)`
 /// through the engine's NVRTC path on sm_120: 72 / 96 / 128 registers at

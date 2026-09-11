@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-08-26
 
-> **Scope:** The benchmark suite covers Lumen's v1 model family: Qwen3.5-9B dense, Qwen3.5-MoE-35B-A3B, and (from the retained 2026-07-16 battery) Qwen3.6-27B dense CUDA decode. Additional model families will be added as they ship.
+> **Scope:** The benchmark suite covers Lumen's v1 model family: Qwen3.5-9B dense, Qwen3.5-MoE-35B-A3B, and (from the retained 2026-07-16 battery) the since-retired Qwen3.6-27B dense CUDA decode. Additional model families will be added as they ship.
 
 Methodology: [METHODOLOGY.md](METHODOLOGY.md). How to reproduce: [README.md](README.md). Deployment guidance: [`docs/production.md`](../docs/production.md).
 
