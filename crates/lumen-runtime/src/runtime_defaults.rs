@@ -1246,21 +1246,22 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`: up to this many 16-key tiles the
 /// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
-/// above it the CTAs walk whole tiles at the fixed target. The default is per
-/// store, from the RTX 5090 sweeps: 176 on the F32
-/// store (never slower than the one-tile form below it, faster above); 256 on
-/// the half store, where against a 176 bound — both on the loop's own one-tile
-/// form, five CTAs per SM either way — it reads −9 % at 3,200 and −7 % at
-/// 3,968 keys but +7 to +9 % at 3,600 and +8 to +18 % at 4,096 in all four
-/// sweep runs: a wash across the grid, kept at 256 pending an engine-level
-/// retune. Against the previous release's one-tile kernel (six CTAs per SM
-/// on the half store, a one-wave edge to 255 tiles) the loop is slower only
-/// in the band 3,392–4,080 keys: +8 % at 3,968 keys in every run, +0 to +4 %
-/// at 3,600 (one run of four, a bimodal cell); elsewhere no slower — 0 % at
-/// 2,816, −7 % at 4,800, −10 to −29 % at the other measured contexts from
-/// 2,600 to 32,768 — the sole exception one timer tick (+0.2 %) at 1,152
-/// keys in one run of four. Clamped to
-/// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
+/// above it the CTAs walk whole tiles at the fixed target. The default, 176 on
+/// either store, is the RTX 5090 sweeps' choice: on the F32 store the loop is
+/// never slower than the one-tile form below 176 tiles and faster above; on
+/// the half store a 176 and a 256 bound are a wash on the fine grid (176 reads
+/// +10 % at 3,200 keys and +8 % at 3,968, −8 % at 3,600 and −8 to −15 % at
+/// 4,096, equal elsewhere, in all four sweep runs), and one bound on both
+/// stores gives them the same split geometry at every context, so on
+/// half-representable inputs the half store's output is bit-identical to the
+/// F32 store's. Against the previous release's one-tile kernel on the half
+/// store (six CTAs per SM to 255 tiles) the loop reads −10 % at 2,600 keys,
+/// 0 % at 2,816 and 3,200, −8 % at 3,600, +17 % at 3,968 (the one slower
+/// cell, in every run: 248 tiles walk two waves at five CTAs per SM where
+/// the six-CTA kernel takes one), −8 to −15 % at 4,096, −7 % at 4,800, −17 %
+/// at 6,144, −29 % at 16,384; the harness timer is quantised near 2 µs, so
+/// these are coarse. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`;
+/// `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
         .ok()
@@ -1294,7 +1295,7 @@ pub fn attn_splitk_gqa6_target() -> u32 {
 }
 
 pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT: u32 = 176;
-pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16: u32 = 256;
+pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16: u32 = 176;
 pub const ATTN_SPLITK_GQA6_TARGET_DEFAULT: u32 = 128;
 
 /// [`attn_splitk_gqa6_default`] with every input explicit (the process
@@ -2060,6 +2061,8 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
     "LUMEN_CUDA_ATTN_SPLITK_GQA6",
     "LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS",
+    "LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE",
+    "LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET",
     "LUMEN_CUDA_ATTN_SPLITK_SCALE",
     "LUMEN_CUDA_ATTN_TILED_CODEGEN",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
@@ -4379,6 +4382,8 @@ mod tests {
         "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
         "LUMEN_CUDA_ATTN_SPLITK_GQA6",
         "LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS",
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE",
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET",
         "LUMEN_CUDA_ATTN_SPLITK_SCALE",
         "LUMEN_CUDA_ATTN_TILED_CODEGEN",
         "LUMEN_CUDA_F16_CACHE",

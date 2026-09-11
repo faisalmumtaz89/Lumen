@@ -57,9 +57,8 @@ const SCALE: f32 = 0.0625; // 1 / sqrt(256)
 
 /// Absolute tolerance against the float64 reference. Every run prints the
 /// observed maximum per length (`f64-reference …` lines) so the headroom is a
-/// recorded number: at the 2026-09-10 sweep to 16,384 keys the largest was
-/// well under this bound on the RTX 5090 (see the box logs kept with the
-/// campaign record). Never widen this to absorb a storage change; give a
+/// recorded number, read off every run's output rather than assumed. Never
+/// widen this to absorb a storage change; give a
 /// changed input format its own reference instead.
 const MAX_ABS_ERR_VS_F64: f64 = 2e-6;
 /// The two routes are each within ~4e-7 of F64, so they agree with each other

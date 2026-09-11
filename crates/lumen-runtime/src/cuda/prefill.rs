@@ -2040,8 +2040,7 @@ pub const ATTN_SPLITK_GQA6_CHUNK: u32 = 16;
 /// per CTA up to `attn_splitk_gqa6_one_tile_max()` chunks, then a fixed
 /// `attn_splitk_gqa6_target()` CTAs walking whole tiles, so the scratch
 /// (`num_heads * S * head_dim` floats) is bounded by the larger of the two
-/// (4.2 MiB at 176 / 128 on a 24-head, 256-dimension model, 6.0 MiB at the
-/// half store's 256) and never grows
+/// (4.2 MiB at 176 / 128 on a 24-head, 256-dimension model, either store) and never grows
 /// with the context. Under `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` the pair
 /// runs the pre-loop one-tile form up to that many chunks (at most this
 /// constant, 24.2 MiB of scratch) and a longer context hands off to the
@@ -2894,7 +2893,8 @@ fn attention_dump_config() -> Option<&'static (std::path::PathBuf, Vec<u32>)> {
 
 /// Write one decode-attention call to `dir`: `attn-<seq_len>-<call>.json`
 /// (shape, scale, the route that served) beside the raw little-endian F32
-/// files `.q.f32` (`[num_heads, head_dim]`), `.k.f32` and `.v.f32` (the live
+/// files `.q.f32` (`[num_heads, head_dim]`), `.k.f32` and `.v.f32` — `.k.f16`
+/// and `.v.f16` on a half store, with `kv_dtype` in the header — (the live
 /// `[num_kv_heads, seq_len, head_dim]` region of the cache) and `.out.f32`
 /// (the route's output, `[num_heads, head_dim]`). The call counter runs over
 /// the process, so the attention layers of one token appear in order. A
@@ -4980,10 +4980,10 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(super::attn_splitk_gqa6_geometry(16_385, false), (128, 1));
         assert_eq!(super::attn_splitk_gqa6_geometry(2_816, false), (176, 0));
         assert_eq!(super::attn_splitk_gqa6_geometry(2_817, false), (128, 1));
-        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, true), (256, 0));
-        assert_eq!(super::attn_splitk_gqa6_geometry(4_097, true), (128, 1));
+        assert_eq!(super::attn_splitk_gqa6_geometry(2_816, true), (176, 0));
+        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, true), (128, 1));
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 176);
-        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, true), 256);
+        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, true), 176);
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1_000, false), 63);
         // One snapshot carries every derived value.
         let p = super::SplitKGqa6Policy::from_env(false);
@@ -4997,7 +4997,7 @@ mod attn_splitk_gqa6_tests {
             ),
             (None, 176, 128, false, u32::MAX / ATTN_SPLITK_GQA6_CHUNK)
         );
-        assert_eq!(super::SplitKGqa6Policy::from_env(true).one_tile_max, 256);
+        assert_eq!(super::SplitKGqa6Policy::from_env(true).one_tile_max, 176);
         assert_eq!(p.geometry(2_817), (128, 1));
         assert_eq!(p.scratch_chunks(1 << 20), 176);
         assert!(p.supports(HEADS, KV, HD, 1 << 20));

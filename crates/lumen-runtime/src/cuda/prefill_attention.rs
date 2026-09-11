@@ -1591,7 +1591,13 @@ mod tests {
         let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let mut out16 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        for seq_len in [1u32, 16, 129, 330, 1300, 2600, 4097, 16_384, 16_385] {
+        // The two stores take the same split geometry at every context (one
+        // policy), so the identity holds on both partitions: one-tile to 2,816
+        // keys, whole-tile from 2,817.
+        for seq_len in [
+            1u32, 16, 129, 330, 1300, 2600, 2816, 2817, 3072, 3968, 4096, 4097, 6144, 16_384,
+            16_385,
+        ] {
             let a = unsafe {
                 super::super::prefill::launch_attention_decode_gated(
                     &device,

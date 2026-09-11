@@ -267,8 +267,8 @@ extern "C" __global__ void attention_decode_tiled(
 
     // Degenerate seq_len = 0: no work to do; zero the output and exit. (Defensive
     // -- production decode always has seq_len >= 1 because the KV cache is
-    // appended BEFORE the attention call. audit Subject (B) Pass 1
-    // covers the `seq_len = 0` gate case.)
+    // appended BEFORE the attention call; the tiled suite covers the
+    // `seq_len = 0` gate case.)
     if (seq_len == 0u) {
         for (unsigned int d = tid; d < head_dim; d += block_size) {
             attn_out[head * head_dim + d] = 0.0f;
@@ -501,8 +501,8 @@ extern "C" __global__ void attention_decode_tiled_f16(
 
     // Degenerate seq_len = 0: no work to do; zero the output and exit. (Defensive
     // -- production decode always has seq_len >= 1 because the KV cache is
-    // appended BEFORE the attention call. audit Subject (B) Pass 1
-    // covers the `seq_len = 0` gate case.)
+    // appended BEFORE the attention call; the tiled suite covers the
+    // `seq_len = 0` gate case.)
     if (seq_len == 0u) {
         for (unsigned int d = tid; d < head_dim; d += block_size) {
             attn_out[head * head_dim + d] = 0.0f;

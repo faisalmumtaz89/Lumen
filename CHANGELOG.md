@@ -11,18 +11,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **The GQA-shared decode-attention pair serves any context the cache holds,
   with fixed scratch and no route switch.** Its partial pass is now a tile
-  loop: up to a one-tile bound (176 tiles of 16 keys on the F32 store, 256 on
-  the half store) each CTA takes one tile and the partial pass is bit-identical
+  loop: up to a one-tile bound (176 tiles of 16 keys, on either store) each
+  CTA takes one tile and the partial pass is bit-identical
   to every release since v0.29.0; above it the split count is held at 128 and each CTA walks a
   balanced run of whole tiles with the tiled kernel's running-max recurrence.
-  The split-K scratch is 4.2 MiB (F32) / 6.0 MiB (half) on Qwen3.8-27B at any
+  The split-K scratch is 4.2 MiB on Qwen3.8-27B (either store) at any
   context instead of growing with it (24.2 MiB at 16,384), and a generation
   that crosses 16,384 keys no longer hands off to the per-query-head pair.
   Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
   2,600 keys, −19 to −21 % at 6,144, −27 % at 16,384, never slower at any measured
-  context; half store −17 % at 6,144, −29 % at 16,384, slower only in the
-  band 3,392–4,080 keys (+8 % at 3,968 in every run; +0 to +4 % at 3,600, the
-  +4 % in one run of four on a bimodal cell), the sole exception outside it one
+  context; half store −10 % at 2,600, −8 % at 3,600, −8 to −15 % at 4,096,
+  −17 % at 6,144, −29 % at 16,384, equal at 2,816 and 3,200, and slower in
+  one cell, +17 % at 3,968 keys in every run (248 tiles walk two waves where
+  the previous release's six-CTA kernel took one; the harness timer is
+  quantised near 2 µs, so these are coarse), the sole exception elsewhere one
   timer tick (+0.2 %) at 1,152 keys in one run of four; 24,576 and 32,768
   keys now served. Below the one-tile bound the partial pass is bit-identical
   to v0.30.0's; the merge changed in this release (the eight-lane merge
@@ -34,10 +36,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
   set, restores the bounded form as an A/B control by launching the previous
   release's one-tile partials, which stay compiled under their names
-  (`attention_decode_splitk_partial_gqa6_f32` / `_f16`). The loop partials are
-  new kernels with new names (`..._gqa6_loop_f32` / `_loop_f16`); the merge
-  (`attention_decode_splitk_merge_gqa6_f32`) is unchanged, and the route lines
-  name the kernel that ran.
+  (`attention_decode_splitk_partial_gqa6_f32`, and its half twin `_f16`, new
+  in this release) and share this release's eight-lane merge, so the control
+  reproduces the previous release's partial pass, not its complete pair. The
+  loop partials are new kernels with new names (`..._gqa6_loop_f32` /
+  `_loop_f16`); the route lines name the kernel that ran.
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round
@@ -47,9 +50,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   readers are half twins of the F32 kernels (the GQA-shared pair's partial,
   the per-query-head pair's partial
   and the tiled kernel) that widen on load and keep the F32 arithmetic and
-  order, so on half-representable inputs they reproduce the F32 kernels bit
-  for bit; the prefill readers work on the cache widened to F32 into one
-  shared buffer pair. The storage rounding is the only numerical change:
+  order, and the half store takes the same split geometry as the F32 store
+  at every context, so on half-representable inputs the half store's output
+  is bit-identical to the F32 store's; the prefill readers work on the cache
+  widened to F32 into one shared buffer pair. The storage rounding is the
+  only numerical change:
   on real Qwen3.8-27B activations at 5k and 11k keys the half-stored
   attention output differs from the F32-stored one by a relative L2 of
   about 2e-4 (7.5e-4 worst per call). The cache takes half the bytes
@@ -58,8 +63,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   store is unchanged.
 
 - **`LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,...]`**, a diagnostic that writes one
-  decode-attention call's inputs (Q, the live K/V cache region) and the
-  serving route's output as raw F32 beside a JSON header, at the listed
+  decode-attention call's inputs (Q, the live K/V cache region — raw F32 on
+  an F32 store, raw half on a half store, named in the header's `kv_dtype`)
+  and the serving route's output as raw F32 beside a JSON header, at the listed
   sequence lengths, so real activations can be replayed through a float64
   reference. Off unless set.
 
