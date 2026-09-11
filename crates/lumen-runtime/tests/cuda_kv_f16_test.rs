@@ -25,12 +25,11 @@ use lumen_runtime::cuda::shaders::{
 };
 use lumen_runtime::cuda::{
     attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
-    attn_splitk_gqa6_onetile_shared_bytes, attn_splitk_gqa6_onetile_shared_bytes_f16,
-    attn_splitk_gqa6_partial_shared_bytes, attn_splitk_gqa6_partial_shared_bytes_f16,
     ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
-    ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
-    ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM,
+    ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_REVIEWED as SPEC,
 };
+const HEAD_DIM: u32 = SPEC.head_dim;
+const GQA6_DIM_TILES: u32 = SPEC.dim_tiles();
 
 const NUM_HEADS: u32 = 24;
 const NUM_KV_HEADS: u32 = 4;
@@ -167,7 +166,7 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
     geometry: (u32, u32),
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let module = dev
-        .compile_and_load(ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE)
+        .compile_and_load(&SPEC.source())
         .expect("compile GQA-shared pair");
     let partial = module.load_function(partial_name).expect("partial");
     let merge = module
@@ -311,7 +310,7 @@ fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
         let old = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_f32",
-            attn_splitk_gqa6_onetile_shared_bytes(),
+            SPEC.onetile_shared_bytes(false),
             &q,
             &k32,
             &v32,
@@ -321,7 +320,7 @@ fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
         let new = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f32",
-            attn_splitk_gqa6_partial_shared_bytes(),
+            SPEC.partial_shared_bytes(false),
             &q,
             &k32,
             &v32,
@@ -332,7 +331,7 @@ fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
         let old = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_f16",
-            attn_splitk_gqa6_onetile_shared_bytes_f16(),
+            SPEC.onetile_shared_bytes(true),
             &q,
             &k16,
             &v16,
@@ -342,7 +341,7 @@ fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
         let new = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f16",
-            attn_splitk_gqa6_partial_shared_bytes_f16(),
+            SPEC.partial_shared_bytes(true),
             &q,
             &k16,
             &v16,
@@ -366,7 +365,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
         let a = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f32",
-            attn_splitk_gqa6_partial_shared_bytes(),
+            SPEC.partial_shared_bytes(false),
             &q,
             &k32,
             &v32,
@@ -376,7 +375,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
         let b = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f16",
-            attn_splitk_gqa6_partial_shared_bytes_f16(),
+            SPEC.partial_shared_bytes(true),
             &q,
             &k16,
             &v16,
@@ -894,7 +893,7 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
         let a = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f32",
-            attn_splitk_gqa6_partial_shared_bytes(),
+            SPEC.partial_shared_bytes(false),
             &q,
             &k32,
             &v32,
@@ -904,7 +903,7 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
         let b = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f16",
-            attn_splitk_gqa6_partial_shared_bytes_f16(),
+            SPEC.partial_shared_bytes(true),
             &q,
             &k16,
             &v16,

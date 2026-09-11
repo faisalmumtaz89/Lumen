@@ -52,11 +52,9 @@ pub use decode::{ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C};
 pub use prefill::{
     attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_geometry,
     attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_max_seq_len,
-    attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_onetile_shared_bytes,
-    attn_splitk_gqa6_onetile_shared_bytes_f16, attn_splitk_gqa6_partial_shared_bytes,
-    attn_splitk_gqa6_partial_shared_bytes_f16, attn_splitk_gqa6_scratch_chunks,
-    attn_splitk_gqa6_scratch_chunks_within, SplitKGqa6Policy, ATTN_SPLITK_GQA6_CHUNK,
-    ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM, ATTN_SPLITK_GQA6_S_MAX,
+    attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_scratch_chunks,
+    attn_splitk_gqa6_scratch_chunks_within, DecodeAttentionSpec, SplitKGqa6Policy,
+    ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_REVIEWED, ATTN_SPLITK_GQA6_S_MAX,
 };
 
 // ---------------------------------------------------------------------------

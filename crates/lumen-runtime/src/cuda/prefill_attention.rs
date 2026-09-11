@@ -234,14 +234,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 4;
         let num_heads = 2;
@@ -365,14 +368,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 1;
         let num_heads = 2;
@@ -449,14 +455,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         // Simulate: 3 tokens already in cache, then prefill 2 more tokens.
         let pre_existing = 3;
@@ -571,14 +580,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 4;
         let num_heads = 2;
@@ -679,14 +691,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 7; // Not a multiple of 4 -- tests tail handling
         let num_heads = 2;
@@ -789,14 +804,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let pre_existing = 3;
         let batch = 2;
@@ -901,14 +919,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 8;
         let num_heads = 4;
@@ -1021,14 +1042,17 @@ mod tests {
             }
         };
 
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 4;
         let num_heads = 2;
@@ -1113,14 +1137,17 @@ mod tests {
                 return;
             }
         };
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
@@ -1299,14 +1326,17 @@ mod tests {
                 return;
             }
         };
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            crate::kv::KvPrecision::F32,
+            None,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Skipping test: failed to compile kernels: {e}");
+                return;
+            }
+        };
 
         let batch = 8;
         let num_heads = 2;
@@ -1537,7 +1567,11 @@ mod tests {
             }
         }
         let _unset = Unset;
-        let kernels = match super::super::decode::compile_all_kernels(&device, KvPrecision::F16) {
+        let kernels = match super::super::decode::compile_all_kernels(
+            &device,
+            KvPrecision::F16,
+            Some(super::super::prefill::ATTN_SPLITK_GQA6_REVIEWED),
+        ) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("Skipping test: failed to compile kernels: {e}");

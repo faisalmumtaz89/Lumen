@@ -23,17 +23,16 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE;
 use lumen_runtime::cuda::{
-    attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
-    attn_splitk_gqa6_partial_shared_bytes, attn_splitk_gqa6_partial_shared_bytes_f16,
-    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_SPLITK_GQA6_DIM_TILES as DIM_TILES,
-    ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM,
+    attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes, DecodeAttentionSpec,
+    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_SPLITK_GQA6_REVIEWED as SPEC,
 };
 use std::fmt::Write as _;
 
 const NUM_HEADS: u32 = 24;
 const NUM_KV_HEADS: u32 = 4;
+const HEAD_DIM: u32 = SPEC.head_dim;
+const DIM_TILES: u32 = SPEC.dim_tiles();
 const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625;
 const ONE_TILE: u32 = 176;
@@ -280,9 +279,7 @@ fn run<K: cudarc::driver::DeviceRepr>(
     chunks: u32,
     partition: u32,
 ) -> Outputs {
-    let module = dev
-        .compile_and_load(ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE)
-        .expect("compile");
+    let module = dev.compile_and_load(&SPEC.source()).expect("compile");
     let partial = module.load_function(partial_name).expect("partial");
     let merge = module.load_function(MERGE).expect("merge");
     let n_part = (NUM_HEADS * chunks) as usize;
@@ -431,6 +428,10 @@ fn the_kernel_reproduces_the_reference_fixture() {
     } else {
         None
     };
+    assert_eq!(
+        SPEC,
+        DecodeAttentionSpec::for_shape(NUM_HEADS, NUM_KV_HEADS, HEAD_DIM).unwrap()
+    );
     let Some(dev) = try_device() else { return };
     if let Some(d) = &write_dir {
         std::fs::create_dir_all(d).expect("fixture dir");
@@ -456,7 +457,7 @@ fn the_kernel_reproduces_the_reference_fixture() {
             let a = run(
                 &dev,
                 PARTIAL_F32,
-                attn_splitk_gqa6_partial_shared_bytes(),
+                SPEC.partial_shared_bytes(false),
                 &q,
                 &k32,
                 &v32,
@@ -467,7 +468,7 @@ fn the_kernel_reproduces_the_reference_fixture() {
             let b = run(
                 &dev,
                 PARTIAL_F16,
-                attn_splitk_gqa6_partial_shared_bytes_f16(),
+                SPEC.partial_shared_bytes(true),
                 &q,
                 &k16,
                 &v16,

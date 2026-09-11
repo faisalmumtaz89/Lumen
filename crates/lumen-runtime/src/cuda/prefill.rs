@@ -2018,14 +2018,102 @@ fn attention_decode_splitk_supports_head_dim(head_dim: u32) -> bool {
 // GQA-shared split-K pair (`LUMEN_CUDA_ATTN_SPLITK_GQA6`)
 // ---------------------------------------------------------------------------
 
-/// Query heads per KV head the GQA-shared partial pass is specialised for:
-/// it forms all six of a group's scores from one register-resident K row.
-pub const ATTN_SPLITK_GQA6_GQA_RATIO: u32 = 6;
+/// The shape the GQA-shared decode-attention module is compiled for: the
+/// group size (query heads per KV head) and the head dimension. The kernel
+/// forms all `group` scores of a KV head from one register-resident K row
+/// and owns `head_dim` across its 128 threads, so both are compile-time
+/// constants of the module: the host prepends them to the source as
+/// `#define GQA6_G` / `#define GQA6_HD` (the shader refuses to compile
+/// without them), and a backend compiles the module once, for the model it
+/// serves. Every shipped model has head_dim 256 — Qwen3.5-9B at a group of 4
+/// (16 query / 4 KV heads), Qwen3.6-27B and Qwen3.8-27B at 6 (24 / 4),
+/// Qwen3.5-MoE-35B-A3B at 8 (16 / 2); head_dim 128 serves the generated test
+/// models. Register budget at `__launch_bounds__(128, 4)`
+/// through the engine's NVRTC path on sm_120: 72 / 96 / 128 registers at
+/// groups 4 / 6 / 8 with head_dim 256, no spills at any admitted shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodeAttentionSpec {
+    /// Query heads per KV head, 1..=8.
+    pub group: u32,
+    /// Head dimension: 128 or 256.
+    pub head_dim: u32,
+}
 
-/// Head dimension the GQA-shared partial pass is specialised for: 256 is two
-/// `float4` per lane across a 32-lane warp, both in the QK phase and in the
-/// two dimensions each of the 128 threads owns in the PV phase.
-pub const ATTN_SPLITK_GQA6_HEAD_DIM: u32 = 256;
+impl DecodeAttentionSpec {
+    pub const GROUPS: std::ops::RangeInclusive<u32> = 1..=8;
+    pub const HEAD_DIMS: [u32; 2] = [128, 256];
+
+    /// The specification for a model's full-attention shape, or the reason
+    /// the kernel cannot serve it (the message names the shape and the
+    /// domain).
+    pub fn for_shape(num_heads: u32, num_kv_heads: u32, head_dim: u32) -> Result<Self, String> {
+        if num_kv_heads == 0 || num_heads == 0 {
+            return Err(format!(
+                "decode attention: {num_heads} query heads over {num_kv_heads} KV heads; both must be positive"
+            ));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(format!(
+                "decode attention: {num_heads} query heads are not a whole number of groups over {num_kv_heads} KV heads"
+            ));
+        }
+        let group = num_heads / num_kv_heads;
+        if !Self::GROUPS.contains(&group) {
+            return Err(format!(
+                "decode attention: {group} query heads per KV head ({num_heads} / {num_kv_heads}); the kernel serves 1 to 8"
+            ));
+        }
+        if !Self::HEAD_DIMS.contains(&head_dim) {
+            return Err(format!(
+                "decode attention: head_dim {head_dim}; the kernel serves 128 or 256"
+            ));
+        }
+        Ok(Self { group, head_dim })
+    }
+
+    /// The module source for this shape: the two defines, then the shader.
+    pub fn source(&self) -> String {
+        format!(
+            "#define GQA6_G {}u\n#define GQA6_HD {}u\n{}",
+            self.group,
+            self.head_dim,
+            crate::cuda::shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE
+        )
+    }
+
+    /// Whether a dispatch's shape is the one this module was compiled for.
+    pub const fn matches(&self, num_heads: u32, num_kv_heads: u32, head_dim: u32) -> bool {
+        num_kv_heads != 0 && num_heads == num_kv_heads * self.group && head_dim == self.head_dim
+    }
+
+    /// Dynamic shared bytes of the partial pass: Q for the group, one 16-key
+    /// V tile (halves on a half store), the tile's scores, and the running
+    /// max, sum and rescale per head.
+    pub const fn partial_shared_bytes(&self, half_store: bool) -> u32 {
+        let v = if half_store {
+            ATTN_SPLITK_GQA6_CHUNK * self.head_dim / 2
+        } else {
+            ATTN_SPLITK_GQA6_CHUNK * self.head_dim
+        };
+        (self.group * self.head_dim + v + self.group * ATTN_SPLITK_GQA6_CHUNK + 3 * self.group) * 4
+    }
+
+    /// The retained one-tile partials' shared bytes (no rescale floats).
+    pub const fn onetile_shared_bytes(&self, half_store: bool) -> u32 {
+        self.partial_shared_bytes(half_store) - self.group * 4
+    }
+
+    /// CTAs per query head in the merge, 128 dimensions each.
+    pub const fn dim_tiles(&self) -> u32 {
+        self.head_dim / ATTN_DECODE_TILED_BLOCK_DIM
+    }
+}
+
+/// The reviewed shape of the step-3 kernel, which the reference fixture pins.
+pub const ATTN_SPLITK_GQA6_REVIEWED: DecodeAttentionSpec = DecodeAttentionSpec {
+    group: 6,
+    head_dim: 256,
+};
 
 /// KV positions per chunk of the GQA-shared partial pass. The whole chunk's
 /// scores for one query head live in one warp's lanes, so a chunk cannot
@@ -2049,26 +2137,34 @@ pub const ATTN_SPLITK_GQA6_CHUNK: u32 = 16;
 /// loop removed it.
 pub const ATTN_SPLITK_GQA6_S_MAX: u32 = 1024;
 
-/// CTAs per query head in the GQA-shared merge: each owns one block's worth
-/// of the head's dimensions, one dimension per thread. Splitting the head
-/// this way halves each CTA's accumulation and doubles the grid, which one
-/// CTA per head leaves at 24 on a 170-SM card; the price is evaluating the S
-/// rescale factors once per tile instead of once per head. The merge measures
-/// 4.1 µs at a context of 1,100.
-pub const ATTN_SPLITK_GQA6_DIM_TILES: u32 = ATTN_SPLITK_GQA6_HEAD_DIM / ATTN_DECODE_TILED_BLOCK_DIM;
+// The merge's CTAs per query head: each owns one block's worth of the head's
+// dimensions, one dimension per thread (`DecodeAttentionSpec::dim_tiles`).
+// Splitting the head this way halves each CTA's accumulation and doubles the
+// grid, which one CTA per head leaves at 24 on a 170-SM card; the price is
+// evaluating the S rescale factors once per tile instead of once per head.
+// The merge measures 4.1 µs at a context of 1,100.
 
-// The kernel's safety rests on these three, and each would fail silently:
-// a chunk longer than a warp leaves the softmax normalising only the first
-// 32 positions while the PV loop folds the rest in un-normalised; tiles that
-// do not cover the head exactly either drop dimensions or write past the
-// head into its neighbour's output row; and shared memory over the default
-// cap needs an opt-in the launcher does not perform.
+// The kernel's safety rests on these, and each would fail silently: a chunk
+// longer than a warp leaves the softmax normalising only the first 32
+// positions while the PV loop folds the rest in un-normalised; and shared
+// memory over the default cap needs an opt-in the launcher does not perform
+// (the largest admitted shape, a group of 8 at head_dim 256, on the F32
+// store).
 const _: () = assert!(ATTN_SPLITK_GQA6_CHUNK <= 32);
 const _: () =
     assert!(ATTN_SPLITK_GQA6_S_MAX == crate::runtime_defaults::ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT);
-const _: () =
-    assert!(ATTN_SPLITK_GQA6_DIM_TILES * ATTN_DECODE_TILED_BLOCK_DIM == ATTN_SPLITK_GQA6_HEAD_DIM);
-const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes() <= 49152);
+const _: () = assert!(
+    DecodeAttentionSpec {
+        group: 8,
+        head_dim: 256
+    }
+    .partial_shared_bytes(false)
+        <= 49152
+);
+const _: () = assert!(ATTN_SPLITK_GQA6_REVIEWED.partial_shared_bytes(false) == 22_984);
+const _: () = assert!(ATTN_SPLITK_GQA6_REVIEWED.partial_shared_bytes(true) == 14_792);
+const _: () = assert!(ATTN_SPLITK_GQA6_REVIEWED.onetile_shared_bytes(false) == 22_960);
+const _: () = assert!(ATTN_SPLITK_GQA6_REVIEWED.onetile_shared_bytes(true) == 14_768);
 const _: () = assert!(attn_splitk_gqa6_merge_shared_bytes(ATTN_SPLITK_GQA6_S_MAX) <= 49152);
 
 /// The longest context the pre-loop one-tile form can serve at the
@@ -2146,12 +2242,14 @@ impl SplitKGqa6Policy {
 
     pub const fn supports(
         &self,
+        spec: DecodeAttentionSpec,
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
         seq_len: u32,
     ) -> bool {
         attention_decode_splitk_gqa6_supports_within(
+            spec,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -2171,14 +2269,6 @@ pub fn attn_splitk_gqa6_chunk_bound() -> u32 {
 
 /// Dynamic shared bytes of the retained one-tile partials (the previous
 /// release's layout: no rescale slots). 22'960 B (F32) / 14'768 B (half).
-pub const fn attn_splitk_gqa6_onetile_shared_bytes() -> u32 {
-    attn_splitk_gqa6_partial_shared_bytes() - ATTN_SPLITK_GQA6_GQA_RATIO * 4
-}
-pub const fn attn_splitk_gqa6_onetile_shared_bytes_f16() -> u32 {
-    attn_splitk_gqa6_partial_shared_bytes_f16() - ATTN_SPLITK_GQA6_GQA_RATIO * 4
-}
-const _: () = assert!(attn_splitk_gqa6_onetile_shared_bytes() == 22_960);
-const _: () = assert!(attn_splitk_gqa6_onetile_shared_bytes_f16() == 14_768);
 
 /// The partition a launch takes: `0`, one tile per CTA on the pre-loop span
 /// partition (`S = ceil(seq_len / 16)`, span `ceil(seq_len / S)`); `1`, the
@@ -2255,34 +2345,33 @@ pub const fn attn_splitk_gqa6_scratch_chunks_within(
     }
 }
 
-/// Shape eligibility for the GQA-shared pair: any model whose query heads
-/// come in groups of [`ATTN_SPLITK_GQA6_GQA_RATIO`] per KV head at
-/// [`ATTN_SPLITK_GQA6_HEAD_DIM`] dimensions, up to
-/// [`attn_splitk_gqa6_max_seq_len`] KV positions. The kernels index by group,
-/// not by an absolute head count, so 24 query heads over 4 KV heads and 12
-/// over 2 are the same work per CTA and differ only in grid height.
+/// Shape eligibility for the GQA-shared pair: the shape the module was
+/// compiled for ([`DecodeAttentionSpec::matches`]), up to the chunk bound in
+/// force. The kernels index by group, not by an absolute head count, so 24
+/// query heads over 4 KV heads and 12 over 2 are the same work per CTA and
+/// differ only in grid height.
 pub fn attention_decode_splitk_gqa6_supports(
+    spec: DecodeAttentionSpec,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
 ) -> bool {
-    SplitKGqa6Policy::from_env(false).supports(num_heads, num_kv_heads, head_dim, seq_len)
+    SplitKGqa6Policy::from_env(false).supports(spec, num_heads, num_kv_heads, head_dim, seq_len)
 }
 
 /// [`attention_decode_splitk_gqa6_supports`] with the chunk bound explicit: a
 /// pure function of its arguments, so a test can state the bound it means
 /// without touching the process environment.
 pub const fn attention_decode_splitk_gqa6_supports_within(
+    spec: DecodeAttentionSpec,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
     chunk_bound: u32,
 ) -> bool {
-    num_kv_heads != 0
-        && num_heads == num_kv_heads * ATTN_SPLITK_GQA6_GQA_RATIO
-        && head_dim == ATTN_SPLITK_GQA6_HEAD_DIM
+    spec.matches(num_heads, num_kv_heads, head_dim)
         && seq_len >= 1
         && seq_len <= chunk_bound * ATTN_SPLITK_GQA6_CHUNK
 }
@@ -2291,13 +2380,6 @@ pub const fn attention_decode_splitk_gqa6_supports_within(
 /// rows, the staged V tile, the `[6][16]` score block, and the per-head
 /// running (m, l, rescale). 22'984 B, inside the 48 KiB default cap, so no
 /// shared-memory opt-in is needed.
-pub const fn attn_splitk_gqa6_partial_shared_bytes() -> u32 {
-    (ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_HEAD_DIM
-        + ATTN_SPLITK_GQA6_CHUNK * ATTN_SPLITK_GQA6_HEAD_DIM
-        + ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_CHUNK
-        + 3 * ATTN_SPLITK_GQA6_GQA_RATIO)
-        * 4
-}
 
 /// Dynamic shared bytes for the GQA-shared merge: one rescale factor per
 /// chunk plus the four-warp reduction scratch.
@@ -2436,6 +2518,9 @@ unsafe fn launch_attention_decode_splitk_gqa6(
         !control || partition == 0,
         "the one-tile control kernel takes only the span partition"
     );
+    let spec = kernels.attn_spec.ok_or_else(|| {
+        RuntimeError::Compute("attention_decode_splitk_gqa6: no compiled shape".into())
+    })?;
     let s = chunks;
     let (m_part, l_part, o_part) = scratch;
     if control {
@@ -2467,7 +2552,7 @@ unsafe fn launch_attention_decode_splitk_gqa6(
             .launch(CudarcLaunchConfig {
                 grid_dim: (s, num_kv_heads, 1),
                 block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_onetile_shared_bytes(),
+                shared_mem_bytes: spec.onetile_shared_bytes(false),
             })
             .map_err(|e| {
                 RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f32: {e}"))
@@ -2496,7 +2581,7 @@ unsafe fn launch_attention_decode_splitk_gqa6(
             .launch(CudarcLaunchConfig {
                 grid_dim: (s, num_kv_heads, 1),
                 block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
+                shared_mem_bytes: spec.partial_shared_bytes(false),
             })
             .map_err(|e| {
                 RuntimeError::Compute(format!(
@@ -2513,7 +2598,7 @@ unsafe fn launch_attention_decode_splitk_gqa6(
         .arg(attn_out)
         .arg(&s)
         .launch(CudarcLaunchConfig {
-            grid_dim: (num_heads, ATTN_SPLITK_GQA6_DIM_TILES, 1),
+            grid_dim: (num_heads, spec.dim_tiles(), 1),
             block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
             shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(s),
         })
@@ -2689,6 +2774,7 @@ const _: () =
 /// reads the environment) and passes it in.
 #[allow(clippy::too_many_arguments)]
 fn splitk_gqa6_exclusion_reason(
+    spec: DecodeAttentionSpec,
     force_tiled: bool,
     variant: AttentionDecodeVariant,
     scratch_o_floats: Option<usize>,
@@ -2722,6 +2808,7 @@ fn splitk_gqa6_exclusion_reason(
         return Some(X::OneChunkContext);
     }
     if !attention_decode_splitk_gqa6_supports_within(
+        spec,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -3077,15 +3164,16 @@ pub(crate) fn decode_attention_splitk_choice(
     // choice come from the same reading.
     let policy = SplitKGqa6Policy::from_env(half_store);
     let (chunks, partition) = policy.geometry(seq_len);
-    if gqa6_loaded
-        && policy.supports(num_heads, num_kv_heads, head_dim, seq_len)
-        && scratch_o_floats >= (num_heads as usize) * (chunks as usize) * (head_dim as usize)
-    {
-        return Some(SplitKChoice::Gqa6(SplitKGqa6Launch {
-            chunks,
-            partition,
-            policy,
-        }));
+    if let (true, Some(spec)) = (gqa6_loaded, kernels.attn_spec) {
+        if policy.supports(spec, num_heads, num_kv_heads, head_dim, seq_len)
+            && scratch_o_floats >= (num_heads as usize) * (chunks as usize) * (head_dim as usize)
+        {
+            return Some(SplitKChoice::Gqa6(SplitKGqa6Launch {
+                chunks,
+                partition,
+                policy,
+            }));
+        }
     }
     Some(SplitKChoice::PerHead)
 }
@@ -3117,8 +3205,9 @@ unsafe fn launch_attention_decode_routed(
     let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
         && kernels.attention_decode_splitk_merge_gqa6.is_some();
     let scratch_o_floats = splitk_scratch.as_ref().map(|s| s.2.len());
-    if gqa6_loaded {
+    if let (true, Some(spec)) = (gqa6_loaded, kernels.attn_spec) {
         if let Some(reason) = splitk_gqa6_exclusion_reason(
+            spec,
             force_tiled,
             variant,
             scratch_o_floats,
@@ -4679,8 +4768,8 @@ mod attn_splitk_gqa6_tests {
     use super::{
         attention_decode_splitk_gqa6_supports, attention_decode_splitk_gqa6_supports_within,
         attn_splitk_gqa6_chunk_bound, attn_splitk_gqa6_geometry_within,
-        attn_splitk_gqa6_max_seq_len, splitk_gqa6_exclusion_reason, SplitKGqa6Exclusion,
-        ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
+        attn_splitk_gqa6_max_seq_len, splitk_gqa6_exclusion_reason, DecodeAttentionSpec,
+        SplitKGqa6Exclusion, ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_REVIEWED,
         ATTN_SPLITK_GQA6_S_MAX,
     };
     use crate::cuda::decode::AttentionDecodeVariant;
@@ -4689,7 +4778,8 @@ mod attn_splitk_gqa6_tests {
     /// cache gets: enough for every eligible context.
     const HEADS: u32 = 24;
     const KV: u32 = 4;
-    const HD: u32 = ATTN_SPLITK_GQA6_HEAD_DIM;
+    const HD: u32 = 256;
+    const SPEC: DecodeAttentionSpec = ATTN_SPLITK_GQA6_REVIEWED;
     fn ample_scratch() -> Option<usize> {
         Some((HEADS * ATTN_SPLITK_GQA6_S_MAX * HD) as usize)
     }
@@ -4698,6 +4788,7 @@ mod attn_splitk_gqa6_tests {
     /// perturbs exactly one thing.
     fn reason_for_eligible() -> Option<SplitKGqa6Exclusion> {
         splitk_gqa6_exclusion_reason(
+            SPEC,
             false,
             AttentionDecodeVariant::Tiled,
             ample_scratch(),
@@ -4732,6 +4823,7 @@ mod attn_splitk_gqa6_tests {
                 "forced tiled",
                 X::ForcedTiled,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     true,
                     AttentionDecodeVariant::Tiled,
                     ample_scratch(),
@@ -4750,6 +4842,7 @@ mod attn_splitk_gqa6_tests {
                 "single-block threshold",
                 X::SingleBlockThreshold,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::SingleBlock,
                     ample_scratch(),
@@ -4768,6 +4861,7 @@ mod attn_splitk_gqa6_tests {
                 "no scratch (a prefill dispatch site)",
                 X::NoScratch,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     None,
@@ -4786,6 +4880,7 @@ mod attn_splitk_gqa6_tests {
                 "shipping pair absent",
                 X::ShippingPairAbsent,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     ample_scratch(),
@@ -4804,6 +4899,7 @@ mod attn_splitk_gqa6_tests {
                 "head_dim the split-K route declines",
                 X::HeadDim,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     ample_scratch(),
@@ -4825,6 +4921,7 @@ mod attn_splitk_gqa6_tests {
                 "one-chunk context",
                 X::OneChunkContext,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     ample_scratch(),
@@ -4843,6 +4940,7 @@ mod attn_splitk_gqa6_tests {
                 "geometry the kernels do not serve",
                 X::Shape,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     ample_scratch(),
@@ -4861,6 +4959,7 @@ mod attn_splitk_gqa6_tests {
                 "scratch sized for the other split count",
                 X::ScratchTooSmall,
                 splitk_gqa6_exclusion_reason(
+                    SPEC,
                     false,
                     AttentionDecodeVariant::Tiled,
                     Some((HEADS * 32 * HD) as usize),
@@ -4903,6 +5002,7 @@ mod attn_splitk_gqa6_tests {
     fn a_one_chunk_context_without_a_tiled_kernel_is_not_excluded() {
         assert_eq!(
             splitk_gqa6_exclusion_reason(
+                SPEC,
                 false,
                 AttentionDecodeVariant::Tiled,
                 ample_scratch(),
@@ -4925,6 +5025,7 @@ mod attn_splitk_gqa6_tests {
         for (heads, kv) in [(24, 4), (12, 2), (6, 1), (48, 8)] {
             assert!(
                 attention_decode_splitk_gqa6_supports_within(
+                    SPEC,
                     heads,
                     kv,
                     HD,
@@ -4937,6 +5038,7 @@ mod attn_splitk_gqa6_tests {
         for (heads, kv) in [(24, 8), (32, 4), (24, 3), (24, 0)] {
             assert!(
                 !attention_decode_splitk_gqa6_supports_within(
+                    SPEC,
                     heads,
                     kv,
                     HD,
@@ -4948,6 +5050,7 @@ mod attn_splitk_gqa6_tests {
         }
         for hd in [64, 128, 192, 512] {
             assert!(!attention_decode_splitk_gqa6_supports_within(
+                SPEC,
                 HEADS,
                 KV,
                 hd,
@@ -4970,8 +5073,11 @@ mod attn_splitk_gqa6_tests {
             attn_splitk_gqa6_chunk_bound(),
             u32::MAX / ATTN_SPLITK_GQA6_CHUNK
         );
-        assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 16_385));
         assert!(attention_decode_splitk_gqa6_supports(
+            SPEC, HEADS, KV, HD, 16_385
+        ));
+        assert!(attention_decode_splitk_gqa6_supports(
+            SPEC,
             HEADS,
             KV,
             HD,
@@ -5000,7 +5106,7 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(super::SplitKGqa6Policy::from_env(true).one_tile_max, 176);
         assert_eq!(p.geometry(2_817), (128, 1));
         assert_eq!(p.scratch_chunks(1 << 20), 176);
-        assert!(p.supports(HEADS, KV, HD, 1 << 20));
+        assert!(p.supports(SPEC, HEADS, KV, HD, 1 << 20));
         // The A/B control: the one-tile form up to its bound, the old hand-off past it.
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "256");
         assert_eq!(attn_splitk_gqa6_chunk_bound(), 256);
@@ -5011,12 +5117,14 @@ mod attn_splitk_gqa6_tests {
         );
         assert_eq!(p.geometry(4_096), (256, 0));
         assert_eq!(p.scratch_chunks(1 << 20), 256);
-        assert!(p.supports(HEADS, KV, HD, 4_096) && !p.supports(HEADS, KV, HD, 4_097));
+        assert!(p.supports(SPEC, HEADS, KV, HD, 4_096) && !p.supports(SPEC, HEADS, KV, HD, 4_097));
         assert_eq!(super::attn_splitk_gqa6_geometry(4_096, false), (256, 0));
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 256);
-        assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 4096));
+        assert!(attention_decode_splitk_gqa6_supports(
+            SPEC, HEADS, KV, HD, 4096
+        ));
         assert!(
-            !attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 4097),
+            !attention_decode_splitk_gqa6_supports(SPEC, HEADS, KV, HD, 4097),
             "past the lowered bound the per-query-head pair serves"
         );
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "99999");
@@ -5040,6 +5148,7 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(cap, 16_384);
         assert_eq!(
             splitk_gqa6_exclusion_reason(
+                SPEC,
                 false,
                 AttentionDecodeVariant::Tiled,
                 ample_scratch(),
@@ -5057,6 +5166,7 @@ mod attn_splitk_gqa6_tests {
         );
         assert_eq!(
             splitk_gqa6_exclusion_reason(
+                SPEC,
                 false,
                 AttentionDecodeVariant::Tiled,
                 ample_scratch(),
@@ -5084,6 +5194,7 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(cap, ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK);
         assert_eq!(cap, 16_384);
         assert!(attention_decode_splitk_gqa6_supports_within(
+            SPEC,
             HEADS,
             KV,
             HD,
@@ -5091,6 +5202,7 @@ mod attn_splitk_gqa6_tests {
             ATTN_SPLITK_GQA6_S_MAX
         ));
         assert!(!attention_decode_splitk_gqa6_supports_within(
+            SPEC,
             HEADS,
             KV,
             HD,
@@ -5098,6 +5210,7 @@ mod attn_splitk_gqa6_tests {
             ATTN_SPLITK_GQA6_S_MAX
         ));
         assert!(!attention_decode_splitk_gqa6_supports_within(
+            SPEC,
             HEADS,
             KV,
             HD,
@@ -5242,40 +5355,103 @@ mod attn_splitk_gqa6_tests {
         );
     }
 
-    /// The kernel repeats the group size, head dimension and block width as
-    /// its own `#define`s, and NVRTC never sees the Rust constants. The two
-    /// are bound here rather than by a `const _`, because the shader is a
-    /// string: a retune on one side that misses the other fails this test
-    /// instead of launching a kernel whose shared-memory layout disagrees
-    /// with the bytes the host requested.
+    /// The shader carries no shape of its own: the host prepends the group
+    /// size and head dimension, and the source refuses to compile without
+    /// them, so a module can never be built for a shape other than the one
+    /// the backend asked for.
     #[test]
-    fn the_shader_defines_match_the_host_constants() {
+    fn the_shader_takes_its_shape_from_the_host() {
         let src = crate::cuda::shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE;
-        for (name, want) in [
-            ("GQA6_HD", ATTN_SPLITK_GQA6_HEAD_DIM),
-            ("GQA6_G", super::ATTN_SPLITK_GQA6_GQA_RATIO),
-            ("GQA6_BLOCK", super::ATTN_DECODE_TILED_BLOCK_DIM),
-        ] {
-            let line = src
-                .lines()
-                .find(|l| l.starts_with(&format!("#define {name} ")))
-                .unwrap_or_else(|| panic!("the shader no longer defines {name}"));
-            let got: u32 = line
+        for name in ["GQA6_G", "GQA6_HD"] {
+            assert!(
+                !src.lines()
+                    .any(|l| l.starts_with(&format!("#define {name} "))),
+                "the shader defines {name} itself"
+            );
+            assert!(
+                src.contains(&format!("#ifndef {name}\n#error")),
+                "the shader does not refuse to compile without {name}"
+            );
+        }
+        let block = src
+            .lines()
+            .find(|l| l.starts_with("#define GQA6_BLOCK "))
+            .expect("GQA6_BLOCK");
+        assert_eq!(
+            block
                 .split_whitespace()
                 .nth(2)
-                .and_then(|v| v.trim_end_matches('u').parse().ok())
-                .unwrap_or_else(|| panic!("cannot read a value out of `{line}`"));
-            assert_eq!(got, want, "#define {name} disagrees with the host constant");
+                .map(|v| v.trim_end_matches('u')),
+            Some("128"),
+            "the block width disagrees with the host constant"
+        );
+        let text = ATTN_SPLITK_GQA6_REVIEWED.source();
+        assert!(text.starts_with("#define GQA6_G 6u\n#define GQA6_HD 256u\n"));
+        assert!(text.ends_with(src));
+    }
+
+    /// The shape domain: every shipped model, the test shapes, and the
+    /// refusals with their reasons.
+    #[test]
+    fn the_spec_admits_the_shipped_models_and_names_what_it_refuses() {
+        assert_eq!(
+            DecodeAttentionSpec::for_shape(16, 4, 256),
+            Ok(DecodeAttentionSpec {
+                group: 4,
+                head_dim: 256
+            })
+        );
+        assert_eq!(
+            DecodeAttentionSpec::for_shape(24, 4, 256),
+            Ok(ATTN_SPLITK_GQA6_REVIEWED)
+        );
+        assert_eq!(
+            DecodeAttentionSpec::for_shape(16, 2, 256),
+            Ok(DecodeAttentionSpec {
+                group: 8,
+                head_dim: 256
+            })
+        );
+        assert_eq!(
+            DecodeAttentionSpec::for_shape(2, 2, 128),
+            Ok(DecodeAttentionSpec {
+                group: 1,
+                head_dim: 128
+            })
+        );
+        for (nh, nkv, hd, word) in [
+            (0, 4, 256, "positive"),
+            (24, 0, 256, "positive"),
+            (25, 4, 256, "whole number"),
+            (36, 4, 256, "1 to 8"),
+            (24, 4, 64, "128 or 256"),
+            (24, 4, 96, "128 or 256"),
+            (24, 4, 512, "128 or 256"),
+        ] {
+            let err = DecodeAttentionSpec::for_shape(nh, nkv, hd).unwrap_err();
+            assert!(err.contains(word), "({nh}, {nkv}, {hd}): {err}");
         }
     }
 
-    /// The merge's CTAs must tile the head exactly, one dimension per thread.
+    /// The merge's CTAs cover the head exactly, one dimension per thread.
     #[test]
-    fn the_merge_tiles_cover_the_head_exactly() {
-        assert_eq!(
-            ATTN_SPLITK_GQA6_DIM_TILES * super::ATTN_DECODE_TILED_BLOCK_DIM,
-            ATTN_SPLITK_GQA6_HEAD_DIM
-        );
+    fn the_merge_tiles_cover_the_head() {
+        for hd in DecodeAttentionSpec::HEAD_DIMS {
+            let spec = DecodeAttentionSpec {
+                group: 1,
+                head_dim: hd,
+            };
+            assert_eq!(spec.dim_tiles() * super::ATTN_DECODE_TILED_BLOCK_DIM, hd);
+        }
+        // Shared bytes grow with the group and shrink on the half store; the
+        // largest admitted shape stays under the default cap.
+        let g8 = DecodeAttentionSpec {
+            group: 8,
+            head_dim: 256,
+        };
+        assert_eq!(g8.partial_shared_bytes(false), 25_184);
+        assert_eq!(g8.partial_shared_bytes(true), 16_992);
+        assert!(g8.partial_shared_bytes(false) <= 49_152);
     }
 }
 
@@ -5288,14 +5464,6 @@ mod attn_splitk_gqa6_tests {
 
 /// Dynamic shared bytes of `attention_decode_splitk_partial_gqa6_loop_f16`: the Q
 /// block as F32, the V tile as halves, the score block and the (m, l) slots.
-pub const fn attn_splitk_gqa6_partial_shared_bytes_f16() -> u32 {
-    (ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_HEAD_DIM
-        + ATTN_SPLITK_GQA6_CHUNK * ATTN_SPLITK_GQA6_HEAD_DIM / 2
-        + ATTN_SPLITK_GQA6_GQA_RATIO * ATTN_SPLITK_GQA6_CHUNK
-        + 3 * ATTN_SPLITK_GQA6_GQA_RATIO)
-        * 4
-}
-const _: () = assert!(attn_splitk_gqa6_partial_shared_bytes_f16() == 14_792);
 
 /// Route a decode step over a half store: the same admission sequence as the
 /// F32 router, each route replaced by its half twin. The force knob is
@@ -5333,8 +5501,9 @@ unsafe fn launch_attention_decode_routed_f16(
     let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
         && kernels.attention_decode_splitk_merge_gqa6.is_some();
     let scratch_o_floats = splitk_scratch.as_ref().map(|s| s.2.len());
-    if gqa6_loaded {
+    if let (true, Some(spec)) = (gqa6_loaded, kernels.attn_spec) {
         if let Some(reason) = splitk_gqa6_exclusion_reason(
+            spec,
             force_tiled,
             variant,
             scratch_o_floats,
@@ -5557,6 +5726,9 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
         !control || partition == 0,
         "the one-tile control kernel takes only the span partition"
     );
+    let spec = kernels.attn_spec.ok_or_else(|| {
+        RuntimeError::Compute("attention_decode_splitk_gqa6_f16: no compiled shape".into())
+    })?;
     let s = chunks;
     let (m_part, l_part, o_part) = scratch;
     if control {
@@ -5578,7 +5750,7 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
             .launch(CudarcLaunchConfig {
                 grid_dim: (s, num_kv_heads, 1),
                 block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_onetile_shared_bytes_f16(),
+                shared_mem_bytes: spec.onetile_shared_bytes(true),
             })
             .map_err(|e| {
                 RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f16: {e}"))
@@ -5601,7 +5773,7 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
             .launch(CudarcLaunchConfig {
                 grid_dim: (s, num_kv_heads, 1),
                 block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes_f16(),
+                shared_mem_bytes: spec.partial_shared_bytes(true),
             })
             .map_err(|e| {
                 RuntimeError::Compute(format!(
@@ -5618,7 +5790,7 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
         .arg(attn_out)
         .arg(&s)
         .launch(CudarcLaunchConfig {
-            grid_dim: (num_heads, ATTN_SPLITK_GQA6_DIM_TILES, 1),
+            grid_dim: (num_heads, spec.dim_tiles(), 1),
             block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
             shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(s),
         })

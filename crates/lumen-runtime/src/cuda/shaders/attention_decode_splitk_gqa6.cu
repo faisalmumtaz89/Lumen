@@ -1,6 +1,11 @@
 // ==========================================================================
-// GQA-shared split-K decode attention, specialised for 6 query heads per KV
-// head and head_dim 256 (Qwen3.8-27B full attention: 24 Q heads, 4 KV heads).
+// GQA-shared split-K decode attention, specialised at compile time for the
+// model's group size G (query heads per KV head) and head_dim HD: the host
+// prepends `#define GQA6_G <g>u` and `#define GQA6_HD <hd>u` to this source
+// before NVRTC sees it (G in 1..=8, HD in {32, 64, 128, 256}). Every shipped
+// model has HD 256: Qwen3.5-9B G = 4 (16 Q / 4 KV), Qwen3.6-27B and
+// Qwen3.8-27B G = 6 (24 / 4), Qwen3.5-MoE-35B-A3B G = 8 (16 / 2). At (6, 256)
+// the arithmetic is, operation for operation, the kernel reviewed in step 3.
 //
 // Same (m, l, o) partial contract as attention_decode_splitk.cu, and the same
 // two-pass shape, but a different work decomposition:
@@ -22,32 +27,35 @@
 //
 // Decomposition of one CTA (128 threads = 4 warps), per 16-key tile:
 //
-//   stage    Q for the six heads (6 KiB) and the first V tile (16 KiB F32,
-//            8 KiB half) are copied into shared with 16-byte loads, both
-//            issued before the first barrier so the two streams overlap;
-//            each later tile's V is staged before that tile's dot products.
-//   QK       a warp owns one key at a time; lanes own dimensions. Lane l
-//            holds K[pos][4l .. 4l+4) and K[pos][128+4l .. 128+4l+4) — two
-//            float4 (widened from halves on a half store) — in registers while
-//            all six head scores are formed from them, each by a warp
-//            shuffle-xor tree. Q is reloaded from shared per tile (2 float4
-//            per head per lane) so its registers live only through the phase.
-//   softmax  scores are [6][16] in shared; one warp per query head, four warps
-//            covering six heads in two rounds; the tile's max joins the
+//   stage    Q for the G heads (G*HD floats) and the first V tile (16*HD
+//            floats, halves on a half store) are copied into shared with
+//            16-byte loads, both issued before the first barrier so the two
+//            streams overlap; each later tile's V is staged before that
+//            tile's dot products.
+//   QK       a warp owns one key at a time; lanes own dimensions. At HD >= 128
+//            lane l holds the HD/128 float4 K[pos][128c+4l .. 128c+4l+4) (at
+//            256: dims 4l..4l+4 and 128+4l..128+4l+4, widened from halves on
+//            a half store) in registers while all G head scores are formed
+//            from them, each by a warp shuffle-xor tree; below 128 a lane
+//            holds HD/32 scalars. Q is reloaded from shared per tile so its
+//            registers live only through the phase.
+//   softmax  scores are [G][16] in shared; one warp per query head, four warps
+//            covering G heads in ceil(G/4) rounds; the tile's max joins the
 //            running max and the tile's sum the running sum (rescaled).
-//   PV       thread t owns dims t and t+128 and keeps 12 accumulators
-//            (2 dims x 6 heads), rescaled once per tile and walking the staged
-//            V tile in ascending key order, reusing each V value across the
-//            group.
+//   PV       thread t owns dims t + 128i for i < HD/128 (t alone below 128,
+//            threads t >= HD idle) and keeps (HD/128) x G accumulators,
+//            rescaled once per tile and walking the staged V tile in
+//            ascending key order, reusing each V value across the group.
 //
 // A CTA walks one tile below the one-tile bound (the form every context took
 // before the loop, bit-identical) and a contiguous run of whole tiles above
 // it, so the split count — and with it the scratch — is bounded by the host's
 // target at any context.
 //
-// Shared memory: 6*256 (Q) + 16*256 (V; halves on a half store) + 6*16
-// (scores) + 6 m + 6 l + 6 rescale floats: 22'984 B (F32) / 14'792 B (half),
-// under the 48 KiB default dynamic-shared cap, so no opt-in is needed.
+// Shared memory: G*HD (Q) + 16*HD (V; half that in floats on a half store)
+// + G*16 (scores) + G m + G l + G rescale floats: at (6, 256) 22'984 B (F32)
+// / 14'792 B (half), at (8, 256) 25'184 / 16'992 B, under the 48 KiB default
+// dynamic-shared cap, so no opt-in is needed.
 //
 // PRECISION: F32 accumulation throughout (K and V widened exactly from halves
 // on a half store), the same expf, no atomics and no fast-math. The QK
@@ -72,19 +80,30 @@
 //   l_part [num_heads * S]              F32
 //   o_part [num_heads * S * head_dim]   F32
 //
-// Requires (enforced by the host gate
-// `attention_decode_splitk_gqa6_supports`): num_heads / num_kv_heads == 6,
-// head_dim == 256, and the store the entry point is for (F32 words for _f32,
-// half bit patterns for _f16).
+// Requires (enforced by the host, which compiled this module for the model's
+// shape): num_heads / num_kv_heads == GQA6_G, head_dim == GQA6_HD, and the
+// store the entry point is for (F32 words for _f32, half bit patterns for
+// _f16).
 // NVRTC-compatible: no system includes, extern "C" linkage.
 // ==========================================================================
 
+#ifndef GQA6_G
+#error "GQA6_G (query heads per KV head) must be defined by the host before this source"
+#endif
+#ifndef GQA6_HD
+#error "GQA6_HD (head_dim) must be defined by the host before this source"
+#endif
+static_assert(GQA6_G >= 1u && GQA6_G <= 8u, "the group size G must be in 1..=8");
+static_assert(GQA6_HD == 128u || GQA6_HD == 256u, "head_dim must be 128 or 256");
+
 #define GQA6_NEG_INF (-3.402823466e+38f)
-#define GQA6_HD       256u
 #define GQA6_MERGE_LANES 8u       // independent numerator accumulators in the merge (the tree below sums exactly eight)
-#define GQA6_G        6u
 #define GQA6_BLOCK    128u
 #define GQA6_WARPS    (GQA6_BLOCK / 32u)
+// QK: lane l holds GQA6_LC float4 of a K row, chunk c at dims [128c + 4l, +4).
+// PV: thread t owns dims t + 128i, i < GQA6_DPT.
+#define GQA6_LC       (GQA6_HD / 128u)
+#define GQA6_DPT      (GQA6_HD / 128u)
 
 __device__ __forceinline__ float gqa6_warp_max(float v) {
     v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
@@ -247,8 +266,7 @@ __device__ __forceinline__ void gqa6_loop_range(
             unsigned int head = kv_h * GQA6_G + g;                                                  \
             unsigned long long base =                                                               \
                 ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;                          \
-            o_part[base + tid] = 0.0f;                                                              \
-            o_part[base + tid + GQA6_BLOCK] = 0.0f;                                                 \
+            GQA6_ZERO_O(base);                                                                      \
         }                                                                                           \
         if (tid < GQA6_G) {                                                                         \
             unsigned int head = kv_h * GQA6_G + tid;                                                \
@@ -259,14 +277,14 @@ __device__ __forceinline__ void gqa6_loop_range(
     }                                                                                               \
                                                                                                     \
     extern __shared__ __align__(16) float smem[];                                                   \
-    float* s_q = smem;                                                        /* [6][256] */        \
+    float* s_q = smem;                                                        /* [G][HD] */         \
     const unsigned int v_floats = (V_HALF) ? (GQA6_TILE * GQA6_HD) / 2u : GQA6_TILE * GQA6_HD;      \
-    float* s_v = s_q + GQA6_G * GQA6_HD;                                      /* [16][256] */       \
+    float* s_v = s_q + GQA6_G * GQA6_HD;                                      /* [16][HD] */        \
     const unsigned short* s_vh = reinterpret_cast<const unsigned short*>(s_v);                      \
-    float* s_score = s_v + v_floats;                                          /* [6][16] */         \
-    float* s_m = s_score + GQA6_G * GQA6_TILE;                                /* [6] running max */ \
-    float* s_l = s_m + GQA6_G;                                                /* [6] running sum */ \
-    float* s_resc = s_l + GQA6_G;                                             /* [6] rescale */     \
+    float* s_score = s_v + v_floats;                                          /* [G][16] */         \
+    float* s_m = s_score + GQA6_G * GQA6_TILE;                                /* [G] running max */ \
+    float* s_l = s_m + GQA6_G;                                                /* [G] running sum */ \
+    float* s_resc = s_l + GQA6_G;                                             /* [G] rescale */     \
                                                                                                     \
     const unsigned long long kv_base =                                                              \
         (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)GQA6_HD;   \
@@ -285,14 +303,13 @@ __device__ __forceinline__ void gqa6_loop_range(
     }                                                                                               \
     __syncthreads();                                                                                \
                                                                                                     \
-    /* Each thread holds its two dimensions of the numerator for each head;   */                   \
-    /* the running max and sum per head are block-uniform and live in shared. */                   \
-    float acc0[GQA6_G];                                                                             \
-    float acc1[GQA6_G];                                                                             \
+    /* Each thread holds its dimensions of the numerator for each head; the   */                   \
+    /* running max and sum per head are block-uniform and live in shared.     */                   \
+    float acc[GQA6_DPT][GQA6_G];                                                                    \
     _Pragma("unroll")                                                                               \
     for (unsigned int g = 0; g < GQA6_G; g++) {                                                     \
-        acc0[g] = 0.0f;                                                                             \
-        acc1[g] = 0.0f;                                                                             \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int i = 0; i < GQA6_DPT; i++) acc[i][g] = 0.0f;                               \
     }                                                                                               \
                                                                                                     \
     for (unsigned int p0 = k0; p0 < k1; p0 += GQA6_TILE) {                                          \
@@ -306,25 +323,18 @@ __device__ __forceinline__ void gqa6_loop_range(
         /* load overlaps them (tile 0's V came in with Q).                      */                  \
         if (!first) { GQA6_STAGE_V(V_HALF, s_v, p0, span); }                                        \
                                                                                                     \
-        /* QK: a warp per key, the K row in registers across all six heads.  */                     \
-        /* Q is reloaded from shared for each tile (12 shared float4 per lane) */                    \
-        /* so its 48 registers live only through the dot products, not across */                    \
-        /* the PV pass and the tile loop.                                       */                   \
-        float4 qa[GQA6_G];                                                                          \
-        float4 qb[GQA6_G];                                                                          \
-        _Pragma("unroll")                                                                           \
-        for (unsigned int g = 0; g < GQA6_G; g++) {                                                 \
-            const float4* q4 = reinterpret_cast<const float4*>(s_q + g * GQA6_HD);                  \
-            qa[g] = q4[lane];                                                                       \
-            qb[g] = q4[32u + lane];                                                                 \
-        }                                                                                           \
+        /* QK: a warp per key, the K row in registers across all G heads.    */                     \
+        /* Q is reloaded from shared for each tile so its registers live only  */                    \
+        /* through the dot products, not across the PV pass and the tile loop. */                   \
+        GQA6_Q_DECL;                                                                                \
+        GQA6_Q_LOAD;                                                                                \
         for (unsigned int j = warp; j < span; j += GQA6_WARPS) {                                    \
-            float4 ka, kb;                                                                          \
-            KLOAD(p0 + j, ka, kb);                                                                  \
+            GQA6_K_DECL;                                                                            \
+            KLOAD(p0 + j);                                                                          \
             _Pragma("unroll")                                                                       \
             for (unsigned int g = 0; g < GQA6_G; g++) {                                             \
-                float dot = qa[g].x * ka.x + qa[g].y * ka.y + qa[g].z * ka.z + qa[g].w * ka.w;       \
-                dot += qb[g].x * kb.x + qb[g].y * kb.y + qb[g].z * kb.z + qb[g].w * kb.w;           \
+                float dot;                                                                          \
+                GQA6_QK_DOT(g, dot);                                                                \
                 dot = gqa6_warp_sum(dot) * scale;                                                   \
                 if (lane == 0u) s_score[g * GQA6_TILE + j] = dot;                                   \
             }                                                                                       \
@@ -362,24 +372,18 @@ __device__ __forceinline__ void gqa6_loop_range(
             _Pragma("unroll")                                                                       \
             for (unsigned int g = 0; g < GQA6_G; g++) {                                             \
                 const float r = s_resc[g];                                                          \
-                acc0[g] *= r;                                                                       \
-                acc1[g] *= r;                                                                       \
+                _Pragma("unroll")                                                                   \
+                for (unsigned int i = 0; i < GQA6_DPT; i++) acc[i][g] *= r;                         \
             }                                                                                       \
         }                                                                                           \
         for (unsigned int j = 0; j < span; j++) {                                                   \
-            float v0, v1;                                                                           \
-            if (V_HALF) {                                                                           \
-                v0 = gqa6_h2f(s_vh[j * GQA6_HD + tid]);                                             \
-                v1 = gqa6_h2f(s_vh[j * GQA6_HD + tid + GQA6_BLOCK]);                                \
-            } else {                                                                                \
-                v0 = s_v[j * GQA6_HD + tid];                                                        \
-                v1 = s_v[j * GQA6_HD + tid + GQA6_BLOCK];                                           \
-            }                                                                                       \
+            float vv[GQA6_DPT];                                                                     \
+            GQA6_V_LOAD(V_HALF, j, vv);                                                             \
             _Pragma("unroll")                                                                       \
             for (unsigned int g = 0; g < GQA6_G; g++) {                                             \
                 const float p = s_score[g * GQA6_TILE + j];                                         \
-                acc0[g] += p * v0;                                                                  \
-                acc1[g] += p * v1;                                                                  \
+                _Pragma("unroll")                                                                   \
+                for (unsigned int i = 0; i < GQA6_DPT; i++) acc[i][g] += p * vv[i];                 \
             }                                                                                       \
         }                                                                                           \
         /* The next tile overwrites shared V and the scores; everyone is done. */                   \
@@ -390,8 +394,7 @@ __device__ __forceinline__ void gqa6_loop_range(
     for (unsigned int g = 0; g < GQA6_G; g++) {                                                     \
         unsigned int head = kv_h * GQA6_G + g;                                                      \
         unsigned long long base = ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;        \
-        o_part[base + tid] = acc0[g];                                                               \
-        o_part[base + tid + GQA6_BLOCK] = acc1[g];                                                  \
+        GQA6_STORE_O(base, g);                                                                      \
     }                                                                                               \
     if (tid < GQA6_G) {                                                                             \
         unsigned int head = kv_h * GQA6_G + tid;                                                    \
@@ -399,22 +402,64 @@ __device__ __forceinline__ void gqa6_loop_range(
         l_part[head * num_chunks + chunk] = s_l[tid];                                               \
     }
 
-#define GQA6_KLOAD_F32(pos, ka, kb)                                                                 \
+// The per-shape pieces of the loop body: what a lane holds of Q and K, the
+// dot product over them, what a thread holds of V, and the o_part stores.
+// Chunk c of a lane is float4 c*32 + lane of the row (at 256: the two float4
+// the reviewed kernel held as qa/ka and qb/kb, summed in that order).
+#define GQA6_Q_DECL float4 qr[GQA6_LC][GQA6_G]
+#define GQA6_Q_LOAD                                                                                 \
+    _Pragma("unroll")                                                                               \
+    for (unsigned int g = 0; g < GQA6_G; g++) {                                                     \
+        const float4* q4 = reinterpret_cast<const float4*>(s_q + g * GQA6_HD);                      \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int c = 0; c < GQA6_LC; c++) qr[c][g] = q4[32u * c + lane];                   \
+    }
+#define GQA6_K_DECL float4 kr[GQA6_LC]
+#define GQA6_KLOAD_F32(pos)                                                                         \
     {                                                                                               \
         const float4* k4 = reinterpret_cast<const float4*>(                                         \
             k_cache + kv_base + (unsigned long long)(pos) * (unsigned long long)GQA6_HD);           \
-        ka = k4[lane];                                                                              \
-        kb = k4[32u + lane];                                                                        \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int c = 0; c < GQA6_LC; c++) kr[c] = k4[32u * c + lane];                      \
     }
-
-#define GQA6_KLOAD_F16(pos, ka, kb)                                                                 \
+#define GQA6_KLOAD_F16(pos)                                                                         \
     {                                                                                               \
         const uint2* k2 = reinterpret_cast<const uint2*>(                                           \
             k_cache + kv_base + (unsigned long long)(pos) * (unsigned long long)GQA6_HD);           \
-        const uint2 ra = k2[lane];                                                                  \
-        const uint2 rb = k2[32u + lane];                                                            \
-        ka = gqa6_h4_to_f4(ra.x, ra.y);                                                             \
-        kb = gqa6_h4_to_f4(rb.x, rb.y);                                                             \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int c = 0; c < GQA6_LC; c++) {                                                \
+            const uint2 r = k2[32u * c + lane];                                                     \
+            kr[c] = gqa6_h4_to_f4(r.x, r.y);                                                        \
+        }                                                                                           \
+    }
+/* chunk 0 assigns, later chunks add: the reviewed kernel's `dot = qa.ka; dot += qb.kb`. */
+#define GQA6_QK_DOT(g, dot)                                                                         \
+    {                                                                                               \
+        dot = qr[0][g].x * kr[0].x + qr[0][g].y * kr[0].y + qr[0][g].z * kr[0].z                    \
+            + qr[0][g].w * kr[0].w;                                                                 \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int c = 1; c < GQA6_LC; c++) {                                                \
+            dot += qr[c][g].x * kr[c].x + qr[c][g].y * kr[c].y + qr[c][g].z * kr[c].z               \
+                + qr[c][g].w * kr[c].w;                                                             \
+        }                                                                                           \
+    }
+#define GQA6_V_LOAD(V_HALF, j, vv)                                                                  \
+    {                                                                                               \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int i = 0; i < GQA6_DPT; i++) {                                               \
+            if (V_HALF) vv[i] = gqa6_h2f(s_vh[(j) * GQA6_HD + tid + GQA6_BLOCK * i]);               \
+            else        vv[i] = s_v[(j) * GQA6_HD + tid + GQA6_BLOCK * i];                          \
+        }                                                                                           \
+    }
+#define GQA6_ZERO_O(base)                                                                           \
+    {                                                                                               \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int i = 0; i < GQA6_DPT; i++) o_part[(base) + tid + GQA6_BLOCK * i] = 0.0f;   \
+    }
+#define GQA6_STORE_O(base, g)                                                                       \
+    {                                                                                               \
+        _Pragma("unroll")                                                                           \
+        for (unsigned int i = 0; i < GQA6_DPT; i++) o_part[(base) + tid + GQA6_BLOCK * i] = acc[i][g]; \
     }
 
 extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_partial_gqa6_loop_f32(
@@ -460,6 +505,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_par
 // + 12 (m, l) floats.
 // --------------------------------------------------------------------------
 
+#if GQA6_HD == 256u
 extern "C" __global__ void attention_decode_splitk_partial_gqa6_f32(
     const float* __restrict__ q,           // [num_heads * 256]
     const float* __restrict__ k_cache,     // [num_kv_heads, max_seq_len, 256]
@@ -767,6 +813,8 @@ extern "C" __global__ void attention_decode_splitk_partial_gqa6_f16(
     }
 }
 
+#endif  // GQA6_HD == 256u: the retained one-tile partials
+
 // --------------------------------------------------------------------------
 // Merge. grid = (num_heads, 256 / 128), block = 128 threads: two CTAs per
 // query head, each owning 128 of the head's dimensions, one per thread.
@@ -828,6 +876,9 @@ extern "C" __global__ void attention_decode_splitk_merge_gqa6_f32(
     // error at 8.7e-5 against 2.0e-5 for the per-query-head pair.
     const float* op = o_part + (unsigned long long)head * num_chunks * GQA6_HD;
     const unsigned int d = dt * GQA6_BLOCK + tid;
+    // Below 128 dimensions the threads past HD have taken part in the block
+    // reductions above and have nothing to sum or store.
+    if (d >= GQA6_HD) return;
     float acc[GQA6_MERGE_LANES];
 #pragma unroll
     for (unsigned int i = 0; i < GQA6_MERGE_LANES; i++) acc[i] = 0.0f;

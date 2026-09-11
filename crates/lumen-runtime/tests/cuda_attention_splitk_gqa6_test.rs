@@ -27,7 +27,7 @@
 //! | partial grid | `(num_heads * S, 1, 1)` | `(S, num_kv_heads, 1)` |
 //! | merge grid | `(num_heads, 1, 1)` | `(num_heads, head_dim / 128, 1)` |
 //! | block | 128 | 128 |
-//! | partial shared | `(8 + head_dim + 128) * 4` | `attn_splitk_gqa6_partial_shared_bytes()` |
+//! | partial shared | `(8 + head_dim + 128) * 4` | `SPEC.partial_shared_bytes(false)` |
 //! | merge shared | 0 | `attn_splitk_gqa6_merge_shared_bytes(S)` |
 //! | S | `ceil(seq_len / 128)`, capped at 32 | `ceil(seq_len / C)`, C = 16 |
 //!
@@ -38,18 +38,17 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::{
-    ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE, ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
-};
+use lumen_runtime::cuda::shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE;
 // The launch geometry comes from the crate, so a retune of any of these
 // cannot leave this mirror describing a kernel production no longer runs.
 use lumen_runtime::cuda::{
     attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_max_seq_len,
-    attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_partial_shared_bytes,
-    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
-    ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
-    ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM, ATTN_SPLITK_GQA6_S_MAX,
+    attn_splitk_gqa6_merge_shared_bytes, ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM,
+    ATTN_DECODE_TILED_T_C as T_C, ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK,
+    ATTN_SPLITK_GQA6_REVIEWED as SPEC, ATTN_SPLITK_GQA6_S_MAX,
 };
+const HEAD_DIM: u32 = SPEC.head_dim;
+const GQA6_DIM_TILES: u32 = SPEC.dim_tiles();
 use lumen_runtime::runtime_defaults::ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT;
 
 const MAX_SEQ_LEN: u32 = 32_768;
@@ -284,7 +283,7 @@ fn run_gqa6_at(
     partition: u32,
 ) -> Vec<f32> {
     let module = dev
-        .compile_and_load(ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE)
+        .compile_and_load(&SPEC.source())
         .expect("compile GQA-shared pair");
     let partial = module
         .load_function("attention_decode_splitk_partial_gqa6_loop_f32")
@@ -321,7 +320,7 @@ fn run_gqa6_at(
             .launch(LaunchConfig {
                 grid_dim: (chunks, g.num_kv_heads, 1),
                 block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
+                shared_mem_bytes: SPEC.partial_shared_bytes(false),
             })
             .expect("gqa6 partial launch");
         dev.stream

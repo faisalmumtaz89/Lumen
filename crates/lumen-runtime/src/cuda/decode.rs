@@ -216,6 +216,10 @@ pub(crate) struct KernelSet {
     // route itself is enabled, since it is an alternative implementation of
     // that route; both must be present for it to dispatch.
     pub(crate) attention_decode_splitk_partial_gqa6: Option<CudaFunction>,
+    /// The shape the GQA-shared module was compiled for; `None` when the
+    /// backend's model is outside the kernel's domain (then the pair is not
+    /// loaded and the other routes serve).
+    pub(crate) attn_spec: Option<super::prefill::DecodeAttentionSpec>,
     /// The previous one-tile partial (`attention_decode_splitk_partial_gqa6_f32`),
     /// retained as the A/B control `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
     /// launches; loaded with the loop, so the control is the kernel of the
@@ -947,6 +951,7 @@ pub(crate) struct KvF16Kernels {
 pub(crate) fn compile_all_kernels(
     device: &CudaDevice,
     kv_precision: crate::kv::KvPrecision,
+    attn_spec: Option<super::prefill::DecodeAttentionSpec>,
 ) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
@@ -1002,7 +1007,12 @@ pub(crate) fn compile_all_kernels(
     // The GQA-shared pair is an alternative implementation of the split-K
     // route, so it loads only where that route can be selected at all.
     let load_splitk_gqa6 = crate::runtime_defaults::attn_splitk_enabled()
-        && crate::runtime_defaults::attn_splitk_gqa6_enabled();
+        && crate::runtime_defaults::attn_splitk_gqa6_enabled()
+        && attn_spec.is_some();
+    // The GQA-shared module is compiled for the model's shape: the spec's
+    // defines are prepended to the source, so each shape is its own module
+    // (and its own PTX cache entry).
+    let gqa6_source = attn_spec.map(|s| s.source()).unwrap_or_default();
 
     // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
@@ -1078,11 +1088,11 @@ pub(crate) fn compile_all_kernels(
     let kv_f16 = match kv_precision {
         crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
             splitk_partial_gqa6: load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                &gqa6_source,
                 "attention_decode_splitk_partial_gqa6_loop_f16",
             )?,
             splitk_partial_gqa6_onetile: load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                &gqa6_source,
                 "attention_decode_splitk_partial_gqa6_f16",
             )?,
             splitk_partial: load_splitk(
@@ -1110,6 +1120,7 @@ pub(crate) fn compile_all_kernels(
 
     let kernels = KernelSet {
         kv_f16,
+        attn_spec,
         attention_decode_tiled_codegen: tiled_codegen.get(),
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
@@ -1208,7 +1219,7 @@ pub(crate) fn compile_all_kernels(
         },
         attention_decode_splitk_partial_gqa6: if load_splitk_gqa6 {
             match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                &gqa6_source,
                 "attention_decode_splitk_partial_gqa6_loop_f32",
             ) {
                 Ok(f) => Some(f),
@@ -1221,10 +1232,7 @@ pub(crate) fn compile_all_kernels(
             None
         },
         attention_decode_splitk_partial_gqa6_onetile: if load_splitk_gqa6 {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_partial_gqa6_f32",
-            ) {
+            match load_splitk(&gqa6_source, "attention_decode_splitk_partial_gqa6_f32") {
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
@@ -1235,10 +1243,7 @@ pub(crate) fn compile_all_kernels(
             None
         },
         attention_decode_splitk_merge_gqa6: if load_splitk_gqa6 {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_merge_gqa6_f32",
-            ) {
+            match load_splitk(&gqa6_source, "attention_decode_splitk_merge_gqa6_f32") {
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_merge_gqa6_f32: FAILED ({e})");

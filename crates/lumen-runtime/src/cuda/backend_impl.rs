@@ -17906,7 +17906,21 @@ impl ComputeBackend for CudaBackend {
             }
         }
         let kernel_compile_start = std::time::Instant::now();
-        let mut kernels = decode::compile_all_kernels(&self.device, self.kv_precision)?;
+        // The decode-attention module is compiled for this model's
+        // full-attention shape; a shape outside the kernel's domain leaves it
+        // unloaded and the other routes serve.
+        let attn_spec = match super::prefill::DecodeAttentionSpec::for_shape(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+        ) {
+            Ok(spec) => Some(spec),
+            Err(why) => {
+                eprintln!("[CUDA] GQA-shared decode attention not loaded: {why}");
+                None
+            }
+        };
+        let mut kernels = decode::compile_all_kernels(&self.device, self.kv_precision, attn_spec)?;
         {
             let (hits, misses) = super::ptx_cache::stats();
             let elapsed = kernel_compile_start.elapsed();
@@ -18005,12 +18019,15 @@ impl ComputeBackend for CudaBackend {
                 // context instead. One allocation, at init, either way.
                 let gqa6 = kernels.attention_decode_splitk_partial_gqa6.is_some()
                     && kernels.attention_decode_splitk_merge_gqa6.is_some()
-                    && super::prefill::attention_decode_splitk_gqa6_supports(
-                        num_heads as u32,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        1,
-                    );
+                    && kernels.attn_spec.is_some_and(|spec| {
+                        super::prefill::attention_decode_splitk_gqa6_supports(
+                            spec,
+                            num_heads as u32,
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            1,
+                        )
+                    });
                 let s = if gqa6 {
                     // The loop policy bounds the split count whatever the
                     // context (176 / 128 by default on either store: 4.2 MiB on
