@@ -20,8 +20,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   that crosses 16,384 keys no longer hands off to the per-query-head pair.
   Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
   2,600 keys, −21 % at 6,144, −27 % at 16,384, never slower at any measured
-  context; half store −17 % at 6,144, −29 % at 16,384, +8 % in one cell at
-  3,968; 24,576 and 32,768 keys now served. `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
+  context; half store −17 % at 6,144, −29 % at 16,384, slower only in the
+  band 3,392–4,080 keys (+4 % at 3,600, +8 % at 3,968); 24,576 and 32,768
+  keys now served. Below the one-tile bound the pair's output is bit-identical
+  to v0.30.0; above it the whole-tile partition sums in a different order, so
+  outputs there are a near-tie with the previous release rather than
+  identical (the same F64 error bound holds on both partitions). `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
   and `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` set the policy;
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
   set, restores the bounded form as an A/B control by launching the previous
@@ -112,7 +116,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Added
 
 - **`LUMEN_CUDA_ATTN_SPLITK_GQA6`, a GQA-shared decode-attention pair
-  (default off)** — `attention_decode_splitk_partial_gqa6_loop_f32` and
+  (default off)** — `attention_decode_splitk_partial_gqa6_f32` and
   `attention_decode_splitk_merge_gqa6_f32` serve the split-K decode selection
   on models whose query heads come in groups of six per KV head at `head_dim`
   256, at contexts up to 4,096. The shipping split-K partial pass runs one CTA

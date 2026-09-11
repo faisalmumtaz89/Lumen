@@ -48,10 +48,10 @@ use lumen_runtime::cuda::{
     attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_partial_shared_bytes,
     ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
     ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
-    ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM,
+    ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM, ATTN_SPLITK_GQA6_S_MAX,
 };
 
-const MAX_SEQ_LEN: u32 = 16_384;
+const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625; // 1 / sqrt(256)
 
 /// Absolute tolerance against the float64 reference. Every run prints the
@@ -67,10 +67,12 @@ const MAX_ABS_ERR_VS_SHIPPING: f64 = 2e-6;
 
 /// Contexts covering both boundaries of every tile and chunk arithmetic in
 /// play: the single-position case, either side of one GQA-shared chunk (16),
-/// either side of one shipping tile (128), the board shape, and the cap.
+/// either side of one shipping tile (128), the board shapes, either side of
+/// the one-tile form's compile-time reach (16,384), and the contexts only the
+/// whole-tile partition can serve, to the cache's end.
 const LENGTHS: &[u32] = &[
     1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4095, 4096, 4097, 6144, 8192, 12288,
-    16383, 16384,
+    16383, 16384, 16385, 24576, 32767, 32768,
 ];
 
 /// A query-head / KV-head pair the dispatcher admits: any 6:1 group.
@@ -84,6 +86,14 @@ struct Geom {
 /// below its one-tile bound (bit-identical to every release since it shipped).
 fn one_tile_chunks(seq_len: u32) -> u32 {
     attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1).0
+}
+
+/// The geometry the sweep runs at a length: the one-tile form wherever it
+/// can serve (its split count within the merge's compile-time ceiling), the
+/// whole-tile partition at the shipped target beyond that — the only form
+/// that reaches 16,385 keys and more.
+fn sweep_geometry(seq_len: u32) -> (u32, u32) {
+    attn_splitk_gqa6_geometry_within(seq_len, ATTN_SPLITK_GQA6_S_MAX, 128)
 }
 
 /// The 27B full-attention shape.
@@ -244,8 +254,8 @@ fn upload(dev: &CudaDevice, inp: &Inputs) -> Gpu {
 /// The scratch is NaN-filled first: an element the partial pass fails to
 /// write reaches the merge as NaN, and `max_abs_err` rejects a non-finite
 /// result rather than scoring it zero.
-fn run_gqa6(dev: &CudaDevice, g: Geom, gpu: &Gpu, seq_len: u32, chunks: u32) -> Vec<f32> {
-    run_gqa6_at(dev, g, gpu, seq_len, chunks, 0)
+fn run_gqa6(dev: &CudaDevice, g: Geom, gpu: &Gpu, seq_len: u32, geometry: (u32, u32)) -> Vec<f32> {
+    run_gqa6_at(dev, g, gpu, seq_len, geometry.0, geometry.1)
 }
 
 /// The pair at an explicit `(chunks, partition)`: `0` the one-tile form,
@@ -383,21 +393,33 @@ fn run_shipping(dev: &CudaDevice, g: Geom, gpu: &Gpu, seq_len: u32) -> Vec<f32> 
     dev.dtoh_copy(&out).expect("out")
 }
 
-/// The sweep has to reach the boundary the dispatcher stops at, or a retune
-/// of the chunk length would quietly leave the longest eligible context
-/// untested. Runs with or without a GPU.
+/// The sweep has to straddle the one-tile form's compile-time reach and go
+/// on to the cache's end, or a retune would quietly leave the longest
+/// contexts — the ones only the whole-tile partition serves — untested.
+/// Runs with or without a GPU.
 #[test]
 fn the_sweep_reaches_the_longest_eligible_context() {
     let cap = attn_splitk_gqa6_max_seq_len();
+    for at in [cap - 1, cap, cap + 1] {
+        assert!(
+            LENGTHS.contains(&at),
+            "the sweep skips {at}, at the one-tile form's {cap}-position reach"
+        );
+    }
     assert_eq!(
         LENGTHS.iter().copied().max(),
-        Some(cap),
-        "the length sweep stops short of the {cap}-position bound"
+        Some(MAX_SEQ_LEN),
+        "the length sweep stops short of the cache's end"
     );
     assert!(
-        LENGTHS.contains(&(cap - 1)),
-        "the sweep skips the length just inside the bound"
+        MAX_SEQ_LEN >= 2 * cap,
+        "the cache must reach past what the one-tile form can serve"
     );
+    for &seq_len in LENGTHS {
+        let (chunks, partition) = sweep_geometry(seq_len);
+        assert_eq!(partition == 0, chunks == one_tile_chunks(seq_len));
+        assert!(chunks <= ATTN_SPLITK_GQA6_S_MAX);
+    }
 }
 
 /// The guard that makes every other assertion in this file mean something.
@@ -448,7 +470,7 @@ fn gqa6_matches_the_f64_reference_at_every_length() {
         let gpu = upload(&dev, &inp);
         for &seq_len in LENGTHS {
             let want = reference(g, &inp, seq_len);
-            let got = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+            let got = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
             let (err, at) = max_abs_err(&got, &want)
                 .unwrap_or_else(|e| panic!("{} seq_len {seq_len}: {e}", g.label()));
             // The observed maximum is part of the record: the tolerance's
@@ -480,7 +502,7 @@ fn gqa6_matches_the_f64_reference_under_a_wide_score_spread() {
         let gpu = upload(&dev, &inp);
         for &seq_len in LENGTHS {
             let want = reference(g, &inp, seq_len);
-            let got = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+            let got = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
             let (err, at) = max_abs_err(&got, &want)
                 .unwrap_or_else(|e| panic!("{} seq_len {seq_len}: {e}", g.label()));
             assert!(
@@ -504,7 +526,7 @@ fn gqa6_zero_query_averages_the_values() {
     let gpu = upload(&dev, &inp);
     for &seq_len in LENGTHS {
         let want = reference(g, &inp, seq_len);
-        let got = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+        let got = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
         let (err, at) =
             max_abs_err(&got, &want).unwrap_or_else(|e| panic!("seq_len {seq_len}: {e}"));
         assert!(
@@ -521,7 +543,7 @@ fn gqa6_agrees_with_the_shipping_pair_at_every_length() {
         let inp = make_inputs(g, 0x5153, 1.0);
         let gpu = upload(&dev, &inp);
         for &seq_len in LENGTHS {
-            let mine = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+            let mine = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
             let theirs = run_shipping(&dev, g, &gpu, seq_len);
             let as_f64: Vec<f64> = theirs.iter().map(|x| f64::from(*x)).collect();
             let (err, at) = max_abs_err(&mine, &as_f64)
@@ -555,7 +577,7 @@ fn gqa6_is_no_further_from_the_reference_than_the_shipping_pair() {
             let gpu = upload(&dev, &inp);
             for &seq_len in LENGTHS {
                 let want = reference(g, &inp, seq_len);
-                let mine = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+                let mine = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
                 let theirs = run_shipping(&dev, g, &gpu, seq_len);
                 let (a, _) = max_abs_err(&mine, &want)
                     .unwrap_or_else(|e| panic!("gqa6 {} seq_len {seq_len}: {e}", g.label()));
@@ -583,9 +605,9 @@ fn gqa6_is_bit_reproducible() {
     let inp = make_inputs(g, 0x5157, 1.0);
     let gpu = upload(&dev, &inp);
     for &seq_len in LENGTHS {
-        let chunks = one_tile_chunks(seq_len);
-        let first = run_gqa6(&dev, g, &gpu, seq_len, chunks);
-        let second = run_gqa6(&dev, g, &gpu, seq_len, chunks);
+        let geometry = sweep_geometry(seq_len);
+        let first = run_gqa6(&dev, g, &gpu, seq_len, geometry);
+        let second = run_gqa6(&dev, g, &gpu, seq_len, geometry);
         let differing = first
             .iter()
             .zip(second.iter())
@@ -623,7 +645,7 @@ fn gqa6_empty_chunks_contribute_nothing() {
             "seq_len {seq_len}: span {span} outgrows the chunk length"
         );
         let want = reference(g, &inp, seq_len);
-        let got = run_gqa6(&dev, g, &gpu, seq_len, padded);
+        let got = run_gqa6(&dev, g, &gpu, seq_len, (padded, 0));
         let (err, at) = max_abs_err(&got, &want)
             .unwrap_or_else(|e| panic!("seq_len {seq_len} with {padded} chunks: {e}"));
         assert!(
@@ -646,7 +668,8 @@ fn gqa6_whole_tile_partition_matches_the_f64_reference() {
         let inp = make_inputs(g, 0x5158, 1.0);
         let gpu = upload(&dev, &inp);
         for &seq_len in &[
-            2817u32, 2831, 2832, 2833, 3968, 4096, 4097, 6144, 8192, 12288, 16383, 16384,
+            2817u32, 2831, 2832, 2833, 3968, 4096, 4097, 6144, 8192, 12288, 16383, 16384, 16385,
+            24576, 32767, 32768,
         ] {
             let want = reference(g, &inp, seq_len);
             let got = run_gqa6_at(&dev, g, &gpu, seq_len, 128, 1);
@@ -661,7 +684,11 @@ fn gqa6_whole_tile_partition_matches_the_f64_reference() {
                 "{} whole-tile seq_len {seq_len}: max abs error {err:.3e} at element {at}",
                 g.label()
             );
-            let one_tile = run_gqa6(&dev, g, &gpu, seq_len, one_tile_chunks(seq_len));
+            // The one-tile form is a comparator only where it can serve.
+            if one_tile_chunks(seq_len) > ATTN_SPLITK_GQA6_S_MAX {
+                continue;
+            }
+            let one_tile = run_gqa6(&dev, g, &gpu, seq_len, (one_tile_chunks(seq_len), 0));
             let (d, _) = max_abs_err(
                 &got,
                 &one_tile.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
@@ -683,7 +710,7 @@ fn gqa6_whole_tile_partition_is_bit_reproducible() {
     let g = G24_4;
     let inp = make_inputs(g, 0x5159, 1.0);
     let gpu = upload(&dev, &inp);
-    for &seq_len in &[2817u32, 6144, 16384] {
+    for &seq_len in &[2817u32, 6144, 16384, 32768] {
         let a = run_gqa6_at(&dev, g, &gpu, seq_len, 128, 1);
         let b = run_gqa6_at(&dev, g, &gpu, seq_len, 128, 1);
         assert!(

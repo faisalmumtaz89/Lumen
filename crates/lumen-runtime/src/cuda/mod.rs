@@ -55,7 +55,8 @@ pub use prefill::{
     attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_onetile_shared_bytes,
     attn_splitk_gqa6_onetile_shared_bytes_f16, attn_splitk_gqa6_partial_shared_bytes,
     attn_splitk_gqa6_partial_shared_bytes_f16, attn_splitk_gqa6_scratch_chunks,
-    ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
+    attn_splitk_gqa6_scratch_chunks_within, ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES,
+    ATTN_SPLITK_GQA6_HEAD_DIM, ATTN_SPLITK_GQA6_S_MAX,
 };
 
 // ---------------------------------------------------------------------------

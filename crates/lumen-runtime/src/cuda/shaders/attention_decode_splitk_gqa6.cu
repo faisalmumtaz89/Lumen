@@ -56,10 +56,10 @@
 // quality-equivalent NEAR-TIE rather than bit-identical — the same relationship
 // the split-K pair has with the tiled kernel. Deterministic for a fixed
 // (S, partition): every reduction is a fixed tree and every accumulation walks
-// ascending indices. Against an F64 reference over 24 heads x head_dim 256 the
-// largest absolute error observed at contexts from 1 to 32,768 is 6.7e-7
-// (one tile per CTA: 4.3e-7), below the 7.2e-7 of attention_decode_splitk.cu
-// on the same inputs.
+// ascending indices. The integration suite holds both partitions within
+// 2e-6 of an F64 reference at every context from 1 to 32,768 keys and prints
+// the observed maximum per length, so the headroom is a recorded number
+// rather than a figure in this comment.
 //
 // The empty-range arm writes (m = -inf, l = 0, o = 0) and the merge drops it,
 // exactly as in attention_decode_splitk.cu. It is DEFENSIVE: neither partition
@@ -176,10 +176,12 @@ __device__ __forceinline__ float4 gqa6_h4_to_f4(unsigned int lo, unsigned int hi
 // 22,984 B of shared, the half loop runs five (14,792 B). The retained one-tile
 // partials compile to 72 registers on the same path and the half one runs six
 // CTAs per SM (shared-limited at 14,768 B); bounding the half loop to six
-// (rounds 7–8) forces 80 registers with spills to local memory on this path
-// and was measured slower at every context, so the loop keeps five.
-// A runtime guard traps a CTA whose tile would exceed 16 keys (never with a
-// correct host); NaN partials would then reach the merge.
+// forces 80 registers with spills to local memory on this path and was
+// measured slower at every context, so the loop keeps five.
+// A CTA whose tile would exceed 16 keys calls __trap(), which aborts the
+// launch (the driver reports the error at the next synchronisation; no
+// partial reaches the merge). It is unreachable by construction: both host
+// partitions keep S >= ceil(keys / 16), so every tile spans at most 16 keys.
 // --------------------------------------------------------------------------
 
 // The CTA's key range.
@@ -451,7 +453,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_par
 // reference for the loop's one-tile form: grid (S, num_kv_heads) with
 // S = ceil(keys / C), one chunk of at most C <= 32 keys per CTA, the same
 // per-tile arithmetic the loop runs. Byte-for-byte the kernels of the
-// previous release (the r5 bound raise); the loop's first tile reproduces
+// previous release (before this release's bound raise); the loop's first tile reproduces
 // them bit for bit. Shared: 6*256 Q + C*256 V (halves for _f16) + 6*C scores
 // + 12 (m, l) floats.
 // --------------------------------------------------------------------------

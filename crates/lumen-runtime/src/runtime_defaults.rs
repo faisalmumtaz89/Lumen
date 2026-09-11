@@ -1221,14 +1221,14 @@ pub fn set_build_identity(identity: &str) {
 static BUILD_IDENTITY: OnceLock<String> = OnceLock::new();
 
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`: the A/B control for the
-/// one-tile-per-CTA form the GQA-shared pair took through the r5 bound raise.
+/// one-tile-per-CTA form the GQA-shared pair took through the bound raise in this release.
 /// Unset (the default) means no bound: the pair walks tiles in a loop with the
 /// split count held at [`attn_splitk_gqa6_target`] and serves any context the
 /// cache holds. Set to `n`, the pair runs one tile per CTA up to `n` chunks of
 /// 16 keys (clamped to `ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`) with the scratch
 /// sized for `n`, and a longer context hands off to the per-query-head pair
 /// exactly as before the loop — `256` reproduces the v0.29.0/v0.30.0
-/// behaviour (4,096 positions), `1024` the r5 bound raise (16,384). `0` or an
+/// behaviour (4,096 positions), `1024` this release's bound raise (16,384). `0` or an
 /// unparsable value is unset.
 pub fn attn_splitk_gqa6_max_chunks() -> Option<u32> {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS")
@@ -1247,11 +1247,13 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`: up to this many 16-key tiles the
 /// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
 /// above it the CTAs walk whole tiles at the fixed target. The default is per
-/// store, from the RTX 5090 sweeps (r5 step 3, rounds 4–8): 176 on the F32
+/// store, from the RTX 5090 sweeps: 176 on the F32
 /// store (never slower than the one-tile form below it, faster above), 256 on
 /// the half store (whose one-tile kernel runs six CTAs per SM against the
-/// loop's five and keeps a one-wave edge to 255 tiles; the loop's worst cell
-/// is then +8 % at 3,968 keys, elsewhere −10 to −29 %). Clamped to
+/// loop's five and keeps a one-wave edge to 255 tiles; the loop is then
+/// slower only in the band 3,392–4,080 keys, where the six-CTA kernel fits
+/// one wave and the loop takes two: +4 % at 3,600 keys, +8 % at 3,968;
+/// elsewhere −10 to −29 %). Clamped to
 /// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
@@ -1268,9 +1270,10 @@ pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
 
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET`: the split count the GQA-shared pair
 /// holds above the one-tile bound; each CTA walks a balanced run of whole
-/// tiles. Default 128: on the RTX 5090 within 4 % of the best measured count
-/// at every context from 6,144 to 32,768 keys on both stores (r5 step 3,
-/// round 5); 64 starves the machine, 176+ splits too finely below 16k. The
+/// tiles. Default 128: on the RTX 5090, at every context from 6,144 to
+/// 32,768 keys, within 3 % of the best measured count on the F32 store and
+/// within 6 % on the half store (the gap at 32,768 keys, where 176 is best);
+/// 64 starves the machine, 176 splits too finely below 16k. The
 /// scratch is sized for `max(one-tile bound, target)` chunks and never grows
 /// with the context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
 pub fn attn_splitk_gqa6_target() -> u32 {

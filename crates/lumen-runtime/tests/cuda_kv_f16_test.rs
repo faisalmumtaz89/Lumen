@@ -25,6 +25,7 @@ use lumen_runtime::cuda::shaders::{
 };
 use lumen_runtime::cuda::{
     attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
+    attn_splitk_gqa6_onetile_shared_bytes, attn_splitk_gqa6_onetile_shared_bytes_f16,
     attn_splitk_gqa6_partial_shared_bytes, attn_splitk_gqa6_partial_shared_bytes_f16,
     ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
     ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
@@ -263,6 +264,93 @@ fn run_tiled<K: cudarc::driver::DeviceRepr>(
 
 fn bits(xs: &[f32]) -> Vec<u32> {
     xs.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Below the one-tile bound the loop partials reproduce the previous
+/// release's one-tile partials bit for bit on both stores — the retained
+/// kernels are the reference, in the same binary and through the same
+/// compile path, at every partial (m, l, o) and the merged output.
+#[test]
+fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
+    let Some(dev) = try_device() else { return };
+    let inp = make_inputs(0x0005_0911_F16A_0002);
+    let q = dev.htod_copy(&inp.q).unwrap();
+    let k32 = dev.htod_copy(&inp.k).unwrap();
+    let v32 = dev.htod_copy(&inp.v).unwrap();
+    let k16 = dev.htod_copy(&inp.k16).unwrap();
+    let v16 = dev.htod_copy(&inp.v16).unwrap();
+    type Parts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+    fn check(old: &Parts, new: &Parts, store: &str, seq_len: u32) {
+        for (name, a, b) in [
+            ("m", &old.0, &new.0),
+            ("l", &old.1, &new.1),
+            ("o", &old.2, &new.2),
+            ("out", &old.3, &new.3),
+        ] {
+            assert!(
+                b.iter().all(|x| x.is_finite()),
+                "{store} seq_len {seq_len}: the loop's {name} is not finite"
+            );
+            if let Some(at) = a
+                .iter()
+                .zip(b)
+                .position(|(x, y)| x.to_bits() != y.to_bits())
+            {
+                panic!(
+                    "{store} seq_len {seq_len}: the loop's {name} differs from the one-tile \
+                     kernel at element {at} (one-tile {}, loop {})",
+                    a[at], b[at]
+                );
+            }
+        }
+    }
+    for &seq_len in LENGTHS {
+        // One CTA per tile on both kernels; the one-tile kernel takes the
+        // tile length where the loop takes its partition.
+        let (chunks, _) = attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1);
+        let old = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_f32",
+            attn_splitk_gqa6_onetile_shared_bytes(),
+            &q,
+            &k32,
+            &v32,
+            seq_len,
+            (chunks, GQA6_CHUNK),
+        );
+        let new = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_loop_f32",
+            attn_splitk_gqa6_partial_shared_bytes(),
+            &q,
+            &k32,
+            &v32,
+            seq_len,
+            (chunks, 0),
+        );
+        check(&old, &new, "F32", seq_len);
+        let old = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_f16",
+            attn_splitk_gqa6_onetile_shared_bytes_f16(),
+            &q,
+            &k16,
+            &v16,
+            seq_len,
+            (chunks, GQA6_CHUNK),
+        );
+        let new = run_gqa6_partial(
+            &dev,
+            "attention_decode_splitk_partial_gqa6_loop_f16",
+            attn_splitk_gqa6_partial_shared_bytes_f16(),
+            &q,
+            &k16,
+            &v16,
+            seq_len,
+            (chunks, 0),
+        );
+        check(&old, &new, "half", seq_len);
+    }
 }
 
 #[test]
