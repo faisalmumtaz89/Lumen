@@ -25,7 +25,7 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::{
     decode_attention_geometry_within, decode_attention_merge_shared_bytes, DecodeAttentionSpec,
-    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_REVIEWED_SHAPE as SPEC,
+    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_FIXTURE_SHAPE as SPEC,
 };
 use std::fmt::Write as _;
 

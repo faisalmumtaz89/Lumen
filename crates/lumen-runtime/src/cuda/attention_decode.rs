@@ -117,16 +117,16 @@ impl DecodeAttentionSpec {
     }
 }
 
-/// The reviewed shape of the kernel (Qwen3.8-27B: 24 query heads over 4 KV
+/// The reference fixture's shape (Qwen3.8-27B: 24 query heads over 4 KV
 /// heads at head_dim 256), which the reference fixture pins bit for bit.
-pub const ATTN_DECODE_REVIEWED_SHAPE: DecodeAttentionSpec = DecodeAttentionSpec {
+pub const ATTN_DECODE_FIXTURE_SHAPE: DecodeAttentionSpec = DecodeAttentionSpec {
     group: 6,
     head_dim: 256,
 };
 
 const _: () = assert!(ATTN_DECODE_TILE <= 32);
-const _: () = assert!(ATTN_DECODE_REVIEWED_SHAPE.partial_shared_bytes(false) == 22_984);
-const _: () = assert!(ATTN_DECODE_REVIEWED_SHAPE.partial_shared_bytes(true) == 14_792);
+const _: () = assert!(ATTN_DECODE_FIXTURE_SHAPE.partial_shared_bytes(false) == 22_984);
+const _: () = assert!(ATTN_DECODE_FIXTURE_SHAPE.partial_shared_bytes(true) == 14_792);
 // The largest admitted shape stays under the 48 KiB default dynamic-shared
 // cap, so no opt-in is ever needed.
 const _: () = assert!(
@@ -733,7 +733,7 @@ mod tests {
                 .map(|v| v.trim_end_matches('u')),
             Some("16")
         );
-        let text = ATTN_DECODE_REVIEWED_SHAPE.source();
+        let text = ATTN_DECODE_FIXTURE_SHAPE.source();
         assert!(text.starts_with("#define DECODE_G 6u\n#define DECODE_HD 256u\n"));
         assert!(text.ends_with(src));
     }
@@ -751,7 +751,7 @@ mod tests {
         );
         assert_eq!(
             DecodeAttentionSpec::for_shape(24, 4, 256),
-            Ok(ATTN_DECODE_REVIEWED_SHAPE)
+            Ok(ATTN_DECODE_FIXTURE_SHAPE)
         );
         assert_eq!(
             DecodeAttentionSpec::for_shape(16, 2, 256),
@@ -813,6 +813,12 @@ mod tests {
             (176, 0),
             (0, 0),
         ] {
+            // The helper holds both knobs to 1..=ATTN_DECODE_S_MAX; the
+            // expectations below are stated on the held values.
+            let (one_tile, target) = (
+                one_tile.clamp(1, ATTN_DECODE_S_MAX),
+                target.clamp(1, ATTN_DECODE_S_MAX),
+            );
             for seq_len in (1..=70_000)
                 .step_by(7)
                 .chain([1u32, 16, 17, 2816, 2817, 4096, 65_536])

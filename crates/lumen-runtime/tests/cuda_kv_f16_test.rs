@@ -22,7 +22,7 @@ use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::shaders::{KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
 use lumen_runtime::cuda::{
     decode_attention_merge_shared_bytes, ATTN_DECODE_BLOCK_DIM as BLOCK_DIM,
-    ATTN_DECODE_REVIEWED_SHAPE as SPEC, ATTN_DECODE_TILE,
+    ATTN_DECODE_FIXTURE_SHAPE as SPEC, ATTN_DECODE_TILE,
 };
 const HEAD_DIM: u32 = SPEC.head_dim;
 const DIM_TILES: u32 = SPEC.dim_tiles();

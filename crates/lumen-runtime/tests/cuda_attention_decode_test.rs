@@ -41,7 +41,7 @@ use lumen_runtime::cuda::ffi::CudaDevice;
 // cannot leave this mirror describing a kernel production no longer runs.
 use lumen_runtime::cuda::{
     decode_attention_geometry_within, decode_attention_merge_shared_bytes,
-    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_REVIEWED_SHAPE as SPEC, ATTN_DECODE_S_MAX,
+    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_FIXTURE_SHAPE as SPEC, ATTN_DECODE_S_MAX,
     ATTN_DECODE_TILE as DECODE_CHUNK,
 };
 const HEAD_DIM: u32 = SPEC.head_dim;
