@@ -2040,7 +2040,8 @@ pub const ATTN_SPLITK_GQA6_CHUNK: u32 = 16;
 /// per CTA up to `attn_splitk_gqa6_one_tile_max()` chunks, then a fixed
 /// `attn_splitk_gqa6_target()` CTAs walking whole tiles, so the scratch
 /// (`num_heads * S * head_dim` floats) is bounded by the larger of the two
-/// (3.0 MiB at 176 / 128 on a 24-head, 256-dimension model) and never grows
+/// (4.2 MiB at 176 / 128 on a 24-head, 256-dimension model, 6.0 MiB at the
+/// half store's 256) and never grows
 /// with the context. Under `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` the pair
 /// runs the pre-loop one-tile form up to that many chunks (at most this
 /// constant, 24.2 MiB of scratch) and a longer context hands off to the
@@ -2098,6 +2099,25 @@ pub fn attn_splitk_gqa6_chunk_bound() -> u32 {
     }
 }
 
+/// Whether the A/B control is in force (`LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
+/// set): the launchers then run the previous release's one-tile partials, the
+/// kernels of that release byte for byte, so a comparison against the loop
+/// measures the kernels and not a policy inside one kernel.
+pub fn attn_splitk_gqa6_control() -> bool {
+    crate::runtime_defaults::attn_splitk_gqa6_max_chunks().is_some()
+}
+
+/// Dynamic shared bytes of the retained one-tile partials (the previous
+/// release's layout: no rescale slots). 22'960 B (F32) / 14'768 B (half).
+pub const fn attn_splitk_gqa6_onetile_shared_bytes() -> u32 {
+    attn_splitk_gqa6_partial_shared_bytes() - ATTN_SPLITK_GQA6_GQA_RATIO * 4
+}
+pub const fn attn_splitk_gqa6_onetile_shared_bytes_f16() -> u32 {
+    attn_splitk_gqa6_partial_shared_bytes_f16() - ATTN_SPLITK_GQA6_GQA_RATIO * 4
+}
+const _: () = assert!(attn_splitk_gqa6_onetile_shared_bytes() == 22_960);
+const _: () = assert!(attn_splitk_gqa6_onetile_shared_bytes_f16() == 14_768);
+
 /// The partition a launch takes: `0`, one tile per CTA on the pre-loop span
 /// partition (`S = ceil(seq_len / 16)`, span `ceil(seq_len / S)`); `1`, the
 /// balanced whole-tile partition at a fixed split count.
@@ -2127,7 +2147,9 @@ pub const fn attn_splitk_gqa6_geometry_within(
     if n <= one_tile_max {
         (n, 0)
     } else {
-        (target, 1)
+        // Never more CTAs than tiles: a target above the tile count would
+        // leave CTAs empty and ask for scratch a short cache never sized.
+        (if target < n { target } else { n }, 1)
     }
 }
 
@@ -2138,7 +2160,8 @@ pub fn attn_splitk_gqa6_chunks(seq_len: u32, half_store: bool) -> u32 {
 
 /// The split count the scratch must hold for a cache of `max_seq_len`: the
 /// largest count any context up to it can take — the one-tile bound or the
-/// target, whichever is larger, capped by what the cache can even reach.
+/// target, whichever is larger, capped by the tile count the cache can even
+/// reach (the geometry never launches more CTAs than tiles, so this is exact).
 pub fn attn_splitk_gqa6_scratch_chunks(max_seq_len: u32, half_store: bool) -> u32 {
     let n_max = max_seq_len.div_ceil(ATTN_SPLITK_GQA6_CHUNK).max(1);
     let one_tile = attn_splitk_gqa6_one_tile_bound(half_store);
@@ -2322,43 +2345,80 @@ unsafe fn launch_attention_decode_splitk_gqa6(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<(), RuntimeError> {
-    let (partial_fn, merge_fn) = match (
-        kernels.attention_decode_splitk_partial_gqa6.as_ref(),
-        kernels.attention_decode_splitk_merge_gqa6.as_ref(),
-    ) {
-        (Some(p), Some(m)) => (p, m),
-        _ => {
-            return Err(RuntimeError::Compute(
-                "attention_decode_splitk_gqa6: kernels not available".into(),
-            ))
-        }
-    };
+    let merge_fn = kernels
+        .attention_decode_splitk_merge_gqa6
+        .as_ref()
+        .ok_or_else(|| {
+            RuntimeError::Compute("attention_decode_splitk_gqa6: merge not available".into())
+        })?;
     let (s, partition) = attn_splitk_gqa6_geometry(seq_len, false);
     let (m_part, l_part, o_part) = scratch;
-    device
-        .stream
-        .launch_builder(partial_fn)
-        .arg(q)
-        .arg(k_cache)
-        .arg(v_cache)
-        .arg(&mut *m_part)
-        .arg(&mut *l_part)
-        .arg(&mut *o_part)
-        .arg(&seq_len)
-        .arg(&max_seq_len)
-        .arg(&scale)
-        .arg(&s)
-        .arg(&partition)
-        .launch(CudarcLaunchConfig {
-            grid_dim: (s, num_kv_heads, 1),
-            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
-        })
-        .map_err(|e| {
-            RuntimeError::Compute(format!(
-                "attention_decode_splitk_partial_gqa6_loop_f32: {e}"
-            ))
-        })?;
+    if attn_splitk_gqa6_control() {
+        // The A/B control: the previous release's one-tile partial, on its own
+        // signature (a chunk cap, one chunk per CTA).
+        let partial_fn = kernels
+            .attention_decode_splitk_partial_gqa6_onetile
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute(
+                    "attention_decode_splitk_gqa6: the one-tile control kernel did not load".into(),
+                )
+            })?;
+        let chunk = ATTN_SPLITK_GQA6_CHUNK;
+        device
+            .stream
+            .launch_builder(partial_fn)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&mut *m_part)
+            .arg(&mut *l_part)
+            .arg(&mut *o_part)
+            .arg(&seq_len)
+            .arg(&max_seq_len)
+            .arg(&scale)
+            .arg(&s)
+            .arg(&chunk)
+            .launch(CudarcLaunchConfig {
+                grid_dim: (s, num_kv_heads, 1),
+                block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: attn_splitk_gqa6_onetile_shared_bytes(),
+            })
+            .map_err(|e| {
+                RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f32: {e}"))
+            })?;
+    } else {
+        let partial_fn = kernels
+            .attention_decode_splitk_partial_gqa6
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Compute("attention_decode_splitk_gqa6: kernels not available".into())
+            })?;
+        device
+            .stream
+            .launch_builder(partial_fn)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&mut *m_part)
+            .arg(&mut *l_part)
+            .arg(&mut *o_part)
+            .arg(&seq_len)
+            .arg(&max_seq_len)
+            .arg(&scale)
+            .arg(&s)
+            .arg(&partition)
+            .launch(CudarcLaunchConfig {
+                grid_dim: (s, num_kv_heads, 1),
+                block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes(),
+            })
+            .map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "attention_decode_splitk_partial_gqa6_loop_f32: {e}"
+                ))
+            })?;
+    }
     device
         .stream
         .launch_builder(merge_fn)
@@ -2409,8 +2469,13 @@ fn announce_splitk_gqa6_route(num_heads: u32, num_kv_heads: u32, head_dim: u32, 
     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     super::decode::announce_route_once(&SEEN, || {
         let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, false);
+        let kernel = if attn_splitk_gqa6_control() {
+            "attention_decode_splitk_partial_gqa6_f32"
+        } else {
+            "attention_decode_splitk_partial_gqa6_loop_f32"
+        };
         format!(
-            "[CUDA] attention_decode_splitk_partial_gqa6_loop_f32: ACTIVE (kv=f32, \
+            "[CUDA] {kernel}: ACTIVE (kv=f32, \
              q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
              seq_len={seq_len}, chunks={chunks}, partition={partition}, tile={tile}, \
              one_tile_max={one_tile}, target={target}, block={block}, \
@@ -2810,18 +2875,39 @@ fn dump_attention_call(
     };
     let out_host: Vec<f32> = device.dtoh_copy_view(&attn_out.slice(0..nh * hd))?;
     write_f32("out.f32", &out_host)?;
+    let control = attn_splitk_gqa6_control();
     let route = match variant {
         AttentionDecodeVariant::SingleBlock => "attention_decode",
         AttentionDecodeVariant::Tiled => "attention_decode_tiled",
         AttentionDecodeVariant::SplitK => "attention_decode_splitk_partial",
+        AttentionDecodeVariant::SplitKGqa6 if control => "attention_decode_splitk_partial_gqa6_f32",
         AttentionDecodeVariant::SplitKGqa6 => "attention_decode_splitk_partial_gqa6_loop_f32",
         AttentionDecodeVariant::TiledF16 => "attention_decode_tiled_f16",
+        AttentionDecodeVariant::SplitKGqa6F16 if control => {
+            "attention_decode_splitk_partial_gqa6_f16"
+        }
         AttentionDecodeVariant::SplitKGqa6F16 => "attention_decode_splitk_partial_gqa6_loop_f16",
         AttentionDecodeVariant::SplitKF16 => "attention_decode_splitk_partial_f16",
     };
+    // The GQA-shared launch geometry the call took, so a replay can reproduce
+    // the reduction order (the same route name and context can take different
+    // orders under the policy knobs).
+    let geometry = match variant {
+        AttentionDecodeVariant::SplitKGqa6 | AttentionDecodeVariant::SplitKGqa6F16 => {
+            let half = matches!(variant, AttentionDecodeVariant::SplitKGqa6F16);
+            let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, half);
+            format!(
+                ",\n \"gqa6_chunks\": {chunks},\n \"gqa6_partition\": \"{}\",\n \"gqa6_one_tile_max\": {},\n \"gqa6_target\": {},\n \"gqa6_control\": {control}",
+                if partition == 0 { "one-tile" } else { "whole-tile" },
+                attn_splitk_gqa6_one_tile_bound(half),
+                crate::runtime_defaults::attn_splitk_gqa6_target(),
+            )
+        }
+        _ => String::new(),
+    };
     let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
-        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"kv_dtype\": \"{kv_dtype}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}\n}}\n"
+        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"kv_dtype\": \"{kv_dtype}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}{geometry}\n}}\n"
     );
     std::fs::write(stem.with_extension("json"), meta).map_err(io)
 }
@@ -4927,6 +5013,16 @@ mod attn_splitk_gqa6_tests {
             (128, 1)
         );
         assert_eq!(attn_splitk_gqa6_geometry_within(0, 176, 128), (1, 0));
+        // one_tile < N < target: S = N on the whole-tile partition, never more CTAs than tiles
+        assert_eq!(attn_splitk_gqa6_geometry_within(2817, 176, 340), (177, 1));
+        assert_eq!(
+            attn_splitk_gqa6_geometry_within(340 * 16, 176, 340),
+            (340, 1)
+        );
+        assert_eq!(
+            attn_splitk_gqa6_geometry_within(340 * 16 + 1, 176, 340),
+            (340, 1)
+        );
     }
 
     /// The kernel repeats the group size, head dimension and block width as
@@ -5233,30 +5329,56 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
         })?;
     let (s, partition) = attn_splitk_gqa6_geometry(seq_len, true);
     let (m_part, l_part, o_part) = scratch;
-    device
-        .stream
-        .launch_builder(&f16.splitk_partial_gqa6)
-        .arg(q)
-        .arg(k_cache)
-        .arg(v_cache)
-        .arg(&mut *m_part)
-        .arg(&mut *l_part)
-        .arg(&mut *o_part)
-        .arg(&seq_len)
-        .arg(&max_seq_len)
-        .arg(&scale)
-        .arg(&s)
-        .arg(&partition)
-        .launch(CudarcLaunchConfig {
-            grid_dim: (s, num_kv_heads, 1),
-            block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes_f16(),
-        })
-        .map_err(|e| {
-            RuntimeError::Compute(format!(
-                "attention_decode_splitk_partial_gqa6_loop_f16: {e}"
-            ))
-        })?;
+    if attn_splitk_gqa6_control() {
+        let chunk = ATTN_SPLITK_GQA6_CHUNK;
+        device
+            .stream
+            .launch_builder(&f16.splitk_partial_gqa6_onetile)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&mut *m_part)
+            .arg(&mut *l_part)
+            .arg(&mut *o_part)
+            .arg(&seq_len)
+            .arg(&max_seq_len)
+            .arg(&scale)
+            .arg(&s)
+            .arg(&chunk)
+            .launch(CudarcLaunchConfig {
+                grid_dim: (s, num_kv_heads, 1),
+                block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: attn_splitk_gqa6_onetile_shared_bytes_f16(),
+            })
+            .map_err(|e| {
+                RuntimeError::Compute(format!("attention_decode_splitk_partial_gqa6_f16: {e}"))
+            })?;
+    } else {
+        device
+            .stream
+            .launch_builder(&f16.splitk_partial_gqa6)
+            .arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&mut *m_part)
+            .arg(&mut *l_part)
+            .arg(&mut *o_part)
+            .arg(&seq_len)
+            .arg(&max_seq_len)
+            .arg(&scale)
+            .arg(&s)
+            .arg(&partition)
+            .launch(CudarcLaunchConfig {
+                grid_dim: (s, num_kv_heads, 1),
+                block_dim: (ATTN_DECODE_TILED_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: attn_splitk_gqa6_partial_shared_bytes_f16(),
+            })
+            .map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "attention_decode_splitk_partial_gqa6_loop_f16: {e}"
+                ))
+            })?;
+    }
     device
         .stream
         .launch_builder(merge_fn)
@@ -5326,8 +5448,13 @@ fn announce_splitk_gqa6_route_f16(num_heads: u32, num_kv_heads: u32, head_dim: u
     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     super::decode::announce_route_once(&SEEN, || {
         let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, true);
+        let kernel = if attn_splitk_gqa6_control() {
+            "attention_decode_splitk_partial_gqa6_f16"
+        } else {
+            "attention_decode_splitk_partial_gqa6_loop_f16"
+        };
         format!(
-            "[CUDA] attention_decode_splitk_partial_gqa6_loop_f16: ACTIVE (kv=f16, \
+            "[CUDA] {kernel}: ACTIVE (kv=f16, \
              q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
              seq_len={seq_len}, chunks={chunks}, partition={partition}, tile={tile}, \
              one_tile_max={one_tile}, target={target}, block={block}, \

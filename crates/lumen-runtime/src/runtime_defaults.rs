@@ -1270,9 +1270,9 @@ pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
 /// holds above the one-tile bound; each CTA walks a balanced run of whole
 /// tiles. Default 128: on the RTX 5090 within 4 % of the best measured count
 /// at every context from 6,144 to 32,768 keys on both stores (r5 step 3,
-/// round 5); 64 starves the machine, 176+ splits too finely. The scratch is
-/// sized for `max(one-tile bound, target)` chunks and never grows with the
-/// context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
+/// round 5); 64 starves the machine, 176+ splits too finely below 16k. The
+/// scratch is sized for `max(one-tile bound, target)` chunks and never grows
+/// with the context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
 pub fn attn_splitk_gqa6_target() -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET")
         .ok()

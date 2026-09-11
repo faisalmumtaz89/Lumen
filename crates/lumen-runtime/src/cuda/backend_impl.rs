@@ -18013,7 +18013,8 @@ impl ComputeBackend for CudaBackend {
                     );
                 let s = if gqa6 {
                     // The loop policy bounds the split count whatever the
-                    // context (176 / 128 by default: 3.0 MiB on 24 heads); the
+                    // context (176 / 128 by default: 4.2 MiB on 24 heads, 6.0 MiB
+                    // for the half store's 256); the
                     // A/B control sizes it for its one-tile bound instead.
                     (super::prefill::attn_splitk_gqa6_scratch_chunks(
                         max_seq_len as u32,

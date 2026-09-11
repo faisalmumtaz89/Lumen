@@ -216,6 +216,11 @@ pub(crate) struct KernelSet {
     // route itself is enabled, since it is an alternative implementation of
     // that route; both must be present for it to dispatch.
     pub(crate) attention_decode_splitk_partial_gqa6: Option<CudaFunction>,
+    /// The previous one-tile partial (`attention_decode_splitk_partial_gqa6_f32`),
+    /// retained as the A/B control `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
+    /// launches; loaded with the loop, so the control is the kernel of the
+    /// previous release and a route census can tell the two apart.
+    pub(crate) attention_decode_splitk_partial_gqa6_onetile: Option<CudaFunction>,
     pub(crate) attention_decode_splitk_merge_gqa6: Option<CudaFunction>,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
@@ -923,6 +928,8 @@ pub(crate) struct KernelSet {
 pub(crate) struct KvF16Kernels {
     /// `attention_decode_splitk_partial_gqa6_loop_f16`; the F32 merge consumes its partials.
     pub(crate) splitk_partial_gqa6: CudaFunction,
+    /// `attention_decode_splitk_partial_gqa6_f16`, the previous one-tile partial (the A/B control).
+    pub(crate) splitk_partial_gqa6_onetile: CudaFunction,
     /// `attention_decode_splitk_partial_f16`, the per-query-head pair's partial; the F32
     /// merge consumes its partials. The twin of the route the F32 router takes outside the
     /// GQA-shared pair's window.
@@ -1074,6 +1081,10 @@ pub(crate) fn compile_all_kernels(
                 shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
                 "attention_decode_splitk_partial_gqa6_loop_f16",
             )?,
+            splitk_partial_gqa6_onetile: load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_gqa6_f16",
+            )?,
             splitk_partial: load_splitk(
                 shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
                 "attention_decode_splitk_partial_f16",
@@ -1203,6 +1214,20 @@ pub(crate) fn compile_all_kernels(
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_loop_f32: FAILED ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        attention_decode_splitk_partial_gqa6_onetile: if load_splitk_gqa6 {
+            match load_splitk(
+                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
+                "attention_decode_splitk_partial_gqa6_f32",
+            ) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
                     None
                 }
             }

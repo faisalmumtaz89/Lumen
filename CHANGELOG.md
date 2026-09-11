@@ -15,7 +15,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   the half store) each CTA takes one tile, bit-identical to every release
   since v0.29.0; above it the split count is held at 128 and each CTA walks a
   balanced run of whole tiles with the tiled kernel's running-max recurrence.
-  The split-K scratch is 3.0 MiB (F32) / 4.1 MiB (half) on Qwen3.8-27B at any
+  The split-K scratch is 4.2 MiB (F32) / 6.0 MiB (half) on Qwen3.8-27B at any
   context instead of growing with it (24.2 MiB at 16,384), and a generation
   that crosses 16,384 keys no longer hands off to the per-query-head pair.
   Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
@@ -24,10 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   3,968; 24,576 and 32,768 keys now served. `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
   and `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` set the policy;
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
-  set, restores the bounded form as an A/B control. The partials are new
-  kernels and carry new names (`attention_decode_splitk_partial_gqa6_loop_f32`
-  / `_loop_f16`); the merge (`attention_decode_splitk_merge_gqa6_f32`) is
-  unchanged, and the route lines name the new symbols.
+  set, restores the bounded form as an A/B control by launching the previous
+  release's one-tile partials, which stay compiled under their names
+  (`attention_decode_splitk_partial_gqa6_f32` / `_f16`). The loop partials are
+  new kernels with new names (`..._gqa6_loop_f32` / `_loop_f16`); the merge
+  (`attention_decode_splitk_merge_gqa6_f32`) is unchanged, and the route lines
+  name the kernel that ran.
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round

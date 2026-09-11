@@ -441,6 +441,324 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_splitk_par
 }
 
 // --------------------------------------------------------------------------
+// The previous one-tile partials, retained under their names as the A/B
+// control (`LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`) and as the tests'
+// reference for the loop's one-tile form: grid (S, num_kv_heads) with
+// S = ceil(keys / C), one chunk of at most C <= 32 keys per CTA, the same
+// per-tile arithmetic the loop runs. Byte-for-byte the kernels of the
+// previous release (the r5 bound raise); the loop's first tile reproduces
+// them bit for bit. Shared: 6*256 Q + C*256 V (halves for _f16) + 6*C scores
+// + 12 (m, l) floats.
+// --------------------------------------------------------------------------
+
+extern "C" __global__ void attention_decode_splitk_partial_gqa6_f32(
+    const float* __restrict__ q,           // [num_heads * 256]
+    const float* __restrict__ k_cache,     // [num_kv_heads, max_seq_len, 256]
+    const float* __restrict__ v_cache,     // [num_kv_heads, max_seq_len, 256]
+    float* __restrict__ m_part,            // [num_heads * S]
+    float* __restrict__ l_part,            // [num_heads * S]
+    float* __restrict__ o_part,            // [num_heads * S * 256]
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks,               // S
+    unsigned int chunk_cap)                // C
+{
+    const unsigned int chunk = blockIdx.x;
+    const unsigned int kv_h  = blockIdx.y;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int lane  = tid & 31u;
+    const unsigned int warp  = tid >> 5;
+
+    const unsigned int chunk_span = (seq_len + num_chunks - 1u) / num_chunks;
+    const unsigned int p0 = chunk * chunk_span;
+    unsigned int span = 0u;
+    if (p0 < seq_len) {
+        unsigned int p1 = p0 + chunk_span;
+        if (p1 > seq_len) p1 = seq_len;
+        span = p1 - p0;
+    }
+
+    // Empty chunk. `span` is block-uniform, so the whole CTA returns here and
+    // no barrier is skipped by a subset of the threads.
+    if (span == 0u) {
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            unsigned int head = kv_h * GQA6_G + g;
+            unsigned long long base =
+                ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+            o_part[base + tid] = 0.0f;
+            o_part[base + tid + GQA6_BLOCK] = 0.0f;
+        }
+        if (tid < GQA6_G) {
+            unsigned int head = kv_h * GQA6_G + tid;
+            m_part[head * num_chunks + chunk] = GQA6_NEG_INF;
+            l_part[head * num_chunks + chunk] = 0.0f;
+        }
+        return;
+    }
+
+    // 16-byte aligned: s_q and s_v are cast to float4 below, and both start
+    // at multiples of 16 bytes from the base (s_v at 6 * 256 floats).
+    extern __shared__ __align__(16) float smem[];
+    float* s_q     = smem;                          // [6][256]
+    float* s_v     = s_q + GQA6_G * GQA6_HD;        // [C][256]
+    float* s_score = s_v + chunk_cap * GQA6_HD;     // [6][C]
+    float* s_m     = s_score + GQA6_G * chunk_cap;  // [6]
+    float* s_l     = s_m + GQA6_G;                  // [6]
+
+    const unsigned long long kv_base =
+        (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)GQA6_HD;
+
+    // Both staging streams are issued before the barrier so their loads overlap.
+    {
+        const float4* q4src =
+            reinterpret_cast<const float4*>(q + (unsigned long long)kv_h * GQA6_G * GQA6_HD);
+        float4* q4dst = reinterpret_cast<float4*>(s_q);
+        for (unsigned int i = tid; i < (GQA6_G * GQA6_HD) / 4u; i += GQA6_BLOCK) {
+            q4dst[i] = q4src[i];
+        }
+        const float4* v4src = reinterpret_cast<const float4*>(
+            v_cache + kv_base + (unsigned long long)p0 * (unsigned long long)GQA6_HD);
+        float4* v4dst = reinterpret_cast<float4*>(s_v);
+        const unsigned int nv4 = span * (GQA6_HD / 4u);
+        for (unsigned int i = tid; i < nv4; i += GQA6_BLOCK) {
+            v4dst[i] = v4src[i];
+        }
+    }
+    __syncthreads();
+
+    // Q stays in registers for the whole QK phase: 2 float4 per head per lane.
+    float4 qa[GQA6_G];
+    float4 qb[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        const float4* q4 = reinterpret_cast<const float4*>(s_q + g * GQA6_HD);
+        qa[g] = q4[lane];
+        qb[g] = q4[32u + lane];
+    }
+
+    // QK: a warp per position, the K row held in registers across all six heads.
+    for (unsigned int j = warp; j < span; j += GQA6_WARPS) {
+        const float4* k4 = reinterpret_cast<const float4*>(
+            k_cache + kv_base + (unsigned long long)(p0 + j) * (unsigned long long)GQA6_HD);
+        const float4 ka = k4[lane];
+        const float4 kb = k4[32u + lane];
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            float dot = qa[g].x * ka.x + qa[g].y * ka.y + qa[g].z * ka.z + qa[g].w * ka.w;
+            dot += qb[g].x * kb.x + qb[g].y * kb.y + qb[g].z * kb.z + qb[g].w * kb.w;
+            dot = gqa6_warp_sum(dot) * scale;
+            if (lane == 0u) s_score[g * chunk_cap + j] = dot;
+        }
+    }
+    __syncthreads();
+
+    // Softmax: one warp per query head, four warps over six heads.
+    for (unsigned int g = warp; g < GQA6_G; g += GQA6_WARPS) {
+        float s = (lane < span) ? s_score[g * chunk_cap + lane] : GQA6_NEG_INF;
+        float m = gqa6_warp_max(s);
+        float p = (lane < span) ? expf(s - m) : 0.0f;
+        float l = gqa6_warp_sum(p);
+        if (lane < span) s_score[g * chunk_cap + lane] = p;
+        if (lane == 0u) {
+            s_m[g] = m;
+            s_l[g] = l;
+        }
+    }
+    __syncthreads();
+
+    // PV: thread t owns dims t and t+128; ascending positions; each staged V
+    // value feeds all six heads.
+    float acc0[GQA6_G];
+    float acc1[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        acc0[g] = 0.0f;
+        acc1[g] = 0.0f;
+    }
+    for (unsigned int j = 0; j < span; j++) {
+        const float v0 = s_v[j * GQA6_HD + tid];
+        const float v1 = s_v[j * GQA6_HD + tid + GQA6_BLOCK];
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            const float p = s_score[g * chunk_cap + j];
+            acc0[g] += p * v0;
+            acc1[g] += p * v1;
+        }
+    }
+
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        unsigned int head = kv_h * GQA6_G + g;
+        unsigned long long base = ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+        o_part[base + tid] = acc0[g];
+        o_part[base + tid + GQA6_BLOCK] = acc1[g];
+    }
+    if (tid < GQA6_G) {
+        unsigned int head = kv_h * GQA6_G + tid;
+        m_part[head * num_chunks + chunk] = s_m[tid];
+        l_part[head * num_chunks + chunk] = s_l[tid];
+    }
+}
+
+extern "C" __global__ void attention_decode_splitk_partial_gqa6_f16(
+    const float* __restrict__ q,                    // [num_heads * 256]
+    const unsigned short* __restrict__ k_cache,     // [num_kv_heads, max_seq_len, 256] half bits
+    const unsigned short* __restrict__ v_cache,     // [num_kv_heads, max_seq_len, 256] half bits
+    float* __restrict__ m_part,                     // [num_heads * S]
+    float* __restrict__ l_part,                     // [num_heads * S]
+    float* __restrict__ o_part,                     // [num_heads * S * 256]
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks,                        // S
+    unsigned int chunk_cap)                         // C
+{
+    const unsigned int chunk = blockIdx.x;
+    const unsigned int kv_h  = blockIdx.y;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int lane  = tid & 31u;
+    const unsigned int warp  = tid >> 5;
+
+    const unsigned int chunk_span = (seq_len + num_chunks - 1u) / num_chunks;
+    const unsigned int p0 = chunk * chunk_span;
+    unsigned int span = 0u;
+    if (p0 < seq_len) {
+        unsigned int p1 = p0 + chunk_span;
+        if (p1 > seq_len) p1 = seq_len;
+        span = p1 - p0;
+    }
+
+    // Empty chunk: block-uniform, the whole CTA returns before any barrier.
+    if (span == 0u) {
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            unsigned int head = kv_h * GQA6_G + g;
+            unsigned long long base =
+                ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+            o_part[base + tid] = 0.0f;
+            o_part[base + tid + GQA6_BLOCK] = 0.0f;
+        }
+        if (tid < GQA6_G) {
+            unsigned int head = kv_h * GQA6_G + tid;
+            m_part[head * num_chunks + chunk] = GQA6_NEG_INF;
+            l_part[head * num_chunks + chunk] = 0.0f;
+        }
+        return;
+    }
+
+    // Shared layout: s_q [6][256] F32, s_vh [C][256] halves (C * 128 floats of
+    // space), then the score block and the (m, l) slots as in the F32 kernel.
+    // 16-byte aligned: s_q starts at 0, s_vh at 6144 B, s_score at
+    // 6144 + C * 512 B — a multiple of 16 for every C.
+    extern __shared__ __align__(16) float smem[];
+    float* s_q = smem;                                               // [6][256]
+    unsigned short* s_vh = reinterpret_cast<unsigned short*>(s_q + GQA6_G * GQA6_HD); // [C][256]
+    float* s_score = s_q + GQA6_G * GQA6_HD + (chunk_cap * GQA6_HD) / 2u;  // [6][C]
+    float* s_m = s_score + GQA6_G * chunk_cap;                       // [6]
+    float* s_l = s_m + GQA6_G;                                       // [6]
+
+    const unsigned long long kv_base =
+        (unsigned long long)kv_h * (unsigned long long)max_seq_len * (unsigned long long)GQA6_HD;
+
+    // Both staging streams are issued before the barrier so their loads overlap.
+    {
+        const float4* q4src =
+            reinterpret_cast<const float4*>(q + (unsigned long long)kv_h * GQA6_G * GQA6_HD);
+        float4* q4dst = reinterpret_cast<float4*>(s_q);
+        for (unsigned int i = tid; i < (GQA6_G * GQA6_HD) / 4u; i += GQA6_BLOCK) {
+            q4dst[i] = q4src[i];
+        }
+        // V tile as halves: eight halves (16 bytes) per thread per step.
+        const uint4* v8src = reinterpret_cast<const uint4*>(
+            v_cache + kv_base + (unsigned long long)p0 * (unsigned long long)GQA6_HD);
+        uint4* v8dst = reinterpret_cast<uint4*>(s_vh);
+        const unsigned int nv8 = span * (GQA6_HD / 8u);
+        for (unsigned int i = tid; i < nv8; i += GQA6_BLOCK) {
+            v8dst[i] = v8src[i];
+        }
+    }
+    __syncthreads();
+
+    // Q stays in registers for the whole QK phase: 2 float4 per head per lane.
+    float4 qa[GQA6_G];
+    float4 qb[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        const float4* q4 = reinterpret_cast<const float4*>(s_q + g * GQA6_HD);
+        qa[g] = q4[lane];
+        qb[g] = q4[32u + lane];
+    }
+
+    // QK: a warp per position; two 8-byte loads per lane per K row, widened
+    // into the same float4 pairs the F32 kernel reads.
+    for (unsigned int j = warp; j < span; j += GQA6_WARPS) {
+        const uint2* k2 = reinterpret_cast<const uint2*>(
+            k_cache + kv_base + (unsigned long long)(p0 + j) * (unsigned long long)GQA6_HD);
+        const uint2 ra = k2[lane];
+        const uint2 rb = k2[32u + lane];
+        const float4 ka = gqa6_h4_to_f4(ra.x, ra.y);
+        const float4 kb = gqa6_h4_to_f4(rb.x, rb.y);
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            float dot = qa[g].x * ka.x + qa[g].y * ka.y + qa[g].z * ka.z + qa[g].w * ka.w;
+            dot += qb[g].x * kb.x + qb[g].y * kb.y + qb[g].z * kb.z + qb[g].w * kb.w;
+            dot = gqa6_warp_sum(dot) * scale;
+            if (lane == 0u) s_score[g * chunk_cap + j] = dot;
+        }
+    }
+    __syncthreads();
+
+    // Softmax: one warp per query head, four warps over six heads.
+    for (unsigned int g = warp; g < GQA6_G; g += GQA6_WARPS) {
+        float s = (lane < span) ? s_score[g * chunk_cap + lane] : GQA6_NEG_INF;
+        float m = gqa6_warp_max(s);
+        float p = (lane < span) ? expf(s - m) : 0.0f;
+        float l = gqa6_warp_sum(p);
+        if (lane < span) s_score[g * chunk_cap + lane] = p;
+        if (lane == 0u) {
+            s_m[g] = m;
+            s_l[g] = l;
+        }
+    }
+    __syncthreads();
+
+    // PV: thread t owns dims t and t+128; ascending positions; each staged V
+    // half is widened once and feeds all six heads.
+    float acc0[GQA6_G];
+    float acc1[GQA6_G];
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        acc0[g] = 0.0f;
+        acc1[g] = 0.0f;
+    }
+    for (unsigned int j = 0; j < span; j++) {
+        const float v0 = gqa6_h2f(s_vh[j * GQA6_HD + tid]);
+        const float v1 = gqa6_h2f(s_vh[j * GQA6_HD + tid + GQA6_BLOCK]);
+#pragma unroll
+        for (unsigned int g = 0; g < GQA6_G; g++) {
+            const float p = s_score[g * chunk_cap + j];
+            acc0[g] += p * v0;
+            acc1[g] += p * v1;
+        }
+    }
+
+#pragma unroll
+    for (unsigned int g = 0; g < GQA6_G; g++) {
+        unsigned int head = kv_h * GQA6_G + g;
+        unsigned long long base = ((unsigned long long)head * num_chunks + chunk) * GQA6_HD;
+        o_part[base + tid] = acc0[g];
+        o_part[base + tid + GQA6_BLOCK] = acc1[g];
+    }
+    if (tid < GQA6_G) {
+        unsigned int head = kv_h * GQA6_G + tid;
+        m_part[head * num_chunks + chunk] = s_m[tid];
+        l_part[head * num_chunks + chunk] = s_l[tid];
+    }
+}
+
+// --------------------------------------------------------------------------
 // Merge. grid = (num_heads, 256 / 128), block = 128 threads: two CTAs per
 // query head, each owning 128 of the head's dimensions, one per thread.
 //
