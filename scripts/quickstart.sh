@@ -220,8 +220,6 @@ MODELS (registry source of truth: model_registry.toml):
                          downloadable.
     qwen3.5-moe-35b-a3b  Q8_0 (~37 GB), Q4_0 (~19 GB), BF16 (~71 GB 2-shard)
                          all downloadable.
-    qwen3.6-27b          Q8_0 (~29 GB), Q4_0 (~15 GB), BF16 (~55 GB 2-shard)
-                         all downloadable.
     qwen3.8-27b          Q8_0 (~29 GB), Q4_0 (~16 GB), BF16 (~55 GB 2-shard)
                          all downloadable.
 
@@ -421,13 +419,8 @@ build_catalog() {
   _catalog_add "qwen3.5-moe-35b-a3b:q4_0" "~19 GB" "~21 GB" "~39 GB" "MoE 35B (3B active), 4-bit" "1"
   _catalog_add "qwen3.5-moe-35b-a3b:q8_0" "~37 GB" "~38 GB" "~71 GB" "MoE 35B (3B active), 8-bit" "1"
   _catalog_add "qwen3.5-moe-35b-a3b:bf16" "~71 GB" "~72 GB" "~140 GB" "MoE 35B (3B active), full precision" "1"
-  # Dense Qwen3.6-27B (GDN ratio-3). All three quants downloadable; BF16 is a
+  # Dense Qwen3.8-27B (GDN ratio-3). All three quants downloadable; BF16 is a
   # 2-shard split GGUF (same nested HF-subdir layout as the MoE BF16).
-  _catalog_add "qwen3.6-27b:q8_0" "~29 GB" "~30 GB" "~56 GB" "Dense 27B, 8-bit (best quality)" "1"
-  _catalog_add "qwen3.6-27b:q4_0" "~15 GB" "~16 GB" "~29 GB" "Dense 27B, 4-bit (smaller)" "1"
-  _catalog_add "qwen3.6-27b:bf16" "~55 GB" "~56 GB" "~105 GB" "Dense 27B, full precision" "1"
-  # Dense Qwen3.8-27B — identical shapes/sizes to Qwen3.6-27B (same GDN
-  # ratio-3 architecture, retrained weights).
   _catalog_add "qwen3.8-27b:q8_0" "~29 GB" "~29 GB" "~58 GB" "Dense 27B (Qwen3.8), 8-bit (best quality)" "1"
   _catalog_add "qwen3.8-27b:q4_0" "~16 GB" "~17 GB" "~33 GB" "Dense 27B (Qwen3.8), 4-bit (smaller)" "1"
   _catalog_add "qwen3.8-27b:bf16" "~55 GB" "~53 GB" "~108 GB" "Dense 27B (Qwen3.8), full precision" "1"
@@ -478,8 +471,6 @@ qwen3.5-9b
 qwen3-5-moe-35b-a3b
 qwen3.5-moe-35b-a3b
 qwen3.5-moe
-qwen3-6-27b
-qwen3.6-27b
 qwen3-8-27b
 qwen3.8-27b"
 
@@ -513,8 +504,6 @@ canonical_model_name() {
       printf '%s' "qwen3.5-9b" ;;
     qwen3-5-moe-35b-a3b|qwen3.5-moe-35b-a3b|qwen3.5-moe)
       printf '%s' "qwen3.5-moe-35b-a3b" ;;
-    qwen3-6-27b|qwen3.6-27b)
-      printf '%s' "qwen3.6-27b" ;;
     qwen3-8-27b|qwen3.8-27b)
       printf '%s' "qwen3.8-27b" ;;
     *)
@@ -1168,7 +1157,6 @@ validate_selection() {
     log_error "Known models (from model_registry.toml):"
     log_error "  qwen3.5-9b"
     log_error "  qwen3.5-moe-35b-a3b   (alias: qwen3.5-moe)"
-    log_error "  qwen3.6-27b"
     log_error "  qwen3.8-27b"
     log_error "Run 'lumen models' for the live registry + cached LBCs."
     die "model name not recognized"

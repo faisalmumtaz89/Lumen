@@ -1,6 +1,6 @@
 # Lumen Model Support Matrix
 
-This page is the source of truth for what is currently **verified-against-llama.cpp** end-to-end. Lumen runs LLM inference in Rust for Apple Silicon and NVIDIA CUDA; v1 (current) verifies the Qwen3.5 family plus the Qwen3.6-27B and Qwen3.8-27B dense models; additional model families are planned. Architectures outside the v1 set (llama, mistral, qwen2, phi, gemma) are currently rejected at GGUF conversion because they have not yet been gated end-to-end on this runtime.
+This page is the source of truth for what is currently **verified-against-llama.cpp** end-to-end. Lumen runs LLM inference in Rust for Apple Silicon and NVIDIA CUDA; v1 (current) verifies the Qwen3.5 family plus the Qwen3.8-27B dense model; additional model families are planned. Architectures outside the v1 set (llama, mistral, qwen2, phi, gemma) are currently rejected at GGUF conversion because they have not yet been gated end-to-end on this runtime.
 
 ## What is verified
 
@@ -55,12 +55,9 @@ The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on 
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.567× llama.cpp (retained co-located A100 record: 79.2 vs 139.7) | MoE_Q8_SPLIT=OFF default validated |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.598× llama.cpp (retained co-located A100 record: 93.6 vs 156.5) | Same MoE setup path as Q8 MoE |
 | Qwen3.5-MoE-35B-A3B | BF16 | Production-ready with caveats | 0.575× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 104.1 vs 181.1; the previously published 0.902× has no retained artifact) | Requires a dedicated H100/H200-class GPU (peak 72,475 MiB ≈ 70.8 GiB, H100-measured; the A100-80GB fit is unverified and A100 decode unmeasured) |
-| Qwen3.6-27B dense | Q8_0 | Production-ready | 0.891× llama.cpp (retained 2026-07-16 co-located A100 record: 35.08 vs 39.35; see bench/RESULTS.md) | All quality gates pristine (2026-06-11 checklist; earlier 0.85× not artifact-retained) |
-| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.820× llama.cpp (retained 2026-07-16 co-located A100 record: 45.34 vs 55.32; see bench/RESULTS.md) | All quality gates pristine (earlier 0.66× not artifact-retained) |
-| Qwen3.6-27B dense | BF16 | Production-ready (H100) | 0.818× llama.cpp (retained 2026-07-16 same-GPU H100 record, separate per-engine batteries: 40.4 vs 49.4; earlier 0.89× not artifact-retained) | All quality gates pass; shares the deterministic stray-first-token issue noted on the Qwen3.8-27B BF16 row |
 | Qwen3.8-27B dense | Q8_0 | Production-ready | **1.02× llama.cpp** | All quality gates pristine + DET-001 50/50 (2026-08-14, A100; llama.cpp b10032 co-located, same GGUF) |
 | Qwen3.8-27B dense | Q4_0 | Production-ready | 0.93× llama.cpp | All quality gates pristine + DET-001 50/50 (2026-08-14, A100) |
-| Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16, shared with Qwen3.6-27B BF16 (tracked prefill-numerics issue) |
+| Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16 (tracked prefill-numerics issue) |
 | Qwen3.8-27B dense | CtInt4G32 (HF import) | Production-ready, compatibility cell (SM80+) | — (no llama.cpp equivalent format) | Serves the community compressed-tensors INT4 g32 checkpoint byte-exactly (`lumen convert --from-hf`); quality + DET-001 50/50 verified on A100. W4A8 dp4a route — slower than engines with W4A16 4-bit kernels on the same bytes |
 
 ### Metal (Apple Silicon, M-series)
@@ -76,12 +73,9 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.5-9B dense | BF16 | Production-ready (functional) | 0.83× | 0.66× (up from 0.31×) | mmap zero-copy load (the default on Metal) |
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | not retained | not retained | mmap zero-copy load (the default on Metal). Earlier 0.21×/0.09× ratios have no retained artifact (the cited bench records `none` for these cells — llama-bench 8680 could not load this arch); MoE perf on Metal is a known optimization target |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | not retained | not retained | Same mmap default; earlier 0.18×/0.08× ratios have no retained artifact; same MoE-perf caveat |
-| Qwen3.6-27B dense | Q8_0 | Production-ready | **1.03× (beats llama.cpp)** | 0.86× | All quality gates pristine (2026-06-11) |
-| Qwen3.6-27B dense | Q4_0 | Production-ready | 0.99× | 0.82× | All quality gates pristine |
-| Qwen3.6-27B dense | BF16 | N/A on Metal | — | — | Same ~50 GiB capacity-margin arithmetic as the Qwen3.8-27B BF16 row below; validated on CUDA H100 instead |
 | Qwen3.8-27B dense | Q8_0 | Production-ready (functional) | withdrawn — under re-measurement (the 2026-08-14 1.15× predates a machine-level bimodal-speed finding; audited re-runs read below it and are quarantined until the trigger is isolated) | — | All quality gates pristine + DET-001 50/50 (2026-08-14, M3 Ultra; llama.cpp b10032, same GGUF); prefill row pending |
 | Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); ratio from the 2026-08-24 board (40.17 vs 30.57 = 1.314, published conservatively): same GGUF, sequential per-engine runs on the strictly-serial M3 Ultra — not co-resident processes; prefill row pending |
-| Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig (same arithmetic as Qwen3.6-27B BF16); validated on CUDA H100 instead |
+| Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig; validated on CUDA H100 instead |
 
 ## What is not (yet) supported
 

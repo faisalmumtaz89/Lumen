@@ -1129,14 +1129,14 @@ mod tests {
     #[test]
     fn second_bare_positional_is_error() {
         // A second bare token (model already set) is rejected.
-        let e = parse_args(&argv(&["qwen3.5-9b:q4_0", "qwen3.6-27b"]));
+        let e = parse_args(&argv(&["qwen3.5-9b:q4_0", "qwen3.8-27b"]));
         assert!(e.is_err(), "expected error, got {e:?}");
     }
 
     #[test]
     fn bare_token_after_model_flag_is_error() {
         // `--model X` then a bare positional is rejected (model already set).
-        let e = parse_args(&argv(&["--model", "qwen3.5-9b", "qwen3.6-27b"]));
+        let e = parse_args(&argv(&["--model", "qwen3.5-9b", "qwen3.8-27b"]));
         assert!(e.is_err(), "expected error, got {e:?}");
     }
 

@@ -386,9 +386,18 @@ mod tests {
     }
 
     #[test]
+    fn retired_qwen36_27b_does_not_resolve() {
+        // Qwen3.6-27B is retired: Qwen3.8-27B is the same architecture with
+        // retrained weights and supersedes it. Neither spelling resolves.
+        let reg = load_registry();
+        assert!(reg.resolve("qwen3.6-27b").is_none());
+        assert!(reg.resolve("qwen3-6-27b").is_none());
+    }
+
+    #[test]
     fn resolve_qwen38_27b() {
         // Qwen3.8-27B ships the same qwen35 (GatedDeltaNet, dense) GGUF arch
-        // and the same text-config shapes as Qwen3.6-27B; the registry entry
+        // and the same text-config shapes as its predecessor; the registry entry
         // is the only enablement surface. BF16 is a 2-shard split GGUF nested
         // under a `BF16/` subdir in the provider repo.
         let reg = load_registry();

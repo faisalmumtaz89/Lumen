@@ -15,7 +15,7 @@
 # first:  curl -fsSL <url> -o install.sh && less install.sh && bash install.sh
 #
 # Non-interactive / overrides (flags after `bash -s --`, or env):
-#   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.6-27b; accepts name:quant)
+#   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.8-27b; accepts name:quant)
 #   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16; default q8_0)
 #   --yes, -y                        non-interactive (accept defaults, no prompts)
 #   --prefix <dir>    LUMEN_PREFIX  (install dir; default = auto-selected, see below)
@@ -75,7 +75,7 @@ Lumen installer — detects your platform, installs the prebuilt binaries, sets 
   curl -fsSL https://servelumen.com/install.sh | bash
 
 Options (after `bash -s --`) / env:
-  --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.6-27b  (accepts name:quant)
+  --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.8-27b  (accepts name:quant)
   --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16        (default q8_0)
   --yes, -y                       non-interactive (defaults, no prompts)
   --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
@@ -402,10 +402,10 @@ if [ "$INTERACTIVE" = "1" ]; then
   say "  ${C_BOLD}Choose a model${C_RESET}"
   say "    1  Qwen3.5 9B    ${C_DIM}dense · ~10 GB @ Q8${C_RESET}        ${C_GREEN}(recommended)${C_RESET}"
   say "    2  Qwen3.5 MoE   ${C_DIM}35B-A3B · mixture-of-experts${C_RESET}"
-  say "    3  Qwen3.6 27B   ${C_DIM}dense · largest${C_RESET}"
+  say "    3  Qwen3.8 27B   ${C_DIM}dense · largest${C_RESET}"
   printf '  %s›%s ' "$C_CYAN" "$C_RESET"
   read -r pick < /dev/tty || pick=""
-  case "$pick" in 2) MODEL="$MOE_CANONICAL" ;; 3) MODEL="qwen3.6-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
+  case "$pick" in 2) MODEL="$MOE_CANONICAL" ;; 3) MODEL="qwen3.8-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
   if [ -z "$QUANT" ]; then   # honor an explicit --quant; only prompt if unset
     say ""
     say "  ${C_BOLD}Choose a quant${C_RESET}"
