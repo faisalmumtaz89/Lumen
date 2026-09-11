@@ -144,7 +144,8 @@ OPTIONS:
     --kv-precision <p>    KV cache storage precision: f16 | f32. Default: backend-appropriate
                           (Metal -> f16, CUDA -> f32, CPU -> f32). The Metal backend pins KV
                           to f16; passing --kv-precision f32 on Metal is rejected with an
-                          explicit error. CUDA likewise requires f32 in the current release.
+                          explicit error. CUDA takes either: f16 halves the cache and
+                          refuses a generation whose values do not fit the format.
                           Honors `LUMEN_KV_PRECISION=f16|f32` env override.
     --kv-disk-dir <dir>   Directory for the disk-persistent KV cache.
                           When set, the runtime purges stale .tmp.<pid> writes at
