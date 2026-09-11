@@ -57,9 +57,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
   to 213.5 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
   was that model's wall at any long context); the 50-completion greedy
-  determinism run on each model's F32 store reproduces the previous route's
-  digest, and the long-context quality records against the previous build
-  are on file with their one adjudicated parting each. Against v0.30.0 the output is therefore a
+  determinism run on each model, on both KV stores, reproduces the previous
+  route's digest, and the long-context quality records against the previous
+  build are on file with their adjudicated partings. Against v0.30.0 the output is therefore a
   near-tie, not byte-identical, on every model (the models the per-query-head
   pair and the tiled kernel served now take this kernel).
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
