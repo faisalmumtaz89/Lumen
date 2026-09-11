@@ -46,14 +46,13 @@ pub use attention_decode::{
 /// The decode-attention launch geometry, for out-of-crate callers that drive
 /// the kernels in [`shaders`] directly — the correctness suites
 /// (`tests/cuda_attention_decode_test.rs` and its fixture and shape
-/// siblings) and the standalone A/B harness (`examples/attn_decode_ab.rs`).
+/// siblings).
 ///
-/// Those callers cannot reach `prefill`, so without this they would hand-copy
-/// the split counts, chunk length, block dimensions and shared-memory sizes
-/// the launcher uses, and a retune here would leave their copy silently
-/// describing a geometry production no longer runs. Each name below has one
-/// of those two consumers; nothing outside the crate is expected to dispatch
-/// attention.
+/// Those callers cannot reach the launcher, so without this they would
+/// hand-copy the split counts, tile length, block dimensions and
+/// shared-memory sizes it uses, and a retune here would leave their copy
+/// silently describing a geometry production no longer runs. Nothing outside
+/// the crate is expected to dispatch attention.
 pub use decode::ATTN_DECODE_BLOCK_DIM;
 
 // ---------------------------------------------------------------------------
