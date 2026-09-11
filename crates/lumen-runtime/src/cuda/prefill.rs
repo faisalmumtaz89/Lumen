@@ -2659,11 +2659,18 @@ fn announce_splitk_gqa6_route(
             chunks,
             partition,
             policy,
+            codegen,
         } = launch;
+        // The route name carries the codegen target, so a census tells the
+        // compiled variants apart (the CUDA symbol is the same).
         let kernel = if policy.control() {
             "attention_decode_splitk_partial_gqa6_f32"
         } else {
-            "attention_decode_splitk_partial_gqa6_loop_f32"
+            match codegen {
+                "ptx80" => "attention_decode_splitk_partial_gqa6_loop_f32_ptx80",
+                "ptx120" => "attention_decode_splitk_partial_gqa6_loop_f32_ptx120",
+                _ => "attention_decode_splitk_partial_gqa6_loop_f32",
+            }
         };
         format!(
             "[CUDA] {kernel}: ACTIVE (kv=f32, \
@@ -3091,11 +3098,12 @@ fn dump_attention_call(
     // orders under the policy knobs).
     let geometry = match gqa6 {
         Some(g) => format!(
-            ",\n \"gqa6_chunks\": {},\n \"gqa6_partition\": \"{}\",\n \"gqa6_one_tile_max\": {},\n \"gqa6_target\": {},\n \"gqa6_control\": {control}",
+            ",\n \"gqa6_chunks\": {},\n \"gqa6_partition\": \"{}\",\n \"gqa6_one_tile_max\": {},\n \"gqa6_target\": {},\n \"gqa6_control\": {control},\n \"gqa6_codegen\": \"{}\"",
             g.chunks,
             if g.partition == 0 { "one-tile" } else { "whole-tile" },
             g.policy.one_tile_max,
             g.policy.target,
+            g.codegen,
         ),
         None => String::new(),
     };
@@ -3130,6 +3138,8 @@ pub(crate) struct SplitKGqa6Launch {
     pub chunks: u32,
     pub partition: SplitKGqa6Partition,
     pub policy: SplitKGqa6Policy,
+    /// The NVRTC target the module was compiled for (`LUMEN_CUDA_ATTN_CODEGEN`).
+    pub codegen: &'static str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3181,6 +3191,7 @@ pub(crate) fn decode_attention_splitk_choice(
                 chunks,
                 partition,
                 policy,
+                codegen: kernels.attn_codegen,
             }));
         }
     }
@@ -5852,11 +5863,18 @@ fn announce_splitk_gqa6_route_f16(
             chunks,
             partition,
             policy,
+            codegen,
         } = launch;
+        // The route name carries the codegen target, so a census tells the
+        // compiled variants apart (the CUDA symbol is the same).
         let kernel = if policy.control() {
             "attention_decode_splitk_partial_gqa6_f16"
         } else {
-            "attention_decode_splitk_partial_gqa6_loop_f16"
+            match codegen {
+                "ptx80" => "attention_decode_splitk_partial_gqa6_loop_f16_ptx80",
+                "ptx120" => "attention_decode_splitk_partial_gqa6_loop_f16_ptx120",
+                _ => "attention_decode_splitk_partial_gqa6_loop_f16",
+            }
         };
         format!(
             "[CUDA] {kernel}: ACTIVE (kv=f16, \
