@@ -945,7 +945,7 @@ pub(crate) fn compile_all_kernels(
         let f = module.load_function(name).map_err(|e| {
             RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}"))
         })?;
-        // The compile/load roster line every other kernel prints: a load log
+        // The compile/load roster line most kernels print: a load log
         // names what this binary carries, not only what it dispatched.
         cuda_log!("[CUDA] {name}: OK");
         Ok(f)

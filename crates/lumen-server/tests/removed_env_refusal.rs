@@ -1,16 +1,14 @@
 //! The server binary refuses to start when an environment name an earlier
 //! release read, and this one does not, is set: exit code 2 with the name and
 //! the remedy, before any model is opened. Host-only. The binary needs the
-//! `bin` feature; without it the test has nothing to run and says so.
+//! `bin` feature: without it this test does not compile (the CI cpu suite
+//! builds it), so the coverage cannot be retired by a green run.
 
 use std::process::Command;
 
 #[test]
 fn a_removed_env_name_refuses_server_startup_with_its_remedy() {
-    let Some(bin) = option_env!("CARGO_BIN_EXE_lumen-server") else {
-        eprintln!("Skipping: lumen-server binary not built (enable the `bin` feature)");
-        return;
-    };
+    let bin = env!("CARGO_BIN_EXE_lumen-server");
     for (name, remedy) in lumen_runtime::runtime_defaults::REMOVED_LUMEN_ENV_VARS {
         let out = Command::new(bin)
             .arg("--version")
