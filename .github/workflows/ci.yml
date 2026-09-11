@@ -27,8 +27,9 @@ env:
 
 jobs:
   test-cpu:
-    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli, and
-    # lumen-runtime's CPU-side tests) runs without a GPU — see README
+    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli,
+    # lumen-runtime's CPU-side tests and lumen-server with its binary, so the
+    # server's start-up refusals are exercised) runs without a GPU — see README
     # "Requirements". The lumen-runtime GPU paths are validated in the
     # dedicated GPU workflows, not here.
     name: cpu tests + lint

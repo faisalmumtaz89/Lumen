@@ -3325,7 +3325,8 @@ mod tests {
         assert_eq!(attn_one_tile_max(4), ATTN_ONE_TILE_DEFAULT);
         assert_eq!(attn_one_tile_max(4), ATTN_ONE_TILE_DEFAULT);
         assert_eq!(attn_target(4), ATTN_TARGET_DEFAULT);
-        // Per model: the CTA totals stay, the per-KV-head counts scale.
+        // Per model: the one-tile CTA total stays (so its per-KV-head count
+        // scales); the target is the same per-KV-head count on every model.
         assert_eq!(attn_one_tile_max(2), 352);
         assert_eq!(attn_target(2), 128);
         assert_eq!(attn_one_tile_max(1), 704);

@@ -942,9 +942,13 @@ pub(crate) fn compile_all_kernels(
             }
             _ => device.compile_and_load(&attn_source)?,
         };
-        module
-            .load_function(name)
-            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+        let f = module.load_function(name).map_err(|e| {
+            RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}"))
+        })?;
+        // The compile/load roster line every other kernel prints: a load log
+        // names what this binary carries, not only what it dispatched.
+        cuda_log!("[CUDA] {name}: OK");
+        Ok(f)
     };
 
     // For kernels needing SM 80+ features.

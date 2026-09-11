@@ -58,16 +58,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   paired gates on the RTX 5090 against the route each took before: Qwen3.5-9B
   Q4_0 +3.8 / +5.9 / +10.9 % at 3,072 / 6,144 / 12,288 tokens of context (two
   runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
-  to 213.5 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
-  was that model's wall at any long context); the 50-completion greedy
+  to 213.5 / 208.1 / 197.8 tok/s in that gate, whose kernel arm ran the
+  budget-derived target of 256; at the shipped target of 128 the same
+  contexts measured 213.6 / 208.3 / 200.6 tok/s: the tiled kernel's one CTA
+  per query head was that model's wall at any long context); the 50-completion greedy
   determinism run on each model, on both KV stores, reproduces the previous
   route's digest, and the long-context quality records against the previous
   build are on file with their adjudicated partings. Against v0.30.0 the output is therefore
-  not byte-identical on any model: every parting in the 27B and 9B records is
-  inside the declared near-tie margin; the MoE record fails that strict rule
-  on one F32 prompt and on two half-store prompts against its own F32 store,
-  each adjudicated as within the kernel's numerical envelope by a float64
-  replay of the real activations (the models the per-query-head pair and the
+  not byte-identical on any model: every parting in the 27B record and in the
+  9B's F32 record is inside the declared near-tie margin; the 9B's 16-bit
+  store parts from the previous build's 16-bit route once outside it (at 12k
+  keys, margins 0.034 / 0.015); the MoE record fails that strict rule on one
+  F32 prompt and on two half-store prompts against its own F32 store; each of
+  those partings is adjudicated as within the kernel's numerical envelope by a
+  float64 replay of the real activations (the models the per-query-head pair and the
   tiled kernel served now take this kernel).
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every

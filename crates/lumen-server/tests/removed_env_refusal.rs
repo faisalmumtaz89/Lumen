@@ -11,15 +11,19 @@ fn a_removed_env_name_refuses_server_startup_with_its_remedy() {
         eprintln!("Skipping: lumen-server binary not built (enable the `bin` feature)");
         return;
     };
-    let out = Command::new(bin)
-        .arg("--version")
-        .env("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", "128")
-        .output()
-        .expect("run lumen-server");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
-    assert!(
-        stderr.contains("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET is set but this release does not read it: renamed LUMEN_CUDA_ATTN_TARGET"),
-        "stderr: {stderr}"
-    );
+    for (name, remedy) in lumen_runtime::runtime_defaults::REMOVED_LUMEN_ENV_VARS {
+        let out = Command::new(bin)
+            .arg("--version")
+            .env(name, "1")
+            .output()
+            .expect("run lumen-server");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{name}: stderr: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{name} is set but this release does not read it: {remedy}"
+            )),
+            "{name}: the remedy is missing: {stderr}"
+        );
+    }
 }

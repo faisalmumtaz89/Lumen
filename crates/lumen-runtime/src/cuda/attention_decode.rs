@@ -800,6 +800,24 @@ mod tests {
         assert_eq!(g8.partial_shared_bytes(true), 16_992);
     }
 
+    /// A zero knob launches one CTA, never none, and an oversized one the
+    /// ceiling: the helpers hold their own bounds without a caller's clamp.
+    #[test]
+    fn the_geometry_helpers_hold_their_own_bounds() {
+        assert_eq!(decode_attention_geometry_within(100_000, 176, 0), (1, 1));
+        assert_eq!(decode_attention_geometry_within(100_000, 0, 0), (1, 1));
+        assert_eq!(decode_attention_geometry_within(1, 0, 5), (1, 0));
+        assert_eq!(
+            decode_attention_geometry_within(100_000, u32::MAX, u32::MAX),
+            (ATTN_DECODE_S_MAX, 1)
+        );
+        assert_eq!(decode_attention_scratch_chunks_within(100_000, 176, 0), 176);
+        assert_eq!(
+            decode_attention_scratch_chunks_within(1 << 20, u32::MAX, u32::MAX),
+            ATTN_DECODE_S_MAX
+        );
+    }
+
     /// No context makes a tile outgrow its warp, under any policy.
     #[test]
     fn no_context_makes_a_tile_outgrow_its_warp() {
