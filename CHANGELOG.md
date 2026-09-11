@@ -18,14 +18,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `attention_decode_merge`, compiled at load for the model's group size
   (query heads per KV head, 1 to 8) and head dimension (128 or 256). One CTA
   per (KV head, chunk) reads each K and V row once for the whole group with
-  16-byte loads; up to a one-tile bound each CTA takes one 16-key tile, above
+  16-byte loads on the F32 store (8-byte on the half store); up to a one-tile bound each CTA takes one 16-key tile, above
   it the split count is held at a fixed target and each CTA walks a balanced
   run of whole tiles with a running-max recurrence, so the scratch is sized
   once per model (4.2 MiB on Qwen3.8-27B, either store) and a generation never
   changes route as it grows. The one-tile bound is a CTA budget shared by
   every model (704 one-tile CTAs across the KV heads: 176 tiles per KV head
   at 4 KV heads, 352 at 2); the target is 128 chunks per KV head on every
-  model, the measured best at both KV-head counts; set by `LUMEN_CUDA_ATTN_ONE_TILE`
+  model (at 4 KV heads within 3 % of the best measured count on the F32 store
+  and 6 % on the half store from 6,144 to 32,768 keys; at 2 KV heads equal to
+  the budget-derived 256 at 3,072 and 6,144 keys and 1.5 % faster at 12,288); set by `LUMEN_CUDA_ATTN_ONE_TILE`
   and `LUMEN_CUDA_ATTN_TARGET`; `LUMEN_CUDA_ATTN_CODEGEN` selects the NVRTC
   target as an A/B knob. A model outside the kernel's shape domain is refused
   at CUDA init with the shape named, rather than served by a slower route.
@@ -37,8 +39,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   fixture of hashed partials
   and outputs, `crates/lumen-runtime/tests/fixtures/attention_decode_reference.json`,
   is checked by `cuda_attention_decode_fixture_test`); every other (group,
-  head dimension) in the domain is held within 2.5e-7 of a float64 reference
-  (`cuda_attention_decode_shapes_test`). Per attention layer on the RTX 5090
+  head dimension) in the domain is checked against a float64 reference at nine
+  contexts on both stores (`cuda_attention_decode_shapes_test`, tolerance 2e-6;
+  the recorded maximum on the RTX 5090 is 2.45e-7). Per attention layer on the RTX 5090
   against one tile per CTA at every context: F32 −7.6 % at 2,600 keys, −19
   to −21 % at 6,144, −27 % at 16,384, never slower at any measured context;
   half store −10 % at 2,600, −3 to −8 % at 3,600, −8 to −15 % at 4,096,
@@ -59,9 +62,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   was that model's wall at any long context); the 50-completion greedy
   determinism run on each model, on both KV stores, reproduces the previous
   route's digest, and the long-context quality records against the previous
-  build are on file with their adjudicated partings. Against v0.30.0 the output is therefore a
-  near-tie, not byte-identical, on every model (the models the per-query-head
-  pair and the tiled kernel served now take this kernel).
+  build are on file with their adjudicated partings. Against v0.30.0 the output is therefore
+  not byte-identical on any model: every parting in the 27B and 9B records is
+  inside the declared near-tie margin; the MoE record fails that strict rule
+  on one F32 prompt and on two half-store prompts against its own F32 store,
+  each adjudicated as within the kernel's numerical envelope by a float64
+  replay of the real activations (the models the per-query-head pair and the
+  tiled kernel served now take this kernel).
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
   `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
   attention layer's K and V cache is stored as IEEE half: the writers round
@@ -79,9 +86,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   attention output differs from the F32-stored one by a relative L2 of
   about 2e-4 (7.5e-4 worst per call). The cache takes half the bytes
   (1.07 GB instead of 2.15 GB at 16,384 positions on Qwen3.8-27B; the prefill
-  widening pair the half store allocates at start-up adds 128 MB at that
-  capacity, so the net saving there is 0.95 GB) and the
-  decode-attention kernels read half the bytes. Off unless set; the F32
+  widening pair the half store allocates at start-up adds 128 MiB at that
+  capacity, so the net saving there is 0.94 GB) and the
+  decode-attention kernels' KV-cache reads halve. Off unless set; the F32
   store is unchanged.
 
 - **`LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,...]`**, a diagnostic that writes one

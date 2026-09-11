@@ -11,7 +11,7 @@
 // writes (m, l, o) per (query head, chunk), `attention_decode_merge` combines
 // them. One CTA per (KV head, chunk): each K row and V row is fetched ONCE
 // and serves all G query heads of the group, and every Q, K and V read is a
-// 16-byte load. (The partial's scratch stores and the merge's reads of them
+// 16-byte load on the F32 store (K and V are 8-byte loads on the half store). (The partial's scratch stores and the merge's reads of them
 // stay scalar; they are a fifth of the traffic.)
 //
 // Decomposition of one CTA (128 threads = 4 warps), per 16-key tile:
@@ -50,8 +50,8 @@
 // for a fixed (S, partition): every reduction is a fixed tree and every
 // accumulation walks ascending indices, so the output depends on the launch
 // geometry and on nothing else. The integration suites hold both partitions
-// within 2.5e-7 of an F64 reference at every (G, HD) in the domain and
-// within 2e-6 at every context from 1 to 32,768 keys at (6, 256), and print
+// within 2e-6 of an F64 reference at every (G, HD) in the domain (recorded
+// maximum 2.45e-7) and at every context from 1 to 32,768 keys at (6, 256), and print
 // the observed maximum per length, so the headroom is a recorded number
 // rather than a figure in this comment.
 //
