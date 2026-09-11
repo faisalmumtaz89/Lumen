@@ -1018,6 +1018,11 @@ pub(crate) fn compile_all_kernels(
         }
     };
 
+    // Both F32 entry points load before the target is recorded: a refused
+    // target falls back inside `load_attention`, and the record, the load
+    // line, the route line and the dump must all name what actually loaded.
+    let attention_decode_partial = load_attention("attention_decode_partial_f32")?;
+    let attention_decode_merge = load_attention("attention_decode_merge")?;
     cuda_log!(
         "[CUDA] decode attention: compiled for group {} (query heads per KV head), head_dim {}, codegen {}",
         attn_spec.group,
@@ -1028,8 +1033,8 @@ pub(crate) fn compile_all_kernels(
         kv_f16,
         attn_spec,
         attn_codegen: attn_codegen.get(),
-        attention_decode_partial: load_attention("attention_decode_partial_f32")?,
-        attention_decode_merge: load_attention("attention_decode_merge")?,
+        attention_decode_partial,
+        attention_decode_merge,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
@@ -1091,10 +1096,6 @@ pub(crate) fn compile_all_kernels(
         swiglu_inplace: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "swiglu_inplace")?,
         residual_add: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "residual_add")?,
         residual_add_copy: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "residual_add_copy")?,
-        // Tiled streaming-softmax decode-attention kernel.
-        // Optional: log a warning if NVRTC compile fails so the gate sees
-        // the unavailability and operators learn the long-context path is
-        // disabled on this device.
         gemm_f32: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32")?,
         gemm_f32_residual: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32_residual")?,
         compute_rms_scale: load_fn(
@@ -3692,7 +3693,7 @@ pub(crate) fn rmsnorm_shared_bytes(block_size: u32) -> u32 {
 /// Threads per CTA of the decode-attention kernels (must match `DECODE_BLOCK` in the shader).
 pub const ATTN_DECODE_BLOCK_DIM: u32 = 128;
 
-/// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
+/// The NVRTC target a codegen selection compiles for, as text for the load log.
 /// `LUMEN_CUDA_ATTN_CODEGEN`: the NVRTC target for the decode-attention module.
 /// Default: NVRTC's default target. `ptx80` / `ptx120` request that target; an A/B
 /// knob for the codegen question, not a per-device default.

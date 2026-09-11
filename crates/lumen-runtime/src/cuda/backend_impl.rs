@@ -17890,7 +17890,7 @@ impl ComputeBackend for CudaBackend {
                 eprintln!(
                     "[CUDA] compute-capability query failed ({e}): every capability-keyed default resolves \
                      as on an unmeasured device — LUMEN_CUDA_SOA_LOCKED OFF, and on a Q4_0 dense body the \
-                     split-K pair, the dual-output norm route and the compute_120 tiled kernel OFF (set =1 / =ptx120 to force)"
+                     dual-output norm route OFF (set =1 to force)"
                 );
             }
         }
@@ -19102,10 +19102,8 @@ impl ComputeBackend for CudaBackend {
             )?;
         }
 
-        // 6. Attention: decode-attention (q, k_cache, v_cache -> attn_out).
-        // gate: routes to the tiled streaming-softmax kernel at long
-        // context. Byte-identical to the prior single-block dispatch when
-        // the gate selects SingleBlock.
+        // 6. Attention: the one decode-attention kernel, at the split count
+        // and partition the model's policy gives this context.
         {
             let kv_cache = st.kv_caches[layer_idx].as_ref().ok_or_else(|| {
                 RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))

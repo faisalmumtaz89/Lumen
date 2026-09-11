@@ -28,9 +28,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   and `LUMEN_CUDA_ATTN_TARGET`; `LUMEN_CUDA_ATTN_CODEGEN` selects the NVRTC
   target as an A/B knob. A model outside the kernel's shape domain is refused
   at CUDA init with the shape named, rather than served by a slower route.
-  At the shape the previous release's GQA-shared pair served (group 6, head
-  dimension 256) the kernel's output is bit-identical to that pair's at every
-  context and on both stores (a 224-entry reference fixture of hashed partials
+  At the shape the GQA-shared pair served (group 6, head dimension 256) the
+  kernel is that pair's partial and merge with the shape made a compile-time
+  parameter: its output is bit-identical to the pair's as it stood before the
+  consolidation, at every context and on both stores (a 224-entry reference
+  fixture of hashed partials
   and outputs, `crates/lumen-runtime/tests/fixtures/attention_decode_reference.json`,
   is checked by `cuda_attention_decode_fixture_test`); every other (group,
   head dimension) in the domain is held within 2.5e-7 of a float64 reference

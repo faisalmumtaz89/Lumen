@@ -46,7 +46,7 @@ Each `Session` records its prompt history. On the next turn, `Session::extend_wi
 
 | Backend | Source root | Notable kernels |
 |---|---|---|
-| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (tiled streaming-softmax decode), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~16K LoC dispatch) |
+| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (the kernel set and the decode matvecs), `attention_decode.rs` (decode attention: one kernel per model shape), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~16K LoC dispatch) |
 | Metal | `crates/lumen-runtime/src/metal/` | `gdn.rs`, `moe.rs`, `prefill.rs`, `decode_*.rs`, `shaders/*.msl` |
 | CPU | `crates/lumen-runtime/src/compute/cpu_naive.rs` + `crates/lumen-runtime/src/accelerate/` | Scalar reference + SIMD NEON |
 

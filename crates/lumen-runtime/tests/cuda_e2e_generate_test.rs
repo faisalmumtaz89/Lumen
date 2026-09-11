@@ -63,7 +63,9 @@ fn setup_cpu_and_cuda(
         provider.final_norm.clone(),
         provider.output_proj.clone(),
     );
-    cuda.init(&hp)?;
+    // A device exists by now, so a refused init is a failure of the test
+    // model's shape or of the backend, never a reason to skip.
+    cuda.init(&hp).expect("CUDA init refused the test model");
 
     Ok((provider, cpu, cuda))
 }

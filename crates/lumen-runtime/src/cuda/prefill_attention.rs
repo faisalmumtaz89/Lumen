@@ -1664,7 +1664,16 @@ mod tests {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            ((seed >> 33) & 0xff_ffff) as f32 / 8_388_608.0 - 1.0
+            // A signed magnitude in [1/16, 1): every value is a normal half,
+            // so the storage rounding is exact and the two stores hold the
+            // same numbers.
+            let u = ((seed >> 33) & 0xff_ffff) as f32 / 8_388_608.0 - 1.0;
+            let mag = 0.0625 + 0.9375 * u.abs();
+            if u < 0.0 {
+                -mag
+            } else {
+                mag
+            }
         };
         let q: Vec<f32> = (0..num_heads * head_dim)
             .map(|_| host_f16_to_f32(host_f16_bits(next() * 4.0)))

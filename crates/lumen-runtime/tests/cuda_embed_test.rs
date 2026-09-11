@@ -24,7 +24,7 @@ fn test_hyperparams(vocab_size: u32, hidden_dim: u32) -> ModelHyperparams {
         num_layers: 1,
         num_heads: 1,
         num_kv_heads: 1,
-        head_dim: hidden_dim,
+        head_dim: 128, // the decode-attention kernel's smallest head dimension
         hidden_dim,
         intermediate_dim: hidden_dim,
         vocab_size,
