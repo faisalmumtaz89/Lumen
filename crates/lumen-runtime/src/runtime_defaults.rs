@@ -1101,15 +1101,18 @@ pub fn attn_target(num_kv_heads: u32) -> u32 {
         .min(ATTN_DECODE_S_MAX_DEFAULT)
 }
 
-/// The one-tile bound and the whole-tile target were measured on the RTX
-/// 5090 for a model with 4 KV heads as 176 and 128 chunks per KV head: one
-/// wave of 4 × 176 = 704 one-tile CTAs and 4 × 128 = 512 whole-tile CTAs
-/// over the card's 170 SMs. A model with another KV-head count keeps those
-/// CTA totals — the grid the device was measured with — so the per-KV-head
-/// counts scale inversely (352 and 256 on 2 KV heads); the sweep on each
-/// shipped model records whether that holds.
+/// The one-tile bound was measured on the RTX 5090 for a model with 4 KV
+/// heads as 176 tiles per KV head: one wave of 4 × 176 = 704 one-tile CTAs
+/// over the card's 170 SMs. A model with another KV-head count keeps that
+/// CTA total — the grid the device was measured with — so the per-KV-head
+/// bound scales inversely (352 on 2 KV heads; 176 against 352 there was a
+/// null on the MoE). The whole-tile target is NOT a CTA budget: 128 chunks
+/// per KV head was the measured best at 4 KV heads (176 the slowest, 64
+/// starving the card) and, against the budget-derived 256, +1.5 % at 12,288
+/// keys and equal below on the 2-KV-head MoE, so it is one constant for
+/// every model.
 pub const ATTN_ONE_TILE_CTAS: u32 = 704;
-pub const ATTN_TARGET_CTAS: u32 = 512;
+pub const ATTN_TARGET_PER_KV_HEAD: u32 = 128;
 /// The split-count ceiling the merge's shared block is sized for (mirrors
 /// `cuda::ATTN_DECODE_S_MAX`, which asserts the two agree).
 pub const ATTN_DECODE_S_MAX_DEFAULT: u32 = 1024;
@@ -1124,17 +1127,12 @@ pub const fn attn_one_tile_default(num_kv_heads: u32) -> u32 {
     }
 }
 
-pub const fn attn_target_default(num_kv_heads: u32) -> u32 {
-    let kv = if num_kv_heads == 0 { 1 } else { num_kv_heads };
-    let n = ATTN_TARGET_CTAS.div_ceil(kv);
-    if n > ATTN_DECODE_S_MAX_DEFAULT {
-        ATTN_DECODE_S_MAX_DEFAULT
-    } else {
-        n
-    }
+pub const fn attn_target_default(_num_kv_heads: u32) -> u32 {
+    ATTN_TARGET_PER_KV_HEAD
 }
 
-/// The measured 4-KV-head values, which the derivation above must reproduce.
+/// The measured 4-KV-head values, which the derivation above must reproduce
+/// (the target is the same constant at every KV-head count).
 pub const ATTN_ONE_TILE_DEFAULT: u32 = 176;
 pub const ATTN_TARGET_DEFAULT: u32 = 128;
 const _: () = assert!(attn_one_tile_default(4) == ATTN_ONE_TILE_DEFAULT);
@@ -3328,11 +3326,11 @@ mod tests {
         assert_eq!(attn_target(4), ATTN_TARGET_DEFAULT);
         // Per model: the CTA totals stay, the per-KV-head counts scale.
         assert_eq!(attn_one_tile_max(2), 352);
-        assert_eq!(attn_target(2), 256);
+        assert_eq!(attn_target(2), 128);
         assert_eq!(attn_one_tile_max(1), 704);
-        assert_eq!(attn_target(1), 512);
+        assert_eq!(attn_target(1), 128);
         assert_eq!(attn_one_tile_max(8), 88);
-        assert_eq!(attn_target(8), 64);
+        assert_eq!(attn_target(8), 128);
         std::env::set_var("LUMEN_CUDA_ATTN_ONE_TILE", "4096");
         std::env::set_var("LUMEN_CUDA_ATTN_TARGET", " 96 ");
         assert_eq!(attn_one_tile_max(4), ATTN_DECODE_S_MAX_DEFAULT);

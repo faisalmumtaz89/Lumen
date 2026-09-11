@@ -592,6 +592,7 @@ fn every_nvrtc_target_reproduces_the_reference_fixture() {
         }
     };
     let Some(dev) = try_device() else { return };
+    let mut ran = Vec::new();
     for arch in ["compute_80", "compute_120"] {
         if dev
             .compile_and_load_with_arch(&SPEC.source(), arch)
@@ -602,7 +603,16 @@ fn every_nvrtc_target_reproduces_the_reference_fixture() {
         }
         eprintln!("target {arch}");
         sweep(&dev, Some(arch), &None, &expected);
+        ran.push(arch);
     }
+    // A toolkit that refuses every explicit target has compared nothing;
+    // say so rather than pass. (compute_80 is offered by every toolkit the
+    // engine supports.)
+    assert!(
+        !ran.is_empty(),
+        "no explicit NVRTC target could be compiled; the sweep compared nothing"
+    );
+    eprintln!("targets reproduced the fixture: {ran:?}");
 }
 
 /// The digest function is the fixture's identity; pin it to a published

@@ -17897,7 +17897,8 @@ impl ComputeBackend for CudaBackend {
         let kernel_compile_start = std::time::Instant::now();
         // The decode-attention module is compiled for this model's
         // full-attention shape. A shape outside the kernel's domain is refused
-        // here, before any kernel compiles or any buffer is allocated: there
+        // here, before any weight buffer is allocated (the embedding kernels
+        // above have compiled; nothing else has): there
         // is no other decode-attention route (the CPU backend serves such a
         // model: run without --cuda).
         let attn_spec = super::attention_decode::DecodeAttentionSpec::for_shape(

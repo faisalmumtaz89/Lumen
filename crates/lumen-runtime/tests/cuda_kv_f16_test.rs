@@ -21,8 +21,8 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::shaders::{KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
 use lumen_runtime::cuda::{
-    decode_attention_geometry_within, decode_attention_merge_shared_bytes,
-    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_REVIEWED_SHAPE as SPEC,
+    decode_attention_merge_shared_bytes, ATTN_DECODE_BLOCK_DIM as BLOCK_DIM,
+    ATTN_DECODE_REVIEWED_SHAPE as SPEC, ATTN_DECODE_TILE,
 };
 const HEAD_DIM: u32 = SPEC.head_dim;
 const DIM_TILES: u32 = SPEC.dim_tiles();
@@ -241,7 +241,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
             &k32,
             &v32,
             seq_len,
-            decode_attention_geometry_within(seq_len, u32::MAX, 1),
+            (seq_len.div_ceil(ATTN_DECODE_TILE).max(1), 0),
         );
         let b = run_partial(
             &dev,
@@ -251,7 +251,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
             &k16,
             &v16,
             seq_len,
-            decode_attention_geometry_within(seq_len, u32::MAX, 1),
+            (seq_len.div_ceil(ATTN_DECODE_TILE).max(1), 0),
         );
         assert!(
             a.3.iter().all(|x| x.is_finite()),

@@ -22,9 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   it the split count is held at a fixed target and each CTA walks a balanced
   run of whole tiles with a running-max recurrence, so the scratch is sized
   once per model (4.2 MiB on Qwen3.8-27B, either store) and a generation never
-  changes route as it grows. The bound and the target are CTA budgets shared
-  by every model (704 one-tile CTAs and 512 target CTAs across the KV heads:
-  176 / 128 at 4 KV heads, 352 / 256 at 2), set by `LUMEN_CUDA_ATTN_ONE_TILE`
+  changes route as it grows. The one-tile bound is a CTA budget shared by
+  every model (704 one-tile CTAs across the KV heads: 176 tiles per KV head
+  at 4 KV heads, 352 at 2); the target is 128 chunks per KV head on every
+  model, the measured best at both KV-head counts; set by `LUMEN_CUDA_ATTN_ONE_TILE`
   and `LUMEN_CUDA_ATTN_TARGET`; `LUMEN_CUDA_ATTN_CODEGEN` selects the NVRTC
   target as an A/B knob. A model outside the kernel's shape domain is refused
   at CUDA init with the shape named, rather than served by a slower route.
@@ -55,8 +56,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   Q4_0 +3.8 / +5.9 / +10.9 % at 3,072 / 6,144 / 12,288 tokens of context (two
   runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
   to 213.5 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
-  was that model's wall at any long context), greedy output identical on
-  both. Against v0.30.0 the output is therefore a
+  was that model's wall at any long context); the 50-completion greedy
+  determinism run on each model's F32 store reproduces the previous route's
+  digest, and the long-context quality records against the previous build
+  are on file with their one adjudicated parting each. Against v0.30.0 the output is therefore a
   near-tie, not byte-identical, on every model (the models the per-query-head
   pair and the tiled kernel served now take this kernel).
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /

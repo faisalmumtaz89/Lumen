@@ -28,6 +28,26 @@ fn a_removed_env_name_refuses_startup_with_its_remedy() {
     assert!(stderr.contains("refusing to start"), "stderr: {stderr}");
 }
 
+/// Every name on the removed list refuses the CLI, not just the one above.
+#[test]
+fn every_removed_env_name_refuses_startup() {
+    for (name, remedy) in lumen_runtime::runtime_defaults::REMOVED_LUMEN_ENV_VARS {
+        let out = lumen()
+            .arg("--version")
+            .env(name, "1")
+            .output()
+            .expect("run lumen");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{name}: stderr: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{name} is set but this release does not read it: {remedy}"
+            )),
+            "{name}: the remedy is missing: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn a_removed_env_name_set_to_zero_refuses_too() {
     let out = lumen()

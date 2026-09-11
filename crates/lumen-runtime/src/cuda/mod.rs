@@ -40,8 +40,8 @@ pub use backend_impl::CudaBackend;
 
 pub use attention_decode::{
     decode_attention_geometry_within, decode_attention_merge_shared_bytes,
-    decode_attention_scratch_chunks, decode_attention_scratch_chunks_within, DecodeAttentionPolicy,
-    DecodeAttentionSpec, ATTN_DECODE_REVIEWED_SHAPE, ATTN_DECODE_S_MAX, ATTN_DECODE_TILE,
+    decode_attention_scratch_chunks_within, DecodeAttentionPolicy, DecodeAttentionSpec,
+    ATTN_DECODE_REVIEWED_SHAPE, ATTN_DECODE_S_MAX, ATTN_DECODE_TILE,
 };
 /// The decode-attention launch geometry, for out-of-crate callers that drive
 /// the kernels in [`shaders`] directly — the correctness suites

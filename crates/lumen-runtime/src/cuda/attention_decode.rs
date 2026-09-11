@@ -179,18 +179,11 @@ pub const fn decode_attention_geometry_within(
     one_tile_max: u32,
     target: u32,
 ) -> (u32, DecodePartition) {
-    // The merge's shared block is sized for ATTN_DECODE_S_MAX chunks, so no
-    // policy value, clamped or not, can ask for more.
-    let one_tile_max = if one_tile_max > ATTN_DECODE_S_MAX {
-        ATTN_DECODE_S_MAX
-    } else {
-        one_tile_max
-    };
-    let target = if target > ATTN_DECODE_S_MAX {
-        ATTN_DECODE_S_MAX
-    } else {
-        target
-    };
+    // Total over the knobs: both bounds are held to 1..=ATTN_DECODE_S_MAX
+    // here (the merge's shared block is sized for the ceiling; a zero target
+    // would launch no CTA), whatever a caller passes.
+    let one_tile_max = clamp_split(one_tile_max);
+    let target = clamp_split(target);
     let n = seq_len.div_ceil(ATTN_DECODE_TILE);
     let n = if n == 0 { 1 } else { n };
     if n <= one_tile_max {
@@ -211,6 +204,8 @@ pub const fn decode_attention_scratch_chunks_within(
     one_tile_max: u32,
     target: u32,
 ) -> u32 {
+    let one_tile_max = clamp_split(one_tile_max);
+    let target = clamp_split(target);
     let n_max = max_seq_len.div_ceil(ATTN_DECODE_TILE);
     let n_max = if n_max == 0 { 1 } else { n_max };
     let policy_max = if one_tile_max >= target {
@@ -236,10 +231,16 @@ pub const fn decode_attention_merge_shared_bytes(chunks: u32) -> u32 {
     (chunks + 4) * 4
 }
 
-/// The split count the scratch must hold for a cache of `max_seq_len` under
-/// the policy in force for a model with `num_kv_heads` KV heads.
-pub fn decode_attention_scratch_chunks(max_seq_len: u32, num_kv_heads: u32) -> u32 {
-    DecodeAttentionPolicy::from_env(num_kv_heads).scratch_chunks(max_seq_len)
+/// A split-count knob held to what a launch can use: at least one chunk, at
+/// most the merge's ceiling.
+const fn clamp_split(v: u32) -> u32 {
+    if v == 0 {
+        1
+    } else if v > ATTN_DECODE_S_MAX {
+        ATTN_DECODE_S_MAX
+    } else {
+        v
+    }
 }
 
 /// The split-K scratch and the policy it was sized for, allocated once per
@@ -802,7 +803,16 @@ mod tests {
     /// No context makes a tile outgrow its warp, under any policy.
     #[test]
     fn no_context_makes_a_tile_outgrow_its_warp() {
-        for (one_tile, target) in [(176, 128), (352, 256), (1024, 128), (64, 340), (1, 1)] {
+        for (one_tile, target) in [
+            (176, 128),
+            (352, 256),
+            (1024, 128),
+            (64, 340),
+            (1, 1),
+            (u32::MAX, u32::MAX),
+            (176, 0),
+            (0, 0),
+        ] {
             for seq_len in (1..=70_000)
                 .step_by(7)
                 .chain([1u32, 16, 17, 2816, 2817, 4096, 65_536])
@@ -838,6 +848,9 @@ mod tests {
             (1, 1),
             (1, 1024),
             (1024, 1024),
+            (u32::MAX, u32::MAX),
+            (176, 0),
+            (0, 0),
             (2, 3),
         ] {
             for max_seq_len in [
@@ -887,9 +900,10 @@ mod tests {
         assert_eq!(p4.scratch_chunks(1 << 20), 176);
         assert_eq!(p4.scratch_chunks(1_000), 63);
         let p2 = DecodeAttentionPolicy::from_env(2);
-        assert_eq!((p2.one_tile_max, p2.target), (352, 256));
+        assert_eq!((p2.one_tile_max, p2.target), (352, 128));
         assert_eq!(p2.geometry(352 * 16), (352, 0));
-        assert_eq!(p2.geometry(352 * 16 + 1), (256, 1));
+        assert_eq!(p2.geometry(352 * 16 + 1), (128, 1));
+        assert_eq!(p2.scratch_chunks(1 << 20), 352);
         assert_eq!(decode_attention_geometry_within(0, 176, 128), (1, 0));
         assert_eq!(decode_attention_geometry_within(2817, 176, 340), (177, 1));
         std::env::set_var("LUMEN_CUDA_ATTN_ONE_TILE", "64");
