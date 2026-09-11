@@ -20,8 +20,8 @@
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::shaders::{
-    ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE, ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
-    ATTENTION_DECODE_TILED_KERNEL_SOURCE, KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
+    ATTENTION_DECODE_SPLITK_KERNEL_SOURCE, ATTENTION_DECODE_TILED_KERNEL_SOURCE,
+    KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
 };
 use lumen_runtime::cuda::{
     attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
