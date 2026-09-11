@@ -50,7 +50,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   lanes (chunk `c` into lane `c mod 8`, then a fixed tree) instead of one
   serial chain: deterministic, and on real activations the worst coordinate
   error against a float64 reference drops from 8.7e-5 to 7.0e-6 at 5k keys
-  and from 5.2e-5 to 2.2e-5 at 11k. Against v0.30.0 the output is therefore a
+  and from 5.2e-5 to 2.2e-5 at 11k. On the models the other routes served,
+  paired gates on the RTX 5090 against the route each took before: Qwen3.5-9B
+  Q4_0 +3.8 / +5.9 / +10.9 % at 3,072 / 6,144 / 12,288 tokens of context (two
+  runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
+  to 213.4 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
+  was that model's wall at any long context), greedy output identical on
+  both. Against v0.30.0 the output is therefore a
   near-tie, not byte-identical, on every model (the models the per-query-head
   pair and the tiled kernel served now take this kernel).
 - **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
