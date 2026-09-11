@@ -21,6 +21,10 @@ fn a_removed_env_name_refuses_startup_with_its_remedy() {
         stderr.contains("LUMEN_CUDA_ATTN_SPLITK is set but this release does not read it"),
         "stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("there is no other route to switch on or off. Unset it."),
+        "the remedy is missing: {stderr}"
+    );
     assert!(stderr.contains("refusing to start"), "stderr: {stderr}");
 }
 

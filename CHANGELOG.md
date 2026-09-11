@@ -54,7 +54,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   paired gates on the RTX 5090 against the route each took before: Qwen3.5-9B
   Q4_0 +3.8 / +5.9 / +10.9 % at 3,072 / 6,144 / 12,288 tokens of context (two
   runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
-  to 213.4 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
+  to 213.5 / 208.1 / 197.8 tok/s: the tiled kernel's one CTA per query head
   was that model's wall at any long context), greedy output identical on
   both. Against v0.30.0 the output is therefore a
   near-tie, not byte-identical, on every model (the models the per-query-head

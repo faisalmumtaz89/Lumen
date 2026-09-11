@@ -80,9 +80,11 @@ struct Geom {
 }
 
 /// The one-tile split count: one CTA per 16 keys, the partition the policy
-/// keeps below its one-tile bound.
+/// keeps below its one-tile bound. Computed directly, not through the
+/// geometry helper, which clamps to the split ceiling: above it this count
+/// exceeds the ceiling, which is exactly what the callers test for.
 fn one_tile_chunks(seq_len: u32) -> u32 {
-    decode_attention_geometry_within(seq_len, u32::MAX, 1).0
+    seq_len.div_ceil(DECODE_CHUNK).max(1)
 }
 
 /// The geometry the sweep runs at a length: the one-tile partition wherever
