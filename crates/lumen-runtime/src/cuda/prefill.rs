@@ -2430,6 +2430,13 @@ unsafe fn launch_attention_decode_splitk_gqa6(
         .ok_or_else(|| {
             RuntimeError::Compute("attention_decode_splitk_gqa6: merge not available".into())
         })?;
+    // The control launches the one-tile kernel, which has no tile loop: the
+    // admission only admits it on the span partition (its bound refuses
+    // longer contexts), and that is what this guard states.
+    debug_assert!(
+        !control || partition == 0,
+        "the one-tile control kernel takes only the span partition"
+    );
     let s = chunks;
     let (m_part, l_part, o_part) = scratch;
     if control {
@@ -5543,6 +5550,13 @@ unsafe fn launch_attention_decode_splitk_gqa6_f16(
         .ok_or_else(|| {
             RuntimeError::Compute("attention_decode_splitk_gqa6_f16: merge not available".into())
         })?;
+    // The control launches the one-tile kernel, which has no tile loop: the
+    // admission only admits it on the span partition (its bound refuses
+    // longer contexts), and that is what this guard states.
+    debug_assert!(
+        !control || partition == 0,
+        "the one-tile control kernel takes only the span partition"
+    );
     let s = chunks;
     let (m_part, l_part, o_part) = scratch;
     if control {
