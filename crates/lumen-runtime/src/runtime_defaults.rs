@@ -1106,11 +1106,12 @@ pub fn attn_target(num_kv_heads: u32) -> u32 {
 /// over the card's 170 SMs. A model with another KV-head count keeps that
 /// CTA total — the grid the device was measured with — so the per-KV-head
 /// bound scales inversely (352 on 2 KV heads; 176 against 352 there was a
-/// null on the MoE). The whole-tile target is NOT a CTA budget: 128 chunks
-/// per KV head was the measured best at 4 KV heads (176 the slowest, 64
-/// starving the card) and, against the budget-derived 256, +1.5 % at 12,288
-/// keys and equal below on the 2-KV-head MoE, so it is one constant for
-/// every model.
+/// null on the MoE). The whole-tile target is NOT a CTA budget: at 4 KV
+/// heads 128 chunks per KV head is within 3 % of the best measured count on
+/// the F32 store and 6 % on the half store from 6,144 to 32,768 keys (176
+/// the slowest F32 count, 64 starving the card) and, against the
+/// budget-derived 256, +1.5 % at 12,288 keys and equal below on the
+/// 2-KV-head MoE, so it is one constant for every model.
 pub const ATTN_ONE_TILE_CTAS: u32 = 704;
 pub const ATTN_TARGET_PER_KV_HEAD: u32 = 128;
 /// The split-count ceiling the merge's shared block is sized for (mirrors

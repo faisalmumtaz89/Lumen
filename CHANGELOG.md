@@ -18,7 +18,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `attention_decode_merge`, compiled at load for the model's group size
   (query heads per KV head, 1 to 8) and head dimension (128 or 256). One CTA
   per (KV head, chunk) reads each K and V row once for the whole group with
-  16-byte loads on the F32 store (8-byte on the half store); up to a one-tile bound each CTA takes one 16-key tile, above
+  16-byte loads on the F32 store (on the half store the K rows are read as
+  8-byte loads, Q and V stay 16-byte); up to a one-tile bound each CTA takes one 16-key tile, above
   it the split count is held at a fixed target and each CTA walks a balanced
   run of whole tiles with a running-max recurrence, so the scratch is sized
   once per model (4.2 MiB on Qwen3.8-27B, either store) and a generation never

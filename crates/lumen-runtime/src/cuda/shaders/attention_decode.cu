@@ -11,8 +11,9 @@
 // writes (m, l, o) per (query head, chunk), `attention_decode_merge` combines
 // them. One CTA per (KV head, chunk): each K row and V row is fetched ONCE
 // and serves all G query heads of the group, and every Q, K and V read is a
-// 16-byte load on the F32 store (K and V are 8-byte loads on the half store). (The partial's scratch stores and the merge's reads of them
-// stay scalar; they are a fifth of the traffic.)
+// 16-byte load on the F32 store (on the half store Q and V stay 16-byte; K
+// rows are read as 8-byte loads). (The partial's scratch stores and the
+// merge's reads of them stay scalar; they are a fifth of the traffic.)
 //
 // Decomposition of one CTA (128 threads = 4 warps), per 16-key tile:
 //
