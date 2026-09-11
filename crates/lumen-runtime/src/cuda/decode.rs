@@ -182,41 +182,15 @@ pub(crate) struct KernelSet {
     /// Saves 1 graph node per layer (36 fewer nodes for 3B model).
     pub(crate) residual_add_copy: CudaFunction,
 
-    // Multi-head attention
-    pub(crate) attention_decode: CudaFunction,
-
-    // Tiled streaming-softmax decode-attention kernel.
-    //
-    // Closes the single-block `attention_decode` kernel's `seq_len <= 40_950`
-    // ceiling by streaming the softmax over fixed-size KV tiles (T_C=128) using
-    // Dao 2022 online-softmax mechanics. Per-CTA shmem is constant in seq_len
-    // (~1.6 KB at head_dim=256); no dynamic-shmem opt-in required.
-    //
-    // Optional: NVRTC compile may fail on extremely old drivers. If absent,
-    // a Tiled selection errors at dispatch — the selector
-    // (`decode::attention_decode_variant`) never inspects kernel
-    // availability — though eligible automatic selections may still be
-    // served by the split-K pair.
-    pub(crate) attention_decode_tiled: Option<CudaFunction>,
-    /// Which NVRTC target `attention_decode_tiled` was compiled for (`attn_tiled_codegen`), so
-    /// the dispatch announces the compiled variant it actually runs.
-    pub(crate) attention_decode_tiled_codegen: &'static str,
-
-    // Split-K decode-attention pair (sequence-parallel twin of the tiled
-    // kernel, `LUMEN_CUDA_ATTN_SPLITK` — model-aware default: ON for Q8_0-
-    // and BF16-body dense models, OFF otherwise); both must be present for
-    // the split-K route to dispatch.
-    pub(crate) attention_decode_splitk_partial: Option<CudaFunction>,
-    pub(crate) attention_decode_splitk_merge: Option<CudaFunction>,
-
-    // GQA-shared split-K decode-attention pair
-    // (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, ON by default for a Q4_0 dense body on
-    // compute capability 12.x, OFF elsewhere): one CTA per (KV head,
-    // chunk) instead of per (query head, chunk). Loaded only when the split-K
-    // route itself is enabled, since it is an alternative implementation of
-    // that route; both must be present for it to dispatch.
-    pub(crate) attention_decode_splitk_partial_gqa6: Option<CudaFunction>,
-    pub(crate) attention_decode_splitk_merge_gqa6: Option<CudaFunction>,
+    // Decode attention: one kernel family for every model and context
+    // (`shaders/attention_decode.cu`), compiled once for this model's shape.
+    pub(crate) attention_decode_partial: CudaFunction,
+    pub(crate) attention_decode_merge: CudaFunction,
+    /// The shape the decode-attention module was compiled for.
+    pub(crate) attn_spec: super::attention_decode::DecodeAttentionSpec,
+    /// The NVRTC target it was compiled for (`LUMEN_CUDA_ATTN_CODEGEN`):
+    /// "default", "ptx80" or "ptx120".
+    pub(crate) attn_codegen: &'static str,
 
     // Tiled GEMM for batched prefill (superseded by cuBLAS HGEMM; kept for fallback).
     #[allow(dead_code)]
@@ -910,9 +884,32 @@ pub(crate) struct KernelSet {
     pub(crate) fused_glu_gemv_q4_0_prenormed_no_norm: Option<CudaFunction>,
     pub(crate) moe_shared_down_q4_0_sigmoid_accum: Option<CudaFunction>,
     pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
+
+    /// The 16-bit KV cache's kernels: present only when the backend was built
+    /// for `KvPrecision::F16`, and then every one of them loaded (`?`, never
+    /// `.ok()`), so a half-typed store always has a half-typed reader and
+    /// writer. `None` means the store is F32 and nothing here can be reached.
+    pub(crate) kv_f16: Option<KvF16Kernels>,
 }
 
-pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, RuntimeError> {
+/// The kernels a half-typed KV store is read and written with. Loaded as a
+/// group or not at all.
+pub(crate) struct KvF16Kernels {
+    /// `attention_decode_partial_f16`; the F32 merge consumes its partials.
+    pub(crate) attention_decode_partial: CudaFunction,
+    /// `kv_cache_write_batch_f16` (prefill).
+    pub(crate) write_batch: CudaFunction,
+    /// `kv_cache_widen_f16`: the prefill readers work on a widened F32 copy.
+    pub(crate) widen: CudaFunction,
+    /// `attn_prep_fused_kvf16`, the fused decode writer.
+    pub(crate) prep_fused: CudaFunction,
+}
+
+pub(crate) fn compile_all_kernels(
+    device: &CudaDevice,
+    kv_precision: crate::kv::KvPrecision,
+    attn_spec: super::attention_decode::DecodeAttentionSpec,
+) -> Result<KernelSet, RuntimeError> {
     let load_fn = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
         let module = device.compile_and_load(source)?;
         module
@@ -920,54 +917,39 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
             .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
     };
 
-    // The tiled decode-attention kernel at the target `LUMEN_CUDA_ATTN_TILED_CODEGEN` selects,
-    // or the per-device default (compute_120 on capability 12.x when NVRTC can emit it, NVRTC's
-    // default elsewhere). Same source, same math options; only the code generation differs.
-    let tiled_codegen = {
-        let cc_major = device
-            .compute_capability()
-            .map(|(major, _)| major.clamp(0, 255) as u8)
-            .unwrap_or(0);
-        attn_tiled_codegen_selection(cc_major, device.nvrtc_can_target(120))
-    };
-    // An explicit target the toolkit or driver refuses falls back to NVRTC's default target —
-    // the pre-promotion build — rather than leaving the kernel absent; the fallback is announced
-    // and the KernelSet records the target that actually loaded.
-    let tiled_codegen = std::cell::Cell::new(tiled_codegen);
-    let load_tiled = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
-        let selected = tiled_codegen.get();
+    // The decode-attention module is compiled for the model's shape: the
+    // spec's defines are prepended to the source, so each shape is its own
+    // module (and its own PTX cache entry). `LUMEN_CUDA_ATTN_CODEGEN` picks
+    // the NVRTC target (default: NVRTC's default target;
+    // a target the toolkit refuses falls back to it and is announced).
+    let attn_source = attn_spec.source();
+    let attn_codegen = std::cell::Cell::new(attn_codegen_selection());
+    let load_attention = |name: &str| -> Result<CudaFunction, RuntimeError> {
+        let selected = attn_codegen.get();
         let module = match selected {
             "ptx80" | "ptx120" => {
-                let arch = attn_tiled_codegen_target(selected);
-                match device.compile_and_load_with_arch(source, arch) {
-                    Ok(m) => {
-                        cuda_log!("[CUDA] {name}: compiled for {arch}");
-                        m
-                    }
+                let arch = attn_codegen_target(selected);
+                match device.compile_and_load_with_arch(&attn_source, arch) {
+                    Ok(m) => m,
                     Err(e) => {
                         eprintln!(
                             "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
                         );
-                        tiled_codegen.set("default");
-                        device.compile_and_load(source)?
+                        attn_codegen.set("default");
+                        device.compile_and_load(&attn_source)?
                     }
                 }
             }
-            _ => device.compile_and_load(source)?,
+            _ => device.compile_and_load(&attn_source)?,
         };
-        module
-            .load_function(name)
-            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+        let f = module.load_function(name).map_err(|e| {
+            RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}"))
+        })?;
+        // The compile/load roster line most kernels print: a load log
+        // names what this binary carries, not only what it dispatched.
+        cuda_log!("[CUDA] {name}: OK");
+        Ok(f)
     };
-
-    // The split-K decode-attention pair compiles for NVRTC's default target: at compute_120 the
-    // pair measured slightly slower on the RTX 5090, unlike the tiled kernel.
-    let load_splitk = load_fn;
-
-    // The GQA-shared pair is an alternative implementation of the split-K
-    // route, so it loads only where that route can be selected at all.
-    let load_splitk_gqa6 = crate::runtime_defaults::attn_splitk_enabled()
-        && crate::runtime_defaults::attn_splitk_gqa6_enabled();
 
     // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
@@ -1019,26 +1001,45 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         })
     };
 
-    // The tiled kernel loads before the KernelSet records its target, so a fallback inside
-    // `load_tiled` is what the announcements report.
-    let attention_decode_tiled = match load_tiled(
-        shaders::ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-        "attention_decode_tiled",
-    ) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            cuda_log!(
-                "[CUDA] attention_decode_tiled: FAILED ({e}); \
-                 long-context decode (seq_len > {}) will error at dispatch \
-                 (eligible automatic calls may use split-K)",
-                ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
-            );
-            None
+    // The half store's kernels load as a group, each with `?`: a store that
+    // cannot be read or written by every path that touches it is refused at
+    // init, never discovered at a dispatch.
+    let kv_f16 = match kv_precision {
+        crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
+            attention_decode_partial: load_attention("attention_decode_partial_f16")?,
+            write_batch: load_fn(
+                shaders::KV_CACHE_F16_KERNEL_SOURCE,
+                "kv_cache_write_batch_f16",
+            )?,
+            widen: load_fn(shaders::KV_CACHE_F16_KERNEL_SOURCE, "kv_cache_widen_f16")?,
+            prep_fused: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "attn_prep_fused_kvf16")?,
+        }),
+        crate::kv::KvPrecision::F32 => None,
+        other => {
+            return Err(RuntimeError::Unsupported(format!(
+                "CUDA KV cache precision {other:?} is not implemented"
+            )))
         }
     };
 
+    // Every entry point loads before the target is recorded (the half
+    // partial above, when a half store is configured; both F32 entries here):
+    // a refused target falls back inside `load_attention`, and the record, the
+    // load line, the route line and the dump must all name what actually loaded.
+    let attention_decode_partial = load_attention("attention_decode_partial_f32")?;
+    let attention_decode_merge = load_attention("attention_decode_merge")?;
+    cuda_log!(
+        "[CUDA] decode attention: compiled for group {} (query heads per KV head), head_dim {}, codegen {}",
+        attn_spec.group,
+        attn_spec.head_dim,
+        attn_codegen.get()
+    );
     let kernels = KernelSet {
-        attention_decode_tiled_codegen: tiled_codegen.get(),
+        kv_f16,
+        attn_spec,
+        attn_codegen: attn_codegen.get(),
+        attention_decode_partial,
+        attention_decode_merge,
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
         matvec_f32: load_fn(shaders::MATVEC_F32_KERNEL_SOURCE, "matvec_f32")?,
@@ -1100,68 +1101,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         swiglu_inplace: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "swiglu_inplace")?,
         residual_add: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "residual_add")?,
         residual_add_copy: load_fn(shaders::ACTIVATIONS_KERNEL_SOURCE, "residual_add_copy")?,
-        attention_decode: load_fn(shaders::ATTENTION_KERNEL_SOURCE, "attention_decode")?,
-        // Tiled streaming-softmax decode-attention kernel.
-        // Optional: log a warning if NVRTC compile fails so the gate sees
-        // the unavailability and operators learn the long-context path is
-        // disabled on this device.
-        attention_decode_tiled,
-        attention_decode_splitk_partial: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
-                "attention_decode_splitk_partial",
-            ) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    cuda_log!("[CUDA] attention_decode_splitk_partial: FAILED ({e})");
-                    None
-                }
-            }
-        } else {
-            None
-        },
-        attention_decode_splitk_merge: if crate::runtime_defaults::attn_splitk_enabled() {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_KERNEL_SOURCE,
-                "attention_decode_splitk_merge",
-            ) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    cuda_log!("[CUDA] attention_decode_splitk_merge: FAILED ({e})");
-                    None
-                }
-            }
-        } else {
-            None
-        },
-        attention_decode_splitk_partial_gqa6: if load_splitk_gqa6 {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_partial_gqa6_f32",
-            ) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
-                    None
-                }
-            }
-        } else {
-            None
-        },
-        attention_decode_splitk_merge_gqa6: if load_splitk_gqa6 {
-            match load_splitk(
-                shaders::ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE,
-                "attention_decode_splitk_merge_gqa6_f32",
-            ) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    cuda_log!("[CUDA] attention_decode_splitk_merge_gqa6_f32: FAILED ({e})");
-                    None
-                }
-            }
-        } else {
-            None
-        },
         gemm_f32: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32")?,
         gemm_f32_residual: load_fn(shaders::GEMM_F32_KERNEL_SOURCE, "gemm_f32_residual")?,
         compute_rms_scale: load_fn(
@@ -3744,13 +3683,6 @@ pub(crate) fn compile_all_kernels(device: &CudaDevice) -> Result<KernelSet, Runt
         // FA2 block-skip dispatch flag (default-off contract: default OFF, env-gated).
     };
 
-    // Raise the attention_decode kernel's per-block dynamic shared-memory cap
-    // from the static 48 KB ceiling to ATTN_DECODE_EXTENDED_SHMEM_BYTES so the
-    // decode seq_len ceiling rises from ~12 K to ~40 K. Best-effort: GPUs that
-    // cannot service the request keep the default cap and only long-context
-    // decode is affected.
-    opt_in_attention_decode_dyn_shmem(&[&kernels.attention_decode])?;
-
     Ok(kernels)
 }
 
@@ -3761,626 +3693,28 @@ pub(crate) fn rmsnorm_shared_bytes(block_size: u32) -> u32 {
     (block_size / 32) * 4
 }
 
-/// Shared memory bytes needed for the attention_decode kernel.
-///
-/// Layout: 8 floats for warp partial reduction + seq_len floats for scores.
-///
-/// A100 SM 8.0 has a per-block static shared-memory ceiling of 48 KB. When
-/// `seq_len > ATTN_DECODE_DEFAULT_SHMEM_MAX_SEQ_LEN` (12280), the kernel
-/// needs `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, ...)` to opt
-/// into the SM-8.0 extended limit. We perform this opt-in at module load
-/// via [`opt_in_attention_decode_dyn_shmem`]; the practical ceiling then
-/// becomes [`ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN`] (40950).
-pub(crate) fn attention_shared_bytes(seq_len: u32) -> u32 {
-    (8 + seq_len) * 4
-}
-
-/// Per-block shared memory the `attention_decode` kernel uses without
-/// dynamic-shared opt-in (CUDA's default cap on SM 8.0+).
-pub(crate) const ATTN_DECODE_DEFAULT_SHMEM_BYTES: u32 = 49_152;
-
-/// Per-block shared memory the kernel CAN use after
-/// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, ...)`. 163 KB is the
-/// SM 8.0 maximum (164 KB device limit minus 1 KB system reserve); we
-/// round down to 163,840 so the kernel never touches the reserved region.
-pub(crate) const ATTN_DECODE_EXTENDED_SHMEM_BYTES: u32 = 163_840;
-
-/// Maximum `seq_len` reachable using the default 48 KB shared-memory cap.
-pub(crate) const ATTN_DECODE_DEFAULT_SHMEM_MAX_SEQ_LEN: u32 =
-    (ATTN_DECODE_DEFAULT_SHMEM_BYTES / 4) - 8;
-
-/// Maximum `seq_len` reachable after the kernel has opted in to the
-/// extended dynamic-shared-memory budget (163 KB on SM 8.0+).
-pub(crate) const ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN: u32 = 40_950;
-
-/// Inclusive ceiling on `seq_len` for the single-block `attention_decode`
-/// kernel.
-///
-/// Kept as a public crate API because it is the single-block kernel's
-/// structural ceiling ([`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`] is 0, so the
-/// tiled route serves every length by default and this ceiling binds only a
-/// forced single-block dispatch) and is the documented operator-facing constant in the tiled-decode
-/// acceptance criterion. Used in tests to verify the gate cutover falls
-/// inside the single-block kernel's serviceable range.
-#[allow(dead_code)]
-pub(crate) const fn attention_decode_max_seq_len() -> u32 {
-    ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN
-}
-
-/// Predicate: can the single-block `attention_decode` kernel honor
-/// `attention_shared_bytes(seq_len)` after the extended-shmem opt-in?
-///
-/// Kept as a public crate API even after. The new gate predicate
-/// `attention_decode_variant` supersedes this for kernel-selection decisions,
-/// but `attention_decode_can_launch` remains the documented invariant for the
-/// single-block kernel's serviceable range. Test code and diagnostic logging
-/// reference it; production dispatch is via the gate.
-#[allow(dead_code)]
-pub(crate) fn attention_decode_can_launch(seq_len: u32) -> bool {
-    seq_len <= attention_decode_max_seq_len()
-}
-
-/// Raise the `attention_decode` kernel's dynamic shared-memory limit from
-/// the default 48 KB to [`ATTN_DECODE_EXTENDED_SHMEM_BYTES`]. Failure is
-/// non-fatal: the kernel keeps its default cap and only the long-context
-/// decode path is affected.
-pub(crate) fn opt_in_attention_decode_dyn_shmem(fns: &[&CudaFunction]) -> Result<(), RuntimeError> {
-    use cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
-    for f in fns {
-        if let Err(e) = f.set_attribute(
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            ATTN_DECODE_EXTENDED_SHMEM_BYTES as i32,
-        ) {
-            let msg = format!("{e}");
-            if msg.contains("INVALID_VALUE") {
-                eprintln!(
-                    "[lumen-cuda] attention_decode dyn-shmem opt-in declined ({msg}); the \
-                     single-block kernel keeps its seq_len <= {} ceiling (the tiled and split-K \
-                     routes, which serve decode by default, are unaffected)",
-                    ATTN_DECODE_DEFAULT_SHMEM_MAX_SEQ_LEN
-                );
-                continue;
-            }
-            return Err(RuntimeError::Compute(format!(
-                "set_attribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) on attention_decode: {e}",
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ===========================================================================
-// Tiled streaming-softmax decode-attention gate
-// ===========================================================================
-//
-// Closes: long-context decode at
-// `seq_len > 40_950` (the single-block kernel's SM-8.0 extended-shmem
-// ceiling, see `ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN` above).
-//
-// Three variants cohabit:
-//   - Single-block `attention_decode` (fast at short context): selected when
-//     `seq_len <= LUMEN_CUDA_DECODE_TILED_THRESHOLD` and the threshold is
-//     nonzero (default 0 = Tiled is the base selection for every positive
-//     seq_len), and used when the tiled kernel cannot serve the head_dim.
-//   - Tiled `attention_decode_tiled`: seq_len up to the KV cache cap.
-//   - Split-K pair `attention_decode_splitk_*` (`LUMEN_CUDA_ATTN_SPLITK`,
-//     model-aware default): upgrades the AUTO Tiled selection when the
-//     kernels + scratch are present and the shape is eligible — see
-//     `launch_attention_decode_gated` in prefill.rs.
-//   - GQA-shared split-K pair `attention_decode_splitk_*_gqa6_f32`
-//     (`LUMEN_CUDA_ATTN_SPLITK_GQA6`, ON by default for a Q4_0 dense body on
-//     compute capability 12.x, OFF elsewhere): serves the split-K
-//     selection instead of the pair above on the one geometry it is
-//     specialised for (6 query heads per KV head, head_dim 256, a context
-//     the chunk cap covers).
-//
-// `attention_decode_variant(seq_len, force_tiled, threshold)` decides
-// SingleBlock vs Tiled; the split-K upgrade layers on top at the gated
-// launcher. The four launch sites are listed on
-// `launch_attention_decode_gated` (prefill.rs).
+// Decode-attention kernel constants and codegen selection
+/// Threads per CTA of the decode-attention kernels (must match `DECODE_BLOCK` in the shader).
+pub const ATTN_DECODE_BLOCK_DIM: u32 = 128;
 
-/// KV tile width for `attention_decode_tiled` (must match `T_C` in the kernel).
-pub const ATTN_DECODE_TILED_T_C: u32 = 128;
-
-/// Block dim for `attention_decode_tiled` (must match `BLOCK_DIM` in the kernel).
-pub const ATTN_DECODE_TILED_BLOCK_DIM: u32 = 128;
-
-/// Shared memory bytes for `attention_decode_tiled`.
-///
-/// Layout (CONSTANT in seq_len): `partial[8] + q_row[head_dim] + s_tile[T_C]`
-/// floats. At `head_dim = 256`: `(8 + 256 + 128) * 4 = 1568 bytes` — well
-/// under the 48 KB default shmem cap; no `cuFuncSetAttribute` opt-in needed.
-pub(crate) const fn attention_decode_tiled_shared_bytes(head_dim: u32) -> u32 {
-    (8 + head_dim + ATTN_DECODE_TILED_T_C) * 4
-}
-
-/// Whether the tiled decode kernel can serve the given `head_dim`.
-///
-/// **addition**: the tiled kernel's per-thread loop unrolls
-/// `head_dim` over `BLOCK_DIM = 128` threads, so it requires
-/// `head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0` (and `head_dim >=
-/// ATTN_DECODE_TILED_BLOCK_DIM` so each thread has at least one
-/// element). Production Qwen3.5-9B uses `head_dim = 256` which
-/// satisfies both. Tiny test models (e.g. `head_dim = 4`, used by
-/// `crates/lumen-runtime/tests/cuda_e2e_generate_test.rs`) do NOT
-/// satisfy this and must fall back to SingleBlock.
-///
-/// Used by [`launch_attention_decode_gated`] as a hardware-compat
-/// guard AFTER the pure-predicate gate selects Tiled — if the gate
-/// says Tiled but `head_dim` is incompatible, the dispatch silently
-/// falls back to SingleBlock instead of failing the launch. This
-/// preserves the "tiled-always" default while keeping small
-/// test models working.
-pub(crate) const fn attention_decode_tiled_supports_head_dim(head_dim: u32) -> bool {
-    head_dim >= ATTN_DECODE_TILED_BLOCK_DIM && head_dim % ATTN_DECODE_TILED_BLOCK_DIM == 0
-}
-
-/// Default threshold at which the gate auto-routes to the tiled kernel.
-///
-/// **(2026-05-25)**: lowered from the prior value of 36_864
-/// to 0 ("tiled-always") based on empirical data showing the tiled
-/// kernel is universally 1.16x-1.50x FASTER than single-block at every
-/// measured seq_len from 4_096 through 36_864, monotone in seq_len, across
-/// all 3 quants (BF16/Q4_0/Q8_0) on Qwen3.5-9B / A100-80GB PCIe. The
-/// earlier prediction ("tiled slowdown at 4K significant
-/// 10-25%") was empirically refuted; the conservative-headroom argument
-/// that motivated the 36_864 value no longer applies, and keeping it
-/// would mask a 16-50% free decode speedup for all callers at short
-/// context.
-///
-/// Operators that want the prior behaviour can opt out by setting
-/// `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` (u32::MAX), which makes
-/// the gate's `seq_len > threshold` check effectively always-false; the
-/// single-block kernel then serves every seq_len up to the
-/// ceiling at [`ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN`] = 40_950 (above
-/// which the gate auto-promotes Tiled regardless, because single-block
-/// structurally cannot launch).
-///
-/// Default 0 means the tiled streaming-softmax decode path is always engaged,
-/// so it serves sequence lengths past the single-block shared-memory ceiling.
-pub(crate) const ATTN_DECODE_TILED_DEFAULT_THRESHOLD: u32 = 0;
-
-/// Which decode-attention kernel variant to dispatch for this `seq_len`.
-///
-/// Decision rule (binding ADR + user sign-off):
-///   1. If `force_tiled = true` → Tiled (FORCE-mode opt-in, for A/B benching).
-///   2. Else if `seq_len > threshold` → Tiled (auto-route above threshold).
-///   3. Else → SingleBlock (fast path for short decode).
-///
-/// `threshold` is the resolved per-process value of
-/// `LUMEN_CUDA_DECODE_TILED_THRESHOLD` (default
-/// [`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`]).
-///
-/// PURE function of its three inputs — no global state, no env reads.
-/// Env-var resolution lives in [`decode_tiled_threshold`] and
-/// [`decode_tiled_force_enabled`], which cache their results in
-/// process-static [`OnceLock`]s read once per backend lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttentionDecodeVariant {
-    SingleBlock,
-    Tiled,
-    /// Sequence-parallel split-K pair; selected inside the gated dispatcher
-    /// when the auto-selection lands on Tiled, the shape is eligible, and the
-    /// caller supplied split-K scratch. Explicit `LUMEN_CUDA_DECODE_TILED=1`
-    /// or a SingleBlock threshold opt-out takes precedence.
-    SplitK,
-    /// The GQA-shared split-K pair (`LUMEN_CUDA_ATTN_SPLITK_GQA6`), chosen in
-    /// place of [`Self::SplitK`] when that route is selected, the pair loaded,
-    /// and the shape is one it serves.
-    SplitKGqa6,
-}
-
-/// Pure gate predicate. Unit-testable; mirrors the established pattern of
-/// `attention_decode_can_launch` (existing function with same purpose).
-pub(crate) fn attention_decode_variant(
-    seq_len: u32,
-    force_tiled: bool,
-    threshold: u32,
-) -> AttentionDecodeVariant {
-    if force_tiled {
-        AttentionDecodeVariant::Tiled
-    } else if seq_len > threshold {
-        AttentionDecodeVariant::Tiled
-    } else {
-        AttentionDecodeVariant::SingleBlock
-    }
-}
-
-/// Resolved-once value of `LUMEN_CUDA_DECODE_TILED_THRESHOLD`.
-///
-/// Mirrors the `bf16_gemmex_env_force_off()` pattern: env is read
-/// exactly once into the OnceLock the first time this function is called
-/// (typically at first decode dispatch); all subsequent calls return the
-/// cached value without a syscall.
-///
-/// Accepts any `u32`-parseable value. Empty / unparseable / unset → default
-/// [`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`]. Out-of-range values (e.g.
-/// `0` or values above the model's max_seq_len) are passed through
-/// faithfully — the predicate handles edge cases.
-pub(crate) fn decode_tiled_threshold() -> u32 {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_DECODE_TILED_THRESHOLD")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(ATTN_DECODE_TILED_DEFAULT_THRESHOLD)
-    })
-}
-
-/// Resolved-once value of `LUMEN_CUDA_DECODE_TILED` (FORCE-mode opt-in).
-///
-/// Returns `true` when the env var is set to a truthy value
-/// (`1` / `true` / `yes` / `on`, case-insensitive). When `true`, the gate
-/// dispatches the tiled kernel at ALL seq_lens — used for paired
-/// A/B benching against the single-block kernel in the regime where both
-/// can launch.
-///
-/// Default `false` (opt-in only). Auto-routing happens via the
-/// THRESHOLD-based predicate, not this flag.
-pub(crate) fn decode_tiled_force_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("LUMEN_CUDA_DECODE_TILED")
-            .ok()
-            .map(|v| {
-                let s = v.trim().to_ascii_lowercase();
-                matches!(s.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false)
-    })
-}
-
-#[cfg(test)]
-mod attention_decode_variant_tests {
-    //! Gate-predicate boundary tests covering the boundary check
-    //! refinement.
-    //!
-    //! These tests are hardware-independent (the predicate is pure Rust
-    //! and reads no global state). They run on macOS via `cargo test --lib`.
-    //! On Linux + CUDA they additionally execute as part of the lib test
-    //! suite during `cargo test --release -p lumen-runtime --features cuda`.
-
-    use super::{
-        attention_decode_variant, AttentionDecodeVariant, ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN,
-        ATTN_DECODE_TILED_DEFAULT_THRESHOLD,
-    };
-
-    /// Default production threshold (0 = "tiled-always" —
-    /// empirical data showed tiled is 1.16x-1.50x faster than single-block
-    /// at every measured seq_len). Tests use this constant directly so any
-    /// future change to the default lights up in CI.
-    const DEFAULT_THRESHOLD: u32 = ATTN_DECODE_TILED_DEFAULT_THRESHOLD;
-
-    /// Legacy threshold (36_864) retained as a fixed constant for
-    /// shape-validation tests below; the gate predicate is exercised at
-    /// non-default thresholds so the bench harness + opt-out path remain
-    /// covered after the default flip to 0.
-    const LEGACY_THRESHOLD: u32 = 36_864;
-
-    /// Sanity: the default threshold sits strictly below the single-block
-    /// shmem ceiling so the gate cutover always has headroom. With the
-    /// default of 0 ("tiled-always"), this still holds trivially
-    /// (0 < 40_950) — the assertion is preserved so any future bump to a
-    /// near-ceiling value is caught immediately.
-    #[test]
-    fn default_threshold_below_single_block_ceiling() {
-        assert!(
-            DEFAULT_THRESHOLD < ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN,
-            "DEFAULT_THRESHOLD ({DEFAULT_THRESHOLD}) must be < ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN ({ATTN_DECODE_EXTENDED_SHMEM_MAX_SEQ_LEN}) so the auto-routing cutover happens before the single-block kernel's shmem cap"
-        );
-    }
-
-    /// with the default-threshold flip to 0, all seq_len > 0
-    /// auto-route to Tiled. Verify the new contract at a representative
-    /// short-context seq_len.
-    #[test]
-    fn gate_default_threshold_zero_routes_tiled_at_short_ctx() {
-        let v = attention_decode_variant(32_768, false, DEFAULT_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::Tiled);
-    }
-
-    /// `seq_len = 32_768` (well below LEGACY_THRESHOLD = 36_864): SingleBlock
-    /// when not forced. Exercises the gate-predicate's `seq_len <= threshold`
-    /// branch with the non-default LEGACY value to keep the opt-out path
-    /// covered after the default flip.
-    #[test]
-    fn gate_below_threshold_picks_single_block() {
-        let v = attention_decode_variant(32_768, false, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::SingleBlock);
-    }
-
-    /// `seq_len = threshold` (the gate uses `>` so equal goes to SingleBlock):
-    /// at the boundary, single-block is selected when not forced. Uses
-    /// LEGACY_THRESHOLD so the strict-equality boundary is exercised at a
-    /// non-zero value (the boundary case at threshold=0 is degenerate; see
-    /// `gate_zero_seq_len_handled` for the seq_len=0 corner).
-    #[test]
-    fn gate_at_exact_threshold_picks_single_block() {
-        let v = attention_decode_variant(LEGACY_THRESHOLD, false, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::SingleBlock);
-    }
-
-    /// `seq_len = threshold + 1`: first seq_len that auto-routes to tiled.
-    #[test]
-    fn gate_one_past_threshold_picks_tiled() {
-        let v = attention_decode_variant(LEGACY_THRESHOLD + 1, false, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::Tiled);
-    }
-
-    /// `seq_len = 131_072` (far past threshold): Tiled even without force.
-    #[test]
-    fn gate_far_past_threshold_picks_tiled() {
-        let v = attention_decode_variant(131_072, false, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::Tiled);
-    }
-
-    /// `force_tiled = true` overrides the threshold (FORCE-mode opt-in for
-    /// A/B benching at short seq_len). Uses LEGACY_THRESHOLD to make the
-    /// override semantically meaningful (at DEFAULT=0 the gate already picks
-    /// Tiled, so force_tiled is a no-op; LEGACY=36_864 makes force_tiled the
-    /// load-bearing flag here).
-    #[test]
-    fn gate_force_tiled_overrides_below_threshold() {
-        let v = attention_decode_variant(32_768, true, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::Tiled);
-    }
-
-    /// `force_tiled = true` at long context: idempotent (tiled is already the
-    /// auto-routed choice; force is a no-op here but must not regress).
-    #[test]
-    fn gate_force_tiled_idempotent_above_threshold() {
-        let v = attention_decode_variant(131_072, true, LEGACY_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::Tiled);
-    }
-
-    /// `seq_len = 0` (degenerate): defaults to SingleBlock under both
-    /// LEGACY_THRESHOLD (`0 <= 36_864`) and the new DEFAULT=0
-    /// (`0 > 0` is false, so SingleBlock). Decode never actually calls with
-    /// seq_len = 0 in production (KV cache is appended BEFORE attention
-    /// dispatch, so seq_len >= 1 always), but the predicate must handle the
-    /// degenerate case without panicking. Pass 1
-    /// boundary table.)
-    #[test]
-    fn gate_zero_seq_len_handled() {
-        let v = attention_decode_variant(0, false, DEFAULT_THRESHOLD);
-        assert_eq!(v, AttentionDecodeVariant::SingleBlock);
-        let v_legacy = attention_decode_variant(0, false, LEGACY_THRESHOLD);
-        assert_eq!(v_legacy, AttentionDecodeVariant::SingleBlock);
-    }
-
-    /// u32::MAX is the documented opt-out value — operators who
-    /// want the prior single-block-default behaviour set the env var to
-    /// u32::MAX, and the gate then NEVER auto-routes Tiled below the
-    /// 40_950 structural ceiling (above which the gate still must promote
-    /// Tiled because single-block cannot launch — verified separately by
-    /// the bench harness running `LUMEN_CUDA_DECODE_TILED_THRESHOLD=
-    /// 4294967295` at seq_len > 40_950 and observing the auto-promotion
-    /// in production callers; this unit test verifies the predicate alone
-    /// honours u32::MAX strictly per `seq_len > threshold`).
-    #[test]
-    fn gate_opt_out_threshold_u32_max_picks_single_block_at_short_ctx() {
-        let v = attention_decode_variant(32_768, false, u32::MAX);
-        assert_eq!(v, AttentionDecodeVariant::SingleBlock);
-        let v_at_legacy = attention_decode_variant(36_864, false, u32::MAX);
-        assert_eq!(v_at_legacy, AttentionDecodeVariant::SingleBlock);
-    }
-
-    /// Custom-threshold test: when the operator overrides via env var, the
-    /// predicate honours the new boundary precisely. (Models the real
-    /// resolution path from `decode_tiled_threshold()`.)
-    #[test]
-    fn gate_custom_threshold_honoured() {
-        // Operator sets threshold = 10_000 (e.g. for stress-testing the tiled
-        // path at medium seq_len without forcing every dispatch).
-        let custom = 10_000u32;
-        assert_eq!(
-            attention_decode_variant(9_999, false, custom),
-            AttentionDecodeVariant::SingleBlock
-        );
-        assert_eq!(
-            attention_decode_variant(10_000, false, custom),
-            AttentionDecodeVariant::SingleBlock
-        );
-        assert_eq!(
-            attention_decode_variant(10_001, false, custom),
-            AttentionDecodeVariant::Tiled
-        );
-    }
-}
-
-#[cfg(test)]
-mod attention_decode_tiled_head_dim_tests {
-    //! hardware-compat-guard tests for the tiled kernel's
-    //! `head_dim % BLOCK_DIM == 0` requirement. See
-    //! [`attention_decode_tiled_supports_head_dim`].
-
-    use super::{attention_decode_tiled_supports_head_dim, ATTN_DECODE_TILED_BLOCK_DIM};
-
-    /// Production Qwen3.5-9B uses head_dim = 256 = 2 * BLOCK_DIM. PASS.
-    #[test]
-    fn supports_qwen3_5_head_dim_256() {
-        assert!(attention_decode_tiled_supports_head_dim(256));
-    }
-
-    /// head_dim = BLOCK_DIM (= 128) is the minimum supported. PASS.
-    #[test]
-    fn supports_head_dim_equal_to_block_dim() {
-        assert!(attention_decode_tiled_supports_head_dim(
-            ATTN_DECODE_TILED_BLOCK_DIM
-        ));
-    }
-
-    /// head_dim = 384 = 3 * BLOCK_DIM. PASS.
-    #[test]
-    fn supports_multiple_of_block_dim() {
-        assert!(attention_decode_tiled_supports_head_dim(384));
-        assert!(attention_decode_tiled_supports_head_dim(512));
-        assert!(attention_decode_tiled_supports_head_dim(1024));
-    }
-
-    /// head_dim = 4 (tiny test model, `TestModelConfig::default()` in
-    /// `crates/lumen-format/src/test_model.rs`): NOT supported.
-    /// dispatch must fall back to SingleBlock.
-    #[test]
-    fn rejects_tiny_test_head_dim() {
-        assert!(!attention_decode_tiled_supports_head_dim(4));
-        assert!(!attention_decode_tiled_supports_head_dim(8));
-        assert!(!attention_decode_tiled_supports_head_dim(16));
-        assert!(!attention_decode_tiled_supports_head_dim(32));
-        assert!(!attention_decode_tiled_supports_head_dim(64));
-    }
-
-    /// head_dim = 127 (one below BLOCK_DIM): NOT supported.
-    #[test]
-    fn rejects_just_below_block_dim() {
-        assert!(!attention_decode_tiled_supports_head_dim(
-            ATTN_DECODE_TILED_BLOCK_DIM - 1
-        ));
-    }
-
-    /// head_dim = 129 (just above BLOCK_DIM but not a multiple): NOT supported.
-    #[test]
-    fn rejects_just_above_block_dim_non_multiple() {
-        assert!(!attention_decode_tiled_supports_head_dim(
-            ATTN_DECODE_TILED_BLOCK_DIM + 1
-        ));
-    }
-
-    /// head_dim = 0 (degenerate): NOT supported (`0 % anything == 0` but
-    /// `0 >= 128` is false).
-    #[test]
-    fn rejects_zero() {
-        assert!(!attention_decode_tiled_supports_head_dim(0));
-    }
-}
-
-#[cfg(test)]
-mod attention_decode_tiled_const_tests {
-    //! Compile-time invariant tests for the tiled kernel constants.
-    //!
-    //! These guard against accidental shmem-budget drift if T_C or BLOCK_DIM
-    //! are ever retuned — recompile is required, and we want CI to surface
-    //! the change loudly so the operator can re-validate.
-
-    use super::{
-        attention_decode_tiled_shared_bytes, ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C,
-    };
-
-    /// At Qwen3.5-9B's `head_dim = 256`, tiled shmem must be small (< 4 KB)
-    /// so we never need a `cuFuncSetAttribute` opt-in for the tiled kernel
-    #[test]
-    fn tiled_shmem_fits_default_cap_at_head_dim_256() {
-        let bytes = attention_decode_tiled_shared_bytes(256);
-        // (8 + 256 + 128) * 4 = 1568.
-        assert_eq!(bytes, 1568);
-        // Default per-block dyn-shmem cap on SM 6.0+ is 48 KB (49152).
-        assert!(
-            bytes < 49152,
-            "tiled shmem {bytes} bytes must fit default 48 KB cap"
-        );
-    }
-
-    /// Even at head_dim = 1024 (well above any realistic model), the tiled
-    /// shmem still fits.
-    #[test]
-    fn tiled_shmem_fits_default_cap_at_head_dim_1024() {
-        let bytes = attention_decode_tiled_shared_bytes(1024);
-        // (8 + 1024 + 128) * 4 = 4640.
-        assert_eq!(bytes, 4640);
-        assert!(bytes < 49152);
-    }
-
-    /// T_C must equal BLOCK_DIM for the kernel's "one lane per tile position"
-    /// stride assumption to hold (saves an `if (j < T_C)` outer guard in
-    /// Phase A). If they are ever decoupled, the kernel's stride loop in
-    /// Phases A/C still works (it walks T_C in `block_size`-strided
-    /// chunks) but the dispatch will be sub-optimal.
-    #[test]
-    fn tc_equals_block_dim_for_one_lane_per_position() {
-        assert_eq!(ATTN_DECODE_TILED_T_C, ATTN_DECODE_TILED_BLOCK_DIM);
-    }
-
-    #[test]
-    fn tiled_codegen_selection_names_its_target_and_route() {
-        use super::{attention_decode_tiled_route_name, attn_tiled_codegen_target};
-        assert_eq!(attn_tiled_codegen_target("default"), "default");
-        assert_eq!(attn_tiled_codegen_target("ptx80"), "compute_80");
-        assert_eq!(attn_tiled_codegen_target("ptx120"), "compute_120");
-        assert_eq!(
-            attention_decode_tiled_route_name("default"),
-            "attention_decode_tiled"
-        );
-        assert_eq!(
-            attention_decode_tiled_route_name("ptx80"),
-            "attention_decode_tiled_ptx80"
-        );
-        assert_eq!(
-            attention_decode_tiled_route_name("ptx120"),
-            "attention_decode_tiled_ptx120"
-        );
-        assert_eq!(
-            attention_decode_tiled_route_name("anything"),
-            "attention_decode_tiled"
-        );
-    }
-
-    /// 5120/32 = 160 Q8_1 blocks over 1024/32 = 32 warps = 5 CTAs (the name); 4096 → 4,
-    /// 2048 → 2; a dim that does not divide evenly rounds up so no block is left unwritten.
-    #[test]
-    fn rmsnorm_q8_1_cta5_grid_covers_every_block() {
-        use super::{rmsnorm_block_size, rmsnorm_q8_1_cta5_grid};
-        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, rmsnorm_block_size(5120)), 5);
-        assert_eq!(rmsnorm_q8_1_cta5_grid(4096, rmsnorm_block_size(4096)), 4);
-        assert_eq!(rmsnorm_q8_1_cta5_grid(2048, rmsnorm_block_size(2048)), 2);
-        assert_eq!(rmsnorm_q8_1_cta5_grid(1024, rmsnorm_block_size(1024)), 1);
-        assert_eq!(rmsnorm_q8_1_cta5_grid(5152, 1024), 6);
-        assert_eq!(rmsnorm_q8_1_cta5_grid(5120, 1024) * 32, 160);
-    }
-}
-
-/// `LUMEN_CUDA_ATTN_TILED_CODEGEN`: the NVRTC target `attention_decode_tiled` is compiled for —
-/// `ptx80` (compute_80), `ptx120` (compute_120) or `default` (NVRTC's default target); unset
-/// resolves per device through [`crate::runtime_defaults::attn_tiled_codegen_default`]:
-/// compute_120 on a capability-12.x device whose NVRTC can emit it, NVRTC's default elsewhere.
-/// The kernel source and math options are unchanged; only the generated code differs (NVRTC
-/// 13.3 emits a 3632-instruction kernel at its default sm_75 target and a 2520-instruction one
-/// at compute_120 for the same source). Resolved once, at kernel compilation, from the device
-/// being compiled for; the selection is kept on the `KernelSet` for the dispatch announcements.
-pub(crate) fn attn_tiled_codegen_selection(
-    cc_major: u8,
-    nvrtc_can_target_120: bool,
-) -> &'static str {
-    match std::env::var("LUMEN_CUDA_ATTN_TILED_CODEGEN")
-        .ok()
-        .as_deref()
-    {
+/// The NVRTC target a codegen selection compiles for, as text for the load log.
+/// `LUMEN_CUDA_ATTN_CODEGEN`: the NVRTC target for the decode-attention module.
+/// Default: NVRTC's default target. `ptx80` / `ptx120` request that target; an A/B
+/// knob for the codegen question, not a per-device default.
+pub(crate) fn attn_codegen_selection() -> &'static str {
+    match std::env::var("LUMEN_CUDA_ATTN_CODEGEN").ok().as_deref() {
         Some("ptx80") => "ptx80",
         Some("ptx120") => "ptx120",
-        // the kill-switch spellings every default-ON knob honours, and the explicit word
-        Some("default") | Some("0") | Some("off") | Some("false") | Some("no") => "default",
-        _ => crate::runtime_defaults::attn_tiled_codegen_default(cc_major, nvrtc_can_target_120),
-    }
-}
-
-/// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
-pub(crate) fn attn_tiled_codegen_target(codegen: &str) -> &'static str {
-    match codegen {
-        "ptx80" => "compute_80",
-        "ptx120" => "compute_120",
         _ => "default",
     }
 }
 
-/// The route identifier the tiled dispatch announces for a codegen selection: the plain kernel
-/// name on the default target, a suffixed one for an explicit target, so the census can tell
-/// the compiled variants apart (the CUDA symbol is the same in all three).
-pub(crate) fn attention_decode_tiled_route_name(codegen: &str) -> &'static str {
+pub(crate) fn attn_codegen_target(codegen: &str) -> &'static str {
     match codegen {
-        "ptx80" => "attention_decode_tiled_ptx80",
-        "ptx120" => "attention_decode_tiled_ptx120",
-        _ => "attention_decode_tiled",
+        "ptx80" => "compute_80",
+        "ptx120" => "compute_120",
+        _ => "default",
     }
 }
 
@@ -4473,14 +3807,6 @@ pub(crate) fn matvec_smem_shared_bytes(in_dim: u32) -> u32 {
 
 /// Block size for attention: min(seq_len, 256), rounded up to multiple of 32.
 ///
-/// Must be at least 32 (one warp) for the reduction helpers to work correctly.
-pub(crate) fn attention_block_size(seq_len: usize) -> u32 {
-    let bs = seq_len.min(256);
-    // Round up to nearest multiple of 32.
-    let bs = ((bs + 31) / 32) * 32;
-    bs.max(32) as u32
-}
-
 /// Block size for fused norm+matvec F32: 256 threads (matches FUSED_BLOCK_SIZE define).
 pub(crate) fn fused_norm_matvec_block_size() -> u32 {
     256

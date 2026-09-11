@@ -27,14 +27,14 @@ use std::sync::atomic::Ordering;
 /// Build a synthetic hyperparams struct for a small test model.
 ///
 /// Uses minimal dimensions to keep tests fast:
-///   hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=16,
+///   hidden_dim=64, num_heads=4, num_kv_heads=2, head_dim=128,
 ///   inter_dim=128, vocab_size=256, max_seq_len=64, 4 layers.
 fn test_hyperparams() -> ModelHyperparams {
     ModelHyperparams {
         num_layers: 4,
         num_heads: 4,
         num_kv_heads: 2,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 64,
         intermediate_dim: 128,
         vocab_size: 256,

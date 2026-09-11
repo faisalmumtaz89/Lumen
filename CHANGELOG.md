@@ -7,6 +7,146 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **One decode-attention kernel for every model and every context.** The
+  CUDA backend's four decode-attention routes (the single-block kernel, the
+  tiled streaming-softmax kernel, the per-query-head split-K pair and the
+  GQA-shared pair, chosen per model, per capability and per context by a
+  dispatcher with ten environment switches) are replaced by one split-K
+  flash-decoding pair, `attention_decode_partial_f32` / `_f16` +
+  `attention_decode_merge`, compiled at load for the model's group size
+  (query heads per KV head, 1 to 8) and head dimension (128 or 256). One CTA
+  per (KV head, chunk) reads each K and V row once for the whole group with
+  16-byte loads on the F32 store (on the half store the K rows are read as
+  8-byte loads, Q and V stay 16-byte); up to a one-tile bound each CTA takes one 16-key tile, above
+  it the split count is held at a fixed target and each CTA walks a balanced
+  run of whole tiles with a running-max recurrence, so the scratch is sized
+  once per model (4.2 MiB on Qwen3.8-27B, either store) and a generation never
+  changes route as it grows. The one-tile bound is a CTA budget shared by
+  every model (704 one-tile CTAs across the KV heads: 176 tiles per KV head
+  at 4 KV heads, 352 at 2); the target is 128 chunks per KV head on every
+  model (at 4 KV heads within 3 % of the best measured count on the F32 store
+  and 6 % on the half store from 6,144 to 32,768 keys; at 2 KV heads equal to
+  the budget-derived 256 at 3,072 and 6,144 keys and 1.5 % faster at 12,288); set by `LUMEN_CUDA_ATTN_ONE_TILE`
+  and `LUMEN_CUDA_ATTN_TARGET`; `LUMEN_CUDA_ATTN_CODEGEN` selects the NVRTC
+  target as an A/B knob. A model outside the kernel's shape domain is refused
+  at CUDA init with the shape named, rather than served by a slower route.
+  At the shape the GQA-shared pair served (group 6, head dimension 256) the
+  kernel is that pair's partial and merge with the shape made a compile-time
+  parameter: its output is bit-identical to the pair's as it stood before the
+  consolidation (the eight-lane merge included, so this is a stricter baseline
+  than v0.30.0, whose merge was serial), at every context and on both stores (a 224-entry reference
+  fixture of hashed partials
+  and outputs, `crates/lumen-runtime/tests/fixtures/attention_decode_reference.json`,
+  is checked by `cuda_attention_decode_fixture_test`); every other (group,
+  head dimension) in the domain is checked against a float64 reference at nine
+  contexts on both stores (`cuda_attention_decode_shapes_test`, tolerance 2e-6;
+  the recorded maximum on the RTX 5090 is 2.45e-7). Per attention layer on the RTX 5090
+  against one tile per CTA at every context: F32 −7.6 % at 2,600 keys, −19
+  to −21 % at 6,144, −27 % at 16,384, never slower at any measured context;
+  half store −10 % at 2,600, −3 to −8 % at 3,600, −8 to −15 % at 4,096,
+  −17 % at 6,144, −29 % at 16,384, equal at 2,816 and 3,200, and slower in one
+  cell, +17 % at 3,968 keys in every run (the 128 CTAs per KV head each walk
+  two tiles in series where 992 one-tile CTAs fit one wave at six per SM; the
+  harness timer is quantised near 2 µs, so these are coarse), the sole
+  exception elsewhere one timer tick (+0.2 %) at 1,152 keys in one run of
+  four; 24,576 and 32,768 keys served. The merge sums its numerator in eight
+  lanes (chunk `c` into lane `c mod 8`, then a fixed tree) instead of one
+  serial chain: deterministic, and on real activations the worst coordinate
+  error against a float64 reference drops from 8.7e-5 to 7.0e-6 at 5k keys
+  and from 5.2e-5 to 2.2e-5 at 11k. On the models the other routes served,
+  paired gates on the RTX 5090 against the route each took before: Qwen3.5-9B
+  Q4_0 +3.8 / +5.9 / +10.9 % at 3,072 / 6,144 / 12,288 tokens of context (two
+  runs); Qwen3.5-MoE-35B-A3B Q4_0 +166 / +318 / +599 % (80.2 / 49.8 / 28.3
+  to 213.5 / 208.1 / 197.8 tok/s in that gate, whose kernel arm ran the
+  budget-derived target of 256; at the shipped target of 128 the same
+  contexts measured 213.6 / 208.3 / 200.6 tok/s: the tiled kernel's one CTA
+  per query head was that model's wall at any long context); the 50-completion greedy
+  determinism run on each model, on both KV stores, reproduces the previous
+  route's digest, and the long-context quality records against the previous
+  build are on file with their adjudicated partings. Against v0.30.0 the output is therefore
+  not byte-identical on any model: every parting in the 27B record and in the
+  9B's F32 record is inside the declared near-tie margin; the 9B's 16-bit
+  store parts from the previous build's 16-bit route once outside it (at 12k
+  keys, margins 0.034 / 0.015); the MoE record fails that strict rule on one
+  F32 prompt and on two half-store prompts against its own F32 store; each of
+  those partings is adjudicated as within the kernel's numerical envelope by a
+  float64 replay of the real activations (the models the per-query-head pair and the
+  tiled kernel served now take this kernel).
+- **A 16-bit KV cache on CUDA, opt-in with `--kv-precision f16` /
+  `LUMEN_KV_PRECISION=f16`** (the server takes the same flag). Every
+  attention layer's K and V cache is stored as IEEE half: the writers round
+  to nearest even on the way in and count every value that does not fit,
+  and the engine refuses the generation at the next readback rather than
+  emitting an output computed over the poisoned slot; the decode
+  reader is the half entry point of the one decode-attention kernel, which
+  widens on load and keeps the F32 arithmetic and order, and the half store
+  takes the same split geometry as the F32 store at every context, so on
+  half-representable inputs the half store's output is bit-identical to the
+  F32 store's; the prefill readers work on the cache
+  widened to F32 into one shared buffer pair. The storage rounding is the
+  only numerical change:
+  on real Qwen3.8-27B activations at 5k and 11k keys the half-stored
+  attention output differs from the F32-stored one by a relative L2 of
+  about 2e-4 (7.5e-4 worst per call). The cache takes half the bytes
+  (1.07 GB instead of 2.15 GB at 16,384 positions on Qwen3.8-27B; the prefill
+  widening pair the half store allocates at start-up adds 128 MiB at that
+  capacity, so the net saving there is 0.94 GB) and the
+  decode-attention kernels' KV-cache reads halve. Off unless set; the F32
+  store is unchanged.
+
+- **`LUMEN_CUDA_ATTN_DUMP=<dir>:<seq_len>[,...]`**, a diagnostic that writes one
+  decode-attention call's inputs (Q, the live K/V cache region — raw F32 on
+  an F32 store, raw half on a half store, named in the header's `kv_dtype`)
+  and the serving route's output as raw F32 beside a JSON header, at the listed
+  sequence lengths, so real activations can be replayed through a float64
+  reference. Off unless set.
+
+### Changed
+
+- The verbose metrics block prints the decode rate and the time per output
+  token with three decimals instead of one, so a paired measurement that reads
+  it is not quantised to 0.1 tok/s (at 80 tok/s that was a 0.125 % step, wider
+  than the intervals such a measurement reports).
+- **KV caches are allocated for the attention layers only.** The CUDA backend
+  allocated a full F32 K and V cache for every layer, GDN layers included,
+  which never read one; the caches are now allocated at weight load, once the
+  layer types are known, for the layers that use them. On Qwen3.8-27B (64
+  layers, 16 of them attention) at a 16,384-token context that is 2.1 GB
+  instead of 8.6 GB, and the F16 dequant-cache and clone budgets see the
+  memory freed. The per-layer capacity and `LUMEN_CUDA_MAX_SEQ_LEN` are
+  unchanged.
+
+
+
+### Removed
+
+- The single-block, tiled and per-query-head split-K decode-attention kernels
+  (`attention.cu`, `attention_f16.cu`, `attention_decode_tiled.cu`,
+  `attention_decode_splitk.cu`) and the previous GQA-shared pair
+  (`attention_decode_splitk_gqa6.cu`), with the dispatcher that chose
+  between them, are deleted; `attention_decode.cu` is the one source.
+- The switches that chose between those routes are gone, and setting one
+  refuses startup with the variable named and its replacement:
+  `LUMEN_CUDA_ATTN_SPLITK`, `LUMEN_CUDA_ATTN_SPLITK_GQA6`,
+  `LUMEN_CUDA_DECODE_TILED` (no replacement: there is one route);
+  `LUMEN_CUDA_ATTN_SPLITK_CHUNK`, `LUMEN_CUDA_ATTN_SPLITK_SCALE`,
+  `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`, `LUMEN_CUDA_DECODE_TILED_THRESHOLD`
+  (the partition is set by `LUMEN_CUDA_ATTN_ONE_TILE` and
+  `LUMEN_CUDA_ATTN_TARGET`); `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE` and
+  `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` (renamed to those two, same meaning
+  and default); `LUMEN_CUDA_ATTN_TILED_CODEGEN` (`LUMEN_CUDA_ATTN_CODEGEN`).
+  `LUMEN_CUDA_LEGACY_DEFAULTS` no longer touches decode attention.
+- A model outside the kernel's domain (1 to 8 query heads per KV head at head
+  dimension 128 or 256) is refused at CUDA init with the shape named; the
+  tiled kernel that served other head dimensions is gone with the route. Every
+  model in the registry is inside the domain.
+- The `ACTIVE` route line and the `LUMEN_CUDA_ATTN_DUMP` header name the one
+  kernel with its split count, partition, policy and codegen; the route names
+  `attention_decode_tiled`, `attention_decode_splitk_partial` and
+  `attention_decode_splitk_partial_gqa6*` no longer appear.
+
 ## [0.30.0] — 2026-09-10
 
 ### Changed

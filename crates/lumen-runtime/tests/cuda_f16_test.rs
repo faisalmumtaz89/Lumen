@@ -556,7 +556,6 @@ mod gpu_tests {
         let ptx = compile_ptx(src).expect("NVRTC compile failed for kv_cache_f16.cu");
         let module = ctx.load_module(ptx).unwrap();
         let write_func = module.load_function("kv_cache_write_f16").unwrap();
-        let read_func = module.load_function("kv_cache_read_f16").unwrap();
 
         let num_kv_heads = 4u32;
         let max_seq_len = 32u32;
@@ -573,6 +572,9 @@ mod gpu_tests {
             .map(|i| (i as f32) * 0.01 - 1.0)
             .collect();
         let gpu_data = stream.clone_htod(&data).unwrap();
+        // The writer counts every value that does not fit the half format;
+        // none of these do not.
+        let mut overflow: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
 
         let write_cfg = LaunchConfig {
             grid_dim: ((total_data_elems as u32).div_ceil(256), 1, 1),
@@ -585,6 +587,7 @@ mod gpu_tests {
                 .launch_builder(&write_func)
                 .arg(&mut cache)
                 .arg(&gpu_data)
+                .arg(&mut overflow)
                 .arg(&pos)
                 .arg(&num_kv_heads)
                 .arg(&max_seq_len)
@@ -593,42 +596,58 @@ mod gpu_tests {
         }
         .expect("kv_cache_write_f16 launch failed");
 
-        // Read back for each head
-        for head in 0..num_kv_heads {
-            let count = 1u32;
-            let read_elems = (count * head_dim) as usize;
-            let mut gpu_readback: CudaSlice<f32> = stream.alloc_zeros(read_elems).unwrap();
-
-            let read_cfg = LaunchConfig {
-                grid_dim: ((read_elems as u32).div_ceil(256), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-
-            unsafe {
-                stream
-                    .launch_builder(&read_func)
-                    .arg(&cache)
-                    .arg(&mut gpu_readback)
-                    .arg(&head)
-                    .arg(&pos)
-                    .arg(&count)
-                    .arg(&max_seq_len)
-                    .arg(&head_dim)
-                    .launch(read_cfg)
+        // Read the halves back and widen on the host: the device readers widen
+        // in place (there is no read kernel), so the host conversion is the
+        // oracle for what the writer stored.
+        stream.synchronize().unwrap();
+        let stored: Vec<u16> = stream.clone_dtoh(&cache).unwrap();
+        let overflowed: Vec<u32> = stream.clone_dtoh(&overflow).unwrap();
+        assert_eq!(
+            overflowed,
+            vec![0],
+            "no value here is outside the half range"
+        );
+        fn half_to_f32(h: u16) -> f32 {
+            let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+            let exp = ((h >> 10) & 0x1f) as i32;
+            let frac = (h & 0x3ff) as f32;
+            match exp {
+                0 => sign * frac * 2f32.powi(-24),
+                31 => {
+                    if frac == 0.0 {
+                        sign * f32::INFINITY
+                    } else {
+                        f32::NAN
+                    }
+                }
+                _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
             }
-            .expect("kv_cache_read_f16 launch failed");
-
-            stream.synchronize().unwrap();
-            let readback = stream.clone_dtoh(&gpu_readback).unwrap();
+        }
+        for head in 0..num_kv_heads {
             for d in 0..head_dim as usize {
                 let data_idx = (head as usize) * (head_dim as usize) + d;
+                let cache_idx = ((head * max_seq_len + pos) * head_dim) as usize + d;
                 let expected = data[data_idx];
+                let got = half_to_f32(stored[cache_idx]);
                 let tol = expected.abs() * 1e-3 + 1e-4;
                 assert!(
-                    (readback[d] - expected).abs() < tol,
-                    "KV read head={head} d={d}: expected {expected}, got {}",
-                    readback[d]
+                    (got - expected).abs() < tol,
+                    "KV read head={head} d={d}: expected {expected}, got {got}"
+                );
+            }
+        }
+        // Every position other than the written one stays zero.
+        for head in 0..num_kv_heads {
+            for p in 0..max_seq_len {
+                if p == pos {
+                    continue;
+                }
+                let base = ((head * max_seq_len + p) * head_dim) as usize;
+                assert!(
+                    stored[base..base + head_dim as usize]
+                        .iter()
+                        .all(|&h| h == 0),
+                    "the writer touched head {head} position {p}"
                 );
             }
         }

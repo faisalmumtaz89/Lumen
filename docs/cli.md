@@ -27,7 +27,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--cuda` / `--metal` / `--simd` | Force a backend |
 | `--cuda-device <n>` | CUDA device ordinal (default 0) |
 | `--context-len <n>` | KV cache size (auto-sized by default) |
-| `--kv-precision f16\|f32` | KV cache precision (per-backend default: Metal f16, CUDA / CPU f32) |
+| `--kv-precision f16\|f32` | KV cache storage (per-backend default: Metal f16, CUDA / CPU f32). On CUDA `f16` halves the cache's bytes and its decode-attention reads; the model's activations are rounded to half on the way in (see `docs/environment-variables.md`, `LUMEN_KV_PRECISION`) |
 | `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
 | `--kv-disk-space-mb <n>` | KV cache space budget on disk |
 | `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal today) |

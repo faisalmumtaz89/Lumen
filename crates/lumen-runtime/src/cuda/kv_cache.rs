@@ -1,32 +1,63 @@
-//! GPU-resident KV cache for the CUDA backend.
+//! GPU-resident KV cache for CUDA.
 //!
-//! Mirrors the CPU `KvCacheView` layout: head-first `[num_kv_heads][max_seq_len][head_dim]`
-//! for both K and V caches. Data lives entirely on the GPU; the `kv_cache_write`
-//! CUDA kernel handles scatter-writing new tokens at the correct position.
+//! One cache per full-attention layer, `[num_kv_heads, max_seq_len, head_dim]`
+//! head-first, stored either as F32 or as IEEE half (`u16` bit patterns). The
+//! storage type is a variant of [`KvStore`], not a flag beside an untyped
+//! buffer: every reader and writer takes the variant it can consume, so no
+//! program can hand half bits to a kernel that reads floats, or the reverse.
 //!
-//! This module manages per-layer GPU KV buffers. The engine maintains one
-//! `KvCacheGpu` per layer, allocated at session start and reused across tokens.
+//! Writers round to half on the device (round to nearest even) and count every
+//! value that does not fit; the owner of the counter refuses to continue with
+//! a poisoned cache (see `backend_impl.rs`).
 
-use crate::error::RuntimeError;
+use std::sync::Arc;
+
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg,
 };
-use std::sync::Arc;
 
 use super::ffi::CudaDevice;
-use super::shaders::KV_CACHE_KERNEL_SOURCE;
+use super::shaders::{KV_CACHE_F16_KERNEL_SOURCE, KV_CACHE_KERNEL_SOURCE};
 use super::types::LaunchConfig;
+use crate::error::RuntimeError;
+use crate::kv::KvPrecision;
 
-/// GPU-resident KV cache for a single transformer layer.
-///
-/// Allocates K and V buffers of shape `[num_kv_heads, max_seq_len, head_dim]`
-/// as contiguous f32 arrays on the CUDA device. Tracks the current sequence
-/// position (`seq_len`) so new tokens are written at the correct offset.
+/// The K and V buffers of one layer, typed by what they hold.
+pub enum KvStore {
+    /// F32, `[num_kv_heads, max_seq_len, head_dim]` each.
+    F32 {
+        k: CudaSlice<f32>,
+        v: CudaSlice<f32>,
+    },
+    /// IEEE half bit patterns, same layout.
+    F16 {
+        k: CudaSlice<u16>,
+        v: CudaSlice<u16>,
+    },
+}
+
+impl KvStore {
+    /// Bytes one element occupies.
+    pub fn bytes_per_element(&self) -> usize {
+        match self {
+            KvStore::F32 { .. } => 4,
+            KvStore::F16 { .. } => 2,
+        }
+    }
+
+    /// Elements in the K buffer (the V buffer is the same size).
+    pub fn elements(&self) -> usize {
+        match self {
+            KvStore::F32 { k, .. } => k.len(),
+            KvStore::F16 { k, .. } => k.len(),
+        }
+    }
+}
+
+/// GPU-resident KV cache for one transformer layer.
 pub struct KvCacheGpu {
-    /// Key cache on GPU. Shape: `[num_kv_heads, max_seq_len, head_dim]`.
-    pub k_cache: CudaSlice<f32>,
-    /// Value cache on GPU. Shape: `[num_kv_heads, max_seq_len, head_dim]`.
-    pub v_cache: CudaSlice<f32>,
+    /// The K and V buffers, typed by storage.
+    pub store: KvStore,
     /// Current number of tokens with cached KV data.
     seq_len: usize,
     /// Maximum sequence length (allocated capacity).
@@ -35,15 +66,31 @@ pub struct KvCacheGpu {
     pub num_kv_heads: usize,
     /// Dimension per attention head.
     pub head_dim: usize,
-    /// Compiled kv_cache_write kernel function.
+    /// The single-token write kernel for this store's type: `kv_cache_write`
+    /// for F32, `kv_cache_write_f16` for half.
     write_func: CudaFunction,
 }
 
+/// The kernel module a cache's writer comes from, compiled once per precision.
+pub fn compile_kv_module(
+    device: &CudaDevice,
+    precision: KvPrecision,
+) -> Result<Arc<CudaModule>, RuntimeError> {
+    let source = match precision {
+        KvPrecision::F32 => KV_CACHE_KERNEL_SOURCE,
+        KvPrecision::F16 => KV_CACHE_F16_KERNEL_SOURCE,
+        other => {
+            return Err(RuntimeError::Unsupported(format!(
+                "CUDA KV cache precision {other:?} is not implemented"
+            )))
+        }
+    };
+    device.compile_and_load(source)
+}
+
 impl KvCacheGpu {
-    /// Allocate a new GPU KV cache for one layer.
-    ///
-    /// Both K and V buffers are zeroed. The `kv_cache_write` kernel is compiled
-    /// and cached for the lifetime of this struct.
+    /// Allocate an F32 cache for one layer, compiling its write kernel.
+    /// Both buffers are zeroed.
     #[allow(dead_code)] // Used in #[cfg(test)] blocks in prefill_attention.rs.
     pub fn new(
         device: &CudaDevice,
@@ -51,31 +98,12 @@ impl KvCacheGpu {
         max_seq_len: usize,
         head_dim: usize,
     ) -> Result<Self, RuntimeError> {
-        let total_elements = num_kv_heads * max_seq_len * head_dim;
-        let k_cache = device.alloc_zeros::<f32>(total_elements)?;
-        let v_cache = device.alloc_zeros::<f32>(total_elements)?;
-
-        let module = device.compile_and_load(KV_CACHE_KERNEL_SOURCE)?;
-        let write_func = module
-            .load_function("kv_cache_write")
-            .map_err(|e| RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}")))?;
-
-        Ok(Self {
-            k_cache,
-            v_cache,
-            seq_len: 0,
-            max_seq_len,
-            num_kv_heads,
-            head_dim,
-            write_func,
-        })
+        let module = compile_kv_module(device, KvPrecision::F32)?;
+        Self::with_module(device, num_kv_heads, max_seq_len, head_dim, &module)
     }
 
-    /// Allocate a new GPU KV cache using a pre-compiled kernel module.
-    ///
-    /// Avoids redundant NVRTC compilation when creating multiple layers' caches
-    /// from the same kernel source. The caller compiles the module once and
-    /// passes it to each layer.
+    /// Allocate an F32 cache using a module compiled by [`compile_kv_module`]
+    /// for F32.
     pub fn with_module(
         device: &CudaDevice,
         num_kv_heads: usize,
@@ -83,17 +111,54 @@ impl KvCacheGpu {
         head_dim: usize,
         module: &Arc<CudaModule>,
     ) -> Result<Self, RuntimeError> {
-        let total_elements = num_kv_heads * max_seq_len * head_dim;
-        let k_cache = device.alloc_zeros::<f32>(total_elements)?;
-        let v_cache = device.alloc_zeros::<f32>(total_elements)?;
+        Self::with_module_at(
+            device,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            module,
+            KvPrecision::F32,
+        )
+    }
 
+    /// Allocate a cache of the given storage using a module compiled by
+    /// [`compile_kv_module`] for that same precision. Both buffers are zeroed.
+    pub fn with_module_at(
+        device: &CudaDevice,
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        module: &Arc<CudaModule>,
+        precision: KvPrecision,
+    ) -> Result<Self, RuntimeError> {
+        let total_elements = num_kv_heads * max_seq_len * head_dim;
+        let (store, write_name) = match precision {
+            KvPrecision::F32 => (
+                KvStore::F32 {
+                    k: device.alloc_zeros::<f32>(total_elements)?,
+                    v: device.alloc_zeros::<f32>(total_elements)?,
+                },
+                "kv_cache_write",
+            ),
+            KvPrecision::F16 => (
+                KvStore::F16 {
+                    k: device.alloc_zeros::<u16>(total_elements)?,
+                    v: device.alloc_zeros::<u16>(total_elements)?,
+                },
+                "kv_cache_write_f16",
+            ),
+            other => {
+                return Err(RuntimeError::Unsupported(format!(
+                    "CUDA KV cache precision {other:?} is not implemented"
+                )))
+            }
+        };
         let write_func = module
-            .load_function("kv_cache_write")
-            .map_err(|e| RuntimeError::Compute(format!("Failed to load kv_cache_write: {e}")))?;
+            .load_function(write_name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load {write_name}: {e}")))?;
 
         Ok(Self {
-            k_cache,
-            v_cache,
+            store,
             seq_len: 0,
             max_seq_len,
             num_kv_heads,
@@ -107,21 +172,32 @@ impl KvCacheGpu {
         self.seq_len
     }
 
+    pub fn precision(&self) -> KvPrecision {
+        match self.store {
+            KvStore::F32 { .. } => KvPrecision::F32,
+            KvStore::F16 { .. } => KvPrecision::F16,
+        }
+    }
+
+    /// Bytes the two buffers occupy.
+    pub fn bytes(&self) -> u64 {
+        2 * self.store.elements() as u64 * self.store.bytes_per_element() as u64
+    }
+
     /// Append one token's K and V data to the cache at the current position.
     ///
-    /// `k_data` and `v_data` are GPU buffers of shape `[num_kv_heads * head_dim]`.
-    /// The kernel scatter-writes each head's data to the correct position in the
-    /// head-first `[head][pos][dim]` layout.
+    /// `k_data` and `v_data` are GPU buffers of shape `[num_kv_heads * head_dim]`
+    /// (F32 activations whatever the store is). For a half store the kernel
+    /// rounds on the way in and counts every value that does not fit in
+    /// `overflow`, which the caller must supply for that store.
     ///
     /// Advances `seq_len` by 1 after writing.
-    ///
-    /// Returns an error if the cache is full (`seq_len >= max_seq_len`) or if
-    /// the kernel launch fails.
     pub fn append_kv(
         &mut self,
         device: &CudaDevice,
         k_data: &CudaSlice<f32>,
         v_data: &CudaSlice<f32>,
+        overflow: Option<&mut CudaSlice<u32>>,
     ) -> Result<(), RuntimeError> {
         if self.seq_len >= self.max_seq_len {
             return Err(RuntimeError::KvCache(format!(
@@ -143,60 +219,106 @@ impl KvCacheGpu {
             shared_mem_bytes: 0,
         };
 
-        // Write K data to k_cache.
-        // SAFETY: k_data has num_kv_heads * head_dim elements (verified by caller).
-        // k_cache has num_kv_heads * max_seq_len * head_dim elements (allocated
-        // in new()). pos < max_seq_len (checked above). The kernel writes exactly
-        // num_kv_heads * head_dim elements, each at a valid offset within k_cache.
-        unsafe {
-            device
-                .stream
-                .launch_builder(&self.write_func)
-                .arg(&mut self.k_cache)
-                .arg(k_data)
-                .arg(&pos)
-                .arg(&num_kv_heads)
-                .arg(&max_seq_len)
-                .arg(&head_dim)
-                .launch(launch_cfg)
+        match &mut self.store {
+            KvStore::F32 { k, v } => {
+                for (cache, data, which) in [(k, k_data, "K"), (v, v_data, "V")] {
+                    unsafe {
+                        device
+                            .stream
+                            .launch_builder(&self.write_func)
+                            .arg(cache)
+                            .arg(data)
+                            .arg(&pos)
+                            .arg(&num_kv_heads)
+                            .arg(&max_seq_len)
+                            .arg(&head_dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("kv_cache_write {which} launch: {e}"))
+                    })?;
+                }
+            }
+            KvStore::F16 { k, v } => {
+                let overflow = overflow.ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "F16 KV cache write without an overflow counter".to_string(),
+                    )
+                })?;
+                for (cache, data, which) in [(k, k_data, "K"), (v, v_data, "V")] {
+                    unsafe {
+                        device
+                            .stream
+                            .launch_builder(&self.write_func)
+                            .arg(cache)
+                            .arg(data)
+                            .arg(&mut *overflow)
+                            .arg(&pos)
+                            .arg(&num_kv_heads)
+                            .arg(&max_seq_len)
+                            .arg(&head_dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("kv_cache_write_f16 {which} launch: {e}"))
+                    })?;
+                }
+            }
         }
-        .map_err(|e| RuntimeError::Compute(format!("kv_cache_write K launch: {e}")))?;
-
-        // Write V data to v_cache.
-        // SAFETY: Same reasoning as K above, applied to v_cache and v_data.
-        unsafe {
-            device
-                .stream
-                .launch_builder(&self.write_func)
-                .arg(&mut self.v_cache)
-                .arg(v_data)
-                .arg(&pos)
-                .arg(&num_kv_heads)
-                .arg(&max_seq_len)
-                .arg(&head_dim)
-                .launch(launch_cfg)
-        }
-        .map_err(|e| RuntimeError::Compute(format!("kv_cache_write V launch: {e}")))?;
 
         self.seq_len += 1;
         Ok(())
     }
 
-    /// Advance the cache sequence length by `count` tokens at once.
-    ///
-    /// Used by the batched prefill path where all tokens' KV data is written
-    /// in a single batch kernel launch. The kernel writes to positions
-    /// `seq_len..seq_len+count-1` and then this method advances the counter.
     pub fn advance_seq_len_by(&mut self, count: usize) {
         self.seq_len += count;
     }
 
-    /// Reset the cache to empty state (seq_len = 0).
-    ///
-    /// Does not deallocate GPU memory; the buffers are reused for the next
-    /// inference session. Previously written data becomes stale but is
-    /// overwritten naturally as new tokens are appended.
     pub fn reset(&mut self) {
         self.seq_len = 0;
+    }
+}
+
+/// F32 K/V buffers a reader takes: the cache's own F32 store, or a widened
+/// copy of a half store; `[num_kv_heads, seq_stride, head_dim]` either way.
+pub struct KvView<'a> {
+    pub k: &'a CudaSlice<f32>,
+    pub v: &'a CudaSlice<f32>,
+    /// The position stride of the layout (the cache's `max_seq_len`, or the
+    /// widened copy's position count).
+    pub seq_stride: usize,
+}
+
+/// A store borrowed by type, for a dispatch that must pick the reader the
+/// bytes are for.
+pub enum KvRef<'a> {
+    F32 {
+        k: &'a CudaSlice<f32>,
+        v: &'a CudaSlice<f32>,
+    },
+    F16 {
+        k: &'a CudaSlice<u16>,
+        v: &'a CudaSlice<u16>,
+    },
+}
+
+impl KvCacheGpu {
+    pub fn as_ref(&self) -> KvRef<'_> {
+        match &self.store {
+            KvStore::F32 { k, v } => KvRef::F32 { k, v },
+            KvStore::F16 { k, v } => KvRef::F16 { k, v },
+        }
+    }
+
+    /// The store as an F32 view, when it is F32.
+    pub fn f32_view(&self) -> Option<KvView<'_>> {
+        match &self.store {
+            KvStore::F32 { k, v } => Some(KvView {
+                k,
+                v,
+                seq_stride: self.max_seq_len,
+            }),
+            KvStore::F16 { .. } => None,
+        }
     }
 }

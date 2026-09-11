@@ -6,9 +6,27 @@ This page is the source of truth for what is currently **verified-against-llama.
 
 Each backend (CUDA + Metal) is validated end-to-end against llama.cpp per the matrices below; validation dates are per row, and cells marked N/A are excluded by capacity policy rather than validated.
 
-### CUDA (NVIDIA, compute capability 8.0+ — Ampere / Hopper)
+### CUDA (NVIDIA, compute capability 8.0+)
 
-Benchmarked on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
+The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
+
+> **Scope of the current release's verification.** Decode attention now runs one kernel on every
+> model and context (see the CHANGELOG), and that change was verified on an RTX 5090 (compute
+> capability 12.0) only: Qwen3.8-27B Q4_0 (session boards at six context shapes, the long-context
+> quality record on both KV stores), Qwen3.5-9B Q4_0 (a paired gate against the previous route at
+> three context lengths, the quality record) and Qwen3.5-MoE-35B-A3B Q4_0 (the quality record).
+> The decode-attention route changed for every CUDA model in this release (the MoE and the
+> Q4_0 dense models on Ampere/Hopper took the tiled kernel before; every model takes the one
+> kernel now) and was measured on the RTX 5090 only. Every A100/H100 ratio in the table below is
+> a **historical record** taken on an earlier release's decode-attention routes; it was not
+> re-measured on this release, and the ratio it states should be read as that release's. What
+> this release verified on the RTX 5090:
+
+| Model | Quant | RTX 5090 decode, tok/s (2026-09-11) | Verified by |
+|-------|-------|------:|---|
+| Qwen3.8-27B dense | Q4_0 | 85.4 / 83.9 / 81.8 / 78.6 at 1,024 / 3,072 / 6,144 / 12,288 tokens of context (85.7 / 84.7 / 83.3 / 81.3 on the 16-bit KV store) | session boards (five runs, CV ≤ 0.2 %) on both stores; DET-001 50/50 on both stores at 1,335 and 6,153 keys, equal to the registered references; the long-context quality record (5 contexts, both stores) bit-identical to the previous build's on every item |
+| Qwen3.5-9B dense | Q4_0 | 171.6 / 167.1 / 159.9 at 3,072 / 6,144 / 12,288 | a paired gate against the previous route (+3.8 / +5.9 / +10.9 %, two runs); DET-001 50/50 on both stores identical to the previous route's at 6,153 keys; in the long-context quality record (42 items) the F32 store parts from the previous build's on six items, every one inside the declared near-tie margin (the same runner-up on both builds, margins ≤ 0.25 logits); the 16-bit store parts from the previous build's 16-bit route once outside that margin, at 12k keys (margins 0.034 / 0.015), adjudicated by a float64 replay of the real activations at the parting positions (this kernel's half route 2.6e-7 relative L2 against the previous half route's 6.1e-7, each against a float64 reference on the half-rounded inputs it read) |
+| Qwen3.5-MoE-35B-A3B | Q4_0 | 213.6 / 208.3 / 200.6 at 3,072 / 6,144 / 12,288 (the previous route: 80.2 / 49.8 / 28.3) | a paired gate against the previous route (+166 / +318 / +599 %, its kernel arm at the budget-derived target of 256 that preceded the shipped 128; the rates in the previous column are the shipped target's, from the policy check that set it); DET-001 50/50 on both stores, both identical to the previous route's digest at 6,153 keys; the long-context quality record (48 items at four contexts, two of them past the one-tile bound) fails its strict first-flip rule on one prompt on the F32 store (token 25: the runner-up is the same token on both builds at margins of 0.033 and 0.024 logits but is not the other's choice) and on two prompts of the 16-bit store against this build's F32 store (the same prompt at token 25, and one past the one-tile bound at token 245, a mutual runner-up at a margin of 0.29 logits); the 16-bit store never parts from the previous build's 16-bit route outside the near-tie margin. Both partings adjudicated by a float64 replay of the real activations at the parting positions: this kernel 4.7e-7 and 3.3e-7 relative L2 on the F32 store against the previous route's 6.3e-7 and 9.3e-7, and 2.9e-7 and 3.9e-7 on the 16-bit store against the previous 16-bit route's 6.7e-7 and 6.9e-7, each store against a float64 reference on the inputs it read |
 
 **Status reflects functional verification** (correctness, robustness, and determinism gates), not decode-speed parity: a cell can be production-ready while decoding slower than llama.cpp on the same hardware — the ratio column carries the observed record. Cells below ~0.95× are open performance targets.
 
@@ -70,7 +88,8 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Class | Status | Why |
 |---|---|---|
 | llama / mistral / qwen2 / phi / gemma architectures | Currently rejected at conversion | Not yet on the verified-against-llama.cpp matrix. v1 scope decision; planned for future model-family releases. |
-| NVIDIA hardware below compute capability 8.0 (pre-Ampere) | Untested | Ampere/Hopper (e.g. A100, H100) is the kernel target; older cards may compile but are not gated |
+| A CUDA model outside the decode-attention kernel's domain (more than 8 query heads per KV head, or a head dimension other than 128 or 256) | Refused at CUDA init, with the shape named | The one decode-attention kernel is compiled per model for its group size and head dimension; every model in the registry is inside the domain. Such a model runs on the CPU or Metal backends |
+| NVIDIA hardware below compute capability 8.0 (pre-Ampere) | Untested | The kernels are compiled at load for whatever target NVRTC offers; the current release is verified on an RTX 5090 (12.0), earlier releases on A100 / H100 (8.0 / 9.0); older cards may compile but are not gated |
 | Apple Silicon outside the M-series tested configuration | Untested | The published Metal benchmarks were measured on an M3 Ultra |
 | K-quants (Q4_K, Q5_K, Q6_K, Q2_K, Q3_K) at runtime | Backend-dependent at GGUF→LBC import. `--target metal` upcasts K-quant (and legacy Q5_0) layer tensors to Q8_0 and re-quantizes Q4_1 to Q4_0, unless an explicit `--requant`/`--dequantize` overrides. Generic/CUDA conversions carry K-quant layer planes verbatim and CUDA dequantizes them to F32 at load — except MoE shared-expert planes, which are always requantized to Q4_0. Two role-specific tensors are requantized by default and preserved with `LUMEN_CONVERT_SOURCE_FIDELITY=1` for dedicated CUDA kernels: a Q5_K `ssm_out` and a Q6_K output head | No general K-quant matmul kernels; CUDA kernels exist only for the two preserved roles |
 | MXFP4 at runtime | No LBC representation: required MXFP4 layer tensors are rejected at conversion; optional tensors and MoE shared-expert planes are dequantized (to F32, or Q4_0 for shared-expert gate/up) | No MXFP4 runtime kernels |

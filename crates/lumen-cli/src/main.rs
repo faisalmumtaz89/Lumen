@@ -34,6 +34,19 @@ fn main() {
     // (`lumen-server::bin::main`) calls `set_path_is_server(true)`.
     let _warnings = lumen_runtime::runtime_defaults::validate_lumen_env_vars();
     lumen_runtime::runtime_defaults::mark_validator_ran();
+    // A name an earlier release read and this one does not is an error, not a
+    // warning: the configuration the operator asked for would silently not apply.
+    let removed = lumen_runtime::runtime_defaults::removed_lumen_env_vars_set();
+    if !removed.is_empty() {
+        for line in &removed {
+            eprintln!("[lumen] ERROR: {line}");
+        }
+        eprintln!("[lumen] refusing to start with a removed env var set");
+        std::process::exit(2);
+    }
+    lumen_runtime::runtime_defaults::set_build_identity(
+        option_env!("LUMEN_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
 
     let args: Vec<String> = std::env::args().collect();
 

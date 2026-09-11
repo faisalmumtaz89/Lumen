@@ -277,7 +277,7 @@ pub trait ComputeBackend: Send + Sync {
     /// CPU-resident KV cache; if the runtime config asks for a different
     /// precision the backend silently ignored it before, producing memory-
     /// layout mismatches that would later corrupt KV writes (Metal: F16-only
-    /// `gpu_k_cache`/`gpu_v_cache`; CUDA: F32-only `KvCacheGpu`). Reject the
+    /// `gpu_k_cache`/`gpu_v_cache`; CUDA: the F32 or F16 store it was built for). Reject the
     /// mismatch up front so the caller sees an explicit error instead of
     /// downstream silent data corruption.
     ///

@@ -8,7 +8,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use std::sync::Arc;
 

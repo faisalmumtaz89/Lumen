@@ -764,7 +764,7 @@ impl InferenceEngine {
 
         // Validate KV precision once at top of generation, mirroring the
         // contract `generate()` enforces. Failing here surfaces the same
-        // actionable "Metal requires F16" / "CUDA requires F32" message.
+        // actionable "Metal requires F16" / "CUDA was built for F32" message.
         backend.validate_kv_precision(self.config.kv_precision)?;
 
         // Propagate the anti-restate byte decoder (if the CLI installed one)

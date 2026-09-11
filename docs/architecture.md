@@ -24,7 +24,7 @@ The forward-pass surface is transformer + GDN-hybrid (dense or MoE FFN). v1's sh
 
 - **Dense FFN**: fused gate + up + SwiGLU + down kernel
 - **MoE FFN**: routes the top-K experts per token through stacked gate + up + SwiGLU + down kernels
-- **Long-context decode**: tiled/split-K streaming-softmax attention past the 40,950-token single-block shared-memory ceiling. Threshold 0 (`ATTN_DECODE_TILED_DEFAULT_THRESHOLD`) selects Tiled as the base variant for every sequence length; eligible Q8_0/BF16-body dense calls upgrade to the split-K pair (`LUMEN_CUDA_ATTN_SPLITK`), as do Q4_0-body dense calls on compute capability 12.x
+- **Decode attention**: one split-K flash-decoding kernel pair (`attention_decode_partial_f32` / `_f16` + `attention_decode_merge`), compiled at load for the model's group size (query heads per KV head, 1 to 8) and head dimension (128 or 256), serving every context the cache holds with fixed scratch and no route switch: one CTA per (KV head, chunk) so each K and V row is read once for the whole group, one 16-key tile per CTA up to a per-model bound and a balanced run of whole tiles at a fixed split count above it (`LUMEN_CUDA_ATTN_ONE_TILE`, `LUMEN_CUDA_ATTN_TARGET`)
 
 ## LBC binary format
 
@@ -46,7 +46,7 @@ Each `Session` records its prompt history. On the next turn, `Session::extend_wi
 
 | Backend | Source root | Notable kernels |
 |---|---|---|
-| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (tiled streaming-softmax decode), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~16K LoC dispatch) |
+| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (the kernel set and the decode matvecs), `attention_decode.rs` (decode attention: one kernel per model shape), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~16K LoC dispatch) |
 | Metal | `crates/lumen-runtime/src/metal/` | `gdn.rs`, `moe.rs`, `prefill.rs`, `decode_*.rs`, `shaders/*.msl` |
 | CPU | `crates/lumen-runtime/src/compute/cpu_naive.rs` + `crates/lumen-runtime/src/accelerate/` | Scalar reference + SIMD NEON |
 

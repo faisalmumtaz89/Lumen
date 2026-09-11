@@ -967,69 +967,6 @@ pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
 
-/// `LUMEN_CUDA_ATTN_SPLITK` (model-aware default: ON for Q8_0- and
-/// BF16-body dense models, OFF otherwise): route the full-attention decode
-/// step through the split-K kernel pair (sequence-parallel: one CTA per
-/// query head per chunk, plus a merge) instead of the one-CTA-per-head
-/// tiled kernel. Lifts the occupancy ceiling on few-head models (27B: 24
-/// CTAs -> 24 per chunk, plus a 24-CTA merge) and cuts each partial CTA's
-/// sequence walk to its own chunk (total work stays linear in context
-/// length). The chunk count follows the context length, one chunk per
-/// [`attn_splitk_chunk_positions`] positions; where that count is 1 the
-/// tiled kernel runs instead. Quality-equivalent near-tie — the cross-chunk
-/// merge sums in a different order than the tiled kernel's progressive
-/// rescale, and that order follows the chunk count. `=0` opts out, `=1`
-/// forces on; unset resolves model-aware: ON for Q8_0-body and BF16-body
-/// dense models (the classes the engine A/Bs + full GQ/DET gates banked, at
-/// a fixed 4 chunks: Q8 +0.195 ms/tok on A100-SXM, BF16 +0.298 ms/tok on
-/// H100), following the canonical-defaults master switch. Q4_0-body dense
-/// models take the pair on compute capability 12.x as well: on the RTX 5090
-/// the tiled route is the kernel that collapses at context (one CTA per
-/// head, 24 CTAs on a 170-SM card) and the pair, context-scaled, was gated
-/// there at +34.39 % at 1,300 tokens and +67 % at 2,600 with the 48-token
-/// greedy output byte-identical to the tiled route's (r2-016; the 1,024-in /
-/// 128-out board: 60.7 -> 79.4 tok/s). On every other capability Q4 bodies
-/// stay on the tiled route: an earlier Q4 quality gate on the A100 failed
-/// with the (then fixed 4-chunk) pair on, and nothing has been measured there
-/// since. `=0` opts a Blackwell Q4 run back out.
-pub fn attn_splitk_enabled() -> bool {
-    match std::env::var("LUMEN_CUDA_ATTN_SPLITK") {
-        Ok(v) if v == "0" => false,
-        Ok(v) if v == "1" => true,
-        _ => attn_splitk_default(),
-    }
-}
-
-/// The model-aware default behind [`attn_splitk_enabled`]: Q8_0 and BF16
-/// dense bodies everywhere, Q4_0 dense bodies on compute capability 12.x,
-/// never MoE, all under the canonical-defaults master switch.
-pub fn attn_splitk_default() -> bool {
-    attn_splitk_default_for(
-        model_dense_quant(),
-        model_is_moe(),
-        device_cc_major(),
-        canonical_default_on(),
-    )
-}
-
-/// [`attn_splitk_default`] with every input explicit (the process wrappers feed the globals;
-/// tests feed values).
-pub fn attn_splitk_default_for(
-    quant: Option<QuantScheme>,
-    moe: bool,
-    cc_major: u8,
-    canonical: bool,
-) -> bool {
-    if moe || !canonical {
-        return false;
-    }
-    match quant {
-        Some(QuantScheme::Q8_0) | Some(QuantScheme::Bf16) => true,
-        Some(QuantScheme::Q4_0) => cc_major == 12,
-        _ => false,
-    }
-}
-
 /// Per-process default for `LUMEN_CUDA_NORM_CTA5_DUAL` when unset: ON for a
 /// Q4_0 dense body on compute capability 12.x — the one cell it is measured
 /// on (source-fidelity Qwen3.8-27B Q4_0, RTX 5090: +4.10 % decode, byte-
@@ -1055,51 +992,6 @@ pub fn norm_cta5_dual_default_for(
     canonical: bool,
 ) -> bool {
     !moe && matches!(quant, Some(QuantScheme::Q4_0)) && cc_major == 12 && canonical
-}
-
-/// The NVRTC target the tiled decode-attention kernel is compiled for when
-/// `LUMEN_CUDA_ATTN_TILED_CODEGEN` is unset: `ptx120` (compute_120) on a
-/// compute capability 12.x device whose NVRTC lists that target, else NVRTC's
-/// default. Measured on the RTX 5090 with CUDA 13.3: the same source emits
-/// 2,520 instructions at compute_120 against 3,632 at the default sm_75
-/// target, +9.6 % decode at 1,300 tokens and +14.7 % at 2,600 on the tiled
-/// route, byte-identical (r3-025/028); the compute_80 control was null, so
-/// the gain is the target, not the recompile. Only this kernel: the GDN
-/// kernels grow at compute_120, so the policy is per kernel, not per process.
-/// And only the measured cell — a Q4_0 dense body — like the other two
-/// promoted defaults: an MoE or Q8/BF16 model on the same card keeps NVRTC's
-/// default target until it is gated there. Follows the canonical-defaults
-/// master switch. Resolved at kernel compilation, after the CLI/server have
-/// recorded the model's body class and before the backend records the
-/// capability (which is why the capability is a parameter here).
-pub fn attn_tiled_codegen_default(cc_major: u8, nvrtc_can_target_120: bool) -> &'static str {
-    attn_tiled_codegen_default_for(
-        model_dense_quant(),
-        model_is_moe(),
-        cc_major,
-        nvrtc_can_target_120,
-        canonical_default_on(),
-    )
-}
-
-/// [`attn_tiled_codegen_default`] with every input explicit.
-pub fn attn_tiled_codegen_default_for(
-    quant: Option<QuantScheme>,
-    moe: bool,
-    cc_major: u8,
-    nvrtc_can_target_120: bool,
-    canonical: bool,
-) -> &'static str {
-    if !moe
-        && matches!(quant, Some(QuantScheme::Q4_0))
-        && cc_major == 12
-        && nvrtc_can_target_120
-        && canonical
-    {
-        "ptx120"
-    } else {
-        "default"
-    }
 }
 
 /// `LUMEN_CUDA_FORCE_SCALAR_ATTN=1`: run the fused Q+gate prefill attention
@@ -1140,154 +1032,112 @@ pub fn attn_prefill_sgemm_enabled() -> bool {
     })
 }
 
-/// Target KV positions per split-K decode-attention chunk unless
-/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK` says otherwise: one of the kernel's
-/// 128-position tiles. The value picks the chunk *count* — the context
-/// length divided by it, rounded up, capped at the scratch bound — so the
-/// span a chunk actually walks is the context divided by that count: 65 and
-/// 64 at a context of 129, 119 at 1300, 384 at 12280, where the cap binds.
-/// Measured on the RTX 5090 (Qwen3.8-27B, 330 to 2.6k tokens of context):
-/// 128 beat 256 at every length.
-pub const ATTN_SPLITK_CHUNK_POSITIONS: u32 = 128;
+/// The identity of the binary this runtime is linked into — the version the
+/// binary prints (`v0.30.0-6-g4045592`), recorded by the binary's `main`
+/// through [`set_build_identity`] because the crate's own `option_env!` sees
+/// only its package version. Read by the diagnostics that stamp their output.
+pub fn build_identity() -> &'static str {
+    BUILD_IDENTITY
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
-/// The split count the split-K pair used at every context through v0.24.0,
-/// and what [`attn_splitk_scale_with_context`] returns to when opted out.
-pub const ATTN_SPLITK_FIXED_CHUNKS: u32 = 4;
+/// Record the binary's version string once, at startup. Later calls are
+/// ignored, so the first (the binary's own) wins.
+pub fn set_build_identity(identity: &str) {
+    let _ = BUILD_IDENTITY.set(identity.to_string());
+}
 
-/// `LUMEN_CUDA_ATTN_SPLITK_GQA6`: serve the eligible full-attention decode
-/// step with the GQA-shared split-K pair
-/// (`attention_decode_splitk_partial_gqa6_f32` +
-/// `attention_decode_splitk_merge_gqa6_f32`) instead of the per-query-head
-/// pair. One CTA per (KV head, chunk) fetches each K and V row once for the
-/// whole six-query-head group rather than once per query head, and every Q,
-/// K and V read is a 16-byte load; the merge computes each chunk's rescale
-/// once instead of once per output dimension.
-///
-/// Unset, [`attn_splitk_gqa6_default`] decides: ON for a Q4_0 dense body on
-/// compute capability 12.x, the one cell it is measured on, OFF elsewhere.
-/// `0`/`off`/`false`/`no` switch it off, `1`/`on`/`true`/`yes` force it on
-/// wherever the pair is eligible (either case), and any other spelling falls
-/// to the default (the kill-switch dialect every default-ON knob honours).
-/// Eligibility is narrow — six query heads per KV head (24/4, 12/2 and 6/1
-/// alike), head_dim 256, and a context the chunk cap covers — and every other
-/// shape keeps its existing route, so the setting is a no-op elsewhere. The
-/// chunk partition and both reduction orders differ from the per-query-head
-/// pair, which makes the two a near-tie rather than byte-identical.
-///
-/// The loader consults it once while building the kernel set; the scratch
-/// allocator keys off the loaded pair.
-pub fn attn_splitk_gqa6_enabled() -> bool {
-    let value = std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6")
+static BUILD_IDENTITY: OnceLock<String> = OnceLock::new();
+
+/// `LUMEN_CUDA_ATTN_ONE_TILE`: up to this many 16-key tiles the
+/// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
+/// above it the CTAs walk whole tiles at the fixed target. The default is
+/// derived per model from the CTA totals measured on the RTX 5090
+/// (`attn_one_tile_default`): 176 for 4 KV heads, on either
+/// store, the RTX 5090 sweeps' choice: on the F32 store the loop is
+/// never slower than the one-tile form below 176 tiles and faster above; on
+/// the half store a 176 and a 256 bound are a wash on the fine grid (176 reads
+/// +10 % at 3,200 keys and +8 % at 3,968, −6 to −8 % at 3,600 and −8 to
+/// −15 % at 4,096, equal elsewhere, over the four sweep runs), and one bound on both
+/// stores gives them the same split geometry at every context, so on
+/// half-representable inputs the half store's output is bit-identical to the
+/// F32 store's. Against the pre-loop one-tile form on the half store (this
+/// release's half twin of the previous release's partial; six CTAs per SM to
+/// 255 tiles) the loop reads −10 % at 2,600 keys, 0 % at 2,816 and 3,200,
+/// −3 to −8 % at 3,600, +17 % at 3,968 (the one slower cell, in every run:
+/// the loop's 128 CTAs per KV head each walk two tiles in series where the
+/// one-tile form's 992 CTAs all fit one wave at six per SM), −8 to −15 % at
+/// 4,096, −7 % at 4,800, −17 % at 6,144, −29 % at 16,384, the sole exception
+/// elsewhere one timer tick (+0.2 %) at 1,152 keys in one run of four; the
+/// harness timer is quantised near 2 µs, so these are coarse. Clamped to `1..=ATTN_DECODE_S_MAX_DEFAULT`;
+/// `0` or unparsable is the default.
+pub fn attn_one_tile_max(num_kv_heads: u32) -> u32 {
+    std::env::var("LUMEN_CUDA_ATTN_ONE_TILE")
         .ok()
-        .map(|v| v.trim().to_ascii_lowercase());
-    match value.as_deref() {
-        Some("0") | Some("off") | Some("false") | Some("no") => false,
-        Some("1") | Some("on") | Some("true") | Some("yes") => true,
-        _ => attn_splitk_gqa6_default(),
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| attn_one_tile_default(num_kv_heads))
+        .min(ATTN_DECODE_S_MAX_DEFAULT)
+}
+
+/// `LUMEN_CUDA_ATTN_TARGET`: the split count the decode-attention pair
+/// holds above the one-tile bound; each CTA walks a balanced run of whole
+/// tiles. Default 128: on the RTX 5090, at every context from 6,144 to
+/// 32,768 keys, within 3 % of the best measured count on the F32 store and
+/// within 6 % on the half store (the gap at 32,768 keys, where 176 is best);
+/// 64 starves the machine; 176 splits too finely on the F32 store at every
+/// context (the slowest F32 count, +23 % at 16,384 and 32,768) and is the
+/// best half-store count from 16k up. The
+/// scratch is sized for `max(one-tile bound, target)` chunks and never grows
+/// with the context. Clamped to `1..=ATTN_DECODE_S_MAX_DEFAULT`.
+pub fn attn_target(num_kv_heads: u32) -> u32 {
+    std::env::var("LUMEN_CUDA_ATTN_TARGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| attn_target_default(num_kv_heads))
+        .min(ATTN_DECODE_S_MAX_DEFAULT)
+}
+
+/// The one-tile bound was measured on the RTX 5090 for a model with 4 KV
+/// heads as 176 tiles per KV head: one wave of 4 × 176 = 704 one-tile CTAs
+/// over the card's 170 SMs. A model with another KV-head count keeps that
+/// CTA total — the grid the device was measured with — so the per-KV-head
+/// bound scales inversely (352 on 2 KV heads; 176 against 352 there was a
+/// null on the MoE). The whole-tile target is NOT a CTA budget: at 4 KV
+/// heads 128 chunks per KV head is within 3 % of the best measured count on
+/// the F32 store and 6 % on the half store from 6,144 to 32,768 keys (176
+/// the slowest F32 count, 64 starving the card) and, against the
+/// budget-derived 256, +1.5 % at 12,288 keys and equal below on the
+/// 2-KV-head MoE, so it is one constant for every model.
+pub const ATTN_ONE_TILE_CTAS: u32 = 704;
+pub const ATTN_TARGET_PER_KV_HEAD: u32 = 128;
+/// The split-count ceiling the merge's shared block is sized for (mirrors
+/// `cuda::ATTN_DECODE_S_MAX`, which asserts the two agree).
+pub const ATTN_DECODE_S_MAX_DEFAULT: u32 = 1024;
+
+pub const fn attn_one_tile_default(num_kv_heads: u32) -> u32 {
+    let kv = if num_kv_heads == 0 { 1 } else { num_kv_heads };
+    let n = ATTN_ONE_TILE_CTAS.div_ceil(kv);
+    if n > ATTN_DECODE_S_MAX_DEFAULT {
+        ATTN_DECODE_S_MAX_DEFAULT
+    } else {
+        n
     }
 }
 
-/// The model- and device-aware default behind [`attn_splitk_gqa6_enabled`]:
-/// a Q4_0 dense body on compute capability 12.x (source-fidelity Qwen3.8-27B
-/// Q4_0 on the RTX 5090: 82.59 → 85.56 tok/s at 1,024 in / 128 out on the
-/// promoted build), never MoE, all under the canonical-defaults master switch. Every other cell is
-/// unmeasured and stays on the per-query-head pair.
-pub fn attn_splitk_gqa6_default() -> bool {
-    attn_splitk_gqa6_default_for(
-        model_dense_quant(),
-        model_is_moe(),
-        device_cc_major(),
-        canonical_default_on(),
-    )
+pub const fn attn_target_default(_num_kv_heads: u32) -> u32 {
+    ATTN_TARGET_PER_KV_HEAD
 }
 
-/// [`attn_splitk_gqa6_default`] with every input explicit (the process
-/// wrappers feed the globals; tests feed values).
-pub fn attn_splitk_gqa6_default_for(
-    quant: Option<QuantScheme>,
-    moe: bool,
-    cc_major: u8,
-    canonical: bool,
-) -> bool {
-    !moe && canonical && cc_major == 12 && matches!(quant, Some(QuantScheme::Q4_0))
-}
-
-/// `LUMEN_CUDA_ATTN_SPLITK_SCALE` (default ON, canonical): size the split-K
-/// decode-attention split count from the context. `=0` pins the fixed count
-/// [`ATTN_SPLITK_FIXED_CHUNKS`] at every context, the configuration the
-/// classes that take the pair by default (Q8_0- and BF16-body dense) were
-/// gate-banked under; the scaled count merges a different number of chunks,
-/// a near-tie numerics change on those classes. Follows the
-/// canonical-defaults master switch.
-pub fn attn_splitk_scale_with_context() -> bool {
-    match std::env::var("LUMEN_CUDA_ATTN_SPLITK_SCALE") {
-        Ok(v) if v == "0" => false,
-        Ok(v) if v == "1" => true,
-        _ => canonical_default_on(),
-    }
-}
-
-/// `LUMEN_CUDA_ATTN_SPLITK_CHUNK`: target KV positions per split-K attention
-/// chunk (default [`ATTN_SPLITK_CHUNK_POSITIONS`]). The chunk count is the
-/// context length divided by this, rounded up and capped at the scratch
-/// bound; a count of 1 means the tiled kernel runs instead. A value below 128
-/// is raised to 128 (one kernel tile) and an unparseable value is the
-/// default; either substitution is printed once, so a chunk size the operator
-/// wrote and the runtime did not use never passes unnoticed.
-pub fn attn_splitk_chunk_positions() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let (chunk, warning) = parse_attn_splitk_chunk(
-            std::env::var("LUMEN_CUDA_ATTN_SPLITK_CHUNK")
-                .ok()
-                .as_deref(),
-        );
-        if let Some(warning) = warning {
-            eprintln!("{warning}");
-        }
-        chunk
-    })
-}
-
-/// Pure parser behind [`attn_splitk_chunk_positions`] (separated for unit
-/// testing): the resolved chunk size and, when the operator's value was not
-/// used verbatim, the one line the caller prints. A perf knob the runtime
-/// rewrites silently reads as honoured and is not; a typo must still not
-/// abort engine init.
-fn parse_attn_splitk_chunk(raw: Option<&str>) -> (u32, Option<String>) {
-    const ENV: &str = "LUMEN_CUDA_ATTN_SPLITK_CHUNK";
-    let Some(raw) = raw else {
-        return (ATTN_SPLITK_CHUNK_POSITIONS, None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return (
-            ATTN_SPLITK_CHUNK_POSITIONS,
-            Some(format!(
-                "[CUDA] {ENV}='{raw}' is empty; using the default \
-                 {ATTN_SPLITK_CHUNK_POSITIONS} KV positions per chunk"
-            )),
-        );
-    }
-    match trimmed.parse::<u32>() {
-        Ok(v) if v >= ATTN_SPLITK_CHUNK_POSITIONS => (v, None),
-        Ok(v) => (
-            ATTN_SPLITK_CHUNK_POSITIONS,
-            Some(format!(
-                "[CUDA] {ENV}='{raw}' is below one kernel tile ({v} < \
-                 {ATTN_SPLITK_CHUNK_POSITIONS}); raised to \
-                 {ATTN_SPLITK_CHUNK_POSITIONS}"
-            )),
-        ),
-        Err(e) => (
-            ATTN_SPLITK_CHUNK_POSITIONS,
-            Some(format!(
-                "[CUDA] {ENV}='{raw}' is not a positive integer ({e}); using \
-                 the default {ATTN_SPLITK_CHUNK_POSITIONS} KV positions per chunk"
-            )),
-        ),
-    }
-}
+/// The measured 4-KV-head values, which the derivation above must reproduce
+/// (the target is the same constant at every KV-head count).
+pub const ATTN_ONE_TILE_DEFAULT: u32 = 176;
+pub const ATTN_TARGET_DEFAULT: u32 = 128;
+const _: () = assert!(attn_one_tile_default(4) == ATTN_ONE_TILE_DEFAULT);
+const _: () = assert!(attn_target_default(4) == ATTN_TARGET_DEFAULT);
 
 /// `LUMEN_CUDA_BF16_NR1` (default ON): route the broad BF16 decode matvecs
 /// through the one-row/CTA `matvec_bf16_v4_nr1` kernel instead of the NR=2
@@ -1942,6 +1792,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_ANTI_RESTATE_LOOP",
     "LUMEN_ANTI_RESTATE_NGRAM",
     "LUMEN_ANTI_RESTATE_SUBWORD",
+    "LUMEN_ATTN_FIXTURE_WRITE",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
     "LUMEN_BENCH_MASK_EOG",
@@ -1957,13 +1808,12 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CORR010_MODEL",
     "LUMEN_CUDA_ARGMAX_TILED",
     "LUMEN_CUDA_ATTN_BANK3",
+    "LUMEN_CUDA_ATTN_CODEGEN",
+    "LUMEN_CUDA_ATTN_DUMP",
+    "LUMEN_CUDA_ATTN_ONE_TILE",
     "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
-    "LUMEN_CUDA_ATTN_SPLITK",
-    "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
-    "LUMEN_CUDA_ATTN_SPLITK_GQA6",
-    "LUMEN_CUDA_ATTN_SPLITK_SCALE",
-    "LUMEN_CUDA_ATTN_TILED_CODEGEN",
+    "LUMEN_CUDA_ATTN_TARGET",
     "LUMEN_CUDA_BF16_AB_Q8BANK",
     "LUMEN_CUDA_BF16_AUTOTUNE",
     "LUMEN_CUDA_BF16_FUSED_GLU",
@@ -1975,8 +1825,6 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_CT4_DP4A",
     "LUMEN_CUDA_CT4_EXACTK",
     "LUMEN_CUDA_DECODE_DELAY_US",
-    "LUMEN_CUDA_DECODE_TILED",
-    "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
     "LUMEN_CUDA_F16_CACHE",
     "LUMEN_CUDA_F16_CACHE_FORCE",
     "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
@@ -2229,6 +2077,9 @@ fn collect_unknown_lumen_env_vars() -> Vec<String> {
                 .chain(KNOWN_LUMEN_TOOLING_ENV_VARS.iter())
                 .any(|known| *known == k.as_str())
         })
+        // A removed name is refused by `removed_lumen_env_vars_set`, with its
+        // remedy; a typo suggestion on top of that would only mislead.
+        .filter(|k| !REMOVED_LUMEN_ENV_VARS.iter().any(|(r, _)| *r == k.as_str()))
         .collect();
     unknown_with_prefix.sort();
     for name in unknown_with_prefix {
@@ -2372,6 +2223,69 @@ pub fn mark_validator_ran() {
 /// Reports whether `mark_validator_ran` has been called this process.
 pub fn validator_was_run() -> bool {
     VALIDATOR_RAN.get().is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Removed env vars
+// ---------------------------------------------------------------------------
+
+/// Names an earlier release honoured that this one does not read, each with
+/// what replaced it. Setting one is refused at startup rather than warned
+/// about: an operator who exports a removed switch expects it to take effect,
+/// and a process that starts anyway runs a configuration they did not choose.
+/// Sorted alphabetically.
+pub const REMOVED_LUMEN_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "LUMEN_CUDA_ATTN_SPLITK",
+        "decode attention runs one kernel on every model and every context; there is no other route to switch on or off. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
+        "the kernel's partition is set by LUMEN_CUDA_ATTN_ONE_TILE and LUMEN_CUDA_ATTN_TARGET; nothing else chooses a split count. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6",
+        "decode attention runs one kernel on every model and every context; there is no other route to switch on or off. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS",
+        "the bounded one-tile form it restored no longer exists; the one kernel's partition is set by LUMEN_CUDA_ATTN_ONE_TILE and LUMEN_CUDA_ATTN_TARGET. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE",
+        "renamed LUMEN_CUDA_ATTN_ONE_TILE (same meaning, same default).",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET",
+        "renamed LUMEN_CUDA_ATTN_TARGET (same meaning, same default).",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_SPLITK_SCALE",
+        "the kernel's partition is set by LUMEN_CUDA_ATTN_ONE_TILE and LUMEN_CUDA_ATTN_TARGET; nothing else chooses a split count. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_ATTN_TILED_CODEGEN",
+        "replaced by LUMEN_CUDA_ATTN_CODEGEN (default | ptx80 | ptx120), which targets the one decode-attention kernel.",
+    ),
+    (
+        "LUMEN_CUDA_DECODE_TILED",
+        "the tiled decode-attention kernel no longer exists; decode attention runs one kernel on every model and every context. Unset it.",
+    ),
+    (
+        "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
+        "the tiled decode-attention kernel no longer exists; decode attention runs one kernel on every model and every context. Unset it.",
+    ),
+];
+
+/// Every removed name that is set in this process, each with its remedy, in
+/// the order of [`REMOVED_LUMEN_ENV_VARS`]. Empty when none is set. The
+/// binaries print each line and exit non-zero before opening a model.
+pub fn removed_lumen_env_vars_set() -> Vec<String> {
+    REMOVED_LUMEN_ENV_VARS
+        .iter()
+        .filter(|(name, _)| std::env::var_os(name).is_some())
+        .map(|(name, remedy)| format!("{name} is set but this release does not read it: {remedy}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3381,40 +3295,6 @@ mod tests {
     }
 
     #[test]
-    fn q4_dense_takes_split_k_only_on_blackwell() {
-        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_tests();
-        set_model_primary_quant(QuantScheme::Q4_0);
-        set_model_is_moe(false);
-        set_device_cc_major(12);
-        assert!(
-            attn_splitk_default(),
-            "Q4_0 dense on cc 12.x: the pair is the measured route"
-        );
-        for cc in [0u8, 7, 8, 9, 10, 11, 13] {
-            set_device_cc_major(cc);
-            assert!(
-                !attn_splitk_default(),
-                "Q4_0 dense on cc {cc}.x is unmeasured: tiled"
-            );
-        }
-        set_device_cc_major(12);
-        set_model_is_moe(true);
-        assert!(
-            !attn_splitk_default(),
-            "MoE never takes the pair by default"
-        );
-        set_model_is_moe(false);
-        set_model_primary_quant(QuantScheme::Q8_0);
-        set_device_cc_major(8);
-        assert!(
-            attn_splitk_default(),
-            "Q8_0 dense keeps the pair on every capability"
-        );
-        reset_for_tests();
-    }
-
-    #[test]
     fn norm_dual_defaults_on_for_the_measured_cell_only() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset_for_tests();
@@ -3439,130 +3319,34 @@ mod tests {
     }
 
     #[test]
-    fn tiled_codegen_defaults_to_compute_120_only_for_the_measured_cell() {
+    fn attn_policy_knobs_default_per_model_and_clamp() {
         let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_tests();
-        set_model_primary_quant(QuantScheme::Q4_0);
-        set_model_is_moe(false);
-        assert_eq!(attn_tiled_codegen_default(12, true), "ptx120");
-        assert_eq!(
-            attn_tiled_codegen_default(12, false),
-            "default",
-            "NVRTC without the target"
-        );
-        for cc in [0u8, 8, 9, 10, 13] {
-            assert_eq!(attn_tiled_codegen_default(cc, true), "default", "cc {cc}.x");
+        std::env::remove_var("LUMEN_CUDA_ATTN_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_TARGET");
+        assert_eq!(attn_one_tile_max(4), ATTN_ONE_TILE_DEFAULT);
+        assert_eq!(attn_one_tile_max(4), ATTN_ONE_TILE_DEFAULT);
+        assert_eq!(attn_target(4), ATTN_TARGET_DEFAULT);
+        // Per model: the one-tile CTA total stays (so its per-KV-head count
+        // scales); the target is the same per-KV-head count on every model.
+        assert_eq!(attn_one_tile_max(2), 352);
+        assert_eq!(attn_target(2), 128);
+        assert_eq!(attn_one_tile_max(1), 704);
+        assert_eq!(attn_target(1), 128);
+        assert_eq!(attn_one_tile_max(8), 88);
+        assert_eq!(attn_target(8), 128);
+        std::env::set_var("LUMEN_CUDA_ATTN_ONE_TILE", "4096");
+        std::env::set_var("LUMEN_CUDA_ATTN_TARGET", " 96 ");
+        assert_eq!(attn_one_tile_max(4), ATTN_DECODE_S_MAX_DEFAULT);
+        assert_eq!(attn_one_tile_max(4), ATTN_DECODE_S_MAX_DEFAULT);
+        assert_eq!(attn_target(4), 96);
+        for v in ["0", "garbage", ""] {
+            std::env::set_var("LUMEN_CUDA_ATTN_ONE_TILE", v);
+            std::env::set_var("LUMEN_CUDA_ATTN_TARGET", v);
+            assert_eq!(attn_one_tile_max(4), ATTN_ONE_TILE_DEFAULT);
+            assert_eq!(attn_target(4), ATTN_TARGET_DEFAULT);
         }
-        set_model_is_moe(true);
-        assert_eq!(
-            attn_tiled_codegen_default(12, true),
-            "default",
-            "MoE keeps NVRTC's default target"
-        );
-        set_model_is_moe(false);
-        set_model_primary_quant(QuantScheme::Q8_0);
-        assert_eq!(
-            attn_tiled_codegen_default(12, true),
-            "default",
-            "Q8_0 body is unmeasured"
-        );
-        reset_for_tests();
-    }
-
-    #[test]
-    fn legacy_defaults_switch_off_every_promoted_default() {
-        // Through the explicit-input resolvers: the process-wide legacy cache cannot be toggled
-        // inside one test process without leaking into its siblings.
-        let q4 = Some(QuantScheme::Q4_0);
-        assert!(attn_splitk_default_for(q4, false, 12, true));
-        assert!(
-            !attn_splitk_default_for(q4, false, 12, false),
-            "legacy switch: split-K off"
-        );
-        assert!(norm_cta5_dual_default_for(q4, false, 12, true));
-        assert!(
-            !norm_cta5_dual_default_for(q4, false, 12, false),
-            "legacy switch: dual norm off"
-        );
-        assert_eq!(
-            attn_tiled_codegen_default_for(q4, false, 12, true, true),
-            "ptx120"
-        );
-        assert_eq!(
-            attn_tiled_codegen_default_for(q4, false, 12, true, false),
-            "default",
-            "legacy switch: default target"
-        );
-        assert!(
-            !attn_splitk_default_for(Some(QuantScheme::Q8_0), false, 8, false),
-            "legacy switch: Q8 pair off too"
-        );
-        assert!(attn_splitk_gqa6_default_for(q4, false, 12, true));
-        assert!(
-            !attn_splitk_gqa6_default_for(q4, false, 12, false),
-            "legacy switch: GQA-shared pair off"
-        );
-    }
-
-    #[test]
-    fn gqa6_default_is_the_measured_cell_only() {
-        let q4 = Some(QuantScheme::Q4_0);
-        assert!(attn_splitk_gqa6_default_for(q4, false, 12, true));
-        for cc in [0u8, 7, 8, 9, 10, 11, 13] {
-            assert!(
-                !attn_splitk_gqa6_default_for(q4, false, cc, true),
-                "compute capability {cc}.x is unmeasured"
-            );
-        }
-        for quant in [
-            Some(QuantScheme::Q8_0),
-            Some(QuantScheme::Bf16),
-            Some(QuantScheme::F16),
-            None,
-        ] {
-            assert!(
-                !attn_splitk_gqa6_default_for(quant, false, 12, true),
-                "{quant:?} body is unmeasured"
-            );
-        }
-        assert!(!attn_splitk_gqa6_default_for(q4, true, 12, true), "MoE off");
-    }
-
-    #[test]
-    fn gqa6_env_is_a_kill_switch_over_the_default() {
-        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_tests();
-        set_model_primary_quant(QuantScheme::Q4_0);
-        set_model_is_moe(false);
-        set_device_cc_major(12);
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
-        assert!(attn_splitk_gqa6_enabled(), "measured cell: on when unset");
-        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "0");
-        assert!(!attn_splitk_gqa6_enabled(), "=0 switches the pair off");
-        for off in ["off", "false", "no", "OFF", "False", " 0 "] {
-            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", off);
-            assert!(
-                !attn_splitk_gqa6_enabled(),
-                "={off:?} switches the pair off"
-            );
-        }
-        for other in ["", "garbage", "01", "2"] {
-            std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", other);
-            assert!(
-                attn_splitk_gqa6_enabled(),
-                "={other:?} is neither spelling and falls to the default"
-            );
-        }
-        set_device_cc_major(8);
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
-        assert!(
-            !attn_splitk_gqa6_enabled(),
-            "unmeasured card: off when unset"
-        );
-        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "1");
-        assert!(attn_splitk_gqa6_enabled(), "=1 forces it on");
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
-        reset_for_tests();
+        std::env::remove_var("LUMEN_CUDA_ATTN_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_TARGET");
     }
 
     #[test]
@@ -3940,35 +3724,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn attn_splitk_chunk_parse_warns_on_every_substituted_value() {
-        // Unset and any value of one kernel tile or more are taken verbatim
-        // and say nothing; every substitution (empty, sub-tile, negative,
-        // float, garbage) resolves to the default and names the variable.
-        for (raw, want) in [
-            (None, ATTN_SPLITK_CHUNK_POSITIONS),
-            (Some("128"), 128),
-            (Some(" 256 "), 256),
-            (Some("4294967295"), u32::MAX),
-        ] {
-            assert_eq!(parse_attn_splitk_chunk(raw), (want, None), "raw={raw:?}");
-        }
-        for raw in ["", "   ", "0", "1", "127", "-1", "12.5", "abc", "1e9"] {
-            let (chunk, warning) = parse_attn_splitk_chunk(Some(raw));
-            assert_eq!(chunk, ATTN_SPLITK_CHUNK_POSITIONS, "raw={raw:?}");
-            let warning = warning.unwrap_or_else(|| panic!("raw={raw:?} must warn"));
-            assert!(
-                warning.contains("LUMEN_CUDA_ATTN_SPLITK_CHUNK"),
-                "{warning}"
-            );
-        }
-    }
-
-    #[test]
-    fn attn_splitk_chunk_default_is_one_kernel_tile() {
-        assert_eq!(ATTN_SPLITK_CHUNK_POSITIONS, 128);
-    }
-
     // ---- F1 + F2: allowlist membership (no false unknown-env typo warning) ----
 
     #[test]
@@ -3988,6 +3743,61 @@ mod tests {
             (Ok(" 1 ".into()), true),
         ] {
             assert_eq!(parse_ct4_exactk(raw.clone()), want, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_defaults_switch_off_every_promoted_default() {
+        // Through the explicit-input resolver: the process-wide legacy cache cannot be toggled
+        // inside one test process without leaking into its siblings.
+        let q4 = Some(QuantScheme::Q4_0);
+        assert!(norm_cta5_dual_default_for(q4, false, 12, true));
+        assert!(
+            !norm_cta5_dual_default_for(q4, false, 12, false),
+            "legacy switch: dual norm off"
+        );
+    }
+
+    #[test]
+    fn removed_env_vars_are_refused_by_name_with_a_remedy() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (name, _) in REMOVED_LUMEN_ENV_VARS {
+            std::env::remove_var(name);
+        }
+        assert!(removed_lumen_env_vars_set().is_empty());
+        std::env::set_var("LUMEN_CUDA_DECODE_TILED", "1");
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", "128");
+        let found = removed_lumen_env_vars_set();
+        let unknown = collect_unknown_lumen_env_vars();
+        std::env::remove_var("LUMEN_CUDA_DECODE_TILED");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].starts_with("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET is set but this release does not read it: renamed LUMEN_CUDA_ATTN_TARGET"), "{found:?}");
+        assert!(found[1].starts_with("LUMEN_CUDA_DECODE_TILED is set but this release does not read it: the tiled decode-attention kernel no longer exists"), "{found:?}");
+        assert!(
+            !unknown
+                .iter()
+                .any(|w| w.contains("LUMEN_CUDA_DECODE_TILED") || w.contains("GQA6_TARGET")),
+            "a removed name must be refused, not near-missed: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn removed_env_vars_are_sorted_and_absent_from_both_allowlists() {
+        let names: Vec<&str> = REMOVED_LUMEN_ENV_VARS.iter().map(|(n, _)| *n).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "removed list must be sorted and unique");
+        for name in &names {
+            assert!(name.starts_with("LUMEN_"), "{name}");
+            assert!(
+                !KNOWN_LUMEN_ENV_VARS.contains(name)
+                    && !KNOWN_LUMEN_TOOLING_ENV_VARS.contains(name),
+                "{name} is both removed and known"
+            );
         }
     }
 
@@ -4203,6 +4013,7 @@ mod tests {
         "LUMEN_ANTI_RESTATE_LOOP",
         "LUMEN_ANTI_RESTATE_NGRAM",
         "LUMEN_ANTI_RESTATE_SUBWORD",
+        "LUMEN_ATTN_FIXTURE_WRITE",
         "LUMEN_BASE_URL",
         "LUMEN_BENCH_ITERATIONS",
         "LUMEN_BENCH_MASK_EOG",
@@ -4216,13 +4027,12 @@ mod tests {
         "LUMEN_CORR010_MODEL",
         "LUMEN_CUDA_ARGMAX_TILED",
         "LUMEN_CUDA_ATTN_BANK3",
+        "LUMEN_CUDA_ATTN_CODEGEN",
+        "LUMEN_CUDA_ATTN_DUMP",
+        "LUMEN_CUDA_ATTN_ONE_TILE",
         "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
         "LUMEN_CUDA_ATTN_PREP_FUSE",
-        "LUMEN_CUDA_ATTN_SPLITK",
-        "LUMEN_CUDA_ATTN_SPLITK_CHUNK",
-        "LUMEN_CUDA_ATTN_SPLITK_GQA6",
-        "LUMEN_CUDA_ATTN_SPLITK_SCALE",
-        "LUMEN_CUDA_ATTN_TILED_CODEGEN",
+        "LUMEN_CUDA_ATTN_TARGET",
         "LUMEN_CUDA_F16_CACHE",
         "LUMEN_CUDA_F16_CACHE_FORCE",
         "LUMEN_CUDA_FFN_DIRECT_RESIDUAL",
@@ -4239,8 +4049,6 @@ mod tests {
         "LUMEN_CUDA_CT4_DP4A",
         "LUMEN_CUDA_CT4_EXACTK",
         "LUMEN_CUDA_DECODE_DELAY_US",
-        "LUMEN_CUDA_DECODE_TILED",
-        "LUMEN_CUDA_DECODE_TILED_THRESHOLD",
         "LUMEN_CUDA_FFN_FUSED_GLU",
         "LUMEN_CUDA_FORCE_SCALAR_ATTN",
         "LUMEN_CUDA_GDN_AB_F16",

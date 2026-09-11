@@ -63,7 +63,9 @@ fn setup_cpu_and_cuda(
         provider.final_norm.clone(),
         provider.output_proj.clone(),
     );
-    cuda.init(&hp)?;
+    // A device exists by now, so a refused init is a failure of the test
+    // model's shape or of the backend, never a reason to skip.
+    cuda.init(&hp).expect("CUDA init refused the test model");
 
     Ok((provider, cpu, cuda))
 }
@@ -329,7 +331,7 @@ fn cuda_e2e_larger_model_matches_cpu() {
         num_layers: 4,
         num_heads: 4,
         num_kv_heads: 2,
-        head_dim: 8,
+        head_dim: 128,
         hidden_dim: 32,
         intermediate_dim: 64,
         vocab_size: 64,

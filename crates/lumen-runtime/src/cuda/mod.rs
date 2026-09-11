@@ -17,6 +17,7 @@
 //!   GQA attention, SwiGLU MLP, residual connections).
 //! - `compute_final` (F32 + Q8_0): Final RMSNorm + output projection to logits.
 
+pub(crate) mod attention_decode;
 mod backend_impl;
 pub(crate) mod decode;
 /// CUDA device wrapper (context, stream, buffer management).
@@ -37,23 +38,22 @@ pub(crate) mod types;
 
 pub use backend_impl::CudaBackend;
 
-/// The decode-attention launch geometry, for out-of-crate callers that drive
-/// the kernels in [`shaders`] directly — the correctness suite
-/// (`tests/cuda_attention_splitk_gqa6_test.rs`) and the standalone A/B
-/// harness (`examples/attn_decode_ab.rs`).
-///
-/// Those callers cannot reach `prefill`, so without this they would hand-copy
-/// the split counts, chunk length, block dimensions and shared-memory sizes
-/// the launcher uses, and a retune here would leave their copy silently
-/// describing a geometry production no longer runs. Each name below has one
-/// of those two consumers; nothing outside the crate is expected to dispatch
-/// attention.
-pub use decode::{ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C};
-pub use prefill::{
-    attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_max_seq_len,
-    attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_partial_shared_bytes,
-    ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES, ATTN_SPLITK_GQA6_HEAD_DIM,
+pub use attention_decode::{
+    decode_attention_geometry_within, decode_attention_merge_shared_bytes,
+    decode_attention_scratch_chunks_within, DecodeAttentionPolicy, DecodeAttentionSpec,
+    ATTN_DECODE_FIXTURE_SHAPE, ATTN_DECODE_S_MAX, ATTN_DECODE_TILE,
 };
+/// The decode-attention launch geometry, for out-of-crate callers that drive
+/// the kernels in [`shaders`] directly — the correctness suites
+/// (`tests/cuda_attention_decode_test.rs` and its fixture and shape
+/// siblings).
+///
+/// Those callers cannot reach the launcher, so without this they would
+/// hand-copy the split counts, tile length, block dimensions and
+/// shared-memory sizes it uses, and a retune here would leave their copy
+/// silently describing a geometry production no longer runs. Nothing outside
+/// the crate is expected to dispatch attention.
+pub use decode::ATTN_DECODE_BLOCK_DIM;
 
 // ---------------------------------------------------------------------------
 // BF16 GemmEx fault-injection hooks.

@@ -25,7 +25,7 @@
 // is gated on bit-equivalence to the per-expert path.
 
 // NVRTC-compatible: inline PTX for f16->f32, no cuda_fp16.h. Matches the
-// pattern used in attention_f16.cu / dequant_q8_0_f16.cu / hgemv_q8_0.cu.
+// pattern used in dequant_q8_0_f16.cu / hgemv_q8_0.cu.
 // (cudarc::nvrtc::compile_ptx is invoked without --include-path, so system
 // headers like <cuda_fp16.h> are unreachable; the fix was wrong.)
 

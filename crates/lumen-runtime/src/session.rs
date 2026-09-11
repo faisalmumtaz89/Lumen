@@ -318,7 +318,7 @@ impl Session {
     /// Verify that the given backend supports this session's KV precision.
     ///
     /// Different backends pin the KV cache storage to a specific precision
-    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: F32-only
+    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: the store the backend was built for, F32 or F16
     /// `KvCacheGpu`); CPU backends accept any implemented precision. If the
     /// session's `RuntimeConfig.kv_precision` is incompatible with the
     /// backend, return `RuntimeError::Unsupported` with an actionable
@@ -392,7 +392,7 @@ impl Session {
         // First call into the backend for this generation -> reset recurrent
         // state. No-op for non-GDN backends. Also validate KV precision
         // compatibility before any KV read/write touches the backend, so the
-        // user sees an explicit "Metal requires F16" / "CUDA requires F32"
+        // user sees an explicit "Metal requires F16" / "CUDA was built for F32"
         // error instead of downstream silent data corruption.
         let warm = !self.tokens.is_empty();
         let mut caught_up = 0usize;

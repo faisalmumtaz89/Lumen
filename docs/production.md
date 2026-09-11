@@ -27,7 +27,7 @@ Operational policy items required before production deployment:
 6. **Pin `--context-len`** for BF16 deployments. The BF16 mmvf kernel produces different first-token argmax at different KV-cache layout sizes. Fix at a single value (e.g. `--context-len 8192`) per deployment.
 7. **Canonical env stack**: the 11-flag CUDA production stack is **default-ON**, so out-of-the-box `lumen run` uses the canonical flag stack. The one value you must not change is `LUMEN_CUDA_BF16_GEMMEX=0` (the explicit value required for BF16 P3 correctness on MoE). Full annotated stack with per-flag gains: [`bench/METHODOLOGY.md`](../bench/METHODOLOGY.md#required-env-vars-for-full-performance).
 8. **Metal BF16-dense / Q8-MoE / Q4-MoE require `LUMEN_METAL_MMAP_ONLY=1`** to fit in the M3 Ultra 96 GB residency budget. This is a documented operating requirement, not a defect.
-9. **CUDA driver / CUDA runtime**: validated on driver 580.126.20, CUDA 12.2.140, sm_80 (A100). NVRTC compiles kernels at runtime; no build-time CUDA SDK required.
+9. **CUDA driver / CUDA runtime**: the current release is validated on driver 610.57.04, CUDA 13.3, sm_120 (RTX 5090); earlier releases on driver 580.126.20, CUDA 12.2.140, sm_80 (A100). NVRTC compiles kernels at runtime; no build-time CUDA SDK required.
 10. **LBC format compatibility**: current `LBC_VERSION = 4`. Reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1/v2 is in the code path but unverified at runtime. **Policy: rebuild LBCs after major Lumen upgrades** via `lumen convert` or `lumen pull --quant <scheme>`.
 
 ## Known limitations (will NOT be fixed in v0.1.0)

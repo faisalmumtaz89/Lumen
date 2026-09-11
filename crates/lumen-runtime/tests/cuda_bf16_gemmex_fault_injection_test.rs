@@ -95,8 +95,9 @@ fn try_cuda_backend() -> Option<CudaBackend> {
 /// Build a minimal `ModelHyperparams` for a tiny test model that
 /// exercises the BF16 wrapper without requiring a multi-GB weight
 /// payload. The values here are arbitrary -- they only need to be
-/// internally consistent (head_dim * num_heads = hidden_dim etc.) so
-/// that `CudaBackend::init` succeeds and compiles the full kernel set.
+/// internally consistent, with an attention shape inside the
+/// decode-attention kernel's domain, so that `CudaBackend::init` succeeds
+/// and compiles the full kernel set.
 /// The actual BF16 matvec dispatched by the test does NOT use these
 /// hyperparams; it uses the (in_dim, out_dim) the test itself provides.
 fn minimal_test_hyperparams() -> ModelHyperparams {
@@ -104,7 +105,7 @@ fn minimal_test_hyperparams() -> ModelHyperparams {
         num_layers: 2,
         num_heads: 4,
         num_kv_heads: 2,
-        head_dim: 32,
+        head_dim: 128,
         hidden_dim: 128,
         intermediate_dim: 256,
         vocab_size: 1024,
