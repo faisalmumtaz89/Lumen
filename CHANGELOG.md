@@ -20,7 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   that crosses 16,384 keys no longer hands off to the per-query-head pair.
   Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
   2,600 keys, −19 to −21 % at 6,144, −27 % at 16,384, never slower at any measured
-  context; half store −10 % at 2,600, −8 % at 3,600, −8 to −15 % at 4,096,
+  context; half store −10 % at 2,600, −3 to −8 % at 3,600, −8 to −15 % at 4,096,
   −17 % at 6,144, −29 % at 16,384, equal at 2,816 and 3,200, and slower in
   one cell, +17 % at 3,968 keys in every run (248 tiles walk two waves where
   the previous release's six-CTA kernel took one; the harness timer is
@@ -94,7 +94,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   comparators' kernels). The split-K scratch is sized to the smaller of the
   context and the bound, up to 24.2 MiB on a 24-head, head_dim-256 model. New
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` lowers the bound a process serves
-  (`256` reproduces the v0.30.0 behaviour).
+  (`256` = the v0.30.0 bound and route boundary, on this release's merge).
 - **The GQA-shared merge sums its numerator in eight lanes** (chunk `c` into
   lane `c mod 8`, then a fixed tree) instead of one serial chain over up to
   1,024 partials. Deterministic, and on real activations the pair's worst
