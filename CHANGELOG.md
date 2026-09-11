@@ -12,8 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **The GQA-shared decode-attention pair serves any context the cache holds,
   with fixed scratch and no route switch.** Its partial pass is now a tile
   loop: up to a one-tile bound (176 tiles of 16 keys on the F32 store, 256 on
-  the half store) each CTA takes one tile, bit-identical to every release
-  since v0.29.0; above it the split count is held at 128 and each CTA walks a
+  the half store) each CTA takes one tile and the partial pass is bit-identical
+  to every release since v0.29.0; above it the split count is held at 128 and each CTA walks a
   balanced run of whole tiles with the tiled kernel's running-max recurrence.
   The split-K scratch is 4.2 MiB (F32) / 6.0 MiB (half) on Qwen3.8-27B at any
   context instead of growing with it (24.2 MiB at 16,384), and a generation
@@ -24,10 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   band 3,392–4,080 keys (+8 % at 3,968 in every run; +0 to +4 % at 3,600, the
   +4 % in one run of four on a bimodal cell), the sole exception outside it one
   timer tick (+0.2 %) at 1,152 keys in one run of four; 24,576 and 32,768
-  keys now served. Below the one-tile bound the pair's output is bit-identical
-  to v0.30.0; above it the whole-tile partition sums in a different order, so
-  outputs there are a near-tie with the previous release rather than
-  identical (the same F64 error bound holds on both partitions). `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
+  keys now served. Below the one-tile bound the partial pass is bit-identical
+  to v0.30.0's; the merge changed in this release (the eight-lane merge
+  below), so the pair's output is a near-tie with v0.30.0 at every context
+  rather than identical, and above the bound the whole-tile partition sums
+  the partials in a different order as well (the same F64 error bound holds
+  on both partitions). `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`
   and `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` set the policy;
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` is now unset by default and, when
   set, restores the bounded form as an A/B control by launching the previous

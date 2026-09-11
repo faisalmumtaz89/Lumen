@@ -1248,15 +1248,18 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
 /// above it the CTAs walk whole tiles at the fixed target. The default is per
 /// store, from the RTX 5090 sweeps: 176 on the F32
-/// store (never slower than the one-tile form below it, faster above), 256 on
-/// the half store (whose one-tile kernel runs six CTAs per SM against the
-/// loop's five and keeps a one-wave edge to 255 tiles; the loop is then
-/// slower only in the band 3,392–4,080 keys, where the six-CTA kernel fits
-/// one wave and the loop takes two: +8 % at 3,968 keys in every run, +0 to
-/// +4 % at 3,600 (one run of four, a bimodal cell); elsewhere no slower — 0 %
-/// at 2,816, −7 % at 4,800, −10 to −29 % at the other measured contexts from
-/// 2,600 to 32,768 — the sole exception one timer tick (+0.2 %) at 1,152 keys
-/// in one run of four). Clamped to
+/// store (never slower than the one-tile form below it, faster above); 256 on
+/// the half store, where against a 176 bound — both on the loop's own one-tile
+/// form, five CTAs per SM either way — it reads −9 % at 3,200 and −7 % at
+/// 3,968 keys but +7 to +9 % at 3,600 and +8 to +18 % at 4,096 in all four
+/// sweep runs: a wash across the grid, kept at 256 pending an engine-level
+/// retune. Against the previous release's one-tile kernel (six CTAs per SM
+/// on the half store, a one-wave edge to 255 tiles) the loop is slower only
+/// in the band 3,392–4,080 keys: +8 % at 3,968 keys in every run, +0 to +4 %
+/// at 3,600 (one run of four, a bimodal cell); elsewhere no slower — 0 % at
+/// 2,816, −7 % at 4,800, −10 to −29 % at the other measured contexts from
+/// 2,600 to 32,768 — the sole exception one timer tick (+0.2 %) at 1,152
+/// keys in one run of four. Clamped to
 /// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
@@ -1276,7 +1279,9 @@ pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
 /// tiles. Default 128: on the RTX 5090, at every context from 6,144 to
 /// 32,768 keys, within 3 % of the best measured count on the F32 store and
 /// within 6 % on the half store (the gap at 32,768 keys, where 176 is best);
-/// 64 starves the machine, 176 splits too finely below 16k. The
+/// 64 starves the machine; 176 splits too finely on the F32 store at every
+/// context (the slowest F32 count, +23 % at 16,384 and 32,768) and is the
+/// best half-store count from 16k up. The
 /// scratch is sized for `max(one-tile bound, target)` chunks and never grows
 /// with the context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
 pub fn attn_splitk_gqa6_target() -> u32 {
