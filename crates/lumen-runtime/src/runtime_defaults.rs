@@ -1253,8 +1253,10 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// loop's five and keeps a one-wave edge to 255 tiles; the loop is then
 /// slower only in the band 3,392–4,080 keys, where the six-CTA kernel fits
 /// one wave and the loop takes two: +8 % at 3,968 keys in every run, +0 to
-/// +4 % at 3,600 (one run of four, a bimodal cell); elsewhere −10 to −29 %,
-/// the sole exception one timer tick (+0.2 %) at 1,152 keys in one run of four). Clamped to
+/// +4 % at 3,600 (one run of four, a bimodal cell); elsewhere no slower — 0 %
+/// at 2,816, −7 % at 4,800, −10 to −29 % at the other measured contexts from
+/// 2,600 to 32,768 — the sole exception one timer tick (+0.2 %) at 1,152 keys
+/// in one run of four). Clamped to
 /// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
