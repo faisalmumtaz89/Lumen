@@ -50,6 +50,7 @@ use lumen_runtime::cuda::{
     ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_DIM_TILES as GQA6_DIM_TILES,
     ATTN_SPLITK_GQA6_HEAD_DIM as HEAD_DIM, ATTN_SPLITK_GQA6_S_MAX,
 };
+use lumen_runtime::runtime_defaults::ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT;
 
 const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625; // 1 / sqrt(256)
@@ -94,6 +95,21 @@ fn one_tile_chunks(seq_len: u32) -> u32 {
 /// that reaches 16,385 keys and more.
 fn sweep_geometry(seq_len: u32) -> (u32, u32) {
     attn_splitk_gqa6_geometry_within(seq_len, ATTN_SPLITK_GQA6_S_MAX, 128)
+}
+
+/// The geometry the F32 store's default policy launches at a length, which
+/// differs from the sweep's between the one-tile default and the one-tile
+/// form's ceiling. The distribution sweeps run both wherever they differ.
+fn production_geometry(seq_len: u32) -> (u32, u32) {
+    attn_splitk_gqa6_geometry_within(seq_len, ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT, 128)
+}
+
+fn geometries_at(seq_len: u32) -> Vec<(u32, u32)> {
+    let mut g = vec![sweep_geometry(seq_len)];
+    if production_geometry(seq_len) != g[0] {
+        g.push(production_geometry(seq_len));
+    }
+    g
 }
 
 /// The 27B full-attention shape.
@@ -502,14 +518,17 @@ fn gqa6_matches_the_f64_reference_under_a_wide_score_spread() {
         let gpu = upload(&dev, &inp);
         for &seq_len in LENGTHS {
             let want = reference(g, &inp, seq_len);
-            let got = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
-            let (err, at) = max_abs_err(&got, &want)
-                .unwrap_or_else(|e| panic!("{} seq_len {seq_len}: {e}", g.label()));
-            assert!(
-                err <= MAX_ABS_ERR_VS_F64,
-                "{} seq_len {seq_len}: max abs error {err:.3e} at element {at}",
-                g.label()
-            );
+            for geometry in geometries_at(seq_len) {
+                let got = run_gqa6(&dev, g, &gpu, seq_len, geometry);
+                let (err, at) = max_abs_err(&got, &want).unwrap_or_else(|e| {
+                    panic!("{} seq_len {seq_len} {geometry:?}: {e}", g.label())
+                });
+                assert!(
+                    err <= MAX_ABS_ERR_VS_F64,
+                    "{} seq_len {seq_len} {geometry:?}: max abs error {err:.3e} at element {at}",
+                    g.label()
+                );
+            }
         }
     }
 }
@@ -526,13 +545,15 @@ fn gqa6_zero_query_averages_the_values() {
     let gpu = upload(&dev, &inp);
     for &seq_len in LENGTHS {
         let want = reference(g, &inp, seq_len);
-        let got = run_gqa6(&dev, g, &gpu, seq_len, sweep_geometry(seq_len));
-        let (err, at) =
-            max_abs_err(&got, &want).unwrap_or_else(|e| panic!("seq_len {seq_len}: {e}"));
-        assert!(
-            err <= MAX_ABS_ERR_VS_F64,
-            "seq_len {seq_len}: max abs error {err:.3e} at element {at}"
-        );
+        for geometry in geometries_at(seq_len) {
+            let got = run_gqa6(&dev, g, &gpu, seq_len, geometry);
+            let (err, at) = max_abs_err(&got, &want)
+                .unwrap_or_else(|e| panic!("seq_len {seq_len} {geometry:?}: {e}"));
+            assert!(
+                err <= MAX_ABS_ERR_VS_F64,
+                "seq_len {seq_len} {geometry:?}: max abs error {err:.3e} at element {at}"
+            );
+        }
     }
 }
 

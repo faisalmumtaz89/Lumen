@@ -2078,14 +2078,88 @@ pub const fn attn_splitk_gqa6_max_seq_len() -> u32 {
     ATTN_SPLITK_GQA6_S_MAX * ATTN_SPLITK_GQA6_CHUNK
 }
 
-/// The one-tile bound in force: `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
-/// (the A/B control) when set, else the loop policy's one-tile count.
-/// Below it a CTA walks one tile on the pre-loop partition, bit-identical to
-/// every release since the pair shipped.
-pub fn attn_splitk_gqa6_one_tile_bound(half_store: bool) -> u32 {
-    crate::runtime_defaults::attn_splitk_gqa6_max_chunks()
-        .unwrap_or_else(|| crate::runtime_defaults::attn_splitk_gqa6_one_tile_max(half_store))
-        .clamp(1, ATTN_SPLITK_GQA6_S_MAX)
+/// The GQA-shared policy in force for one store, read from the three knobs
+/// in a single pass. The split-K admission takes one snapshot per dispatch
+/// and derives the geometry, the eligibility bound, the scratch requirement
+/// and the kernel choice from it, so no two of them can see different
+/// readings; the free functions around it are the same rules on a fresh
+/// snapshot for callers outside a dispatch (init sizing, diagnostics, tests).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplitKGqa6Policy {
+    /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS` when set: the A/B control,
+    /// which launches the previous release's one-tile partials up to this
+    /// many chunks and refuses beyond.
+    pub max_chunks: Option<u32>,
+    /// The one-tile bound in force (the control's bound, else the store's
+    /// default), within the compile-time ceiling.
+    pub one_tile_max: u32,
+    /// The split count above the one-tile bound.
+    pub target: u32,
+}
+
+impl SplitKGqa6Policy {
+    pub fn from_env(half_store: bool) -> Self {
+        let max_chunks = crate::runtime_defaults::attn_splitk_gqa6_max_chunks();
+        let one_tile_max = max_chunks
+            .unwrap_or_else(|| crate::runtime_defaults::attn_splitk_gqa6_one_tile_max(half_store))
+            .clamp(1, ATTN_SPLITK_GQA6_S_MAX);
+        Self {
+            max_chunks,
+            one_tile_max,
+            target: crate::runtime_defaults::attn_splitk_gqa6_target(),
+        }
+    }
+
+    /// The A/B control is in force: the retained one-tile kernels launch.
+    pub const fn control(&self) -> bool {
+        self.max_chunks.is_some()
+    }
+
+    /// The most chunks a context may need to be served: the control's bound,
+    /// else no bound (the loop serves any context the cache holds).
+    pub const fn chunk_bound(&self) -> u32 {
+        match self.max_chunks {
+            Some(b) => {
+                if b < 1 {
+                    1
+                } else if b > ATTN_SPLITK_GQA6_S_MAX {
+                    ATTN_SPLITK_GQA6_S_MAX
+                } else {
+                    b
+                }
+            }
+            None => u32::MAX / ATTN_SPLITK_GQA6_CHUNK,
+        }
+    }
+
+    pub const fn geometry(&self, seq_len: u32) -> (u32, SplitKGqa6Partition) {
+        attn_splitk_gqa6_geometry_within(seq_len, self.one_tile_max, self.target)
+    }
+
+    pub const fn scratch_chunks(&self, max_seq_len: u32) -> u32 {
+        attn_splitk_gqa6_scratch_chunks_within(
+            max_seq_len,
+            self.one_tile_max,
+            self.target,
+            self.control(),
+        )
+    }
+
+    pub const fn supports(
+        &self,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        seq_len: u32,
+    ) -> bool {
+        attention_decode_splitk_gqa6_supports_within(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            self.chunk_bound(),
+        )
+    }
 }
 
 /// The chunk bound the eligibility test reads: with the A/B control set, its
@@ -2093,18 +2167,7 @@ pub fn attn_splitk_gqa6_one_tile_bound(half_store: bool) -> u32 {
 /// the loop); unset, no bound — the loop serves any context the cache holds,
 /// so the test sees the largest count the arithmetic allows.
 pub fn attn_splitk_gqa6_chunk_bound() -> u32 {
-    match crate::runtime_defaults::attn_splitk_gqa6_max_chunks() {
-        Some(b) => b.clamp(1, ATTN_SPLITK_GQA6_S_MAX),
-        None => u32::MAX / ATTN_SPLITK_GQA6_CHUNK,
-    }
-}
-
-/// Whether the A/B control is in force (`LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
-/// set): the launchers then run the previous release's one-tile partials, the
-/// kernels of that release byte for byte, so a comparison against the loop
-/// measures the kernels and not a policy inside one kernel.
-pub fn attn_splitk_gqa6_control() -> bool {
-    crate::runtime_defaults::attn_splitk_gqa6_max_chunks().is_some()
+    SplitKGqa6Policy::from_env(false).chunk_bound()
 }
 
 /// Dynamic shared bytes of the retained one-tile partials (the previous
@@ -2129,11 +2192,7 @@ pub type SplitKGqa6Partition = u32;
 /// control set — there the caller has already excluded the context).
 /// Pure in its explicit form below; this reads the process knobs once.
 pub fn attn_splitk_gqa6_geometry(seq_len: u32, half_store: bool) -> (u32, SplitKGqa6Partition) {
-    attn_splitk_gqa6_geometry_within(
-        seq_len,
-        attn_splitk_gqa6_one_tile_bound(half_store),
-        crate::runtime_defaults::attn_splitk_gqa6_target(),
-    )
+    SplitKGqa6Policy::from_env(half_store).geometry(seq_len)
 }
 
 /// [`attn_splitk_gqa6_geometry`] with the policy explicit.
@@ -2163,12 +2222,7 @@ pub fn attn_splitk_gqa6_chunks(seq_len: u32, half_store: bool) -> u32 {
 /// target, whichever is larger, capped by the tile count the cache can even
 /// reach (the geometry never launches more CTAs than tiles, so this is exact).
 pub fn attn_splitk_gqa6_scratch_chunks(max_seq_len: u32, half_store: bool) -> u32 {
-    attn_splitk_gqa6_scratch_chunks_within(
-        max_seq_len,
-        attn_splitk_gqa6_one_tile_bound(half_store),
-        crate::runtime_defaults::attn_splitk_gqa6_target(),
-        attn_splitk_gqa6_control(),
-    )
+    SplitKGqa6Policy::from_env(half_store).scratch_chunks(max_seq_len)
 }
 
 /// The scratch count for an explicit policy (pure): the largest split count
@@ -2214,13 +2268,7 @@ pub fn attention_decode_splitk_gqa6_supports(
     head_dim: u32,
     seq_len: u32,
 ) -> bool {
-    attention_decode_splitk_gqa6_supports_within(
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        seq_len,
-        attn_splitk_gqa6_chunk_bound(),
-    )
+    SplitKGqa6Policy::from_env(false).supports(num_heads, num_kv_heads, head_dim, seq_len)
 }
 
 /// [`attention_decode_splitk_gqa6_supports`] with the chunk bound explicit: a
@@ -2501,13 +2549,16 @@ fn announce_splitk_gqa6_route(
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
-    chunks: u32,
-    partition: SplitKGqa6Partition,
-    control: bool,
+    launch: SplitKGqa6Launch,
 ) {
     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     super::decode::announce_route_once(&SEEN, || {
-        let kernel = if control {
+        let SplitKGqa6Launch {
+            chunks,
+            partition,
+            policy,
+        } = launch;
+        let kernel = if policy.control() {
             "attention_decode_splitk_partial_gqa6_f32"
         } else {
             "attention_decode_splitk_partial_gqa6_loop_f32"
@@ -2524,8 +2575,8 @@ fn announce_splitk_gqa6_route(
                 "whole-tile"
             },
             tile = ATTN_SPLITK_GQA6_CHUNK,
-            one_tile = attn_splitk_gqa6_one_tile_bound(false),
-            target = crate::runtime_defaults::attn_splitk_gqa6_target(),
+            one_tile = policy.one_tile_max,
+            target = policy.target,
             block = ATTN_DECODE_TILED_BLOCK_DIM,
         )
     });
@@ -2752,7 +2803,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
     // The store's type picks the router: each router's kernels take exactly
     // the bytes that store holds, so a half store can never reach an F32
     // kernel, nor the reverse.
-    let variant = match kv {
+    let (variant, gqa6) = match kv {
         KvRef::F32 { k, v } => launch_attention_decode_routed(
             device,
             kernels,
@@ -2799,6 +2850,7 @@ pub(crate) unsafe fn launch_attention_decode_gated(
                 max_seq_len,
                 scale,
                 variant,
+                gqa6,
             )?;
         }
     }
@@ -2855,6 +2907,7 @@ fn dump_attention_call(
     max_seq_len: u32,
     scale: f32,
     variant: AttentionDecodeVariant,
+    gqa6: Option<SplitKGqa6Launch>,
 ) -> Result<(), RuntimeError> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALL: AtomicU32 = AtomicU32::new(0);
@@ -2913,7 +2966,9 @@ fn dump_attention_call(
     };
     let out_host: Vec<f32> = device.dtoh_copy_view(&attn_out.slice(0..nh * hd))?;
     write_f32("out.f32", &out_host)?;
-    let control = attn_splitk_gqa6_control();
+    // The GQA-shared receipt is the launch's own, not a fresh reading of the
+    // policy: the dump records what ran.
+    let control = gqa6.is_some_and(|g| g.policy.control());
     let route = match variant {
         AttentionDecodeVariant::SingleBlock => "attention_decode",
         AttentionDecodeVariant::Tiled => "attention_decode_tiled",
@@ -2930,18 +2985,15 @@ fn dump_attention_call(
     // The GQA-shared launch geometry the call took, so a replay can reproduce
     // the reduction order (the same route name and context can take different
     // orders under the policy knobs).
-    let geometry = match variant {
-        AttentionDecodeVariant::SplitKGqa6 | AttentionDecodeVariant::SplitKGqa6F16 => {
-            let half = matches!(variant, AttentionDecodeVariant::SplitKGqa6F16);
-            let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, half);
-            format!(
-                ",\n \"gqa6_chunks\": {chunks},\n \"gqa6_partition\": \"{}\",\n \"gqa6_one_tile_max\": {},\n \"gqa6_target\": {},\n \"gqa6_control\": {control}",
-                if partition == 0 { "one-tile" } else { "whole-tile" },
-                attn_splitk_gqa6_one_tile_bound(half),
-                crate::runtime_defaults::attn_splitk_gqa6_target(),
-            )
-        }
-        _ => String::new(),
+    let geometry = match gqa6 {
+        Some(g) => format!(
+            ",\n \"gqa6_chunks\": {},\n \"gqa6_partition\": \"{}\",\n \"gqa6_one_tile_max\": {},\n \"gqa6_target\": {},\n \"gqa6_control\": {control}",
+            g.chunks,
+            if g.partition == 0 { "one-tile" } else { "whole-tile" },
+            g.policy.one_tile_max,
+            g.policy.target,
+        ),
+        None => String::new(),
     };
     let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
@@ -2962,12 +3014,18 @@ pub(crate) enum SplitKChoice {
     /// The GQA-shared pair at the split geometry decided here: the launcher
     /// launches exactly what the scratch check admitted, and neither reads
     /// the policy again.
-    Gqa6 {
-        chunks: u32,
-        partition: SplitKGqa6Partition,
-        control: bool,
-    },
+    Gqa6(SplitKGqa6Launch),
     PerHead,
+}
+
+/// What the admission decided for a GQA-shared launch, from one policy
+/// snapshot: the launcher launches it, the announcement and the dump record
+/// it, none of them reads the policy again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SplitKGqa6Launch {
+    pub chunks: u32,
+    pub partition: SplitKGqa6Partition,
+    pub policy: SplitKGqa6Policy,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3008,16 +3066,19 @@ pub(crate) fn decode_attention_splitk_choice(
     // so nothing is silently truncated.
     let gqa6_loaded = kernels.attention_decode_splitk_partial_gqa6.is_some()
         && kernels.attention_decode_splitk_merge_gqa6.is_some();
-    let (chunks, partition) = attn_splitk_gqa6_geometry(seq_len, half_store);
+    // One snapshot of the policy: geometry, eligibility and the kernel
+    // choice come from the same reading.
+    let policy = SplitKGqa6Policy::from_env(half_store);
+    let (chunks, partition) = policy.geometry(seq_len);
     if gqa6_loaded
-        && attention_decode_splitk_gqa6_supports(num_heads, num_kv_heads, head_dim, seq_len)
+        && policy.supports(num_heads, num_kv_heads, head_dim, seq_len)
         && scratch_o_floats >= (num_heads as usize) * (chunks as usize) * (head_dim as usize)
     {
-        return Some(SplitKChoice::Gqa6 {
+        return Some(SplitKChoice::Gqa6(SplitKGqa6Launch {
             chunks,
             partition,
-            control: attn_splitk_gqa6_control(),
-        });
+            policy,
+        }));
     }
     Some(SplitKChoice::PerHead)
 }
@@ -3037,7 +3098,7 @@ unsafe fn launch_attention_decode_routed(
     seq_len: u32,
     max_seq_len: u32,
     scale: f32,
-) -> Result<AttentionDecodeVariant, RuntimeError> {
+) -> Result<(AttentionDecodeVariant, Option<SplitKGqa6Launch>), RuntimeError> {
     let force_tiled = decode_tiled_force_enabled();
     let threshold = decode_tiled_threshold();
     let mut variant = attention_decode_variant(seq_len, force_tiled, threshold);
@@ -3080,11 +3141,7 @@ unsafe fn launch_attention_decode_routed(
         seq_len,
         false,
     ) {
-        Some(SplitKChoice::Gqa6 {
-            chunks,
-            partition,
-            control,
-        }) => {
+        Some(SplitKChoice::Gqa6(launch)) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
             launch_attention_decode_splitk_gqa6(
                 device,
@@ -3099,20 +3156,12 @@ unsafe fn launch_attention_decode_routed(
                 seq_len,
                 max_seq_len,
                 scale,
-                chunks,
-                partition,
-                control,
+                launch.chunks,
+                launch.partition,
+                launch.policy.control(),
             )?;
-            announce_splitk_gqa6_route(
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                chunks,
-                partition,
-                control,
-            );
-            return Ok(AttentionDecodeVariant::SplitKGqa6);
+            announce_splitk_gqa6_route(num_heads, num_kv_heads, head_dim, seq_len, launch);
+            return Ok((AttentionDecodeVariant::SplitKGqa6, Some(launch)));
         }
         Some(SplitKChoice::PerHead) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
@@ -3132,7 +3181,7 @@ unsafe fn launch_attention_decode_routed(
                 scale,
             )?;
             announce_splitk_route(head_dim, seq_len);
-            return Ok(AttentionDecodeVariant::SplitK);
+            return Ok((AttentionDecodeVariant::SplitK, None));
         }
         None => {}
     }
@@ -3222,7 +3271,7 @@ unsafe fn launch_attention_decode_routed(
         }
     }
 
-    Ok(variant)
+    Ok((variant, None))
 }
 
 /// Launch the Q8_0 -> F32 dequantization kernel.
@@ -4929,9 +4978,33 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 176);
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, true), 256);
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1_000, false), 63);
+        // One snapshot carries every derived value.
+        let p = super::SplitKGqa6Policy::from_env(false);
+        assert_eq!(
+            (
+                p.max_chunks,
+                p.one_tile_max,
+                p.target,
+                p.control(),
+                p.chunk_bound()
+            ),
+            (None, 176, 128, false, u32::MAX / ATTN_SPLITK_GQA6_CHUNK)
+        );
+        assert_eq!(super::SplitKGqa6Policy::from_env(true).one_tile_max, 256);
+        assert_eq!(p.geometry(2_817), (128, 1));
+        assert_eq!(p.scratch_chunks(1 << 20), 176);
+        assert!(p.supports(HEADS, KV, HD, 1 << 20));
         // The A/B control: the one-tile form up to its bound, the old hand-off past it.
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "256");
         assert_eq!(attn_splitk_gqa6_chunk_bound(), 256);
+        let p = super::SplitKGqa6Policy::from_env(true);
+        assert_eq!(
+            (p.max_chunks, p.one_tile_max, p.control(), p.chunk_bound()),
+            (Some(256), 256, true, 256)
+        );
+        assert_eq!(p.geometry(4_096), (256, 0));
+        assert_eq!(p.scratch_chunks(1 << 20), 256);
+        assert!(p.supports(HEADS, KV, HD, 4_096) && !p.supports(HEADS, KV, HD, 4_097));
         assert_eq!(super::attn_splitk_gqa6_geometry(4_096, false), (256, 0));
         assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 256);
         assert!(attention_decode_splitk_gqa6_supports(HEADS, KV, HD, 4096));
@@ -5240,7 +5313,7 @@ unsafe fn launch_attention_decode_routed_f16(
     seq_len: u32,
     max_seq_len: u32,
     scale: f32,
-) -> Result<AttentionDecodeVariant, RuntimeError> {
+) -> Result<(AttentionDecodeVariant, Option<SplitKGqa6Launch>), RuntimeError> {
     let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
         RuntimeError::Compute("16-bit KV cache dispatched without its kernels".into())
     })?;
@@ -5284,11 +5357,7 @@ unsafe fn launch_attention_decode_routed_f16(
         seq_len,
         true,
     ) {
-        Some(SplitKChoice::Gqa6 {
-            chunks,
-            partition,
-            control,
-        }) => {
+        Some(SplitKChoice::Gqa6(launch)) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
             launch_attention_decode_splitk_gqa6_f16(
                 device,
@@ -5304,20 +5373,12 @@ unsafe fn launch_attention_decode_routed_f16(
                 seq_len,
                 max_seq_len,
                 scale,
-                chunks,
-                partition,
-                control,
+                launch.chunks,
+                launch.partition,
+                launch.policy.control(),
             )?;
-            announce_splitk_gqa6_route_f16(
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                chunks,
-                partition,
-                control,
-            );
-            return Ok(AttentionDecodeVariant::SplitKGqa6F16);
+            announce_splitk_gqa6_route_f16(num_heads, num_kv_heads, head_dim, seq_len, launch);
+            return Ok((AttentionDecodeVariant::SplitKGqa6F16, Some(launch)));
         }
         Some(SplitKChoice::PerHead) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
@@ -5338,7 +5399,7 @@ unsafe fn launch_attention_decode_routed_f16(
                 scale,
             )?;
             announce_splitk_route_f16(head_dim, seq_len);
-            return Ok(AttentionDecodeVariant::SplitKF16);
+            return Ok((AttentionDecodeVariant::SplitKF16, None));
         }
         None => {}
     }
@@ -5370,7 +5431,7 @@ unsafe fn launch_attention_decode_routed_f16(
                 max_seq_len,
                 scale,
             )?;
-            Ok(AttentionDecodeVariant::TiledF16)
+            Ok((AttentionDecodeVariant::TiledF16, None))
         }
     }
 }
@@ -5604,13 +5665,16 @@ fn announce_splitk_gqa6_route_f16(
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
-    chunks: u32,
-    partition: SplitKGqa6Partition,
-    control: bool,
+    launch: SplitKGqa6Launch,
 ) {
     static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     super::decode::announce_route_once(&SEEN, || {
-        let kernel = if control {
+        let SplitKGqa6Launch {
+            chunks,
+            partition,
+            policy,
+        } = launch;
+        let kernel = if policy.control() {
             "attention_decode_splitk_partial_gqa6_f16"
         } else {
             "attention_decode_splitk_partial_gqa6_loop_f16"
@@ -5627,8 +5691,8 @@ fn announce_splitk_gqa6_route_f16(
                 "whole-tile"
             },
             tile = ATTN_SPLITK_GQA6_CHUNK,
-            one_tile = attn_splitk_gqa6_one_tile_bound(true),
-            target = crate::runtime_defaults::attn_splitk_gqa6_target(),
+            one_tile = policy.one_tile_max,
+            target = policy.target,
             block = ATTN_DECODE_TILED_BLOCK_DIM,
         )
     });

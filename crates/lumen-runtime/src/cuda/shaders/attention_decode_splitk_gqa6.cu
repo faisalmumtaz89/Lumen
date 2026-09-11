@@ -178,10 +178,12 @@ __device__ __forceinline__ float4 gqa6_h4_to_f4(unsigned int lo, unsigned int hi
 // CTAs per SM (shared-limited at 14,768 B); bounding the half loop to six
 // forces 80 registers with spills to local memory on this path and was
 // measured slower at every context, so the loop keeps five.
-// A CTA whose tile would exceed 16 keys calls __trap(), which aborts the
+// A tile whose span would exceed 16 keys calls __trap(), which aborts the
 // launch (the driver reports the error at the next synchronisation; no
-// partial reaches the merge). It is unreachable by construction: both host
-// partitions keep S >= ceil(keys / 16), so every tile spans at most 16 keys.
+// partial reaches the merge). It is unreachable by construction: on the span
+// partition the host keeps S = ceil(keys / 16), so a CTA's whole range is at
+// most 16 keys, and on the whole-tile partition every iteration clips its
+// tile to 16 keys whatever the CTA's range.
 // --------------------------------------------------------------------------
 
 // The CTA's key range.

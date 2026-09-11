@@ -34,7 +34,7 @@ use lumen_runtime::cuda::{
 
 const NUM_HEADS: u32 = 24;
 const NUM_KV_HEADS: u32 = 4;
-const MAX_SEQ_LEN: u32 = 16_384;
+const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625;
 
 /// Either side of one GQA-shared chunk (16), one tiled tile (128), the
@@ -879,7 +879,8 @@ fn the_half_per_head_partial_reproduces_the_f32_partial_bit_for_bit() {
 
 /// The whole-tile partition: the half partial reproduces the F32 partial bit
 /// for bit at the shipped target too, at the balanced partition's boundary
-/// contexts and past the old bound.
+/// contexts, past the old bound, and at the contexts only this partition
+/// serves, to the cache's end.
 #[test]
 fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
     let Some(dev) = try_device() else { return };
@@ -889,7 +890,7 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
     let v32 = dev.htod_copy(&inp.v).unwrap();
     let k16 = dev.htod_copy(&inp.k16).unwrap();
     let v16 = dev.htod_copy(&inp.v16).unwrap();
-    for &seq_len in &[2817u32, 4097, 6144, 12288, 16384] {
+    for &seq_len in &[2817u32, 4097, 6144, 12288, 16384, 16385, 24576, 32768] {
         let a = run_gqa6_partial(
             &dev,
             "attention_decode_splitk_partial_gqa6_loop_f32",

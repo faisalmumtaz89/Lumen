@@ -19,7 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   context instead of growing with it (24.2 MiB at 16,384), and a generation
   that crosses 16,384 keys no longer hands off to the per-query-head pair.
   Per attention layer on the RTX 5090 against the one-tile form: F32 −7.6 % at
-  2,600 keys, −21 % at 6,144, −27 % at 16,384, never slower at any measured
+  2,600 keys, −19 to −21 % at 6,144, −27 % at 16,384, never slower at any measured
   context; half store −17 % at 6,144, −29 % at 16,384, slower only in the
   band 3,392–4,080 keys (+4 % at 3,600, +8 % at 3,968); 24,576 and 32,768
   keys now served. Below the one-tile bound the pair's output is bit-identical
