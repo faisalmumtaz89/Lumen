@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-09-11
+
 ### Removed
 
 - **Qwen3.6-27B is retired from the model registry.** Qwen3.8-27B is the
@@ -1490,6 +1492,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.31.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.27.0...v0.28.0
