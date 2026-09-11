@@ -68,8 +68,8 @@ const MAX_ABS_ERR_BETWEEN_PARTITIONS: f64 = 2e-6;
 /// and the contexts only the whole-tile partition can serve, to the cache's
 /// end.
 const LENGTHS: &[u32] = &[
-    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4095, 4096, 4097, 6144, 8192, 12288,
-    16383, 16384, 16385, 24576, 32767, 32768,
+    1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 2815, 2816, 2817, 4095, 4096, 4097, 6144,
+    8192, 12288, 16383, 16384, 16385, 24576, 32767, 32768,
 ];
 
 /// A query-head / KV-head pair at the suite's group size of 6.
@@ -580,4 +580,38 @@ fn decode_whole_tile_partition_is_bit_reproducible() {
             "seq_len {seq_len}"
         );
     }
+}
+
+/// Host-executable: the sweep's length list is tied to the policy constants
+/// it exists to straddle, so a retune of the one-tile bound or the split
+/// ceiling cannot quietly leave the boundary contexts untested.
+#[test]
+fn the_sweep_straddles_every_policy_boundary_and_reaches_the_cache_end() {
+    let one_tile_keys = ATTN_ONE_TILE_DEFAULT * DECODE_CHUNK;
+    let ceiling_keys = ATTN_DECODE_S_MAX * DECODE_CHUNK;
+    for k in [one_tile_keys - 1, one_tile_keys, one_tile_keys + 1] {
+        assert!(
+            LENGTHS.contains(&k),
+            "{k} (the one-tile bound edge) is not swept"
+        );
+    }
+    for k in [ceiling_keys - 1, ceiling_keys, ceiling_keys + 1] {
+        assert!(
+            LENGTHS.contains(&k),
+            "{k} (the split ceiling edge) is not swept"
+        );
+    }
+    assert_eq!(
+        *LENGTHS.iter().max().unwrap(),
+        MAX_SEQ_LEN,
+        "the sweep must reach the cache's end"
+    );
+    assert!(
+        MAX_SEQ_LEN >= 2 * ceiling_keys,
+        "the cache must reach past the one-tile partition's ceiling"
+    );
+    assert!(
+        LENGTHS.windows(2).all(|w| w[0] < w[1]),
+        "LENGTHS must be strictly ascending"
+    );
 }

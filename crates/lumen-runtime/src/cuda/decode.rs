@@ -1018,9 +1018,10 @@ pub(crate) fn compile_all_kernels(
         }
     };
 
-    // Both F32 entry points load before the target is recorded: a refused
-    // target falls back inside `load_attention`, and the record, the load
-    // line, the route line and the dump must all name what actually loaded.
+    // Every entry point loads before the target is recorded (the half
+    // partial above, when a half store is configured; both F32 entries here):
+    // a refused target falls back inside `load_attention`, and the record, the
+    // load line, the route line and the dump must all name what actually loaded.
     let attention_decode_partial = load_attention("attention_decode_partial_f32")?;
     let attention_decode_merge = load_attention("attention_decode_merge")?;
     cuda_log!(

@@ -31,7 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   At the shape the GQA-shared pair served (group 6, head dimension 256) the
   kernel is that pair's partial and merge with the shape made a compile-time
   parameter: its output is bit-identical to the pair's as it stood before the
-  consolidation, at every context and on both stores (a 224-entry reference
+  consolidation (the eight-lane merge included, so this is a stricter baseline
+  than v0.30.0, whose merge was serial), at every context and on both stores (a 224-entry reference
   fixture of hashed partials
   and outputs, `crates/lumen-runtime/tests/fixtures/attention_decode_reference.json`,
   is checked by `cuda_attention_decode_fixture_test`); every other (group,
@@ -116,6 +117,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` (renamed to those two, same meaning
   and default); `LUMEN_CUDA_ATTN_TILED_CODEGEN` (`LUMEN_CUDA_ATTN_CODEGEN`).
   `LUMEN_CUDA_LEGACY_DEFAULTS` no longer touches decode attention.
+- A model outside the kernel's domain (1 to 8 query heads per KV head at head
+  dimension 128 or 256) is refused at CUDA init with the shape named; the
+  tiled kernel that served other head dimensions is gone with the route. Every
+  model in the registry is inside the domain.
 - The `ACTIVE` route line and the `LUMEN_CUDA_ATTN_DUMP` header name the one
   kernel with its split count, partition, policy and codegen; the route names
   `attention_decode_tiled`, `attention_decode_splitk_partial` and

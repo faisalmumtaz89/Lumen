@@ -738,7 +738,7 @@ struct GpuScratch {
     /// Decode-attention scratch, allocated once for the largest split count
     /// the policy can launch: per-chunk softmax triples (m [heads*S],
     /// l [heads*S], o [heads*S*head_dim]).
-    attn_scratch: (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_scratch: super::attention_decode::DecodeScratch,
 }
 
 /// GPU-resident global tensors (uploaded once at init, reused across all tokens).
@@ -18001,23 +18001,25 @@ impl ComputeBackend for CudaBackend {
             q_gate: None,
             gate_buf: None,
             attn_scratch: {
-                // The split-K scratch: (m, l, o) partials for the split count
-                // the policy can reach at this cache capacity, fixed at init
-                // whatever the context (4.2 MiB on 24 heads at 176 chunks).
-                // Allocation failure is fatal: there is no other route.
-                let s = super::attention_decode::decode_attention_scratch_chunks(
-                    max_seq_len as u32,
+                // Sized once, from the policy read once, for the largest
+                // split count the policy can reach at this cache capacity
+                // (4.2 MiB on 24 heads at 176 chunks). Allocation failure is
+                // fatal: there is no other route.
+                let scratch = super::attention_decode::DecodeScratch::allocate(
+                    &self.device,
+                    num_heads as u32,
                     num_kv_heads as u32,
-                ) as usize;
-                let mib = (num_heads * s * (head_dim + 2) * 4) as f64 / (1024.0 * 1024.0);
+                    head_dim as u32,
+                    max_seq_len as u32,
+                )?;
                 eprintln!(
-                    "[CUDA mem] decode-attention scratch: {s} chunks x {num_heads} heads x head_dim {head_dim} ({mib:.1} MiB), fixed for every context"
+                    "[CUDA mem] decode-attention scratch: {} chunks x {num_heads} heads x head_dim {head_dim} ({:.1} MiB), fixed for every context (one-tile bound {}, target {})",
+                    scratch.chunks,
+                    scratch.bytes() as f64 / (1024.0 * 1024.0),
+                    scratch.policy.one_tile_max,
+                    scratch.policy.target
                 );
-                (
-                    self.device.alloc_zeros::<f32>(num_heads * s)?,
-                    self.device.alloc_zeros::<f32>(num_heads * s)?,
-                    self.device.alloc_zeros::<f32>(num_heads * s * head_dim)?,
-                )
+                scratch
             },
         };
 

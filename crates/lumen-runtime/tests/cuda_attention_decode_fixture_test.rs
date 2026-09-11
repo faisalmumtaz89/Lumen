@@ -270,6 +270,7 @@ struct Outputs {
 #[allow(clippy::too_many_arguments)]
 fn run<K: cudarc::driver::DeviceRepr>(
     dev: &CudaDevice,
+    arch: Option<&'static str>,
     partial_name: &str,
     shared_bytes: u32,
     q: &CudaSlice<f32>,
@@ -279,7 +280,11 @@ fn run<K: cudarc::driver::DeviceRepr>(
     chunks: u32,
     partition: u32,
 ) -> Outputs {
-    let module = dev.compile_and_load(&SPEC.source()).expect("compile");
+    let module = match arch {
+        Some(arch) => dev.compile_and_load_with_arch(&SPEC.source(), arch),
+        None => dev.compile_and_load(&SPEC.source()),
+    }
+    .expect("compile");
     let partial = module.load_function(partial_name).expect("partial");
     let merge = module.load_function(MERGE).expect("merge");
     let n_part = (NUM_HEADS * chunks) as usize;
@@ -436,6 +441,18 @@ fn the_kernel_reproduces_the_reference_fixture() {
     if let Some(d) = &write_dir {
         std::fs::create_dir_all(d).expect("fixture dir");
     }
+    sweep(&dev, None, &write_dir, &expected);
+}
+
+/// The sweep: every class at every length on both stores, through a module
+/// compiled at `arch` (NVRTC's default target when `None`), against the
+/// manifest when one is given, and into `write_dir` when one is given.
+fn sweep(
+    dev: &CudaDevice,
+    arch: Option<&'static str>,
+    write_dir: &Option<String>,
+    expected: &Option<std::collections::HashMap<String, String>>,
+) {
     let mut input_digests = Vec::new();
     let mut entries = Vec::new();
     let mut mismatches = Vec::new();
@@ -455,7 +472,8 @@ fn the_kernel_reproduces_the_reference_fixture() {
         for &seq_len in LENGTHS {
             let (chunks, partition) = decode_attention_geometry_within(seq_len, ONE_TILE, TARGET);
             let a = run(
-                &dev,
+                dev,
+                arch,
                 PARTIAL_F32,
                 SPEC.partial_shared_bytes(false),
                 &q,
@@ -466,7 +484,8 @@ fn the_kernel_reproduces_the_reference_fixture() {
                 partition,
             );
             let b = run(
-                &dev,
+                dev,
+                arch,
                 PARTIAL_F16,
                 SPEC.partial_shared_bytes(true),
                 &q,
@@ -554,6 +573,35 @@ fn the_kernel_reproduces_the_reference_fixture() {
             mismatches.len(),
             mismatches.join("\n")
         );
+    }
+}
+
+/// The knob `LUMEN_CUDA_ATTN_CODEGEN` compiles the same source for an
+/// explicit virtual target. Each target the toolkit offers must reproduce the
+/// fixture bit for bit too: a target that changed the bits would make the
+/// knob a numerics change, and the fixture would say so here. A target the
+/// toolkit refuses is skipped, named.
+#[test]
+fn every_nvrtc_target_reproduces_the_reference_fixture() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(MANIFEST);
+    let expected = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => Some(read_manifest(&t)),
+        Err(_) => {
+            eprintln!("Skipping: no fixture at {}", manifest_path.display());
+            return;
+        }
+    };
+    let Some(dev) = try_device() else { return };
+    for arch in ["compute_80", "compute_120"] {
+        if dev
+            .compile_and_load_with_arch(&SPEC.source(), arch)
+            .is_err()
+        {
+            eprintln!("Skipping {arch}: the toolkit or driver refused it");
+            continue;
+        }
+        eprintln!("target {arch}");
+        sweep(&dev, Some(arch), &None, &expected);
     }
 }
 

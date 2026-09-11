@@ -66,7 +66,7 @@ pub fn prefill_attention_sequential(
     pos_start: usize,
     q_single: &mut CudaSlice<f32>,
     attn_out_single: &mut CudaSlice<f32>,
-    attn_scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    attn_scratch: &mut super::attention_decode::DecodeScratch,
 ) -> Result<(), RuntimeError> {
     let q_dim = num_heads * head_dim;
 
@@ -170,20 +170,15 @@ mod tests {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> (
-        cudarc::driver::CudaSlice<f32>,
-        cudarc::driver::CudaSlice<f32>,
-        cudarc::driver::CudaSlice<f32>,
-    ) {
-        let s = super::super::attention_decode::decode_attention_scratch_chunks(
-            4096,
+    ) -> super::super::attention_decode::DecodeScratch {
+        super::super::attention_decode::DecodeScratch::allocate(
+            device,
+            num_heads as u32,
             num_kv_heads as u32,
-        ) as usize;
-        (
-            device.alloc_zeros::<f32>(num_heads * s).unwrap(),
-            device.alloc_zeros::<f32>(num_heads * s).unwrap(),
-            device.alloc_zeros::<f32>(num_heads * s * head_dim).unwrap(),
+            head_dim as u32,
+            4096,
         )
+        .expect("decode scratch")
     }
 
     /// Reference implementation of single-head attention on CPU for validation.
@@ -1614,10 +1609,6 @@ mod tests {
 
     /// The typed dispatch: the same Q over the same half-representable K/V
     /// held in an F32 store and in a half store produces bit-identical
-    /// output, the half arm taking the half entry point of the one kernel
-    /// (the
-    /// The typed dispatch: the same Q over the same half-representable K/V
-    /// held in an F32 store and in a half store produces bit-identical
     /// output at every context, on both partitions (one-tile to 2,816 keys,
     /// whole-tile from 2,817 at the 4-KV-head policy), through the one
     /// launcher the backend uses.
@@ -1656,7 +1647,6 @@ mod tests {
                     return;
                 }
             };
-        let f16 = kernels.kv_f16.as_ref().expect("half kernels");
         let max_seq_len = 16_385usize;
         let cache = num_kv_heads * max_seq_len * head_dim;
         let mut seed = 0x0005_0910_F16D_0001u64;
@@ -1716,7 +1706,6 @@ mod tests {
             }
             KvStore::F32 { .. } => unreachable!(),
         }
-        let _ = f16;
         let q_gpu = device.htod_copy(&q).unwrap();
         let mut scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
         let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();

@@ -179,6 +179,18 @@ pub const fn decode_attention_geometry_within(
     one_tile_max: u32,
     target: u32,
 ) -> (u32, DecodePartition) {
+    // The merge's shared block is sized for ATTN_DECODE_S_MAX chunks, so no
+    // policy value, clamped or not, can ask for more.
+    let one_tile_max = if one_tile_max > ATTN_DECODE_S_MAX {
+        ATTN_DECODE_S_MAX
+    } else {
+        one_tile_max
+    };
+    let target = if target > ATTN_DECODE_S_MAX {
+        ATTN_DECODE_S_MAX
+    } else {
+        target
+    };
     let n = seq_len.div_ceil(ATTN_DECODE_TILE);
     let n = if n == 0 { 1 } else { n };
     if n <= one_tile_max {
@@ -230,6 +242,69 @@ pub fn decode_attention_scratch_chunks(max_seq_len: u32, num_kv_heads: u32) -> u
     DecodeAttentionPolicy::from_env(num_kv_heads).scratch_chunks(max_seq_len)
 }
 
+/// The split-K scratch and the policy it was sized for, allocated once per
+/// model at init. The policy is read from the environment exactly once,
+/// here, and every launch takes it from this struct: the geometry a call
+/// launches and the scratch it writes into cannot disagree, whatever the
+/// environment does after init, and the hot path reads no environment.
+pub(crate) struct DecodeScratch {
+    /// Per-chunk running max, `[num_heads * chunks]`.
+    pub m: CudaSlice<f32>,
+    /// Per-chunk running sum, `[num_heads * chunks]`.
+    pub l: CudaSlice<f32>,
+    /// Per-chunk unnormalised output, `[num_heads * chunks * head_dim]`.
+    pub o: CudaSlice<f32>,
+    /// The policy every launch uses.
+    pub policy: DecodeAttentionPolicy,
+    /// The split count the three buffers hold: the largest the policy can
+    /// launch at the cache capacity it was allocated for.
+    pub chunks: u32,
+    num_heads: u32,
+    head_dim: u32,
+}
+
+impl DecodeScratch {
+    /// Allocate for the largest split count `policy` can launch at
+    /// `max_seq_len`. Failure is fatal to init: there is no other route.
+    pub(crate) fn allocate(
+        device: &CudaDevice,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        max_seq_len: u32,
+    ) -> Result<Self, RuntimeError> {
+        let policy = DecodeAttentionPolicy::from_env(num_kv_heads);
+        let chunks = policy.scratch_chunks(max_seq_len);
+        let per_chunk = (num_heads as usize) * (chunks as usize);
+        Ok(Self {
+            m: device.alloc_zeros::<f32>(per_chunk)?,
+            l: device.alloc_zeros::<f32>(per_chunk)?,
+            o: device.alloc_zeros::<f32>(per_chunk * head_dim as usize)?,
+            policy,
+            chunks,
+            num_heads,
+            head_dim,
+        })
+    }
+
+    /// Bytes the three buffers hold.
+    pub(crate) fn bytes(&self) -> usize {
+        (self.m.len() + self.l.len() + self.o.len()) * 4
+    }
+
+    /// Whether every buffer holds `chunks` chunks for this scratch's heads
+    /// and head dimension — checked at every admission, so a scratch built
+    /// any other way than `allocate` is refused rather than overrun.
+    fn holds(&self, num_heads: u32, head_dim: u32, chunks: u32) -> bool {
+        let per_chunk = (num_heads as usize) * (chunks as usize);
+        num_heads == self.num_heads
+            && head_dim == self.head_dim
+            && self.m.len() >= per_chunk
+            && self.l.len() >= per_chunk
+            && self.o.len() >= per_chunk * head_dim as usize
+    }
+}
+
 /// What one decode-attention call launches, decided once from a policy
 /// snapshot and the compiled module: the launcher launches exactly this, and
 /// the route line and the dump record it.
@@ -257,14 +332,14 @@ impl DecodeAttentionLaunch {
     }
 }
 
-/// The admission: the dispatch's shape must be the module's, the scratch
-/// must hold the split count the policy picks. Both hold by construction
-/// (the backend refused any other shape at init and sized the scratch from
-/// the same policy), so a failure here is an engine defect and is an error,
-/// never a fallback.
+/// The admission: the dispatch's shape must be the module's, and the
+/// scratch must hold the split count its own policy picks. Both hold by
+/// construction (the backend refused any other shape at init, and the
+/// policy and the scratch come from one `DecodeScratch::allocate`), so a
+/// failure here is an engine defect and is an error, never a fallback.
 fn admit(
     kernels: &KernelSet,
-    scratch_o_floats: usize,
+    scratch: &DecodeScratch,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -282,12 +357,12 @@ fn admit(
             "decode attention: a call with no KV positions".into(),
         ));
     }
-    let policy = DecodeAttentionPolicy::from_env(num_kv_heads);
+    let policy = scratch.policy;
     let (chunks, partition) = policy.geometry(seq_len);
-    let need = (num_heads as usize) * (chunks as usize) * (head_dim as usize);
-    if scratch_o_floats < need {
+    if chunks > scratch.chunks || !scratch.holds(num_heads, head_dim, chunks) {
         return Err(RuntimeError::Compute(format!(
-            "decode attention: the split-K scratch holds {scratch_o_floats} floats but {chunks} chunks at seq_len {seq_len} need {need}"
+            "decode attention: the split-K scratch holds {} chunks ({} heads, head_dim {}) but {chunks} chunks at seq_len {seq_len} are asked for ({num_heads} heads, head_dim {head_dim})",
+            scratch.chunks, scratch.num_heads, scratch.head_dim
         )));
     }
     Ok(DecodeAttentionLaunch {
@@ -308,7 +383,9 @@ unsafe fn launch_pair<K: DeviceRepr>(
     q: &CudaSlice<f32>,
     k_cache: &CudaSlice<K>,
     v_cache: &CudaSlice<K>,
-    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    m_part: &mut CudaSlice<f32>,
+    l_part: &mut CudaSlice<f32>,
+    o_part: &mut CudaSlice<f32>,
     attn_out: &mut CudaSlice<f32>,
     num_heads: u32,
     num_kv_heads: u32,
@@ -320,7 +397,6 @@ unsafe fn launch_pair<K: DeviceRepr>(
     let spec = kernels.attn_spec;
     let s = launch.chunks;
     let partition = launch.partition;
-    let (m_part, l_part, o_part) = scratch;
     device
         .stream
         .launch_builder(partial_fn)
@@ -401,7 +477,7 @@ pub(crate) unsafe fn launch_attention_decode(
     kernels: &KernelSet,
     q: &CudaSlice<f32>,
     kv: KvRef<'_>,
-    scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
+    scratch: &mut DecodeScratch,
     attn_out: &mut CudaSlice<f32>,
     num_heads: u32,
     num_kv_heads: u32,
@@ -410,14 +486,7 @@ pub(crate) unsafe fn launch_attention_decode(
     max_seq_len: u32,
     scale: f32,
 ) -> Result<DecodeAttentionLaunch, RuntimeError> {
-    let launch = admit(
-        kernels,
-        scratch.2.len(),
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        seq_len,
-    )?;
+    let launch = admit(kernels, scratch, num_heads, num_kv_heads, head_dim, seq_len)?;
     let half_store = matches!(kv, KvRef::F16 { .. });
     match kv {
         KvRef::F32 { k, v } => launch_pair(
@@ -428,7 +497,9 @@ pub(crate) unsafe fn launch_attention_decode(
             q,
             k,
             v,
-            scratch,
+            &mut scratch.m,
+            &mut scratch.l,
+            &mut scratch.o,
             attn_out,
             num_heads,
             num_kv_heads,
@@ -449,7 +520,9 @@ pub(crate) unsafe fn launch_attention_decode(
                 q,
                 k,
                 v,
-                scratch,
+                &mut scratch.m,
+                &mut scratch.l,
+                &mut scratch.o,
                 attn_out,
                 num_heads,
                 num_kv_heads,
