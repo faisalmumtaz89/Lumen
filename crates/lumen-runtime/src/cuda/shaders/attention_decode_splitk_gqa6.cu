@@ -167,12 +167,17 @@ __device__ __forceinline__ float4 gqa6_h4_to_f4(unsigned int lo, unsigned int hi
 // numbers are the one-tile form's exactly.
 // Output: (m, l, o[256]) per head per CTA, the partial format the eight-lane
 // merge below consumes.
-// Occupancy: __launch_bounds__(128, 4) on both loops — four CTAs per SM, what
-// the F32 loop's 22,984 B of shared allow; ptxas (sm_120): 116 / 118 registers,
-// no stack frame, no spills. The half loop's shared (14,792 B) would allow six
-// CTAs, but bounding it to six (80 registers) or five (96) was measured slower
-// or no faster at every context (r5 step 3, rounds 7–8): the register cap
-// costs more instructions than the occupancy returns.
+// Occupancy: __launch_bounds__(128, 4) on both loops (a floor on resident
+// CTAs, not a cap). On the engine's compile path — NVRTC at its default PTX
+// target, then the driver's ptxas for the device — ptxas reports 96 registers
+// for both loops, no stack frame, no spills (an offline nvcc -arch=sm_120 build
+// reports 116 / 118; the numbers that count are the engine's). At 96 registers
+// an SM holds five CTAs by registers: the F32 loop is held to four by its
+// 22,984 B of shared, the half loop runs five (14,792 B). The retained one-tile
+// partials compile to 72 registers on the same path and the half one runs six
+// CTAs per SM (shared-limited at 14,768 B); bounding the half loop to six
+// (rounds 7–8) forces 80 registers with spills to local memory on this path
+// and was measured slower at every context, so the loop keeps five.
 // A runtime guard traps a CTA whose tile would exceed 16 keys (never with a
 // correct host); NaN partials would then reach the merge.
 // --------------------------------------------------------------------------

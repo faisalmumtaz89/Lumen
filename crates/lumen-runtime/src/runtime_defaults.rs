@@ -1249,9 +1249,9 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// above it the CTAs walk whole tiles at the fixed target. The default is per
 /// store, from the RTX 5090 sweeps (r5 step 3, rounds 4–8): 176 on the F32
 /// store (never slower than the one-tile form below it, faster above), 256 on
-/// the half store (whose one-tile kernel runs six CTAs per SM and keeps a
-/// one-wave edge to 255 tiles; the loop's worst cell is then +8 % at 3,968
-/// keys, elsewhere −10 to −29 %). Clamped to
+/// the half store (whose one-tile kernel runs six CTAs per SM against the
+/// loop's five and keeps a one-wave edge to 255 tiles; the loop's worst cell
+/// is then +8 % at 3,968 keys, elsewhere −10 to −29 %). Clamped to
 /// `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`; `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
