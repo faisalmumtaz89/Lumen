@@ -9,7 +9,7 @@
 //!
 //! * `LUMEN_ATTN_FIXTURE_WRITE=<dir>`: run the kernel and write every raw
 //!   array (little-endian F32) beside a `manifest.json` of their digests, the
-//!   generator's identity and the launch geometry. Run once, on the reviewed
+//!   generator's identity and the launch geometry. Run once, on the approved-as-shipped
 //!   kernel, before it changes.
 //! * otherwise: if `tests/fixtures/attention_decode_reference.json` exists,
 //!   regenerate the inputs, run the kernel and require every digest to match.
