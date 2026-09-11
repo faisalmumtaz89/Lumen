@@ -34,13 +34,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Tiny Q4_0-compatible model dims. All in-dims are multiples of 32 (Q4_0 block
-/// size): hidden=32, q_dim=kv_dim=32, inter=64.
+/// size): hidden=32, q_dim=kv_dim=256, inter=64.
 fn q4_config(seed: u64) -> TestModelQ4Config {
     TestModelQ4Config {
         num_layers: 2,
         num_heads: 2,
         num_kv_heads: 2,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 32,
         intermediate_dim: 64,
         vocab_size: 32,

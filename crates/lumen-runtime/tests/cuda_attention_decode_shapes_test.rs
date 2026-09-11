@@ -11,8 +11,8 @@
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::{
-    attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes, DecodeAttentionSpec,
-    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM,
+    decode_attention_geometry_within, decode_attention_merge_shared_bytes, DecodeAttentionSpec,
+    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM,
 };
 
 const NUM_KV_HEADS: u32 = 2;
@@ -175,7 +175,7 @@ fn run<K: cudarc::driver::DeviceRepr>(
     let module = dev.compile_and_load(&spec.source()).expect("compile");
     let partial = module.load_function(partial_name).expect("partial");
     let merge = module
-        .load_function("attention_decode_splitk_merge_gqa6_f32")
+        .load_function("attention_decode_merge")
         .expect("merge");
     let num_heads = NUM_KV_HEADS * spec.group;
     let n_part = (num_heads * chunks) as usize;
@@ -215,7 +215,7 @@ fn run<K: cudarc::driver::DeviceRepr>(
             .launch(LaunchConfig {
                 grid_dim: (num_heads, spec.dim_tiles(), 1),
                 block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(chunks),
+                shared_mem_bytes: decode_attention_merge_shared_bytes(chunks),
             })
             .expect("merge launch");
     }
@@ -257,7 +257,7 @@ fn every_admitted_shape_matches_the_f64_reference_on_both_stores() {
                 let want = reference(spec, &inp, seq_len, scale);
                 // Both partitions at every length: the policy's, and the
                 // other one at the shipped target.
-                let policy = attn_splitk_gqa6_geometry_within(seq_len, ONE_TILE, TARGET);
+                let policy = decode_attention_geometry_within(seq_len, ONE_TILE, TARGET);
                 let other = if policy.1 == 0 {
                     (TARGET.min(seq_len.div_ceil(16)), 1)
                 } else {
@@ -267,7 +267,7 @@ fn every_admitted_shape_matches_the_f64_reference_on_both_stores() {
                     let a = run(
                         &dev,
                         spec,
-                        "attention_decode_splitk_partial_gqa6_loop_f32",
+                        "attention_decode_partial_f32",
                         false,
                         &q,
                         &k32,
@@ -280,7 +280,7 @@ fn every_admitted_shape_matches_the_f64_reference_on_both_stores() {
                     let b = run(
                         &dev,
                         spec,
-                        "attention_decode_splitk_partial_gqa6_loop_f16",
+                        "attention_decode_partial_f16",
                         true,
                         &q,
                         &k16,

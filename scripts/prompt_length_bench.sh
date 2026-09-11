@@ -38,7 +38,6 @@ echo "{" > "$RESULTS_JSON"
 
 # Pin the CUDA opt-in stack so envelopes match the published baselines.
 export LUMEN_CUDA_BF16_GEMMEX=${LUMEN_CUDA_BF16_GEMMEX:-1}
-export LUMEN_CUDA_DECODE_TILED_THRESHOLD=${LUMEN_CUDA_DECODE_TILED_THRESHOLD:-0}
 
 # -------------------------------------------------------------------
 # Helpers

@@ -19,7 +19,7 @@ use super::ffi::CudaDevice;
 #[cfg(test)]
 use super::kv_cache::KvCacheGpu;
 use super::kv_cache::{KvRef, KvView};
-use super::prefill::{launch_attention_decode_gated, launch_extract_row, launch_scatter_row};
+use super::prefill::{launch_extract_row, launch_scatter_row};
 
 /// Run causal attention for all tokens in a prefill batch.
 ///
@@ -66,6 +66,7 @@ pub fn prefill_attention_sequential(
     pos_start: usize,
     q_single: &mut CudaSlice<f32>,
     attn_out_single: &mut CudaSlice<f32>,
+    attn_scratch: &mut (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
 ) -> Result<(), RuntimeError> {
     let q_dim = num_heads * head_dim;
 
@@ -111,10 +112,6 @@ pub fn prefill_attention_sequential(
         }
 
         // 2. Run decode-attention for this single token against the KV cache.
-        // gate: routes to the tiled streaming-softmax kernel at long
-        // context. Byte-identical to the prior single-block dispatch when
-        // the gate selects SingleBlock (the default for typical prefill shapes
-        // within the single-block ceiling).
         let nh = num_heads as u32;
         let nkvh = num_kv_heads as u32;
         let hd = head_dim as u32;
@@ -122,12 +119,12 @@ pub fn prefill_attention_sequential(
         let msl = kv.seq_stride as u32;
 
         unsafe {
-            launch_attention_decode_gated(
+            super::attention_decode::launch_attention_decode(
                 device,
                 kernels,
                 q_single as &CudaSlice<f32>,
                 KvRef::F32 { k: kv.k, v: kv.v },
-                None,
+                attn_scratch,
                 &mut *attn_out_single,
                 nh,
                 nkvh,
@@ -164,6 +161,30 @@ mod tests {
     //! the attention_decode kernel individually for the same token.
 
     use super::*;
+
+    /// The decode-attention scratch a test needs for the sequential
+    /// reference: sized like the backend sizes it (the policy's split count
+    /// at a generous capacity).
+    fn test_decode_scratch(
+        device: &super::CudaDevice,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> (
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+        cudarc::driver::CudaSlice<f32>,
+    ) {
+        let s = super::super::attention_decode::decode_attention_scratch_chunks(
+            4096,
+            num_kv_heads as u32,
+        ) as usize;
+        (
+            device.alloc_zeros::<f32>(num_heads * s).unwrap(),
+            device.alloc_zeros::<f32>(num_heads * s).unwrap(),
+            device.alloc_zeros::<f32>(num_heads * s * head_dim).unwrap(),
+        )
+    }
 
     /// Reference implementation of single-head attention on CPU for validation.
     ///
@@ -234,10 +255,18 @@ mod tests {
             }
         };
 
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -247,9 +276,6 @@ mod tests {
         };
 
         let batch = 4;
-        let num_heads = 2;
-        let num_kv_heads = 2;
-        let head_dim = 4;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = 0;
@@ -287,6 +313,7 @@ mod tests {
         }
 
         // Run the function under test.
+        let mut attn_scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
         prefill_attention_sequential(
             &device,
             &kernels,
@@ -300,6 +327,7 @@ mod tests {
             pos_start,
             &mut q_single,
             &mut attn_out_single,
+            &mut attn_scratch,
         )
         .unwrap();
 
@@ -368,10 +396,18 @@ mod tests {
             }
         };
 
+        let num_heads = 2;
+        let num_kv_heads = 1; // GQA: 2 Q heads share 1 KV head
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -381,9 +417,6 @@ mod tests {
         };
 
         let batch = 1;
-        let num_heads = 2;
-        let num_kv_heads = 1; // GQA: 2 Q heads share 1 KV head
-        let head_dim = 8;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = 0;
@@ -403,6 +436,8 @@ mod tests {
         let v_gpu = device.htod_copy(&v_data).unwrap();
         kv_cache.append_kv(&device, &k_gpu, &v_gpu, None).unwrap();
 
+        let mut attn_scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
+
         prefill_attention_sequential(
             &device,
             &kernels,
@@ -416,6 +451,7 @@ mod tests {
             pos_start,
             &mut q_single,
             &mut attn_out_single,
+            &mut attn_scratch,
         )
         .unwrap();
 
@@ -455,10 +491,18 @@ mod tests {
             }
         };
 
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -470,9 +514,6 @@ mod tests {
         // Simulate: 3 tokens already in cache, then prefill 2 more tokens.
         let pre_existing = 3;
         let batch = 2;
-        let num_heads = 1;
-        let num_kv_heads = 1;
-        let head_dim = 4;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = pre_existing;
@@ -504,6 +545,8 @@ mod tests {
         let mut q_single = device.alloc_zeros::<f32>(q_dim).unwrap();
         let mut attn_out_single = device.alloc_zeros::<f32>(q_dim).unwrap();
 
+        let mut attn_scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
+
         prefill_attention_sequential(
             &device,
             &kernels,
@@ -517,6 +560,7 @@ mod tests {
             pos_start,
             &mut q_single,
             &mut attn_out_single,
+            &mut attn_scratch,
         )
         .unwrap();
 
@@ -580,10 +624,18 @@ mod tests {
             }
         };
 
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -593,9 +645,6 @@ mod tests {
         };
 
         let batch = 4;
-        let num_heads = 2;
-        let num_kv_heads = 2;
-        let head_dim = 4;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = 0;
@@ -691,10 +740,18 @@ mod tests {
             }
         };
 
+        let num_heads = 2;
+        let num_kv_heads = 1; // GQA: 2 Q heads share 1 KV head
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -704,9 +761,6 @@ mod tests {
         };
 
         let batch = 7; // Not a multiple of 4 -- tests tail handling
-        let num_heads = 2;
-        let num_kv_heads = 1; // GQA: 2 Q heads share 1 KV head
-        let head_dim = 8;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = 0;
@@ -804,10 +858,18 @@ mod tests {
             }
         };
 
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -818,9 +880,6 @@ mod tests {
 
         let pre_existing = 3;
         let batch = 2;
-        let num_heads = 1;
-        let num_kv_heads = 1;
-        let head_dim = 4;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = pre_existing;
@@ -919,10 +978,18 @@ mod tests {
             }
         };
 
+        let num_heads = 4;
+        let num_kv_heads = 2; // GQA ratio = 2
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -932,9 +999,6 @@ mod tests {
         };
 
         let batch = 8;
-        let num_heads = 4;
-        let num_kv_heads = 2; // GQA ratio = 2
-        let head_dim = 16;
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let pos_start = 0;
@@ -968,6 +1032,8 @@ mod tests {
         let mut q_single = device.alloc_zeros::<f32>(q_dim).unwrap();
         let mut attn_out_single = device.alloc_zeros::<f32>(q_dim).unwrap();
 
+        let mut attn_scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
+
         prefill_attention_sequential(
             &device,
             &kernels,
@@ -981,6 +1047,7 @@ mod tests {
             pos_start,
             &mut q_single,
             &mut attn_out_single,
+            &mut attn_scratch,
         )
         .unwrap();
         device.synchronize().unwrap();
@@ -1042,10 +1109,18 @@ mod tests {
             }
         };
 
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -1055,9 +1130,6 @@ mod tests {
         };
 
         let batch = 4;
-        let num_heads = 2;
-        let num_kv_heads = 2;
-        let head_dim = 4;
         let q_dim = num_heads * head_dim;
 
         let kv_cache = KvCacheGpu::new(&device, num_kv_heads, 16, head_dim).unwrap();
@@ -1067,6 +1139,8 @@ mod tests {
         let mut attn_out_batch = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         let mut q_single = device.alloc_zeros::<f32>(q_dim).unwrap();
         let mut attn_out_single = device.alloc_zeros::<f32>(q_dim).unwrap();
+
+        let mut attn_scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
 
         let result = prefill_attention_sequential(
             &device,
@@ -1081,6 +1155,7 @@ mod tests {
             0,
             &mut q_single,
             &mut attn_out_single,
+            &mut attn_scratch,
         );
 
         assert!(result.is_err(), "Expected error for undersized q_batch");
@@ -1140,7 +1215,12 @@ mod tests {
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -1326,10 +1406,18 @@ mod tests {
                 return;
             }
         };
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 128; // the decode-attention kernel's smallest head dimension
         let kernels = match super::super::decode::compile_all_kernels(
             &device,
             crate::kv::KvPrecision::F32,
-            None,
+            super::super::attention_decode::DecodeAttentionSpec::for_shape(
+                num_heads as u32,
+                num_kv_heads as u32,
+                head_dim as u32,
+            )
+            .expect("a test shape inside the kernel's domain"),
         ) {
             Ok(k) => k,
             Err(e) => {
@@ -1339,9 +1427,6 @@ mod tests {
         };
 
         let batch = 8;
-        let num_heads = 2;
-        let num_kv_heads = 1;
-        let head_dim = 8;
         let q_dim = num_heads * head_dim;
         let kv_cache = KvCacheGpu::new(&device, num_kv_heads, 16, head_dim).unwrap();
 
@@ -1529,12 +1614,15 @@ mod tests {
 
     /// The typed dispatch: the same Q over the same half-representable K/V
     /// held in an F32 store and in a half store produces bit-identical
-    /// output, the half arm taking the half twin of whatever route the F32
-    /// arm took (the GQA-shared pair where it is loaded and admitted, the
-    /// tiled kernel otherwise).
+    /// output, the half arm taking the half entry point of the one kernel
+    /// (the
+    /// The typed dispatch: the same Q over the same half-representable K/V
+    /// held in an F32 store and in a half store produces bit-identical
+    /// output at every context, on both partitions (one-tile to 2,816 keys,
+    /// whole-tile from 2,817 at the 4-KV-head policy), through the one
+    /// launcher the backend uses.
     #[test]
     fn half_store_dispatch_reproduces_the_f32_store_bit_for_bit() {
-        use super::super::decode::AttentionDecodeVariant as V;
         use crate::cuda::kv_cache::{compile_kv_module, KvCacheGpu, KvStore};
         use crate::kv::KvPrecision;
         if super::super::ffi::device_count().unwrap_or(0) == 0 {
@@ -1548,62 +1636,50 @@ mod tests {
                 return;
             }
         };
-        // The split-K route and the GQA-shared pair are on by default only for
-        // the model and device classes a bare kernel set does not declare:
-        // force both on so the arm this test exists for is the one that runs.
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK", "1");
-        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "1");
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
-        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
-        struct Unset;
-        impl Drop for Unset {
-            fn drop(&mut self) {
-                std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK");
-                std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
-            }
-        }
-        let _unset = Unset;
-        let kernels = match super::super::decode::compile_all_kernels(
-            &device,
-            KvPrecision::F16,
-            Some(super::super::prefill::ATTN_SPLITK_GQA6_REVIEWED),
-        ) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Skipping test: failed to compile kernels: {e}");
-                return;
-            }
-        };
-        assert!(
-            kernels.attention_decode_splitk_partial_gqa6.is_some() && kernels.kv_f16.is_some(),
-            "the GQA-shared pair and the half twins must load for this test to mean anything"
-        );
+        std::env::remove_var("LUMEN_CUDA_ATTN_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_TARGET");
         let (num_heads, num_kv_heads, head_dim) = (24usize, 4usize, 256usize);
-        let max_seq_len = 16_400usize;
+        let spec = super::super::attention_decode::DecodeAttentionSpec::for_shape(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+        )
+        .unwrap();
+        let kernels =
+            match super::super::decode::compile_all_kernels(&device, KvPrecision::F16, spec) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Skipping test: failed to compile kernels: {e}");
+                    return;
+                }
+            };
+        let f16 = kernels.kv_f16.as_ref().expect("half kernels");
+        let max_seq_len = 16_385usize;
         let cache = num_kv_heads * max_seq_len * head_dim;
+        let mut seed = 0x0005_0910_F16D_0001u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) & 0xff_ffff) as f32 / 8_388_608.0 - 1.0
+        };
         let q: Vec<f32> = (0..num_heads * head_dim)
-            .map(|i| ((i as f32) * 0.011 + 0.7).sin() * 4.0)
+            .map(|_| host_f16_to_f32(host_f16_bits(next() * 4.0)))
             .collect();
-        let k16: Vec<u16> = (0..cache)
-            .map(|i| host_f16_bits(((i as f32) * 0.013 + 0.3).sin() * 0.5 + 0.75))
-            .collect();
-        let v16: Vec<u16> = (0..cache)
-            .map(|i| host_f16_bits(((i as f32) * 0.017 + 0.5).cos() * 0.5 + 0.75))
-            .collect();
+        let k16: Vec<u16> = (0..cache).map(|_| host_f16_bits(next())).collect();
+        let v16: Vec<u16> = (0..cache).map(|_| host_f16_bits(next())).collect();
         let k32: Vec<f32> = k16.iter().map(|&h| host_f16_to_f32(h)).collect();
         let v32: Vec<f32> = v16.iter().map(|&h| host_f16_to_f32(h)).collect();
-
-        let m32 = compile_kv_module(&device, KvPrecision::F32).unwrap();
+        let kv32_module = compile_kv_module(&device, KvPrecision::F32).unwrap();
         let mut kv32 = KvCacheGpu::with_module_at(
             &device,
             num_kv_heads,
             max_seq_len,
             head_dim,
-            &m32,
+            &kv32_module,
             KvPrecision::F32,
         )
         .unwrap();
@@ -1614,13 +1690,13 @@ mod tests {
             }
             KvStore::F16 { .. } => unreachable!(),
         }
-        let m16 = compile_kv_module(&device, KvPrecision::F16).unwrap();
+        let kv16_module = compile_kv_module(&device, KvPrecision::F16).unwrap();
         let mut kv16 = KvCacheGpu::with_module_at(
             &device,
             num_kv_heads,
             max_seq_len,
             head_dim,
-            &m16,
+            &kv16_module,
             KvPrecision::F16,
         )
         .unwrap();
@@ -1631,41 +1707,23 @@ mod tests {
             }
             KvStore::F32 { .. } => unreachable!(),
         }
-        assert_eq!(kv16.bytes() * 2, kv32.bytes());
-
+        let _ = f16;
         let q_gpu = device.htod_copy(&q).unwrap();
-        let s_max = super::super::prefill::attn_splitk_gqa6_scratch_chunks(
-            max_seq_len as u32,
-            num_kv_heads as u32,
-        )
-        .max(super::super::prefill::attn_splitk_gqa6_scratch_chunks(
-            max_seq_len as u32,
-            num_kv_heads as u32,
-        )) as usize;
-        let mut scratch = (
-            device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),
-            device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),
-            device
-                .alloc_zeros::<f32>(num_heads * s_max * head_dim)
-                .unwrap(),
-        );
+        let mut scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
         let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let mut out16 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        // The two stores take the same split geometry at every context (one
-        // policy), so the identity holds on both partitions: one-tile to 2,816
-        // keys, whole-tile from 2,817.
         for seq_len in [
             1u32, 16, 129, 330, 1300, 2600, 2816, 2817, 3072, 3968, 4096, 4097, 6144, 16_384,
             16_385,
         ] {
             let a = unsafe {
-                super::super::prefill::launch_attention_decode_gated(
+                super::super::attention_decode::launch_attention_decode(
                     &device,
                     &kernels,
                     &q_gpu,
                     kv32.as_ref(),
-                    Some(&mut scratch),
+                    &mut scratch,
                     &mut out32,
                     num_heads as u32,
                     num_kv_heads as u32,
@@ -1677,12 +1735,12 @@ mod tests {
             }
             .unwrap();
             let b = unsafe {
-                super::super::prefill::launch_attention_decode_gated(
+                super::super::attention_decode::launch_attention_decode(
                     &device,
                     &kernels,
                     &q_gpu,
                     kv16.as_ref(),
-                    Some(&mut scratch),
+                    &mut scratch,
                     &mut out16,
                     num_heads as u32,
                     num_kv_heads as u32,
@@ -1694,6 +1752,16 @@ mod tests {
             }
             .unwrap();
             device.synchronize().unwrap();
+            assert_eq!(
+                (a.chunks, a.partition),
+                (b.chunks, b.partition),
+                "seq_len {seq_len}"
+            );
+            let expect_partition = u32::from(seq_len > 176 * 16);
+            assert_eq!(
+                a.partition, expect_partition,
+                "seq_len {seq_len}: partition"
+            );
             let got32: Vec<u32> = device
                 .dtoh_copy(&out32)
                 .unwrap()
@@ -1706,23 +1774,7 @@ mod tests {
                 .iter()
                 .map(|x| x.to_bits())
                 .collect();
-            // A one-chunk context (128 keys or fewer) is the tiled kernel's; every
-            // longer one must take the GQA-shared pair on both stores, on the
-            // partition the shared policy picks — the arm this test guards.
-            let want = if super::super::prefill::attn_splitk_chunks(seq_len) <= 1 {
-                (V::Tiled, V::TiledF16)
-            } else {
-                (V::SplitKGqa6, V::SplitKGqa6F16)
-            };
-            assert_eq!(
-                (a, b),
-                want,
-                "at seq_len {seq_len} the stores took ({a:?}, {b:?})"
-            );
-            assert_eq!(
-                got32, got16,
-                "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
-            );
+            assert_eq!(got32, got16, "outputs differ at seq_len {seq_len}");
         }
     }
 }

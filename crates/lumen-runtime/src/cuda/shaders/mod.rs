@@ -82,41 +82,13 @@ pub const MATVEC_Q4_0_KERNEL_SOURCE: &str = include_str!("matvec_q4_0.cu");
 /// KV cache scatter-write kernel (head-first layout).
 pub const KV_CACHE_KERNEL_SOURCE: &str = include_str!("kv_cache.cu");
 
-/// Multi-head attention decode kernel with GQA support.
-pub const ATTENTION_KERNEL_SOURCE: &str = include_str!("attention.cu");
-
-/// Tiled streaming-softmax decode attention kernel.
-///
-/// Removes the single-block `attention_decode` kernel's `seq_len <= 40_950`
-/// ceiling by streaming the softmax over fixed-size KV tiles using Dao 2022
-/// online-softmax mechanics. Per-CTA shared memory is constant in `seq_len`
-/// (~1.6 KB at T_C=128, head_dim=256); no dynamic-shmem opt-in required.
-///
-/// Capability-gated via `decode::attention_decode_variant`: the base
-/// selector picks this kernel when `seq_len >
-/// LUMEN_CUDA_DECODE_TILED_THRESHOLD` (default 0 = Tiled base selection for
-/// every positive seq_len) OR `LUMEN_CUDA_DECODE_TILED=1` is set; eligible
-/// automatic selections may upgrade to split-K, and incompatible head_dims
-/// fall back to single-block. Operators can set
-/// `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` to keep the base selector
-/// on single-block (launchable only below the 40_950 structural ceiling).
-pub const ATTENTION_DECODE_TILED_KERNEL_SOURCE: &str = include_str!("attention_decode_tiled.cu");
-
-/// Split-K decode attention: sequence-parallel twin of the tiled kernel for
-/// few-head models (grid = heads x S chunks + a merge pass), lifting the
-/// one-CTA-per-head occupancy ceiling. Selected via `LUMEN_CUDA_ATTN_SPLITK`
-/// (model-aware default: ON for Q8_0- and BF16-body dense models); near-tie
-/// class (cross-chunk merge order).
-pub const ATTENTION_DECODE_SPLITK_KERNEL_SOURCE: &str = include_str!("attention_decode_splitk.cu");
-
-/// GQA-shared split-K decode attention: same two-pass (m, l, o) contract as
-/// the pair above, but one CTA per (KV head, chunk), so each K and V row is
-/// fetched once for the whole 6-query-head group instead of once per query
-/// head, in 16-byte loads throughout. Specialised for 6 query heads per KV
-/// head and head_dim 256; selected via `LUMEN_CUDA_ATTN_SPLITK_GQA6`.
-/// Near-tie class (a different reduction order again).
-pub const ATTENTION_DECODE_SPLITK_GQA6_KERNEL_SOURCE: &str =
-    include_str!("attention_decode_splitk_gqa6.cu");
+/// Decode attention: the one kernel family for every model and context
+/// (`attention_decode_partial_f32` / `_f16` + `attention_decode_merge`), a
+/// split-K flash-decoding pair specialised at compile time for the model's
+/// group size and head dimension — the host prepends `#define DECODE_G` /
+/// `#define DECODE_HD` (`cuda::DecodeAttentionSpec::source`); the source refuses
+/// to compile without them.
+pub const ATTENTION_DECODE_KERNEL_SOURCE: &str = include_str!("attention_decode.cu");
 
 /// Tiled GEMM F32 kernels for batched prefill (32x32 tiles, shared memory).
 pub const GEMM_F32_KERNEL_SOURCE: &str = include_str!("gemm_f32.cu");

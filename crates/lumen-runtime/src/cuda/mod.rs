@@ -17,6 +17,7 @@
 //!   GQA attention, SwiGLU MLP, residual connections).
 //! - `compute_final` (F32 + Q8_0): Final RMSNorm + output projection to logits.
 
+pub(crate) mod attention_decode;
 mod backend_impl;
 pub(crate) mod decode;
 /// CUDA device wrapper (context, stream, buffer management).
@@ -37,10 +38,15 @@ pub(crate) mod types;
 
 pub use backend_impl::CudaBackend;
 
+pub use attention_decode::{
+    decode_attention_geometry_within, decode_attention_merge_shared_bytes,
+    decode_attention_scratch_chunks, decode_attention_scratch_chunks_within, DecodeAttentionPolicy,
+    DecodeAttentionSpec, ATTN_DECODE_REVIEWED_SHAPE, ATTN_DECODE_S_MAX, ATTN_DECODE_TILE,
+};
 /// The decode-attention launch geometry, for out-of-crate callers that drive
-/// the kernels in [`shaders`] directly — the correctness suite
-/// (`tests/cuda_attention_splitk_gqa6_test.rs`) and the standalone A/B
-/// harness (`examples/attn_decode_ab.rs`).
+/// the kernels in [`shaders`] directly — the correctness suites
+/// (`tests/cuda_attention_decode_test.rs` and its fixture and shape
+/// siblings) and the standalone A/B harness (`examples/attn_decode_ab.rs`).
 ///
 /// Those callers cannot reach `prefill`, so without this they would hand-copy
 /// the split counts, chunk length, block dimensions and shared-memory sizes
@@ -48,14 +54,7 @@ pub use backend_impl::CudaBackend;
 /// describing a geometry production no longer runs. Each name below has one
 /// of those two consumers; nothing outside the crate is expected to dispatch
 /// attention.
-pub use decode::{ATTN_DECODE_TILED_BLOCK_DIM, ATTN_DECODE_TILED_T_C};
-pub use prefill::{
-    attn_splitk_chunks, attn_splitk_gqa6_chunks, attn_splitk_gqa6_geometry,
-    attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_max_seq_len,
-    attn_splitk_gqa6_merge_shared_bytes, attn_splitk_gqa6_scratch_chunks,
-    attn_splitk_gqa6_scratch_chunks_within, DecodeAttentionSpec, SplitKGqa6Policy,
-    ATTN_SPLITK_GQA6_CHUNK, ATTN_SPLITK_GQA6_REVIEWED, ATTN_SPLITK_GQA6_S_MAX,
-};
+pub use decode::ATTN_DECODE_BLOCK_DIM;
 
 // ---------------------------------------------------------------------------
 // BF16 GemmEx fault-injection hooks.

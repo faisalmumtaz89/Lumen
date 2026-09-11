@@ -27,7 +27,7 @@ pub fn gdn_model_hyperparams_with(max_seq_len: u32) -> ModelHyperparams {
         num_layers: 2,
         num_heads: 4,
         num_kv_heads: 2,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 64,
         intermediate_dim: 128,
         vocab_size: 64,

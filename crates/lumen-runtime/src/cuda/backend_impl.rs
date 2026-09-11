@@ -735,10 +735,10 @@ struct GpuScratch {
     q_gate: Option<CudaSlice<f32>>,
     gate_buf: Option<CudaSlice<f32>>,
 
-    /// Split-K decode attention scratch (`LUMEN_CUDA_ATTN_SPLITK`, model-aware
-    /// default: ON for Q8_0- and BF16-body dense models, OFF otherwise):
-    /// per-chunk softmax triples (m [heads*S], l [heads*S], o [heads*S*head_dim]).
-    attn_splitk: Option<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    /// Decode-attention scratch, allocated once for the largest split count
+    /// the policy can launch: per-chunk softmax triples (m [heads*S],
+    /// l [heads*S], o [heads*S*head_dim]).
+    attn_scratch: (CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>),
 }
 
 /// GPU-resident global tensors (uploaded once at init, reused across all tokens).
@@ -3605,14 +3605,8 @@ impl CudaBackend {
                     );
                 }
             }
-            // 4. Attention. gate: the base selector picks Tiled when
-            // seq_len > LUMEN_CUDA_DECODE_TILED_THRESHOLD (default 0 = Tiled
-            // base selection for every positive seq_len) or when
-            // LUMEN_CUDA_DECODE_TILED=1 forces it; eligible automatic Tiled
-            // selections may upgrade to split-K, and incompatible head_dims
-            // fall back to SingleBlock. Operators can set
-            // `LUMEN_CUDA_DECODE_TILED_THRESHOLD=4294967295` to keep the base
-            // selector on SingleBlock (launchable only up to 40_950 tokens).
+            // 4. Attention: the one decode-attention kernel, at the split
+            // count and partition the model's policy gives this context.
             {
                 let kv_cache = st.kv_caches[layer_idx].as_ref().ok_or_else(|| {
                     RuntimeError::Compute(format!("no KV cache for layer {layer_idx}"))
@@ -3624,12 +3618,12 @@ impl CudaBackend {
                 let msl = kv_cache.max_seq_len as u32;
                 let scale = 1.0f32 / (head_dim as f32).sqrt();
                 unsafe {
-                    super::prefill::launch_attention_decode_gated(
+                    super::attention_decode::launch_attention_decode(
                         &self.device,
                         &st.kernels,
                         &st.scratch.q,
                         kv_cache.as_ref(),
-                        st.scratch.attn_splitk.as_mut(),
+                        &mut st.scratch.attn_scratch,
                         &mut st.scratch.attn_out,
                         nh,
                         nkvh,
@@ -17875,16 +17869,11 @@ impl ComputeBackend for CudaBackend {
                     // default, the legacy switch and any per-variable override folded in.
                     let on = |b: bool| if b { "ON" } else { "OFF" };
                     eprintln!(
-                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed routes for this model — split-K decode \
-                         attention {}, GQA-shared split-K pair {}, dual-output norm route {}, compute_120 tiled \
-                         kernel {} (defaults measured on cc 12.0; LUMEN_CUDA_ATTN_SPLITK / \
-                         LUMEN_CUDA_ATTN_SPLITK_GQA6 / LUMEN_CUDA_NORM_CTA5_DUAL / LUMEN_CUDA_ATTN_TILED_CODEGEN \
-                         override, and this line shows the result)",
-                        on(crate::runtime_defaults::attn_splitk_enabled()),
-                        on(crate::runtime_defaults::attn_splitk_enabled()
-                            && crate::runtime_defaults::attn_splitk_gqa6_enabled()),
+                        "[CUDA] cc {cc_major}.{cc_minor}: capability-keyed routes for this model — dual-output \
+                         norm route {} (defaults measured on cc 12.0; LUMEN_CUDA_NORM_CTA5_DUAL overrides, and \
+                         this line shows the result); decode attention: one kernel, codegen {}",
                         on(super::decode::norm_cta5_dual_enabled()),
-                        on(super::decode::attn_tiled_codegen_selection(cc_major.clamp(0, 255) as u8, self.device.nvrtc_can_target(120)) == "ptx120"),
+                        super::decode::attn_codegen_selection(),
                     );
                 }
                 if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
@@ -17907,19 +17896,20 @@ impl ComputeBackend for CudaBackend {
         }
         let kernel_compile_start = std::time::Instant::now();
         // The decode-attention module is compiled for this model's
-        // full-attention shape; a shape outside the kernel's domain leaves it
-        // unloaded and the other routes serve.
-        let attn_spec = match super::prefill::DecodeAttentionSpec::for_shape(
+        // full-attention shape. A shape outside the kernel's domain is refused
+        // here, before any kernel compiles or any buffer is allocated: there
+        // is no other decode-attention route (the CPU backend serves such a
+        // model: run without --cuda).
+        let attn_spec = super::attention_decode::DecodeAttentionSpec::for_shape(
             num_heads as u32,
             num_kv_heads as u32,
             head_dim as u32,
-        ) {
-            Ok(spec) => Some(spec),
-            Err(why) => {
-                eprintln!("[CUDA] GQA-shared decode attention not loaded: {why}");
-                None
-            }
-        };
+        )
+        .map_err(|why| {
+            RuntimeError::Unsupported(format!(
+                "{why}; the CUDA backend serves 1 to 8 query heads per KV head at head_dim 128 or 256 (run without --cuda for this model)"
+            ))
+        })?;
         let mut kernels = decode::compile_all_kernels(&self.device, self.kv_precision, attn_spec)?;
         {
             let (hits, misses) = super::ptx_cache::stats();
@@ -18010,54 +18000,24 @@ impl ComputeBackend for CudaBackend {
             // Q+gate fusion: allocated lazily in preload_weights when attn_q_norm detected.
             q_gate: None,
             gate_buf: None,
-            attn_splitk: if kernels.attention_decode_splitk_partial.is_some()
-                && kernels.attention_decode_splitk_merge.is_some()
-            {
-                // The GQA-shared pair shares this scratch but splits the
-                // context far more finely, so when it loaded for a geometry
-                // it serves the buffers are sized for its split count at this
-                // context instead. One allocation, at init, either way.
-                let gqa6 = kernels.attention_decode_splitk_partial_gqa6.is_some()
-                    && kernels.attention_decode_splitk_merge_gqa6.is_some()
-                    && kernels.attn_spec.is_some_and(|spec| {
-                        super::prefill::attention_decode_splitk_gqa6_supports(
-                            spec,
-                            num_heads as u32,
-                            num_kv_heads as u32,
-                            head_dim as u32,
-                            1,
-                        )
-                    });
-                let s = if gqa6 {
-                    // The loop policy bounds the split count whatever the
-                    // context (176 / 128 by default on either store: 4.2 MiB on
-                    // 24 heads); the
-                    // A/B control sizes it for its one-tile bound instead.
-                    (super::prefill::attn_splitk_gqa6_scratch_chunks(
-                        max_seq_len as u32,
-                        num_kv_heads as u32,
-                    ) as usize)
-                        .max(super::prefill::ATTN_SPLITK_S_MAX as usize)
-                } else {
-                    super::prefill::ATTN_SPLITK_S_MAX as usize
-                };
-                match (
-                    self.device.alloc_zeros::<f32>(num_heads * s),
-                    self.device.alloc_zeros::<f32>(num_heads * s),
-                    self.device.alloc_zeros::<f32>(num_heads * s * head_dim),
-                ) {
-                    (Ok(m), Ok(l), Ok(o)) => Some((m, l, o)),
-                    _ => {
-                        eprintln!(
-                            "[CUDA] attn split-K scratch alloc failed; decode \
-                             attention falls back to the base SingleBlock/Tiled \
-                             selection"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
+            attn_scratch: {
+                // The split-K scratch: (m, l, o) partials for the split count
+                // the policy can reach at this cache capacity, fixed at init
+                // whatever the context (4.2 MiB on 24 heads at 176 chunks).
+                // Allocation failure is fatal: there is no other route.
+                let s = super::attention_decode::decode_attention_scratch_chunks(
+                    max_seq_len as u32,
+                    num_kv_heads as u32,
+                ) as usize;
+                let mib = (num_heads * s * (head_dim + 2) * 4) as f64 / (1024.0 * 1024.0);
+                eprintln!(
+                    "[CUDA mem] decode-attention scratch: {s} chunks x {num_heads} heads x head_dim {head_dim} ({mib:.1} MiB), fixed for every context"
+                );
+                (
+                    self.device.alloc_zeros::<f32>(num_heads * s)?,
+                    self.device.alloc_zeros::<f32>(num_heads * s)?,
+                    self.device.alloc_zeros::<f32>(num_heads * s * head_dim)?,
+                )
             },
         };
 
@@ -18295,24 +18255,6 @@ impl ComputeBackend for CudaBackend {
         // The KV caches are allocated in `preload_weights()`, once the layer
         // types are known: only the full-attention layers get one. `init()`
         // compiles the write kernel they share and records the capacity.
-        if self.kv_precision == KvPrecision::F16
-            && head_dim % (crate::cuda::ATTN_DECODE_TILED_BLOCK_DIM as usize) != 0
-        {
-            return Err(RuntimeError::Unsupported(format!(
-                "16-bit KV cache: the half decode-attention readers need head_dim to be a \
-                 multiple of {} (this model has {head_dim}); use --kv-precision f32",
-                crate::cuda::ATTN_DECODE_TILED_BLOCK_DIM
-            )));
-        }
-        if self.kv_precision == KvPrecision::F16
-            && decode::decode_tiled_threshold() != decode::ATTN_DECODE_TILED_DEFAULT_THRESHOLD
-        {
-            return Err(RuntimeError::Unsupported(format!(
-                "16-bit KV cache: LUMEN_CUDA_DECODE_TILED_THRESHOLD={} selects the single-block \
-                 decode-attention route, which has no half twin; unset it or use --kv-precision f32",
-                decode::decode_tiled_threshold()
-            )));
-        }
         let kv_module = super::kv_cache::compile_kv_module(&self.device, self.kv_precision)?;
         let kv_caches: Vec<Option<KvCacheGpu>> = (0..num_layers).map(|_| None).collect();
         eprintln!(
@@ -19179,12 +19121,12 @@ impl ComputeBackend for CudaBackend {
             // num_kv_heads * max_seq_len * head_dim elements each. attn_out has
             // num_heads * head_dim elements. attn_seq_len <= max_seq_len.
             unsafe {
-                super::prefill::launch_attention_decode_gated(
+                super::attention_decode::launch_attention_decode(
                     &self.device,
                     &st.kernels,
                     &st.scratch.q,
                     kv_cache.as_ref(),
-                    st.scratch.attn_splitk.as_mut(),
+                    &mut st.scratch.attn_scratch,
                     &mut st.scratch.attn_out,
                     nh,
                     nkvh,

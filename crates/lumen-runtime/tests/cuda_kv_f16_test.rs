@@ -19,25 +19,21 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::{
-    ATTENTION_DECODE_SPLITK_KERNEL_SOURCE, ATTENTION_DECODE_TILED_KERNEL_SOURCE,
-    KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE,
-};
+use lumen_runtime::cuda::shaders::{KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
 use lumen_runtime::cuda::{
-    attn_splitk_chunks, attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes,
-    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_TILED_T_C as T_C,
-    ATTN_SPLITK_GQA6_CHUNK as GQA6_CHUNK, ATTN_SPLITK_GQA6_REVIEWED as SPEC,
+    decode_attention_geometry_within, decode_attention_merge_shared_bytes,
+    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_REVIEWED_SHAPE as SPEC,
 };
 const HEAD_DIM: u32 = SPEC.head_dim;
-const GQA6_DIM_TILES: u32 = SPEC.dim_tiles();
+const DIM_TILES: u32 = SPEC.dim_tiles();
 
 const NUM_HEADS: u32 = 24;
 const NUM_KV_HEADS: u32 = 4;
 const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625;
 
-/// Either side of one GQA-shared chunk (16), one tiled tile (128), the
-/// board shapes, and the pair's served bound (16,384 keys) and the key before it.
+/// Either side of one 16-key tile and of 128 keys, the board shapes, and
+/// 16,384 keys and the key before it.
 const LENGTHS: &[u32] = &[
     1, 15, 16, 17, 127, 128, 129, 330, 1100, 1300, 2600, 4096, 4097, 8192, 12288, 16383, 16384,
 ];
@@ -152,10 +148,10 @@ fn nan_filled(dev: &CudaDevice, n: usize) -> CudaSlice<f32> {
     dev.htod_copy(&vec![f32::NAN; n]).expect("alloc")
 }
 
-/// The GQA-shared partial's (m, l, o) and merged output from the named
+/// The partial's (m, l, o) and merged output from the named
 /// partial kernel over the given caches.
 #[allow(clippy::too_many_arguments)]
-fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
+fn run_partial<K: cudarc::driver::DeviceRepr>(
     dev: &CudaDevice,
     partial_name: &str,
     shared_bytes: u32,
@@ -167,10 +163,10 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let module = dev
         .compile_and_load(&SPEC.source())
-        .expect("compile GQA-shared pair");
+        .expect("compile the decode-attention module");
     let partial = module.load_function(partial_name).expect("partial");
     let merge = module
-        .load_function("attention_decode_splitk_merge_gqa6_f32")
+        .load_function("attention_decode_merge")
         .expect("merge");
     let (chunks, partition) = geometry;
     let n_part = (NUM_HEADS * chunks) as usize;
@@ -208,9 +204,9 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
             .arg(&mut out)
             .arg(&chunks)
             .launch(LaunchConfig {
-                grid_dim: (NUM_HEADS, GQA6_DIM_TILES, 1),
+                grid_dim: (NUM_HEADS, DIM_TILES, 1),
                 block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(chunks),
+                shared_mem_bytes: decode_attention_merge_shared_bytes(chunks),
             })
             .expect("merge launch");
     }
@@ -223,133 +219,8 @@ fn run_gqa6_partial<K: cudarc::driver::DeviceRepr>(
     )
 }
 
-fn run_tiled<K: cudarc::driver::DeviceRepr>(
-    dev: &CudaDevice,
-    name: &str,
-    q: &CudaSlice<f32>,
-    k: &CudaSlice<K>,
-    v: &CudaSlice<K>,
-    seq_len: u32,
-) -> Vec<f32> {
-    let module = dev
-        .compile_and_load(ATTENTION_DECODE_TILED_KERNEL_SOURCE)
-        .expect("compile tiled");
-    let kernel = module.load_function(name).expect("tiled kernel");
-    let mut out = nan_filled(dev, (NUM_HEADS * HEAD_DIM) as usize);
-    let (nh, nkv, hd, msl, scale) = (NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, SCALE);
-    unsafe {
-        dev.stream
-            .launch_builder(&kernel)
-            .arg(q)
-            .arg(k)
-            .arg(v)
-            .arg(&mut out)
-            .arg(&nh)
-            .arg(&nkv)
-            .arg(&hd)
-            .arg(&seq_len)
-            .arg(&msl)
-            .arg(&scale)
-            .launch(LaunchConfig {
-                grid_dim: (NUM_HEADS, 1, 1),
-                block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: (8 + HEAD_DIM + T_C) * 4,
-            })
-            .expect("tiled launch");
-    }
-    dev.synchronize().expect("sync");
-    dev.dtoh_copy(&out).unwrap()
-}
-
 fn bits(xs: &[f32]) -> Vec<u32> {
     xs.iter().map(|x| x.to_bits()).collect()
-}
-
-/// Below the one-tile bound the loop partials reproduce the previous
-/// release's one-tile partials bit for bit on both stores — the retained
-/// kernels are the reference, in the same binary and through the same
-/// compile path, at every partial (m, l, o) and the merged output.
-#[test]
-fn the_loop_partials_reproduce_the_retained_one_tile_partials_bit_for_bit() {
-    let Some(dev) = try_device() else { return };
-    let inp = make_inputs(0x0005_0911_F16A_0002);
-    let q = dev.htod_copy(&inp.q).unwrap();
-    let k32 = dev.htod_copy(&inp.k).unwrap();
-    let v32 = dev.htod_copy(&inp.v).unwrap();
-    let k16 = dev.htod_copy(&inp.k16).unwrap();
-    let v16 = dev.htod_copy(&inp.v16).unwrap();
-    type Parts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
-    fn check(old: &Parts, new: &Parts, store: &str, seq_len: u32) {
-        for (name, a, b) in [
-            ("m", &old.0, &new.0),
-            ("l", &old.1, &new.1),
-            ("o", &old.2, &new.2),
-            ("out", &old.3, &new.3),
-        ] {
-            assert!(
-                b.iter().all(|x| x.is_finite()),
-                "{store} seq_len {seq_len}: the loop's {name} is not finite"
-            );
-            if let Some(at) = a
-                .iter()
-                .zip(b)
-                .position(|(x, y)| x.to_bits() != y.to_bits())
-            {
-                panic!(
-                    "{store} seq_len {seq_len}: the loop's {name} differs from the one-tile \
-                     kernel at element {at} (one-tile {}, loop {})",
-                    a[at], b[at]
-                );
-            }
-        }
-    }
-    for &seq_len in LENGTHS {
-        // One CTA per tile on both kernels; the one-tile kernel takes the
-        // tile length where the loop takes its partition.
-        let (chunks, _) = attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1);
-        let old = run_gqa6_partial(
-            &dev,
-            "attention_decode_splitk_partial_gqa6_f32",
-            SPEC.onetile_shared_bytes(false),
-            &q,
-            &k32,
-            &v32,
-            seq_len,
-            (chunks, GQA6_CHUNK),
-        );
-        let new = run_gqa6_partial(
-            &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f32",
-            SPEC.partial_shared_bytes(false),
-            &q,
-            &k32,
-            &v32,
-            seq_len,
-            (chunks, 0),
-        );
-        check(&old, &new, "F32", seq_len);
-        let old = run_gqa6_partial(
-            &dev,
-            "attention_decode_splitk_partial_gqa6_f16",
-            SPEC.onetile_shared_bytes(true),
-            &q,
-            &k16,
-            &v16,
-            seq_len,
-            (chunks, GQA6_CHUNK),
-        );
-        let new = run_gqa6_partial(
-            &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f16",
-            SPEC.partial_shared_bytes(true),
-            &q,
-            &k16,
-            &v16,
-            seq_len,
-            (chunks, 0),
-        );
-        check(&old, &new, "half", seq_len);
-    }
 }
 
 #[test]
@@ -362,25 +233,25 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
     let k16 = dev.htod_copy(&inp.k16).unwrap();
     let v16 = dev.htod_copy(&inp.v16).unwrap();
     for &seq_len in LENGTHS {
-        let a = run_gqa6_partial(
+        let a = run_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f32",
+            "attention_decode_partial_f32",
             SPEC.partial_shared_bytes(false),
             &q,
             &k32,
             &v32,
             seq_len,
-            attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1),
+            decode_attention_geometry_within(seq_len, u32::MAX, 1),
         );
-        let b = run_gqa6_partial(
+        let b = run_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f16",
+            "attention_decode_partial_f16",
             SPEC.partial_shared_bytes(true),
             &q,
             &k16,
             &v16,
             seq_len,
-            attn_splitk_gqa6_geometry_within(seq_len, u32::MAX, 1),
+            decode_attention_geometry_within(seq_len, u32::MAX, 1),
         );
         assert!(
             a.3.iter().all(|x| x.is_finite()),
@@ -393,30 +264,6 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
             bits(&a.3),
             bits(&b.3),
             "merged output differs at seq_len {seq_len}"
-        );
-    }
-}
-
-#[test]
-fn the_half_tiled_kernel_reproduces_the_f32_tiled_kernel_bit_for_bit() {
-    let Some(dev) = try_device() else { return };
-    let inp = make_inputs(0x0005_0910_F16A_0002);
-    let q = dev.htod_copy(&inp.q).unwrap();
-    let k32 = dev.htod_copy(&inp.k).unwrap();
-    let v32 = dev.htod_copy(&inp.v).unwrap();
-    let k16 = dev.htod_copy(&inp.k16).unwrap();
-    let v16 = dev.htod_copy(&inp.v16).unwrap();
-    for &seq_len in LENGTHS {
-        let a = run_tiled(&dev, "attention_decode_tiled", &q, &k32, &v32, seq_len);
-        let b = run_tiled(&dev, "attention_decode_tiled_f16", &q, &k16, &v16, seq_len);
-        assert!(
-            a.iter().all(|x| x.is_finite()),
-            "F32 output not finite at {seq_len}"
-        );
-        assert_eq!(
-            bits(&a),
-            bits(&b),
-            "tiled output differs at seq_len {seq_len}"
         );
     }
 }
@@ -764,118 +611,6 @@ fn the_fused_prep_half_twin_matches_the_f32_kernel_and_rounds_its_stores() {
     assert_eq!(b.7, expected_count, "overflow count from the fused writer");
 }
 
-/// The per-query-head split-K partial's half twin over the given caches:
-/// (m, l, o) and the merged output.
-fn run_splitk_partial<K: cudarc::driver::DeviceRepr>(
-    dev: &CudaDevice,
-    partial_name: &str,
-    q: &CudaSlice<f32>,
-    k: &CudaSlice<K>,
-    v: &CudaSlice<K>,
-    seq_len: u32,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let module = dev
-        .compile_and_load(ATTENTION_DECODE_SPLITK_KERNEL_SOURCE)
-        .expect("compile per-head pair");
-    let partial = module.load_function(partial_name).expect("partial");
-    let merge = module
-        .load_function("attention_decode_splitk_merge")
-        .expect("merge");
-    let chunks = attn_splitk_chunks(seq_len);
-    let n_part = (NUM_HEADS * chunks) as usize;
-    let mut m_part = nan_filled(dev, n_part);
-    let mut l_part = nan_filled(dev, n_part);
-    let mut o_part = nan_filled(dev, n_part * HEAD_DIM as usize);
-    let mut out = nan_filled(dev, (NUM_HEADS * HEAD_DIM) as usize);
-    let (nh, nkv, hd, msl, scale) = (NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, SCALE);
-    unsafe {
-        dev.stream
-            .launch_builder(&partial)
-            .arg(q)
-            .arg(k)
-            .arg(v)
-            .arg(&mut m_part)
-            .arg(&mut l_part)
-            .arg(&mut o_part)
-            .arg(&nh)
-            .arg(&nkv)
-            .arg(&hd)
-            .arg(&seq_len)
-            .arg(&msl)
-            .arg(&scale)
-            .arg(&chunks)
-            .launch(LaunchConfig {
-                grid_dim: (NUM_HEADS * chunks, 1, 1),
-                block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: (8 + HEAD_DIM + T_C) * 4,
-            })
-            .expect("per-head partial launch");
-        dev.stream
-            .launch_builder(&merge)
-            .arg(&m_part)
-            .arg(&l_part)
-            .arg(&o_part)
-            .arg(&mut out)
-            .arg(&nh)
-            .arg(&hd)
-            .arg(&chunks)
-            .launch(LaunchConfig {
-                grid_dim: (NUM_HEADS, 1, 1),
-                block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
-            })
-            .expect("per-head merge launch");
-    }
-    dev.synchronize().expect("sync");
-    (
-        dev.dtoh_copy(&m_part).unwrap(),
-        dev.dtoh_copy(&l_part).unwrap(),
-        dev.dtoh_copy(&o_part).unwrap(),
-        dev.dtoh_copy(&out).unwrap(),
-    )
-}
-
-#[test]
-fn the_half_per_head_partial_reproduces_the_f32_partial_bit_for_bit() {
-    let Some(dev) = try_device() else { return };
-    let inp = make_inputs(0x0005_0910_F16A_0005);
-    let q = dev.htod_copy(&inp.q).unwrap();
-    let k32 = dev.htod_copy(&inp.k).unwrap();
-    let v32 = dev.htod_copy(&inp.v).unwrap();
-    let k16 = dev.htod_copy(&inp.k16).unwrap();
-    let v16 = dev.htod_copy(&inp.v16).unwrap();
-    for &seq_len in LENGTHS {
-        let a = run_splitk_partial(
-            &dev,
-            "attention_decode_splitk_partial",
-            &q,
-            &k32,
-            &v32,
-            seq_len,
-        );
-        let b = run_splitk_partial(
-            &dev,
-            "attention_decode_splitk_partial_f16",
-            &q,
-            &k16,
-            &v16,
-            seq_len,
-        );
-        assert!(
-            a.3.iter().all(|x| x.is_finite()),
-            "F32 output not finite at {seq_len}"
-        );
-        assert_eq!(bits(&a.0), bits(&b.0), "m differs at seq_len {seq_len}");
-        assert_eq!(bits(&a.1), bits(&b.1), "l differs at seq_len {seq_len}");
-        assert_eq!(bits(&a.2), bits(&b.2), "o differs at seq_len {seq_len}");
-        assert_eq!(
-            bits(&a.3),
-            bits(&b.3),
-            "merged output differs at seq_len {seq_len}"
-        );
-    }
-}
-
 /// The whole-tile partition: the half partial reproduces the F32 partial bit
 /// for bit at the shipped target too, at the balanced partition's boundary
 /// contexts, past the old bound, and at the contexts only this partition
@@ -890,9 +625,9 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
     let k16 = dev.htod_copy(&inp.k16).unwrap();
     let v16 = dev.htod_copy(&inp.v16).unwrap();
     for &seq_len in &[2817u32, 4097, 6144, 12288, 16384, 16385, 24576, 32768] {
-        let a = run_gqa6_partial(
+        let a = run_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f32",
+            "attention_decode_partial_f32",
             SPEC.partial_shared_bytes(false),
             &q,
             &k32,
@@ -900,9 +635,9 @@ fn the_half_partial_reproduces_the_f32_partial_on_the_whole_tile_partition() {
             seq_len,
             (128, 1),
         );
-        let b = run_gqa6_partial(
+        let b = run_partial(
             &dev,
-            "attention_decode_splitk_partial_gqa6_loop_f16",
+            "attention_decode_partial_f16",
             SPEC.partial_shared_bytes(true),
             &q,
             &k16,

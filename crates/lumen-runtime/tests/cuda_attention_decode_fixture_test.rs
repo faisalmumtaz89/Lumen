@@ -24,8 +24,8 @@
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::cuda::{
-    attn_splitk_gqa6_geometry_within, attn_splitk_gqa6_merge_shared_bytes, DecodeAttentionSpec,
-    ATTN_DECODE_TILED_BLOCK_DIM as BLOCK_DIM, ATTN_SPLITK_GQA6_REVIEWED as SPEC,
+    decode_attention_geometry_within, decode_attention_merge_shared_bytes, DecodeAttentionSpec,
+    ATTN_DECODE_BLOCK_DIM as BLOCK_DIM, ATTN_DECODE_REVIEWED_SHAPE as SPEC,
 };
 use std::fmt::Write as _;
 
@@ -37,9 +37,9 @@ const MAX_SEQ_LEN: u32 = 32_768;
 const SCALE: f32 = 0.0625;
 const ONE_TILE: u32 = 176;
 const TARGET: u32 = 128;
-const PARTIAL_F32: &str = "attention_decode_splitk_partial_gqa6_loop_f32";
-const PARTIAL_F16: &str = "attention_decode_splitk_partial_gqa6_loop_f16";
-const MERGE: &str = "attention_decode_splitk_merge_gqa6_f32";
+const PARTIAL_F32: &str = "attention_decode_partial_f32";
+const PARTIAL_F16: &str = "attention_decode_partial_f16";
+const MERGE: &str = "attention_decode_merge";
 const MANIFEST: &str = "tests/fixtures/attention_decode_reference.json";
 
 /// Every boundary of the tile (16), the one-tile bound (176 tiles = 2,816
@@ -320,7 +320,7 @@ fn run<K: cudarc::driver::DeviceRepr>(
             .launch(LaunchConfig {
                 grid_dim: (NUM_HEADS, DIM_TILES, 1),
                 block_dim: (BLOCK_DIM, 1, 1),
-                shared_mem_bytes: attn_splitk_gqa6_merge_shared_bytes(chunks),
+                shared_mem_bytes: decode_attention_merge_shared_bytes(chunks),
             })
             .expect("merge launch");
     }
@@ -453,7 +453,7 @@ fn the_kernel_reproduces_the_reference_fixture() {
         let k16 = dev.htod_copy(&inp.k16).unwrap();
         let v16 = dev.htod_copy(&inp.v16).unwrap();
         for &seq_len in LENGTHS {
-            let (chunks, partition) = attn_splitk_gqa6_geometry_within(seq_len, ONE_TILE, TARGET);
+            let (chunks, partition) = decode_attention_geometry_within(seq_len, ONE_TILE, TARGET);
             let a = run(
                 &dev,
                 PARTIAL_F32,

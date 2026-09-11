@@ -128,8 +128,8 @@ fn setup_bench_backend(
 ///   LUMEN_BENCH_WARMUP   — number of warmup tokens (default 5)
 ///   LUMEN_BENCH_SCALE    — "tiny" (default) or "realistic"
 ///
-/// The "realistic" scale uses TinyLlama-sized dimensions (hidden_dim=2048,
-/// 22 layers, 32 heads, head_dim=64, inter_dim=5632, vocab=32000). This
+/// The "realistic" scale uses a small-model shape (hidden_dim=2048,
+/// 22 layers, 32 heads, head_dim=128, inter_dim=5632, vocab=32000). This
 /// takes significantly more GPU memory and time.
 #[test]
 #[ignore]
@@ -143,7 +143,7 @@ fn bench_cuda_decode() {
             num_layers: 22,
             num_heads: 32,
             num_kv_heads: 32,
-            head_dim: 64,
+            head_dim: 128,
             hidden_dim: 2048,
             intermediate_dim: 5632,
             vocab_size: 32000,
@@ -574,85 +574,6 @@ fn bench_kernel_matvec_q8_0() {
 
 #[test]
 #[ignore]
-fn bench_kernel_attention_decode() {
-    let iterations = env_usize("LUMEN_BENCH_ITERATIONS", 10000);
-    let num_heads = 32u32;
-    let num_kv_heads = 32u32;
-    let head_dim = 64u32;
-
-    let (ctx, stream) = create_context();
-    let src = lumen_runtime::cuda::shaders::ATTENTION_KERNEL_SOURCE;
-    let ptx = compile_ptx(src).expect("NVRTC compile failed for attention.cu");
-    let module = ctx.load_module(ptx).unwrap();
-    let func = module.load_function("attention_decode").unwrap();
-
-    // Test multiple sequence lengths to see scaling behavior.
-    let seq_lengths: Vec<u32> = vec![32, 128, 512, 1024];
-    let max_seq_len = *seq_lengths.iter().max().unwrap();
-
-    let q_size = (num_heads * head_dim) as usize;
-    let kv_cache_size = (num_kv_heads as usize) * (max_seq_len as usize) * (head_dim as usize);
-
-    let q_data: Vec<f32> = (0..q_size)
-        .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
-        .collect();
-    let kv_data: Vec<f32> = (0..kv_cache_size)
-        .map(|i| ((i % 61) as f32 - 30.0) * 0.01)
-        .collect();
-
-    let q_gpu = stream.clone_htod(&q_data).unwrap();
-    let k_cache_gpu = stream.clone_htod(&kv_data).unwrap();
-    let v_cache_gpu = stream.clone_htod(&kv_data).unwrap();
-    let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(q_size).unwrap();
-
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    eprintln!();
-    eprintln!("=== Attention Decode Benchmark (heads={num_heads}, head_dim={head_dim}) ===",);
-
-    for &seq_len in &seq_lengths {
-        let block_size = {
-            let bs = (seq_len as usize).min(256);
-            let bs = ((bs + 31) / 32) * 32;
-            bs.max(32) as u32
-        };
-        let shared_bytes = (8 + seq_len) * 4;
-
-        let cfg = LaunchConfig {
-            grid_dim: (num_heads, 1, 1),
-            block_dim: (block_size, 1, 1),
-            shared_mem_bytes: shared_bytes,
-        };
-
-        // Fewer iterations for attention (more expensive per call).
-        let attn_iters = iterations / 10;
-
-        let (mean_us, _min_us, _max_us, _elapsed) =
-            bench_kernel_loop(&stream, 50, attn_iters, || {
-                unsafe {
-                    stream
-                        .launch_builder(&func)
-                        .arg(&q_gpu)
-                        .arg(&k_cache_gpu)
-                        .arg(&v_cache_gpu)
-                        .arg(&mut out_gpu)
-                        .arg(&num_heads)
-                        .arg(&num_kv_heads)
-                        .arg(&head_dim)
-                        .arg(&seq_len)
-                        .arg(&max_seq_len)
-                        .arg(&scale)
-                        .launch(cfg)
-                }
-                .unwrap();
-            });
-
-        eprintln!("  seq_len={seq_len:4}: {mean_us:8.1} us/op  ({attn_iters} iterations)",);
-    }
-}
-
-#[test]
-#[ignore]
 fn bench_kernel_swiglu() {
     let iterations = env_usize("LUMEN_BENCH_ITERATIONS", 10000);
     let dim = 5632usize; // TinyLlama intermediate_dim
@@ -832,64 +753,3 @@ fn bench_kernel_rope() {
 // ---------------------------------------------------------------------------
 // BENCH 3: Kernel compilation time
 // ---------------------------------------------------------------------------
-
-#[test]
-#[ignore]
-fn bench_kernel_compilation_time() {
-    let (ctx, _stream) = create_context();
-
-    eprintln!();
-    eprintln!("=== Kernel Compilation Time ===");
-
-    let kernel_sources = [
-        (
-            "norm.cu (rmsnorm)",
-            lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE,
-        ),
-        (
-            "matvec_f32.cu",
-            lumen_runtime::cuda::shaders::MATVEC_F32_KERNEL_SOURCE,
-        ),
-        (
-            "matvec_q8_0.cu",
-            lumen_runtime::cuda::shaders::MATVEC_Q8_0_KERNEL_SOURCE,
-        ),
-        ("rope.cu", lumen_runtime::cuda::shaders::ROPE_KERNEL_SOURCE),
-        (
-            "activations.cu",
-            lumen_runtime::cuda::shaders::ACTIVATIONS_KERNEL_SOURCE,
-        ),
-        (
-            "attention.cu",
-            lumen_runtime::cuda::shaders::ATTENTION_KERNEL_SOURCE,
-        ),
-        (
-            "kv_cache.cu",
-            lumen_runtime::cuda::shaders::KV_CACHE_KERNEL_SOURCE,
-        ),
-        (
-            "embed.cu",
-            lumen_runtime::cuda::shaders::EMBED_KERNEL_SOURCE,
-        ),
-    ];
-
-    let mut total_ms = 0.0f64;
-
-    for (name, source) in &kernel_sources {
-        let start = Instant::now();
-        let ptx = compile_ptx(source).unwrap();
-        let compile_time = start.elapsed();
-
-        let load_start = Instant::now();
-        let _module = ctx.load_module(ptx).unwrap();
-        let load_time = load_start.elapsed();
-
-        let compile_ms = compile_time.as_secs_f64() * 1000.0;
-        let load_ms = load_time.as_secs_f64() * 1000.0;
-        total_ms += compile_ms + load_ms;
-
-        eprintln!("  {name:30}  compile: {compile_ms:7.1} ms  load: {load_ms:6.1} ms",);
-    }
-
-    eprintln!("  {:<30}  total:  {total_ms:7.1} ms", "ALL KERNELS");
-}

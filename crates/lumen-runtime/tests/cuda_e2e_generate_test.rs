@@ -329,7 +329,7 @@ fn cuda_e2e_larger_model_matches_cpu() {
         num_layers: 4,
         num_heads: 4,
         num_kv_heads: 2,
-        head_dim: 8,
+        head_dim: 128,
         hidden_dim: 32,
         intermediate_dim: 64,
         vocab_size: 64,

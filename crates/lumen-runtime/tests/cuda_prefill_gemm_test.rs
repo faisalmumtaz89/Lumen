@@ -247,7 +247,7 @@ fn test_gemm_batch_32_tile_aligned() {
 }
 
 // ---------- Test: dimensions that are multiples of 32 ----------
-// hidden_dim=32, head_dim=16, inter=64 -- all tile-aligned.
+// hidden_dim=32, head_dim=128, inter=64 -- all tile-aligned.
 // This verifies the kernel works correctly in the "happy path".
 
 #[test]
@@ -255,7 +255,7 @@ fn test_gemm_tile_aligned_dimensions() {
     let config = TestModelConfig {
         num_heads: 2,
         num_kv_heads: 2,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 32,
         intermediate_dim: 64,
         vocab_size: 64,
@@ -291,8 +291,8 @@ fn test_gemm_pp128_small_model() {
 }
 
 // ---------- Test: asymmetric Q vs KV dimensions ----------
-// num_heads=4, num_kv_heads=1: q_dim=64, kv_dim=16. The WQ GEMM has
-// N=64 (2 tiles), while WK/WV GEMM has N=16 (1 partial tile).
+// num_heads=4, num_kv_heads=1: q_dim=512, kv_dim=128. The WQ GEMM has
+// N=512 (16 tiles), while WK/WV GEMM has N=128 (4 tiles).
 // This tests that different N dimensions within the same prefill call
 // all produce correct results.
 
@@ -301,7 +301,7 @@ fn test_gemm_asymmetric_qkv() {
     let config = TestModelConfig {
         num_heads: 4,
         num_kv_heads: 1,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 64,
         intermediate_dim: 128,
         vocab_size: 64,
@@ -317,16 +317,16 @@ fn test_gemm_asymmetric_qkv() {
 }
 
 // ---------- Test: odd dimensions (primes) ----------
-// hidden_dim=13, head_dim=13, inter_dim=17. None of these are multiples
-// of 32, and none are even multiples of 4. Stress-tests the zero-padding
-// logic in the GEMM kernel.
+// hidden_dim=13, inter_dim=17: neither is a multiple of 32, nor even of 4.
+// Stress-tests the zero-padding logic in the GEMM kernel. (head_dim stays
+// 128, the smallest head dimension the decode-attention kernel serves.)
 
 #[test]
 fn test_gemm_prime_dimensions() {
     let config = TestModelConfig {
         num_heads: 1,
         num_kv_heads: 1,
-        head_dim: 13,
+        head_dim: 128,
         hidden_dim: 13,
         intermediate_dim: 17,
         vocab_size: 32,
@@ -350,7 +350,7 @@ fn test_gemm_single_token_aligned() {
     let config = TestModelConfig {
         num_heads: 2,
         num_kv_heads: 2,
-        head_dim: 16,
+        head_dim: 128,
         hidden_dim: 32,
         intermediate_dim: 64,
         vocab_size: 64,
