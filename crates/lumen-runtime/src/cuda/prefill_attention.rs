@@ -1518,12 +1518,13 @@ mod tests {
                 return;
             }
         };
-        // The GQA-shared pair is on by default only for a Q4_0 dense body on a
-        // 12.x device, which a bare kernel set does not declare: force it on so
-        // the arm this test exists for is the one that runs.
+        // The split-K route and the GQA-shared pair are on by default only for
+        // the model and device classes a bare kernel set does not declare:
+        // force both on so the arm this test exists for is the one that runs.
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK", "1");
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "1");
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
@@ -1531,6 +1532,7 @@ mod tests {
         struct Unset;
         impl Drop for Unset {
             fn drop(&mut self) {
+                std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK");
                 std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
             }
         }
