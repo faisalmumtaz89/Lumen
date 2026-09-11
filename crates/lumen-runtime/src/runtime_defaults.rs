@@ -1254,13 +1254,15 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// −15 % at 4,096, equal elsewhere, over the four sweep runs), and one bound on both
 /// stores gives them the same split geometry at every context, so on
 /// half-representable inputs the half store's output is bit-identical to the
-/// F32 store's. Against the previous release's one-tile kernel on the half
-/// store (six CTAs per SM to 255 tiles) the loop reads −10 % at 2,600 keys,
-/// 0 % at 2,816 and 3,200, −3 to −8 % at 3,600, +17 % at 3,968 (the one slower
-/// cell, in every run: 248 tiles walk two waves at five CTAs per SM where
-/// the six-CTA kernel takes one), −8 to −15 % at 4,096, −7 % at 4,800, −17 %
-/// at 6,144, −29 % at 16,384; the harness timer is quantised near 2 µs, so
-/// these are coarse. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`;
+/// F32 store's. Against the pre-loop one-tile form on the half store (this
+/// release's half twin of the previous release's partial; six CTAs per SM to
+/// 255 tiles) the loop reads −10 % at 2,600 keys, 0 % at 2,816 and 3,200,
+/// −3 to −8 % at 3,600, +17 % at 3,968 (the one slower cell, in every run:
+/// the loop's 128 CTAs per KV head each walk two tiles in series where the
+/// one-tile form's 992 CTAs all fit one wave at six per SM), −8 to −15 % at
+/// 4,096, −7 % at 4,800, −17 % at 6,144, −29 % at 16,384, the sole exception
+/// elsewhere one timer tick (+0.2 %) at 1,152 keys in one run of four; the
+/// harness timer is quantised near 2 µs, so these are coarse. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`;
 /// `0` or unparsable is the default.
 pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")

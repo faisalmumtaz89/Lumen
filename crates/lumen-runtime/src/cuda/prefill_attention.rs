@@ -1518,6 +1518,23 @@ mod tests {
                 return;
             }
         };
+        // The GQA-shared pair is on by default only for a Q4_0 dense body on a
+        // 12.x device, which a bare kernel set does not declare: force it on so
+        // the arm this test exists for is the one that runs.
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6", "1");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
+        std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6");
+            }
+        }
+        let _unset = Unset;
         let kernels = match super::super::decode::compile_all_kernels(&device, KvPrecision::F16) {
             Ok(k) => k,
             Err(e) => {
@@ -1525,6 +1542,10 @@ mod tests {
                 return;
             }
         };
+        assert!(
+            kernels.attention_decode_splitk_partial_gqa6.is_some() && kernels.kv_f16.is_some(),
+            "the GQA-shared pair and the half twins must load for this test to mean anything"
+        );
         let (num_heads, num_kv_heads, head_dim) = (24usize, 4usize, 256usize);
         let max_seq_len = 16_400usize;
         let cache = num_kv_heads * max_seq_len * head_dim;
@@ -1645,23 +1666,23 @@ mod tests {
                 .iter()
                 .map(|x| x.to_bits())
                 .collect();
-            // Past the pair's bound both stores take the per-query-head pair
-            // (when it loaded), each with its own store's kernel.
-            match (a, b) {
-                (V::Tiled, V::TiledF16) | (V::SplitKGqa6, V::SplitKGqa6F16) => {
-                    assert_eq!(
-                        got32, got16,
-                        "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
-                    );
-                }
-                (V::SplitK, V::SplitKF16) => {
-                    assert_eq!(
-                        got32, got16,
-                        "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
-                    );
-                }
-                other => panic!("at seq_len {seq_len} the stores took {other:?}"),
-            }
+            // A one-chunk context (128 keys or fewer) is the tiled kernel's; every
+            // longer one must take the GQA-shared pair on both stores, on the
+            // partition the shared policy picks — the arm this test guards.
+            let want = if super::super::prefill::attn_splitk_chunks(seq_len) <= 1 {
+                (V::Tiled, V::TiledF16)
+            } else {
+                (V::SplitKGqa6, V::SplitKGqa6F16)
+            };
+            assert_eq!(
+                (a, b),
+                want,
+                "at seq_len {seq_len} the stores took ({a:?}, {b:?})"
+            );
+            assert_eq!(
+                got32, got16,
+                "outputs differ at seq_len {seq_len} ({a:?} / {b:?})"
+            );
         }
     }
 }

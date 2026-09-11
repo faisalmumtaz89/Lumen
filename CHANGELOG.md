@@ -22,9 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   2,600 keys, −19 to −21 % at 6,144, −27 % at 16,384, never slower at any measured
   context; half store −10 % at 2,600, −3 to −8 % at 3,600, −8 to −15 % at 4,096,
   −17 % at 6,144, −29 % at 16,384, equal at 2,816 and 3,200, and slower in
-  one cell, +17 % at 3,968 keys in every run (248 tiles walk two waves where
-  the previous release's six-CTA kernel took one; the harness timer is
-  quantised near 2 µs, so these are coarse), the sole exception elsewhere one
+  one cell, +17 % at 3,968 keys in every run (the loop's 128 CTAs per KV head
+  each walk two tiles in series where the pre-loop one-tile form's 992 CTAs
+  fit one wave at six per SM; the harness timer is quantised near 2 µs, so
+  these are coarse), the sole exception elsewhere one
   timer tick (+0.2 %) at 1,152 keys in one run of four; 24,576 and 32,768
   keys now served. Below the one-tile bound the partial pass is bit-identical
   to v0.30.0's; the merge changed in this release (the eight-lane merge
@@ -58,7 +59,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   on real Qwen3.8-27B activations at 5k and 11k keys the half-stored
   attention output differs from the F32-stored one by a relative L2 of
   about 2e-4 (7.5e-4 worst per call). The cache takes half the bytes
-  (1.07 GB instead of 2.15 GB at 16,384 positions on Qwen3.8-27B) and the
+  (1.07 GB instead of 2.15 GB at 16,384 positions on Qwen3.8-27B; the prefill
+  widening pair the half store allocates at start-up adds 128 MB at that
+  capacity, so the net saving there is 0.95 GB) and the
   decode-attention kernels read half the bytes. Off unless set; the F32
   store is unchanged.
 

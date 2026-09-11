@@ -636,11 +636,20 @@ mod gpu_tests {
                 );
             }
         }
-        // Every other position stays untouched.
-        let written: usize = stored.iter().filter(|&&h| h != 0).count();
-        assert!(
-            written <= total_data_elems,
-            "the writer touched {written} halves for {total_data_elems} values"
-        );
+        // Every position other than the written one stays zero.
+        for head in 0..num_kv_heads {
+            for p in 0..max_seq_len {
+                if p == pos {
+                    continue;
+                }
+                let base = ((head * max_seq_len + p) * head_dim) as usize;
+                assert!(
+                    stored[base..base + head_dim as usize]
+                        .iter()
+                        .all(|&h| h == 0),
+                    "the writer touched head {head} position {p}"
+                );
+            }
+        }
     }
 }
