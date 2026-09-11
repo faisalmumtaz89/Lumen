@@ -1634,10 +1634,14 @@ mod tests {
         assert_eq!(kv16.bytes() * 2, kv32.bytes());
 
         let q_gpu = device.htod_copy(&q).unwrap();
-        let s_max =
-            super::super::prefill::attn_splitk_gqa6_scratch_chunks(max_seq_len as u32, true).max(
-                super::super::prefill::attn_splitk_gqa6_scratch_chunks(max_seq_len as u32, false),
-            ) as usize;
+        let s_max = super::super::prefill::attn_splitk_gqa6_scratch_chunks(
+            max_seq_len as u32,
+            num_kv_heads as u32,
+        )
+        .max(super::super::prefill::attn_splitk_gqa6_scratch_chunks(
+            max_seq_len as u32,
+            num_kv_heads as u32,
+        )) as usize;
         let mut scratch = (
             device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),
             device.alloc_zeros::<f32>(num_heads * s_max).unwrap(),

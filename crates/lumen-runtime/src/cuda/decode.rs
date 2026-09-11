@@ -220,6 +220,9 @@ pub(crate) struct KernelSet {
     /// backend's model is outside the kernel's domain (then the pair is not
     /// loaded and the other routes serve).
     pub(crate) attn_spec: Option<super::prefill::DecodeAttentionSpec>,
+    /// The NVRTC target the GQA-shared module was compiled for
+    /// (`LUMEN_CUDA_ATTN_CODEGEN`): "default", "ptx80" or "ptx120".
+    pub(crate) attn_codegen: &'static str,
     /// The previous one-tile partial (`attention_decode_splitk_partial_gqa6_f32`),
     /// retained as the A/B control `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`
     /// launches; loaded with the loop, so the control is the kernel of the
@@ -1011,8 +1014,34 @@ pub(crate) fn compile_all_kernels(
         && attn_spec.is_some();
     // The GQA-shared module is compiled for the model's shape: the spec's
     // defines are prepended to the source, so each shape is its own module
-    // (and its own PTX cache entry).
+    // (and its own PTX cache entry). `LUMEN_CUDA_ATTN_CODEGEN` picks the
+    // NVRTC target for it (an A/B knob: the default is NVRTC's default
+    // target, the reviewed build); a target the toolkit refuses falls back to
+    // the default and is announced.
     let gqa6_source = attn_spec.map(|s| s.source()).unwrap_or_default();
+    let gqa6_codegen = std::cell::Cell::new(attn_codegen_selection());
+    let load_splitk_gqa6_fn = |name: &str| -> Result<CudaFunction, RuntimeError> {
+        let selected = gqa6_codegen.get();
+        let module = match selected {
+            "ptx80" | "ptx120" => {
+                let arch = attn_tiled_codegen_target(selected);
+                match device.compile_and_load_with_arch(&gqa6_source, arch) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!(
+                            "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
+                        );
+                        gqa6_codegen.set("default");
+                        device.compile_and_load(&gqa6_source)?
+                    }
+                }
+            }
+            _ => device.compile_and_load(&gqa6_source)?,
+        };
+        module
+            .load_function(name)
+            .map_err(|e| RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}")))
+    };
 
     // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
@@ -1087,12 +1116,10 @@ pub(crate) fn compile_all_kernels(
     // init, never discovered at a dispatch.
     let kv_f16 = match kv_precision {
         crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
-            splitk_partial_gqa6: load_splitk(
-                &gqa6_source,
+            splitk_partial_gqa6: load_splitk_gqa6_fn(
                 "attention_decode_splitk_partial_gqa6_loop_f16",
             )?,
-            splitk_partial_gqa6_onetile: load_splitk(
-                &gqa6_source,
+            splitk_partial_gqa6_onetile: load_splitk_gqa6_fn(
                 "attention_decode_splitk_partial_gqa6_f16",
             )?,
             splitk_partial: load_splitk(
@@ -1118,9 +1145,18 @@ pub(crate) fn compile_all_kernels(
         }
     };
 
+    if let Some(spec) = attn_spec.filter(|_| load_splitk_gqa6) {
+        cuda_log!(
+            "[CUDA] GQA-shared decode attention: compiled for G={} (query heads per KV head), head_dim={}, codegen={}",
+            spec.group,
+            spec.head_dim,
+            gqa6_codegen.get()
+        );
+    }
     let kernels = KernelSet {
         kv_f16,
         attn_spec,
+        attn_codegen: gqa6_codegen.get(),
         attention_decode_tiled_codegen: tiled_codegen.get(),
         rmsnorm: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm")?,
         rmsnorm_per_head: load_fn(shaders::NORM_KERNEL_SOURCE, "rmsnorm_per_head")?,
@@ -1218,10 +1254,7 @@ pub(crate) fn compile_all_kernels(
             None
         },
         attention_decode_splitk_partial_gqa6: if load_splitk_gqa6 {
-            match load_splitk(
-                &gqa6_source,
-                "attention_decode_splitk_partial_gqa6_loop_f32",
-            ) {
+            match load_splitk_gqa6_fn("attention_decode_splitk_partial_gqa6_loop_f32") {
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_loop_f32: FAILED ({e})");
@@ -1232,7 +1265,7 @@ pub(crate) fn compile_all_kernels(
             None
         },
         attention_decode_splitk_partial_gqa6_onetile: if load_splitk_gqa6 {
-            match load_splitk(&gqa6_source, "attention_decode_splitk_partial_gqa6_f32") {
+            match load_splitk_gqa6_fn("attention_decode_splitk_partial_gqa6_f32") {
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_partial_gqa6_f32: FAILED ({e})");
@@ -1243,7 +1276,7 @@ pub(crate) fn compile_all_kernels(
             None
         },
         attention_decode_splitk_merge_gqa6: if load_splitk_gqa6 {
-            match load_splitk(&gqa6_source, "attention_decode_splitk_merge_gqa6_f32") {
+            match load_splitk_gqa6_fn("attention_decode_splitk_merge_gqa6_f32") {
                 Ok(f) => Some(f),
                 Err(e) => {
                     cuda_log!("[CUDA] attention_decode_splitk_merge_gqa6_f32: FAILED ({e})");
@@ -4462,6 +4495,17 @@ pub(crate) fn attn_tiled_codegen_selection(
 }
 
 /// The NVRTC target a `attn_tiled_codegen` selection compiles for, as text for the load log.
+/// `LUMEN_CUDA_ATTN_CODEGEN`: the NVRTC target for the GQA-shared decode-attention module.
+/// Default: NVRTC's default target (the reviewed build). `ptx80` / `ptx120` request that
+/// target; an A/B knob for the codegen question, not a per-device default.
+pub(crate) fn attn_codegen_selection() -> &'static str {
+    match std::env::var("LUMEN_CUDA_ATTN_CODEGEN").ok().as_deref() {
+        Some("ptx80") => "ptx80",
+        Some("ptx120") => "ptx120",
+        _ => "default",
+    }
+}
+
 pub(crate) fn attn_tiled_codegen_target(codegen: &str) -> &'static str {
     match codegen {
         "ptx80" => "compute_80",

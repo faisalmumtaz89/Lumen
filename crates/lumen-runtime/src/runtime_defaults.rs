@@ -1246,8 +1246,10 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 
 /// `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`: up to this many 16-key tiles the
 /// GQA-shared pair runs one tile per CTA (the pre-loop form, bit-identical);
-/// above it the CTAs walk whole tiles at the fixed target. The default, 176 on
-/// either store, is the RTX 5090 sweeps' choice: on the F32 store the loop is
+/// above it the CTAs walk whole tiles at the fixed target. The default is
+/// derived per model from the CTA totals measured on the RTX 5090
+/// (`attn_splitk_gqa6_one_tile_default`): 176 for 4 KV heads, on either
+/// store, the RTX 5090 sweeps' choice: on the F32 store the loop is
 /// never slower than the one-tile form below 176 tiles and faster above; on
 /// the half store a 176 and a 256 bound are a wash on the fine grid (176 reads
 /// +10 % at 3,200 keys and +8 % at 3,968, −6 to −8 % at 3,600 and −8 to
@@ -1264,16 +1266,12 @@ pub const ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT: u32 = 1024;
 /// elsewhere one timer tick (+0.2 %) at 1,152 keys in one run of four; the
 /// harness timer is quantised near 2 µs, so these are coarse. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`;
 /// `0` or unparsable is the default.
-pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
+pub fn attn_splitk_gqa6_one_tile_max(num_kv_heads: u32) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(if half_store {
-            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16
-        } else {
-            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
-        })
+        .unwrap_or_else(|| attn_splitk_gqa6_one_tile_default(num_kv_heads))
         .min(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT)
 }
 
@@ -1287,18 +1285,50 @@ pub fn attn_splitk_gqa6_one_tile_max(half_store: bool) -> u32 {
 /// best half-store count from 16k up. The
 /// scratch is sized for `max(one-tile bound, target)` chunks and never grows
 /// with the context. Clamped to `1..=ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT`.
-pub fn attn_splitk_gqa6_target() -> u32 {
+pub fn attn_splitk_gqa6_target(num_kv_heads: u32) -> u32 {
     std::env::var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(ATTN_SPLITK_GQA6_TARGET_DEFAULT)
+        .unwrap_or_else(|| attn_splitk_gqa6_target_default(num_kv_heads))
         .min(ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT)
 }
 
+/// The one-tile bound and the whole-tile target were measured on the RTX
+/// 5090 for a model with 4 KV heads as 176 and 128 chunks per KV head: one
+/// wave of 4 × 176 = 704 one-tile CTAs and 4 × 128 = 512 whole-tile CTAs
+/// over the card's 170 SMs. A model with another KV-head count keeps those
+/// CTA totals — the grid the device was measured with — so the per-KV-head
+/// counts scale inversely (352 and 256 on 2 KV heads); the sweep on each
+/// shipped model records whether that holds.
+pub const ATTN_SPLITK_GQA6_ONE_TILE_CTAS: u32 = 704;
+pub const ATTN_SPLITK_GQA6_TARGET_CTAS: u32 = 512;
+
+pub const fn attn_splitk_gqa6_one_tile_default(num_kv_heads: u32) -> u32 {
+    let kv = if num_kv_heads == 0 { 1 } else { num_kv_heads };
+    let n = ATTN_SPLITK_GQA6_ONE_TILE_CTAS.div_ceil(kv);
+    if n > ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT {
+        ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
+    } else {
+        n
+    }
+}
+
+pub const fn attn_splitk_gqa6_target_default(num_kv_heads: u32) -> u32 {
+    let kv = if num_kv_heads == 0 { 1 } else { num_kv_heads };
+    let n = ATTN_SPLITK_GQA6_TARGET_CTAS.div_ceil(kv);
+    if n > ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT {
+        ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
+    } else {
+        n
+    }
+}
+
+/// The measured 4-KV-head values, which the derivation above must reproduce.
 pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT: u32 = 176;
-pub const ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16: u32 = 176;
 pub const ATTN_SPLITK_GQA6_TARGET_DEFAULT: u32 = 128;
+const _: () = assert!(attn_splitk_gqa6_one_tile_default(4) == ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT);
+const _: () = assert!(attn_splitk_gqa6_target_default(4) == ATTN_SPLITK_GQA6_TARGET_DEFAULT);
 
 /// [`attn_splitk_gqa6_default`] with every input explicit (the process
 /// wrappers feed the globals; tests feed values).
@@ -2056,6 +2086,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CORR010_MODEL",
     "LUMEN_CUDA_ARGMAX_TILED",
     "LUMEN_CUDA_ATTN_BANK3",
+    "LUMEN_CUDA_ATTN_CODEGEN",
     "LUMEN_CUDA_ATTN_DUMP",
     "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
     "LUMEN_CUDA_ATTN_PREP_FUSE",
@@ -3657,33 +3688,40 @@ mod tests {
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
         assert_eq!(
-            attn_splitk_gqa6_one_tile_max(false),
+            attn_splitk_gqa6_one_tile_max(4),
             ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
         );
         assert_eq!(
-            attn_splitk_gqa6_one_tile_max(true),
-            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT_F16
+            attn_splitk_gqa6_one_tile_max(4),
+            ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
         );
-        assert_eq!(attn_splitk_gqa6_target(), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
+        assert_eq!(attn_splitk_gqa6_target(4), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
+        // Per model: the CTA totals stay, the per-KV-head counts scale.
+        assert_eq!(attn_splitk_gqa6_one_tile_max(2), 352);
+        assert_eq!(attn_splitk_gqa6_target(2), 256);
+        assert_eq!(attn_splitk_gqa6_one_tile_max(1), 704);
+        assert_eq!(attn_splitk_gqa6_target(1), 512);
+        assert_eq!(attn_splitk_gqa6_one_tile_max(8), 88);
+        assert_eq!(attn_splitk_gqa6_target(8), 64);
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE", "4096");
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", " 96 ");
         assert_eq!(
-            attn_splitk_gqa6_one_tile_max(false),
+            attn_splitk_gqa6_one_tile_max(4),
             ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
         );
         assert_eq!(
-            attn_splitk_gqa6_one_tile_max(true),
+            attn_splitk_gqa6_one_tile_max(4),
             ATTN_SPLITK_GQA6_MAX_CHUNKS_DEFAULT
         );
-        assert_eq!(attn_splitk_gqa6_target(), 96);
+        assert_eq!(attn_splitk_gqa6_target(4), 96);
         for v in ["0", "garbage", ""] {
             std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE", v);
             std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET", v);
             assert_eq!(
-                attn_splitk_gqa6_one_tile_max(false),
+                attn_splitk_gqa6_one_tile_max(4),
                 ATTN_SPLITK_GQA6_ONE_TILE_DEFAULT
             );
-            assert_eq!(attn_splitk_gqa6_target(), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
+            assert_eq!(attn_splitk_gqa6_target(4), ATTN_SPLITK_GQA6_TARGET_DEFAULT);
         }
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE");
         std::env::remove_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET");
@@ -4377,6 +4415,7 @@ mod tests {
         "LUMEN_CORR010_MODEL",
         "LUMEN_CUDA_ARGMAX_TILED",
         "LUMEN_CUDA_ATTN_BANK3",
+        "LUMEN_CUDA_ATTN_CODEGEN",
         "LUMEN_CUDA_ATTN_DUMP",
         "LUMEN_CUDA_ATTN_PREFILL_SGEMM",
         "LUMEN_CUDA_ATTN_PREP_FUSE",

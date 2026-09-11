@@ -18035,7 +18035,7 @@ impl ComputeBackend for CudaBackend {
                     // A/B control sizes it for its one-tile bound instead.
                     (super::prefill::attn_splitk_gqa6_scratch_chunks(
                         max_seq_len as u32,
-                        self.kv_precision == KvPrecision::F16,
+                        num_kv_heads as u32,
                     ) as usize)
                         .max(super::prefill::ATTN_SPLITK_S_MAX as usize)
                 } else {

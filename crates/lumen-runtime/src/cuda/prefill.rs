@@ -2193,15 +2193,17 @@ pub struct SplitKGqa6Policy {
 }
 
 impl SplitKGqa6Policy {
-    pub fn from_env(half_store: bool) -> Self {
+    /// The policy for a model with `num_kv_heads` KV heads: the knobs when
+    /// set, else the per-model defaults.
+    pub fn from_env(num_kv_heads: u32) -> Self {
         let max_chunks = crate::runtime_defaults::attn_splitk_gqa6_max_chunks();
         let one_tile_max = max_chunks
-            .unwrap_or_else(|| crate::runtime_defaults::attn_splitk_gqa6_one_tile_max(half_store))
+            .unwrap_or_else(|| crate::runtime_defaults::attn_splitk_gqa6_one_tile_max(num_kv_heads))
             .clamp(1, ATTN_SPLITK_GQA6_S_MAX);
         Self {
             max_chunks,
             one_tile_max,
-            target: crate::runtime_defaults::attn_splitk_gqa6_target(),
+            target: crate::runtime_defaults::attn_splitk_gqa6_target(num_kv_heads),
         }
     }
 
@@ -2264,7 +2266,10 @@ impl SplitKGqa6Policy {
 /// the loop); unset, no bound — the loop serves any context the cache holds,
 /// so the test sees the largest count the arithmetic allows.
 pub fn attn_splitk_gqa6_chunk_bound() -> u32 {
-    SplitKGqa6Policy::from_env(false).chunk_bound()
+    match crate::runtime_defaults::attn_splitk_gqa6_max_chunks() {
+        Some(b) => b.clamp(1, ATTN_SPLITK_GQA6_S_MAX),
+        None => u32::MAX / ATTN_SPLITK_GQA6_CHUNK,
+    }
 }
 
 /// Dynamic shared bytes of the retained one-tile partials (the previous
@@ -2280,8 +2285,8 @@ pub type SplitKGqa6Partition = u32;
 /// above it the target count on the balanced partition (never with the A/B
 /// control set — there the caller has already excluded the context).
 /// Pure in its explicit form below; this reads the process knobs once.
-pub fn attn_splitk_gqa6_geometry(seq_len: u32, half_store: bool) -> (u32, SplitKGqa6Partition) {
-    SplitKGqa6Policy::from_env(half_store).geometry(seq_len)
+pub fn attn_splitk_gqa6_geometry(seq_len: u32, num_kv_heads: u32) -> (u32, SplitKGqa6Partition) {
+    SplitKGqa6Policy::from_env(num_kv_heads).geometry(seq_len)
 }
 
 /// [`attn_splitk_gqa6_geometry`] with the policy explicit.
@@ -2302,16 +2307,16 @@ pub const fn attn_splitk_gqa6_geometry_within(
 }
 
 /// The GQA-shared split count for `seq_len` under the policy in force.
-pub fn attn_splitk_gqa6_chunks(seq_len: u32, half_store: bool) -> u32 {
-    attn_splitk_gqa6_geometry(seq_len, half_store).0
+pub fn attn_splitk_gqa6_chunks(seq_len: u32, num_kv_heads: u32) -> u32 {
+    attn_splitk_gqa6_geometry(seq_len, num_kv_heads).0
 }
 
 /// The split count the scratch must hold for a cache of `max_seq_len`: the
 /// largest count any context up to it can take — the one-tile bound or the
 /// target, whichever is larger, capped by the tile count the cache can even
 /// reach (the geometry never launches more CTAs than tiles, so this is exact).
-pub fn attn_splitk_gqa6_scratch_chunks(max_seq_len: u32, half_store: bool) -> u32 {
-    SplitKGqa6Policy::from_env(half_store).scratch_chunks(max_seq_len)
+pub fn attn_splitk_gqa6_scratch_chunks(max_seq_len: u32, num_kv_heads: u32) -> u32 {
+    SplitKGqa6Policy::from_env(num_kv_heads).scratch_chunks(max_seq_len)
 }
 
 /// The scratch count for an explicit policy (pure): the largest split count
@@ -2357,7 +2362,13 @@ pub fn attention_decode_splitk_gqa6_supports(
     head_dim: u32,
     seq_len: u32,
 ) -> bool {
-    SplitKGqa6Policy::from_env(false).supports(spec, num_heads, num_kv_heads, head_dim, seq_len)
+    SplitKGqa6Policy::from_env(num_kv_heads).supports(
+        spec,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+    )
 }
 
 /// [`attention_decode_splitk_gqa6_supports`] with the chunk bound explicit: a
@@ -2786,7 +2797,6 @@ fn splitk_gqa6_exclusion_reason(
     head_dim: u32,
     seq_len: u32,
     chunk_bound: u32,
-    half_store: bool,
 ) -> Option<SplitKGqa6Exclusion> {
     use SplitKGqa6Exclusion as X;
     if force_tiled {
@@ -2818,7 +2828,7 @@ fn splitk_gqa6_exclusion_reason(
         return Some(X::Shape);
     }
     let needed = (num_heads as usize)
-        * (attn_splitk_gqa6_chunks(seq_len, half_store) as usize)
+        * (attn_splitk_gqa6_chunks(seq_len, num_kv_heads) as usize)
         * (head_dim as usize);
     if o_floats < needed {
         return Some(X::ScratchTooSmall);
@@ -3132,7 +3142,6 @@ pub(crate) fn decode_attention_splitk_choice(
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
-    half_store: bool,
 ) -> Option<SplitKChoice> {
     // Split-K upgrade: applies only to the AUTO Tiled selection — an explicit
     // `LUMEN_CUDA_DECODE_TILED=1` still forces the tiled kernel, and a
@@ -3162,7 +3171,7 @@ pub(crate) fn decode_attention_splitk_choice(
         && kernels.attention_decode_splitk_merge_gqa6.is_some();
     // One snapshot of the policy: geometry, eligibility and the kernel
     // choice come from the same reading.
-    let policy = SplitKGqa6Policy::from_env(half_store);
+    let policy = SplitKGqa6Policy::from_env(num_kv_heads);
     let (chunks, partition) = policy.geometry(seq_len);
     if let (true, Some(spec)) = (gqa6_loaded, kernels.attn_spec) {
         if policy.supports(spec, num_heads, num_kv_heads, head_dim, seq_len)
@@ -3220,7 +3229,6 @@ unsafe fn launch_attention_decode_routed(
             head_dim,
             seq_len,
             attn_splitk_gqa6_chunk_bound(),
-            false,
         ) {
             announce_splitk_gqa6_excluded(num_heads, num_kv_heads, head_dim, seq_len, reason);
         }
@@ -3235,7 +3243,6 @@ unsafe fn launch_attention_decode_routed(
         num_kv_heads,
         head_dim,
         seq_len,
-        false,
     ) {
         Some(SplitKChoice::Gqa6(launch)) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
@@ -4800,7 +4807,6 @@ mod attn_splitk_gqa6_tests {
             HD,
             1100,
             ATTN_SPLITK_GQA6_S_MAX,
-            false,
         )
     }
 
@@ -4835,7 +4841,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4854,7 +4859,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4873,7 +4877,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4892,7 +4895,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4911,7 +4913,6 @@ mod attn_splitk_gqa6_tests {
                     100,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4933,7 +4934,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     64,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4952,7 +4952,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
             (
@@ -4971,7 +4970,6 @@ mod attn_splitk_gqa6_tests {
                     HD,
                     1100,
                     ATTN_SPLITK_GQA6_S_MAX,
-                    false,
                 ),
             ),
         ];
@@ -5014,7 +5012,6 @@ mod attn_splitk_gqa6_tests {
                 HD,
                 64,
                 ATTN_SPLITK_GQA6_S_MAX,
-                false,
             ),
             None
         );
@@ -5083,16 +5080,16 @@ mod attn_splitk_gqa6_tests {
             HD,
             1 << 20
         ));
-        assert_eq!(super::attn_splitk_gqa6_geometry(16_385, false), (128, 1));
-        assert_eq!(super::attn_splitk_gqa6_geometry(2_816, false), (176, 0));
-        assert_eq!(super::attn_splitk_gqa6_geometry(2_817, false), (128, 1));
-        assert_eq!(super::attn_splitk_gqa6_geometry(2_816, true), (176, 0));
-        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, true), (128, 1));
-        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 176);
-        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, true), 176);
-        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1_000, false), 63);
+        assert_eq!(super::attn_splitk_gqa6_geometry(16_385, 4), (128, 1));
+        assert_eq!(super::attn_splitk_gqa6_geometry(2_816, 4), (176, 0));
+        assert_eq!(super::attn_splitk_gqa6_geometry(2_817, 4), (128, 1));
+        assert_eq!(super::attn_splitk_gqa6_geometry(2_816, 4), (176, 0));
+        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, 4), (128, 1));
+        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, 4), 176);
+        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, 4), 176);
+        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1_000, 4), 63);
         // One snapshot carries every derived value.
-        let p = super::SplitKGqa6Policy::from_env(false);
+        let p = super::SplitKGqa6Policy::from_env(4);
         assert_eq!(
             (
                 p.max_chunks,
@@ -5103,14 +5100,14 @@ mod attn_splitk_gqa6_tests {
             ),
             (None, 176, 128, false, u32::MAX / ATTN_SPLITK_GQA6_CHUNK)
         );
-        assert_eq!(super::SplitKGqa6Policy::from_env(true).one_tile_max, 176);
+        assert_eq!(super::SplitKGqa6Policy::from_env(4).one_tile_max, 176);
         assert_eq!(p.geometry(2_817), (128, 1));
         assert_eq!(p.scratch_chunks(1 << 20), 176);
         assert!(p.supports(SPEC, HEADS, KV, HD, 1 << 20));
         // The A/B control: the one-tile form up to its bound, the old hand-off past it.
         std::env::set_var("LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS", "256");
         assert_eq!(attn_splitk_gqa6_chunk_bound(), 256);
-        let p = super::SplitKGqa6Policy::from_env(true);
+        let p = super::SplitKGqa6Policy::from_env(4);
         assert_eq!(
             (p.max_chunks, p.one_tile_max, p.control(), p.chunk_bound()),
             (Some(256), 256, true, 256)
@@ -5118,8 +5115,8 @@ mod attn_splitk_gqa6_tests {
         assert_eq!(p.geometry(4_096), (256, 0));
         assert_eq!(p.scratch_chunks(1 << 20), 256);
         assert!(p.supports(SPEC, HEADS, KV, HD, 4_096) && !p.supports(SPEC, HEADS, KV, HD, 4_097));
-        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, false), (256, 0));
-        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, false), 256);
+        assert_eq!(super::attn_splitk_gqa6_geometry(4_096, 4), (256, 0));
+        assert_eq!(super::attn_splitk_gqa6_scratch_chunks(1 << 20, 4), 256);
         assert!(attention_decode_splitk_gqa6_supports(
             SPEC, HEADS, KV, HD, 4096
         ));
@@ -5160,7 +5157,6 @@ mod attn_splitk_gqa6_tests {
                 HD,
                 cap + 1,
                 ATTN_SPLITK_GQA6_S_MAX,
-                false,
             ),
             Some(SplitKGqa6Exclusion::Shape)
         );
@@ -5178,7 +5174,6 @@ mod attn_splitk_gqa6_tests {
                 HD,
                 cap,
                 ATTN_SPLITK_GQA6_S_MAX,
-                false,
             ),
             None
         );
@@ -5516,7 +5511,6 @@ unsafe fn launch_attention_decode_routed_f16(
             head_dim,
             seq_len,
             attn_splitk_gqa6_chunk_bound(),
-            true,
         ) {
             announce_splitk_gqa6_excluded(num_heads, num_kv_heads, head_dim, seq_len, reason);
         }
@@ -5531,7 +5525,6 @@ unsafe fn launch_attention_decode_routed_f16(
         num_kv_heads,
         head_dim,
         seq_len,
-        true,
     ) {
         Some(SplitKChoice::Gqa6(launch)) => {
             let scratch = splitk_scratch.expect("a split-K choice implies scratch");
