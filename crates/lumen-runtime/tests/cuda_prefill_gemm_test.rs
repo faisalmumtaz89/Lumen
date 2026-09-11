@@ -180,10 +180,12 @@ fn cuda_prefill(
     cuda.prefill(prompt_tokens, provider, &mut kv)
 }
 
-// ---------- Test: default config (hidden=8, head=4, inter=16, vocab=32) ----------
-// All dimensions are non-multiples of 32. This is the primary regression test
-// for the MISALIGNED_ADDRESS bug: the GEMM kernel must correctly zero-pad
-// shared memory tiles when M, N, K < 32.
+// ---------- Test: default config (hidden=8, head_dim=128, inter=16, vocab=32) ----------
+// hidden and inter are non-multiples of 32 (q_dim = kv_dim = 256 are not: the
+// decode-attention kernel's smallest head dimension is 128). This is the
+// primary regression test for the MISALIGNED_ADDRESS bug: the GEMM kernel
+// must correctly zero-pad shared memory tiles when M, N, K < 32 on the
+// WO / FFN projections.
 
 #[test]
 fn test_gemm_default_config_batch_1() {
@@ -271,7 +273,8 @@ fn test_gemm_tile_aligned_dimensions() {
 }
 
 // ---------- Test: large batch (pp128) with small dimensions ----------
-// 128 tokens with hidden_dim=8. GEMM grid: (1, 4). Four tile-rows,
+// 128 tokens with hidden_dim=8. GEMM grid: (1, 4) on the WO / FFN
+// projections ((8, 4) on Q/K/V at q_dim = kv_dim = 256). Four tile-rows,
 // all fully utilized. Tests that multi-row grids work correctly.
 
 #[test]
