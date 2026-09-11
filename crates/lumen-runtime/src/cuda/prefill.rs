@@ -4987,7 +4987,11 @@ mod attn_splitk_gqa6_tests {
                         "seq_len={seq_len}: span={span}"
                     );
                 } else {
-                    assert_eq!(s, target);
+                    assert_eq!(
+                        s,
+                        target.min(n),
+                        "whole-tile: the target, never more CTAs than tiles"
+                    );
                     assert!(
                         n > one_tile,
                         "whole-tile partition only above the one-tile bound"
