@@ -88,7 +88,7 @@ impl<W: Write> StreamingLbcWriter<W> {
         let layers_start = align_up(globals_start + globals_total, alignment);
 
         // --- Phase 2: fix up header offsets ---
-        let mut fixed_header = header.clone();
+        let mut fixed_header = crate::writer::header_with_version(header);
         fixed_header.layer_index_offset = header_bytes.len() as u64;
         fixed_header.payload_offset = globals_start as u64;
 

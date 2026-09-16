@@ -24,10 +24,10 @@ use std::sync::Mutex;
 use super::decode::{
     self, dp4a_q4_grid, dp4a_q8_1_grid, fused_glu_grid, fused_glu_shared_bytes_f16,
     fused_glu_shared_bytes_f32, fused_norm_matvec_block_size, hgemv_grid, hgemv_shared_bytes,
-    matvec_block_size, matvec_q8_0_grid, matvec_smem_grid, matvec_smem_grid_nr,
-    matvec_smem_shared_bytes, q8_1_quant_grid, rmsnorm_block_size, rmsnorm_shared_bytes, KernelSet,
-    Q4F32ActKernel, DP4A_Q4_BLOCK_DIM, DP4A_Q8_1_BLOCK_DIM, FUSED_GLU_BLOCK_DIM,
-    FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM, HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM,
+    kquant_layout, kquant_tag, matvec_block_size, matvec_q8_0_grid, matvec_smem_grid,
+    matvec_smem_grid_nr, matvec_smem_shared_bytes, q8_1_quant_grid, rmsnorm_block_size,
+    rmsnorm_shared_bytes, KernelSet, Q4F32ActKernel, DP4A_Q4_BLOCK_DIM, DP4A_Q8_1_BLOCK_DIM,
+    FUSED_GLU_BLOCK_DIM, FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM, HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM,
     Q8_1_QUANT_BLOCK_DIM, SMEM_BLOCK_DIM,
 };
 use super::ffi::CudaDevice;
@@ -790,6 +790,11 @@ struct GpuGlobals {
     /// Dispatched via the `embed_token_bf16` kernel. Avoids the host-side
     /// BF16 -> F32 inflation (~4 GB on Qwen3.5-9B) that previously OOM'd preload.
     embedding_bf16: Option<CudaSlice<u8>>,
+    /// Embedding as raw Q4_K / Q5_K / Q6_K superblocks with its scheme (None
+    /// otherwise). Gathered row-wise by the scheme's `embed_token_*` /
+    /// `embed_batch_*` kernels; keyed on the plane's own scheme, whatever the
+    /// artifact's header scheme is.
+    embedding_kquant: Option<(QuantScheme, CudaSlice<u8>)>,
 }
 
 /// GPU-resident scratch buffers for GDN (GatedDeltaNet) layer computation.
@@ -2301,7 +2306,7 @@ impl CudaBackend {
         };
 
         // Dispatch embed kernel based on embedding precision.
-        // Order: BF16 > F16 > Q4_0 > Q8_0 > F32. BF16 added for the Qwen3.5-9B BF16 path.
+        // Order: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32. BF16 added for the Qwen3.5-9B BF16 path.
         if let Some(ref emb_bf16) = st.globals.embedding_bf16 {
             let func = self.embed_bf16_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_bf16 kernel not compiled".into())
@@ -2334,6 +2339,33 @@ impl CudaBackend {
                     .launch(launch_cfg)
             }
             .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 gpu launch: {e}")))?;
+        } else if let Some((scheme, ref emb_kq)) = st.globals.embedding_kquant {
+            let func = &kquant_kernels(&st.kernels, scheme)
+                .ok_or_else(|| {
+                    RuntimeError::Compute(format!(
+                        "embed_token_{}: kernels not loaded",
+                        kquant_tag(scheme)
+                    ))
+                })?
+                .embed_token;
+            let hd = hidden_dim as u32;
+            unsafe {
+                self.device
+                    .stream
+                    .launch_builder(func)
+                    .arg(emb_kq)
+                    .arg(&mut st.scratch.x_gpu)
+                    .arg(&token_id)
+                    .arg(&hd)
+                    .launch(launch_cfg)
+            }
+            .map_err(|e| {
+                RuntimeError::Compute(format!(
+                    "CUDA embed_token_{} gpu launch: {e}",
+                    kquant_tag(scheme)
+                ))
+            })?;
+            announce_embed_route(scheme, hidden_dim);
         } else if let Some(ref emb_q4) = st.globals.embedding_q4 {
             let func = self.embed_q4_0_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_q4_0 kernel not compiled".into())
@@ -2922,7 +2954,7 @@ impl CudaBackend {
                                     &self.device,
                                     &st.kernels,
                                     &lw.wq,
-                                    lw.q8_split_wq.as_ref(),
+                                    lw.q8_split_wq.as_deref(),
                                     lw.q4_split_wq.as_ref(),
                                     q8_1_buf,
                                     st.scratch.q_gate.as_mut().unwrap(),
@@ -2935,7 +2967,7 @@ impl CudaBackend {
                                     &self.device,
                                     &st.kernels,
                                     &lw.wq,
-                                    lw.q8_split_wq.as_ref(),
+                                    lw.q8_split_wq.as_deref(),
                                     lw.q4_split_wq.as_ref(),
                                     q8_1_buf,
                                     &mut st.scratch.q,
@@ -2948,7 +2980,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.wk,
-                                lw.q8_split_wk.as_ref(),
+                                lw.q8_split_wk.as_deref(),
                                 lw.q4_split_wk.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.k,
@@ -2960,7 +2992,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.wv,
-                                lw.q8_split_wv.as_ref(),
+                                lw.q8_split_wv.as_deref(),
                                 lw.q4_split_wv.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.v,
@@ -3017,7 +3049,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_split_wq.as_ref(),
+                                lw.q8_split_wq.as_deref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
                                 st.scratch.q_gate.as_mut().unwrap(),
@@ -3030,7 +3062,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.wq,
-                                lw.q8_split_wq.as_ref(),
+                                lw.q8_split_wq.as_deref(),
                                 lw.q4_split_wq.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.q,
@@ -3043,7 +3075,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &lw.wk,
-                            lw.q8_split_wk.as_ref(),
+                            lw.q8_split_wk.as_deref(),
                             lw.q4_split_wk.as_ref(),
                             q8_1_buf,
                             &mut st.scratch.k,
@@ -3055,7 +3087,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &lw.wv,
-                            lw.q8_split_wv.as_ref(),
+                            lw.q8_split_wv.as_deref(),
                             lw.q4_split_wv.as_ref(),
                             q8_1_buf,
                             &mut st.scratch.v,
@@ -3760,7 +3792,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.wo,
-                                lw.q8_split_wo.as_ref(),
+                                lw.q8_split_wo.as_deref(),
                                 lw.q4_split_wo.as_ref(),
                                 q8_1_buf,
                                 &st.scratch.x_gpu,
@@ -4110,8 +4142,8 @@ impl CudaBackend {
                 // 2. Fused gate+up+SwiGLU mmvq: q8_1 -> scratch.gate = silu(gate)*up.
                 {
                     let fused_fn = st.kernels.fused_glu_gemv_q8_split_mmvq.as_ref().unwrap();
-                    let wg = lw.q8_split_w_gate.as_ref().unwrap();
-                    let wu = lw.q8_split_w_up.as_ref().unwrap();
+                    let wg: &CudaSlice<u8> = lw.q8_split_w_gate.as_deref().unwrap();
+                    let wu: &CudaSlice<u8> = lw.q8_split_w_up.as_deref().unwrap();
                     let q8_1_ref = st.scratch.input_q8_1.as_ref().unwrap();
                     let inter_u32 = inter_dim as u32;
                     let hd_u32 = hidden_dim as u32;
@@ -4913,7 +4945,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_gate,
-                                lw.q8_split_w_gate.as_ref(),
+                                lw.q8_split_w_gate.as_deref(),
                                 lw.q4_split_w_gate.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.gate,
@@ -4925,7 +4957,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_up,
-                                lw.q8_split_w_up.as_ref(),
+                                lw.q8_split_w_up.as_deref(),
                                 lw.q4_split_w_up.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.up,
@@ -4975,7 +5007,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &lw.w_gate,
-                            lw.q8_split_w_gate.as_ref(),
+                            lw.q8_split_w_gate.as_deref(),
                             lw.q4_split_w_gate.as_ref(),
                             q8_1_buf,
                             &mut st.scratch.gate,
@@ -4987,7 +5019,7 @@ impl CudaBackend {
                             &self.device,
                             &st.kernels,
                             &lw.w_up,
-                            lw.q8_split_w_up.as_ref(),
+                            lw.q8_split_w_up.as_deref(),
                             lw.q4_split_w_up.as_ref(),
                             q8_1_buf,
                             &mut st.scratch.up,
@@ -5065,6 +5097,7 @@ impl CudaBackend {
                         GpuWeightBuf::F16Raw(_) => "F16Raw",
                         GpuWeightBuf::Bf16Raw(_) => "Bf16Raw",
                         GpuWeightBuf::Q8Raw(_) => "Q8Raw",
+                        GpuWeightBuf::Q8Split(_) => "Q8Split",
                         GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
                         GpuWeightBuf::Q4Raw(_) => "Q4Raw",
                         GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
@@ -5425,7 +5458,7 @@ impl CudaBackend {
                                     &self.device,
                                     &st.kernels,
                                     &lw.w_down,
-                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q8_split_w_down.as_deref(),
                                     lw.q4_split_w_down.as_ref(),
                                     q8_1_buf,
                                     &st.scratch.attn_proj,
@@ -5451,7 +5484,7 @@ impl CudaBackend {
                                     &self.device,
                                     &st.kernels,
                                     &lw.w_down,
-                                    lw.q8_split_w_down.as_ref(),
+                                    lw.q8_split_w_down.as_deref(),
                                     lw.q4_split_w_down.as_ref(),
                                     q8_1_buf,
                                     &mut st.scratch.down,
@@ -5888,7 +5921,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_down,
-                                lw.q8_split_w_down.as_ref(),
+                                lw.q8_split_w_down.as_deref(),
                                 lw.q4_split_w_down.as_ref(),
                                 q8_1_buf,
                                 &st.scratch.attn_proj,
@@ -5914,7 +5947,7 @@ impl CudaBackend {
                                 &self.device,
                                 &st.kernels,
                                 &lw.w_down,
-                                lw.q8_split_w_down.as_ref(),
+                                lw.q8_split_w_down.as_deref(),
                                 lw.q4_split_w_down.as_ref(),
                                 q8_1_buf,
                                 &mut st.scratch.down,
@@ -6410,7 +6443,7 @@ impl CudaBackend {
                         &self.device,
                         &st.kernels,
                         &lw.wq,
-                        lw.q8_split_wq.as_ref(),
+                        lw.q8_split_wq.as_deref(),
                         lw.q4_split_wq.as_ref(),
                         q8_1_buf,
                         &mut gdn.qkv_buf,
@@ -6651,7 +6684,7 @@ impl CudaBackend {
                         &self.device,
                         &st.kernels,
                         attn_gate_w,
-                        lw.q8_split_attn_gate.as_ref(),
+                        lw.q8_split_attn_gate.as_deref(),
                         lw.q4_split_attn_gate.as_ref(),
                         q8_1_buf,
                         &mut gdn.gate_buf,
@@ -8250,7 +8283,7 @@ impl CudaBackend {
             }
             if let (false, Some(split_buf), Some(quant_fn), Some(q8_1_buf)) = (
                 ssm_split_done,
-                lw.q8_split_ssm_out.as_ref(),
+                lw.q8_split_ssm_out.as_deref(),
                 st.kernels.quantize_q8_1_rawsum.as_ref(),
                 st.scratch
                     .input_q8_1
@@ -8413,6 +8446,7 @@ impl CudaBackend {
                     || st.globals.embedding_f16.is_some()
                     || st.globals.embedding_bf16.is_some()
                     || st.globals.embedding_q4.is_some()
+                    || st.globals.embedding_kquant.is_some()
                     || st.globals.embedding.len() > 1,
                 "batched embed would read the placeholder F32 embedding"
             );
@@ -8424,6 +8458,7 @@ impl CudaBackend {
                 st.globals.embedding_f16.as_ref(),
                 st.globals.embedding_bf16.as_ref(),
                 st.globals.embedding_q4.as_ref(),
+                st.globals.embedding_kquant.as_ref().map(|(q, b)| (*q, b)),
                 &pf.token_ids_gpu,
                 &mut pf.x,
                 batch,
@@ -12008,6 +12043,44 @@ unsafe fn launch_matvec(
     // 3. cuBLAS HGEMV via pre-dequanted F16 cache (2 B/elem): any in_dim
     // 4. dp4a (on-the-fly x quant) or v1 scalar: any in_dim (last resort)
 
+    // A Q8_0 plane resident only in the split layout (its raw copy was released after the split
+    // clone): quantize the activation exactly as the pre-quantized route does and dispatch the split
+    // kernel through the sibling slot. Reached only when the caller had no shared Q8_1 activation
+    // for this plane — a projection group of mixed formats, or the token-at-a-time prefill of a
+    // model without batched prefill. The clone pass releases a raw plane only when this route's
+    // prerequisites (split dispatch, both split kernels, the quantizer, the Q8_1 scratch) are loaded.
+    if let GpuWeightBuf::Q8Split(split) = weight {
+        // 32 elements per 34-byte block: the split kernels index the row base from the row
+        // id, so a short plane would read out of bounds
+        if in_dim % 32 != 0 || split.len() < out_dim * (in_dim / 32) * 34 {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: Q8Split plane of {} bytes does not fit {out_dim}x{in_dim} \
+                 (32 elements per 34-byte block)",
+                split.len()
+            )));
+        }
+        if kernels.use_q8_split_dispatch {
+            if let (Some(quant_fn), Some(q8_1_buf)) = (
+                kernels.quantize_f32_to_q8_1.as_ref(),
+                input_q8_1_scratch.as_deref_mut(),
+            ) {
+                launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+                return launch_matvec_preq8_1_split(
+                    device,
+                    kernels,
+                    weight,
+                    Some(&**split),
+                    None,
+                    &*q8_1_buf,
+                    output,
+                    out_dim,
+                    in_dim,
+                    label,
+                );
+            }
+        }
+    }
+
     if let GpuWeightBuf::Q8Raw(w_q8) = weight {
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
@@ -12684,6 +12757,24 @@ unsafe fn launch_matvec(
         }
     }
 
+    // K-quant plane of a K-quant artifact: quantize the input to Q8_1 and
+    // run the scheme's dp4a matvec (the only decode route for these planes).
+    if let Some((scheme, w_kq)) = super::gpu_buffers::kquant_weight(weight) {
+        let (Some(quant_fn), Some(q8_1_buf)) = (
+            kernels.quantize_f32_to_q8_1.as_ref(),
+            input_q8_1_scratch.as_deref_mut(),
+        ) else {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: {scheme:?} requires the Q8_1 quantizer and scratch \
+                 (kernel or scratch unavailable)"
+            )));
+        };
+        launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        return launch_matvec_kquant_preq8_1(
+            device, kernels, scheme, w_kq, q8_1_buf, None, output, out_dim, in_dim, label,
+        );
+    }
+
     // CtInt4G32: dp4a against pre-quantized Q8_1 input (the only decode
     // route for this format — no scalar/HGEMV fallback exists).
     if let GpuWeightBuf::Ct4Raw(w_ct4) = weight {
@@ -13027,19 +13118,23 @@ unsafe fn launch_matvec(
                 "Q4Aligned weight reached fallback match in matvec {label} — dp4a kernels unavailable"
             )));
         }
-        // split-layout: Q8Split/Q4Split are sibling buffers consumed only by
-        // `launch_matvec_preq8_1_split`. Reaching the base `launch_matvec`
-        // means the caller passed a sibling as the base weight, which is a bug.
-        GpuWeightBuf::Ct4Raw(_) => {
+        // split-layout: a Q8Split base is served by the early dispatch at the top of
+        // `launch_matvec` (`launch_matvec_preq8_1_split`); a Q4Split is a sibling
+        // buffer, never a base. Either reaching this match is a bug.
+        GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::Q4KRaw(_)
+        | GpuWeightBuf::Q5KRaw(_)
+        | GpuWeightBuf::Q6KRaw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Ct4Raw reached fallback match in matvec {label} — \
-                 handled by the early ct4 dp4a path"
+                "Ct4Raw/K-quant weight reached fallback match in matvec {label} — \
+                 handled by the early dp4a path"
             )));
         }
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Q8Split/Q4Split sibling reached fallback match in matvec {label} — \
-                 caller must dispatch via launch_matvec_preq8_1_split"
+                "split-layout plane reached fallback match in matvec {label} — a Q8Split \
+                 base is a plane whose raw copy was released; its decode dispatch goes \
+                 through the sibling slot (launch_matvec_preq8_1_split)"
             )));
         }
     }
@@ -13074,6 +13169,40 @@ unsafe fn launch_matvec_residual(
     // Priority: dp4a Q8_1 > smem (F32 x) > hgemv (F16 x) > cuBLAS HGEMV > dp4a/scalar.
 
     // Q8_0 raw residual: dp4a Q8_1 > smem > hgemv > HGEMV fallback > dp4a/scalar.
+    // A Q8_0 plane resident only in the split layout: the same route as in `launch_matvec`.
+    if let GpuWeightBuf::Q8Split(split) = weight {
+        // 32 elements per 34-byte block: the split kernels index the row base from the row
+        // id, so a short plane would read out of bounds
+        if in_dim % 32 != 0 || split.len() < out_dim * (in_dim / 32) * 34 {
+            return Err(RuntimeError::Compute(format!(
+                "matvec {label}: Q8Split plane of {} bytes does not fit {out_dim}x{in_dim} \
+                 (32 elements per 34-byte block)",
+                split.len()
+            )));
+        }
+        if kernels.use_q8_split_dispatch {
+            if let (Some(quant_fn), Some(q8_1_buf)) = (
+                kernels.quantize_f32_to_q8_1.as_ref(),
+                input_q8_1_scratch.as_deref_mut(),
+            ) {
+                launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+                return launch_matvec_preq8_1_residual_split(
+                    device,
+                    kernels,
+                    weight,
+                    Some(&**split),
+                    None,
+                    &*q8_1_buf,
+                    residual,
+                    output,
+                    out_dim,
+                    in_dim,
+                    label,
+                );
+            }
+        }
+    }
+
     if let GpuWeightBuf::Q8Raw(w_q8) = weight {
         let shmem_f32 = (in_dim as u32) * 4;
         let shmem_f16 = (in_dim as u32) * 2;
@@ -13510,6 +13639,33 @@ unsafe fn launch_matvec_residual(
         }
     }
 
+    // K-quant plane of a K-quant artifact: quantize the input to Q8_1 and
+    // run the scheme's residual-folding dp4a matvec.
+    if let Some((scheme, w_kq)) = super::gpu_buffers::kquant_weight(weight) {
+        let (Some(quant_fn), Some(q8_1_buf)) = (
+            kernels.quantize_f32_to_q8_1.as_ref(),
+            input_q8_1_scratch.as_deref_mut(),
+        ) else {
+            return Err(RuntimeError::Compute(format!(
+                "matvec+residual {label}: {scheme:?} requires the Q8_1 quantizer and scratch \
+                 (kernel or scratch unavailable)"
+            )));
+        };
+        launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
+        return launch_matvec_kquant_preq8_1(
+            device,
+            kernels,
+            scheme,
+            w_kq,
+            q8_1_buf,
+            Some(residual),
+            output,
+            out_dim,
+            in_dim,
+            label,
+        );
+    }
+
     // CtInt4G32: dp4a against pre-quantized Q8_1 input (the only decode
     // route for this format — no scalar/HGEMV fallback exists).
     if let GpuWeightBuf::Ct4Raw(w_ct4) = weight {
@@ -13876,20 +14032,23 @@ unsafe fn launch_matvec_residual(
                 "Q4Aligned weight reached fallback match in matvec+residual {label} — dp4a kernels unavailable"
             )));
         }
-        // split-layout: Q8Split/Q4Split are sibling buffers consumed only by
-        // `launch_matvec_residual_split`. Reaching the base
-        // `launch_matvec_residual` means the caller passed a sibling as the
-        // base weight, which is a bug.
-        GpuWeightBuf::Ct4Raw(_) => {
+        // split-layout: a Q8Split base is served by the early dispatch at the top of
+        // `launch_matvec_residual` (`launch_matvec_preq8_1_residual_split`); a Q4Split
+        // is a sibling buffer, never a base. Either reaching this match is a bug.
+        GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::Q4KRaw(_)
+        | GpuWeightBuf::Q5KRaw(_)
+        | GpuWeightBuf::Q6KRaw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Ct4Raw reached fallback match in matvec+residual {label} — \
-                 handled by the early ct4 dp4a path"
+                "Ct4Raw/K-quant weight reached fallback match in matvec+residual {label} — \
+                 handled by the early dp4a path"
             )));
         }
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "Q8Split/Q4Split sibling reached fallback match in matvec+residual {label} — \
-                 caller must dispatch via launch_matvec_residual_split"
+                "split-layout plane reached fallback match in matvec+residual {label} — a \
+                 Q8Split base is a plane whose raw copy was released; its decode dispatch \
+                 goes through the sibling slot (launch_matvec_preq8_1_residual_split)"
             )));
         }
     }
@@ -13939,7 +14098,8 @@ unsafe fn launch_quantize_input_q8_1(
 ///
 /// Use after `launch_quantize_input_q8_1` to avoid redundant quantization when
 /// multiple matvecs share the same input vector. Supports Q8Raw, Q8Aligned,
-/// Q4Aligned, and Q4Raw weights. Falls back to the full `launch_matvec` for
+/// Q4Aligned, Q4Raw and the K-quant planes (Q4KRaw / Q5KRaw / Q6KRaw, served by
+/// `launch_matvec_kquant_preq8_1`). Falls back to the full `launch_matvec` for
 /// weight types that don't use dp4a (F32, F16Raw) or when dp4a kernels are
 /// unavailable.
 ///
@@ -14146,6 +14306,13 @@ unsafe fn launch_matvec_preq8_1(
                 }
                 return Ok(());
             }
+        }
+        GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+            let (scheme, w_kq) =
+                super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
+            return launch_matvec_kquant_preq8_1(
+                device, kernels, scheme, w_kq, q8_1_buf, None, output, out_dim, in_dim, label,
+            );
         }
         _ => {} // F32, F16Raw: no dp4a path, caller should not use preq8_1
     }
@@ -14380,6 +14547,22 @@ unsafe fn launch_matvec_preq8_1_residual(
                 return Ok(());
             }
         }
+        GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+            let (scheme, w_kq) =
+                super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
+            return launch_matvec_kquant_preq8_1(
+                device,
+                kernels,
+                scheme,
+                w_kq,
+                q8_1_buf,
+                Some(residual),
+                output,
+                out_dim,
+                in_dim,
+                label,
+            );
+        }
         _ => {}
     }
 
@@ -14398,8 +14581,9 @@ unsafe fn launch_matvec_preq8_1_residual(
 // native `int*` loads thanks to a 4-byte-aligned offset between them.
 //
 // Memory cost: one sibling buffer per source weight (~1x the original byte
-// size). Decode prefers the sibling when present; prefill always reads the
-// AoS original.
+// size). Decode prefers the sibling when present; prefill reads the AoS original, except
+// on a K-quant artifact whose raw plane was released after the clone, where it dequantizes
+// the split layout instead (`dequant_q8_split_to_f16` / `_to_f32`).
 //
 // The helpers below are NO-OP fall-throughs when the sibling is None or the
 // SPLIT kernel failed to load -- keeping default-off contract (clean revert) intact
@@ -14416,7 +14600,7 @@ unsafe fn launch_matvec_preq8_1_residual(
 /// # Safety
 ///
 /// Same constraints as `launch_matvec_preq8_1`. The sibling buffer is
-/// produced by `repack_layer_q8_clone_to_split()` and has identical element
+/// produced by `repack_all_layers_q8_clone_to_split()` and has identical element
 /// count to the base weight.
 /// Four-slot banked Q4 split matvec off one shared Q8_1 input — one launch
 /// covers up to four weights' rows (a slot with 0 rows gets no CTAs). The
@@ -15253,7 +15437,11 @@ unsafe fn repack_q4_raw_to_split(
 /// `matvec_q4_split_q8_1_locked_residual`, which stays excluded on Q4).
 ///
 /// Returns `(num_layers_with_any_split, first_oom_layer_idx, total_oom_count,
-/// total_jobs_attempted)`. On OOM the loop aborts (no more attempts).
+/// total_jobs_enumerated, raw_planes_released, raw_released_bytes)` — the last
+/// two are zero unless the caller passed `release_raw` (see the ladder in
+/// `preload_weights`), in which case they count the Q8Raw planes dropped after
+/// their split sibling was built and the bytes those planes held. On OOM the
+/// loop aborts (no more attempts).
 ///
 /// # Safety
 ///
@@ -15264,7 +15452,8 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     layers: &mut [LayerWeightsGpu],
     hp: &ModelHyperparams,
     clone_budget_bytes: usize,
-) -> (usize, Option<usize>, usize, usize) {
+    release_raw: bool,
+) -> (usize, Option<usize>, usize, usize, usize, usize) {
     let hidden = hp.hidden_dim as usize;
     let inter = hp.intermediate_dim as usize;
 
@@ -15493,6 +15682,10 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
     let mut bytes_cloned: usize = 0;
+    // `release_raw`: the caller decided whether the split-only routes can serve this
+    // model (see the call site); when false the raw plane stays beside its sibling.
+    let mut raw_released: usize = 0;
+    let mut raw_released_bytes: usize = 0;
 
     for job in &jobs {
         if oom_layer.is_some() {
@@ -15565,18 +15758,44 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         let Some(raw_buf) = src_ref else { continue };
         match repack_q8_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
             Ok(split_buf) => {
-                match job.kind {
-                    SplitWeightKind::Gate => layer.q8_split_w_gate = Some(split_buf),
-                    SplitWeightKind::Up => layer.q8_split_w_up = Some(split_buf),
-                    SplitWeightKind::Down => layer.q8_split_w_down = Some(split_buf),
-                    SplitWeightKind::SsmOut => layer.q8_split_ssm_out = Some(split_buf),
+                let split_buf = std::sync::Arc::new(split_buf);
+                // The decode dispatch keys on the sibling slot; the base slot keeps the
+                // plane's AoS bytes for the prefill unless the split layout can serve the
+                // prefill too, in which case the base moves to the same split plane and the
+                // raw copy is released — the plane is then resident once.
+                let (sibling, base): (
+                    &mut Option<std::sync::Arc<CudaSlice<u8>>>,
+                    &mut GpuWeightBuf,
+                ) = match job.kind {
+                    SplitWeightKind::Gate => (&mut layer.q8_split_w_gate, &mut layer.w_gate),
+                    SplitWeightKind::Up => (&mut layer.q8_split_w_up, &mut layer.w_up),
+                    SplitWeightKind::Down => (&mut layer.q8_split_w_down, &mut layer.w_down),
+                    SplitWeightKind::SsmOut => (
+                        &mut layer.q8_split_ssm_out,
+                        layer
+                            .ssm_out
+                            .as_mut()
+                            .expect("ssm_out plane enumerated for the clone"),
+                    ),
                     SplitWeightKind::GdnQkv | SplitWeightKind::AttnWq => {
-                        layer.q8_split_wq = Some(split_buf)
+                        (&mut layer.q8_split_wq, &mut layer.wq)
                     }
-                    SplitWeightKind::GdnGate => layer.q8_split_attn_gate = Some(split_buf),
-                    SplitWeightKind::AttnWk => layer.q8_split_wk = Some(split_buf),
-                    SplitWeightKind::AttnWv => layer.q8_split_wv = Some(split_buf),
-                    SplitWeightKind::AttnWo => layer.q8_split_wo = Some(split_buf),
+                    SplitWeightKind::GdnGate => (
+                        &mut layer.q8_split_attn_gate,
+                        layer
+                            .attn_gate
+                            .as_mut()
+                            .expect("attn_gate plane enumerated for the clone"),
+                    ),
+                    SplitWeightKind::AttnWk => (&mut layer.q8_split_wk, &mut layer.wk),
+                    SplitWeightKind::AttnWv => (&mut layer.q8_split_wv, &mut layer.wv),
+                    SplitWeightKind::AttnWo => (&mut layer.q8_split_wo, &mut layer.wo),
+                };
+                *sibling = Some(split_buf.clone());
+                if release_raw {
+                    *base = GpuWeightBuf::Q8Split(split_buf);
+                    raw_released += 1;
+                    raw_released_bytes += job.size_bytes;
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;
@@ -15589,7 +15808,14 @@ unsafe fn repack_all_layers_q8_clone_to_split(
         }
     }
 
-    (layers_with_split.len(), oom_layer, oom_count, jobs.len())
+    (
+        layers_with_split.len(),
+        oom_layer,
+        oom_count,
+        jobs.len(),
+        raw_released,
+        raw_released_bytes,
+    )
 }
 
 /// Largest-first allocator for cloning every Q4Raw projection weight into the
@@ -15927,11 +16153,117 @@ fn weight_uses_f32_act_q4(weight: &GpuWeightBuf, q4_decode_f32_act: bool) -> boo
 fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
     match weight {
         GpuWeightBuf::Q8Raw(_) => kernels.matvec_q8_0_q8_1.is_some(),
+        // a Q8_0 plane resident only in the split layout (raw copy released): served by
+        // the split kernel through its sibling slot
+        GpuWeightBuf::Q8Split(_) => {
+            kernels.use_q8_split_dispatch && kernels.matvec_q8_split_q8_1.is_some()
+        }
         GpuWeightBuf::Q8Aligned(_) => kernels.matvec_q8_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Aligned(_) => kernels.matvec_q4_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
+        GpuWeightBuf::Q4KRaw(_) => kquant_kernels(kernels, QuantScheme::Q4_K).is_some(),
+        GpuWeightBuf::Q5KRaw(_) => kquant_kernels(kernels, QuantScheme::Q5_K).is_some(),
+        GpuWeightBuf::Q6KRaw(_) => kquant_kernels(kernels, QuantScheme::Q6_K).is_some(),
         _ => false,
     }
+}
+
+/// The kernel group that serves `scheme`, when this build loaded it.
+fn kquant_kernels(
+    kernels: &KernelSet,
+    scheme: QuantScheme,
+) -> Option<&super::decode::KquantKernels> {
+    match scheme {
+        QuantScheme::Q4_K => kernels.kq4.as_ref(),
+        QuantScheme::Q5_K => kernels.kq5.as_ref(),
+        QuantScheme::Q6_K => kernels.kq6.as_ref(),
+        _ => None,
+    }
+}
+
+/// Launch the K-quant matvec (`residual` folded when given) on a pre-quantized
+/// Q8_1 activation. The CTA geometry (threads, rows per CTA) is the one the
+/// kernel source declares, read at load. The kernel indexes the weight by
+/// `row * (in_dim / 256) * block_bytes`, so the byte length and the
+/// 256-multiple `in_dim` are checked here rather than trusted.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_matvec_kquant_preq8_1(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    scheme: QuantScheme,
+    weight: &CudaSlice<u8>,
+    q8_1_buf: &CudaSlice<u8>,
+    residual: Option<&CudaSlice<f32>>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let (block_bytes, tag) = kquant_layout(scheme);
+    let group = kquant_kernels(kernels, scheme).ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "matvec {label}: {scheme:?} plane but the {tag} kernels are not loaded"
+        ))
+    })?;
+    let expected_w = out_dim * (in_dim / 256) * block_bytes;
+    let needed_q8 = (in_dim / 32) * 36;
+    if in_dim % 256 != 0 || weight.len() != expected_w || q8_1_buf.len() < needed_q8 {
+        return Err(RuntimeError::Compute(format!(
+            "matvec {label}: {scheme:?} shape mismatch: weight {} bytes \
+             (expected {expected_w} for [{out_dim}, {in_dim}]), \
+             Q8_1 scratch {} bytes (need {needed_q8})",
+            weight.len(),
+            q8_1_buf.len(),
+        )));
+    }
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (out_dim_u32.div_ceil(group.matvec_rows_per_cta), 1, 1),
+        block_dim: (group.matvec_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match residual {
+        Some(res) => device
+            .stream
+            .launch_builder(&group.matvec_residual)
+            .arg(weight)
+            .arg(q8_1_buf)
+            .arg(res)
+            .arg(output)
+            .arg(&out_dim_u32)
+            .arg(&in_dim_u32)
+            .launch(launch_cfg),
+        None => device
+            .stream
+            .launch_builder(&group.matvec)
+            .arg(weight)
+            .arg(q8_1_buf)
+            .arg(output)
+            .arg(&out_dim_u32)
+            .arg(&in_dim_u32)
+            .launch(launch_cfg),
+    }
+    .map_err(|e| RuntimeError::Compute(format!("matvec_{tag}_q8_1 {label} launch: {e}")))?;
+    // one latch per (scheme, sibling): the first site of each kernel announces it, and the
+    // name is looked up inside the latch
+    const NAMES: [&str; 6] = [
+        "matvec_q4_k_q8_1",
+        "matvec_q4_k_q8_1_residual",
+        "matvec_q5_k_q8_1",
+        "matvec_q5_k_q8_1_residual",
+        "matvec_q6_k_q8_1",
+        "matvec_q6_k_q8_1_residual",
+    ];
+    static SEEN: [std::sync::OnceLock<()>; 6] = [const { std::sync::OnceLock::new() }; 6];
+    let slot = match scheme {
+        QuantScheme::Q4_K => 0,
+        QuantScheme::Q5_K => 2,
+        QuantScheme::Q6_K => 4,
+        other => unreachable!("K-quant matvec on {other:?}"),
+    } + usize::from(residual.is_some());
+    announce_matvec_route(&SEEN[slot], || NAMES[slot], label, out_dim, in_dim);
+    Ok(())
 }
 
 /// The raw Q4_0 dp4a matvec a site launches, with its block size and name: `matvec_q4_0_dp4a`
@@ -15995,6 +16327,18 @@ fn rmsnorm_q8_1_launch<'k>(
             shared_mem_bytes: shared_bytes,
         },
     )
+}
+
+/// `[CUDA] embed_token_<tag>: ACTIVE (token_embd, in=<hidden>)`, once per process:
+/// the receipt that the embedding is gathered from its native K-quant plane.
+fn announce_embed_route(scheme: QuantScheme, hidden_dim: usize) {
+    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    super::decode::announce_route_once(&SEEN, || {
+        format!(
+            "[CUDA] embed_token_{}: ACTIVE (token_embd, in={hidden_dim})",
+            kquant_tag(scheme)
+        )
+    });
 }
 
 /// Name the output-head kernel a branch dispatched, once per process.
@@ -17651,11 +17995,10 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// four-byte-aligned, non-colliding unsupported buffer is read with unknown
 /// formats reinterpreted as F32 (a non-aligned one panics in bytes_to_f32),
 /// the resulting F32 copy uploading via the plain-F32 path (no length or
-/// cap check). Known behavior-changing detector collision, tracked: Q4_K's
-/// packed size equals Q4_0's (144 B / 256 elems), so a hand-built Q4_K
-/// global would be misdetected as Q4_0 and forwarded raw; the converter
-/// never emits a colliding K-quant global (fidelity mode may preserve a
-/// Q6_K head, 210 B / 256 — unique).
+/// cap check). Q4_K's packed size equals Q4_0's (144 B / 256 elems), so a
+/// Q4_K global is told from a Q4_0 one by the header's declared family, not
+/// by its length (`weight::provider_sync::read_embedding_global_for`); this
+/// path length-checks a scheme the header already named.
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
 /// only valid raw size. `Ok(None)` = the layout is not length-checkable
 /// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are
@@ -17667,7 +18010,14 @@ fn raw_global_expected_len(
     // The embed/head kernels compute element and byte offsets in 32-bit
     // (`token_id * hidden_dim + idx`, `block_idx * block_bytes`), so both
     // the element count and the raw byte length must fit u32 — beyond
-    // that the kernels wrap and read the wrong rows.
+    // that the kernels wrap and read the wrong rows. The K-quant embed/head
+    // kernels are the exception: they index the table in 64-bit
+    // (`(unsigned long long)token_id * hidden_dim`, `matvec_q4_k_q8_1.cu`),
+    // so for Q4_K / Q5_K / Q6_K this bound is a conservative admission gate,
+    // not a wrap boundary. The F16 / BF16 embeds index in 64-bit too
+    // (`shaders/embed.cu:65`, `:82`), so the bound is a conservative gate for
+    // them as well. The 32-bit gathers are the F32 / Q8_0 / Q4_0 embeds
+    // (`shaders/embed.cu:14`, `:40`, `:101`).
     if n_elements > 1usize << 32 {
         return Err(RuntimeError::Compute(format!(
             "{quant:?} global of {n_elements} elements exceeds the 32-bit \
@@ -17694,6 +18044,8 @@ fn raw_global_expected_len(
         QuantScheme::Q8_0 => block(32, 34),
         QuantScheme::Q4_0 => block(32, 18),
         QuantScheme::F16 | QuantScheme::Bf16 => block(1, 2),
+        QuantScheme::Q4_K => block(256, 144),
+        QuantScheme::Q5_K => block(256, 176),
         QuantScheme::Q6_K => block(256, 210),
         _ => Ok(None),
     }
@@ -17783,6 +18135,7 @@ mod raw_global_len_tests {
 
 impl ComputeBackend for CudaBackend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
+        super::gpu_buffers::kquant_plane_counters().reset();
         self.hyperparams = Some(*hyperparams);
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
@@ -18061,6 +18414,7 @@ impl ComputeBackend for CudaBackend {
         // BF16 embedding now uploads RAW bytes (2 B/elem) instead of dequanting
         // to F32 (4 B/elem) — saves ~2 GB on Qwen3.5-9B (vocab=248320, hidden=4096; BF16 raw is half the F32 copy).
         let has_raw_embedding = self.embedding_raw.is_some();
+        let mut embedding_kquant: Option<(QuantScheme, CudaSlice<u8>)> = None;
         let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) =
             if has_raw_embedding {
                 let raw = self.embedding_raw.as_ref().unwrap();
@@ -18077,10 +18431,19 @@ impl ComputeBackend for CudaBackend {
                     }
                 }
                 let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
+                super::gpu_buffers::validate_kquant_embedding(self.embedding_quant)?;
                 match self.embedding_quant {
                     QuantScheme::Q8_0 => {
                         let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
                         (placeholder, Some(gpu_q8), None, None, None)
+                    }
+                    q @ (QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K) => {
+                        // K-quant embedding: raw superblocks, gathered natively.
+                        let raw_mb = raw.len() as f64 / 1.0e6;
+                        eprintln!("[CUDA mem] uploading {q:?} embedding raw: {raw_mb:.1} MB");
+                        super::gpu_buffers::kquant_plane_counters().count_native(q);
+                        embedding_kquant = Some((q, self.device.htod_copy(raw.as_slice())?));
+                        (placeholder, None, None, None, None)
                     }
                     QuantScheme::F16 => {
                         let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
@@ -18102,7 +18465,7 @@ impl ComputeBackend for CudaBackend {
                     }
                     other => {
                         return Err(RuntimeError::Compute(format!(
-                        "CUDA init: embedding raw quant {other:?} not supported (only Q8_0, F16, Q4_0, Bf16)",
+                        "CUDA init: embedding raw quant {other:?} not supported (only Q8_0, F16, Q4_0, Bf16, Q4_K, Q5_K, Q6_K)",
                     )));
                     }
                 }
@@ -18183,12 +18546,12 @@ impl ComputeBackend for CudaBackend {
                         raw,
                         QuantScheme::Q6_K,
                         n_elements,
-                        super::gpu_buffers::host_f16_to_f32,
                     )?;
                     eprintln!(
                         "[CUDA mem] Q6K_HEAD disabled: uploading F32 head fallback ({:.1} MB)",
                         (n_elements * 4) as f64 / 1.0e6
                     );
+                    super::gpu_buffers::kquant_plane_counters().count_catch_all(QuantScheme::Q6_K);
                     let gpu_f32 = self.device.htod_copy(&f32_data)?;
                     (gpu_f32, None, None, None, None)
                 }
@@ -18212,6 +18575,7 @@ impl ComputeBackend for CudaBackend {
                         sc[i * 16..(i + 1) * 16].copy_from_slice(&b[192..208]);
                         dd[i * 2..(i + 1) * 2].copy_from_slice(&b[208..210]);
                     }
+                    super::gpu_buffers::kquant_plane_counters().count_native(QuantScheme::Q6_K);
                     output_proj_q6k = Some((
                         self.device.htod_copy(ql.as_slice())?,
                         self.device.htod_copy(qh.as_slice())?,
@@ -18253,6 +18617,7 @@ impl ComputeBackend for CudaBackend {
             embedding_f16: embedding_f16_raw,
             embedding_q4: embedding_q4_raw,
             embedding_bf16: embedding_bf16_raw,
+            embedding_kquant,
         };
 
         // The KV caches are allocated in `preload_weights()`, once the layer
@@ -18641,7 +19006,7 @@ impl ComputeBackend for CudaBackend {
             };
 
             // Dispatch embed kernel based on embedding precision.
-            // Order: BF16 > F16 > Q4_0 > Q8_0 > F32 (mirror embed_token_gpu).
+            // Order: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32 (mirror embed_token_gpu).
             if let Some(ref emb_bf16) = st.globals.embedding_bf16 {
                 let func = self.embed_bf16_func.as_ref().ok_or_else(|| {
                     RuntimeError::Compute("embed_token_bf16 kernel not compiled".into())
@@ -18674,6 +19039,33 @@ impl ComputeBackend for CudaBackend {
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 launch: {e}")))?;
+            } else if let Some((scheme, ref emb_kq)) = st.globals.embedding_kquant {
+                let func = &kquant_kernels(&st.kernels, scheme)
+                    .ok_or_else(|| {
+                        RuntimeError::Compute(format!(
+                            "embed_token_{}: kernels not loaded",
+                            kquant_tag(scheme)
+                        ))
+                    })?
+                    .embed_token;
+                let hd = hidden_dim as u32;
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(func)
+                        .arg(emb_kq)
+                        .arg(&mut output_gpu)
+                        .arg(&token_id)
+                        .arg(&hd)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "CUDA embed_token_{} launch: {e}",
+                        kquant_tag(scheme)
+                    ))
+                })?;
+                announce_embed_route(scheme, hidden_dim);
             } else if let Some(ref emb_q4) = st.globals.embedding_q4 {
                 let func = self.embed_q4_0_func.as_ref().ok_or_else(|| {
                     RuntimeError::Compute("embed_token_q4_0 kernel not compiled".into())
@@ -20210,6 +20602,77 @@ impl ComputeBackend for CudaBackend {
 
         let mut cache = Vec::with_capacity(num_layers);
 
+        // A K-quant artifact needs the kernel group of every K-quant scheme its planes
+        // carry: refused here, before a plane is uploaded, rather than at the first token
+        // after the whole model is resident. The failed group's NVRTC error was printed
+        // at kernel load.
+        if crate::runtime_defaults::kquant_artifact()
+            && super::gpu_buffers::kquant_planes_servable()
+            && (st.kernels.kq4.is_none() || st.kernels.kq5.is_none() || st.kernels.kq6.is_none())
+        {
+            // only when a group is missing: the layer reads below fetch the payload
+            let mut needed = [false; 3];
+            let mut note = |q: QuantScheme| match q {
+                QuantScheme::Q4_K => needed[0] = true,
+                QuantScheme::Q5_K => needed[1] = true,
+                QuantScheme::Q6_K => needed[2] = true,
+                _ => {}
+            };
+            // the embedding gathers through the scheme's group; the Q6_K head has its own
+            // kernel (`matvec_q6k_head`, checked below), so its scheme does not make a
+            // group required
+            note(self.embedding_quant);
+            for layer_idx in 0..num_layers {
+                let view = weights.get_layer_raw(layer_idx).map_err(|e| {
+                    RuntimeError::Compute(format!("Failed to read layer {layer_idx}: {e}"))
+                })?;
+                for (_, slice) in view.subtensors.named_slices() {
+                    if slice.length > 0 {
+                        note(slice.quant);
+                    }
+                }
+            }
+            for (tag, needed, group) in [
+                ("q4_k", needed[0], st.kernels.kq4.is_some()),
+                ("q5_k", needed[1], st.kernels.kq5.is_some()),
+                ("q6_k", needed[2], st.kernels.kq6.is_some()),
+            ] {
+                if needed && !group {
+                    return Err(RuntimeError::Compute(format!(
+                        "CUDA: this is a K-quant artifact and the {tag} kernels did not load on \
+                         this device (see the `[CUDA] kquant {tag}: FAILED` line above); refused \
+                         at load rather than served through the F32 host-dequant fallback"
+                    )));
+                }
+            }
+        }
+        // every K-quant plane dispatch quantizes its activation with `quantize_f32_to_q8_1`
+        // (a kernel compiled for compute_80) into the Q8_1 scratch
+        if crate::runtime_defaults::kquant_artifact()
+            && super::gpu_buffers::kquant_planes_servable()
+            && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())
+        {
+            return Err(RuntimeError::Compute(
+                "CUDA: this is a K-quant artifact and the Q8_1 activation quantizer \
+                 (`quantize_f32_to_q8_1`) or its scratch is unavailable on this device; \
+                 refused at load rather than at the first token"
+                    .into(),
+            ));
+        }
+        if crate::runtime_defaults::kquant_artifact()
+            && self.output_proj_quant == QuantScheme::Q6_K
+            && crate::runtime_defaults::q6k_head_enabled()
+            && st.kernels.matvec_q6k_head.is_none()
+        {
+            return Err(RuntimeError::Compute(
+                "CUDA: this is a K-quant artifact with a Q6_K output head and the head kernel \
+                 (`matvec_q6k_head`) did not load on this device; refused at load rather than \
+                 at the first token (`LUMEN_CUDA_Q6K_HEAD=0` serves the head from a host F32 \
+                 dequant instead)"
+                    .into(),
+            ));
+        }
+
         let mem_before_layers = self.device.free_memory().unwrap_or(0);
         eprintln!(
             "[CUDA mem] before layer weight upload: {:.2} GB free",
@@ -20555,11 +21018,11 @@ impl ComputeBackend for CudaBackend {
 
         // split-layout integration: Q8_0 per-row split (SoA) clone pass.
         // Runs BEFORE the aligned repack pass because both consume Q8Raw and
-        // the aligned pass MUTATES Q8Raw -> Q8Aligned in place. After this
-        // pass, layers that received a split sibling skip aligned repack
-        // (their decode path prefers the sibling, prefill keeps Q8Raw).
-        let mut layers_with_q8_split: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        // the aligned pass MUTATES Q8Raw -> Q8Aligned in place. Both passes run:
+        // the aligned repack is not skipped for a layer that got a split sibling
+        // (a weight whose base slot became `Q8Split` is left alone by
+        // `repack_weight` instead). Decode prefers the sibling; prefill reads
+        // Q8Raw, or the split layout when the raw plane was released.
         if st.use_q8_split {
             if let (Some(ref split_repack_fn), true) = (
                 st.kernels.repack_q8_raw_to_split.as_ref(),
@@ -20577,13 +21040,57 @@ impl ComputeBackend for CudaBackend {
                     self.kv_precision.bytes_per_element(),
                 );
                 let mem_before_q8_split = budget.free_mem_bytes;
-                let (n_layers_split, oom_layer, oom_count, total_jobs) = unsafe {
+                // A raw Q8_0 plane is released only when every route that could read the plane
+                // can read the split layout instead: the prefill's dequant arms (not MMQ — the
+                // policy predicate), and the decode fallbacks' quantize -> split kernel route
+                // (split dispatch on, both split kernels, the quantizer and the Q8_1 scratch).
+                // The conv-state parity arm, the split-dispatch arm and the first disjunct of
+                // the split-kernel arm restate conditions an enclosing guard or an earlier arm
+                // already excludes (conv-state parity is MoE-only and the earlier
+                // `q8_split_release_raw_enabled()` arm refuses MoE; `use_q8_split_dispatch` is
+                // `use_q8_split && matvec_q8_split_q8_1.is_some()`,
+                // both true here). They are kept deliberately: the ladder is fail-safe in one
+                // direction only — an extra arm costs memory, a missing one frees a plane a live
+                // route still reads.
+                let release_block: Option<&str> = if !crate::runtime_defaults::kquant_artifact() {
+                    // The plan freezes the existing Q4_0 / Q8_0 / BF16 cells: their planes,
+                    // routes and memory stay as shipped. The release is a K-quant-artifact
+                    // rule, like the native K-quant planes themselves.
+                    Some("not a K-quant artifact (existing cells keep both copies)")
+                } else if !crate::runtime_defaults::q8_split_release_raw_enabled() {
+                    Some("policy: MMQ prefill or LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1")
+                } else if gdn_convstate_parity_enabled() && gdn_decode_via_prefill_enabled() {
+                    // the conv-state parity reprojection runs the batched MMQ on the raw plane
+                    Some("conv-state parity reprojection reads the raw plane")
+                } else if !st.kernels.use_q8_split_dispatch {
+                    Some("split dispatch off")
+                } else if st.kernels.matvec_q8_split_q8_1.is_none()
+                    || st.kernels.matvec_q8_split_q8_1_residual.is_none()
+                {
+                    Some("a split matvec kernel did not load")
+                } else if st.kernels.quantize_f32_to_q8_1.is_none() {
+                    Some("quantize_f32_to_q8_1 did not load")
+                } else if st.scratch.input_q8_1.is_none() {
+                    Some("no Q8_1 activation scratch")
+                } else {
+                    None
+                };
+                let release_raw = release_block.is_none();
+                let (
+                    n_layers_split,
+                    oom_layer,
+                    oom_count,
+                    total_jobs,
+                    raw_released,
+                    raw_released_bytes,
+                ) = unsafe {
                     repack_all_layers_q8_clone_to_split(
                         &self.device,
                         split_repack_fn,
                         &mut cache,
                         &hp_copy,
                         budget.budget_bytes,
+                        release_raw,
                     )
                 };
                 // Ship-what-you-gated proof: the resolved cap plus its inputs.
@@ -20612,20 +21119,19 @@ impl ComputeBackend for CudaBackend {
                      {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
                     oom_layer,
                 );
-                // Track which layers have any Q8 split sibling -- those layers
-                // skip the aligned repack below to save the ~12% memory cost
-                // (36-byte aligned vs 34-byte raw).
-                for (idx, lw) in cache.iter().enumerate() {
-                    if lw.q8_split_wq.is_some()
-                        || lw.q8_split_wk.is_some()
-                        || lw.q8_split_wv.is_some()
-                        || lw.q8_split_wo.is_some()
-                        || lw.q8_split_w_gate.is_some()
-                        || lw.q8_split_w_up.is_some()
-                        || lw.q8_split_w_down.is_some()
-                    {
-                        layers_with_q8_split.insert(idx);
-                    }
+                match release_block {
+                    Some(why) => eprintln!(
+                        "[CUDA] Q8 split raw-plane release off ({why}): both copies stay \
+                         resident and the prefill keeps reading the packed plane (clone \
+                         pass {consumed_gb:.2} GB)"
+                    ),
+                    None => eprintln!(
+                        "[CUDA] Q8 split planes resident once: raw planes released after the \
+                         clone={raw_released} (byte-sum {:.2} GB; measured net device memory \
+                         of the clone pass {consumed_gb:.2} GB; the prefill dequantizes the \
+                         split layout)",
+                        (raw_released_bytes as f64) / 1.0e9,
+                    ),
                 }
             } else if st.use_q8_split {
                 eprintln!(
@@ -20718,7 +21224,6 @@ impl ComputeBackend for CudaBackend {
         // faster than separate-quantize + split matvec -- remains available.
         // Decode dispatch checks SPLIT sibling first, then falls through to
         // the Q8Aligned path (which the aligned repack pre-stages).
-        let _ = &layers_with_q8_split; // tracked for diagnostic logs; no longer gates aligned skip
         if let Some(ref repack_fn) = st.kernels.repack_q8_0_to_aligned36 {
             if st.kernels.matvec_q8_0_aligned.is_some()
                 || st.kernels.matvec_q8_aligned_q8_1.is_some()
@@ -20764,8 +21269,6 @@ impl ComputeBackend for CudaBackend {
         // split-layout integration: Q4_0 per-row split (SoA) clone pass.
         // Same pattern as the Q8 SPLIT pass above -- runs BEFORE the Q4 aligned
         // pass so SPLIT can read Q4Raw before aligned mutates it.
-        let mut layers_with_q4_split: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
         if st.use_q4_split {
             if let (Some(ref split_repack_fn), true) = (
                 st.kernels.repack_q4_raw_to_split.as_ref(),
@@ -20815,18 +21318,6 @@ impl ComputeBackend for CudaBackend {
                      {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
                     oom_layer,
                 );
-                for (idx, lw) in cache.iter().enumerate() {
-                    if lw.q4_split_wq.is_some()
-                        || lw.q4_split_wk.is_some()
-                        || lw.q4_split_wv.is_some()
-                        || lw.q4_split_wo.is_some()
-                        || lw.q4_split_w_gate.is_some()
-                        || lw.q4_split_w_up.is_some()
-                        || lw.q4_split_w_down.is_some()
-                    {
-                        layers_with_q4_split.insert(idx);
-                    }
-                }
             } else if st.use_q4_split {
                 eprintln!(
                     "[CUDA] LUMEN_CUDA_Q4_SPLIT=1 set but split kernels unavailable; \
@@ -20841,7 +21332,6 @@ impl ComputeBackend for CudaBackend {
         // faster than separate-quantize + split matvec -- remains available.
         // Decode dispatch checks SPLIT sibling first, then falls through to
         // the Q4Aligned path.
-        let _ = &layers_with_q4_split; // tracked for diagnostic logs; no longer gates aligned skip
         if let Some(ref repack_fn) = st.kernels.repack_q4_0_to_aligned20 {
             if st.kernels.matvec_q4_aligned_q8_1.is_some() {
                 for (layer_idx, layer) in cache.iter_mut().enumerate() {
@@ -21094,6 +21584,14 @@ impl ComputeBackend for CudaBackend {
             eprintln!("[CUDA] BF16 autotune SKIPPED (LUMEN_CUDA_BF16_AUTOTUNE=0); using DEFAULT_TENSOR_OP");
         }
 
+        if crate::runtime_defaults::kquant_artifact() || super::decode::cuda_verbose() {
+            eprintln!(
+                "{}; embedding {:?}; output head {:?}",
+                super::gpu_buffers::kquant_plane_counters().report_line(),
+                self.embedding_quant,
+                self.output_proj_quant
+            );
+        }
         Ok(())
     }
 

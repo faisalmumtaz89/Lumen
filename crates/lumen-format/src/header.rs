@@ -6,7 +6,20 @@ use crate::quantization::{QuantScheme, QuantizationDescriptor};
 /// Magic bytes identifying an LBC file: "LBC\x01" in little-endian u32.
 pub const LBC_MAGIC: u32 = 0x01_43_42_4C; // 'L' 'B' 'C' 0x01
 
+/// The version of every artifact that carries no as-stored K-quant embedding:
+/// unchanged since 0.31.0. An artifact from a source that is not a K-quant source is
+/// byte-identical to that release's; a K-quant source's artifact can be version 4 too
+/// (no K-quant embedding), with the planes this release's source-fidelity policy keeps.
 pub const LBC_VERSION: u32 = 4;
+
+/// The version of an artifact whose embedding is an as-stored K-quant plane, and the
+/// newest version the reader accepts: the default generic conversion of a K-quant
+/// source (`Q4_K_M`, `Q5_K_M`) whose `token_embd` is K-quant produces one
+/// (`--dequantize` leaves no such plane, and that artifact keeps version 4). A 0.31.0
+/// reader classified a global by its byte length, and a Q4_K plane has exactly Q4_0's
+/// length, so it would misread the embedding; the version gate makes it refuse the
+/// file with `UnsupportedVersion` instead.
+pub const LBC_VERSION_KQUANT_EMBEDDING: u32 = 5;
 
 /// Default alignment for layer blobs (128 KiB).
 pub const DEFAULT_ALIGNMENT: u64 = 128 * 1024;
@@ -85,10 +98,10 @@ impl LbcHeader {
                 found: self.magic,
             });
         }
-        if self.version > LBC_VERSION {
+        if self.version > LBC_VERSION_KQUANT_EMBEDDING {
             return Err(crate::FormatError::UnsupportedVersion {
                 version: self.version,
-                max_supported: LBC_VERSION,
+                max_supported: LBC_VERSION_KQUANT_EMBEDDING,
             });
         }
         if self.alignment == 0 || !self.alignment.is_power_of_two() {
@@ -190,16 +203,18 @@ mod tests {
 
     #[test]
     fn version_validation() {
-        // Version 0 through 4 pass (≤ LBC_VERSION which is 4)
-        for v in 0..=4 {
+        // every version up to the K-quant-embedding one passes
+        for v in 0..=LBC_VERSION_KQUANT_EMBEDDING {
             let mut header = LbcHeader::new(test_hyperparams(), test_quant());
             header.version = v;
             header.validate().unwrap();
         }
+        assert_eq!(LBC_VERSION, 4);
+        assert_eq!(LBC_VERSION_KQUANT_EMBEDDING, 5);
 
-        // Version 5 fails (> LBC_VERSION)
+        // one past it fails
         let mut header = LbcHeader::new(test_hyperparams(), test_quant());
-        header.version = 5;
+        header.version = LBC_VERSION_KQUANT_EMBEDDING + 1;
         let err = header.validate().unwrap_err();
         assert!(matches!(err, crate::FormatError::UnsupportedVersion { .. }));
     }

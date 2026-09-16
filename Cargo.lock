@@ -770,6 +770,7 @@ version = "0.31.0"
 dependencies = [
  "lumen-format",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

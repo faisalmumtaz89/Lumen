@@ -70,7 +70,7 @@ v1 (current) verifies the Qwen3.5 family and the Qwen3.8-27B dense model end-to-
 | Model | Architecture | Parameters | Quants |
 |-------|--------------|------------|--------|
 | `qwen3.5-9b` | Dense GDN-hybrid | 9B | Q8_0, Q4_0, BF16 |
-| `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16 |
+| `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16, Q4_K_M (16.2 GB download), Q5_K_M (19.5 GB download) |
 | `qwen3.5-moe` | MoE GDN-hybrid | 35B total / 3B active | Q8_0, Q4_0, BF16 |
 
 | Backend | Hardware | Status |

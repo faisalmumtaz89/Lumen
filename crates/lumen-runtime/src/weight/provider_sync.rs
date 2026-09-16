@@ -56,7 +56,7 @@ impl SyncWeightProvider {
         let embedding_bytes =
             backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant)?;
         let final_norm = read_f32_tensor(
             &backend,
             lbc.header.final_norm.offset,
@@ -69,7 +69,7 @@ impl SyncWeightProvider {
             vocab_size,
             hidden_dim,
             outproj_header_quant,
-        );
+        )?;
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -103,7 +103,7 @@ impl SyncWeightProvider {
         let embedding_bytes =
             backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant)?;
         let final_norm = read_f32_tensor(
             &backend,
             lbc.header.final_norm.offset,
@@ -116,7 +116,7 @@ impl SyncWeightProvider {
             vocab_size,
             hidden_dim,
             outproj_header_quant,
-        );
+        )?;
 
         let weight_tying = lbc.header.weight_tying;
         Ok(Self {
@@ -226,57 +226,6 @@ pub fn dequantize_q8_0_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
     out
 }
 
-/// Dequantize Q6_K superblocks to `Vec<f32>`.
-/// Q6_K block layout (256 elements, 210 bytes): [128B ql low-4s] [64B qh
-/// upper-2s] [16B int8 sub-scales] [2B f16 d]. GGML group order: for each
-/// 128-element half, four 32-element groups combine ql lo/hi nibbles of
-/// ql[0..32]/ql[32..64] with qh bit-pairs 0/2/4/6; value = d * sc * (q - 32).
-/// Matches `lumen-convert::dequant` and the CUDA host reference exactly.
-pub fn dequantize_q6_k_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; n_elements];
-    let block_size = 210;
-    let n_blocks = src.len() / block_size;
-    let mut written = 0usize;
-    for b in 0..n_blocks {
-        let bp = &src[b * block_size..];
-        let ql = &bp[0..128];
-        let qh = &bp[128..192];
-        let scales = &bp[192..208];
-        let d = f16_bits_to_f32(u16::from_le_bytes([bp[208], bp[209]]));
-        let mut idx = 0usize;
-        for half in 0..2usize {
-            let ql_ptr = &ql[64 * half..];
-            let qh_ptr = &qh[32 * half..];
-            let sc_ptr = &scales[8 * half..];
-            for group in 0..4usize {
-                // Group g reads ql byte (g%2)*32+j (lo nibble for g<2, hi for
-                // g>=2) and qh bit pair 2*g of qh[j].
-                let ql_base = (group & 1) * 32;
-                let use_hi = group >= 2;
-                let hshift = 2 * group as u32;
-                for j in 0..32usize {
-                    if written + idx >= n_elements {
-                        break;
-                    }
-                    let ql_byte = ql_ptr[ql_base + j];
-                    let q_lo = if use_hi {
-                        (ql_byte >> 4) & 0x0F
-                    } else {
-                        ql_byte & 0x0F
-                    };
-                    let q_hi = ((qh_ptr[j] >> hshift) & 3) << 4;
-                    let q = (q_lo | q_hi) as i32 - 32;
-                    let sc = sc_ptr[2 * group + j / 16] as i8 as f32;
-                    out[written + idx] = d * sc * q as f32;
-                    idx += 1;
-                }
-            }
-        }
-        written += idx;
-    }
-    out
-}
-
 /// Dequantize Q4_0 bytes to `Vec<f32>`.
 /// Q4_0 block layout: [2 bytes f16 scale] [16 bytes packed nibbles], total 18 bytes per 32 elements.
 /// GGML de-interleaved order: indices 0-15 use lo nibbles, indices 16-31 use hi nibbles.
@@ -346,95 +295,155 @@ fn dequantize_bf16_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
 }
 
 /// Detect embedding quantization from byte length and model dimensions.
-/// Returns (f32_data, raw_bytes, quant_scheme).
+/// Returns `(f32_data, raw_bytes, quant_scheme)`, or `Err` when the plane fails to
+/// dequantise.
 /// Same heuristic as read_output_proj_global: compare byte length against
-/// expected sizes for F32, Q8_0, Q4_0, and F16/BF16. F16 and BF16 share the
-/// same 2-byte width, so `header_quant` (from the LBC header) disambiguates them.
+/// expected sizes for F32, Q8_0, Q4_0, F16/BF16 and the K-quant superblock
+/// formats (Q4_K / Q5_K / Q6_K, carried raw for the backends that gather them
+/// natively). F16 and BF16 share the same 2-byte width, so `header_quant`
+/// (from the LBC header) disambiguates them.
 pub fn read_embedding_global(
     raw_bytes: Vec<u8>,
     vocab_size: usize,
     hidden_dim: usize,
     header_quant: QuantScheme,
-) -> (Vec<f32>, Vec<u8>, QuantScheme) {
+) -> Result<(Vec<f32>, Vec<u8>, QuantScheme), RuntimeError> {
     let n_elements = vocab_size * hidden_dim;
     let expected_f32_bytes = n_elements * 4;
     let expected_q8_bytes = (n_elements / 32) * 34;
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
 
-    if raw_bytes.len() == expected_f32_bytes {
-        let f32_data = bytes_to_f32(&raw_bytes);
-        (f32_data, Vec::new(), QuantScheme::F32)
+    // A K-quant plane is declared by the header and confirmed by its length:
+    // Q4_K (144 B / 256) has exactly Q4_0's bytes per element (18 B / 32), so
+    // the length alone cannot tell them apart.
+    let kquant = kquant_scheme_for_len(raw_bytes.len(), n_elements)
+        .filter(|&q| is_kquant(header_quant) && q == header_quant);
+
+    // (scheme, whether the stored bytes are kept beside the F32 copy)
+    let (quant, keep_raw) = if let Some(q) = kquant {
+        (q, true)
+    } else if raw_bytes.len() == expected_f32_bytes {
+        (QuantScheme::F32, false)
     } else if raw_bytes.len() == expected_f16_bytes {
         // F16 and BF16 share the same byte width — trust the header to disambiguate.
         if matches!(header_quant, QuantScheme::Bf16) {
-            let f32_data = dequantize_bf16_to_f32(&raw_bytes, n_elements);
-            (f32_data, raw_bytes, QuantScheme::Bf16)
+            (QuantScheme::Bf16, true)
         } else {
-            let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
-            (f32_data, raw_bytes, QuantScheme::F16)
+            (QuantScheme::F16, true)
         }
     } else if raw_bytes.len() == expected_q8_bytes {
-        let f32_data = dequantize_q8_0_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::Q8_0)
+        (QuantScheme::Q8_0, true)
     } else if raw_bytes.len() == expected_q4_bytes {
-        let f32_data = dequantize_q4_0_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::Q4_0)
+        (QuantScheme::Q4_0, true)
     } else {
         // Unknown format -- try F32 interpretation (backward compat)
-        let f32_data = bytes_to_f32(&raw_bytes);
-        (f32_data, Vec::new(), QuantScheme::F32)
+        (QuantScheme::F32, false)
+    };
+
+    let f32_data = global_plane_to_f32(&raw_bytes, quant, n_elements, "embedding")?;
+    let raw_bytes = if keep_raw { raw_bytes } else { Vec::new() };
+    Ok((f32_data, raw_bytes, quant))
+}
+
+/// The F32 reading of a global plane of scheme `quant` (`role` names the plane in the
+/// error). A K-quant plane too short for the elements it must hold is an error, not a
+/// panic.
+fn global_plane_to_f32(
+    raw_bytes: &[u8],
+    quant: QuantScheme,
+    n_elements: usize,
+    role: &str,
+) -> Result<Vec<f32>, RuntimeError> {
+    Ok(match quant {
+        QuantScheme::F32 => bytes_to_f32(raw_bytes),
+        QuantScheme::Bf16 => dequantize_bf16_to_f32(raw_bytes, n_elements),
+        QuantScheme::F16 => dequantize_f16_to_f32(raw_bytes, n_elements),
+        QuantScheme::Q8_0 => dequantize_q8_0_to_f32(raw_bytes, n_elements),
+        QuantScheme::Q4_0 => dequantize_q4_0_to_f32(raw_bytes, n_elements),
+        QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K => {
+            crate::weight::kquant::dequant_kquant_to_f32(raw_bytes, quant, n_elements).map_err(
+                |e| {
+                    RuntimeError::Compute(format!("K-quant {role} plane failed to dequantise: {e}"))
+                },
+            )?
+        }
+        other => unreachable!("no global plane is classified as {other:?}"),
+    })
+}
+
+/// Whether `q` is an as-stored K-quant superblock scheme.
+fn is_kquant(q: QuantScheme) -> bool {
+    matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K)
+}
+
+/// The K-quant scheme whose plane of `n_elements` is exactly `len` bytes (256
+/// elements per superblock: Q4_K 144, Q5_K 176, Q6_K 210).
+fn kquant_scheme_for_len(len: usize, n_elements: usize) -> Option<QuantScheme> {
+    if n_elements % 256 != 0 {
+        return None;
     }
+    let blocks = n_elements / 256;
+    [
+        (QuantScheme::Q4_K, 144usize),
+        (QuantScheme::Q5_K, 176),
+        (QuantScheme::Q6_K, 210),
+    ]
+    .into_iter()
+    .find(|&(_, bb)| blocks * bb == len)
+    .map(|(q, _)| q)
 }
 
 /// Detect output_proj quantization from byte length and model dimensions.
-/// Returns (f32_data, raw_bytes, quant_scheme). F16 and BF16 share the same
-/// 2-byte width, so `header_quant` (from the LBC header) disambiguates them.
+/// Returns `(f32_data, raw_bytes, quant_scheme)`, or `Err` when the plane fails to
+/// dequantise. F16 and BF16 share the same 2-byte width, so `header_quant` (from the
+/// LBC header) disambiguates them.
 pub fn read_output_proj_global(
     raw_bytes: Vec<u8>,
     vocab_size: usize,
     hidden_dim: usize,
     header_quant: QuantScheme,
-) -> (Vec<f32>, Vec<u8>, QuantScheme) {
+) -> Result<(Vec<f32>, Vec<u8>, QuantScheme), RuntimeError> {
     let n_elements = vocab_size * hidden_dim;
     let expected_f32_bytes = n_elements * 4;
     let expected_q8_bytes = (n_elements / 32) * 34;
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
-    let expected_q6k_bytes = (n_elements / 256) * 210;
+    // A K-quant head is declared by the header and confirmed by its length.
+    let kquant = kquant_scheme_for_len(raw_bytes.len(), n_elements)
+        .filter(|&q| is_kquant(header_quant) && q == header_quant);
 
-    // Q6_K head (source-fidelity artifacts): keep the raw superblocks for the
-    // CUDA dp4a plane kernel AND materialize the F32 copy for CPU fallbacks.
-    // Checked before the length cascade — without this branch the final else
-    // used to misinterpret the Q6_K bytes as F32 and drop the raw entirely.
-    if matches!(header_quant, QuantScheme::Q6_K) && raw_bytes.len() == expected_q6k_bytes {
-        let f32_data = dequantize_q6_k_to_f32(&raw_bytes, n_elements);
-        return (f32_data, raw_bytes, QuantScheme::Q6_K);
-    }
-
-    if raw_bytes.len() == expected_f32_bytes {
-        let f32_data = bytes_to_f32(&raw_bytes);
-        (f32_data, raw_bytes, QuantScheme::F32)
+    // (scheme, whether the stored bytes are kept beside the F32 copy)
+    let (quant, keep_raw) = if let Some(q) = kquant {
+        // Q6_K head (source-fidelity artifacts): the raw superblocks feed the
+        // CUDA dp4a plane kernel and the Metal K-quant head; the F32 copy is
+        // for the CPU fallbacks. Checked before the length cascade so the
+        // final else cannot read the Q6_K bytes as F32. A Q4_K / Q5_K head is
+        // carried raw with its scheme so the backend can refuse it by name (the
+        // converter does not preserve a Q4_K / Q5_K head on any target); a Q4_K plane
+        // has exactly Q4_0's byte length, so the header must decide.
+        (q, true)
+    } else if raw_bytes.len() == expected_f32_bytes {
+        (QuantScheme::F32, true)
     } else if raw_bytes.len() == expected_f16_bytes {
         // F16 and BF16 share the same byte width — trust the header to disambiguate.
         if matches!(header_quant, QuantScheme::Bf16) {
-            let f32_data = dequantize_bf16_to_f32(&raw_bytes, n_elements);
-            (f32_data, raw_bytes, QuantScheme::Bf16)
+            (QuantScheme::Bf16, true)
         } else {
-            let f32_data = dequantize_f16_to_f32(&raw_bytes, n_elements);
-            (f32_data, raw_bytes, QuantScheme::F16)
+            (QuantScheme::F16, true)
         }
     } else if raw_bytes.len() == expected_q8_bytes {
-        let f32_data = dequantize_q8_0_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::Q8_0)
+        (QuantScheme::Q8_0, true)
     } else if raw_bytes.len() == expected_q4_bytes {
-        let f32_data = dequantize_q4_0_to_f32(&raw_bytes, n_elements);
-        (f32_data, raw_bytes, QuantScheme::Q4_0)
+        (QuantScheme::Q4_0, true)
     } else {
         // Unknown format -- try F32 interpretation (backward compat)
-        let f32_data = bytes_to_f32(&raw_bytes);
-        (f32_data, Vec::new(), QuantScheme::F32)
-    }
+        (QuantScheme::F32, false)
+    };
+
+    let f32_data = global_plane_to_f32(&raw_bytes, quant, n_elements, "output head")?;
+    let raw_bytes = if keep_raw { raw_bytes } else { Vec::new() };
+    Ok((f32_data, raw_bytes, quant))
 }
 
 /// Dequantize a single subtensor from the raw layer blob, returning F32 bytes.
@@ -750,11 +759,80 @@ mod tests {
             }
         }
 
-        let got = dequantize_q6_k_to_f32(&block, 256);
+        let got = global_plane_to_f32(&block, QuantScheme::Q6_K, 256, "output head").unwrap();
         assert_eq!(got.len(), 256);
         for i in 0..256 {
             assert_eq!(got[i], expected[i], "Q6_K mismatch at element {i}");
         }
+    }
+
+    /// A K-quant plane too short for the elements it must hold is an error naming the
+    /// plane, not a panic. The public readers classify a K-quant plane by an exact
+    /// superblock length, so they cannot reach this; the reading itself still reports it.
+    #[test]
+    fn a_short_k_quant_plane_is_an_error_not_a_panic() {
+        let err = global_plane_to_f32(&[0u8; 144], QuantScheme::Q4_K, 512, "embedding")
+            .expect_err("one superblock cannot hold 512 elements");
+        assert!(
+            err.to_string()
+                .contains("K-quant embedding plane failed to dequantise"),
+            "{err}"
+        );
+        let err = global_plane_to_f32(&[0u8; 210], QuantScheme::Q6_K, 512, "output head")
+            .expect_err("the head likewise");
+        assert!(
+            err.to_string().contains("K-quant output head plane"),
+            "{err}"
+        );
+    }
+
+    /// A K-quant embedding plane is recognised by its superblock length and
+    /// carried raw with its scheme; the F32 copy is the shared host dequant.
+    #[test]
+    fn read_embedding_global_keeps_k_quant_planes_raw() {
+        let vocab = 4usize;
+        let hidden = 256usize;
+        for (scheme, bb) in [
+            (QuantScheme::Q4_K, 144usize),
+            (QuantScheme::Q5_K, 176),
+            (QuantScheme::Q6_K, 210),
+        ] {
+            let raw: Vec<u8> = (0..vocab * bb).map(|i| (i * 37 % 251) as u8).collect();
+            let (f32_data, kept, quant) =
+                read_embedding_global(raw.clone(), vocab, hidden, scheme).unwrap();
+            assert_eq!(quant, scheme);
+            assert_eq!(kept, raw);
+            let expected =
+                crate::weight::kquant::dequant_kquant_to_f32(&raw, scheme, vocab * hidden).unwrap();
+            assert_eq!(f32_data.len(), vocab * hidden);
+            assert!(f32_data
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        // Q4_K and Q4_0 planes have the same byte length: the header decides.
+        let q4_len = (vocab * hidden / 256) * 144;
+        let (_, kept, quant) =
+            read_embedding_global(vec![0u8; q4_len], vocab, hidden, QuantScheme::Q4_0).unwrap();
+        assert_eq!(quant, QuantScheme::Q4_0);
+        assert_eq!(kept.len(), q4_len);
+        // the head reader: a Q4_K-length plane is Q4_K only when the header says so
+        let (_, kept, quant) =
+            read_output_proj_global(vec![0u8; q4_len], vocab, hidden, QuantScheme::Q4_K).unwrap();
+        assert_eq!(quant, QuantScheme::Q4_K);
+        assert_eq!(kept.len(), q4_len);
+        let (_, _, quant) =
+            read_output_proj_global(vec![0u8; q4_len], vocab, hidden, QuantScheme::Q4_0).unwrap();
+        assert_eq!(quant, QuantScheme::Q4_0);
+        let q5_len = (vocab * hidden / 256) * 176;
+        let (_, kept, quant) =
+            read_output_proj_global(vec![0u8; q5_len], vocab, hidden, QuantScheme::Q5_K).unwrap();
+        assert_eq!((quant, kept.len()), (QuantScheme::Q5_K, q5_len));
+        // a length that is no known format still falls back to the F32 reading
+        let odd = vec![0u8; vocab * hidden * 4 + 4];
+        let (_, kept, quant) = read_embedding_global(odd, vocab, hidden, QuantScheme::F32).unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(quant, QuantScheme::F32);
     }
 
     /// Write the given LBC bytes to a unique temp file and return its path.

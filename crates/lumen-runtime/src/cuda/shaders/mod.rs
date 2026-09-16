@@ -41,6 +41,9 @@ pub const MATVEC_Q8_0_VEC_KERNEL_SOURCE: &str = include_str!("matvec_q8_0_vec.cu
 
 /// Q8_0 dequantization kernels (Q8_0→F32 and Q8_0→F16 for cuBLAS GEMM prefill).
 pub const DEQUANT_Q8_0_KERNEL_SOURCE: &str = include_str!("dequant_q8_0_f16.cu");
+/// Q8_0 split-layout (SoA) dequant to F16 / F32 for the prefill: serves a Q8_0 plane whose
+/// raw copy was released after the split clone (`dequant_q8_split.cu`).
+pub const DEQUANT_Q8_SPLIT_KERNEL_SOURCE: &str = include_str!("dequant_q8_split.cu");
 
 /// MMQ-style Q8_0 batched matmul.
 ///
@@ -483,6 +486,20 @@ pub const MATVEC_Q4_SPLIT_Q8_1_MMVQ_KERNEL_SOURCE: &str =
 /// Configurable NR via `MATVEC_Q8_SPLIT_OUTPUT_PROJ_NR` macro at compile time.
 pub const MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE: &str =
     include_str!("matvec_q8_split_output_proj.cu");
+
+/// Q4_K kernels for K-quant artifacts: decode matvec against Q8_1 input
+/// (plain + residual), the F16 dequant tile for the prefill HGEMM, and the
+/// embedding row-gather. Reads the GGML superblocks as stored (no repack).
+pub const MATVEC_Q4_K_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q4_k_q8_1.cu");
+
+/// Q5_K kernels for K-quant artifacts; the Q4_K set's layout with the qh
+/// high-bit plane.
+pub const MATVEC_Q5_K_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q5_k_q8_1.cu");
+
+/// Q6_K kernels for K-quant artifacts (general planes; the output head keeps
+/// its own split-plane kernel). 2-byte-aligned superblocks; a 32-bit load where the
+/// address is 4-aligned, a 16-bit pair otherwise (warp-uniform branch).
+pub const MATVEC_Q6_K_Q8_1_KERNEL_SOURCE: &str = include_str!("matvec_q6_k_q8_1.cu");
 
 /// Q6_K output-head matvec (split-plane layout) against Q8_1 input. Serves
 /// `output.weight` in its source K-quant form (6.5625 bpw) instead of the

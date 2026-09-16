@@ -4,7 +4,9 @@
 //! layer indices, and the file path for lazy layer reads.
 
 use crate::crc::{crc32, crc32_finalize, crc32_update, CRC32_INIT};
-use crate::header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION};
+use crate::header::{
+    Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION_KQUANT_EMBEDDING,
+};
 use crate::hyperparams::{GdnDims, ModelHyperparams, RopeParams, RopeScalingType};
 use crate::index::{ExpertSlice, LayerIndex, SubtensorOffsets, TensorSlice};
 use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
@@ -233,10 +235,10 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
     }
 
     let version = cursor.read_u32()?;
-    if version > LBC_VERSION {
+    if version > LBC_VERSION_KQUANT_EMBEDDING {
         return Err(FormatError::UnsupportedVersion {
             version,
-            max_supported: LBC_VERSION,
+            max_supported: LBC_VERSION_KQUANT_EMBEDDING,
         });
     }
 
@@ -847,6 +849,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::LBC_VERSION;
     use crate::writer::{write_lbc, GlobalTensors};
 
     fn make_test_header() -> (LbcHeader, Vec<LayerIndex>) {

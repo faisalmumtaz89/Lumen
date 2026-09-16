@@ -37,6 +37,19 @@ pub struct GgufSource {
     pub files: Vec<String>,
 }
 
+/// Split a `model:quant` argument into the model name and the upper-cased
+/// quant tag (`qwen3.8-27b:q4_k_m` → `("qwen3.8-27b", Some("Q4_K_M"))`). The
+/// last colon separates them; a trailing colon is not a tag and the value is returned
+/// unchanged, colon included (as `lumen run` has always treated it).
+pub fn split_model_tag(value: &str) -> (&str, Option<String>) {
+    match value.rfind(':') {
+        Some(pos) if pos + 1 < value.len() => {
+            (&value[..pos], Some(value[pos + 1..].to_uppercase()))
+        }
+        _ => (value, None),
+    }
+}
+
 impl GgufSource {
     /// Returns the primary (first) shard filename. For single-file GGUFs this
     /// is the file itself; for multi-shard GGUFs it's the shard the converter
@@ -383,6 +396,43 @@ mod tests {
                 "BF16 shard filename should match the *-of-* pattern: {f}"
             );
         }
+    }
+
+    #[test]
+    fn model_tag_splits_on_the_last_colon_and_upper_cases_the_quant() {
+        assert_eq!(
+            split_model_tag("qwen3.8-27b:q4_k_m"),
+            ("qwen3.8-27b", Some("Q4_K_M".to_owned()))
+        );
+        assert_eq!(
+            split_model_tag("qwen3.8-27b:q5_k_m"),
+            ("qwen3.8-27b", Some("Q5_K_M".to_owned()))
+        );
+        assert_eq!(split_model_tag("qwen3.8-27b:"), ("qwen3.8-27b:", None));
+        assert_eq!(split_model_tag("qwen3.8-27b"), ("qwen3.8-27b", None));
+    }
+
+    #[test]
+    fn qwen38_27b_has_the_k_quant_files() {
+        let reg = load_registry();
+        let entry = reg
+            .resolve("qwen3.8-27b")
+            .expect("qwen3.8-27b must resolve");
+        for (input, key, file) in [
+            ("qwen3.8-27b:q4_k_m", "Q4_K_M", "Qwen3.8-27B-Q4_K_M.gguf"),
+            ("qwen3.8-27b:q5_k_m", "Q5_K_M", "Qwen3.8-27B-Q5_K_M.gguf"),
+        ] {
+            let (name, tag) = split_model_tag(input);
+            assert_eq!(name, "qwen3.8-27b");
+            assert_eq!(tag.as_deref(), Some(key));
+            let src = &entry.gguf_files[key];
+            assert_eq!(src.repo, "bartowski/Qwen3.8-27B-GGUF");
+            assert_eq!(src.file(), file);
+            assert!(!src.is_multi_shard());
+        }
+        let mut listed: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["BF16", "Q4_0", "Q4_K_M", "Q5_K_M", "Q8_0"]);
     }
 
     #[test]

@@ -34,9 +34,9 @@ Lumen's Layer-Blob Container (`.lbc`) format:
 - CRC32 header
 - Zero-copy mmap
 - Per-tensor quantization (mix BF16 / Q8_0 / Q4_0 in one file)
-- Current version: `LBC_VERSION = 4`
+- Current version: `LBC_VERSION = 4` (version 5 for an artifact whose embedding is an as-stored K-quant plane)
 
-The converter accepts GGUF v2/v3, streams one layer at a time, re-quantizes or preserves tensors per target backend (see `docs/support.md` — Metal targets upcast K-quants to Q8_0, generic targets carry them for CUDA's dequant-at-load), and filters the MTP (Next-N) head.
+The converter accepts GGUF v2/v3, streams one layer at a time, re-quantizes or preserves tensors per target backend (see `docs/support.md` — a K-quant source's (`Q4_K_M`, `Q5_K_M`) Q4_K / Q5_K / Q6_K FFN planes are carried verbatim on the generic target and served by the CUDA K-quant kernels, its embedding, a kept `ssm_out` and a Q6_K head likewise, while a Q4_K / Q5_K head is re-quantised (Q8_0 by default); the Metal target upcasts every K-quant plane to Q8_0 as before), and filters the MTP (Next-N) head.
 
 ## Suffix prefill
 

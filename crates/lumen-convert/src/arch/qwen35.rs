@@ -55,6 +55,20 @@ impl ArchConverter for Qwen35Converter {
 // Qwen3.5 (dense) layer shape computation
 // ---------------------------------------------------------------------------
 
+/// Whether a layer's `ssm_out` keeps its source scheme. The layer plan and the
+/// layer write both call this one function, so the two cannot disagree. Under
+/// source fidelity — which a K-quant source conversion takes by default — a Q5_K or
+/// Q8_0 `ssm_out` is kept (the runtime's dedicated kernels serve them); a K-quant
+/// source conversion also keeps a Q4_K or Q6_K one (the general K-quant kernels serve
+/// them). Only on a target that serves K-quant planes: the Metal target requantises it.
+pub(crate) fn ssm_out_keeps_source(target: ConvertTarget, src: Option<GgmlType>) -> bool {
+    crate::convert::target_serves_kquant(target)
+        && crate::convert::source_fidelity()
+        && (matches!(src, Some(GgmlType::Q5_K) | Some(GgmlType::Q8_0))
+            || (crate::convert::kquant_source()
+                && matches!(src, Some(GgmlType::Q4_K) | Some(GgmlType::Q6_K))))
+}
+
 /// Compute the LayerShape for a single Qwen3.5 (dense) layer.
 ///
 /// Same hybrid GDN + full-attention architecture as Qwen3.5-MoE, but with
@@ -299,8 +313,9 @@ fn compute_layer_shape_qwen35(
             None => {
                 // SOURCE_FIDELITY passthrough: a None target keeps the source
                 // scheme verbatim (the ssm_out caller only passes None for
-                // sources the runtime serves natively: Q5_K, Q8_0). Must
-                // mirror `write_layer_blob`'s None-target verbatim copy.
+                // sources the runtime serves natively — `ssm_out_keeps_source`:
+                // Q5_K, Q8_0, and on a K-quant source conversion Q4_K and Q6_K).
+                // Must mirror `write_layer_blob`'s None-target verbatim copy.
                 let quant = src_quant.ok_or_else(|| ConvertError::UnsupportedTensorType {
                     tensor: name.clone(),
                     ggml_type: format!("{:?}", tensor.ggml_type),
@@ -482,19 +497,14 @@ fn compute_layer_shape_qwen35(
     // "force F32 unless requant handles it" shipped LBCs that lost 100%+
     // Metal prefill on Qwen3.5-9B.)
     // SOURCE_FIDELITY: keep ssm_out in its source format when the runtime can
-    // serve it (Q5_K in Q4_0-preset files, Q8_0 in Q8 files). The Q8_0 floor
-    // below guards the historical hazard — REQUANTIZING ssm_out DOWN to 4-bit
-    // corrupts the recurrence; serving the provider's own Q5_K is the
-    // reference engine's configuration, not a down-requant.
+    // serve it (`ssm_out_keeps_source`). The Q8_0 floor below guards the
+    // historical hazard — REQUANTIZING ssm_out DOWN to 4-bit corrupts the
+    // recurrence; serving the provider's own K-quant is the reference
+    // engine's configuration, not a down-requant.
     let ssm_out_src = gguf
         .find_tensor(&layer_tensor_name(layer, SSM_OUT))
         .map(|t| t.ggml_type);
-    let ssm_out_target = if target != ConvertTarget::Metal
-        && crate::convert::source_fidelity()
-        && matches!(
-            ssm_out_src,
-            Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
-        ) {
+    let ssm_out_target = if ssm_out_keeps_source(target, ssm_out_src) {
         None
     } else {
         match requant_to {
@@ -718,14 +728,9 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             // MUST stay in sync for layer-shape symmetry). (Target is
             // irrelevant here: ssm_out is always force-requanted.)
             // SOURCE_FIDELITY: keep the source scheme verbatim (None target =
-            // passthrough) — must mirror the plan's `ssm_out_target` above.
+            // passthrough) — the same `ssm_out_keeps_source` the plan used.
             let src = gguf.find_tensor(&name).map(|t| t.ggml_type);
-            let ssm_out_target = if target != ConvertTarget::Metal
-                && crate::convert::source_fidelity()
-                && matches!(
-                    src,
-                    Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
-                ) {
+            let ssm_out_target = if ssm_out_keeps_source(target, src) {
                 None
             } else {
                 match requant_to {

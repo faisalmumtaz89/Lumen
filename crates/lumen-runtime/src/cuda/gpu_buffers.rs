@@ -56,18 +56,18 @@ pub enum GpuWeightBuf {
     /// to the quants stream is 4-byte aligned because every shipped `in_dim`
     /// yields an even `nb`, so the consumer kernel keeps native `int*` loads.
     ///
-    /// Used only for the decode path; produced by `repack_q8_raw_to_split()`
-    /// when `LUMEN_CUDA_Q8_SPLIT=1` is set at session start. The original
-    /// `Q8Raw`/`Q8Aligned` buffer is preserved on `LayerWeightsGpu` because
-    /// batched prefill uses `dequant -> F16 -> cuBLAS HGEMM` which needs the
-    /// AoS layout. Consumed by `matvec_q8_split_q8_1` /
-    /// `matvec_q8_split_q8_1_residual`.
-    ///
-    /// Stored as a sibling `Option<CudaSlice<u8>>` on `LayerWeightsGpu`, not
-    /// constructed directly via this enum; the variant exists so all match
-    /// sites on `GpuWeightBuf` are exhaustive.
-    #[allow(dead_code)]
-    Q8Split(CudaSlice<u8>),
+    /// Produced by `repack_q8_raw_to_split()` in the split-clone pass and consumed
+    /// by `matvec_q8_split_q8_1` / `_residual` on decode. The pass stores the split
+    /// plane behind an `Arc` in the layer's `q8_split_*` slot (the decode dispatch
+    /// keys on those slots) and, on a K-quant artifact where every route that could
+    /// read the plane can read the split layout instead, moves the base slot to this
+    /// variant over the same `Arc` and releases the raw plane — a Q8_0 plane is
+    /// then resident once, in the split layout. A Q4_0 / Q8_0 / BF16 artifact keeps
+    /// both copies as shipped; the whole predicate is the ladder in
+    /// `backend_impl::preload_weights`. The prefill serves this variant
+    /// with `dequant_q8_split_to_f16` / `_to_f32` (a tile bit-identical to the raw
+    /// dequant) on its usual dequant -> GEMM route.
+    Q8Split(std::sync::Arc<CudaSlice<u8>>),
     /// Repacked Q4_0 in per-row split (SoA) layout: each row holds
     /// `[f16 scale * nb][nibble[16] * nb]` for a total of 18*nb bytes
     /// (same density as `Q4Raw`, 10% denser than `Q4Aligned`'s 20*nb).
@@ -85,6 +85,16 @@ pub enum GpuWeightBuf {
     /// `matvec_ct4_q8_1(_residual)` at decode and `dequant_ct4_to_f16`
     /// for the prefill HGEMM path.
     Ct4Raw(CudaSlice<u8>),
+    /// Raw GGML Q4_K superblocks (144 bytes per 256 elements), exactly the
+    /// artifact's bytes. Only a K-quant artifact (LBC header scheme Q4_K,
+    /// Q5_K or Q6_K) uploads its planes this way; consumed by
+    /// `matvec_q4_k_q8_1(_residual)` at decode and `dequant_q4_k_to_f16`
+    /// for the prefill HGEMM. No F16 cache is built for it.
+    Q4KRaw(CudaSlice<u8>),
+    /// Raw GGML Q5_K superblocks (176 bytes per 256 elements); as `Q4KRaw`.
+    Q5KRaw(CudaSlice<u8>),
+    /// Raw GGML Q6_K superblocks (210 bytes per 256 elements); as `Q4KRaw`.
+    Q6KRaw(CudaSlice<u8>),
 }
 
 /// Per-layer weight buffers resident on GPU.
@@ -128,24 +138,30 @@ pub struct LayerWeightsGpu {
     pub w_up_f16: Option<CudaSlice<u8>>,
     pub w_down_f16: Option<CudaSlice<u8>>,
 
-    // --- split-layout integration: decode-only Q8 split siblings ---
-    /// Populated by `repack_layer_q8_clone_to_split()` when
+    // --- split-layout integration: Q8 split siblings ---
+    /// Populated by `repack_all_layers_q8_clone_to_split()` when
     /// `LUMEN_CUDA_Q8_SPLIT=1` is set at session start. Holds the same elements
     /// as the parallel `wq`/`wk`/etc. buffer but reorganized as `[scales][quants]`
     /// per row to enable native `int*` loads in `matvec_q8_split_q8_1`. The
-    /// original AoS buffer is preserved (prefill uses dequant->F16->HGEMM which
-    /// needs AoS). Decode dispatch prefers these siblings when present.
-    pub q8_split_wq: Option<CudaSlice<u8>>,
-    pub q8_split_wk: Option<CudaSlice<u8>>,
-    pub q8_split_wv: Option<CudaSlice<u8>>,
-    pub q8_split_wo: Option<CudaSlice<u8>>,
-    pub q8_split_w_gate: Option<CudaSlice<u8>>,
-    pub q8_split_w_up: Option<CudaSlice<u8>>,
-    pub q8_split_w_down: Option<CudaSlice<u8>>,
+    /// original AoS buffer is kept on every Q4_0 / Q8_0 / BF16 artifact (the plan
+    /// freezes those cells) and, on a K-quant artifact, whenever a route still needs
+    /// those bytes (`LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`, a MoE model, `LUMEN_CUDA_Q8_PROJ_MMQ`
+    /// set, the conv-state parity reprojection, or a split kernel / the Q8_1 quantizer /
+    /// its scratch that did not load — the ladder in `backend_impl::preload_weights` is
+    /// the whole predicate); otherwise the base slot is replaced by `GpuWeightBuf::Q8Split`
+    /// over the same allocation, and prefill reads the split layout. Decode dispatch
+    /// prefers these siblings when present.
+    pub q8_split_wq: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_wk: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_wv: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_wo: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_w_gate: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_w_up: Option<std::sync::Arc<CudaSlice<u8>>>,
+    pub q8_split_w_down: Option<std::sync::Arc<CudaSlice<u8>>>,
 
     // --- split-layout integration: decode-only Q4 split siblings ---
     /// Mirror of the q8_split_* fields for Q4_0 weights. Populated by
-    /// `repack_layer_q4_clone_to_split()` when `LUMEN_CUDA_Q4_SPLIT=1`.
+    /// `repack_all_layers_q4_clone_to_split()` when `LUMEN_CUDA_Q4_SPLIT=1`.
     pub q4_split_wq: Option<CudaSlice<u8>>,
     pub q4_split_wk: Option<CudaSlice<u8>>,
     pub q4_split_wv: Option<CudaSlice<u8>>,
@@ -190,18 +206,18 @@ pub struct LayerWeightsGpu {
     /// `LUMEN_CUDA_Q8_SPLIT_SSMOUT=1` (default ON) — subject to global
     /// `LUMEN_CUDA_Q8_SPLIT` enablement, Q8Raw eligibility, the clone budget,
     /// and allocation success.
-    pub q8_split_ssm_out: Option<CudaSlice<u8>>,
+    pub q8_split_ssm_out: Option<std::sync::Arc<CudaSlice<u8>>>,
     /// Per-row split sibling for the GDN z-gate projection when Q8Raw.
     /// Eligible for population by the Q8 clone pass on wide-GDN models when
     /// `LUMEN_CUDA_Q8_SPLIT_ATTN=1` (default ON — see
     /// `q8_split_attn_enabled`) — subject to global `LUMEN_CUDA_Q8_SPLIT`
     /// enablement, Q8Raw eligibility, the clone budget, and allocation
     /// success.
-    pub q8_split_attn_gate: Option<CudaSlice<u8>>,
+    pub q8_split_attn_gate: Option<std::sync::Arc<CudaSlice<u8>>>,
     #[allow(dead_code)]
-    pub q8_split_ssm_alpha: Option<CudaSlice<u8>>,
+    pub q8_split_ssm_alpha: Option<std::sync::Arc<CudaSlice<u8>>>,
     #[allow(dead_code)]
-    pub q8_split_ssm_beta: Option<CudaSlice<u8>>,
+    pub q8_split_ssm_beta: Option<std::sync::Arc<CudaSlice<u8>>>,
     /// Per-row split siblings for Q4Raw GDN weights (decode-only). Currently
     /// always `None` (no populator); the decode projection reads them as
     /// optional split siblings and falls back to the base Q4Raw matvec.
@@ -292,30 +308,9 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
     n_blocks * bs_elem
 }
 
-/// Host IEEE f16 bits -> f32. Module-level twin of the per-arm copies inside
-/// `upload_tensor`; used where a `fn(u16) -> f32` must be passed by name.
-pub(super) fn host_f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x3ff) as u32;
-    if exp == 0 {
-        if frac == 0 {
-            return if sign == 1 { -0.0 } else { 0.0 };
-        }
-        let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
-        return if sign == 1 { -v } else { v };
-    }
-    if exp == 31 {
-        return if frac != 0 {
-            f32::NAN
-        } else if sign == 1 {
-            f32::NEG_INFINITY
-        } else {
-            f32::INFINITY
-        };
-    }
-    f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
-}
+use crate::runtime_defaults::kquant_artifact;
+pub(crate) use crate::weight::kquant::dequant_kquant_to_f32;
+use crate::weight::kquant::host_f16_to_f32;
 
 /// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
 /// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
@@ -388,337 +383,6 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     } else {
         sign // underflow to signed zero
     }
-}
-
-/// Decode K-quant scales from 12 packed bytes into 8 scale + 8 min arrays.
-///
-/// Used by Q4_K and Q5_K. The 12 bytes encode 8 6-bit scales and 8 6-bit mins
-/// in the standard packed layout: low 6 bits from bytes 0..7, high 2 bits from bytes 8..11.
-fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
-    let mut sc = [0u8; 8];
-    let mut m = [0u8; 8];
-    for j in 0..4 {
-        sc[j] = scales[j] & 63;
-        m[j] = scales[j + 4] & 63;
-    }
-    for j in 4..8 {
-        sc[j] = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
-        m[j] = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-    }
-    (sc, m)
-}
-
-/// Dequantize a K-quant weight buffer to F32.
-///
-/// Supports all K-quant schemes stored in LBC files: Q6_K, Q4_K, Q5_K, Q2_K,
-/// Q3_K. Mixed-quant GGUFs (e.g. bartowski/mradermacher Q4_0 with imatrix)
-/// commonly use Q5_K or Q6_K for sensitive per-layer tensors alongside Q4_0.
-///
-/// All implementations match the reference layout exactly (same as
-/// lumen-convert::dequant).
-pub(super) fn dequant_kquant_to_f32(
-    raw: &[u8],
-    scheme: QuantScheme,
-    n_elements: usize,
-    f16_to_f32: fn(u16) -> f32,
-) -> Result<Vec<f32>, RuntimeError> {
-    let mut out = vec![0.0f32; n_elements];
-
-    match scheme {
-        QuantScheme::Q6_K => {
-            // Q6_K: 256 elements per block, 210 bytes per block.
-            // Layout: [128B ql, 64B qh, 16B scales, 2B f16_d]
-            let block_size = 210;
-            let n_blocks = raw.len() / block_size;
-            let mut written = 0usize;
-            for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
-                let ql = &bp[0..128];
-                let qh = &bp[128..192];
-                let scales = &bp[192..208];
-                let d_bits = u16::from_le_bytes([bp[208], bp[209]]);
-                let d = f16_to_f32(d_bits);
-
-                let mut idx = 0usize;
-                for half in 0..2usize {
-                    let ql_ptr = &ql[64 * half..];
-                    let qh_ptr = &qh[32 * half..];
-                    let sc_ptr = &scales[8 * half..];
-
-                    // Group 0: low nibbles of ql[0..32], qh bits [0..1]
-                    for j in 0..32 {
-                        if written + idx >= n_elements {
-                            break;
-                        }
-                        let q_lo = ql_ptr[j] & 0x0F;
-                        let q_hi = (qh_ptr[j] & 3) << 4;
-                        let q = (q_lo | q_hi) as i32 - 32;
-                        let sc = sc_ptr[j / 16] as i8 as f32;
-                        out[written + idx] = d * sc * q as f32;
-                        idx += 1;
-                    }
-                    // Group 1: low nibbles of ql[32..64], qh bits [2..3]
-                    // (order MUST match ggml's dequantize_row_q6_K).
-                    for j in 0..32 {
-                        if written + idx >= n_elements {
-                            break;
-                        }
-                        let q_lo = ql_ptr[32 + j] & 0x0F;
-                        let q_hi = ((qh_ptr[j] >> 2) & 3) << 4;
-                        let q = (q_lo | q_hi) as i32 - 32;
-                        let sc = sc_ptr[2 + j / 16] as i8 as f32;
-                        out[written + idx] = d * sc * q as f32;
-                        idx += 1;
-                    }
-                    // Group 2: high nibbles of ql[0..32], qh bits [4..5]
-                    for j in 0..32 {
-                        if written + idx >= n_elements {
-                            break;
-                        }
-                        let q_lo = (ql_ptr[j] >> 4) & 0x0F;
-                        let q_hi = ((qh_ptr[j] >> 4) & 3) << 4;
-                        let q = (q_lo | q_hi) as i32 - 32;
-                        let sc = sc_ptr[4 + j / 16] as i8 as f32;
-                        out[written + idx] = d * sc * q as f32;
-                        idx += 1;
-                    }
-                    // Group 3: high nibbles of ql[32..64], qh bits [6..7]
-                    for j in 0..32 {
-                        if written + idx >= n_elements {
-                            break;
-                        }
-                        let q_lo = (ql_ptr[32 + j] >> 4) & 0x0F;
-                        let q_hi = ((qh_ptr[j] >> 6) & 3) << 4;
-                        let q = (q_lo | q_hi) as i32 - 32;
-                        let sc = sc_ptr[6 + j / 16] as i8 as f32;
-                        out[written + idx] = d * sc * q as f32;
-                        idx += 1;
-                    }
-                }
-                written += idx;
-            }
-        }
-        QuantScheme::Q4_K => {
-            // Q4_K: 256 elements per block, 144 bytes per block.
-            // Layout: [2B f16 d, 2B f16 dmin, 12B scales, 128B qs]
-            let block_size = 144;
-            let n_blocks = raw.len() / block_size;
-            let mut written = 0usize;
-            for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
-                let d = f16_to_f32(u16::from_le_bytes([bp[0], bp[1]]));
-                let dmin = f16_to_f32(u16::from_le_bytes([bp[2], bp[3]]));
-                let (sc, m_arr) = decode_k_scales(&bp[4..16]);
-                let qs = &bp[16..144];
-
-                // 4 groups of 64 values (2 sub-blocks each)
-                for group in 0..4 {
-                    let is = group * 2;
-                    let d1 = d * sc[is] as f32;
-                    let m1 = dmin * m_arr[is] as f32;
-                    let d2 = d * sc[is + 1] as f32;
-                    let m2 = dmin * m_arr[is + 1] as f32;
-                    let qs_offset = group * 32;
-
-                    // First 32 values: low nibbles
-                    for l in 0..32 {
-                        if written >= n_elements {
-                            break;
-                        }
-                        out[written] = d1 * (qs[qs_offset + l] & 0x0F) as f32 - m1;
-                        written += 1;
-                    }
-                    // Second 32 values: high nibbles
-                    for l in 0..32 {
-                        if written >= n_elements {
-                            break;
-                        }
-                        out[written] = d2 * ((qs[qs_offset + l] >> 4) & 0x0F) as f32 - m2;
-                        written += 1;
-                    }
-                }
-            }
-        }
-        QuantScheme::Q5_K => {
-            // Q5_K: 256 elements per block, 176 bytes per block.
-            // Layout: [2B f16 d, 2B f16 dmin, 12B scales, 32B qh, 128B qs]
-            let block_size = 176;
-            let n_blocks = raw.len() / block_size;
-            let mut written = 0usize;
-            for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
-                let d = f16_to_f32(u16::from_le_bytes([bp[0], bp[1]]));
-                let dmin = f16_to_f32(u16::from_le_bytes([bp[2], bp[3]]));
-                let (sc, m_arr) = decode_k_scales(&bp[4..16]);
-                let qh = &bp[16..48];
-                let qs = &bp[48..176];
-
-                // 4 groups of 64 values
-                for group in 0..4 {
-                    let is = group * 2;
-                    let d1 = d * sc[is] as f32;
-                    let m1 = dmin * m_arr[is] as f32;
-                    let d2 = d * sc[is + 1] as f32;
-                    let m2 = dmin * m_arr[is + 1] as f32;
-                    let qs_offset = group * 32;
-                    let u1 = group * 2;
-                    let u2 = u1 + 1;
-
-                    // First 32 values: low nibbles + high bit
-                    for l in 0..32 {
-                        if written >= n_elements {
-                            break;
-                        }
-                        let h_bit = (qh[l] >> u1) & 1;
-                        out[written] = d1 * ((qs[qs_offset + l] & 0x0F) | (h_bit << 4)) as f32 - m1;
-                        written += 1;
-                    }
-                    // Second 32 values: high nibbles + high bit
-                    for l in 0..32 {
-                        if written >= n_elements {
-                            break;
-                        }
-                        let h_bit = (qh[l] >> u2) & 1;
-                        out[written] =
-                            d2 * (((qs[qs_offset + l] >> 4) & 0x0F) | (h_bit << 4)) as f32 - m2;
-                        written += 1;
-                    }
-                }
-            }
-        }
-        QuantScheme::Q2_K => {
-            // Q2_K: 256 elements per block, 84 bytes per block.
-            // Layout: [16B scales, 64B qs, 2B f16 d, 2B f16 dmin]
-            //
-            // qs traversal MUST follow GGML's `dequantize_row_q2_K`: two
-            // 128-value groups, four shift passes (0,2,4,6) over the same 32 qs
-            // bytes per group, two 16-value runs (`q[l]`, `q[l+16]`) per pass.
-            // A naive linear byte scan corrupts ~74% of any real Q2_K block
-            // (agrees only on degenerate uniform blocks). See the matching
-            // converter fix in lumen-convert/src/dequant.rs::dequantize_q2_k.
-            let block_size = 84;
-            let n_blocks = raw.len() / block_size;
-            let mut written = 0usize;
-            'blocks: for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
-                let scales = &bp[0..16];
-                let qs = &bp[16..80];
-                let d = f16_to_f32(u16::from_le_bytes([bp[80], bp[81]]));
-                let dmin = f16_to_f32(u16::from_le_bytes([bp[82], bp[83]]));
-
-                let mut q_off = 0usize;
-                let mut is = 0usize;
-                for _group in 0..2 {
-                    let mut shift = 0u8;
-                    for _j in 0..4 {
-                        let sc0 = scales[is];
-                        is += 1;
-                        let dl0 = d * (sc0 & 0x0F) as f32;
-                        let ml0 = dmin * ((sc0 >> 4) & 0x0F) as f32;
-                        for l in 0..16usize {
-                            if written >= n_elements {
-                                break 'blocks;
-                            }
-                            out[written] = dl0 * (((qs[q_off + l] >> shift) & 3) as f32) - ml0;
-                            written += 1;
-                        }
-                        let sc1 = scales[is];
-                        is += 1;
-                        let dl1 = d * (sc1 & 0x0F) as f32;
-                        let ml1 = dmin * ((sc1 >> 4) & 0x0F) as f32;
-                        for l in 0..16usize {
-                            if written >= n_elements {
-                                break 'blocks;
-                            }
-                            out[written] = dl1 * (((qs[q_off + l + 16] >> shift) & 3) as f32) - ml1;
-                            written += 1;
-                        }
-                        shift += 2;
-                    }
-                    q_off += 32;
-                }
-            }
-        }
-        QuantScheme::Q3_K => {
-            // Q3_K: 256 elements per block, 110 bytes per block.
-            // Layout: [32B hmask, 64B qs (2-bit low), 12B scales (6-bit packed), 2B f16 d]
-            let block_size = 110;
-            let n_blocks = raw.len() / block_size;
-            let mut written = 0usize;
-            for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
-                let hmask = &bp[0..32];
-                let qs = &bp[32..96];
-                let scale_bytes = &bp[96..108];
-                let d = f16_to_f32(u16::from_le_bytes([bp[108], bp[109]]));
-
-                // Decode 16 6-bit scales from 12 bytes (standard packed layout)
-                let mut sc_arr = [0u8; 16];
-                for j in 0..4 {
-                    sc_arr[j] = scale_bytes[j] & 0x0F;
-                    sc_arr[j + 4] = (scale_bytes[j] >> 4) & 0x0F;
-                }
-                for j in 0..4 {
-                    sc_arr[j + 8] = scale_bytes[4 + j] & 0x0F;
-                    sc_arr[j + 12] = (scale_bytes[4 + j] >> 4) & 0x0F;
-                }
-                for (j, sc) in sc_arr.iter_mut().enumerate() {
-                    let byte_idx = 8 + j / 4;
-                    let bit_shift = 2 * (j % 4);
-                    *sc |= ((scale_bytes[byte_idx] >> bit_shift) & 3) << 4;
-                }
-
-                // GGML `dequantize_row_q3_K` traversal: same grouped/shifted
-                // scheme as Q2_K (two 128-value groups; four shift passes over
-                // the same 32 qs bytes; `q[l]`/`q[l+16]` runs; hmask selector
-                // `m` advances per pass). The naive linear scan corrupts ~82%
-                // of values. See the converter fix in
-                // lumen-convert/src/dequant.rs::dequantize_q3_k.
-                let mut q_off = 0usize;
-                let mut is = 0usize;
-                let mut hbit = 1u8;
-                'q3blocks: for _group in 0..2 {
-                    let mut shift = 0u8;
-                    for _j in 0..4 {
-                        let scale0 = d * (sc_arr[is] as i8 as f32 - 32.0);
-                        is += 1;
-                        for l in 0..16usize {
-                            if written >= n_elements {
-                                break 'q3blocks;
-                            }
-                            let q_lo = (qs[q_off + l] >> shift) & 3;
-                            let h = u8::from((hmask[l] & hbit) != 0);
-                            out[written] = scale0 * ((q_lo | (h << 2)) as i32 - 4) as f32;
-                            written += 1;
-                        }
-                        let scale1 = d * (sc_arr[is] as i8 as f32 - 32.0);
-                        is += 1;
-                        for l in 0..16usize {
-                            if written >= n_elements {
-                                break 'q3blocks;
-                            }
-                            let q_lo = (qs[q_off + l + 16] >> shift) & 3;
-                            let h = u8::from((hmask[l + 16] & hbit) != 0);
-                            out[written] = scale1 * ((q_lo | (h << 2)) as i32 - 4) as f32;
-                            written += 1;
-                        }
-                        shift += 2;
-                        hbit <<= 1;
-                    }
-                    q_off += 32;
-                }
-            }
-        }
-        other => {
-            return Err(RuntimeError::Compute(format!(
-                "CUDA weight upload: {other:?} dequant not implemented. \
-                 Re-convert the model with --requant q4_0 to convert K-quant \
-                 tensors to a supported format.",
-            )));
-        }
-    }
-
-    Ok(out)
 }
 
 /// Repack CtInt4G32 source planes (qweight ‖ scale ‖ zero_point, the LBC
@@ -892,8 +556,11 @@ fn upload_projection_tensor(
 /// - `QuantScheme::Q4_0`: upload raw bytes as `GpuWeightBuf::Q4Raw`.
 /// - `QuantScheme::Q4_1`: dequant to F16 on host (uploaded as `F16Raw`).
 /// - `QuantScheme::Q5_0`: dequant to F32 on host.
-/// - K-quants (`Q6_K`, `Q5_K`, `Q4_K`, `Q3_K`, `Q2_K`): dequant to F32 on host.
-/// The F32 buffer gets an F16 cache via `dequant_layer_q8_to_f16()` for HGEMV.
+/// - `Q4_K` / `Q5_K` / `Q6_K` in a K-quant artifact: raw bytes as `Q4KRaw` /
+///   `Q5KRaw` / `Q6KRaw` (served by the K-quant kernels; no F16 cache).
+/// - K-quants elsewhere (a Q4_0 artifact's `Q6_K` plane), `Q3_K`, `Q2_K`:
+///   dequant to F32 on host. The F32 buffer gets an F16 cache via
+///   `dequant_layer_q8_to_f16()` for HGEMV.
 fn upload_tensor(
     device: &CudaDevice,
     weights: &LayerView,
@@ -932,35 +599,10 @@ fn upload_tensor(
             let n_elements = n_blocks * 32;
             let mut f32_data = vec![0.0f32; n_elements];
 
-            // Inline f16→f32 conversion (no half crate dependency needed)
-            fn f16_to_f32(bits: u16) -> f32 {
-                let sign = ((bits >> 15) & 1) as u32;
-                let exp = ((bits >> 10) & 0x1f) as u32;
-                let frac = (bits & 0x3ff) as u32;
-                if exp == 0 {
-                    if frac == 0 {
-                        return if sign == 1 { -0.0 } else { 0.0 };
-                    }
-                    let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
-                    return if sign == 1 { -v } else { v };
-                }
-                if exp == 31 {
-                    return if frac != 0 {
-                        f32::NAN
-                    } else if sign == 1 {
-                        f32::NEG_INFINITY
-                    } else {
-                        f32::INFINITY
-                    };
-                }
-                let f32_bits = (sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13);
-                f32::from_bits(f32_bits)
-            }
-
             for b in 0..n_blocks {
                 let bp = &raw[b * 20..];
-                let scale = f16_to_f32((bp[0] as u16) | ((bp[1] as u16) << 8));
-                let min = f16_to_f32((bp[2] as u16) | ((bp[3] as u16) << 8));
+                let scale = host_f16_to_f32((bp[0] as u16) | ((bp[1] as u16) << 8));
+                let min = host_f16_to_f32((bp[2] as u16) | ((bp[3] as u16) << 8));
                 for i in 0..16 {
                     let byte = bp[4 + i];
                     let lo = (byte & 0x0F) as f32;
@@ -1040,12 +682,25 @@ fn upload_tensor(
             let gpu_buf = device.htod_copy(&f32_data)?;
             Ok(GpuWeightBuf::F32(gpu_buf))
         }
+        QuantScheme::Q4_K if kquant_artifact() => {
+            kquant_plane_counters().count_native(QuantScheme::Q4_K);
+            Ok(GpuWeightBuf::Q4KRaw(device.htod_copy(raw)?))
+        }
+        QuantScheme::Q5_K if kquant_artifact() => {
+            kquant_plane_counters().count_native(QuantScheme::Q5_K);
+            Ok(GpuWeightBuf::Q5KRaw(device.htod_copy(raw)?))
+        }
+        QuantScheme::Q6_K if kquant_artifact() => {
+            kquant_plane_counters().count_native(QuantScheme::Q6_K);
+            Ok(GpuWeightBuf::Q6KRaw(device.htod_copy(raw)?))
+        }
         other => {
-            // Catch-all for K-quant and other unsupported quant schemes:
-            // dequantize to F32 on host and upload as F32. This handles Q4_K,
-            // Q5_K, Q6_K, Q2_K, Q3_K, and any future schemes the converter emits.
+            // Catch-all for K-quant planes outside a K-quant artifact (the
+            // scoping rule: a Q4_0 artifact's Q6_K `attn_q` stays here) and
+            // for Q2_K / Q3_K: dequantize to F32 on host and upload as F32.
             // The F32 buffer will get an F16 cache via dequant_layer_q8_to_f16(),
             // so decode uses the fast HGEMV path (not the slow scalar matvec).
+            kquant_plane_counters().count_catch_all(other);
             let n_elements = estimate_quant_elements(raw.len(), other);
             if n_elements == 0 {
                 return Err(RuntimeError::Compute(format!(
@@ -1055,30 +710,7 @@ fn upload_tensor(
                 )));
             }
 
-            fn f16_to_f32_generic(bits: u16) -> f32 {
-                let sign = ((bits >> 15) & 1) as u32;
-                let exp = ((bits >> 10) & 0x1f) as u32;
-                let frac = (bits & 0x3ff) as u32;
-                if exp == 0 {
-                    if frac == 0 {
-                        return if sign == 1 { -0.0 } else { 0.0 };
-                    }
-                    let v = (frac as f32) / 16_777_216.0; // 2^-24, the f16 subnormal scale
-                    return if sign == 1 { -v } else { v };
-                }
-                if exp == 31 {
-                    return if frac != 0 {
-                        f32::NAN
-                    } else if sign == 1 {
-                        f32::NEG_INFINITY
-                    } else {
-                        f32::INFINITY
-                    };
-                }
-                f32::from_bits((sign << 31) | ((exp - 15 + 127) << 23) | (frac << 13))
-            }
-
-            let f32_data = dequant_kquant_to_f32(raw, other, n_elements, f16_to_f32_generic)?;
+            let f32_data = dequant_kquant_to_f32(raw, other, n_elements)?;
             eprintln!("[CUDA] upload {name}: {other:?} dequant to F32 ({n_elements} elements)");
             let gpu_buf = device.htod_copy(&f32_data)?;
             Ok(GpuWeightBuf::F32(gpu_buf))
@@ -1136,6 +768,171 @@ pub(crate) fn validate_layer_slices(
     lumen_format::serving_rules::validate_layer_slices(layer, subs).map_err(RuntimeError::Compute)
 }
 
+/// A K-quant plane held as its raw superblocks, with its scheme.
+pub(super) fn kquant_weight(weight: &GpuWeightBuf) -> Option<(QuantScheme, &CudaSlice<u8>)> {
+    match weight {
+        GpuWeightBuf::Q4KRaw(b) => Some((QuantScheme::Q4_K, b)),
+        GpuWeightBuf::Q5KRaw(b) => Some((QuantScheme::Q5_K, b)),
+        GpuWeightBuf::Q6KRaw(b) => Some((QuantScheme::Q6_K, b)),
+        _ => None,
+    }
+}
+
+/// Whether a Q4_K/Q5_K/Q6_K plane of a K-quant artifact can be served with the
+/// current switches.
+pub(crate) fn kquant_planes_servable() -> bool {
+    crate::runtime_defaults::cuda_kquant_enabled()
+}
+
+fn is_kquant(q: QuantScheme) -> bool {
+    matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K)
+}
+
+fn kquant_refusal(what: &str, quant: QuantScheme) -> RuntimeError {
+    RuntimeError::Compute(format!(
+        "CUDA: {what} is {quant:?} and LUMEN_CUDA_KQUANT=0 switched the K-quant kernels off; a K-quant artifact is refused at load rather than served through the F32 host-dequant fallback"
+    ))
+}
+
+/// Load-time counters behind the `[CUDA] K-quant planes:` line: planes (layer planes,
+/// the embedding and the output head) uploaded natively per scheme, planes that went
+/// through the F32 host-dequant catch-all per scheme, and F16 caches built for
+/// F32-resident planes (a K-quant plane can only reach that cache through the catch-all).
+#[derive(Default)]
+pub(crate) struct KquantPlaneCounters {
+    native: [std::sync::atomic::AtomicUsize; 3],
+    catch_all: [std::sync::atomic::AtomicUsize; 3],
+    /// F16 images built from a K-quant plane, per scheme (the Q5_K `ssm_out`
+    /// special case builds one beside its planes).
+    f16_images: [std::sync::atomic::AtomicUsize; 3],
+    f32_f16_caches: std::sync::atomic::AtomicUsize,
+}
+
+impl KquantPlaneCounters {
+    fn slot(q: QuantScheme) -> Option<usize> {
+        match q {
+            QuantScheme::Q4_K => Some(0),
+            QuantScheme::Q5_K => Some(1),
+            QuantScheme::Q6_K => Some(2),
+            _ => None,
+        }
+    }
+    pub(crate) fn count_native(&self, q: QuantScheme) {
+        if let Some(i) = Self::slot(q) {
+            self.native[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn count_catch_all(&self, q: QuantScheme) {
+        if let Some(i) = Self::slot(q) {
+            self.catch_all[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn count_f16_image(&self, q: QuantScheme) {
+        if let Some(i) = Self::slot(q) {
+            self.f16_images[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn count_f32_f16_cache(&self) {
+        self.f32_f16_caches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Zero every counter: called at the start of a model load so the line
+    /// reports that load alone.
+    pub(crate) fn reset(&self) {
+        for c in self
+            .native
+            .iter()
+            .chain(self.catch_all.iter())
+            .chain(self.f16_images.iter())
+            .chain(std::iter::once(&self.f32_f16_caches))
+        {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// F16 images built from K-quant planes, per scheme (Q4_K, Q5_K, Q6_K).
+    pub(crate) fn f16_images(&self) -> [usize; 3] {
+        std::array::from_fn(|i| self.f16_images[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// `(native, catch_all)` per scheme in the order Q4_K, Q5_K, Q6_K.
+    pub(crate) fn planes(&self) -> [(usize, usize); 3] {
+        std::array::from_fn(|i| {
+            (
+                self.native[i].load(std::sync::atomic::Ordering::Relaxed),
+                self.catch_all[i].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+    pub(crate) fn f32_f16_caches(&self) -> usize {
+        self.f32_f16_caches
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// The line the load prints once every layer is resident.
+    pub(crate) fn report_line(&self) -> String {
+        let [(n4, c4), (n5, c5), (n6, c6)] = self.planes();
+        let [i4, i5, i6] = self.f16_images();
+        format!(
+            "[CUDA] K-quant planes: native Q4_K={n4} Q5_K={n5} Q6_K={n6}; \
+             host-dequant catch-all Q4_K={c4} Q5_K={c5} Q6_K={c6}; \
+             F16 images from K-quant planes Q4_K={i4} Q5_K={i5} Q6_K={i6}; \
+             F16 caches built for F32-resident planes={}",
+            self.f32_f16_caches()
+        )
+    }
+}
+
+pub(crate) fn kquant_plane_counters() -> &'static KquantPlaneCounters {
+    static COUNTERS: std::sync::OnceLock<KquantPlaneCounters> = std::sync::OnceLock::new();
+    COUNTERS.get_or_init(KquantPlaneCounters::default)
+}
+
+/// Refuse the K-quant planes of a K-quant artifact (LBC header scheme Q4_K,
+/// Q5_K or Q6_K) when the general K-quant kernels are absent or switched off.
+/// A Q4_0/Q8_0/BF16 artifact keeps its occasional K-quant plane on the F32
+/// host-dequant path as before; Q2_K, Q3_K and Q5_0 planes are never refused.
+pub(crate) fn validate_kquant_planes(
+    layer: usize,
+    subs: &lumen_format::index::SubtensorOffsets,
+    artifact_quant: QuantScheme,
+) -> Result<(), RuntimeError> {
+    validate_kquant_planes_with(layer, subs, artifact_quant, kquant_planes_servable())
+}
+
+/// [`validate_kquant_planes`] with the build's serving capability given
+/// explicitly, so the refusal is testable on a build that has the kernels.
+fn validate_kquant_planes_with(
+    layer: usize,
+    subs: &lumen_format::index::SubtensorOffsets,
+    artifact_quant: QuantScheme,
+    servable: bool,
+) -> Result<(), RuntimeError> {
+    if !is_kquant(artifact_quant) || servable {
+        return Ok(());
+    }
+    for (name, slice) in subs.named_slices() {
+        if slice.length > 0 && is_kquant(slice.quant) {
+            return Err(kquant_refusal(
+                &format!("layer {layer} tensor '{name}'"),
+                slice.quant,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A K-quant artifact's K-quant embedding is refused while the K-quant gathers
+/// are absent or switched off; every other artifact's embedding keeps its
+/// existing path (the scoping rule of `kquant_artifact`).
+pub(crate) fn validate_kquant_embedding(quant: QuantScheme) -> Result<(), RuntimeError> {
+    validate_kquant_embedding_with(quant, kquant_planes_servable() || !kquant_artifact())
+}
+
+fn validate_kquant_embedding_with(quant: QuantScheme, servable: bool) -> Result<(), RuntimeError> {
+    if is_kquant(quant) && !servable {
+        return Err(kquant_refusal("token_embd.weight", quant));
+    }
+    Ok(())
+}
+
 /// Upload a single layer's weight tensors from a `LayerView` to GPU memory.
 ///
 /// Extracts each subtensor's raw bytes and uploads according to quant scheme:
@@ -1146,7 +943,6 @@ pub(crate) fn validate_layer_slices(
 /// - Norm weights are always F32.
 ///
 /// Returns an error if any tensor uses an unsupported scheme or if CUDA upload fails.
-
 pub fn upload_layer_weights(
     device: &CudaDevice,
     weights: &LayerView,
@@ -1156,6 +952,14 @@ pub fn upload_layer_weights(
     let layer = weights.layer_idx;
 
     validate_layer_slices(layer, subs)?;
+    // the artifact's primary scheme is the LBC header's, recorded by the loader before any
+    // layer is uploaded (`set_model_primary_quant`, read back by `model_dense_quant`); a legacy caller that never set it is not
+    // a K-quant artifact
+    validate_kquant_planes(
+        layer,
+        subs,
+        crate::runtime_defaults::model_dense_quant().unwrap_or(QuantScheme::F32),
+    )?;
     lumen_format::serving_rules::validate_expert_count(subs, hp.num_experts.unwrap_or(0) as usize)
         .map_err(|e| RuntimeError::Compute(format!("layer {layer}: {e}")))?;
     lumen_format::serving_rules::validate_attn_vector_extents(
@@ -1170,13 +974,18 @@ pub fn upload_layer_weights(
     // Source-fidelity artifacts keep ssm_out in its source Q5_K form. Base
     // buffer becomes an F16 image (first-class prefill HGEMM / decode HGEMV
     // path); the raw superblocks are additionally split into four aligned
-    // planes for the decode dp4a kernel (matvec_q5k_split_q8_1).
+    // planes for the decode dp4a kernel (matvec_q5k_split_q8_1). A K-quant
+    // artifact's Q5_K ssm_out takes the general path below instead (the raw
+    // plane, served by the Q5_K kernels; no F16 image beside it).
     let (ssm_out_base, ssm_out_q5k) = match &subs.ssm_out {
-        Some(s) if s.quant == QuantScheme::Q5_K => {
+        Some(s) if s.quant == QuantScheme::Q5_K && !kquant_artifact() => {
             let raw = weights.subtensor_bytes(s)?;
             let n_blocks = raw.len() / 176;
-            let f32_data =
-                dequant_kquant_to_f32(raw, QuantScheme::Q5_K, n_blocks * 256, host_f16_to_f32)?;
+            // served from its planes by the Q5_K ssm_out kernel; the F16 image beside
+            // them is counted so the load line shows it
+            kquant_plane_counters().count_native(QuantScheme::Q5_K);
+            kquant_plane_counters().count_f16_image(QuantScheme::Q5_K);
+            let f32_data = dequant_kquant_to_f32(raw, QuantScheme::Q5_K, n_blocks * 256)?;
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&x| f32_to_f16_bits(x).to_le_bytes())
@@ -1355,7 +1164,7 @@ pub fn upload_layer_weights(
         w_up_f16: None,
         w_down_f16: None,
         // Q8 split siblings start as None; populated by
-        // repack_layer_q8_clone_to_split() when LUMEN_CUDA_Q8_SPLIT=1.
+        // repack_all_layers_q8_clone_to_split() when LUMEN_CUDA_Q8_SPLIT=1.
         q8_split_wq: None,
         q8_split_wk: None,
         q8_split_wv: None,
@@ -1364,7 +1173,7 @@ pub fn upload_layer_weights(
         q8_split_w_up: None,
         q8_split_w_down: None,
         // Q4 split siblings start as None; populated by
-        // repack_layer_q4_clone_to_split() when LUMEN_CUDA_Q4_SPLIT=1.
+        // repack_all_layers_q4_clone_to_split() when LUMEN_CUDA_Q4_SPLIT=1.
         q4_split_wq: None,
         q4_split_wk: None,
         q4_split_wv: None,
@@ -1601,6 +1410,9 @@ fn makes_f16_cache(w: &GpuWeightBuf, quantised_cached: bool) -> bool {
         GpuWeightBuf::Q8Aligned(_)
         | GpuWeightBuf::Q4Aligned(_)
         | GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::Q4KRaw(_)
+        | GpuWeightBuf::Q5KRaw(_)
+        | GpuWeightBuf::Q6KRaw(_)
         | GpuWeightBuf::F16Raw(_)
         | GpuWeightBuf::Bf16Raw(_)
         | GpuWeightBuf::Q8Split(_)
@@ -1701,6 +1513,7 @@ pub fn dequant_layer_q8_to_f16(
                 if f32_buf.is_empty() {
                     return Ok(None);
                 }
+                kquant_plane_counters().count_f32_f16_cache();
                 let mut f16_buf: CudaSlice<u8> = device.alloc_zeros(n * 2)?;
                 let n_u32 = n as u32;
                 let block = 256u32;
@@ -1724,41 +1537,12 @@ pub fn dequant_layer_q8_to_f16(
                 Ok(Some(f16_buf))
             }
             GpuWeightBuf::Q4Aligned(_) => Ok(None), // Q4Aligned uses dp4a path, no F16 cache needed
+            GpuWeightBuf::Q8Split(_) => Err(RuntimeError::Compute(
+                "F16 cache requested for a Q8Split base: the caches are built before the \
+                 split-clone pass releases raw planes, so this is an ordering regression"
+                    .to_string(),
+            )),
             _ => Ok(None), // F16Raw already in the right format for HGEMM -- no dequant needed
-        }
-    };
-
-    // Helper: compute element count from buffer type and dimensions.
-    // For GDN layers, wq is fused [qkv_dim, hidden_dim] so we derive
-    // the element count from the buffer byte size instead of model dims.
-    let _buf_elements = |w: &GpuWeightBuf| -> usize {
-        match w {
-            GpuWeightBuf::Q8Raw(q8) | GpuWeightBuf::Q8Aligned(q8) => {
-                // Q8_0: 34 bytes per block of 32 elements
-                (q8.len() / 34) * 32
-            }
-            GpuWeightBuf::Q4Raw(q4) => {
-                // Q4_0: 18 bytes per block of 32 elements
-                (q4.len() / 18) * 32
-            }
-            GpuWeightBuf::Q4Aligned(q4a) => {
-                // Q4Aligned: 20 bytes per block of 32 elements
-                (q4a.len() / 20) * 32
-            }
-            GpuWeightBuf::Ct4Raw(ct4) => {
-                // Ct4Raw: 20 bytes per block of 32 elements
-                (ct4.len() / 20) * 32
-            }
-            GpuWeightBuf::F32(f32_buf) => f32_buf.len(),
-            GpuWeightBuf::F16Raw(f16_buf) => f16_buf.len() / 2,
-            GpuWeightBuf::Bf16Raw(bf16_buf) => bf16_buf.len() / 2,
-            // Q8Split/Q4Split: same density as Q8Raw/Q4Raw (34 / 18 B per
-            // 32-elem block) -- the variants reorganize bytes per row but
-            // preserve the per-block layout. Returning the same arithmetic
-            // makes this helper safe in case a future change stores a Split
-            // value in the base weight slot (currently sibling-only).
-            GpuWeightBuf::Q8Split(q8) => (q8.len() / 34) * 32,
-            GpuWeightBuf::Q4Split(q4) => (q4.len() / 18) * 32,
         }
     };
 
@@ -2030,6 +1814,120 @@ pub fn repack_layer_q4_to_aligned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A K-quant artifact's K-quant planes are refused while the general kernels are absent;
+    /// a Q4_0 artifact's occasional K-quant plane (the 9B/MoE `attn_q`) and every Q5_0/Q2_K/Q3_K
+    /// plane keep the host-dequant path; the message names the tensor, its scheme and CUDA.
+    #[test]
+    fn kquant_planes_of_a_kquant_artifact_are_refused_without_the_kernels() {
+        use lumen_format::index::{SubtensorOffsets, TensorSlice};
+        fn plane(quant: QuantScheme, length: u64) -> TensorSlice {
+            TensorSlice {
+                offset: 0,
+                length,
+                quant,
+            }
+        }
+        fn layer(w_gate: TensorSlice, w_up: TensorSlice, w_down: TensorSlice) -> SubtensorOffsets {
+            SubtensorOffsets {
+                wq: plane(QuantScheme::Q8_0, 34),
+                wk: plane(QuantScheme::Q8_0, 34),
+                wv: plane(QuantScheme::Q8_0, 34),
+                wo: plane(QuantScheme::Q8_0, 34),
+                bq: None,
+                bk: None,
+                bv: None,
+                w_gate,
+                w_up,
+                w_down,
+                attn_norm: plane(QuantScheme::F32, 4),
+                ffn_norm: plane(QuantScheme::F32, 4),
+                router_weight: None,
+                experts: None,
+                shared_expert_gate: None,
+                shared_expert_up: None,
+                shared_expert_down: None,
+                attn_gate: None,
+                attn_post_norm: None,
+                ssm_a: None,
+                ssm_conv1d: None,
+                ssm_dt: None,
+                ssm_beta: None,
+                ssm_alpha: None,
+                ssm_norm: None,
+                ssm_out: None,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                ffn_gate_inp_shexp: None,
+                layer_type: Some(0),
+            }
+        }
+        let st = layer(
+            plane(QuantScheme::Q4_K, 144),
+            plane(QuantScheme::Q8_0, 34),
+            plane(QuantScheme::Q5_0, 22),
+        );
+        let err = validate_kquant_planes_with(7, &st, QuantScheme::Q4_K, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layer 7")
+                && err.contains("w_gate")
+                && err.contains("Q4_K")
+                && err.contains("CUDA"),
+            "{err}"
+        );
+        assert!(
+            err.contains("LUMEN_CUDA_KQUANT=0 switched the K-quant kernels off"),
+            "{err}"
+        );
+        assert!(
+            validate_kquant_planes_with(7, &st, QuantScheme::Q4_K, true).is_ok(),
+            "with the kernels present and on, a K-quant artifact loads"
+        );
+        assert!(
+            validate_kquant_planes_with(7, &st, QuantScheme::Q4_0, false).is_ok(),
+            "a Q4_0 artifact keeps its K-quant plane on the catch-all"
+        );
+        assert!(validate_kquant_planes_with(7, &st, QuantScheme::Q8_0, false).is_ok());
+        let q5_0_only = layer(
+            plane(QuantScheme::Q5_0, 22),
+            plane(QuantScheme::Q3_K, 110),
+            plane(QuantScheme::Q2_K, 84),
+        );
+        assert!(
+            validate_kquant_planes_with(0, &q5_0_only, QuantScheme::Q5_K, false).is_ok(),
+            "Q5_0/Q3_K/Q2_K planes are never refused"
+        );
+        let zero_len = layer(
+            plane(QuantScheme::Q6_K, 0),
+            plane(QuantScheme::Q8_0, 34),
+            plane(QuantScheme::Q8_0, 34),
+        );
+        assert!(
+            validate_kquant_planes_with(0, &zero_len, QuantScheme::Q6_K, false).is_ok(),
+            "an absent plane is not a plane"
+        );
+        for q in [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K] {
+            let err = validate_kquant_embedding_with(q, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("token_embd.weight") && err.contains(&format!("{q:?}")),
+                "{err}"
+            );
+            assert!(validate_kquant_embedding_with(q, true).is_ok());
+        }
+        for q in [
+            QuantScheme::Q4_0,
+            QuantScheme::Q8_0,
+            QuantScheme::F16,
+            QuantScheme::Bf16,
+            QuantScheme::F32,
+        ] {
+            assert!(validate_kquant_embedding_with(q, false).is_ok());
+        }
+    }
 
     /// The fit check bills two bytes per element of the slots that get a
     /// copy and nothing for the others, whatever the mix is — all seven,
@@ -2431,14 +2329,14 @@ mod layer_slice_tests {
         }
     }
 
-    #[test]
-    fn zero_length_optionals_rejected() {
+    /// A dense layer's slices, all F32, the shape `validate_layer_slices` is driven with.
+    fn base_layer_slices() -> SubtensorOffsets {
         let t = |offset: u64, length: u64| TensorSlice {
             offset,
             length,
             quant: QuantScheme::F32,
         };
-        let mut subs = SubtensorOffsets {
+        SubtensorOffsets {
             wq: t(0, 64),
             wk: t(64, 64),
             wv: t(128, 64),
@@ -2469,7 +2367,17 @@ mod layer_slice_tests {
             attn_k_norm: None,
             ffn_gate_inp_shexp: None,
             layer_type: None,
+        }
+    }
+
+    #[test]
+    fn zero_length_optionals_rejected() {
+        let t = |offset: u64, length: u64| TensorSlice {
+            offset,
+            length,
+            quant: QuantScheme::F32,
         };
+        let mut subs = base_layer_slices();
         assert!(validate_layer_slices(0, &subs).is_ok());
         subs.bq = Some(t(480, 0));
         let err = validate_layer_slices(0, &subs).unwrap_err();

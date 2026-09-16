@@ -15,7 +15,7 @@ use crate::crc::crc32;
 use crate::header::{Endianness, GlobalTensorRange, LbcHeader};
 use crate::hyperparams::{ModelHyperparams, RopeScalingType};
 use crate::index::{LayerIndex, TensorSlice};
-use crate::quantization::{QuantGroupSize, QuantizationDescriptor};
+use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
 use crate::tokenizer::TokenizerSection;
 use std::io::{self, Write};
 
@@ -80,7 +80,7 @@ pub fn write_lbc<W: Write>(
     let layers_start = align_up(globals_start + globals_total, alignment);
 
     // --- Phase 2: fix up header offsets ---
-    let mut fixed_header = header.clone();
+    let mut fixed_header = header_with_version(header);
     fixed_header.layer_index_offset = header_bytes.len() as u64;
     fixed_header.payload_offset = globals_start as u64;
 
@@ -186,6 +186,33 @@ pub fn write_lbc<W: Write>(
     }
 
     Ok(())
+}
+
+/// Whether `quant` is an as-stored K-quant superblock scheme, whose plane a reader
+/// before [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`] misreads when it carries a
+/// global: that reader classified a global by its byte length alone, and a Q4_K plane
+/// has exactly Q4_0's length.
+fn is_kquant_superblock(quant: QuantScheme) -> bool {
+    matches!(
+        quant,
+        QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K
+    )
+}
+
+/// The header as written: its version is [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`]
+/// when the embedding is an as-stored K-quant plane (an earlier reader refuses the file
+/// by name instead of misreading that plane), [`crate::header::LBC_VERSION`] otherwise.
+/// The version byte is the only difference, so an artifact without such an embedding
+/// stays byte-identical to 0.31.0's. A K-quant head needs no bump: a reader reads it by
+/// its header tag.
+pub(crate) fn header_with_version(header: &LbcHeader) -> LbcHeader {
+    let mut h = header.clone();
+    h.version = if is_kquant_superblock(header.embedding.quant) {
+        crate::header::LBC_VERSION_KQUANT_EMBEDDING
+    } else {
+        crate::header::LBC_VERSION
+    };
+    h
 }
 
 /// Global tensors passed to the writer.
@@ -528,6 +555,51 @@ mod tests {
     use super::*;
     use crate::hyperparams::RopeParams;
     use crate::quantization::QuantScheme;
+
+    /// An as-stored K-quant embedding stamps `LBC_VERSION_KQUANT_EMBEDDING`; an
+    /// artifact without one keeps `LBC_VERSION`, head included.
+    #[test]
+    fn a_k_quant_embedding_stamps_the_newer_version() {
+        use crate::header::{LBC_VERSION, LBC_VERSION_KQUANT_EMBEDDING};
+        let hp = ModelHyperparams {
+            num_layers: 0,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            hidden_dim: 8,
+            intermediate_dim: 16,
+            vocab_size: 32,
+            max_seq_len: 64,
+            rope_params: Some(RopeParams::default()),
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let qd = QuantizationDescriptor {
+            scheme: QuantScheme::Q4_K,
+            group_size: QuantGroupSize::PerTensor,
+            block_byte_size: 144,
+            scale_offset_in_block: None,
+        };
+        let plain = LbcHeader::new(hp, qd);
+        assert_eq!(header_with_version(&plain).version, LBC_VERSION);
+        for embd in [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K] {
+            let mut h = plain.clone();
+            h.embedding.quant = embd;
+            assert_eq!(
+                header_with_version(&h).version,
+                LBC_VERSION_KQUANT_EMBEDDING,
+                "{embd:?} embedding"
+            );
+        }
+        // a Q6_K head alone keeps version 4: a reader reads it by its header tag
+        let mut q6k_head = plain.clone();
+        q6k_head.output_proj.quant = QuantScheme::Q6_K;
+        assert_eq!(header_with_version(&q6k_head).version, LBC_VERSION);
+    }
 
     #[test]
     fn align_up_works() {

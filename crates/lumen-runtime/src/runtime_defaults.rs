@@ -193,6 +193,21 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     }
 }
 
+/// Whether the artifact being served is a K-quant artifact: its header scheme
+/// (`set_model_primary_quant`, recorded by `lumen run` / `lumen-server` before the
+/// backend loads a layer) is Q4_K, Q5_K or Q6_K — the scheme a K-quant source's
+/// conversion stamps. CUDA scopes its K-quant-only behaviour on it (the native plane
+/// upload, the split-plane release, the load-time kernel-group refusal), so every other
+/// artifact keeps its kernels of record. A K-quant source converted
+/// with `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
+/// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is
+/// re-quantised either way): CUDA serves each preserved plane through its own scheme's arm,
+/// and a missing kernel group is then reported at the first token instead of at load.
+pub fn kquant_artifact() -> bool {
+    model_dense_quant()
+        .is_some_and(|q| matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K))
+}
+
 /// Public diagnostic wrapper over `model_dense_quant` for the
 /// `dump_quant_hint` example (which lives outside the crate and so cannot see
 /// the `pub(crate)` accessor). Behaviourally identical; not used on any hot
@@ -952,6 +967,34 @@ pub fn profile_attn_leaf() -> Option<&'static str> {
     })
 }
 
+/// The Q8_0 prefill projection route: MMQ (INT8 dp4a on the AoS plane) when
+/// `LUMEN_CUDA_Q8_PROJ_MMQ` is set to anything but 0/false/no, or by default on a
+/// MoE model; otherwise dequant -> F16 -> HGEMM.
+#[cfg(feature = "cuda")]
+pub(crate) fn q8_proj_mmq_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
+        Some(v) => !matches!(v, "0" | "false" | "no"),
+        None => model_is_moe(),
+    }
+}
+
+/// Whether the split-clone pass releases a Q8_0 plane's raw copy once its split
+/// sibling exists (the plane is then resident once, in the split layout, and the
+/// prefill dequantizes that layout). Off when the prefill reads the AoS bytes
+/// directly — `LUMEN_CUDA_Q8_PROJ_MMQ` set at all (the residual site keys on the
+/// variable's presence) or a MoE model — and under the rollback switch
+/// `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`. The artifact scoping is the call site's, not this
+/// accessor's: only a K-quant artifact releases (`cuda::backend_impl`, under
+/// `kquant_artifact()`); the Q4_0 / Q8_0 / BF16 cells keep both copies as shipped.
+pub fn q8_split_release_raw_enabled() -> bool {
+    if matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW"), Ok(v) if v == "1") {
+        return false;
+    }
+    // The variable's presence alone keeps the raw planes: the residual prefill site keys
+    // on presence, the projection site on the value, and MoE models default to MMQ.
+    !(std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok() || model_is_moe())
+}
+
 /// `LUMEN_CUDA_Q8_SPLIT_SSMOUT` (default ON): clone the GDN `ssm_out` Q8
 /// weight into its per-row split sibling and dispatch it through the Q8
 /// split family instead of the raw-layout route. `=0` opts out.
@@ -1452,6 +1495,17 @@ pub fn q4_1_down_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_KQUANT=0`: kill-switch for the general K-quant kernels — a
+/// rollback to refusing K-quant artifacts at load, never an A/B axis (the
+/// pre-kernel path cannot serve them). Default ON.
+pub fn cuda_kquant_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_KQUANT") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_Q6K_HEAD=0`: kill-switch for the source-fidelity Q6_K output
 /// head planes. When OFF the CUDA init skips the plane build and serves the
 /// head from the provider's F32 dequant copy (SGEMV; ~5 GB extra VRAM —
@@ -1844,6 +1898,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
     "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
     "LUMEN_CUDA_GPU_SAMPLE",
+    "LUMEN_CUDA_KQUANT",
     "LUMEN_CUDA_LEGACY_DEFAULTS",
     "LUMEN_CUDA_MAX_SEQ_LEN",
     "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
@@ -1894,6 +1949,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q8_SPLIT",
     "LUMEN_CUDA_Q8_SPLIT_ATTN",
     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+    "LUMEN_CUDA_Q8_SPLIT_KEEP_RAW",
     "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q8_SPLIT_WO",
     "LUMEN_CUDA_ROPE_TAB",
@@ -1908,6 +1964,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_DUMP_GDN_L0_BIN",
     "LUMEN_DUMP_NORMED",
     "LUMEN_FREQUENCY_PENALTY",
+    "LUMEN_KQUANT_LBC",
     "LUMEN_KV_PRECISION",
     "LUMEN_METAL_ATTN_PRECISE",
     "LUMEN_METAL_BF16_GATE_UP_NR",
@@ -2693,6 +2750,43 @@ mod fixed_horizon_bench_tests {
         }
         std::env::remove_var(name);
         assert!(!env_is_exactly_one(name));
+    }
+
+    /// The accessor is the policy half of the release predicate: with the switches clear it
+    /// allows the release; the rollback switch, a MoE model, and any prefill route that reads
+    /// the raw bytes directly (`LUMEN_CUDA_Q8_PROJ_MMQ` present at all) refuse it. The artifact
+    /// half — only a K-quant artifact releases — is the call site's
+    /// (`cuda::backend_impl::preload_weights`).
+    #[test]
+    fn q8_split_raw_release_default_and_switches() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        for name in ["LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "LUMEN_CUDA_Q8_PROJ_MMQ"] {
+            std::env::remove_var(name);
+        }
+        assert!(
+            q8_split_release_raw_enabled(),
+            "default with the policy switches clear: the accessor allows the release"
+        );
+        set_model_is_moe(true);
+        assert!(
+            !q8_split_release_raw_enabled(),
+            "a MoE model prefills Q8 through MMQ: the raw plane stays"
+        );
+        reset_for_tests();
+        std::env::set_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "1");
+        assert!(!q8_split_release_raw_enabled(), "=1 keeps the raw plane");
+        std::env::set_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "0");
+        assert!(q8_split_release_raw_enabled(), "=0 is the default");
+        std::env::remove_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW");
+        for v in ["1", "0", "false"] {
+            std::env::set_var("LUMEN_CUDA_Q8_PROJ_MMQ", v);
+            assert!(
+                !q8_split_release_raw_enabled(),
+                "LUMEN_CUDA_Q8_PROJ_MMQ={v}: the residual MMQ site keys on the variable's presence, so the raw plane stays"
+            );
+        }
+        std::env::remove_var("LUMEN_CUDA_Q8_PROJ_MMQ");
     }
 
     /// Off is shipping behaviour: the resolver reports false.
@@ -4064,6 +4158,7 @@ mod tests {
         "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
         "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
         "LUMEN_CUDA_GPU_SAMPLE",
+        "LUMEN_CUDA_KQUANT",
         "LUMEN_CUDA_LEGACY_DEFAULTS",
         "LUMEN_CUDA_MAX_SEQ_LEN",
         "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
@@ -4110,6 +4205,7 @@ mod tests {
         "LUMEN_CUDA_Q8_SPLIT",
         "LUMEN_CUDA_Q8_SPLIT_ATTN",
         "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+        "LUMEN_CUDA_Q8_SPLIT_KEEP_RAW",
         "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
         "LUMEN_CUDA_Q8_SPLIT_WO",
         "LUMEN_CUDA_ROPE_TAB",
@@ -4124,6 +4220,7 @@ mod tests {
         "LUMEN_DUMP_GDN_L0_BIN",
         "LUMEN_DUMP_NORMED",
         "LUMEN_FREQUENCY_PENALTY",
+        "LUMEN_KQUANT_LBC",
         "LUMEN_KV_PRECISION",
         "LUMEN_METAL_ATTN_PRECISE",
         "LUMEN_METAL_BF16_GATE_UP_NR",

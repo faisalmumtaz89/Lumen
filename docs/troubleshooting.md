@@ -66,4 +66,4 @@ The converter currently accepts the v1 architecture set (`qwen35` and `qwen35moe
 
 ## `LBC_VERSION` mismatch
 
-`LBC_VERSION = 4` is current. The reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1 / v2 is in the code path but unverified at runtime. Policy: rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull --quant <scheme>`.
+`LBC_VERSION = 4`; an artifact whose embedding is an as-stored K-quant plane is version 5 (the default generic conversion of a K-quant source whose `token_embd` is K-quant produces one — both registry cells; `--dequantize` leaves no such plane, and that artifact keeps version 4) and needs this release or later. The reader rejects newer-than-current with `UnsupportedVersion`; backward-compat for v1 / v2 is in the code path but unverified at runtime. Policy: rebuild LBCs after major Lumen upgrades via `lumen convert` or `lumen pull --quant <scheme>`.
