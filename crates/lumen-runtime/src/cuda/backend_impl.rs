@@ -12769,6 +12769,7 @@ unsafe fn launch_matvec(
                  (kernel or scratch unavailable)"
             )));
         };
+        kquant_shape_ok(scheme, w_kq.len(), q8_1_buf.len(), out_dim, in_dim, label)?;
         launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
         return launch_matvec_kquant_preq8_1(
             device, kernels, scheme, w_kq, q8_1_buf, None, output, out_dim, in_dim, label,
@@ -13651,6 +13652,7 @@ unsafe fn launch_matvec_residual(
                  (kernel or scratch unavailable)"
             )));
         };
+        kquant_shape_ok(scheme, w_kq.len(), q8_1_buf.len(), out_dim, in_dim, label)?;
         launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
         return launch_matvec_kquant_preq8_1(
             device,
@@ -16183,11 +16185,36 @@ fn kquant_kernels(
     }
 }
 
+/// The shape contract of the K-quant matvec: the kernel indexes the weight by
+/// `row * (in_dim / 256) * block_bytes` and the Q8_1 activation by `in_dim / 32`
+/// 36-byte blocks, so neither byte length nor the 256-multiple `in_dim` is trusted.
+/// Split out of `launch_matvec_kquant_preq8_1` so a caller that quantizes into the
+/// scratch first can check before that write rather than after it.
+fn kquant_shape_ok(
+    scheme: QuantScheme,
+    weight_len: usize,
+    q8_1_len: usize,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let (block_bytes, _) = kquant_layout(scheme);
+    let expected_w = out_dim * (in_dim / 256) * block_bytes;
+    let needed_q8 = (in_dim / 32) * 36;
+    if in_dim % 256 != 0 || weight_len != expected_w || q8_1_len < needed_q8 {
+        return Err(RuntimeError::Compute(format!(
+            "matvec {label}: {scheme:?} shape mismatch: weight {weight_len} bytes \
+             (expected {expected_w} for [{out_dim}, {in_dim}]), \
+             Q8_1 scratch {q8_1_len} bytes (need {needed_q8})"
+        )));
+    }
+    Ok(())
+}
+
 /// Launch the K-quant matvec (`residual` folded when given) on a pre-quantized
 /// Q8_1 activation. The CTA geometry (threads, rows per CTA) is the one the
-/// kernel source declares, read at load. The kernel indexes the weight by
-/// `row * (in_dim / 256) * block_bytes`, so the byte length and the
-/// 256-multiple `in_dim` are checked here rather than trusted.
+/// kernel source declares, read at load. `kquant_shape_ok` is re-run here: the
+/// pre-quantized entry points have no earlier opportunity to check.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_matvec_kquant_preq8_1(
     device: &CudaDevice,
@@ -16201,23 +16228,13 @@ unsafe fn launch_matvec_kquant_preq8_1(
     in_dim: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    let (block_bytes, tag) = kquant_layout(scheme);
+    let (_, tag) = kquant_layout(scheme);
     let group = kquant_kernels(kernels, scheme).ok_or_else(|| {
         RuntimeError::Compute(format!(
             "matvec {label}: {scheme:?} plane but the {tag} kernels are not loaded"
         ))
     })?;
-    let expected_w = out_dim * (in_dim / 256) * block_bytes;
-    let needed_q8 = (in_dim / 32) * 36;
-    if in_dim % 256 != 0 || weight.len() != expected_w || q8_1_buf.len() < needed_q8 {
-        return Err(RuntimeError::Compute(format!(
-            "matvec {label}: {scheme:?} shape mismatch: weight {} bytes \
-             (expected {expected_w} for [{out_dim}, {in_dim}]), \
-             Q8_1 scratch {} bytes (need {needed_q8})",
-            weight.len(),
-            q8_1_buf.len(),
-        )));
-    }
+    kquant_shape_ok(scheme, weight.len(), q8_1_buf.len(), out_dim, in_dim, label)?;
     let out_dim_u32 = out_dim as u32;
     let in_dim_u32 = in_dim as u32;
     let launch_cfg = CudarcLaunchConfig {
@@ -18544,7 +18561,7 @@ impl ComputeBackend for CudaBackend {
                     // the head from a host F32 dequant instead of the planes.
                     // ~5 GB VRAM for the 27B head; F32 SGEMV dispatch.
                     let n_elements = (raw.len() / 210) * 256;
-                    let f32_data = super::gpu_buffers::dequant_kquant_to_f32(
+                    let f32_data = crate::weight::kquant::dequant_kquant_to_f32(
                         raw,
                         QuantScheme::Q6_K,
                         n_elements,
@@ -20648,9 +20665,10 @@ impl ComputeBackend for CudaBackend {
                 }
             }
         }
-        // a K-quant layer plane's decode matvec reads its activation from the Q8_1
-        // scratch, and every route that fills it needs `quantize_f32_to_q8_1` (a kernel
-        // compiled for compute_80) — the fused RMSNorm-to-Q8_1 variants are gated on it too
+        // a K-quant layer plane's decode matvec reads its activation from the Q8_1 scratch,
+        // and every route that fills it for one needs `quantize_f32_to_q8_1` (a kernel
+        // compiled for compute_80): the QKV, FFN and GDN pre-quantized groups are gated on
+        // it, fused RMSNorm-to-Q8_1 variant included
         if crate::runtime_defaults::kquant_artifact()
             && super::gpu_buffers::kquant_planes_servable()
             && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())

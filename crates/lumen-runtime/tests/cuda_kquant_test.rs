@@ -743,8 +743,9 @@ fn quantize_q5_k(v: &[f32; 256]) -> Vec<u8> {
 }
 
 /// A valid Q6_K quantization of 256 values: one int8 scale per 16 elements
-/// (`amax / 31`, so `q - 32` spans -31..31), `d` sized so every scale fits
-/// in 0..127; the ql / qh planes packed in the GGML element order.
+/// (`amax / 31` aims `q - 32` at -31..31; rounding that scale to the stored
+/// int8 can take it to the 6-bit -32..31 the clamp allows), `d` sized so every
+/// scale fits in 0..127; the ql / qh planes packed in the GGML element order.
 fn quantize_q6_k(v: &[f32; 256]) -> Vec<u8> {
     let mut scales = [0.0f32; 16];
     for (i, sc) in scales.iter_mut().enumerate() {

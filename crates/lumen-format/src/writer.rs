@@ -193,9 +193,10 @@ pub fn write_lbc<W: Write>(
 /// embedding global by its byte length, and a Q4_K plane has exactly Q4_0's length, so
 /// it refuses the file by name instead of misreading that plane),
 /// [`crate::header::LBC_VERSION`] otherwise.
-/// The version byte is the only difference, so an artifact without such an embedding
-/// stays byte-identical to 0.31.0's. A K-quant head needs no bump: a reader reads it by
-/// its header tag.
+/// The version field is the only thing this function changes; every other field is
+/// written as its caller set it. Which artifacts are byte-identical to 0.31.0's is
+/// [`crate::header::LBC_VERSION`]'s subject. A K-quant head needs no bump: a reader
+/// reads it by its header tag.
 pub(crate) fn header_with_version(header: &LbcHeader) -> LbcHeader {
     let mut h = header.clone();
     h.version = if header.embedding.quant.is_kquant_superblock() {

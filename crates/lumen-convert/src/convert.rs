@@ -593,8 +593,8 @@ fn do_convert_from_reader<R: Read + Seek>(
                 //
                 // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight for the
                 // CUDA backend's dedicated Q6_K head kernel — the exact source bytes,
-                // 6.5625 bpw. A K-quant source keeps a Q6_K head as stored (the general
-                // K-quant kernels serve it too). Never on the Metal target — Metal has no
+                // 6.5625 bpw. A K-quant source keeps a Q6_K head as stored too (the same
+                // dedicated head kernel serves it). Never on the Metal target — Metal has no
                 // Q6_K head kernel and would serve the head through the F32-dequant
                 // fallback (4 bytes/elem streamed per token), so Metal conversions
                 // requantize to the fast Q8_0 head path (the rule of every other

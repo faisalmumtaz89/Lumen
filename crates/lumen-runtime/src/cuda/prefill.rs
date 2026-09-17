@@ -1289,7 +1289,6 @@ pub(crate) unsafe fn launch_gemm_residual(
             let variant = match weight {
                 GpuWeightBuf::F32(_) => "F32",
                 GpuWeightBuf::Q8Raw(_) => "Q8Raw",
-                GpuWeightBuf::Q8Split(_) => "Q8Split",
                 GpuWeightBuf::Q4Raw(_) => "Q4Raw",
                 GpuWeightBuf::F16Raw(_) => "F16Raw",
                 _ => "OTHER",

@@ -23,7 +23,7 @@
 //
 // Structure: one warp per row, Q6K_NR = 4 rows per Q6K_THREADS = 128-thread
 // CTA. Within a superblock the 32 lanes read the 32 consecutive words of the
-// 128-byte ql field — one fully coalesced transaction per warp — plus the qh
+// 128-byte ql field — four 32-byte sectors, five when the 210-byte stride misaligns them — plus the qh
 // word and the two scale bytes their elements need. Lane word `lane` holds the
 // low nibbles of group (n, g_lo) and the high nibbles of group (n, g_lo + 2)
 // for elements j0 .. j0 + 3, so a lane does two dp4a per superblock, and the

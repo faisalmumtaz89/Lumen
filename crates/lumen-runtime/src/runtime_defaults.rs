@@ -1495,8 +1495,9 @@ pub fn q4_1_down_enabled() -> bool {
 }
 
 /// `LUMEN_CUDA_KQUANT=0`: kill-switch for the general K-quant kernels — a
-/// rollback to refusing K-quant artifacts at load, never an A/B axis (the
-/// pre-kernel path cannot serve them). Default ON.
+/// rollback to refusing at load a K-quant artifact that carries a Q4_K / Q5_K /
+/// Q6_K layer or embedding plane, never an A/B axis (the pre-kernel path cannot
+/// serve them). Default ON.
 pub fn cuda_kquant_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_KQUANT") {

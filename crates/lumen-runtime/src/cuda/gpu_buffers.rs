@@ -11,7 +11,9 @@
 //! are always F32 regardless of model quantization.
 
 use crate::error::RuntimeError;
+use crate::runtime_defaults::kquant_artifact;
 use crate::weight::cache::LayerView;
+use crate::weight::kquant::{dequant_kquant_to_f32, host_f16_to_f32};
 use cudarc::driver::CudaSlice;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
@@ -307,10 +309,6 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
     let n_blocks = byte_len / bs_bytes;
     n_blocks * bs_elem
 }
-
-use crate::runtime_defaults::kquant_artifact;
-pub(crate) use crate::weight::kquant::dequant_kquant_to_f32;
-use crate::weight::kquant::host_f16_to_f32;
 
 /// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
 /// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
