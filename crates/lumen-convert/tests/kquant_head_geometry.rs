@@ -9,10 +9,11 @@
 //!
 //! GGUF sizes a tensor from its flattened element count, so a K-quant plane whose row
 //! is narrower than a superblock is a file the converter reads without complaint —
-//! the source of the first fixture. Both registry models have hidden 5120 and no
-//! K-quant tensor of a standard export has a row length that is not a multiple of the
-//! 256-element superblock, so no shipped file converts differently; the pin is the
-//! guard against the default widening to one that does.
+//! the source of the first fixture. The registry's two K-quant cells are both
+//! `qwen3.8-27b`, at hidden 5120, and no K-quant tensor of a standard export has a row
+//! length that is not a multiple of the 256-element superblock, so no shipped file
+//! converts differently; the pin is the guard against the default widening to one that
+//! does.
 //!
 //! The pin was derived by building this same fixture against the 0.31.0 converter
 //! (release commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway

@@ -161,7 +161,7 @@ fn f32_to_f16_rne(val: f32) -> u16 {
 
 /// The engine's Q8_1 quantizer (`quantize_f32_to_q8_1`) mirrored on the host:
 /// per 32-block `amax`, `scale = amax / 127`, `q = rn(v * (127 / amax))`
-/// clamped to [-127, 127], header `f16 scale | f16 (scale_f16 * sum(q))`.
+/// clamped to [-127, 127], header `f16 scale | f16 (scale * sum(q))`.
 fn quantize_q8_1(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % 32, 0);
     let mut out = Vec::with_capacity(x.len() / 32 * Q8_1_BLOCK_BYTES);
@@ -175,7 +175,7 @@ fn quantize_q8_1(x: &[f32]) -> Vec<u8> {
             .collect();
         let d_bits = f32_to_f16_rne(scale);
         let qsum: f32 = q.iter().map(|&v| v as f32).sum();
-        let s_bits = f32_to_f16_rne(host_f16_to_f32(d_bits) * qsum);
+        let s_bits = f32_to_f16_rne(scale * qsum);
         out.extend_from_slice(&d_bits.to_le_bytes());
         out.extend_from_slice(&s_bits.to_le_bytes());
         out.extend(q.iter().map(|&v| v as u8));

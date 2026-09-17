@@ -4214,8 +4214,10 @@ mod announce_route_once_tests {
 
 #[cfg(test)]
 mod kquant_geometry_tests {
-    //! Every K-quant kernel file declares the CTA geometry its matvec is
-    //! launched with; the loader reads exactly that.
+    //! Each of the three general K-quant kernel files declares the CTA geometry its
+    //! matvec is launched with, and `load_kquant_kernels` reads exactly that. The
+    //! dedicated `matvec_q6k_head.cu` is outside this rule: its `Q6_NR` / `Q6_THREADS`
+    //! are compiled in, and the head launchers carry the matching geometry as literals.
 
     use super::kernel_define;
 

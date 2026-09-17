@@ -2731,9 +2731,9 @@ unsafe fn launch_matvec_slice(
         // GEMM serves Q8Split; Q4Split keeps its raw plane)
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "{label}: a split-layout plane reached the per-row prefill matvec; the batched \
-                 prefill serves Q8Split through its dequant -> GEMM arm and Q4Split has no \
-                 prefill route (its raw plane is kept)",
+                "matvec_slice {label}: a split-layout plane reached the per-row prefill \
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
+                 and Q4Split has no prefill route (its raw plane is kept)",
             )));
         }
     }
@@ -3224,8 +3224,8 @@ unsafe fn launch_matvec_residual_slice(
         | GpuWeightBuf::Q5KRaw(_)
         | GpuWeightBuf::Q6KRaw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec_slice_residual {label}: CtInt4G32 and K-quant planes are served by the \
-                 prefill HGEMM path, not the per-row fallback"
+                "matvec_res {label}: CtInt4G32 and K-quant planes are served by the prefill \
+                 HGEMM path, not the per-row fallback"
             )));
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
@@ -3338,9 +3338,9 @@ unsafe fn launch_matvec_residual_slice(
         // GEMM serves Q8Split; Q4Split keeps its raw plane)
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "{label}: a split-layout plane reached the per-row prefill matvec; the batched \
-                 prefill serves Q8Split through its dequant -> GEMM arm and Q4Split has no \
-                 prefill route (its raw plane is kept)",
+                "matvec_res {label}: a split-layout plane reached the per-row prefill \
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
+                 and Q4Split has no prefill route (its raw plane is kept)",
             )));
         }
     }

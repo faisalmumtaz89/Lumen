@@ -20,8 +20,12 @@ use crate::dequant::*;
 /// flag: none of the Q4_K / Q5_K / Q6_K planes it carries — its layer planes, its
 /// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
 /// better than the source bytes, so its default conversion and its fidelity conversion
-/// are the same file. A Q4_K / Q5_K head is not among them: the runtime has a Q6_K
-/// head kernel and no Q4_K / Q5_K one, so the head arm requantises it.
+/// are the same file, except on a source whose head the runtime does not serve: a
+/// K-quant source's default head has to be servable, so a Q6_K head whose row width is
+/// not whole superblocks is requantised by default while the explicit switches answer
+/// for every width, as in 0.31.0. A Q4_K / Q5_K head is not among the preserved planes
+/// either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K one, so the head arm
+/// requantises it.
 pub(crate) fn source_fidelity() -> bool {
     kquant_source() || source_fidelity_requested()
 }
@@ -466,6 +470,15 @@ fn do_convert_from_reader<R: Read + Seek>(
     let embedding_bytes = read_tensor_data(reader, gguf, embedding_tensor)?;
     let embedding_ggml_type = embedding_tensor.ggml_type;
     let embedding_n_elements = embedding_tensor.n_elements();
+    // The embedding gather reads the table as whole 256-element superblocks and the
+    // loader refuses an element count that is not whole superblocks, while GGUF sizes
+    // the plane from that count at `div_ceil` — so a source K-quant embedding with a
+    // partial final superblock is one the converter must not carry as stored. Such an
+    // embedding takes the F32 conversion below, the one 0.31.0 wrote for it.
+    let kquant_embedding_servable = embedding_ggml_type.to_lbc_quant().is_some_and(|q| {
+        lumen_format::serving_rules::kquant_global_plane_len(q, embedding_n_elements as usize)
+            .is_ok()
+    });
 
     // For Q8_0, Q4_0, and F16 embeddings, keep raw bytes in the LBC file.
     // The runtime will use GPU dequant kernels for embedding lookup.
@@ -506,13 +519,15 @@ fn do_convert_from_reader<R: Read + Seek>(
             );
             (embedding_bytes, QuantScheme::Q4_0)
         }
-        // A K-quant source's K-quant embedding is carried as stored (as F32 it would be
-        // 5-7x its size on the device; the CUDA K-quant path has the row-gather). Every
-        // other source's embedding is dequantised to F32 below (or kept, if it already is),
-        // and so is a tied one: without `output.weight` the head shares this plane and
-        // would take its scheme, and no target carries a Q4_K / Q5_K head.
+        // A K-quant source's K-quant embedding is carried as stored when its element
+        // count is whole superblocks (as F32 it would be 5-7x its size on the device;
+        // the CUDA K-quant path has the row-gather). Any other Q4_K / Q5_K / Q6_K
+        // embedding is dequantised to F32 below, and so is a tied one: without
+        // `output.weight` the head shares this plane and would take its scheme, and no
+        // target carries a Q4_K / Q5_K head.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
             if kquant_source()
+                && kquant_embedding_servable
                 && !opts.dequantize_to_f32
                 && gguf.find_tensor(OUTPUT_PROJ_NAME).is_some() =>
         {

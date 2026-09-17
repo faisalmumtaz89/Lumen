@@ -18079,9 +18079,16 @@ fn raw_global_expected_len(
         QuantScheme::Q8_0 => block(32, 34),
         QuantScheme::Q4_0 => block(32, 18),
         QuantScheme::F16 | QuantScheme::Bf16 => block(1, 2),
-        QuantScheme::Q4_K => block(256, 144),
-        QuantScheme::Q5_K => block(256, 176),
-        QuantScheme::Q6_K => block(256, 210),
+        // One rule with the converter for a K-quant global (the converter
+        // reads it before it carries a source embedding verbatim); a
+        // superblock holds 256 elements in under 256 bytes, so the byte
+        // bound the 32-bit gathers need cannot bind once the element count
+        // above has passed.
+        q if q.is_kquant_superblock() => {
+            lumen_format::serving_rules::kquant_global_plane_len(q, n_elements)
+                .map(Some)
+                .map_err(RuntimeError::Compute)
+        }
         _ => Ok(None),
     }
 }
