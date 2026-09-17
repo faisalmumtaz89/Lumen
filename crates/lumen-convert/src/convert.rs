@@ -9,7 +9,7 @@ use crate::dequant::*;
 
 /// `LUMEN_CONVERT_SOURCE_FIDELITY=1`: preserve every tensor in the exact
 /// format the source GGUF stores it, instead of requantizing to the runtime's
-/// historical fast-path formats. Covers: K-quant `output.weight`, K-quant
+/// historical fast-path formats. Covers: Q6_K `output.weight`, K-quant
 /// `ssm_out` (Q5_K in Q4_0-preset files), Q4_1 layer tensors (8 of 64
 /// `ffn_down` in Q4_0-preset files carry Q4_1's min term), and F32
 /// `ssm_alpha`/`ssm_beta` gates. Requires a runtime with the matching decode

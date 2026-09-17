@@ -15282,8 +15282,10 @@ unsafe fn launch_matvec_preq8_1_residual_split(
 ///
 /// Produces a buffer of `out_dim * nb * 34` bytes (same density as Q8Raw,
 /// reorganized as `[scale[nb] | quant[nb]]` per row). The source buffer is
-/// read by reference and preserved (caller keeps the original Q8Raw for
-/// prefill HGEMM path).
+/// read by reference and preserved; whether the caller keeps the original
+/// Q8Raw beside the split copy is the caller's decision (a K-quant artifact
+/// releases it once every route reads the split layout; every other artifact
+/// keeps it for the prefill HGEMM path).
 ///
 /// # Safety
 ///
@@ -17997,7 +17999,7 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// the resulting F32 copy uploading via the plain-F32 path (no length or
 /// cap check). Q4_K's packed size equals Q4_0's (144 B / 256 elems), so a
 /// Q4_K global is told from a Q4_0 one by the header's declared family, not
-/// by its length (`weight::provider_sync::read_embedding_global_for`); this
+/// by its length (`weight::provider_sync::read_embedding_global`); this
 /// path length-checks a scheme the header already named.
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
 /// only valid raw size. `Ok(None)` = the layout is not length-checkable
@@ -21120,9 +21122,12 @@ impl ComputeBackend for CudaBackend {
                     oom_layer,
                 );
                 match release_block {
+                    // The release is a K-quant-artifact rule, so an existing cell
+                    // never reaches it: its receipts stay exactly as shipped.
+                    Some(_) if !crate::runtime_defaults::kquant_artifact() => {}
                     Some(why) => eprintln!(
                         "[CUDA] Q8 split raw-plane release off ({why}): both copies stay \
-                         resident and the prefill keeps reading the packed plane (clone \
+                         resident and the prefill keeps reading the raw plane (clone \
                          pass {consumed_gb:.2} GB)"
                     ),
                     None => eprintln!(

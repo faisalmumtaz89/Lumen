@@ -468,7 +468,9 @@ fn dequant_identity_width(sc: &Scheme, hidden: usize) {
         }
     }
 
-    // (2) embed_token over every row (>= 64 seeded rows) == host f32, bit for bit.
+    // (2) embed_token over every row (64 seeded random superblocks + 10 edge blocks,
+    // padded to whole rows: 74 rows at hidden 256, 15 at hidden 1280) == host f32,
+    // bit for bit.
     let hd = hidden as u32;
     let mut row_gpu: CudaSlice<f32> = stream.alloc_zeros(hidden).unwrap();
     let mut gather_mismatch = 0usize;
@@ -1018,6 +1020,12 @@ fn matvec_shapes(sc: &Scheme) {
         }
         // the quantisation-quality ratio is a statistic over a plane's many rows: on the
         // two small synthetic shapes only the kernel-versus-host bars above apply
+        // The ratio bar is only as strong as its comparator: a non-finite E_q4 makes
+        // `1.10 * E_q4` infinite and every E_kq satisfies it, so the comparator is
+        // gated on its own before the ratio is applied.
+        if !c.e_q4.is_finite() {
+            failures.push(format!("{role}: E_q4 {:.3e} is not finite", c.e_q4));
+        }
         if out_dim * in_dim >= 1 << 20 && !(c.e_kq <= 1.10 * c.e_q4) {
             failures.push(format!(
                 "{role}: E_kq {:.3e} > 1.10 x E_q4 {:.3e}",
@@ -1052,10 +1060,19 @@ fn q6_k_matvec_shapes() {
 // Matvec on edge superblocks: the matvec decodes scales from registers (Q4_K /
 // Q5_K header words, Q6_K 16-bit scale pairs), a different path from the byte
 // reads the dequant identity gate proves. Rows are built from every edge block
-// (the fp16-max ones excluded: their products overflow f32 dot products) and
-// from random-bytes superblocks (random signed Q6_K sub-scales, random 6-bit
-// scales and mins), on a shape whose out_dim is odd — not a multiple of any NR the kernels use (2 or 4).
+// except the two saturated-`d` ones (below) and from random-bytes superblocks
+// (random signed Q6_K sub-scales, random 6-bit scales and mins),
+// on a shape whose out_dim is odd — not a multiple of any NR the kernels use (2 or 4).
 // ---------------------------------------------------------------------------
+
+/// The edge fixtures whose `d` is fp16 max: their elements reach |d * sc * q| ~ 1e8, so a
+/// row that mixes one with ordinary superblocks drives the kernel's f32 accumulator through
+/// partial sums ~1e10 while the dot itself can cancel to far less, and the leftover f32
+/// rounding then exceeds this gate's 1e-4 relative bar. Nothing overflows (the conservative
+/// 512-element bound is ~1.4e11 against f32's ~3.4e38); the largest-subnormal `d` fixtures
+/// (`0x03FF`) are ordinary here and stay in the pool. Every fixture, these included, is
+/// covered bit-for-bit by the dequant identity gate above.
+const SATURATED_D_FIXTURES: [&str; 2] = ["d/dmin fp16 max", "d fp16 max, scale -128"];
 
 fn matvec_edge_case(sc: &Scheme) {
     let (ctx, stream) = create_context();
@@ -1066,7 +1083,7 @@ fn matvec_edge_case(sc: &Scheme) {
     let pool: Vec<Vec<u8>> = sc
         .edge_blocks()
         .into_iter()
-        .filter(|(name, _)| !name.contains("fp16 max"))
+        .filter(|(name, _)| !SATURATED_D_FIXTURES.contains(name))
         .map(|(_, b)| b)
         .collect();
     let mut s = 0xed6e_0001u64 ^ (sc.block_bytes as u64);

@@ -4,7 +4,7 @@
 //! `ssm_out`, embedding, and a Q6_K head — the one head scheme the converter
 //! preserves; a Q4_K/Q5_K head is requantised as before), takes its K-quant scheme in
 //! the header, and is written at `LBC_VERSION_KQUANT_EMBEDDING` when its embedding is
-//! an as-stored K-quant plane (fixtures F and I keep version 4: their embedding is
+//! an as-stored K-quant plane (fixtures F and H keep version 4: their embedding is
 //! Q8_0); a file that is not a K-quant source — the shipping Q4_0 shape with its Q5_K
 //! `ssm_out`, Q6_K head and Q6_K full-attention `attn_q`, a GDN pair stored as K-quant,
 //! or a K-quant embedding alone — converts exactly as before.
@@ -362,7 +362,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
                 _ => GgmlType::Q8_0,
             }),
         ),
-        // I. A K-quant source whose GDN pair mixes a Q4_0 attn_qkv with a K-quant gate.
+        // H. A K-quant source whose GDN pair mixes a Q4_0 attn_qkv with a K-quant gate.
         (
             "q4_0_qkv_kq_gate",
             build(GgmlType::Q8_0, GgmlType::Q8_0, |_, nm| match nm {
@@ -391,7 +391,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
             build(GgmlType::Q5_K, GgmlType::Q8_0, |_, _| GgmlType::Q8_0),
         ),
     ];
-    // J. A K-quant source whose GDN pair mixes a K-quant attn_qkv with an F32 gate.
+    // I. A K-quant source whose GDN pair mixes a K-quant attn_qkv with an F32 gate.
     for (name, qkv) in [
         ("q4_k_qkv_f32_gate", GgmlType::Q4_K),
         ("q5_k_qkv_f32_gate", GgmlType::Q5_K),
@@ -519,9 +519,10 @@ fn kquant_source_policy_matrix() {
     );
 
     // D. A K-quant source (one Q4_K ffn_up): every K-quant plane verbatim — a
-    // Q4_K and a Q6_K ssm_out, a Q5_K head, a Q6_K embedding — the Q4_1 kept,
-    // the F32 gates kept, the header at the dominant K-quant scheme; and the
-    // default conversion is byte-identical to the fidelity conversion.
+    // Q4_K and a Q6_K ssm_out, a Q6_K embedding — while its Q5_K head is
+    // re-quantised (only a Q6_K head is preserved); the Q4_1 kept, the F32 gates
+    // kept, the header at the dominant K-quant scheme; and the default conversion
+    // is byte-identical to the fidelity conversion.
     let kquant_src = fixture("kquant_src");
     let d = convert("kquant", &kquant_src, ConvertTarget::Generic);
     assert_eq!(
@@ -694,43 +695,43 @@ fn kquant_source_policy_matrix() {
         "G: Q4_K down as stored"
     );
 
-    // I. A K-quant source whose GDN pair mixes a Q4_0 attn_qkv with a K-quant
+    // H. A K-quant source whose GDN pair mixes a Q4_0 attn_qkv with a K-quant
     // attn_gate: the generic target carries both as stored.
     let mixed_pair = fixture("q4_0_qkv_kq_gate");
-    let i = convert("q4_0_qkv_kq_gate", &mixed_pair, ConvertTarget::Generic);
+    let h = convert("q4_0_qkv_kq_gate", &mixed_pair, ConvertTarget::Generic);
     assert_eq!(
-        slice(&i, 0, "wq").0,
+        slice(&h, 0, "wq").0,
         QuantScheme::Q4_0,
-        "I: generic qkv as stored"
+        "H: generic qkv as stored"
     );
     assert_eq!(
-        slice(&i, 0, "attn_gate").0,
+        slice(&h, 0, "attn_gate").0,
         QuantScheme::Q4_K,
-        "I: generic gate as stored"
+        "H: generic gate as stored"
     );
     assert_eq!(
-        i.version,
+        h.version,
         lumen_format::LBC_VERSION,
-        "I: a Q8_0 embedding keeps version 4"
+        "H: a Q8_0 embedding keeps version 4"
     );
 
-    // J. A K-quant source whose GDN pair mixes a K-quant attn_qkv with an F32
+    // I. A K-quant source whose GDN pair mixes a K-quant attn_qkv with an F32
     // attn_gate: the generic target carries both as stored.
     for (name, qkv) in [
         ("q4_k_qkv_f32_gate", GgmlType::Q4_K),
         ("q5_k_qkv_f32_gate", GgmlType::Q5_K),
         ("q6_k_qkv_f32_gate", GgmlType::Q6_K),
     ] {
-        let j = convert(name, &fixture(name), ConvertTarget::Generic);
+        let i = convert(name, &fixture(name), ConvertTarget::Generic);
         assert_eq!(
-            slice(&j, 0, "wq").0,
+            slice(&i, 0, "wq").0,
             qkv.to_lbc_quant().expect("a K-quant scheme"),
-            "J/{qkv:?}: generic qkv as stored"
+            "I/{qkv:?}: generic qkv as stored"
         );
         assert_eq!(
-            slice(&j, 0, "attn_gate").0,
+            slice(&i, 0, "attn_gate").0,
             QuantScheme::F32,
-            "J/{qkv:?}: generic gate as stored"
+            "I/{qkv:?}: generic gate as stored"
         );
     }
 

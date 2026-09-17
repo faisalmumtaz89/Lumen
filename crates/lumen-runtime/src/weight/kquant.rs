@@ -34,6 +34,11 @@ pub fn host_f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | ((exp + 112) << 23) | (frac << 13))
 }
 
+/// Whether `q` is an as-stored K-quant superblock scheme.
+pub fn is_kquant(q: QuantScheme) -> bool {
+    matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K)
+}
+
 /// Decode K-quant scales from 12 packed bytes into 8 scale + 8 min arrays.
 ///
 /// Used by Q4_K and Q5_K. The 12 bytes encode 8 6-bit scales and 8 6-bit mins

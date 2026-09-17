@@ -17,8 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   head. The registry gains `qwen3.8-27b:Q4_K_M` and `:Q5_K_M`. Kill switches
   `LUMEN_CUDA_KQUANT` and `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW`
   (`docs/environment-variables.md`). An artifact whose embedding is an as-stored
-  K-quant plane is LBC version 5 (`docs/lbc-format.md`): the default conversion of a
-  K-quant source whose `token_embd` is K-quant produces one (both registry cells;
+  K-quant plane is LBC version 5 (`docs/lbc-format.md`): the default generic conversion
+  of a K-quant source whose `token_embd` is K-quant produces one (both registry cells;
   `--dequantize` leaves no such plane, and that artifact keeps version 4). A Lumen
   before this release refuses a version-5 file with `UnsupportedVersion`. Every other
   artifact keeps version 4, an artifact from a source that is not a K-quant source

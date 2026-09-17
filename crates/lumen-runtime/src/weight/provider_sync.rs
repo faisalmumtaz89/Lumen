@@ -9,6 +9,7 @@ use crate::storage::{IoSnapshot, StorageBackend};
 use crate::weight::cache::{
     CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider,
 };
+use crate::weight::kquant::is_kquant;
 use lumen_format::index::{SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
 use lumen_format::reader::LbcFile;
@@ -372,11 +373,6 @@ fn global_plane_to_f32(
     })
 }
 
-/// Whether `q` is an as-stored K-quant superblock scheme.
-fn is_kquant(q: QuantScheme) -> bool {
-    matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K)
-}
-
 /// The K-quant scheme whose plane of `n_elements` is exactly `len` bytes (256
 /// elements per superblock: Q4_K 144, Q5_K 176, Q6_K 210).
 fn kquant_scheme_for_len(len: usize, n_elements: usize) -> Option<QuantScheme> {
@@ -416,8 +412,8 @@ pub fn read_output_proj_global(
     // (scheme, whether the stored bytes are kept beside the F32 copy)
     let (quant, keep_raw) = if let Some(q) = kquant {
         // Q6_K head (source-fidelity artifacts): the raw superblocks feed the
-        // CUDA dp4a plane kernel and the Metal K-quant head; the F32 copy is
-        // for the CPU fallbacks. Checked before the length cascade so the
+        // CUDA dp4a plane kernel; Metal and the CPU fallbacks have no K-quant
+        // head and read the F32 copy. Checked before the length cascade so the
         // final else cannot read the Q6_K bytes as F32. A Q4_K / Q5_K head is
         // carried raw with its scheme so the backend can refuse it by name (the
         // converter does not preserve a Q4_K / Q5_K head on any target); a Q4_K plane

@@ -73,6 +73,11 @@ v1 (current) verifies the Qwen3.5 family and the Qwen3.8-27B dense model end-to-
 | `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16, Q4_K_M (16.2 GB download), Q5_K_M (19.5 GB download) |
 | `qwen3.5-moe` | MoE GDN-hybrid | 35B total / 3B active | Q8_0, Q4_0, BF16 |
 
+The two K-quant cells are served as stored on CUDA only. On Apple Silicon (the Metal
+conversion target) the converter upcasts their planes to Q8_0 exactly as it always has,
+so the artifact is about the size of the `Q8_0` one while carrying the source's coarser
+precision — prefer `Q8_0` or `Q4_0` there.
+
 | Backend | Hardware | Status |
 |---------|----------|--------|
 | **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100) | Production-ready |

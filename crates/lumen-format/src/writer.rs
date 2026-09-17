@@ -189,9 +189,9 @@ pub fn write_lbc<W: Write>(
 }
 
 /// Whether `quant` is an as-stored K-quant superblock scheme, whose plane a reader
-/// before [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`] misreads when it carries a
-/// global: that reader classified a global by its byte length alone, and a Q4_K plane
-/// has exactly Q4_0's length.
+/// before [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`] misreads when it carries the
+/// embedding: that reader classified the embedding global by its byte length, and a
+/// Q4_K plane has exactly Q4_0's length.
 fn is_kquant_superblock(quant: QuantScheme) -> bool {
     matches!(
         quant,

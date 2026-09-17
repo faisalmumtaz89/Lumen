@@ -76,8 +76,9 @@ tokenizer = "Qwen/Qwen3.8-27B"
     Q4_0 = { repo = "unsloth/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q4_0.gguf" }
     # K-quant superblock files: on the generic target the converter keeps every
     # Q4_K/Q5_K/Q6_K tensor, the embedding and a Q6_K head verbatim, and CUDA serves them
-    # natively. On the Metal target they convert as before (every K-quant plane upcast to
-    # Q8_0, the head re-quantised): Metal has no K-quant kernel.
+    # natively. On the Metal target they convert as before (every K-quant layer plane
+    # upcast to Q8_0, the head re-quantised, a K-quant embedding dequantised to F32):
+    # Metal has no K-quant kernel.
     Q4_K_M = { repo = "bartowski/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q4_K_M.gguf" }
     Q5_K_M = { repo = "bartowski/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q5_K_M.gguf" }
     # BF16: 2-shard split GGUF nested under a HF subdir (same shape as the MoE

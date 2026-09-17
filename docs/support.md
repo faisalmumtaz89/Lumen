@@ -59,7 +59,7 @@ The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on 
 | Qwen3.8-27B dense | Q4_0 | Production-ready | 0.93× llama.cpp | All quality gates pristine + DET-001 50/50 (2026-08-14, A100) |
 | Qwen3.8-27B dense | BF16 | Production-ready (H100 / sm_90) | 0.87× llama.cpp | All quality gates pass + DET-001 50/50 (2026-08-14, H100 — sm_90 native BF16). Known issue: a deterministic stray first token at BF16 (tracked prefill-numerics issue) |
 | Qwen3.8-27B dense | CtInt4G32 (HF import) | Production-ready, compatibility cell (SM80+) | — (no llama.cpp equivalent format) | Serves the community compressed-tensors INT4 g32 checkpoint byte-exactly (`lumen convert --from-hf`); quality + DET-001 50/50 verified on A100. W4A8 dp4a route — slower than engines with W4A16 4-bit kernels on the same bytes |
-| Qwen3.8-27B dense | Q4_K_M / Q5_K_M | Served natively (no published board) | — | The Q4_K / Q5_K / Q6_K planes are served as stored by the CUDA K-quant kernels (`docs/lbc-format.md`); no co-located ratio published yet |
+| Qwen3.8-27B dense | Q4_K_M / Q5_K_M | Functional (end-to-end gates not yet recorded) | — | The Q4_K / Q5_K / Q6_K planes are served as stored by the CUDA K-quant kernels (`docs/lbc-format.md`); the quality / determinism gate record and a co-located ratio are not yet published for this cell |
 
 ### Metal (Apple Silicon, M-series)
 

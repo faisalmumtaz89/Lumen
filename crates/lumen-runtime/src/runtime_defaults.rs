@@ -204,8 +204,7 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// re-quantised either way): CUDA serves each preserved plane through its own scheme's arm,
 /// and a missing kernel group is then reported at the first token instead of at load.
 pub fn kquant_artifact() -> bool {
-    model_dense_quant()
-        .is_some_and(|q| matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K))
+    model_dense_quant().is_some_and(crate::weight::kquant::is_kquant)
 }
 
 /// Public diagnostic wrapper over `model_dense_quant` for the

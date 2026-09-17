@@ -436,6 +436,7 @@ need=12
 case "$QUANT" in
   bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
   q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
+  q4_k_m|q5_k_m) case "$MODEL" in *27b*) need=55 ;; *) need=16 ;; esac ;;
   *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
 esac
 free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"

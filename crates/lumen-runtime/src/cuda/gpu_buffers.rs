@@ -310,7 +310,7 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
 
 use crate::runtime_defaults::kquant_artifact;
 pub(crate) use crate::weight::kquant::dequant_kquant_to_f32;
-use crate::weight::kquant::host_f16_to_f32;
+use crate::weight::kquant::{host_f16_to_f32, is_kquant};
 
 /// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
 /// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
@@ -782,10 +782,6 @@ pub(super) fn kquant_weight(weight: &GpuWeightBuf) -> Option<(QuantScheme, &Cuda
 /// current switches.
 pub(crate) fn kquant_planes_servable() -> bool {
     crate::runtime_defaults::cuda_kquant_enabled()
-}
-
-fn is_kquant(q: QuantScheme) -> bool {
-    matches!(q, QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K)
 }
 
 fn kquant_refusal(what: &str, quant: QuantScheme) -> RuntimeError {
