@@ -295,8 +295,8 @@ fn dequantize_bf16_to_f32(src: &[u8], n_elements: usize) -> Vec<f32> {
 }
 
 /// Detect embedding quantization from byte length and model dimensions.
-/// Returns `(f32_data, raw_bytes, quant_scheme)`, or `Err` when the plane fails to
-/// dequantise.
+/// Returns `(f32_data, raw_bytes, quant_scheme)`, or `Err` when the plane
+/// fails to dequantise.
 /// Same heuristic as read_output_proj_global: compare byte length against
 /// expected sizes for F32, Q8_0, Q4_0, F16/BF16 and the K-quant superblock
 /// formats (Q4_K / Q5_K / Q6_K, carried raw for the backends that gather them

@@ -44,9 +44,9 @@ const GROUPS: u64 = 2;
 // Four layers: the converter's layer kinds are positional (full attention at 3, 7, …).
 const LAYERS: u32 = 4;
 
-/// The source bytes of one plane, distinct per type and per superblock. K-quant planes
-/// are sized the way GGUF sizes them — `div_ceil`, so a partial final superblock is a
-/// whole stored block.
+/// The source bytes of one plane, varying with the type and the superblock index.
+/// K-quant planes are sized the way GGUF sizes them — `div_ceil`, so a partial final
+/// superblock is a whole stored block.
 fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     let n = n as usize;
     match t {

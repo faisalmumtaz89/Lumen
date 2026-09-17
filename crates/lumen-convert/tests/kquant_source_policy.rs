@@ -47,7 +47,7 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
             }
             v
         }
-        // K-quant superblocks with distinct bytes: a pattern over the quant bytes,
+        // K-quant superblocks keyed on their index: a pattern over the quant bytes,
         // the packed 6-bit scales and mins left at zero, the f16 scales per superblock
         GgmlType::Q4_K | GgmlType::Q5_K => {
             let bb = if t == GgmlType::Q4_K { 144 } else { 176 };
