@@ -100,6 +100,14 @@ impl QuantScheme {
         !matches!(self, Self::F32 | Self::F16 | Self::Bf16)
     }
 
+    /// Whether this is one of the three K-quant superblock schemes Lumen stores and
+    /// serves as superblocks — `Q4_K`, `Q5_K`, `Q6_K` — the set the LBC version stamp
+    /// and the runtime's K-quant paths key on. `Q2_K` and `Q3_K` are GGML K-quants
+    /// too, but they have no kernel on either backend, so no global is written in one.
+    pub fn is_kquant_superblock(&self) -> bool {
+        matches!(self, Self::Q4_K | Self::Q5_K | Self::Q6_K)
+    }
+
     /// Serialize to a single-byte tag for the LBC binary format.
     pub fn to_u8(&self) -> u8 {
         match self {
@@ -306,5 +314,26 @@ mod tests {
         assert!(QuantScheme::Q2_K.is_quantized());
         assert!(QuantScheme::Q3_K.is_quantized());
         assert!(QuantScheme::CtInt4G32.is_quantized());
+    }
+
+    #[test]
+    fn is_kquant_superblock_classification() {
+        // The three a global is carried in and the runtime serves from superblocks.
+        assert!(QuantScheme::Q4_K.is_kquant_superblock());
+        assert!(QuantScheme::Q5_K.is_kquant_superblock());
+        assert!(QuantScheme::Q6_K.is_kquant_superblock());
+        // K-quants with no kernel on either backend: not in the set.
+        assert!(!QuantScheme::Q2_K.is_kquant_superblock());
+        assert!(!QuantScheme::Q3_K.is_kquant_superblock());
+        // Every other scheme, including the block quants that share a length with
+        // one of the three (Q4_0 is Q4_K's 0.5625 bytes per element).
+        assert!(!QuantScheme::F32.is_kquant_superblock());
+        assert!(!QuantScheme::F16.is_kquant_superblock());
+        assert!(!QuantScheme::Bf16.is_kquant_superblock());
+        assert!(!QuantScheme::Q8_0.is_kquant_superblock());
+        assert!(!QuantScheme::Q4_0.is_kquant_superblock());
+        assert!(!QuantScheme::Q4_1.is_kquant_superblock());
+        assert!(!QuantScheme::Q5_0.is_kquant_superblock());
+        assert!(!QuantScheme::CtInt4G32.is_kquant_superblock());
     }
 }

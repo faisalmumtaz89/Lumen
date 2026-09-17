@@ -1181,7 +1181,7 @@ fn matvec_edge_case(sc: &Scheme) {
     );
     assert!(
         max_abs_res < abs_bar,
-        "[{}] edge residual max_abs {max_abs_res:.3e}",
+        "[{}] edge residual max_abs {max_abs_res:.3e} >= {abs_bar:.3e}",
         sc.tag
     );
     assert!(

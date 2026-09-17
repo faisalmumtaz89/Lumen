@@ -706,8 +706,9 @@ fn kquant_source_policy_matrix() {
     );
 
     // G. A K-quant source with Q3_K planes (the Q3_K_M shape): the Q3_K gate and up
-    // ride through as before, the Q4_K down is carried, and the header takes the
-    // K-quant scheme with the most planned layer planes.
+    // ride through as before, the Q4_K down is carried, and the header takes whichever
+    // of Q4_K / Q5_K / Q6_K has the most planned layer planes — Q3_K is not one of
+    // them, so Q4_K here, even though Q3_K has twice as many planes.
     let q3 = fixture("q3_k_gate_up");
     let g = convert("q3", &q3, ConvertTarget::Generic);
     assert_eq!(g.primary, QuantScheme::Q4_K, "G: header scheme");

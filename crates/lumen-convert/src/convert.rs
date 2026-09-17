@@ -162,8 +162,9 @@ pub struct ConvertOptions {
     pub alignment: u64,
     /// If true, dequantize quantized layer tensors to F32. A kept `ssm_out` keeps its
     /// stored scheme (the Q8_0 floor otherwise) and, on a K-quant source conversion, so
-    /// does a preserved `Q6_K` head. The embedding is dequantised, so such an artifact
-    /// keeps LBC version 4. Produces larger files but compatible with the naive F32
+    /// does a preserved `Q6_K` head. A K-quant embedding is dequantised (every other
+    /// embedding is kept as stored, as without the flag), so such an artifact keeps
+    /// LBC version 4. Produces larger files but compatible with the naive F32
     /// backend.
     pub dequantize_to_f32: bool,
     /// If set, requantize layer weight tensors to this scheme during conversion.

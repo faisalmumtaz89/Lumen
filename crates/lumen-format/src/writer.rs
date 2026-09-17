@@ -15,7 +15,7 @@ use crate::crc::crc32;
 use crate::header::{Endianness, GlobalTensorRange, LbcHeader};
 use crate::hyperparams::{ModelHyperparams, RopeScalingType};
 use crate::index::{LayerIndex, TensorSlice};
-use crate::quantization::{QuantGroupSize, QuantScheme, QuantizationDescriptor};
+use crate::quantization::{QuantGroupSize, QuantizationDescriptor};
 use crate::tokenizer::TokenizerSection;
 use std::io::{self, Write};
 
@@ -188,26 +188,17 @@ pub fn write_lbc<W: Write>(
     Ok(())
 }
 
-/// Whether `quant` is an as-stored K-quant superblock scheme, whose plane a reader
-/// before [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`] misreads when it carries the
-/// embedding: that reader classified the embedding global by its byte length, and a
-/// Q4_K plane has exactly Q4_0's length.
-fn is_kquant_superblock(quant: QuantScheme) -> bool {
-    matches!(
-        quant,
-        QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K
-    )
-}
-
 /// The header as written: its version is [`crate::header::LBC_VERSION_KQUANT_EMBEDDING`]
-/// when the embedding is an as-stored K-quant plane (an earlier reader refuses the file
-/// by name instead of misreading that plane), [`crate::header::LBC_VERSION`] otherwise.
+/// when the embedding is an as-stored K-quant plane (an earlier reader classified the
+/// embedding global by its byte length, and a Q4_K plane has exactly Q4_0's length, so
+/// it refuses the file by name instead of misreading that plane),
+/// [`crate::header::LBC_VERSION`] otherwise.
 /// The version byte is the only difference, so an artifact without such an embedding
 /// stays byte-identical to 0.31.0's. A K-quant head needs no bump: a reader reads it by
 /// its header tag.
 pub(crate) fn header_with_version(header: &LbcHeader) -> LbcHeader {
     let mut h = header.clone();
-    h.version = if is_kquant_superblock(header.embedding.quant) {
+    h.version = if header.embedding.quant.is_kquant_superblock() {
         crate::header::LBC_VERSION_KQUANT_EMBEDDING
     } else {
         crate::header::LBC_VERSION

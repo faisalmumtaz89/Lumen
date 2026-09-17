@@ -9,7 +9,6 @@ use crate::storage::{IoSnapshot, StorageBackend};
 use crate::weight::cache::{
     CacheStats, LayerView, PrefetchHandle, PrefetchPriority, WeightProvider,
 };
-use crate::weight::kquant::is_kquant;
 use lumen_format::index::{SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
 use lumen_format::reader::LbcFile;
@@ -319,7 +318,7 @@ pub fn read_embedding_global(
     // Q4_K (144 B / 256) has exactly Q4_0's bytes per element (18 B / 32), so
     // the length alone cannot tell them apart.
     let kquant = kquant_scheme_for_len(raw_bytes.len(), n_elements)
-        .filter(|&q| is_kquant(header_quant) && q == header_quant);
+        .filter(|&q| header_quant.is_kquant_superblock() && q == header_quant);
 
     // (scheme, whether the stored bytes are kept beside the F32 copy)
     let (quant, keep_raw) = if let Some(q) = kquant {
@@ -407,7 +406,7 @@ pub fn read_output_proj_global(
     let expected_f16_bytes = n_elements * 2;
     // A K-quant head is declared by the header and confirmed by its length.
     let kquant = kquant_scheme_for_len(raw_bytes.len(), n_elements)
-        .filter(|&q| is_kquant(header_quant) && q == header_quant);
+        .filter(|&q| header_quant.is_kquant_superblock() && q == header_quant);
 
     // (scheme, whether the stored bytes are kept beside the F32 copy)
     let (quant, keep_raw) = if let Some(q) = kquant {

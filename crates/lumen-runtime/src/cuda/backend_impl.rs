@@ -20605,8 +20605,8 @@ impl ComputeBackend for CudaBackend {
         let mut cache = Vec::with_capacity(num_layers);
 
         // A K-quant artifact needs the kernel group of every K-quant scheme its planes
-        // carry: refused here, before a plane is uploaded, rather than at the first token
-        // after the whole model is resident. The failed group's NVRTC error was printed
+        // carry: refused here, before a layer plane is uploaded, rather than at the first
+        // token after the whole model is resident. The failed group's NVRTC error was printed
         // at kernel load.
         if crate::runtime_defaults::kquant_artifact()
             && super::gpu_buffers::kquant_planes_servable()

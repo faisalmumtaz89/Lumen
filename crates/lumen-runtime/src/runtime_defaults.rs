@@ -197,14 +197,14 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// (`set_model_primary_quant`, recorded by `lumen run` / `lumen-server` before the
 /// backend loads a layer) is Q4_K, Q5_K or Q6_K — the scheme a K-quant source's
 /// conversion stamps. CUDA scopes its K-quant-only behaviour on it (the native plane
-/// upload, the split-plane release, the load-time kernel-group refusal), so every other
-/// artifact keeps its kernels of record. A K-quant source converted
+/// upload, the raw-plane release after the Q8 split clone, the load-time kernel-group
+/// refusal), so every other artifact keeps its kernels of record. A K-quant source converted
 /// with `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
 /// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is
 /// re-quantised either way): CUDA serves each preserved plane through its own scheme's arm,
 /// and a missing kernel group is then reported at the first token instead of at load.
 pub fn kquant_artifact() -> bool {
-    model_dense_quant().is_some_and(crate::weight::kquant::is_kquant)
+    model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
 }
 
 /// Public diagnostic wrapper over `model_dense_quant` for the

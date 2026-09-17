@@ -310,7 +310,7 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
 
 use crate::runtime_defaults::kquant_artifact;
 pub(crate) use crate::weight::kquant::dequant_kquant_to_f32;
-use crate::weight::kquant::{host_f16_to_f32, is_kquant};
+use crate::weight::kquant::host_f16_to_f32;
 
 /// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
 /// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
@@ -901,11 +901,11 @@ fn validate_kquant_planes_with(
     artifact_quant: QuantScheme,
     servable: bool,
 ) -> Result<(), RuntimeError> {
-    if !is_kquant(artifact_quant) || servable {
+    if !artifact_quant.is_kquant_superblock() || servable {
         return Ok(());
     }
     for (name, slice) in subs.named_slices() {
-        if slice.length > 0 && is_kquant(slice.quant) {
+        if slice.length > 0 && slice.quant.is_kquant_superblock() {
             return Err(kquant_refusal(
                 &format!("layer {layer} tensor '{name}'"),
                 slice.quant,
@@ -923,7 +923,7 @@ pub(crate) fn validate_kquant_embedding(quant: QuantScheme) -> Result<(), Runtim
 }
 
 fn validate_kquant_embedding_with(quant: QuantScheme, servable: bool) -> Result<(), RuntimeError> {
-    if is_kquant(quant) && !servable {
+    if quant.is_kquant_superblock() && !servable {
         return Err(kquant_refusal("token_embd.weight", quant));
     }
     Ok(())
