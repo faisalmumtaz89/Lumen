@@ -339,7 +339,7 @@ fn slice(p: &Probe, layer: usize, name: &str) -> (QuantScheme, u64) {
 fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     let mut v: Vec<(&'static str, Vec<u8>)> = vec![
         // A. The shipping Q4_0 shape: Q5_K ssm_out, Q6_K head, a Q6_K attn_q in the
-        // full-attention layer, one Q4_1 ffn_down, every FFN projection Q4_0.
+        // full-attention layer, one Q4_1 ffn_down, every other FFN projection Q4_0.
         (
             "shipping_q4_0",
             build(GgmlType::Q4_0, GgmlType::Q6_K, |l, nm| match (l, nm) {
