@@ -4,9 +4,8 @@
 //! as Q8_0 only, so default conversions force-requantize them; CUDA also
 //! serves F32 gates (a K-quant source's default non-Metal conversion, at the
 //! extent the projection reads; source-fidelity and `--dequantize` non-Metal
-//! artifacts).
-//! This module centralises that logic so both the dense and MoE converters
-//! handle it identically.
+//! artifacts). This module centralises that logic so both the dense and MoE
+//! converters handle it identically.
 
 use crate::convert::{ConvertError, ConvertTarget};
 use crate::gguf::{GgmlType, GgufFile};

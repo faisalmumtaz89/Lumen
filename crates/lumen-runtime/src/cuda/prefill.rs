@@ -591,11 +591,11 @@ pub(crate) unsafe fn launch_gemm_projection(
     // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`; a K-quant source's
     // default non-Metal conversion at the extent the projection reads,
     // source-fidelity, HF-import, and `--dequantize` non-Metal artifacts keep
-    // F32), so the default runtime path runs them through HGEMM-F16 / MMQ-Q8 —
-    // both of which introduce ~0.4-3.4% per-element rounding noise from the
-    // requant step. When the
-    // `gdn_alpha`/`gdn_beta` projection is routed through F32 SGEMM, it matches
-    // that canonical F32 path (modulo SGEMM accumulator order).
+    // F32), so the default runtime path runs them through HGEMM-F16 /
+    // MMQ-Q8 — both of which introduce ~0.4-3.4% per-element rounding
+    // noise from the requant step. When the `gdn_alpha`/`gdn_beta`
+    // projection is routed through F32 SGEMM, it matches that canonical F32
+    // path (modulo SGEMM accumulator order).
     //
     // Default-ON for MoE BF16 (`model_is_moe_bf16()`): empirically this F32
     // alpha/beta path is what kills the BF16 GQ-001 arith-05 repetition that the

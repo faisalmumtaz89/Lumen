@@ -666,14 +666,14 @@ pub fn gdn_f64_accum_default() -> bool {
 /// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in default
 /// conversions (the GGUF source is typically F32; the converter
 /// force-requantizes them to Q8_0 — a K-quant source's default non-Metal
-/// conversion at the extent the projection reads, source-fidelity, HF-import, and
-/// `--dequantize` non-Metal artifacts carry F32 gates and take the F32 route
-/// instead). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL projects them via
-/// `mmq_q8_0_batched` (INT8 MMA) while the single-token
-/// DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile matvec — a
-/// DIFFERENT activation-quant granularity + INT8 reduction order. The
-/// `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this as
-/// alpha relD 19.45% / beta relD 20.96% decode-vs-prefill, while the
+/// conversion at the extent the projection reads, source-fidelity, HF-import,
+/// and `--dequantize` non-Metal artifacts carry F32 gates and take the F32
+/// route instead). With the keeper Q8-prefill-MMQ default ON, the batched
+/// PREFILL projects them via `mmq_q8_0_batched` (INT8 MMA) while the
+/// single-token DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile
+/// matvec — a DIFFERENT activation-quant granularity + INT8 reduction
+/// order. The `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this
+/// as alpha relD 19.45% / beta relD 20.96% decode-vs-prefill, while the
 /// (F16/bf16) qkv + gate projections were 0.000% (BIT-IDENTICAL). The
 /// 256-expert top-K router amplifies the ~20% alpha/beta divergence into a
 /// 5-of-8 expert flip that cascades 40 layers and derails greedy decode.

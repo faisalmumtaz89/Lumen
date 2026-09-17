@@ -1,10 +1,10 @@
-//! What a K-quant source preserves by default has to be a plane the runtime serves.
+//! What a K-quant source preserves by default has to be the plane the runtime reads.
 //! The GDN gate projections read `ssm_alpha` / `ssm_beta` at `num_v_heads x hidden`
-//! and refuse a buffer shorter than that, so a source whose F32 gate stores another
-//! extent takes the Q8_0 gate 0.31.0's default wrote for it instead of an F32 plane
-//! the artifact would be refused for. The explicit `LUMEN_CONVERT_SOURCE_FIDELITY`
-//! switch is outside this rule and unchanged — `kquant_gate_extent_fidelity.rs` pins
-//! it — so these fixtures set no environment.
+//! and refuse a buffer shorter than that at the first token; a gate stored at any
+//! other extent is not the plane the projection reads. Either way the conversion takes
+//! the Q8_0 gate 0.31.0's default wrote for it rather than keeping the F32 plane. The
+//! explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and unchanged
+//! — `kquant_gate_extent_fidelity.rs` pins it — so these fixtures set no environment.
 //!
 //! GGUF sizes a tensor from its flattened element count, so a gate of any extent is a
 //! file the converter reads without complaint — the source of the first two fixtures.

@@ -5,9 +5,10 @@
 //! `lumen_format::serving_rules::validate_projection_geometry`, which the converter
 //! runs over the planned layers before it writes a byte. The K-quant source policy
 //! plans such a plane as 0.31.0 planned it — requantised to Q8_0, or a stored Q8_0
-//! unchanged, which that gate then refuses either way — instead of carrying it. The
-//! explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and unchanged,
-//! so these fixtures set no environment.
+//! unchanged, which that gate then refuses either way at a width that is not whole
+//! 32-element blocks — instead of carrying it. The explicit
+//! `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and unchanged, so these
+//! fixtures set no environment.
 //!
 //! GGUF sizes a tensor from its flattened element count, so a K-quant plane whose row
 //! is narrower than a superblock is a file the converter reads without complaint —
