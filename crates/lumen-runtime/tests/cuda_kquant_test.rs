@@ -18,11 +18,14 @@
 //!   error next to the shipped Q4_0 dp4a route's over the same activations
 //!   (~1.00 on every scheme and shape) — reported evidence, not a gate.
 //! * matvec edge blocks — the same comparison on a 71 x 512 shape whose rows mix
-//!   the edge fixtures with random superblocks. The edge scales carry the
-//!   reference up to ~1e8, so the absolute bar is scaled by it
-//!   (`max_abs < 1e-3 * max|ref|`); `rel_l2 <= 1e-4` is the gate a defect fires.
-//!   The two saturated-`d` fixtures are held out (`SATURATED_D_FIXTURES`) and
-//!   are covered bit-for-bit by the dequant identity family.
+//!   the edge fixtures with random superblocks, the two fp16-max-`d` fixtures
+//!   held out (`SATURATED_D_FIXTURES`; the dequant identity family covers them
+//!   bit-for-bit). The remaining scales still carry the reference well above the
+//!   ordinary rows': max|ref| is 1.10e4 / 2.29e4 / 2.80e4 on Q4_K / Q5_K / Q6_K,
+//!   and the ~1e8 magnitude quoted at `SATURATED_D_FIXTURES` belongs to the
+//!   held-out ones. The absolute bar is taken against that reference —
+//!   `max_abs < 1e-3 * max|ref|.max(1.0)`, so 11 / 23 / 28 here — while
+//!   `rel_l2 <= 1e-4` is the gate a defect fires.
 //!
 //! Requires a CUDA GPU: SM 6.1+ for the dequant / edge gates, SM 8.0+ for the
 //! `*_matvec_shapes` comparator (it loads the compute_80 Q4_0 dp4a kernel):

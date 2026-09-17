@@ -776,8 +776,8 @@ pub(super) fn kquant_weight(weight: &GpuWeightBuf) -> Option<(QuantScheme, &Cuda
     }
 }
 
-/// Whether a Q4_K/Q5_K/Q6_K plane of a K-quant artifact can be served with the
-/// current switches.
+/// Whether `LUMEN_CUDA_KQUANT` leaves the K-quant kernels on. The layer-plane refusal
+/// scopes it on a K-quant artifact; the embedding refusal reads it under any header.
 pub(crate) fn kquant_planes_servable() -> bool {
     crate::runtime_defaults::cuda_kquant_enabled()
 }
@@ -883,8 +883,9 @@ pub(crate) fn kquant_plane_counters() -> &'static KquantPlaneCounters {
 /// Refuse the K-quant planes of a K-quant artifact (LBC header scheme Q4_K,
 /// Q5_K or Q6_K) when `LUMEN_CUDA_KQUANT=0` switched the general K-quant
 /// kernels off; a group that failed to load is refused at preload instead.
-/// A Q4_0/Q8_0/BF16 artifact keeps its occasional K-quant plane on the F32
-/// host-dequant path as before; Q2_K, Q3_K and Q5_0 planes are never refused.
+/// A Q4_0/Q8_0/BF16 artifact keeps each K-quant layer plane on the route it already had —
+/// the F32 host-dequant catch-all below, or, for a source-fidelity Q5_K `ssm_out`, its
+/// F16 image and four split planes; Q2_K, Q3_K and Q5_0 planes are never refused.
 pub(crate) fn validate_kquant_planes(
     layer: usize,
     subs: &lumen_format::index::SubtensorOffsets,
@@ -952,9 +953,9 @@ pub fn upload_layer_weights(
     let layer = weights.layer_idx;
 
     validate_layer_slices(layer, subs)?;
-    // the artifact's primary scheme is the LBC header's, recorded by the loader before any
-    // layer is uploaded (`set_model_primary_quant`, read back by `model_dense_quant`); a legacy caller that never set it is not
-    // a K-quant artifact
+    // the artifact's primary scheme is the LBC header's, recorded by the loader before any layer is
+    // uploaded (`set_model_primary_quant`, read back by `model_dense_quant`); a legacy caller that
+    // never set it is not a K-quant artifact
     validate_kquant_planes(
         layer,
         subs,
@@ -1928,9 +1929,17 @@ mod tests {
     /// matches the plane's own stored scheme whatever the LBC header carries, so a
     /// Q4_K / Q5_K / Q6_K embedding preserved under a requantised header — what
     /// `--requant q8_0` of a K-quant source writes — reaches the same gather as a
-    /// K-quant artifact's and the switch has to reach it too.
+    /// K-quant artifact's and the switch has to reach it too. With the switch on the
+    /// loop pins that every K-quant embedding is served under every header; the
+    /// switch-off case is the run that fails if the refusal is re-scoped on the
+    /// header, and `ci.yml` runs this test a second time with `LUMEN_CUDA_KQUANT=0`.
     #[test]
     fn kquant_embedding_refusal_follows_the_switch_whatever_the_header() {
+        // Writes the process-wide primary-quant atomic and reads the process
+        // env: the crate-wide lock keeps both out of the other tests' view.
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for header in [
             QuantScheme::Q8_0,
             QuantScheme::Q4_0,
@@ -1951,6 +1960,7 @@ mod tests {
                 assert!(validate_kquant_embedding(q).is_ok());
             }
         }
+        crate::runtime_defaults::reset_for_tests();
     }
 
     /// The fit check bills two bytes per element of the slots that get a

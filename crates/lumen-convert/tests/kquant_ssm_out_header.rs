@@ -16,9 +16,12 @@
 //! (release commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway
 //! worktree and hashing the `ssm_out` plane of its artifact; the fixture GGUF hashes
 //! the same on both trees, which is the cross-check that the transcription did not
-//! drift. The pins are on the plane, not on the whole artifact: a K-quant source keeps
-//! its embedding under a requant header, so its artifact is not byte-identical to
-//! 0.31.0's by design.
+//! drift. The pins are on the plane, not on the whole artifact: 0.31.0 requantised
+//! this source's F32 GDN gates to Q8_0 unless `--dequantize` was given, and the
+//! branch keeps them F32, so its two `--requant` artifacts differ from 0.31.0's in
+//! `ssm_alpha` / `ssm_beta` alone, its default artifact differs in its header scheme
+//! and `ssm_out` as well, and only its `--dequantize` artifact is byte-identical.
+//! The embedding and head are Q8_0 here and match 0.31.0's on every route.
 //!
 //! The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and
 //! unchanged — it keeps only the Q5_K and Q8_0 `ssm_out` 0.31.0 kept, both of which

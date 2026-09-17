@@ -202,27 +202,27 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// (on a dense GDN file layer 0 has no `attn_q`, so the converter's scheme detection reads
 /// `blk.0.ffn_gate`), and that artifact is plane for plane a Q8_0 one. CUDA therefore scopes its
 /// K-quant-only behaviour on this predicate AND on the artifact's own planes: the native plane
-/// upload on each plane's stored scheme, and the raw-plane release after the Q8 split clone, the
-/// load-time refusals and the K-quant receipts on [`kquant_planes_present`], the loader's census
-/// of the schemes the planes are stored in — so an artifact without an as-stored K-quant plane
-/// keeps its kernels of record, its planes and its memory. A K-quant source converted with
-/// `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
-/// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is re-
-/// quantised either way; its `ssm_out` is the one 0.31.0 wrote, because the layer arms are the
-/// header-scoped ones while the embedding and head arms read a plane's own scheme whatever the
-/// header says; and a plane the runtime does not serve at that geometry — a Q6_K head whose row
-/// width is not whole superblocks, an embedding stored as some plane other than the one the
-/// header's vocab x hidden needs, an `ssm_out` whose GDN width is not whole blocks for its
-/// scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads — is
-/// converted as 0.31.0 converted it): CUDA serves each preserved plane through its own scheme's
-/// arm, and a missing kernel group is then reported at the first token instead of at load.
+/// upload on each plane's stored scheme, and the raw-plane release after the Q8 split clone and the
+/// K-quant receipts on [`kquant_planes_present`], the loader's census of the schemes the planes are
+/// stored in — so an artifact without an as-stored K-quant plane keeps its kernels of record, its
+/// planes and its memory. A K-quant source converted with `--requant q8_0` keeps its K-quant
+/// embedding and a `Q6_K` head under a Q8_0 header (`--requant q4_0` keeps the embedding and
+/// re-quantises the head; a Q4_K / Q5_K head is re-quantised either way; its `ssm_out` is the one
+/// 0.31.0 wrote, because the layer arms are the header-scoped ones while the embedding and head
+/// arms read a plane's own scheme whatever the header says; and a plane the runtime does not serve
+/// at that geometry — a Q6_K head whose row width is not whole superblocks, an embedding stored as
+/// some plane other than the one the header's vocab x hidden needs, an `ssm_out` whose GDN width is
+/// not whole blocks for its scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the
+/// projection reads — is converted as 0.31.0 converted it): CUDA serves each preserved plane
+/// through its own scheme's arm, and a missing kernel group is then
+/// reported at the first token instead of at load.
 pub fn kquant_artifact() -> bool {
     model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
 }
 
 /// Whether the artifact both declares a K-quant primary scheme in its header and
-/// actually CARRIES an as-stored K-quant plane — the predicate CUDA's K-quant-only
-/// routes, load refusals and receipts are scoped on. `header` is
+/// actually CARRIES an as-stored K-quant plane — the predicate the raw-plane release
+/// after the Q8 split clone and the K-quant receipts are scoped on. `header` is
 /// [`model_dense_quant`]'s value, `embedding` and `output_head` the two globals'
 /// stored schemes, and `any_layer_plane` whether any layer slice of non-zero length
 /// is stored in one of the three superblock schemes (the loader's census, taken while

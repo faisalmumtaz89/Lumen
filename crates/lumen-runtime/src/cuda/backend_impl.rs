@@ -2306,7 +2306,8 @@ impl CudaBackend {
         };
 
         // Dispatch embed kernel based on embedding precision.
-        // Order: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32. BF16 added for the Qwen3.5-9B BF16 path.
+        // Order: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32.
+        // BF16 added for the Qwen3.5-9B BF16 path.
         if let Some(ref emb_bf16) = st.globals.embedding_bf16 {
             let func = self.embed_bf16_func.as_ref().ok_or_else(|| {
                 RuntimeError::Compute("embed_token_bf16 kernel not compiled".into())
@@ -19000,7 +19001,8 @@ impl ComputeBackend for CudaBackend {
             };
 
             // Dispatch embed kernel based on embedding precision.
-            // Order: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32 (mirror embed_token_gpu).
+            // Order (mirror embed_token_gpu): BF16 > F16 > K-quant
+            // (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32.
             if let Some(ref emb_bf16) = st.globals.embedding_bf16 {
                 let func = self.embed_bf16_func.as_ref().ok_or_else(|| {
                     RuntimeError::Compute("embed_token_bf16 kernel not compiled".into())
