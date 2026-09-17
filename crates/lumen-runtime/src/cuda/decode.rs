@@ -118,10 +118,13 @@ fn load_kquant_kernels(
             Some(k)
         }
         Err(e) => {
-            // printed on a K-quant artifact, where the loader refuses and names this
-            // line; behind `LUMEN_CUDA_VERBOSE` otherwise — an artifact whose header
-            // is not K-quant can still carry a preserved K-quant embedding, and a
-            // missing group is then reported at the first token
+            // printed when the header says K-quant, the one case where the loader can
+            // refuse and name this line; behind `LUMEN_CUDA_VERBOSE` otherwise — an
+            // artifact whose header is not K-quant can still carry a preserved K-quant
+            // embedding, and a missing group is then reported at the first token. The
+            // kernels load before any plane is read, so this line cannot wait for the
+            // loader's plane census: a K-quant header over Q8_0 planes prints it and is
+            // not refused, the census having found nothing the group serves
             if crate::runtime_defaults::kquant_artifact() {
                 eprintln!("[CUDA] kquant {tag}: FAILED: {e}");
             } else {

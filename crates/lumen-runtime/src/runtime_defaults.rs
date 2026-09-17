@@ -193,23 +193,51 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     }
 }
 
-/// Whether the artifact being served is a K-quant artifact: its header scheme
-/// (`set_model_primary_quant`, recorded by `lumen run` / `lumen-server` before the
-/// backend loads a layer) is Q4_K, Q5_K or Q6_K — the scheme a K-quant source's
-/// conversion stamps. CUDA scopes its K-quant-only behaviour on it (the native plane
-/// upload, the raw-plane release after the Q8 split clone, the load-time kernel-group
-/// refusal), so every other artifact keeps its kernels of record. A K-quant source converted
-/// with `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
-/// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is
-/// re-quantised either way; a plane the runtime does not serve at that geometry — a Q6_K head
-/// whose row width is not whole superblocks, an embedding stored as some plane other than
-/// the one the header's vocab x hidden needs, an `ssm_out` whose GDN width is not whole
-/// blocks for its scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the
-/// projection reads — is converted as 0.31.0 converted it): CUDA serves each preserved
-/// plane through its own scheme's arm, and a missing kernel group is then reported at the
-/// first token instead of at load.
+/// Whether the artifact's HEADER carries a K-quant primary scheme: the scheme recorded by
+/// `set_model_primary_quant` (`lumen run` / `lumen-server`, before the backend loads a layer) is
+/// Q4_K, Q5_K or Q6_K — the scheme a K-quant source's conversion stamps. It is a statement about
+/// the header alone, and a K-quant header does not by itself mean a K-quant plane is present: a
+/// `--target metal` conversion of a K-quant source upcasts every K-quant layer plane to Q8_0,
+/// dequantises the embedding and re-quantises the head, yet still takes a K-quant primary scheme
+/// (on a dense GDN file layer 0 has no `attn_q`, so the converter's scheme detection reads
+/// `blk.0.ffn_gate`), and that artifact is plane for plane a Q8_0 one. CUDA therefore scopes its
+/// K-quant-only behaviour on this predicate AND on the artifact's own planes: the native plane
+/// upload on each plane's stored scheme, and the raw-plane release after the Q8 split clone, the
+/// load-time refusals and the K-quant receipts on [`kquant_planes_present`], the loader's census
+/// of the schemes the planes are stored in — so an artifact without an as-stored K-quant plane
+/// keeps its kernels of record, its planes and its memory. A K-quant source converted with
+/// `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
+/// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is re-
+/// quantised either way; a plane the runtime does not serve at that geometry — a Q6_K head whose
+/// row width is not whole superblocks, an embedding stored as some plane other than the one the
+/// header's vocab x hidden needs, an `ssm_out` whose GDN width is not whole blocks for its
+/// scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads — is
+/// converted as 0.31.0 converted it): CUDA serves each preserved plane through its own scheme's
+/// arm, and a missing kernel group is then reported at the first token instead of at load.
 pub fn kquant_artifact() -> bool {
     model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
+}
+
+/// Whether the artifact both declares a K-quant primary scheme in its header and
+/// actually CARRIES an as-stored K-quant plane — the predicate CUDA's K-quant-only
+/// routes, load refusals and receipts are scoped on. `header` is
+/// [`model_dense_quant`]'s value, `embedding` and `output_head` the two globals'
+/// stored schemes, and `any_layer_plane` whether any layer slice of non-zero length
+/// is stored in one of the three superblock schemes (the loader's census, taken while
+/// it walks the layers it is uploading anyway). A K-quant header over Q8_0 / F32
+/// planes — what a `--target metal` conversion of a K-quant source produces — is
+/// false, and so is a preserved K-quant plane under a Q8_0 / Q4_0 / F32 header
+/// (`--requant` / `--dequantize`), which keeps 0.31.0's scoping rule.
+pub fn kquant_planes_present(
+    header: Option<QuantScheme>,
+    embedding: QuantScheme,
+    output_head: QuantScheme,
+    any_layer_plane: bool,
+) -> bool {
+    header.is_some_and(|q| q.is_kquant_superblock())
+        && (any_layer_plane
+            || embedding.is_kquant_superblock()
+            || output_head.is_kquant_superblock())
 }
 
 /// Public diagnostic wrapper over `model_dense_quant` for the
@@ -989,8 +1017,9 @@ pub(crate) fn q8_proj_mmq_enabled() -> bool {
 /// directly — `LUMEN_CUDA_Q8_PROJ_MMQ` set at all (the residual site keys on the
 /// variable's presence) or a MoE model — and under the rollback switch
 /// `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`. The artifact scoping is the call site's, not this
-/// accessor's: only a K-quant artifact releases (`cuda::backend_impl`, under
-/// `kquant_artifact()`); the Q4_0 / Q8_0 / BF16 cells keep both copies as shipped.
+/// accessor's: only an artifact that carries an as-stored K-quant plane releases
+/// (`cuda::backend_impl`, under `kquant_artifact()` and the loader's plane census);
+/// an artifact whose planes are Q4_0 / Q8_0 / BF16 keeps both copies as shipped.
 pub fn q8_split_release_raw_enabled() -> bool {
     if matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW"), Ok(v) if v == "1") {
         return false;
@@ -2761,7 +2790,7 @@ mod fixed_horizon_bench_tests {
     /// The accessor is the policy half of the release predicate: with the switches clear it
     /// allows the release; the rollback switch, a MoE model, and any prefill route that reads
     /// the raw bytes directly (`LUMEN_CUDA_Q8_PROJ_MMQ` present at all) refuse it. The artifact
-    /// half — only a K-quant artifact releases — is the call site's
+    /// half — only an artifact carrying a K-quant plane releases — is the call site's
     /// (`cuda::backend_impl::preload_weights`).
     #[test]
     fn q8_split_raw_release_default_and_switches() {
@@ -2987,6 +3016,29 @@ mod tests {
                 "primary scheme must round-trip for {scheme:?}"
             );
         }
+    }
+
+    /// The header alone does not scope CUDA's K-quant routes: a `--target metal`
+    /// conversion of a K-quant source keeps a K-quant primary scheme over Q8_0 / F32
+    /// planes, and the predicate must be false for it; a preserved K-quant plane under
+    /// a requantised header stays out of scope, as in 0.31.0.
+    #[test]
+    fn kquant_planes_present_needs_a_plane_not_just_the_header() {
+        use QuantScheme::{F32, Q4_0, Q4_K, Q6_K, Q8_0};
+        // the `--target metal` artifact of a K-quant source: K-quant header, no plane
+        assert!(!kquant_planes_present(Some(Q4_K), F32, Q8_0, false));
+        // the registry cells: a K-quant layer plane, and the two globals besides
+        assert!(kquant_planes_present(Some(Q4_K), Q4_K, Q6_K, true));
+        assert!(kquant_planes_present(Some(Q4_K), F32, Q8_0, true));
+        assert!(kquant_planes_present(Some(Q4_K), Q4_K, Q8_0, false));
+        assert!(kquant_planes_present(Some(Q4_K), F32, Q6_K, false));
+        // the scoping rule of `kquant_artifact`: a preserved K-quant plane under a
+        // requantised or dequantised header is served exactly as 0.31.0 served it
+        assert!(!kquant_planes_present(Some(Q8_0), Q4_K, Q6_K, true));
+        assert!(!kquant_planes_present(Some(Q4_0), Q4_K, Q6_K, true));
+        assert!(!kquant_planes_present(Some(F32), Q4_K, Q6_K, true));
+        // a legacy caller that never recorded a header scheme
+        assert!(!kquant_planes_present(None, Q4_K, Q6_K, true));
     }
 
     #[test]

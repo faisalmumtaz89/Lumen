@@ -1,6 +1,6 @@
 //! What a K-quant source preserves by default has to be the plane the runtime reads.
 //! The GDN gate projections read `ssm_alpha` / `ssm_beta` at `num_v_heads x hidden`
-//! and refuse a buffer shorter than that at the first token; a gate stored at any
+//! and refuse an F32 gate shorter than that at the first token; a gate stored at any
 //! other extent is not the plane the projection reads. Either way the conversion takes
 //! the Q8_0 gate 0.31.0's default wrote for it rather than keeping the F32 plane. The
 //! explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and unchanged

@@ -31,8 +31,9 @@
 // folded by the final warp reduction. Q6_K is the one scheme where the
 // thread-per-group body of the Q4_K/Q5_K kernels loses: its 210-byte
 // superblock is only 2-byte aligned, so that body's per-thread 16-bit loads
-// leave the kernel issue-bound; the warp-per-row body streams the weight
-// faster than the Q4_0 kernel. Alignment: alternate superblocks start 2 mod 4,
+// leave the kernel issue-bound; the warp-per-row body streams the weight at
+// 1.1-1.3x the Q4_0 kernel's bytes per second on the 27B plane shapes (sm_80,
+// same-batch comparator). Alignment: alternate superblocks start 2 mod 4,
 // so the word loads go through `q6k_load_u32` (a warp-uniform branch: one
 // 32-bit load when the address is 4-byte aligned, two 16-bit loads otherwise).
 //

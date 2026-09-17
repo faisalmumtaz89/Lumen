@@ -539,8 +539,9 @@ fn do_convert_from_reader<R: Read + Seek>(
         // stores is the one the header's vocab x hidden needs (as F32 it would be 5-7x
         // its size on the device; the CUDA K-quant path has the row-gather). Any other
         // Q4_K / Q5_K / Q6_K embedding is dequantised to F32 below, and so is a tied
-        // one: without `output.weight` the head shares this plane and would take its
-        // scheme, and no target carries a Q4_K / Q5_K head.
+        // one: without `output.weight` the head shares this plane and its scheme, and
+        // the head arm — where a Q6_K head's servability is decided and a Q4_K / Q5_K
+        // head requantised — never runs for a tied source.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
             if kquant_source()
                 && kquant_embedding_servable

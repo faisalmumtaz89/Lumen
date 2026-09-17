@@ -5101,6 +5101,9 @@ impl CudaBackend {
                         GpuWeightBuf::Q8Aligned(_) => "Q8Aligned",
                         GpuWeightBuf::Q4Raw(_) => "Q4Raw",
                         GpuWeightBuf::Q4Aligned(_) => "Q4Aligned",
+                        GpuWeightBuf::Q4KRaw(_) => "Q4KRaw",
+                        GpuWeightBuf::Q5KRaw(_) => "Q5KRaw",
+                        GpuWeightBuf::Q6KRaw(_) => "Q6KRaw",
                         _ => "other",
                     };
                     eprintln!(
@@ -20606,16 +20609,31 @@ impl ComputeBackend for CudaBackend {
         })?;
 
         let mut cache = Vec::with_capacity(num_layers);
+        // Does this artifact CARRY an as-stored K-quant plane? Taken on the layer views
+        // the upload loop reads anyway, so it costs no extra read; the two globals are
+        // known from the header. Scopes the raw-plane release and the K-quant receipts
+        // below, which a K-quant HEADER alone must not turn on (see
+        // `runtime_defaults::kquant_planes_present`).
+        let mut any_kquant_layer_plane = false;
 
         // A K-quant artifact needs the kernel group of every K-quant scheme its planes
-        // carry: refused here, before a layer plane is uploaded, rather than at the first
-        // token after the whole model is resident. The failed group's NVRTC error was printed
-        // at kernel load.
+        // carry, and the Q8_1 activation quantizer every K-quant plane's decode matvec
+        // reads its input from: refused here, before a layer plane is uploaded, rather
+        // than at the first token after the whole model is resident. The failed group's
+        // NVRTC error was printed at kernel load. Both refusals are scoped on the census
+        // below, not on the header alone — a `--target metal` conversion of a K-quant
+        // source keeps a K-quant primary scheme over Q8_0 / F32 planes (see
+        // `runtime_defaults::kquant_artifact`), and such an artifact needs neither.
         if crate::runtime_defaults::kquant_artifact()
             && super::gpu_buffers::kquant_planes_servable()
-            && (st.kernels.kq4.is_none() || st.kernels.kq5.is_none() || st.kernels.kq6.is_none())
+            && (st.kernels.kq4.is_none()
+                || st.kernels.kq5.is_none()
+                || st.kernels.kq6.is_none()
+                || st.kernels.quantize_f32_to_q8_1.is_none()
+                || st.scratch.input_q8_1.is_none())
         {
-            // only when a group is missing: the layer reads below fetch the payload
+            // only when something a K-quant plane would need is missing: the layer reads
+            // below fetch the payload
             let mut needed = [false; 3];
             let mut note = |q: QuantScheme| match q {
                 QuantScheme::Q4_K => needed[0] = true,
@@ -20650,21 +20668,21 @@ impl ComputeBackend for CudaBackend {
                     )));
                 }
             }
-        }
-        // a K-quant layer plane's decode matvec reads its activation from the Q8_1 scratch,
-        // and every route that fills it for one needs `quantize_f32_to_q8_1` (a kernel
-        // compiled for compute_80): the QKV, FFN and GDN pre-quantized groups are gated on
-        // it, fused RMSNorm-to-Q8_1 variant included
-        if crate::runtime_defaults::kquant_artifact()
-            && super::gpu_buffers::kquant_planes_servable()
-            && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())
-        {
-            return Err(RuntimeError::Compute(
-                "CUDA: this is a K-quant artifact and the Q8_1 activation quantizer \
-                 (`quantize_f32_to_q8_1`) or its scratch is unavailable on this device; \
-                 refused at load rather than at the first token"
-                    .into(),
-            ));
+            // a K-quant plane's decode matvec reads its activation from the Q8_1 scratch,
+            // and every route that fills it for one needs `quantize_f32_to_q8_1` (a kernel
+            // compiled for compute_80): the QKV, FFN and GDN pre-quantized groups are gated
+            // on it, fused RMSNorm-to-Q8_1 variant included. `needed` is the census: no
+            // K-quant plane, nothing to quantise an activation for.
+            if needed.iter().any(|&n| n)
+                && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())
+            {
+                return Err(RuntimeError::Compute(
+                    "CUDA: this is a K-quant artifact and the Q8_1 activation quantizer \
+                     (`quantize_f32_to_q8_1`) or its scratch is unavailable on this device; \
+                     refused at load rather than at the first token"
+                        .into(),
+                ));
+            }
         }
         if crate::runtime_defaults::kquant_artifact()
             && self.output_proj_quant == QuantScheme::Q6_K
@@ -20696,6 +20714,11 @@ impl ComputeBackend for CudaBackend {
                     layer_idx, e,
                 ))
             })?;
+            any_kquant_layer_plane |= layer_view
+                .subtensors
+                .named_slices()
+                .iter()
+                .any(|(_, s)| s.length > 0 && s.quant.is_kquant_superblock());
             // Fail fast on the FIRST layer that will keep a raw Ct4 tensor,
             // before the multi-GB upload: Ct4 decode needs its kernel trio +
             // Q8_1 scratch, and those load failures (e.g. no SM80 dp4a) are
@@ -21021,6 +21044,14 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
+        // The census is complete once every layer has been read.
+        let kquant_planes = crate::runtime_defaults::kquant_planes_present(
+            crate::runtime_defaults::model_dense_quant(),
+            self.embedding_quant,
+            self.output_proj_quant,
+            any_kquant_layer_plane,
+        );
+
         let has_gdn = cache.iter().any(|lw| lw.layer_type == 1);
 
         // split-layout integration: Q8_0 per-row split (SoA) clone pass.
@@ -21064,16 +21095,19 @@ impl ComputeBackend for CudaBackend {
                     /// Every route that could read the raw plane reads the split layout
                     /// instead: free it, and print the byte-sum receipt.
                     Release,
-                    /// Keep both copies and print nothing: an existing Q4_0 / Q8_0 / BF16
-                    /// cell, whose receipts stay exactly as shipped.
+                    /// Keep both copies and print nothing: an artifact whose planes are
+                    /// Q4_0 / Q8_0 / BF16, whose receipts stay exactly as shipped.
                     KeepSilently,
                     /// Keep both copies, and print why.
                     Keep(&'static str),
                 }
-                let raw_plane_release = if !crate::runtime_defaults::kquant_artifact() {
-                    // The plan freezes the existing Q4_0 / Q8_0 / BF16 cells: their planes,
-                    // routes and memory stay as shipped. The release is a K-quant-artifact
-                    // rule, like the native K-quant planes themselves.
+                let raw_plane_release = if !kquant_planes {
+                    // The plan freezes every artifact whose planes are Q4_0 / Q8_0 / BF16:
+                    // their planes, routes and memory stay as shipped. The release is a
+                    // rule for an artifact that CARRIES a K-quant plane, like the native
+                    // K-quant planes themselves — a K-quant header over Q8_0 planes (a
+                    // `--target metal` conversion of a K-quant source) is such a frozen
+                    // artifact, not a K-quant one.
                     RawPlaneRelease::KeepSilently
                 } else if !crate::runtime_defaults::q8_split_release_raw_enabled() {
                     RawPlaneRelease::Keep("policy: MMQ prefill or LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1")
@@ -21603,7 +21637,7 @@ impl ComputeBackend for CudaBackend {
             eprintln!("[CUDA] BF16 autotune SKIPPED (LUMEN_CUDA_BF16_AUTOTUNE=0); using DEFAULT_TENSOR_OP");
         }
 
-        if crate::runtime_defaults::kquant_artifact() || super::decode::cuda_verbose() {
+        if kquant_planes || super::decode::cuda_verbose() {
             eprintln!(
                 "{}; embedding {:?}; output head {:?}",
                 super::gpu_buffers::kquant_plane_counters().report_line(),
