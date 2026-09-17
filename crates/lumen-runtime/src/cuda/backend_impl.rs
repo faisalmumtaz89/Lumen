@@ -15304,9 +15304,9 @@ unsafe fn launch_matvec_preq8_1_residual_split(
 /// Produces a buffer of `out_dim * nb * 34` bytes (same density as Q8Raw,
 /// reorganized as `[scale[nb] | quant[nb]]` per row). The source buffer is
 /// read by reference and preserved; whether the caller keeps the original
-/// Q8Raw beside the split copy is the caller's decision (a K-quant artifact
-/// releases it once every route reads the split layout; every other artifact
-/// keeps it for the prefill HGEMM path).
+/// Q8Raw beside the split copy is the caller's decision (an artifact that
+/// carries an as-stored K-quant plane releases it once every route reads the
+/// split layout; every other artifact keeps it for the prefill HGEMM path).
 ///
 /// # Safety
 ///

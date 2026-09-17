@@ -61,14 +61,14 @@ pub enum GpuWeightBuf {
     /// Produced by `repack_q8_raw_to_split()` in the split-clone pass and consumed
     /// by `matvec_q8_split_q8_1` / `_residual` on decode. The pass stores the split
     /// plane behind an `Arc` in the layer's `q8_split_*` slot (the decode dispatch
-    /// keys on those slots) and, on a K-quant artifact where every route that could
-    /// read the plane can read the split layout instead, moves the base slot to this
-    /// variant over the same `Arc` and releases the raw plane — a Q8_0 plane is
-    /// then resident once, in the split layout. A Q4_0 / Q8_0 / BF16 artifact keeps
-    /// both copies as shipped; the whole predicate is the ladder in
-    /// `backend_impl::preload_weights`. The prefill serves this variant
-    /// with `dequant_q8_split_to_f16` / `_to_f32` (a tile bit-identical to the raw
-    /// dequant) on its usual dequant -> GEMM route.
+    /// keys on those slots) and, on an artifact that carries an as-stored K-quant
+    /// plane, where every route that could read the plane can read the split layout
+    /// instead, moves the base slot to this variant over the same `Arc` and releases
+    /// the raw plane — a Q8_0 plane is then resident once, in the split layout. An
+    /// artifact whose planes are Q4_0 / Q8_0 / BF16 keeps both copies as shipped;
+    /// the whole predicate is the ladder in `backend_impl::preload_weights`. The
+    /// prefill serves this variant with `dequant_q8_split_to_f16` / `_to_f32` (a
+    /// tile bit-identical to the raw dequant) on its usual dequant -> GEMM route.
     Q8Split(std::sync::Arc<CudaSlice<u8>>),
     /// Repacked Q4_0 in per-row split (SoA) layout: each row holds
     /// `[f16 scale * nb][nibble[16] * nb]` for a total of 18*nb bytes
@@ -144,15 +144,15 @@ pub struct LayerWeightsGpu {
     /// Populated by `repack_all_layers_q8_clone_to_split()` when
     /// `LUMEN_CUDA_Q8_SPLIT=1` is set at session start. Holds the same elements
     /// as the parallel `wq`/`wk`/etc. buffer but reorganized as `[scales][quants]`
-    /// per row to enable native `int*` loads in `matvec_q8_split_q8_1`. The
-    /// original AoS buffer is kept on every Q4_0 / Q8_0 / BF16 artifact (the plan
-    /// freezes those cells) and, on a K-quant artifact, whenever a route still needs
-    /// those bytes (`LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`, a MoE model, `LUMEN_CUDA_Q8_PROJ_MMQ`
-    /// set, the conv-state parity reprojection, or a split kernel / the Q8_1 quantizer /
-    /// its scratch that did not load — the ladder in `backend_impl::preload_weights` is
-    /// the whole predicate); otherwise the base slot is replaced by `GpuWeightBuf::Q8Split`
-    /// over the same allocation, and prefill reads the split layout. Decode dispatch
-    /// prefers these siblings when present.
+    /// per row to enable native `int*` loads in `matvec_q8_split_q8_1`. The original AoS
+    /// buffer is kept on every artifact whose planes are Q4_0 / Q8_0 / BF16 (the plan
+    /// freezes those cells) and, on one that carries an as-stored K-quant plane, whenever
+    /// a route still needs those bytes (`LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`, a MoE model,
+    /// `LUMEN_CUDA_Q8_PROJ_MMQ` set, the conv-state parity reprojection, or a split
+    /// kernel / the Q8_1 quantizer / its scratch that did not load — the ladder in
+    /// `backend_impl::preload_weights` is the whole predicate); otherwise the base slot
+    /// is replaced by `GpuWeightBuf::Q8Split` over the same allocation, and prefill reads
+    /// the split layout. Decode dispatch prefers these siblings when present.
     pub q8_split_wq: Option<std::sync::Arc<CudaSlice<u8>>>,
     pub q8_split_wk: Option<std::sync::Arc<CudaSlice<u8>>>,
     pub q8_split_wv: Option<std::sync::Arc<CudaSlice<u8>>>,

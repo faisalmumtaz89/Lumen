@@ -92,11 +92,15 @@ impl Drop for KquantSourceScope {
 /// tensor-type index before any tensor data is read: `Some` when a planned
 /// dense FFN projection is Q4_K, Q5_K or Q6_K, carrying the K-quant scheme
 /// with the most planned layer planes (Q4_K for a Q4_K_M file, Q5_K for a
-/// Q5_K_M file) — the LBC header's primary scheme. Planned = the tensor the
-/// dense planner reads for a layer below `num_layers` (the MTP `nextn` layer is
-/// excluded by the layer count), resolved through that planner's own lookup.
-/// `ffn_gate` / `ffn_up` / `ffn_down` are the dense converter's names, so the
-/// caller applies its result only to the architecture that planner serves.
+/// Q5_K_M file) — the LBC header's primary scheme. Planned = the tensor
+/// `find_tensor` resolves for the canonical `blk.<layer>.<suffix>` name below
+/// `num_layers` (the MTP `nextn` layer is excluded by the layer count), which
+/// is the dense planner's own lookup by name: it excludes a non-canonical
+/// spelling and a duplicate of a canonical name, but not the layer KIND — a
+/// file that carried both `attn_qkv` and `attn_q` at one layer would count a
+/// name the planner does not read there (no exporter writes one). `ffn_gate` /
+/// `ffn_up` / `ffn_down` are the dense converter's names, so the caller
+/// applies its result only to the architecture that planner serves.
 pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
     const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
     const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];
@@ -115,8 +119,8 @@ pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<Q
         if l >= num_layers {
             continue;
         }
-        // Count only the tensor the planner will read for this layer and suffix:
-        // it builds the name with `layer_tensor_name` and takes `find_tensor`'s
+        // Count only the tensor `find_tensor` resolves for this layer and suffix:
+        // the planner builds the same name with `layer_tensor_name` and takes the
         // first match, so a non-canonical spelling (`blk.00.ffn_gate.weight`) or a
         // second tensor of the same name is never planned, and must not decide a
         // scheme the planes do not have.

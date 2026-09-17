@@ -3033,7 +3033,7 @@ mod tests {
         assert!(kquant_planes_present(Some(Q4_K), Q4_K, Q8_0, false));
         assert!(kquant_planes_present(Some(Q4_K), F32, Q6_K, false));
         // the scoping rule of `kquant_artifact`: a preserved K-quant plane under a
-        // requantised or dequantised header is served exactly as 0.31.0 served it
+        // requantised or dequantised header is out of scope — 0.31.0's header rule
         assert!(!kquant_planes_present(Some(Q8_0), Q4_K, Q6_K, true));
         assert!(!kquant_planes_present(Some(Q4_0), Q4_K, Q6_K, true));
         assert!(!kquant_planes_present(Some(F32), Q4_K, Q6_K, true));
