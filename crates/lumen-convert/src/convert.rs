@@ -17,9 +17,11 @@ use crate::dequant::*;
 /// reference engine reads from the same file.
 ///
 /// A K-quant source conversion ([`kquant_source`]) takes this policy without the
-/// flag: none of its planes has a requantised form a runtime kernel serves better
-/// than the source bytes, so its default conversion and its fidelity conversion are
-/// the same file.
+/// flag: none of the Q4_K / Q5_K / Q6_K planes it carries — its layer planes, its
+/// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
+/// better than the source bytes, so its default conversion and its fidelity conversion
+/// are the same file. A Q4_K / Q5_K head is not among them: the runtime has a Q6_K
+/// head kernel and no Q4_K / Q5_K one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
     kquant_source()
         || matches!(
@@ -163,7 +165,7 @@ pub struct ConvertOptions {
     /// If true, dequantize quantized layer tensors to F32. A kept `ssm_out` keeps its
     /// stored scheme (the Q8_0 floor otherwise) and, on a K-quant source conversion, so
     /// does a preserved `Q6_K` head. A K-quant embedding is dequantised (every other
-    /// embedding is kept as stored, as without the flag), so such an artifact keeps
+    /// embedding is handled exactly as without the flag), so such an artifact keeps
     /// LBC version 4. Produces larger files but compatible with the naive F32
     /// backend.
     pub dequantize_to_f32: bool,

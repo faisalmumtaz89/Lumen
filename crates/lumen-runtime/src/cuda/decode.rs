@@ -714,8 +714,9 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_ct4_residual_t192: Option<CudaFunction>,
     pub(crate) dequant_ct4_to_f16: Option<CudaFunction>,
     /// General K-quant kernels, one group per scheme (`load_fn_dp4a`, so
-    /// `compute_61`-first and no fast-math). `None` when the scheme's source
-    /// is not in this build or a kernel failed to load.
+    /// `compute_61`-first and no fast-math). `None` when the group did not load on this
+    /// device: no dp4a NVRTC target, a declared geometry the loader could not read or
+    /// launch, or a kernel that failed to compile or load.
     pub(crate) kq4: Option<KquantKernels>,
     pub(crate) kq5: Option<KquantKernels>,
     pub(crate) kq6: Option<KquantKernels>,

@@ -30,7 +30,7 @@
 // reduction. The small CTA: at in_dim 5120 a row has 160 sub-blocks, so a
 // 256-thread CTA idles 96 threads and the 4-row group re-reads the activation
 // for a quarter of the work; 64 threads keep every lane busy at every in_dim
-// the 27B has (5120, 10240, 17408). Alignment: the superblock is 144 bytes, so
+// the 27B has (5120, 6144, 17408). Alignment: the superblock is 144 bytes, so
 // with a 256-byte cudaMalloc base every superblock, its 16-byte header and
 // every 32-byte nibble pair are 16-byte aligned.
 //

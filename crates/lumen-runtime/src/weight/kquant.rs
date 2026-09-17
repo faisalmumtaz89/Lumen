@@ -2,7 +2,8 @@
 //! providers (the F32 copy of a K-quant embedding or output head) and the CUDA backend
 //! (the layer host-dequant catch-all, the Q5_K `ssm_out` plane build of a non-K-quant
 //! artifact, the `LUMEN_CUDA_Q6K_HEAD=0` head fallback, and the reference the K-quant
-//! kernels are held bit-identical to).
+//! kernels are held to — bit-identically for the F16 dequant tiles and the embedding
+//! gathers, within a tolerance for the matvecs).
 
 use crate::error::RuntimeError;
 use lumen_format::quantization::QuantScheme;
@@ -92,11 +93,10 @@ pub fn dequant_kquant_to_f32(
         QuantScheme::Q6_K => {
             // Q6_K: 256 elements per block, 210 bytes per block.
             // Layout: [128B ql, 64B qh, 16B scales, 2B f16_d]
-            let block_size = 210;
-            let n_blocks = raw.len() / block_size;
+            let n_blocks = raw.len() / block_bytes;
             let mut written = 0usize;
             for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
+                let bp = &raw[b * block_bytes..];
                 let ql = &bp[0..128];
                 let qh = &bp[128..192];
                 let scales = &bp[192..208];
@@ -165,11 +165,10 @@ pub fn dequant_kquant_to_f32(
         QuantScheme::Q4_K => {
             // Q4_K: 256 elements per block, 144 bytes per block.
             // Layout: [2B f16 d, 2B f16 dmin, 12B scales, 128B qs]
-            let block_size = 144;
-            let n_blocks = raw.len() / block_size;
+            let n_blocks = raw.len() / block_bytes;
             let mut written = 0usize;
             for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
+                let bp = &raw[b * block_bytes..];
                 let d = host_f16_to_f32(u16::from_le_bytes([bp[0], bp[1]]));
                 let dmin = host_f16_to_f32(u16::from_le_bytes([bp[2], bp[3]]));
                 let (sc, m_arr) = decode_k_scales(&bp[4..16]);
@@ -206,11 +205,10 @@ pub fn dequant_kquant_to_f32(
         QuantScheme::Q5_K => {
             // Q5_K: 256 elements per block, 176 bytes per block.
             // Layout: [2B f16 d, 2B f16 dmin, 12B scales, 32B qh, 128B qs]
-            let block_size = 176;
-            let n_blocks = raw.len() / block_size;
+            let n_blocks = raw.len() / block_bytes;
             let mut written = 0usize;
             for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
+                let bp = &raw[b * block_bytes..];
                 let d = host_f16_to_f32(u16::from_le_bytes([bp[0], bp[1]]));
                 let dmin = host_f16_to_f32(u16::from_le_bytes([bp[2], bp[3]]));
                 let (sc, m_arr) = decode_k_scales(&bp[4..16]);
@@ -260,11 +258,10 @@ pub fn dequant_kquant_to_f32(
             // A naive linear byte scan corrupts ~74% of any real Q2_K block
             // (agrees only on degenerate uniform blocks). See the matching
             // converter fix in lumen-convert/src/dequant.rs::dequantize_q2_k.
-            let block_size = 84;
-            let n_blocks = raw.len() / block_size;
+            let n_blocks = raw.len() / block_bytes;
             let mut written = 0usize;
             'blocks: for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
+                let bp = &raw[b * block_bytes..];
                 let scales = &bp[0..16];
                 let qs = &bp[16..80];
                 let d = host_f16_to_f32(u16::from_le_bytes([bp[80], bp[81]]));
@@ -306,11 +303,10 @@ pub fn dequant_kquant_to_f32(
         QuantScheme::Q3_K => {
             // Q3_K: 256 elements per block, 110 bytes per block.
             // Layout: [32B hmask, 64B qs (2-bit low), 12B scales (6-bit packed), 2B f16 d]
-            let block_size = 110;
-            let n_blocks = raw.len() / block_size;
+            let n_blocks = raw.len() / block_bytes;
             let mut written = 0usize;
             for b in 0..n_blocks {
-                let bp = &raw[b * block_size..];
+                let bp = &raw[b * block_bytes..];
                 let hmask = &bp[0..32];
                 let qs = &bp[32..96];
                 let scale_bytes = &bp[96..108];

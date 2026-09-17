@@ -20648,8 +20648,9 @@ impl ComputeBackend for CudaBackend {
                 }
             }
         }
-        // every K-quant plane dispatch quantizes its activation with `quantize_f32_to_q8_1`
-        // (a kernel compiled for compute_80) into the Q8_1 scratch
+        // a K-quant layer plane's decode matvec reads its activation from the Q8_1
+        // scratch, and every route that fills it needs `quantize_f32_to_q8_1` (a kernel
+        // compiled for compute_80) — the fused RMSNorm-to-Q8_1 variants are gated on it too
         if crate::runtime_defaults::kquant_artifact()
             && super::gpu_buffers::kquant_planes_servable()
             && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())

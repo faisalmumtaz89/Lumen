@@ -208,7 +208,11 @@ fn split_layout_dequant_is_bit_identical_to_the_raw_dequant() {
         println!(
             "[q8 split dequant] [{rows} x {in_dim}]: f16 mismatches {bad16}, f32 mismatches {bad32}, non-zero {nonzero}/{n}"
         );
-        assert!(nonzero > n / 2, "degenerate fixture");
+        assert!(
+            nonzero > n / 2,
+            "[{rows} x {in_dim}] degenerate fixture: non-zero {nonzero} <= {}",
+            n / 2
+        );
         assert_eq!(
             bad16, 0,
             "[{rows} x {in_dim}] F16 tile differs between raw and split layouts"
