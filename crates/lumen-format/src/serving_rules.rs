@@ -602,6 +602,39 @@ pub fn validate_projection_geometry(
     Ok(())
 }
 
+/// The output-head matvec kernels lay blocks out per row
+/// ([vocab rows] x [hidden/block_elems blocks]), so the row width itself
+/// must be block-aligned — flattened vocab*hidden divisibility alone
+/// admits totals whose rows split blocks (e.g. hidden=48 under Q8_0, or a
+/// Q6_K head on a hidden below one 256-element superblock), which the
+/// kernels misindex. The embedding keeps the flattened check: its lookup
+/// kernels tolerate blocks crossing row boundaries.
+///
+/// One rule for this global plane, read by the CUDA loader before it
+/// uploads the head and by the converter before it carries a source head
+/// verbatim, so the two cannot disagree about which head geometry is
+/// servable.
+pub fn validate_output_head_row_alignment(
+    quant: QuantScheme,
+    hidden_dim: usize,
+) -> Result<(), String> {
+    let row_block_elems = match quant {
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 => Some(32usize),
+        QuantScheme::Q6_K => Some(256usize),
+        _ => None,
+    };
+    if let Some(elems) = row_block_elems {
+        if hidden_dim % elems != 0 {
+            return Err(format!(
+                "output_proj is {quant:?} but hidden_dim {hidden_dim} is \
+                 not a multiple of the {elems}-element block row layout \
+                 the head kernels require (malformed hyperparams)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Exact byte extents for the F32 attention vectors the kernels read at
 /// hyperparam-derived lengths: per-head Q/K norms at `head_dim` values
 /// per head (CUDA's `rmsnorm_per_head_inplace` indexes
@@ -1077,6 +1110,26 @@ mod tests {
         st.layer_type = Some(1);
         let err = validate_gdn_conv1d(0, &st, usize::MAX, 2).unwrap_err();
         assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn output_head_rejects_row_misaligned_hidden() {
+        // Total block-aligned but rows split blocks: vocab=2 x hidden=48
+        // gives 96 elements (3 Q8_0 blocks), yet each row is 1.5 blocks —
+        // the flattened length check alone accepts it.
+        let err = validate_output_head_row_alignment(QuantScheme::Q8_0, 48).unwrap_err();
+        assert!(err.contains("block row layout"), "{err}");
+        let err = validate_output_head_row_alignment(QuantScheme::Q4_0, 48).unwrap_err();
+        assert!(err.contains("block row layout"), "{err}");
+        // A Q6_K head row below one superblock: the matvec reads
+        // `hidden_dim / 256 == 0` superblocks per row.
+        let err = validate_output_head_row_alignment(QuantScheme::Q6_K, 128).unwrap_err();
+        assert!(err.contains("256-element"), "{err}");
+        assert!(validate_output_head_row_alignment(QuantScheme::Q8_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q4_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q6_K, 512).is_ok());
+        // Float heads have no block rows; any hidden width is fine.
+        assert!(validate_output_head_row_alignment(QuantScheme::F16, 48).is_ok());
     }
 
     #[test]

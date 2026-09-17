@@ -23,13 +23,20 @@ use crate::dequant::*;
 /// are the same file. A Q4_K / Q5_K head is not among them: the runtime has a Q6_K
 /// head kernel and no Q4_K / Q5_K one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
-    kquant_source()
-        || matches!(
-            std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
-                .ok()
-                .as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+    kquant_source() || source_fidelity_requested()
+}
+
+/// Whether `LUMEN_CONVERT_SOURCE_FIDELITY` asks for the policy explicitly, as
+/// opposed to a K-quant source taking it by default. Only the head arm needs the
+/// two apart: what the default writes has to be servable, while an explicitly
+/// requested fidelity conversion answers exactly as it did in 0.31.0.
+fn source_fidelity_requested() -> bool {
+    matches!(
+        std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 thread_local! {
@@ -38,11 +45,12 @@ thread_local! {
 
 /// Whether the conversion running on this thread carries a K-quant source's planes
 /// as stored: [`kquant_source_scheme`] found one (a planned dense FFN projection —
-/// `ffn_gate`, `ffn_up` or `ffn_down` — stored as Q4_K, Q5_K or Q6_K) **and** the
-/// target serves such planes ([`target_serves_kquant`]). On the Metal target the
-/// answer is always false, so a K-quant source converts for Metal exactly as it did
-/// in 0.31.0. Set for the duration of one conversion by [`KquantSourceScope`]; the
-/// converter does not spawn threads.
+/// `ffn_gate`, `ffn_up` or `ffn_down` — stored as Q4_K, Q5_K or Q6_K), the file is
+/// the dense architecture whose planner reads those names ([`arch::is_moe_arch`] is
+/// false) **and** the target serves such planes ([`target_serves_kquant`]). On the
+/// Metal target the answer is always false, so a K-quant source converts for Metal
+/// exactly as it did in 0.31.0. Set for the duration of one conversion by
+/// [`KquantSourceScope`]; the converter does not spawn threads.
 pub(crate) fn kquant_source() -> bool {
     KQUANT_SOURCE.with(Cell::get)
 }
@@ -80,7 +88,7 @@ impl Drop for KquantSourceScope {
 /// dense planner reads for a layer below `num_layers` (the MTP `nextn` layer is
 /// excluded by the layer count), resolved through that planner's own lookup.
 /// `ffn_gate` / `ffn_up` / `ffn_down` are the dense converter's names, so the
-/// caller asks this only for the architecture that planner serves.
+/// caller applies its result only to the architecture that planner serves.
 pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
     const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
     const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];
@@ -621,13 +629,28 @@ fn do_convert_from_reader<R: Read + Seek>(
                 let keep_head = target_serves_kquant(opts.target)
                     && match output_proj_tensor.ggml_type {
                         GgmlType::Q6_K => {
-                            source_fidelity()
+                            let requested = source_fidelity_requested()
                                 || matches!(
                                     std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
                                         .ok()
                                         .as_deref(),
                                     Some("1") | Some("true") | Some("yes") | Some("on")
+                                );
+                            // A K-quant source takes this preservation by DEFAULT, so it
+                            // must not write a head the runtime then refuses: the head
+                            // matvec reads `hidden_dim / 256` whole superblocks per row,
+                            // and the loader rejects a width that is not whole
+                            // superblocks. Such a head is requantised — the conversion
+                            // 0.31.0 gave it. The two explicit switches are outside this
+                            // rule: they answer for every width, on every source, as they
+                            // did before the policy.
+                            let servable =
+                                lumen_format::serving_rules::validate_output_head_row_alignment(
+                                    QuantScheme::Q6_K,
+                                    hp.hidden_dim as usize,
                                 )
+                                .is_ok();
+                            requested || (kquant_source() && servable)
                         }
                         // A Q4_K / Q5_K head is not carried verbatim on any target: it is
                         // requantised like every other head, K-quant source or not.

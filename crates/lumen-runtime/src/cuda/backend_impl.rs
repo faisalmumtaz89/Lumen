@@ -18086,33 +18086,6 @@ fn raw_global_expected_len(
     }
 }
 
-/// The output-head matvec kernels lay blocks out per row
-/// ([vocab rows] x [hidden/block_elems blocks]), so the row width itself
-/// must be block-aligned — flattened vocab*hidden divisibility alone
-/// admits totals whose rows split blocks (e.g. hidden=48 under Q8_0),
-/// which the kernels misindex. The embedding keeps the flattened check:
-/// its lookup kernels tolerate blocks crossing row boundaries.
-fn validate_output_head_row_alignment(
-    quant: QuantScheme,
-    hidden_dim: usize,
-) -> Result<(), RuntimeError> {
-    let row_block_elems = match quant {
-        QuantScheme::Q8_0 | QuantScheme::Q4_0 => Some(32usize),
-        QuantScheme::Q6_K => Some(256usize),
-        _ => None,
-    };
-    if let Some(elems) = row_block_elems {
-        if hidden_dim % elems != 0 {
-            return Err(RuntimeError::Compute(format!(
-                "output_proj is {quant:?} but hidden_dim {hidden_dim} is \
-                 not a multiple of the {elems}-element block row layout \
-                 the head kernels require (malformed hyperparams)"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod raw_global_len_tests {
     use super::*;
@@ -18147,24 +18120,6 @@ mod raw_global_len_tests {
         assert!(n <= u32::MAX as usize);
         let err = raw_global_expected_len(QuantScheme::Q8_0, n).unwrap_err();
         assert!(err.to_string().contains("32-bit byte indexing"), "{err}");
-    }
-
-    #[test]
-    fn output_head_rejects_row_misaligned_hidden() {
-        // Total block-aligned but rows split blocks: vocab=2 x hidden=48
-        // gives 96 elements (3 Q8_0 blocks), yet each row is 1.5 blocks —
-        // the flattened length check alone accepts it.
-        let err = validate_output_head_row_alignment(QuantScheme::Q8_0, 48).unwrap_err();
-        assert!(err.to_string().contains("block row layout"), "{err}");
-        let err = validate_output_head_row_alignment(QuantScheme::Q4_0, 48).unwrap_err();
-        assert!(err.to_string().contains("block row layout"), "{err}");
-        let err = validate_output_head_row_alignment(QuantScheme::Q6_K, 128).unwrap_err();
-        assert!(err.to_string().contains("256-element"), "{err}");
-        assert!(validate_output_head_row_alignment(QuantScheme::Q8_0, 64).is_ok());
-        assert!(validate_output_head_row_alignment(QuantScheme::Q4_0, 64).is_ok());
-        assert!(validate_output_head_row_alignment(QuantScheme::Q6_K, 512).is_ok());
-        // Float heads have no block rows; any hidden width is fine.
-        assert!(validate_output_head_row_alignment(QuantScheme::F16, 48).is_ok());
     }
 }
 
@@ -18534,10 +18489,11 @@ impl ComputeBackend for CudaBackend {
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
-            validate_output_head_row_alignment(
+            lumen_format::serving_rules::validate_output_head_row_alignment(
                 self.output_proj_quant,
                 hyperparams.hidden_dim as usize,
-            )?;
+            )
+            .map_err(RuntimeError::Compute)?;
             if let Some(expected) = raw_global_expected_len(self.output_proj_quant, n)? {
                 if raw.len() != expected {
                     return Err(RuntimeError::Compute(format!(

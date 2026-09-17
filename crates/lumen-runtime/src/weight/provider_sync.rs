@@ -336,6 +336,12 @@ pub fn read_embedding_global(
         (QuantScheme::Q8_0, true)
     } else if raw_bytes.len() == expected_q4_bytes {
         (QuantScheme::Q4_0, true)
+    } else if header_quant.is_kquant_superblock() {
+        // The header declares a K-quant plane but the length is no whole number of
+        // superblocks: read it by its declared scheme, so a plane too short for the
+        // elements it must hold is reported by name instead of being reinterpreted
+        // as F32 (a length no multiple of four bytes panics there).
+        (header_quant, true)
     } else {
         // Unknown format -- try F32 interpretation (backward compat)
         (QuantScheme::F32, false)
@@ -431,6 +437,12 @@ pub fn read_output_proj_global(
         (QuantScheme::Q8_0, true)
     } else if raw_bytes.len() == expected_q4_bytes {
         (QuantScheme::Q4_0, true)
+    } else if header_quant.is_kquant_superblock() {
+        // The header declares a K-quant plane but the length is no whole number of
+        // superblocks: read it by its declared scheme, so a plane too short for the
+        // elements it must hold is reported by name instead of being reinterpreted
+        // as F32 (a length no multiple of four bytes panics there).
+        (header_quant, true)
     } else {
         // Unknown format -- try F32 interpretation (backward compat)
         (QuantScheme::F32, false)
@@ -762,8 +774,9 @@ mod tests {
     }
 
     /// A K-quant plane too short for the elements it must hold is an error naming the
-    /// plane, not a panic. The public readers classify a K-quant plane by an exact
-    /// superblock length, so they cannot reach this; the reading itself still reports it.
+    /// plane, not a panic — through the public readers too: a header-declared K-quant
+    /// plane whose length is no whole number of superblocks is read by its declared
+    /// scheme, not as F32.
     #[test]
     fn a_short_k_quant_plane_is_an_error_not_a_panic() {
         let err = global_plane_to_f32(&[0u8; 144], QuantScheme::Q4_K, 512, "embedding")
@@ -777,6 +790,34 @@ mod tests {
             .expect_err("the head likewise");
         assert!(
             err.to_string().contains("K-quant output head plane"),
+            "{err}"
+        );
+    }
+
+    /// A header-declared K-quant plane whose byte count is no whole number of
+    /// superblocks reaches both public readers as its declared scheme: 630 bytes are
+    /// three Q6_K superblocks (768 elements) where the header asks for 1000, and the
+    /// F32 fall-through would panic on the 630-byte length instead of naming it.
+    #[test]
+    fn a_k_quant_plane_of_no_whole_superblock_count_is_an_error_not_a_panic() {
+        let raw = vec![0u8; 630];
+        let err = read_output_proj_global(raw.clone(), 1000, 1, QuantScheme::Q6_K)
+            .expect_err("three superblocks cannot hold 1000 elements");
+        assert!(
+            err.to_string()
+                .contains("K-quant output head plane failed to dequantise"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("630 bytes hold 768 elements, 1000 required"),
+            "{err}"
+        );
+        let err = read_embedding_global(raw, 1000, 1, QuantScheme::Q6_K)
+            .expect_err("the embedding likewise");
+        assert!(
+            err.to_string()
+                .contains("K-quant embedding plane failed to dequantise"),
             "{err}"
         );
     }
