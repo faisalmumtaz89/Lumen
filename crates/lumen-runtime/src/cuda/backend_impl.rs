@@ -21104,10 +21104,11 @@ impl ComputeBackend for CudaBackend {
                 let raw_plane_release = if !kquant_planes {
                     // The plan freezes every artifact whose planes are Q4_0 / Q8_0 / BF16:
                     // their planes, routes and memory stay as shipped. The release is a
-                    // rule for an artifact that CARRIES a K-quant plane, like the native
-                    // K-quant planes themselves — a K-quant header over Q8_0 planes (a
-                    // `--target metal` conversion of a K-quant source) is such a frozen
-                    // artifact, not a K-quant one.
+                    // rule for an artifact whose header scheme is K-quant and that carries
+                    // an as-stored K-quant plane, like the native K-quant planes
+                    // themselves — a K-quant header over Q8_0 planes (a `--target metal`
+                    // conversion of a K-quant source), and a K-quant plane kept under a
+                    // requantised header, are such frozen artifacts, not K-quant ones.
                     RawPlaneRelease::KeepSilently
                 } else if !crate::runtime_defaults::q8_split_release_raw_enabled() {
                     RawPlaneRelease::Keep("policy: MMQ prefill or LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1")
