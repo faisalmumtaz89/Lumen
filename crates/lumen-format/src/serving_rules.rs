@@ -602,6 +602,34 @@ pub fn validate_projection_geometry(
     Ok(())
 }
 
+/// The row-width half of [`validate_projection_geometry`], asked before a
+/// plane is planned: the converter knows the scheme it would keep and the
+/// width the kernels will read that plane at, but not yet its length. A
+/// K-quant source takes plane preservation by DEFAULT, so the default must
+/// not plan a projection the loaders then refuse; the explicit
+/// `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside the rule and answers for
+/// every width, as in 0.31.0.
+///
+/// One rule and one block table: this asks `validate_projection_geometry`
+/// itself, with the zero-length slice that function documents as an absence
+/// sentinel, so only the width half can fail.
+pub fn validate_projection_row_width(
+    name: &str,
+    quant: QuantScheme,
+    in_dim: usize,
+) -> Result<(), String> {
+    validate_projection_geometry(
+        name,
+        &crate::index::TensorSlice {
+            offset: 0,
+            length: 0,
+            quant,
+        },
+        in_dim,
+        &[],
+    )
+}
+
 /// The output-head matvec kernels lay blocks out per row
 /// ([vocab rows] x [hidden/block_elems blocks]), so the row width itself
 /// must be block-aligned — flattened vocab*hidden divisibility alone

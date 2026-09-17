@@ -2,12 +2,15 @@
 //! The embedding gather reads the table as whole 256-element superblocks, and the loader
 //! sizes the plane from the header's `vocab_size * hidden_dim`
 //! (`lumen_format::serving_rules::kquant_global_plane_len`) and requires the stored plane
-//! to be exactly that many bytes, so a K-quant embedding whose element count is not whole
-//! superblocks, and one whose `token_embd` has rows the header's vocab does not, are both
+//! to be exactly that many bytes, so a K-quant embedding whose header `vocab x hidden` is
+//! not whole superblocks, and one whose stored plane is some other length, are both
 //! refused at load; the K-quant source policy dequantises such an embedding instead of
-//! carrying it, which is the embedding 0.31.0 wrote for the same file.
+//! carrying it, which is the embedding 0.31.0 wrote for the same file. The two questions
+//! are about the plane, not the row count, and the fourth fixture is the boundary where
+//! that separates: a `token_embd` short of the header's vocab by fewer elements than a
+//! superblock holds stores exactly the plane the header needs, and is carried.
 //!
-//! Both are files the converter reads without complaint. GGUF sizes a tensor from its
+//! These are files the converter reads without complaint. GGUF sizes a tensor from its
 //! flattened element count at `div_ceil`, so a K-quant plane can end in a partial
 //! superblock — the source of the first fixture (257 x 128 = 32,896 elements: 128 whole
 //! superblocks plus a 128-element tail, which GGUF stores in `div_ceil` = 129
@@ -313,5 +316,50 @@ fn a_kquant_embedding_padded_past_the_header_vocab_keeps_the_0_31_0_embedding() 
         lumen_format::serving_rules::kquant_global_plane_len(QuantScheme::Q4_K, 256 * 128),
         Ok(18432),
         "the header's geometry needs a shorter plane than the source stores"
+    );
+}
+
+/// The accepted boundary: a `token_embd` one row short of the header's vocab, at a
+/// hidden width small enough that the missing row fits inside the final superblock's
+/// padding. 255 x 128 = 32,640 elements, which GGUF stores at `div_ceil` in 128
+/// superblocks = 18,432 bytes — exactly the plane the header's 256 x 128 needs, so both
+/// of the loader's questions pass, the plane is carried and the artifact is version 5.
+/// The gather for the 256th token reads that padding: inside the plane the loader sized,
+/// not past it. (0.31.0 wrote F32 here — 130,560 bytes under a header geometry that
+/// needs 131,072 — and its F32 gather read past the plane; nothing is pinned on that.)
+#[test]
+fn a_kquant_embedding_one_row_short_of_the_header_vocab_is_carried() {
+    let (primary, version, quant, plane) = convert_embedding("short", &build(255, Some(256)));
+    assert_eq!(
+        primary,
+        QuantScheme::Q4_K,
+        "fixture is not a K-quant source"
+    );
+    assert_eq!(
+        quant,
+        QuantScheme::Q4_K,
+        "the K-quant embedding the header's geometry accepts was not preserved"
+    );
+    assert_eq!(
+        plane,
+        bytes_for(GgmlType::Q4_K, 255 * HID),
+        "the preserved embedding is not the source bytes"
+    );
+    assert_eq!(
+        version, 5,
+        "an as-stored K-quant embedding stamps version 5"
+    );
+    // The loader's rule on the loader's numbers: the header's product is whole
+    // superblocks and needs exactly the bytes the source stores.
+    assert_eq!(
+        lumen_format::serving_rules::kquant_global_plane_len(QuantScheme::Q4_K, 256 * 128),
+        Ok(plane.len()),
+        "the plane the loader sizes is the plane the source stores"
+    );
+    // The source's own element count is not whole superblocks — it is not the operand
+    // either side measures.
+    assert!(
+        lumen_format::serving_rules::kquant_global_plane_len(QuantScheme::Q4_K, 255 * 128).is_err(),
+        "the source count is not the number the rule is run on"
     );
 }

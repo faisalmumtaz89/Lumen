@@ -20,21 +20,22 @@ use crate::dequant::*;
 /// flag: none of the Q4_K / Q5_K / Q6_K planes it carries — its layer planes, its
 /// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
 /// better than the source bytes, so its default conversion and its fidelity conversion
-/// are the same file, except on a source whose head the runtime does not serve: a
-/// K-quant source's default head has to be servable, so a Q6_K head whose row width is
-/// not whole superblocks is requantised by default while the explicit switches answer
-/// for every width, as in 0.31.0. A Q4_K / Q5_K head is not among the preserved planes
-/// either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K one, so the head arm
-/// requantises it.
+/// are the same file, except on a plane the runtime does not serve at that geometry:
+/// a K-quant source's default head and `ssm_out` have to be servable, so a Q6_K head
+/// whose row width is not whole superblocks, and an `ssm_out` whose GDN width is not
+/// whole blocks for its scheme, are requantised by default while the explicit
+/// switches answer for every width, as in 0.31.0. A Q4_K / Q5_K head is not among the
+/// preserved planes either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K one,
+/// so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
     kquant_source() || source_fidelity_requested()
 }
 
 /// Whether `LUMEN_CONVERT_SOURCE_FIDELITY` asks for the policy explicitly, as
-/// opposed to a K-quant source taking it by default. Only the head arm needs the
-/// two apart: what the default writes has to be servable, while an explicitly
-/// requested fidelity conversion answers exactly as it did in 0.31.0.
-fn source_fidelity_requested() -> bool {
+/// opposed to a K-quant source taking it by default. The head and `ssm_out` arms
+/// need the two apart: what the default writes has to be servable, while an
+/// explicitly requested fidelity conversion answers exactly as it did in 0.31.0.
+pub(crate) fn source_fidelity_requested() -> bool {
     matches!(
         std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
             .ok()
@@ -473,12 +474,17 @@ fn do_convert_from_reader<R: Read + Seek>(
     // The embedding gather reads the table as whole 256-element superblocks, and the
     // loader sizes the plane from the HEADER's `vocab_size * hidden_dim`, then requires
     // the stored plane to be exactly that many bytes. The converter answers the same
-    // two questions, on the same numbers. GGUF sizes a tensor from its own flattened
-    // count at `div_ceil`, and the header's vocab is the tokenizer's token count when
-    // the source carries one (`hyperparams.rs`), so a partial final superblock and a
-    // `token_embd` with more or fewer rows than that vocab are both sources whose
-    // K-quant embedding the converter must not carry as stored. Such an embedding takes
-    // the F32 conversion below, the one 0.31.0 wrote for it.
+    // two questions, on the same numbers: the header's product must be whole
+    // superblocks, and the stored plane must be exactly the length that product needs.
+    // GGUF sizes a tensor from its own flattened count at `div_ceil`, and the header's
+    // vocab is the tokenizer's token count when the source carries one
+    // (`hyperparams.rs`), so the test is on the plane, not on the row count: a
+    // `token_embd` padded past that vocab, or short of it by a superblock or more,
+    // stores some other plane and takes the F32 conversion below, the one 0.31.0 wrote
+    // for it; one short by fewer elements than a superblock holds stores exactly the
+    // plane the header needs and is carried, the final superblock's padding standing
+    // where the missing rows would be (0.31.0 wrote a plane short of the header's
+    // geometry there, which its F32 gather read past).
     let kquant_embedding_servable = embedding_ggml_type.to_lbc_quant().is_some_and(|q| {
         lumen_format::serving_rules::kquant_global_plane_len(
             q,
@@ -528,11 +534,10 @@ fn do_convert_from_reader<R: Read + Seek>(
         }
         // A K-quant source's K-quant embedding is carried as stored when the plane it
         // stores is the one the header's vocab x hidden needs (as F32 it would be 5-7x
-        // its size on the device;
-        // the CUDA K-quant path has the row-gather). Any other Q4_K / Q5_K / Q6_K
-        // embedding is dequantised to F32 below, and so is a tied one: without
-        // `output.weight` the head shares this plane and would take its scheme, and no
-        // target carries a Q4_K / Q5_K head.
+        // its size on the device; the CUDA K-quant path has the row-gather). Any other
+        // Q4_K / Q5_K / Q6_K embedding is dequantised to F32 below, and so is a tied
+        // one: without `output.weight` the head shares this plane and would take its
+        // scheme, and no target carries a Q4_K / Q5_K head.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
             if kquant_source()
                 && kquant_embedding_servable

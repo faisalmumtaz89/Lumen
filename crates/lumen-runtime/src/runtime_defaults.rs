@@ -202,10 +202,11 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// with `--requant q8_0` keeps its K-quant embedding and a `Q6_K` head under a Q8_0 header
 /// (`--requant q4_0` keeps the embedding and re-quantises the head; a Q4_K / Q5_K head is
 /// re-quantised either way; a plane the runtime does not serve at that geometry — a Q6_K head
-/// whose row width is not whole superblocks, an embedding stored as some plane other than the
-/// one its vocab x hidden needs — is converted as 0.31.0 converted it): CUDA serves each
-/// preserved plane through its own scheme's arm, and a missing kernel group is then reported
-/// at the first token instead of at load.
+/// whose row width is not whole superblocks, an embedding stored as some plane other than
+/// the one the header's vocab x hidden needs, an `ssm_out` whose GDN width is not whole
+/// blocks for its scheme — is converted as 0.31.0 converted it): CUDA serves each preserved
+/// plane through its own scheme's arm, and a missing kernel group is then reported at the
+/// first token instead of at load.
 pub fn kquant_artifact() -> bool {
     model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
 }

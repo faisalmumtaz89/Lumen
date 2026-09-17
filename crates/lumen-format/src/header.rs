@@ -17,11 +17,11 @@ pub const LBC_VERSION: u32 = 4;
 /// source (`Q4_K_M`, `Q5_K_M`) whose `token_embd` is the Q4_K, Q5_K or Q6_K plane the
 /// header's `vocab_size * hidden_dim` needs produces one (`--dequantize`, a source that
 /// ties its head to the embedding, and an embedding stored as some other plane — a
-/// partial final superblock, or rows the header's vocab does not have — each leave no
-/// such plane, and those artifacts keep version 4). A 0.31.0 reader classified the embedding
-/// global by its byte length, and a Q4_K plane has exactly Q4_0's length, so it would
-/// misread it; the version gate makes it refuse the file with `UnsupportedVersion`
-/// instead.
+/// header `vocab x hidden` that is not whole superblocks, or a stored plane of another
+/// length — each leave no such plane, and those artifacts keep version 4). A 0.31.0
+/// reader classified the embedding global by its byte length, and a Q4_K plane has
+/// exactly Q4_0's length, so it would misread it; the version gate makes it refuse the
+/// file with `UnsupportedVersion` instead.
 pub const LBC_VERSION_KQUANT_EMBEDDING: u32 = 5;
 
 /// Default alignment for layer blobs (128 KiB).

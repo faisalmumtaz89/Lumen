@@ -11,7 +11,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **K-quant artifacts are served natively on CUDA.** A `Q4_K_M` or `Q5_K_M` source (a
   file with K-quant dense FFN projections) carries every Q4_K / Q5_K / Q6_K FFN plane
-  verbatim on the generic target — a K-quant embedding stored as the plane its
+  verbatim on the generic target — a K-quant embedding stored as the plane the header's
   `vocab x hidden` needs, a kept `ssm_out` and a preserved Q6_K head with it — and the
   CUDA runtime serves the planes as stored: per-scheme decode matvecs, prefill dequant
   tiles, an embedding gather and a Q6_K head. The registry gains `qwen3.8-27b:Q4_K_M`
@@ -21,13 +21,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   of a K-quant source whose `token_embd` is the Q4_K, Q5_K or Q6_K plane the header's
   `vocab x hidden` needs produces one (both registry cells; `--dequantize`, a source
   that ties its head to the embedding, and an embedding stored as some other plane — a
-  partial final superblock, or rows the header's vocab does not have — each leave no
-  such plane, and those artifacts keep version 4). A Lumen before this release refuses
-  a version-5 file with `UnsupportedVersion`. Every other artifact keeps version 4, an
-  artifact from a source that is not a K-quant source converts byte for byte as in
-  0.31.0, and so does every `--target metal` conversion, K-quant source included:
-  Metal has no K-quant kernel, so the Metal target upcasts or re-quantises those
-  planes exactly as before.
+  header `vocab x hidden` that is not whole superblocks, or a stored plane of another
+  length — each leave no such plane, and those artifacts keep version 4). A Lumen before
+  this release refuses a version-5 file with `UnsupportedVersion`. Every other artifact
+  keeps version 4, an artifact from a source that is not a K-quant source converts byte
+  for byte as in 0.31.0, and so does every `--target metal` conversion, K-quant source
+  included: Metal has no K-quant kernel, so the Metal target upcasts or re-quantises
+  those planes exactly as before.
 
 ### Changed
 
