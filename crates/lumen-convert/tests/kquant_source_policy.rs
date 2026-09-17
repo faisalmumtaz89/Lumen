@@ -5,9 +5,11 @@
 //! preserves; a Q4_K/Q5_K head is requantised as before), takes its K-quant scheme in
 //! the header, and is written at `LBC_VERSION_KQUANT_EMBEDDING` when its embedding is
 //! an as-stored K-quant plane (fixtures F and H keep version 4: their embedding is
-//! Q8_0); a file that is not a K-quant source — the shipping Q4_0 shape with its Q5_K
-//! `ssm_out`, Q6_K head and Q6_K full-attention `attn_q`, a GDN pair stored as K-quant,
-//! or a K-quant embedding alone — converts exactly as before.
+//! Q8_0, and so does J: it ties its head to the embedding, so the embedding is
+//! dequantised and the tied head is not a K-quant one); a file that is not a K-quant
+//! source — the shipping Q4_0 shape with its Q5_K `ssm_out`, Q6_K head and Q6_K
+//! full-attention `attn_q`, a GDN pair stored as K-quant, or a K-quant embedding
+//! alone — converts exactly as before.
 //!
 //! The Metal target is untouched by the policy: it has no K-quant kernel, so it upcasts
 //! or re-quantises every K-quant plane exactly as in 0.31.0. `metal_target_is_0_31_0`
@@ -77,6 +79,20 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
 /// A four-layer qwen35 model whose weight types come from `ty(layer, suffix)`;
 /// the embedding and the head take `embd` and `head`; the GDN gates are F32.
 fn build(embd: GgmlType, head: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> Vec<u8> {
+    build_with_head(embd, Some(head), ty)
+}
+
+/// [`build`] with no `output.weight`: the source ties its head to the embedding, and
+/// the converter's weight-tying path gives the head the embedding's storage and scheme.
+fn build_tied(embd: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> Vec<u8> {
+    build_with_head(embd, None, ty)
+}
+
+fn build_with_head(
+    embd: GgmlType,
+    head: Option<GgmlType>,
+    ty: impl Fn(u32, &str) -> GgmlType,
+) -> Vec<u8> {
     let mut b = GgufBuilder::new();
     let k = |s: &str| format!("qwen35.{s}");
     b.add_string("general.architecture", "qwen35");
@@ -105,7 +121,9 @@ fn build(embd: GgmlType, head: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> 
         );
     }
     b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
-    b.add_tensor("output.weight", head, &[HID, VOCAB], bytes_for(head, ne));
+    if let Some(head) = head {
+        b.add_tensor("output.weight", head, &[HID, VOCAB], bytes_for(head, ne));
+    }
     let kvd = (HID / HEADS as u64) * KVH as u64;
     for l in 0..LAYERS {
         let p = format!("blk.{l}");
@@ -407,6 +425,15 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
             }),
         ));
     }
+    // J. A K-quant source with a Q4_K embedding and no `output.weight`: the head is
+    // tied to the embedding and takes its scheme, so the embedding is dequantised.
+    v.push((
+        "tied_kquant_src",
+        build_tied(GgmlType::Q4_K, |_, nm| match nm {
+            "ffn_gate.weight" | "ffn_up.weight" | "ffn_down.weight" => GgmlType::Q4_K,
+            _ => GgmlType::Q8_0,
+        }),
+    ));
     v
 }
 
@@ -735,6 +762,39 @@ fn kquant_source_policy_matrix() {
         );
     }
 
+    // J. A K-quant source whose head is tied to the embedding: the head shares the
+    // embedding's plane and scheme, so a K-quant embedding would make a Q4_K head no
+    // target serves. The embedding is dequantised instead, exactly as at 0.31.0 — the
+    // layer planes still follow the policy.
+    let tied = fixture("tied_kquant_src");
+    let j = convert("tied_kquant_src", &tied, ConvertTarget::Generic);
+    assert_eq!(
+        j.embedding,
+        (QuantScheme::F32, lbc_len(QuantScheme::F32, VOCAB * HID)),
+        "J: a tied head dequantises the K-quant embedding"
+    );
+    assert_eq!(
+        j.head,
+        (QuantScheme::F32, lbc_len(QuantScheme::F32, VOCAB * HID)),
+        "J: the tied head is F32, not Q4_K"
+    );
+    assert_eq!(
+        j.version,
+        lumen_format::LBC_VERSION,
+        "J: no as-stored K-quant embedding, so version 4"
+    );
+    assert_eq!(
+        slice(&j, 0, "w_up"),
+        (QuantScheme::Q4_K, lbc_len(QuantScheme::Q4_K, ffn)),
+        "J: the layer planes still follow the policy"
+    );
+    let jm = convert("tied_kquant_src_metal", &tied, ConvertTarget::Metal);
+    assert_eq!(
+        jm.embedding,
+        (QuantScheme::F32, lbc_len(QuantScheme::F32, VOCAB * HID)),
+        "J: Metal embedding F32"
+    );
+
     // The Metal target is untouched by the policy: every fixture's `--target metal`
     // artifact is the one 0.31.0 wrote, byte for byte.
     metal_target_is_0_31_0();
@@ -933,5 +993,9 @@ const METAL_PINNED: &[(&str, &str)] = &[
     (
         "q6_k_qkv_f32_gate",
         "c5aad6f32b5a337e639e315b81960503dc4a6344fcc1a7a85e5dab6ed306aa71",
+    ),
+    (
+        "tied_kquant_src",
+        "f7d4ff8f8633dd84a6785e208872e0aea5650b39157d19f9f56b7c095a0f1762",
     ),
 ];

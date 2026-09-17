@@ -112,7 +112,9 @@ MODEL (positional or --model):
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
                            (q8_0, q4_0, bf16; q4_k_m, q5_k_m for qwen3.8-27b,
-                           served natively on CUDA). Default: q8_0
+                           served as stored on CUDA only — on Apple Silicon the
+                           cached artifact is larger than the q8_0 one).
+                           Default: q8_0
     --host <HOST>          Listen host. Default: 127.0.0.1
     --port <N>             Listen port. Default: 8000
     --context-len <N>      Max sequence length (KV cache size).

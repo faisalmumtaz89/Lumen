@@ -365,8 +365,9 @@ fn load_scheme(ctx: &Arc<CudaContext>, sc: &Scheme) -> Kernels {
             .load_function(&n)
             .unwrap_or_else(|e| panic!("{n}: {e}"))
     };
+    // `kernel_define` is the runtime loader's own parser, so the geometry below is
+    // exactly the geometry the runtime launches these kernels with.
     let prefix = sc.tag.replace('_', "").to_uppercase(); // q4_k -> Q4K
-                                                         // the production parser, so the test launches with exactly the geometry the runtime will
     let threads = kernel_define(&source, &format!("{prefix}_THREADS"))
         .unwrap_or_else(|e| panic!("{}: {e}", sc.tag));
     let rows_per_cta = kernel_define(&source, &format!("{prefix}_NR"))
@@ -786,8 +787,9 @@ fn quantize_q6_k(v: &[f32; 256]) -> Vec<u8> {
     out
 }
 
-/// GGML's Q4_0 quantization of one 32-block: `d = max_signed / -8`,
-/// `q = min(15, (int)(v / d + 8.5))`, nibbles de-interleaved.
+/// Q4_0 quantization of one 32-block in GGML's block layout: `d = max_signed / -8`
+/// stored as f16, then `q = clamp(0, 15, trunc(v * (1 / stored_d) + 8.5))` against that
+/// stored scale — the one `dequant_q4_0` reads back — nibbles de-interleaved.
 fn quantize_q4_0(v: &[f32]) -> [u8; 18] {
     let mut amax = 0.0f32;
     let mut max_signed = 0.0f32;
@@ -1018,14 +1020,16 @@ fn matvec_shapes(sc: &Scheme) {
                 c.rel_l2_res
             ));
         }
-        // the quantisation-quality ratio is a statistic over a plane's many rows: on the
-        // two small synthetic shapes only the kernel-versus-host bars above apply
-        // The ratio bar is only as strong as its comparator: a non-finite E_q4 makes
-        // `1.10 * E_q4` infinite and every E_kq satisfies it, so the comparator is
-        // gated on its own before the ratio is applied.
+        // The ratio bar is only as strong as its comparator: a positive-infinite E_q4
+        // makes `1.10 * E_q4` infinite, which every finite E_kq satisfies, so the bar
+        // passes vacuously; a NaN E_q4 makes the comparison false, so the bar fires
+        // under the ratio's name instead of naming the comparator that broke. The
+        // comparator is therefore checked on its own, on every shape, first.
         if !c.e_q4.is_finite() {
             failures.push(format!("{role}: E_q4 {:.3e} is not finite", c.e_q4));
         }
+        // the quantisation-quality ratio is a statistic over a plane's many rows: on the
+        // two small synthetic shapes only the bars above apply
         if out_dim * in_dim >= 1 << 20 && !(c.e_kq <= 1.10 * c.e_q4) {
             failures.push(format!(
                 "{role}: E_kq {:.3e} > 1.10 x E_q4 {:.3e}",

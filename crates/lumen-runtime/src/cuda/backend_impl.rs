@@ -21054,30 +21054,41 @@ impl ComputeBackend for CudaBackend {
                 // both true here). They are kept deliberately: the ladder is fail-safe in one
                 // direction only — an extra arm costs memory, a missing one frees a plane a live
                 // route still reads.
-                let release_block: Option<&str> = if !crate::runtime_defaults::kquant_artifact() {
+                /// What becomes of the raw Q8_0 plane once its split sibling exists.
+                enum RawPlaneRelease {
+                    /// Every route that could read the raw plane reads the split layout
+                    /// instead: free it, and print the byte-sum receipt.
+                    Release,
+                    /// Keep both copies and print nothing: an existing Q4_0 / Q8_0 / BF16
+                    /// cell, whose receipts stay exactly as shipped.
+                    KeepSilently,
+                    /// Keep both copies, and print why.
+                    Keep(&'static str),
+                }
+                let raw_plane_release = if !crate::runtime_defaults::kquant_artifact() {
                     // The plan freezes the existing Q4_0 / Q8_0 / BF16 cells: their planes,
                     // routes and memory stay as shipped. The release is a K-quant-artifact
                     // rule, like the native K-quant planes themselves.
-                    Some("not a K-quant artifact (existing cells keep both copies)")
+                    RawPlaneRelease::KeepSilently
                 } else if !crate::runtime_defaults::q8_split_release_raw_enabled() {
-                    Some("policy: MMQ prefill or LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1")
+                    RawPlaneRelease::Keep("policy: MMQ prefill or LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1")
                 } else if gdn_convstate_parity_enabled() && gdn_decode_via_prefill_enabled() {
                     // the conv-state parity reprojection runs the batched MMQ on the raw plane
-                    Some("conv-state parity reprojection reads the raw plane")
+                    RawPlaneRelease::Keep("conv-state parity reprojection reads the raw plane")
                 } else if !st.kernels.use_q8_split_dispatch {
-                    Some("split dispatch off")
+                    RawPlaneRelease::Keep("split dispatch off")
                 } else if st.kernels.matvec_q8_split_q8_1.is_none()
                     || st.kernels.matvec_q8_split_q8_1_residual.is_none()
                 {
-                    Some("a split matvec kernel did not load")
+                    RawPlaneRelease::Keep("a split matvec kernel did not load")
                 } else if st.kernels.quantize_f32_to_q8_1.is_none() {
-                    Some("quantize_f32_to_q8_1 did not load")
+                    RawPlaneRelease::Keep("quantize_f32_to_q8_1 did not load")
                 } else if st.scratch.input_q8_1.is_none() {
-                    Some("no Q8_1 activation scratch")
+                    RawPlaneRelease::Keep("no Q8_1 activation scratch")
                 } else {
-                    None
+                    RawPlaneRelease::Release
                 };
-                let release_raw = release_block.is_none();
+                let release_raw = matches!(raw_plane_release, RawPlaneRelease::Release);
                 let (
                     n_layers_split,
                     oom_layer,
@@ -21121,16 +21132,14 @@ impl ComputeBackend for CudaBackend {
                      {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
                     oom_layer,
                 );
-                match release_block {
-                    // The release is a K-quant-artifact rule, so an existing cell
-                    // never reaches it: its receipts stay exactly as shipped.
-                    Some(_) if !crate::runtime_defaults::kquant_artifact() => {}
-                    Some(why) => eprintln!(
+                match raw_plane_release {
+                    RawPlaneRelease::KeepSilently => {}
+                    RawPlaneRelease::Keep(why) => eprintln!(
                         "[CUDA] Q8 split raw-plane release off ({why}): both copies stay \
                          resident and the prefill keeps reading the raw plane (clone \
                          pass {consumed_gb:.2} GB)"
                     ),
-                    None => eprintln!(
+                    RawPlaneRelease::Release => eprintln!(
                         "[CUDA] Q8 split planes resident once: raw planes released after the \
                          clone={raw_released} (byte-sum {:.2} GB; measured net device memory \
                          of the clone pass {consumed_gb:.2} GB; the prefill dequantizes the \

@@ -478,9 +478,13 @@ fn do_convert_from_reader<R: Read + Seek>(
         }
         // A K-quant source's K-quant embedding is carried as stored (as F32 it would be
         // 5-7x its size on the device; the CUDA K-quant path has the row-gather). Every
-        // other source's embedding is dequantised to F32 below (or kept, if it already is).
+        // other source's embedding is dequantised to F32 below (or kept, if it already is),
+        // and so is a tied one: without `output.weight` the head shares this plane and
+        // would take its scheme, and no target carries a Q4_K / Q5_K head.
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
-            if kquant_source() && !opts.dequantize_to_f32 =>
+            if kquant_source()
+                && !opts.dequantize_to_f32
+                && gguf.find_tensor(OUTPUT_PROJ_NAME).is_some() =>
         {
             let quant = match embedding_ggml_type {
                 GgmlType::Q4_K => QuantScheme::Q4_K,

@@ -40,7 +40,8 @@ ARGUMENTS:
 OPTIONS:
     --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16;
                           Q4_K_M, Q5_K_M for qwen3.8-27b (served as stored on CUDA; on
-                          Apple Silicon they convert to a Q8_0-size artifact, as before)
+                          Apple Silicon they convert to an artifact larger than the
+                          Q8_0 one, as before)
     --yes, -y             Skip download confirmation prompt
     -h, --help            Print this help message
 
@@ -75,7 +76,8 @@ MODELS:
     Quantization tag: q8_0 (best quality / production default), q4_0 (smaller),
                       bf16 (full precision, fastest prefill on supported GPUs),
                       q4_k_m / q5_k_m (qwen3.8-27b only, served as stored on CUDA;
-                      on Apple Silicon they convert to a Q8_0-size artifact)
+                      on Apple Silicon they convert to an artifact larger than
+                      the q8_0 one)
 
 OPTIONS:
     --model <name|path>   Model name from registry (e.g. qwen3-5-9b:q8_0) or path to .lbc/.gguf file

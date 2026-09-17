@@ -15,10 +15,11 @@ pub const LBC_VERSION: u32 = 4;
 /// The version of an artifact whose embedding is an as-stored K-quant plane, and the
 /// newest version the reader accepts: the default generic conversion of a K-quant
 /// source (`Q4_K_M`, `Q5_K_M`) whose `token_embd` is K-quant produces one
-/// (`--dequantize` leaves no such plane, and that artifact keeps version 4). A 0.31.0
-/// reader classified a global by its byte length, and a Q4_K plane has exactly Q4_0's
-/// length, so it would misread the embedding; the version gate makes it refuse the
-/// file with `UnsupportedVersion` instead.
+/// (`--dequantize`, and a source that ties its head to the embedding, leave no such
+/// plane, and those artifacts keep version 4). A 0.31.0 reader classified the embedding
+/// global by its byte length, and a Q4_K plane has exactly Q4_0's length, so it would
+/// misread it; the version gate makes it refuse the file with `UnsupportedVersion`
+/// instead.
 pub const LBC_VERSION_KQUANT_EMBEDDING: u32 = 5;
 
 /// Default alignment for layer blobs (128 KiB).
