@@ -609,13 +609,28 @@ const SHAPES: &[(usize, usize, &str)] = &[
     (10240, 5120, "attn_qkv (GDN in-proj)"),
     (6144, 5120, "attn_gate"),
     (12288, 5120, "attn_q (Q+gate)"),
-    (5120, 6144, "ssm_out"),
+    (1024, 5120, "attn_k/attn_v"),
+    (5120, 6144, "ssm_out/attn_output"),
     (248320, 5120, "output head"),
     // shapes no file has: an odd superblock count and an output count that is not a
     // multiple of the rows per CTA (the guarded last CTA)
     (96, 1280, "odd superblock count"),
     (9, 5120, "partial row group"),
 ];
+
+/// `max |a - b|` over the pair, NaN-propagating. Not a `f64::max` fold: that
+/// returns the *other* argument for a NaN, so a NaN device output would reduce
+/// to 0.0 and sail through the absolute bars below.
+fn max_abs_err(a: &[f32], b: &[f64]) -> f64 {
+    a.iter().zip(b).fold(0.0f64, |m, (&x, &y)| {
+        let d = (x as f64 - y).abs();
+        if d.is_nan() || d > m {
+            d
+        } else {
+            m
+        }
+    })
+}
 
 fn rel_l2(a: &[f32], b: &[f64]) -> f64 {
     let mut num = 0.0f64;
@@ -924,10 +939,7 @@ fn matvec_case(
             .unwrap();
     }
     let got = stream.clone_dtoh(&out_gpu).unwrap();
-    let max_abs = got
-        .iter()
-        .zip(&ref_q)
-        .fold(0.0f64, |m, (&g, &e)| m.max((g as f64 - e).abs()));
+    let max_abs = max_abs_err(&got, &ref_q);
     let rel_l2_q = rel_l2(&got, &ref_q);
     let e_kq = rel_l2(&got, &ref_f);
 
@@ -951,10 +963,7 @@ fn matvec_case(
         .zip(&residual)
         .map(|(&e, &r)| e + r as f64)
         .collect();
-    let max_abs_res = got_res
-        .iter()
-        .zip(&ref_res)
-        .fold(0.0f64, |m, (&g, &e)| m.max((g as f64 - e).abs()));
+    let max_abs_res = max_abs_err(&got_res, &ref_res);
     let rel_l2_res = rel_l2(&got_res, &ref_res);
 
     // Q4_0 dp4a comparator: the same real matrix in Q4_0, same activations.
@@ -1073,8 +1082,9 @@ fn q6_k_matvec_shapes() {
 }
 
 // ---------------------------------------------------------------------------
-// Matvec on edge superblocks: the matvec decodes scales from registers (Q4_K /
-// Q5_K header words, Q6_K 16-bit scale pairs), a different path from the byte
+// Matvec on edge superblocks: the matvec decodes the scales on its own geometry
+// (Q4_K / Q5_K unpack the header words in registers; Q6_K reads the two signed-byte
+// sub-scales a lane needs and the halfword `d`), a different path from the per-element
 // reads the dequant identity gate proves. Rows are built from every edge block
 // except the two saturated-`d` ones (below) and from random-bytes superblocks
 // (random signed Q6_K sub-scales, random 6-bit scales and mins),
@@ -1161,14 +1171,8 @@ fn matvec_edge_case(sc: &Scheme) {
     }
     let got = stream.clone_dtoh(&out_gpu).unwrap();
     let got_res = stream.clone_dtoh(&out_res).unwrap();
-    let max_abs = got
-        .iter()
-        .zip(&ref_q)
-        .fold(0.0f64, |m, (&g, &e)| m.max((g as f64 - e).abs()));
-    let max_abs_res = got_res
-        .iter()
-        .zip(&ref_res)
-        .fold(0.0f64, |m, (&g, &e)| m.max((g as f64 - e).abs()));
+    let max_abs = max_abs_err(&got, &ref_q);
+    let max_abs_res = max_abs_err(&got_res, &ref_res);
     let rl = rel_l2(&got, &ref_q);
     let rl_res = rel_l2(&got_res, &ref_res);
     let ref_max = ref_q.iter().fold(0.0f64, |m, v| m.max(v.abs()));

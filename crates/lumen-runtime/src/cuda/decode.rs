@@ -118,8 +118,10 @@ fn load_kquant_kernels(
             Some(k)
         }
         Err(e) => {
-            // printed on a K-quant artifact (the loader refuses on it, naming this line);
-            // a diagnostic line otherwise, the kernels being unused
+            // printed on a K-quant artifact, where the loader refuses and names this
+            // line; behind `LUMEN_CUDA_VERBOSE` otherwise — an artifact whose header
+            // is not K-quant can still carry a preserved K-quant embedding, and a
+            // missing group is then reported at the first token
             if crate::runtime_defaults::kquant_artifact() {
                 eprintln!("[CUDA] kquant {tag}: FAILED: {e}");
             } else {

@@ -9,7 +9,7 @@
 //! dequantised and the tied head is not a K-quant one); a file that is not a K-quant
 //! source — the shipping Q4_0 shape with its Q5_K `ssm_out`, Q6_K head and Q6_K
 //! full-attention `attn_q`, a GDN pair stored as K-quant, a K-quant embedding
-//! alone, or a K-quant tensor under a `blk.` name no planner lookup resolves to —
+//! alone, or a K-quant `blk.` tensor no planner lookup resolves to —
 //! converts exactly as before.
 //!
 //! The Metal target is untouched by the policy: it has no K-quant kernel, so it upcasts
@@ -89,8 +89,9 @@ fn build_tied(embd: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> Vec<u8> {
     build_with_head(embd, None, ty, &[])
 }
 
-/// [`build`] plus `extra` tensors appended after the layers: names no planner lookup
-/// resolves to, so the artifact must not move.
+/// [`build`] plus `extra` tensors appended after the layers: tensors no planner lookup
+/// resolves to — a non-canonical layer spelling, or a duplicate of a canonical name
+/// after the tensor `find_tensor` returns — so the artifact must not move.
 fn build_with_extra(
     embd: GgmlType,
     head: GgmlType,
@@ -407,7 +408,7 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
                 _ => GgmlType::Q8_0,
             }),
         ),
-        // The four non-K-quant sources whose 0.31.0 digests are pinned on both targets.
+        // Non-K-quant sources whose 0.31.0 digests are pinned on both targets.
         (
             "pure_q4_0",
             build(GgmlType::Q4_0, GgmlType::Q4_0, |_, _| GgmlType::Q4_0),
@@ -914,7 +915,7 @@ fn metal_target_is_0_31_0() {
             ),
         }
     }
-    // the four non-K-quant fixtures pinned on both targets must agree with `PINNED`
+    // every non-K-quant fixture pinned on both targets must agree with `PINNED`
     for (name, label, digest) in PINNED {
         if *label != "metal" {
             continue;
@@ -975,15 +976,27 @@ const PINNED: &[(&str, &str, &str)] = &[
         "metal",
         "4b295d9954af68941706adc72ddebf95b4802d4097ddb1d74e51fc84537d4407",
     ),
-    ("pure_q8_0_noncanonical_layer", "generic", PURE_Q8_0_0_31_0),
-    ("pure_q8_0_noncanonical_layer", "metal", PURE_Q8_0_0_31_0),
-    ("pure_q8_0_shadowed_ffn_gate", "generic", PURE_Q8_0_0_31_0),
-    ("pure_q8_0_shadowed_ffn_gate", "metal", PURE_Q8_0_0_31_0),
+    (
+        "pure_q8_0_noncanonical_layer",
+        "generic",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
+    (
+        "pure_q8_0_noncanonical_layer",
+        "metal",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
+    (
+        "pure_q8_0_shadowed_ffn_gate",
+        "generic",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
+    (
+        "pure_q8_0_shadowed_ffn_gate",
+        "metal",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
 ];
-
-/// `pure_q8_0`'s 0.31.0 artifact digest, the same on both targets. Fixture K's two
-/// sources add a tensor the planner never reads, so they convert to these bytes too.
-const PURE_Q8_0_0_31_0: &str = "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb";
 
 /// A fixture the 0.31.0 Metal target refuses to convert; see [`metal_target_is_0_31_0`].
 const METAL_REFUSED: &str = "refused";
@@ -1048,6 +1061,12 @@ const METAL_PINNED: &[(&str, &str)] = &[
         "tied_kquant_src",
         "f7d4ff8f8633dd84a6785e208872e0aea5650b39157d19f9f56b7c095a0f1762",
     ),
-    ("pure_q8_0_noncanonical_layer", PURE_Q8_0_0_31_0),
-    ("pure_q8_0_shadowed_ffn_gate", PURE_Q8_0_0_31_0),
+    (
+        "pure_q8_0_noncanonical_layer",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
+    (
+        "pure_q8_0_shadowed_ffn_gate",
+        "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb",
+    ),
 ];

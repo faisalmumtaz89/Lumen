@@ -77,8 +77,10 @@ impl Drop for KquantSourceScope {
 /// dense FFN projection is Q4_K, Q5_K or Q6_K, carrying the K-quant scheme
 /// with the most planned layer planes (Q4_K for a Q4_K_M file, Q5_K for a
 /// Q5_K_M file) — the LBC header's primary scheme. Planned = the tensor the
-/// planner reads for a layer below `num_layers` (the MTP `nextn` layer is
-/// excluded by the layer count), resolved through the planner's own lookup.
+/// dense planner reads for a layer below `num_layers` (the MTP `nextn` layer is
+/// excluded by the layer count), resolved through that planner's own lookup.
+/// `ffn_gate` / `ffn_up` / `ffn_down` are the dense converter's names, so the
+/// caller asks this only for the architecture that planner serves.
 pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
     const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
     const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];
@@ -408,9 +410,13 @@ fn do_convert_from_reader<R: Read + Seek>(
     // K-quant source takes the source-fidelity policy and its own scheme in
     // the header (every planning and writing site reads `kquant_source()`).
     // Only on a target that serves K-quant planes; the Metal target upcasts or
-    // re-quantises them, exactly as it did before this policy existed.
-    let kquant =
-        kquant_source_scheme(gguf, hp.num_layers).filter(|_| target_serves_kquant(opts.target));
+    // re-quantises them, exactly as it did before this policy existed. And only
+    // for the dense architecture, whose planner is the one that reads the
+    // `ffn_gate` / `ffn_up` / `ffn_down` names the scheme is read off: the MoE
+    // planner reads `ffn_*_exps` and zeroes `w_gate` / `w_up` / `w_down`, so a
+    // MoE file carrying such a tensor would take a policy none of its planes has.
+    let kquant = kquant_source_scheme(gguf, hp.num_layers)
+        .filter(|_| target_serves_kquant(opts.target) && !arch::is_moe_arch(&arch));
     let _kquant_scope = KquantSourceScope::enter(kquant.is_some());
     if let Some(k) = kquant {
         eprintln!(
@@ -422,10 +428,8 @@ fn do_convert_from_reader<R: Read + Seek>(
     // The MoE converter has no requant path — no layer tensor is
     // requantized — so accepting the flag would stamp a requant scheme in
     // the header that the planes do not have. Refuse before any tensor is
-    // read, keyed on the same architecture set `select_converter` uses.
-    if matches!(arch.as_str(), "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe")
-        && opts.requant_to.is_some()
-    {
+    // read, keyed on the same predicate `select_converter` uses.
+    if arch::is_moe_arch(&arch) && opts.requant_to.is_some() {
         return Err(ConvertError::UnsupportedOption(
             "--requant is not supported for MoE models (the MoE converter \
              carries layer tensors in their source quantization); convert \

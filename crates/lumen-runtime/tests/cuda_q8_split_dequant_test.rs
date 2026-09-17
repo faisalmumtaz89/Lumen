@@ -19,42 +19,12 @@ use lumen_runtime::cuda::shaders::{
 };
 use std::sync::Arc;
 
-fn compile(ctx: &Arc<CudaContext>, src: &str) -> Ptx {
-    // The highest target this device can load (a PTX for a newer target compiles but cannot load).
-    let (major, minor) = ctx.compute_capability().expect("compute capability");
-    let cc = (major * 10 + minor) as u32;
-    let mut last = String::new();
-    for (arch, arch_cc) in [
-        ("compute_121", 121u32),
-        ("compute_120", 120),
-        ("compute_110", 110),
-        ("compute_103", 103),
-        ("compute_100", 100),
-        ("compute_90", 90),
-        ("compute_89", 89),
-        ("compute_88", 88),
-        ("compute_87", 87),
-        ("compute_86", 86),
-        ("compute_80", 80),
-        ("compute_75", 75),
-        ("compute_72", 72),
-        ("compute_70", 70),
-    ] {
-        if arch_cc > cc {
-            continue;
-        }
-        match compile_ptx_with_opts(
-            src,
-            CompileOptions {
-                arch: Some(arch),
-                ..Default::default()
-            },
-        ) {
-            Ok(p) => return p,
-            Err(e) => last = format!("{arch}: {e}"),
-        }
-    }
-    panic!("no compile target for cc {cc}: {last}");
+fn compile(src: &str) -> Ptx {
+    // The production loader's flags: all three kernels ship through `load_fn` ->
+    // `compile_and_load`, i.e. NVRTC's default target and no fast-math, so the tiles
+    // compared here are the tiles the engine emits.
+    compile_ptx_with_opts(src, CompileOptions::default())
+        .unwrap_or_else(|e| panic!("NVRTC compile failed (default target): {e:?}"))
 }
 
 fn load(ctx: &Arc<CudaContext>, ptx: Ptx, names: &[&str]) -> (Arc<CudaModule>, Vec<CudaFunction>) {
@@ -111,17 +81,17 @@ fn split_layout_dequant_is_bit_identical_to_the_raw_dequant() {
     let stream: Arc<CudaStream> = ctx.default_stream();
     let (_m0, raw_fns) = load(
         &ctx,
-        compile(&ctx, DEQUANT_Q8_0_KERNEL_SOURCE),
+        compile(DEQUANT_Q8_0_KERNEL_SOURCE),
         &["dequant_q8_0_to_f16", "dequant_q8_0_to_f32"],
     );
     let (_m1, split_fns) = load(
         &ctx,
-        compile(&ctx, DEQUANT_Q8_SPLIT_KERNEL_SOURCE),
+        compile(DEQUANT_Q8_SPLIT_KERNEL_SOURCE),
         &["dequant_q8_split_to_f16", "dequant_q8_split_to_f32"],
     );
     let (_m2, repack) = load(
         &ctx,
-        compile(&ctx, REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE),
+        compile(REPACK_Q8_RAW_TO_SPLIT_KERNEL_SOURCE),
         &["repack_q8_raw_to_split"],
     );
 

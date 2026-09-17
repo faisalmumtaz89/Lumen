@@ -19249,7 +19249,14 @@ impl ComputeBackend for CudaBackend {
         // Pass 2: fused_norm_matvec_f32 normalizes x inline during the dot product.
         // For non-F32 weights: fall back to separate rmsnorm + matvec (quantized
         // kernels have their own loop structure; fusing norm into them is future work).
-        if matches!(&lw.wq, GpuWeightBuf::F32(_)) {
+        // All three must be F32, for the reason `compute_layer_gpu` states at its own
+        // QKV guard: on a mixed-precision layer the `if let GpuWeightBuf::F32` bindings
+        // below bind only the F32 members, so a non-F32 wk/wv would be skipped and
+        // st.scratch.k/v would keep the previous layer's values.
+        if matches!(&lw.wq, GpuWeightBuf::F32(_))
+            && matches!(&lw.wk, GpuWeightBuf::F32(_))
+            && matches!(&lw.wv, GpuWeightBuf::F32(_))
+        {
             // Pass 1: compute rms_scale scalar.
             // SAFETY: x_gpu is [hidden_dim], rms_scale is [1]. Both allocated in init.
             unsafe {

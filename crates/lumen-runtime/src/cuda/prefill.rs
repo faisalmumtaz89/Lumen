@@ -362,16 +362,17 @@ pub(crate) unsafe fn launch_embed_batch(
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("embed_batch_f16 launch: {e}")))?;
     } else if let Some((scheme, emb_kq)) = embedding_kquant {
-        let (group, tag) = match scheme {
-            QuantScheme::Q4_K => (kernels.kq4.as_ref(), "q4_k"),
-            QuantScheme::Q5_K => (kernels.kq5.as_ref(), "q5_k"),
-            QuantScheme::Q6_K => (kernels.kq6.as_ref(), "q6_k"),
+        let group = match scheme {
+            QuantScheme::Q4_K => kernels.kq4.as_ref(),
+            QuantScheme::Q5_K => kernels.kq5.as_ref(),
+            QuantScheme::Q6_K => kernels.kq6.as_ref(),
             other => {
                 return Err(RuntimeError::Compute(format!(
                     "embed_batch: {other:?} is not a K-quant embedding scheme"
                 )))
             }
         };
+        let tag = super::decode::kquant_tag(scheme);
         let group = group.ok_or_else(|| {
             RuntimeError::Compute(format!("embed_batch_{tag}: kernels not loaded"))
         })?;
@@ -1111,12 +1112,13 @@ pub(crate) unsafe fn launch_gemm_projection(
         GpuWeightBuf::Q8Split(w_split) => {
             // A Q8_0 plane resident only in the split layout (its raw copy was released
             // after the split clone): the same dequant -> F16 -> HGEMM route as `Q8Raw`,
-            // reading the split layout, and the same F32 SGEMM fallback conditions. The
+            // reading the split layout, and the same F32 SGEMM fallback conditions (the
+            // alpha/beta F32 override is `Q8Raw`-only, so it is not one of them here). The
             // MMQ route needs the AoS bytes, so a model that prefills Q8 through MMQ
             // keeps its raw planes and never reaches this arm.
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || force_alpha_beta_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
                 if dequant_scratch.len() < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
