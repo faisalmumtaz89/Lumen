@@ -1,7 +1,8 @@
-//! What a K-quant source preserves by default has to be a plane the runtime serves.
-//! The GDN output projection is read at `gdn_v_dim` — `hidden` rows of
-//! `gdn_v_dim / block_elems` blocks — so an `ssm_out` whose row width is not whole
-//! blocks for its scheme is rejected by
+//! What a K-quant source preserves by default has to be a plane the runtime serves —
+//! at its geometry, which is this file, and under the artifact's header, which is
+//! `kquant_ssm_out_header.rs`. The GDN output projection is read at `gdn_v_dim` —
+//! `hidden` rows of `gdn_v_dim / block_elems` blocks — so an `ssm_out` whose row width
+//! is not whole blocks for its scheme is rejected by
 //! `lumen_format::serving_rules::validate_projection_geometry`, which the converter
 //! runs over the planned layers before it writes a byte. The K-quant source policy
 //! plans such a plane as 0.31.0 planned it — requantised to Q8_0, or a stored Q8_0

@@ -225,22 +225,30 @@ OPTIONS:
     --output <path>      Path to output LBC file (default: input with .lbc extension)
     --dequantize         Dequantize tensors to F32 (larger but compatible).
                          Kernel-required exceptions stay quantized: dense
-                         models keep ssm_out Q8_0, or a kept ssm_out in its
-                         stored scheme for a K-quant source on the generic
-                         target (and under LUMEN_CONVERT_SOURCE_FIDELITY=1),
-                         the Metal target keeps ssm_alpha/ssm_beta Q8_0 (its
-                         GDN kernels read only Q8_0), and a K-quant source
-                         keeps a preserved Q6_K output head.
+                         models keep ssm_out Q8_0 (a K-quant source's kept
+                         ssm_out is off under this flag, whose F32 header the
+                         K-quant layer kernels are closed on; a Q5_K or Q8_0
+                         one is still kept under
+                         LUMEN_CONVERT_SOURCE_FIDELITY=1), the Metal target
+                         keeps ssm_alpha/ssm_beta Q8_0 (its GDN kernels read
+                         only Q8_0), and a K-quant source keeps a preserved
+                         Q6_K output head and its K-quant embedding is
+                         dequantized.
     --requant <scheme>   Requantize weights to target scheme during conversion
                          Supported: q4_0, q8_0. Dense models only (refused for
                          MoE: expert tensors carry their source quantization).
+                         A K-quant source keeps its embedding and a preserved
+                         Q6_K head under the requant header; its ssm_out takes
+                         the Q8_0 floor, as without the flag's header.
     --target <backend>   Runtime backend the LBC is being prepared for.
                          metal:   upcast K-quant layer tensors (Q2..Q6_K) to Q8_0
                                   (Metal has no K-quant dispatch kernels).
                          generic: keep K-quant layer tensors as-is (CUDA host);
                                   a K-quant source's Q4_K/Q5_K/Q6_K planes,
                                   a kept embedding, kept ssm_out and Q6_K
-                                  head are served natively there.
+                                  head are served natively there (the kept
+                                  ssm_out needs this target's own header, so
+                                  --requant / --dequantize drop it).
                          Default: metal on macOS, generic elsewhere.
     --from-hf <dir>      Import a Hugging Face compressed-tensors checkpoint
                          directory (pack-quantized INT4 group-32, indexed

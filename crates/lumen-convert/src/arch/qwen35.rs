@@ -57,40 +57,59 @@ impl ArchConverter for Qwen35Converter {
 // ---------------------------------------------------------------------------
 
 /// Whether a layer's `ssm_out` keeps its source scheme. The layer plan and the
-/// layer write both call this one function, on the same `gdn_v_dim`, so the two
-/// cannot disagree. Under source fidelity — which a K-quant source conversion takes
-/// by default — a Q5_K or Q8_0 `ssm_out` is kept, and a K-quant source conversion
-/// also keeps a Q4_K or Q6_K one. A K-quant artifact serves every kept K-quant
-/// `ssm_out` through the general K-quant kernels, Q5_K included; outside one, a kept
-/// Q5_K `ssm_out` has its own dedicated kernel. A kept Q8_0 one takes its split
-/// sibling either way. Only on a target that serves K-quant planes: the Metal target
-/// requantises it.
+/// layer write both call this one function, on the same `gdn_v_dim` and the same
+/// conversion flags, so the two cannot disagree. Under source fidelity — which a
+/// K-quant source conversion takes by default — a Q5_K or Q8_0 `ssm_out` is kept, and
+/// a K-quant source conversion also keeps a Q4_K or Q6_K one. A K-quant artifact
+/// serves every kept K-quant `ssm_out` through the general K-quant kernels, Q5_K
+/// included; outside one, a kept Q5_K `ssm_out` has its own dedicated kernel. A kept
+/// Q8_0 one takes its split sibling either way. Only on a target that serves K-quant
+/// planes: the Metal target requantises it.
 ///
 /// What the DEFAULT keeps has to be servable, exactly as the head arm's default does
-/// (`convert.rs`): the kernels read this plane at `gdn_v_dim` and would truncate a row
-/// that is not whole blocks, and the converter's own post-planning gate
-/// (`serving_rules::validate_layer_plan`) refuses such a plan before a byte is
-/// written, so a K-quant source whose `gdn_v_dim` is not whole blocks for the source
-/// scheme takes the `ssm_out` 0.31.0 planned for it — requantised to Q8_0, or a stored
-/// Q8_0 unchanged, which that gate refuses either way at a width that is not whole
-/// 32-element blocks — rather than a kept plane the gate would refuse. The explicit
-/// `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside that rule: it keeps the Q5_K and
-/// Q8_0 `ssm_out` 0.31.0 kept, at every width, and where that gate refuses the plan
-/// the conversion is refused with it, exactly as in 0.31.0.
+/// (`convert.rs`), and servable on the artifact the conversion is actually writing:
+///
+/// - Geometry: the kernels read this plane at `gdn_v_dim` and would truncate a row
+///   that is not whole blocks, and the converter's own post-planning gate
+///   (`serving_rules::validate_layer_plan`) refuses such a plan before a byte is
+///   written, so a K-quant source whose `gdn_v_dim` is not whole blocks for the source
+///   scheme takes the `ssm_out` 0.31.0 planned for it — requantised to Q8_0, or a
+///   stored Q8_0 unchanged, which that gate refuses either way at a width that is not
+///   whole 32-element blocks — rather than a kept plane the gate would refuse.
+/// - Header: `--requant` and `--dequantize` stamp a Q8_0 / Q4_0 / F32 primary scheme,
+///   and CUDA's Q4_K / Q5_K / Q6_K layer arms are scoped on a K-quant header
+///   (`runtime_defaults::kquant_artifact`), so a K-quant plane kept under one of those
+///   headers would be dequantised to F32 at load — 4 bytes per weight, against the 34
+///   bytes per 32 weights of the Q8_0 `ssm_out` 0.31.0 wrote there, and against the
+///   144 bytes per 256 weights the source stores a Q4_K one in. The default therefore
+///   keeps nothing on those two routes: they write the `ssm_out` 0.31.0 wrote for
+///   them. The embedding and a preserved Q6_K head are kept there because their arms
+///   read the plane's own scheme whatever the header says.
+///
+/// The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside both rules: it keeps
+/// the Q5_K and Q8_0 `ssm_out` 0.31.0 kept, at every width and under `--requant` /
+/// `--dequantize` as well (both of those schemes are served whatever the header is),
+/// and where that gate refuses the plan the conversion is refused with it, exactly as
+/// in 0.31.0.
 pub(crate) fn ssm_out_keeps_source(
     target: ConvertTarget,
     src: Option<GgmlType>,
     gdn_v_dim: usize,
+    requant_to: Option<QuantScheme>,
+    dequantize: bool,
 ) -> bool {
     if !crate::convert::target_serves_kquant(target) {
         return false;
     }
-    // 0.31.0's answer under the explicit switch, unchanged at every width.
+    // 0.31.0's answer under the explicit switch, unchanged at every width and flag.
     let explicit = crate::convert::source_fidelity_requested()
         && matches!(src, Some(GgmlType::Q5_K) | Some(GgmlType::Q8_0));
-    // The K-quant source default: the same schemes plus Q4_K and Q6_K, and only at a
-    // width the kernels read whole blocks at.
+    // The K-quant source default: the same schemes plus Q4_K and Q6_K, only at a width
+    // the kernels read whole blocks at, and only on the route that stamps the K-quant
+    // header those two schemes' arms are scoped on.
     let default_keep = crate::convert::kquant_source()
+        && requant_to.is_none()
+        && !dequantize
         && matches!(
             src,
             Some(GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0)
@@ -559,14 +578,15 @@ fn compute_layer_shape_qwen35(
     let ssm_out_src = gguf
         .find_tensor(&layer_tensor_name(layer, SSM_OUT))
         .map(|t| t.ggml_type);
-    let ssm_out_target = if ssm_out_keeps_source(target, ssm_out_src, gdn_v_dim(gguf)) {
-        None
-    } else {
-        match requant_to {
-            Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-            other => other.or(Some(QuantScheme::Q8_0)),
-        }
-    };
+    let ssm_out_target =
+        if ssm_out_keeps_source(target, ssm_out_src, gdn_v_dim(gguf), requant_to, dequantize) {
+            None
+        } else {
+            match requant_to {
+                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                other => other.or(Some(QuantScheme::Q8_0)),
+            }
+        };
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 
     // Dense FFN weights (present in all layers)
@@ -785,14 +805,15 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             // SOURCE_FIDELITY: keep the source scheme verbatim (None target =
             // passthrough) — the same `ssm_out_keeps_source` the plan used.
             let src = gguf.find_tensor(&name).map(|t| t.ggml_type);
-            let ssm_out_target = if ssm_out_keeps_source(target, src, gdn_v_dim(gguf)) {
-                None
-            } else {
-                match requant_to {
-                    Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-                    other => other.or(Some(QuantScheme::Q8_0)),
-                }
-            };
+            let ssm_out_target =
+                if ssm_out_keeps_source(target, src, gdn_v_dim(gguf), requant_to, dequantize) {
+                    None
+                } else {
+                    match requant_to {
+                        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                        other => other.or(Some(QuantScheme::Q8_0)),
+                    }
+                };
             append_tensor_to_blob_requant(
                 blob,
                 reader,

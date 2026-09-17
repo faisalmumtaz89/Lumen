@@ -419,10 +419,9 @@ pub fn read_output_proj_global(
         // Q6_K head (source-fidelity artifacts): the raw superblocks feed the
         // CUDA dp4a plane kernel; Metal and the CPU fallbacks have no K-quant
         // head and read the F32 copy. Checked before the length cascade so the
-        // final else cannot read the Q6_K bytes as F32. A Q4_K / Q5_K head is
-        // carried raw with its scheme so the backend can refuse it by name (the
-        // converter does not preserve a Q4_K / Q5_K head on any target); a Q4_K plane
-        // has exactly Q4_0's byte length, so the header must decide.
+        // final else cannot read the Q6_K bytes as F32. A Q4_K / Q5_K head takes this
+        // arm too: a Q4_K plane has exactly Q4_0's byte length, so the header must
+        // decide the scheme (the converter does not preserve such a head on any target).
         (q, true)
     } else if raw_bytes.len() == expected_f32_bytes {
         (QuantScheme::F32, true)

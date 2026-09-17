@@ -659,7 +659,9 @@ fn kquant_source_policy_matrix() {
     );
 
     // D under `--requant q8_0`: the embedding keeps its stored K-quant scheme (the flag
-    // requantises layer tensors), so the artifact is still version 5; under
+    // requantises layer tensors, `ssm_out` included — the header it stamps is one the
+    // K-quant layer kernels are closed on, so the default keep is off there,
+    // `kquant_ssm_out_header.rs`), so the artifact is still version 5; under
     // `--dequantize` the embedding becomes F32 and the artifact is version 4.
     let d_requant = convert_with(
         "kquant_requant",
@@ -683,6 +685,11 @@ fn kquant_source_policy_matrix() {
         d_requant.version,
         lumen_format::LBC_VERSION_KQUANT_EMBEDDING,
         "D: --requant q8_0 still stamps the newer version"
+    );
+    assert_eq!(
+        slice(&d_requant, 0, "ssm_out"),
+        (QuantScheme::Q8_0, lbc_len(QuantScheme::Q8_0, hid2)),
+        "D: --requant q8_0 requantises the ssm_out the header's kernels cannot read"
     );
     let d_deq = convert_with(
         "kquant_dequantize",

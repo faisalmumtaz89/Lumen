@@ -20,14 +20,19 @@ use crate::dequant::*;
 /// flag: none of the Q4_K / Q5_K / Q6_K planes it carries — its layer planes, its
 /// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
 /// better than the source bytes, so its default conversion and its fidelity conversion
-/// are the same file, except on a plane the runtime does not serve at that geometry:
-/// a K-quant source's default head, `ssm_out` and F32 gates have to be servable, so a
-/// Q6_K head whose row width is not whole superblocks, an `ssm_out` whose GDN width is
-/// not whole blocks for its scheme, and an `ssm_alpha` / `ssm_beta` of an extent other
-/// than the one the projection reads, are converted by default as 0.31.0 converted
-/// them. The explicit switches answer as 0.31.0 did at every geometry: the head and the
-/// gates are kept as stored, and a Q5_K or Q8_0 `ssm_out` is kept — at a width the plan
-/// gate refuses, the conversion is refused with it. A Q4_K / Q5_K head is not among
+/// are the same file, except on a plane the runtime does not serve on the artifact the
+/// conversion is writing. A K-quant source's default head, `ssm_out` and F32 gates have
+/// to be servable at their geometry, so a Q6_K head whose row width is not whole
+/// superblocks, an `ssm_out` whose GDN width is not whole blocks for its scheme, and an
+/// `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads, are
+/// converted by default as 0.31.0 converted them; and `ssm_out` has to be servable
+/// under the header as well, so `--requant` and `--dequantize`, which stamp a Q8_0 /
+/// Q4_0 / F32 primary scheme the runtime's K-quant layer arms are closed on, take
+/// 0.31.0's `ssm_out` at every width (the embedding and a preserved Q6_K head are still
+/// kept there: their arms read the plane's own scheme whatever the header says). The
+/// explicit switches answer as 0.31.0 did at every geometry and under either flag: the
+/// head and the gates are kept as stored, and a Q5_K or Q8_0 `ssm_out` is kept — at a
+/// width the plan gate refuses, the conversion is refused with it. A Q4_K / Q5_K head is not among
 /// the preserved planes either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K
 /// one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
@@ -92,15 +97,17 @@ impl Drop for KquantSourceScope {
 /// tensor-type index before any tensor data is read: `Some` when a planned
 /// dense FFN projection is Q4_K, Q5_K or Q6_K, carrying the K-quant scheme
 /// with the most planned layer planes (Q4_K for a Q4_K_M file, Q5_K for a
-/// Q5_K_M file) — the LBC header's primary scheme. Planned = the tensor
-/// `find_tensor` resolves for the canonical `blk.<layer>.<suffix>` name below
-/// `num_layers` (the MTP `nextn` layer is excluded by the layer count), which
-/// is the dense planner's own lookup by name: it excludes a non-canonical
-/// spelling and a duplicate of a canonical name, but not the layer KIND — a
-/// file that carried both `attn_qkv` and `attn_q` at one layer would count a
-/// name the planner does not read there (no exporter writes one). `ffn_gate` /
-/// `ffn_up` / `ffn_down` are the dense converter's names, so the caller
-/// applies its result only to the architecture that planner serves.
+/// Q5_K_M file) — the LBC header's primary scheme on a target that serves
+/// such planes, when neither `--requant` nor `--dequantize` sets one.
+/// Planned = the tensor `find_tensor` resolves for the canonical
+/// `blk.<layer>.<suffix>` name below `num_layers` (the MTP `nextn` layer is
+/// excluded by the layer count), which is the dense planner's own lookup by
+/// name: it excludes a non-canonical spelling and a duplicate of a canonical
+/// name, but not the layer KIND — a file that carried both `attn_qkv` and
+/// `attn_q` at one layer would count a name the planner does not read there
+/// (no exporter writes one). `ffn_gate` / `ffn_up` / `ffn_down` are the dense
+/// converter's names, so the caller applies its result only to the
+/// architecture that planner serves.
 pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
     const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
     const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];

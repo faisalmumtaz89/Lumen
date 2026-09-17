@@ -1,22 +1,26 @@
-//! The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch keeps a Q5_K `ssm_out`, on a
-//! source that is not a K-quant source, exactly as 0.31.0 kept it.
+//! What a K-quant source preserves by default has to be servable on the artifact the
+//! conversion actually writes — at its geometry (`kquant_ssm_out_geometry.rs`) and
+//! under its header. `--requant q8_0`, `--requant q4_0` and `--dequantize` stamp a
+//! Q8_0 / Q4_0 / F32 primary scheme, and CUDA's Q4_K / Q5_K / Q6_K layer arms are
+//! scoped on a K-quant header (`runtime_defaults::kquant_artifact`), so a K-quant
+//! `ssm_out` kept under one of those headers is dequantised to F32 at load — 4 bytes
+//! per weight, against the 34 bytes per 32 weights of the Q8_0 plane 0.31.0 wrote
+//! there, on every GDN layer. The default therefore keeps nothing on those three
+//! routes: each writes the `ssm_out` 0.31.0 wrote for it. The embedding and a
+//! preserved Q6_K head are still kept there, because their arms read the plane's own
+//! scheme whatever the header says.
 //!
-//! `ssm_out_keeps_source` has two arms: the K-quant source default, whose two
-//! conditions `kquant_ssm_out_geometry.rs` and `kquant_ssm_out_header.rs` cover, and
-//! this switch, which answers for a source the default policy never touches. Without
-//! the switch such a plane is requantised to the Q8_0 floor; with it the source bytes
-//! are carried. Both halves run here, so the switch is what the difference is
-//! attributed to.
-//!
-//! The pin was derived by building this same fixture against the 0.31.0 converter
+//! The pins were derived by building this same fixture against the 0.31.0 converter
 //! (release commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway
 //! worktree and hashing the `ssm_out` plane of its artifact; the fixture GGUF hashes
 //! the same on both trees, which is the cross-check that the transcription did not
-//! drift.
+//! drift. The pins are on the plane, not on the whole artifact: a K-quant source keeps
+//! its embedding under a requant header, so its artifact is not byte-identical to
+//! 0.31.0's by design.
 //!
-//! `LUMEN_CONVERT_SOURCE_FIDELITY` is process-global, so this binary has one test
-//! function: no parallel test can observe the variable while it is set, whatever
-//! `--test-threads` is, and the run without it comes first.
+//! The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and
+//! unchanged — it keeps only the Q5_K and Q8_0 `ssm_out` 0.31.0 kept, both of which
+//! CUDA serves whatever the header is — so these fixtures set no environment.
 use lumen_convert::convert::{convert_gguf_bytes_to_lbc, ConvertOptions, ConvertTarget};
 use lumen_convert::gguf::{GgmlType, GgufBuilder};
 use lumen_format::quantization::QuantScheme;
@@ -30,13 +34,13 @@ const KVH: u32 = 4;
 const STATE: u64 = 32;
 const V_HEADS: u64 = 8;
 const GROUPS: u64 = 2;
-/// `ssm_out`'s row width: whole superblocks, so the plane is servable as stored and
-/// the geometry rule is not what decides this case.
+/// `ssm_out`'s row width: whole superblocks, so the plane is servable at its geometry
+/// and the header is what decides this case.
 const V_DIM: u64 = V_HEADS * STATE;
 // Four layers: the converter's layer kinds are positional (full attention at 3, 7, …).
 const LAYERS: u32 = 4;
 
-/// The source bytes of one plane, distinct per type and per block.
+/// The source bytes of one plane, distinct per type and per superblock.
 fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     let n = n as usize;
     match t {
@@ -47,9 +51,9 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
             }
             v
         }
-        GgmlType::Q5_K => {
-            let mut v = vec![0u8; n / 256 * 176];
-            for (b, blk) in v.chunks_exact_mut(176).enumerate() {
+        GgmlType::Q4_K => {
+            let mut v = vec![0u8; n / 256 * 144];
+            for (b, blk) in v.chunks_exact_mut(144).enumerate() {
                 blk[0..2].copy_from_slice(&(0x3C00u16 + (b as u16 & 0xFF)).to_le_bytes());
                 blk[2..4].copy_from_slice(&(0x3800u16 + (b as u16 & 0x7F)).to_le_bytes());
                 for (i, q) in blk[16..].iter_mut().enumerate() {
@@ -62,9 +66,9 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 source that is NOT a K-quant source: every dense FFN projection
-/// is Q8_0, so the K-quant source policy does not apply and the only thing that can
-/// keep the Q5_K `ssm_out` is the explicit switch.
+/// A four-layer qwen35 K-quant source: Q8_0 everywhere except the Q4_K `ffn_down`
+/// that makes it one and the Q4_K `ssm_out` under test, whose row width is the whole
+/// superblocks the loader reads.
 fn build() -> Vec<u8> {
     let qkv_rows: u64 = (2 * GROUPS + V_HEADS) * STATE;
     let kvd = (HID / HEADS as u64) * KVH as u64;
@@ -108,13 +112,13 @@ fn build() -> Vec<u8> {
             ("attn_output.weight", [HID, HID], GgmlType::Q8_0),
             ("ffn_gate.weight", [HID, INTER], GgmlType::Q8_0),
             ("ffn_up.weight", [HID, INTER], GgmlType::Q8_0),
-            ("ffn_down.weight", [INTER, HID], GgmlType::Q8_0),
+            ("ffn_down.weight", [INTER, HID], GgmlType::Q4_K),
         ];
         if !full {
             planes.extend([
                 ("attn_qkv.weight", [HID, qkv_rows], GgmlType::Q8_0),
                 ("attn_gate.weight", [HID, V_DIM], GgmlType::Q8_0),
-                ("ssm_out.weight", [V_DIM, HID], GgmlType::Q5_K),
+                ("ssm_out.weight", [V_DIM, HID], GgmlType::Q4_K),
             ]);
         }
         for (nm, dims, t) in planes {
@@ -169,14 +173,11 @@ fn build() -> Vec<u8> {
 }
 
 /// (primary scheme, `ssm_out` scheme, `ssm_out` plane bytes) of layer 0 of the generic
-/// artifact the fixture converts to under default options.
-fn convert_ssm_out(label: &str) -> (QuantScheme, QuantScheme, Vec<u8>) {
-    let out = std::env::temp_dir().join(format!("ssm_out_sf_{label}_{}.lbc", std::process::id()));
-    let opts = ConvertOptions {
-        target: ConvertTarget::Generic,
-        ..Default::default()
-    };
-    convert_gguf_bytes_to_lbc(&build(), &out, &opts).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+/// artifact the fixture converts to under `opts`.
+fn convert_ssm_out(label: &str, opts: &ConvertOptions) -> (QuantScheme, QuantScheme, Vec<u8>) {
+    let out =
+        std::env::temp_dir().join(format!("kquant_ssm_hdr_{label}_{}.lbc", std::process::id()));
+    convert_gguf_bytes_to_lbc(&build(), &out, opts).unwrap_or_else(|e| panic!("{label}: {e:?}"));
     let bytes = std::fs::read(&out).unwrap();
     let f = LbcFile::open(&out).unwrap();
     let layer = &f.layer_indices[0];
@@ -193,6 +194,15 @@ fn convert_ssm_out(label: &str) -> (QuantScheme, QuantScheme, Vec<u8>) {
     (primary, slice.quant, plane)
 }
 
+fn generic(requant_to: Option<QuantScheme>, dequantize_to_f32: bool) -> ConvertOptions {
+    ConvertOptions {
+        target: ConvertTarget::Generic,
+        requant_to,
+        dequantize_to_f32,
+        ..Default::default()
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
@@ -201,47 +211,90 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The 0.31.0 `ssm_out` plane of this fixture under the switch: the Q5_K source plane
-/// carried verbatim, 45 056 bytes.
-const KEPT_SSM_OUT_0_31_0: &str =
-    "9bc4ca919ceaddd70091fb205d3edeb510542c7ad034b058915a1ac7955a481c";
+/// The 0.31.0 `ssm_out` plane of this fixture: the Q4_K source plane requantised to
+/// the Q8_0 floor, 69 632 bytes. One digest for all three routes — 0.31.0 wrote the
+/// same floored plane under `--requant q8_0`, `--requant q4_0` (the floor pre-empts
+/// the 4-bit target) and `--dequantize` (`ssm_out` is never dequantised).
+const SSM_OUT_0_31_0: &str = "b5822048397cfb7e72443fbe3f37fb07bbd0b397c11177cfd71cf768d44e924a";
 
 #[test]
-fn the_source_fidelity_switch_keeps_a_q5_k_ssm_out_off_a_non_kquant_source() {
-    // Without the switch: the Q8_0 floor, as every non-K-quant source has always had.
-    let (primary, quant, plane) = convert_ssm_out("default");
+fn the_default_keep_is_off_under_requant_q8_0() {
+    let (primary, quant, plane) =
+        convert_ssm_out("requant_q8_0", &generic(Some(QuantScheme::Q8_0), false));
     assert_eq!(
         primary,
         QuantScheme::Q8_0,
-        "fixture must not be a K-quant source, or the default arm answers instead"
+        "the header is the requant target"
     );
     assert_eq!(
         quant,
         QuantScheme::Q8_0,
-        "a Q5_K ssm_out was kept without the switch"
+        "a K-quant ssm_out was kept under a header CUDA's K-quant arms are closed on"
     );
-    assert_eq!(plane.len(), 69_632, "the requantised plane is 69 632 bytes");
+    assert_eq!(plane.len(), 69_632, "the 0.31.0 plane is 69 632 bytes");
+    assert_eq!(
+        sha256_hex(&plane),
+        SSM_OUT_0_31_0,
+        "the ssm_out plane moved from 0.31.0"
+    );
+}
 
-    // With it: the source plane, byte for byte, as in 0.31.0.
-    std::env::set_var("LUMEN_CONVERT_SOURCE_FIDELITY", "1");
-    let kept = convert_ssm_out("fidelity");
-    std::env::remove_var("LUMEN_CONVERT_SOURCE_FIDELITY");
-    let (primary, quant, plane) = kept;
-    assert_eq!(primary, QuantScheme::Q8_0, "the header scheme is unchanged");
+#[test]
+fn the_default_keep_is_off_under_requant_q4_0() {
+    let (primary, quant, plane) =
+        convert_ssm_out("requant_q4_0", &generic(Some(QuantScheme::Q4_0), false));
+    assert_eq!(
+        primary,
+        QuantScheme::Q4_0,
+        "the header is the requant target"
+    );
     assert_eq!(
         quant,
-        QuantScheme::Q5_K,
-        "the switch did not keep the Q5_K ssm_out"
-    );
-    assert_eq!(plane.len(), 45_056, "the kept plane is the source's length");
-    assert_eq!(
-        plane,
-        bytes_for(GgmlType::Q5_K, V_DIM * HID),
-        "the kept ssm_out is not the source bytes"
+        QuantScheme::Q8_0,
+        "a K-quant ssm_out was kept under a header CUDA's K-quant arms are closed on"
     );
     assert_eq!(
         sha256_hex(&plane),
-        KEPT_SSM_OUT_0_31_0,
-        "the ssm_out this switch keeps moved from 0.31.0"
+        SSM_OUT_0_31_0,
+        "the ssm_out plane moved from 0.31.0"
+    );
+}
+
+#[test]
+fn the_default_keep_is_off_under_dequantize() {
+    let (primary, quant, plane) = convert_ssm_out("dequantize", &generic(None, true));
+    assert_eq!(primary, QuantScheme::F32, "the header is F32");
+    assert_eq!(
+        quant,
+        QuantScheme::Q8_0,
+        "a K-quant ssm_out was kept under a header CUDA's K-quant arms are closed on"
+    );
+    assert_eq!(
+        sha256_hex(&plane),
+        SSM_OUT_0_31_0,
+        "the ssm_out plane moved from 0.31.0"
+    );
+}
+
+/// The control: the same fixture on the route that does stamp a K-quant header keeps
+/// the plane as stored, so the three assertions above are the header condition and not
+/// the policy switched off.
+#[test]
+fn the_default_keep_is_on_without_either_flag() {
+    let (primary, quant, plane) = convert_ssm_out("default", &generic(None, false));
+    assert_eq!(
+        primary,
+        QuantScheme::Q4_K,
+        "fixture is not a K-quant source"
+    );
+    assert_eq!(
+        quant,
+        QuantScheme::Q4_K,
+        "the Q4_K ssm_out was not preserved"
+    );
+    assert_eq!(
+        plane,
+        bytes_for(GgmlType::Q4_K, V_DIM * HID),
+        "the preserved ssm_out is not the source bytes"
     );
 }
