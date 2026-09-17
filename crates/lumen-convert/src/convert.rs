@@ -26,15 +26,17 @@ use crate::dequant::*;
 /// superblocks, an `ssm_out` whose GDN width is not whole blocks for its scheme, and an
 /// `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads, are
 /// converted by default as 0.31.0 converted them; and `ssm_out` has to be servable
-/// under the header as well, so `--requant` and `--dequantize`, which stamp a Q8_0 /
-/// Q4_0 / F32 primary scheme the runtime's K-quant layer arms are closed on, take
-/// 0.31.0's `ssm_out` at every width (the embedding and a preserved Q6_K head are still
-/// kept there: their arms read the plane's own scheme whatever the header says). The
-/// explicit switches answer as 0.31.0 did at every geometry and under either flag: the
-/// head and the gates are kept as stored, and a Q5_K or Q8_0 `ssm_out` is kept — at a
-/// width the plan gate refuses, the conversion is refused with it. A Q4_K / Q5_K head is not among
-/// the preserved planes either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K
-/// one, so the head arm requantises it.
+/// under the header as well, so `--requant` and `--dequantize`, which stamp a Q8_0
+/// / Q4_0 / F32 primary scheme the runtime's K-quant layer arms are closed on, take
+/// 0.31.0's `ssm_out` at every width. The other preserved planes go by arms that read
+/// a plane's stored scheme whatever the header is: a kept embedding survives both
+/// `--requant` schemes, while `--dequantize` dequantises it; a preserved Q6_K head
+/// survives `--requant q8_0` and `--dequantize`, while `--requant q4_0` requantises
+/// it as 0.31.0 did. The explicit switches answer as 0.31.0 did at every geometry and
+/// under either flag: the head and the gates are kept as stored, and a Q5_K or Q8_0
+/// `ssm_out` is kept — at a width the plan gate refuses, the conversion is refused
+/// with it. A Q4_K / Q5_K head is not among the preserved planes either: the runtime
+/// has a Q6_K head kernel and no Q4_K / Q5_K one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
     kquant_source() || source_fidelity_requested()
 }

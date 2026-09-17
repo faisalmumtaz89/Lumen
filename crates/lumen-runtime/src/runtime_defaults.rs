@@ -1532,9 +1532,11 @@ pub fn q4_1_down_enabled() -> bool {
 }
 
 /// `LUMEN_CUDA_KQUANT=0`: kill-switch for the general K-quant kernels — a
-/// rollback to refusing at load a K-quant artifact that carries a Q4_K / Q5_K /
-/// Q6_K layer or embedding plane, never an A/B axis (the pre-kernel path cannot
-/// serve them). Default ON.
+/// rollback to refusing at load the Q4_K / Q5_K / Q6_K layer planes of an artifact
+/// whose header scheme is K-quant, and a Q4_K / Q5_K / Q6_K embedding plane whatever
+/// the header carries (the gather reads the plane's own scheme, and `--requant q8_0`
+/// of a K-quant source preserves such an embedding under a Q8_0 header), never an A/B
+/// axis: those kernels are such a plane's only route on this backend. Default ON.
 pub fn cuda_kquant_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_KQUANT") {

@@ -237,9 +237,11 @@ OPTIONS:
     --requant <scheme>   Requantize weights to target scheme during conversion
                          Supported: q4_0, q8_0. Dense models only (refused for
                          MoE: expert tensors carry their source quantization).
-                         A K-quant source keeps its embedding and a preserved
-                         Q6_K head under the requant header; its ssm_out takes
-                         the Q8_0 floor, as without the flag's header.
+                         A K-quant source's kept embedding survives
+                         either requant header; q8_0 also keeps a
+                         preserved Q6_K head, while q4_0 requantises
+                         it. Its ssm_out takes the Q8_0 floor: the
+                         K-quant layer kernels are closed on that header.
     --target <backend>   Runtime backend the LBC is being prepared for.
                          metal:   upcast K-quant layer tensors (Q2..Q6_K) to Q8_0
                                   (Metal has no K-quant dispatch kernels).

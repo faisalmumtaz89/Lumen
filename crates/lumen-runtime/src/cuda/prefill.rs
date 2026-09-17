@@ -362,16 +362,12 @@ pub(crate) unsafe fn launch_embed_batch(
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("embed_batch_f16 launch: {e}")))?;
     } else if let Some((scheme, emb_kq)) = embedding_kquant {
-        let group = match scheme {
-            QuantScheme::Q4_K => kernels.kq4.as_ref(),
-            QuantScheme::Q5_K => kernels.kq5.as_ref(),
-            QuantScheme::Q6_K => kernels.kq6.as_ref(),
-            other => {
-                return Err(RuntimeError::Compute(format!(
-                    "embed_batch: {other:?} is not a K-quant embedding scheme"
-                )))
-            }
-        };
+        if !scheme.is_kquant_superblock() {
+            return Err(RuntimeError::Compute(format!(
+                "embed_batch: {scheme:?} is not a K-quant embedding scheme"
+            )));
+        }
+        let group = super::decode::kquant_kernels(kernels, scheme);
         let tag = super::decode::kquant_tag(scheme);
         let group = group.ok_or_else(|| {
             RuntimeError::Compute(format!("embed_batch_{tag}: kernels not loaded"))
@@ -2484,16 +2480,12 @@ unsafe fn launch_dequant_kquant_to_f16(
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
-    let group = match scheme {
-        QuantScheme::Q4_K => kernels.kq4.as_ref(),
-        QuantScheme::Q5_K => kernels.kq5.as_ref(),
-        QuantScheme::Q6_K => kernels.kq6.as_ref(),
-        other => {
-            return Err(RuntimeError::Compute(format!(
-                "dequant to F16 {label}: {other:?} is not a K-quant scheme"
-            )))
-        }
-    };
+    if !scheme.is_kquant_superblock() {
+        return Err(RuntimeError::Compute(format!(
+            "dequant to F16 {label}: {scheme:?} is not a K-quant scheme"
+        )));
+    }
+    let group = super::decode::kquant_kernels(kernels, scheme);
     let (block_bytes, tag) = super::decode::kquant_layout(scheme);
     let group = group.ok_or_else(|| {
         RuntimeError::Compute(format!("dequant_{tag}_to_f16 {label}: kernels not loaded"))

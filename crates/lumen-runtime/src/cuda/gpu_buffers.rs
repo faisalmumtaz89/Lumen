@@ -784,7 +784,8 @@ pub(crate) fn kquant_planes_servable() -> bool {
 
 fn kquant_refusal(what: &str, quant: QuantScheme) -> RuntimeError {
     RuntimeError::Compute(format!(
-        "CUDA: {what} is {quant:?} and LUMEN_CUDA_KQUANT=0 switched the K-quant kernels off; a K-quant artifact is refused at load rather than served through the F32 host-dequant fallback"
+        "CUDA: {what} is {quant:?} and LUMEN_CUDA_KQUANT=0 switched the K-quant kernels off; \
+         they are the plane's only route on this backend, so the load is refused"
     ))
 }
 
@@ -880,7 +881,8 @@ pub(crate) fn kquant_plane_counters() -> &'static KquantPlaneCounters {
 }
 
 /// Refuse the K-quant planes of a K-quant artifact (LBC header scheme Q4_K,
-/// Q5_K or Q6_K) when the general K-quant kernels are absent or switched off.
+/// Q5_K or Q6_K) when `LUMEN_CUDA_KQUANT=0` switched the general K-quant
+/// kernels off; a group that failed to load is refused at preload instead.
 /// A Q4_0/Q8_0/BF16 artifact keeps its occasional K-quant plane on the F32
 /// host-dequant path as before; Q2_K, Q3_K and Q5_0 planes are never refused.
 pub(crate) fn validate_kquant_planes(
@@ -913,11 +915,15 @@ fn validate_kquant_planes_with(
     Ok(())
 }
 
-/// A K-quant artifact's K-quant embedding is refused while the K-quant gathers
-/// are absent or switched off; every other artifact's embedding keeps its
-/// existing path (the scoping rule of `kquant_artifact`).
+/// A K-quant embedding plane is refused while `LUMEN_CUDA_KQUANT=0` has the
+/// K-quant gathers switched off, whatever the LBC header carries: the arm
+/// matches the plane's own stored scheme, so a Q4_K / Q5_K / Q6_K embedding
+/// preserved under a requantised header — what `--requant q8_0` of a K-quant
+/// source writes — reaches the same gather as a K-quant artifact's. Every other
+/// embedding scheme keeps its existing path. The layer planes are scoped on the
+/// header instead (`validate_kquant_planes`), because their K-quant arms are.
 pub(crate) fn validate_kquant_embedding(quant: QuantScheme) -> Result<(), RuntimeError> {
-    validate_kquant_embedding_with(quant, kquant_planes_servable() || !kquant_artifact())
+    validate_kquant_embedding_with(quant, kquant_planes_servable())
 }
 
 fn validate_kquant_embedding_with(quant: QuantScheme, servable: bool) -> Result<(), RuntimeError> {
@@ -1804,11 +1810,11 @@ pub fn repack_layer_q4_to_aligned(
 mod tests {
     use super::*;
 
-    /// A K-quant artifact's K-quant planes are refused while the general kernels are absent;
+    /// A K-quant artifact's K-quant planes are refused while the kernels are switched off;
     /// a Q4_0 artifact's occasional K-quant plane (the 9B/MoE `attn_q`) and every Q5_0/Q2_K/Q3_K
     /// plane keep the host-dequant path; the message names the tensor, its scheme and CUDA.
     #[test]
-    fn kquant_planes_of_a_kquant_artifact_are_refused_without_the_kernels() {
+    fn kquant_planes_of_a_kquant_artifact_are_refused_with_the_kernels_off() {
         use lumen_format::index::{SubtensorOffsets, TensorSlice};
         fn plane(quant: QuantScheme, length: u64) -> TensorSlice {
             TensorSlice {
@@ -1915,6 +1921,35 @@ mod tests {
             QuantScheme::F32,
         ] {
             assert!(validate_kquant_embedding_with(q, false).is_ok());
+        }
+    }
+
+    /// The embedding refusal follows `LUMEN_CUDA_KQUANT` alone. The embedding arm
+    /// matches the plane's own stored scheme whatever the LBC header carries, so a
+    /// Q4_K / Q5_K / Q6_K embedding preserved under a requantised header — what
+    /// `--requant q8_0` of a K-quant source writes — reaches the same gather as a
+    /// K-quant artifact's and the switch has to reach it too.
+    #[test]
+    fn kquant_embedding_refusal_follows_the_switch_whatever_the_header() {
+        for header in [
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+            QuantScheme::F32,
+            QuantScheme::Q4_K,
+        ] {
+            crate::runtime_defaults::set_model_primary_quant(header);
+            for q in [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K] {
+                assert_eq!(
+                    validate_kquant_embedding(q).is_ok(),
+                    kquant_planes_servable(),
+                    "a {q:?} embedding under a {header:?} header follows the switch"
+                );
+                assert!(validate_kquant_embedding_with(q, false).is_err());
+                assert!(validate_kquant_embedding_with(q, true).is_ok());
+            }
+            for q in [QuantScheme::Q8_0, QuantScheme::Q4_0, QuantScheme::Bf16] {
+                assert!(validate_kquant_embedding(q).is_ok());
+            }
         }
     }
 

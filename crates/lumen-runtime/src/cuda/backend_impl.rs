@@ -2340,7 +2340,7 @@ impl CudaBackend {
             }
             .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 gpu launch: {e}")))?;
         } else if let Some((scheme, ref emb_kq)) = st.globals.embedding_kquant {
-            let func = &kquant_kernels(&st.kernels, scheme)
+            let func = &super::decode::kquant_kernels(&st.kernels, scheme)
                 .ok_or_else(|| {
                     RuntimeError::Compute(format!(
                         "embed_token_{}: kernels not loaded",
@@ -16184,23 +16184,16 @@ fn weight_uses_dp4a_q8_1(weight: &GpuWeightBuf, kernels: &KernelSet) -> bool {
         GpuWeightBuf::Q8Aligned(_) => kernels.matvec_q8_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Aligned(_) => kernels.matvec_q4_aligned_q8_1.is_some(),
         GpuWeightBuf::Q4Raw(_) => kernels.matvec_q4_0_dp4a.is_some(),
-        GpuWeightBuf::Q4KRaw(_) => kquant_kernels(kernels, QuantScheme::Q4_K).is_some(),
-        GpuWeightBuf::Q5KRaw(_) => kquant_kernels(kernels, QuantScheme::Q5_K).is_some(),
-        GpuWeightBuf::Q6KRaw(_) => kquant_kernels(kernels, QuantScheme::Q6_K).is_some(),
+        GpuWeightBuf::Q4KRaw(_) => {
+            super::decode::kquant_kernels(kernels, QuantScheme::Q4_K).is_some()
+        }
+        GpuWeightBuf::Q5KRaw(_) => {
+            super::decode::kquant_kernels(kernels, QuantScheme::Q5_K).is_some()
+        }
+        GpuWeightBuf::Q6KRaw(_) => {
+            super::decode::kquant_kernels(kernels, QuantScheme::Q6_K).is_some()
+        }
         _ => false,
-    }
-}
-
-/// The kernel group that serves `scheme`, when this build loaded it.
-fn kquant_kernels(
-    kernels: &KernelSet,
-    scheme: QuantScheme,
-) -> Option<&super::decode::KquantKernels> {
-    match scheme {
-        QuantScheme::Q4_K => kernels.kq4.as_ref(),
-        QuantScheme::Q5_K => kernels.kq5.as_ref(),
-        QuantScheme::Q6_K => kernels.kq6.as_ref(),
-        _ => None,
     }
 }
 
@@ -16248,7 +16241,7 @@ unsafe fn launch_matvec_kquant_preq8_1(
     label: &str,
 ) -> Result<(), RuntimeError> {
     let (_, tag) = kquant_layout(scheme);
-    let group = kquant_kernels(kernels, scheme).ok_or_else(|| {
+    let group = super::decode::kquant_kernels(kernels, scheme).ok_or_else(|| {
         RuntimeError::Compute(format!(
             "matvec {label}: {scheme:?} plane but the {tag} kernels are not loaded"
         ))
@@ -19041,7 +19034,7 @@ impl ComputeBackend for CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f16 launch: {e}")))?;
             } else if let Some((scheme, ref emb_kq)) = st.globals.embedding_kquant {
-                let func = &kquant_kernels(&st.kernels, scheme)
+                let func = &super::decode::kquant_kernels(&st.kernels, scheme)
                     .ok_or_else(|| {
                         RuntimeError::Compute(format!(
                             "embed_token_{}: kernels not loaded",
@@ -20664,7 +20657,7 @@ impl ComputeBackend for CudaBackend {
                     return Err(RuntimeError::Compute(format!(
                         "CUDA: this is a K-quant artifact and the {tag} kernels did not load on \
                          this device (see the `[CUDA] kquant {tag}: FAILED` line above); refused \
-                         at load rather than served through the F32 host-dequant fallback"
+                         at load rather than at the first token"
                     )));
                 }
             }

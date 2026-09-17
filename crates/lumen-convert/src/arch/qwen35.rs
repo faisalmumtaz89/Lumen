@@ -83,8 +83,10 @@ impl ArchConverter for Qwen35Converter {
 ///   bytes per 32 weights of the Q8_0 `ssm_out` 0.31.0 wrote there, and against the
 ///   144 bytes per 256 weights the source stores a Q4_K one in. The default therefore
 ///   keeps nothing on those two routes: they write the `ssm_out` 0.31.0 wrote for
-///   them. The embedding and a preserved Q6_K head are kept there because their arms
-///   read the plane's own scheme whatever the header says.
+///   them. The other preserved planes go by arms that read a plane's stored scheme
+///   whatever the header is: a kept embedding survives both `--requant` schemes, while
+///   `--dequantize` dequantises it; a preserved Q6_K head survives `--requant q8_0`
+///   and `--dequantize`, while `--requant q4_0` requantises it as 0.31.0 did.
 ///
 /// The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside both rules: it keeps
 /// the Q5_K and Q8_0 `ssm_out` 0.31.0 kept, at every width and under `--requant` /

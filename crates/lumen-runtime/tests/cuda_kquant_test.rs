@@ -1,7 +1,7 @@
 //! GPU tests for the K-quant kernels (`matvec_q*_k_q8_1(_residual)`,
 //! `dequant_q*_k_to_f16`, `embed_token_q*_k`, `embed_batch_q*_k`).
 //!
-//! Two families:
+//! Three families:
 //!
 //! * dequant identity — the device dequant (through the F16 tile and through
 //!   the embedding gathers) is bit-identical to the host reference
@@ -17,6 +17,12 @@
 //!   `E_kq` / `E_q4` column reports the K-quant route's activation-quantization
 //!   error next to the shipped Q4_0 dp4a route's over the same activations
 //!   (~1.00 on every scheme and shape) — reported evidence, not a gate.
+//! * matvec edge blocks — the same comparison on a 71 x 512 shape whose rows mix
+//!   the edge fixtures with random superblocks. The edge scales carry the
+//!   reference up to ~1e8, so the absolute bar is scaled by it
+//!   (`max_abs < 1e-3 * max|ref|`); `rel_l2 <= 1e-4` is the gate a defect fires.
+//!   The two saturated-`d` fixtures are held out (`SATURATED_D_FIXTURES`) and
+//!   are covered bit-for-bit by the dequant identity family.
 //!
 //! Requires a CUDA GPU: SM 6.1+ for the dequant / edge gates, SM 8.0+ for the
 //! `*_matvec_shapes` comparator (it loads the compute_80 Q4_0 dp4a kernel):

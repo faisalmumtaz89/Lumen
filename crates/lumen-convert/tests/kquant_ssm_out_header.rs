@@ -5,10 +5,12 @@
 //! scoped on a K-quant header (`runtime_defaults::kquant_artifact`), so a K-quant
 //! `ssm_out` kept under one of those headers is dequantised to F32 at load — 4 bytes
 //! per weight, against the 34 bytes per 32 weights of the Q8_0 plane 0.31.0 wrote
-//! there, on every GDN layer. The default therefore keeps nothing on those three
-//! routes: each writes the `ssm_out` 0.31.0 wrote for it. The embedding and a
-//! preserved Q6_K head are still kept there, because their arms read the plane's own
-//! scheme whatever the header says.
+//! there, on every GDN layer. The default therefore keeps nothing on those
+//! three routes: each writes the `ssm_out` 0.31.0 wrote for it. The other
+//! preserved planes go by arms that read a plane's stored scheme whatever
+//! the header is: a kept embedding survives both `--requant` schemes, while
+//! `--dequantize` dequantises it; a preserved Q6_K head survives `--requant q8_0`
+//! and `--dequantize`, while `--requant q4_0` requantises it as 0.31.0 did.
 //!
 //! The pins were derived by building this same fixture against the 0.31.0 converter
 //! (release commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway

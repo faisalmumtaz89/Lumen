@@ -62,6 +62,16 @@ pub(super) fn kquant_layout(scheme: QuantScheme) -> (usize, &'static str) {
     }
 }
 
+/// The kernel group that serves `scheme`, when this build loaded it.
+pub(super) fn kquant_kernels(kernels: &KernelSet, scheme: QuantScheme) -> Option<&KquantKernels> {
+    match scheme {
+        QuantScheme::Q4_K => kernels.kq4.as_ref(),
+        QuantScheme::Q5_K => kernels.kq5.as_ref(),
+        QuantScheme::Q6_K => kernels.kq6.as_ref(),
+        _ => None,
+    }
+}
+
 /// The receipt tag of a K-quant scheme (`q4_k`, `q5_k`, `q6_k`).
 pub(super) fn kquant_tag(scheme: QuantScheme) -> &'static str {
     kquant_layout(scheme).1
