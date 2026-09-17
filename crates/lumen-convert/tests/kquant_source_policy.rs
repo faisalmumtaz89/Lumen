@@ -8,8 +8,9 @@
 //! Q8_0, and so does J: it ties its head to the embedding, so the embedding is
 //! dequantised and the tied head is not a K-quant one); a file that is not a K-quant
 //! source — the shipping Q4_0 shape with its Q5_K `ssm_out`, Q6_K head and Q6_K
-//! full-attention `attn_q`, a GDN pair stored as K-quant, or a K-quant embedding
-//! alone — converts exactly as before.
+//! full-attention `attn_q`, a GDN pair stored as K-quant, a K-quant embedding
+//! alone, or a K-quant tensor under a `blk.` name no planner lookup resolves to —
+//! converts exactly as before.
 //!
 //! The Metal target is untouched by the policy: it has no K-quant kernel, so it upcasts
 //! or re-quantises every K-quant plane exactly as in 0.31.0. `metal_target_is_0_31_0`
@@ -79,19 +80,31 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
 /// A four-layer qwen35 model whose weight types come from `ty(layer, suffix)`;
 /// the embedding and the head take `embd` and `head`; the GDN gates are F32.
 fn build(embd: GgmlType, head: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> Vec<u8> {
-    build_with_head(embd, Some(head), ty)
+    build_with_head(embd, Some(head), ty, &[])
 }
 
 /// [`build`] with no `output.weight`: the source ties its head to the embedding, and
 /// the converter's weight-tying path gives the head the embedding's storage and scheme.
 fn build_tied(embd: GgmlType, ty: impl Fn(u32, &str) -> GgmlType) -> Vec<u8> {
-    build_with_head(embd, None, ty)
+    build_with_head(embd, None, ty, &[])
+}
+
+/// [`build`] plus `extra` tensors appended after the layers: names no planner lookup
+/// resolves to, so the artifact must not move.
+fn build_with_extra(
+    embd: GgmlType,
+    head: GgmlType,
+    ty: impl Fn(u32, &str) -> GgmlType,
+    extra: &[(&str, GgmlType, [u64; 2])],
+) -> Vec<u8> {
+    build_with_head(embd, Some(head), ty, extra)
 }
 
 fn build_with_head(
     embd: GgmlType,
     head: Option<GgmlType>,
     ty: impl Fn(u32, &str) -> GgmlType,
+    extra: &[(&str, GgmlType, [u64; 2])],
 ) -> Vec<u8> {
     let mut b = GgufBuilder::new();
     let k = |s: &str| format!("qwen35.{s}");
@@ -187,6 +200,10 @@ fn build_with_head(
             &[HID, nh],
             &vec![0.02; (HID * nh) as usize],
         );
+    }
+    for (nm, t, dims) in extra {
+        let n: u64 = dims.iter().product();
+        b.add_tensor(nm, *t, dims, bytes_for(*t, n));
     }
     b.build()
 }
@@ -407,6 +424,28 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
         (
             "q8_0_q5k_embd",
             build(GgmlType::Q5_K, GgmlType::Q8_0, |_, _| GgmlType::Q8_0),
+        ),
+        // K. `pure_q8_0` carrying a Q4_K tensor no planner lookup resolves to: a
+        // layer index spelled `blk.00`, and a second `blk.0.ffn_gate.weight` after
+        // the one `find_tensor` returns. Every projection the planner reads is still
+        // Q8_0, so both convert to `pure_q8_0`'s 0.31.0 bytes on both targets.
+        (
+            "pure_q8_0_noncanonical_layer",
+            build_with_extra(
+                GgmlType::Q8_0,
+                GgmlType::Q8_0,
+                |_, _| GgmlType::Q8_0,
+                &[("blk.00.ffn_gate.weight", GgmlType::Q4_K, [HID, INTER])],
+            ),
+        ),
+        (
+            "pure_q8_0_shadowed_ffn_gate",
+            build_with_extra(
+                GgmlType::Q8_0,
+                GgmlType::Q8_0,
+                |_, _| GgmlType::Q8_0,
+                &[("blk.0.ffn_gate.weight", GgmlType::Q4_K, [HID, INTER])],
+            ),
         ),
     ];
     // I. A K-quant source whose GDN pair mixes a K-quant attn_qkv with an F32 gate.
@@ -827,6 +866,8 @@ fn assert_non_kquant_conversions_pinned() {
         ("pure_q8_0", BOTH),
         ("q4_0_q6k_embd", BOTH),
         ("q8_0_q5k_embd", BOTH),
+        ("pure_q8_0_noncanonical_layer", BOTH),
+        ("pure_q8_0_shadowed_ffn_gate", BOTH),
     ];
     for (name, targets) in names {
         let gguf = fixture(name);
@@ -934,7 +975,15 @@ const PINNED: &[(&str, &str, &str)] = &[
         "metal",
         "4b295d9954af68941706adc72ddebf95b4802d4097ddb1d74e51fc84537d4407",
     ),
+    ("pure_q8_0_noncanonical_layer", "generic", PURE_Q8_0_0_31_0),
+    ("pure_q8_0_noncanonical_layer", "metal", PURE_Q8_0_0_31_0),
+    ("pure_q8_0_shadowed_ffn_gate", "generic", PURE_Q8_0_0_31_0),
+    ("pure_q8_0_shadowed_ffn_gate", "metal", PURE_Q8_0_0_31_0),
 ];
+
+/// `pure_q8_0`'s 0.31.0 artifact digest, the same on both targets. Fixture K's two
+/// sources add a tensor the planner never reads, so they convert to these bytes too.
+const PURE_Q8_0_0_31_0: &str = "0238150d01202e87b8adf526846ffc138ce23a7ce831744edc7342175c8f81bb";
 
 /// A fixture the 0.31.0 Metal target refuses to convert; see [`metal_target_is_0_31_0`].
 const METAL_REFUSED: &str = "refused";
@@ -999,4 +1048,6 @@ const METAL_PINNED: &[(&str, &str)] = &[
         "tied_kquant_src",
         "f7d4ff8f8633dd84a6785e208872e0aea5650b39157d19f9f56b7c095a0f1762",
     ),
+    ("pure_q8_0_noncanonical_layer", PURE_Q8_0_0_31_0),
+    ("pure_q8_0_shadowed_ffn_gate", PURE_Q8_0_0_31_0),
 ];

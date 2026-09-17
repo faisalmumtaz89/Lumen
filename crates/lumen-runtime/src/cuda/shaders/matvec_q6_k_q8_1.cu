@@ -26,8 +26,8 @@
 // 128-byte ql field — four 32-byte sectors, five when the 210-byte stride misaligns them — plus the qh
 // word and the two scale bytes their elements need. Lane word `lane` holds the
 // low nibbles of group (n, g_lo) and the high nibbles of group (n, g_lo + 2)
-// for elements j0 .. j0 + 3, so a lane does two dp4a per superblock, and the
-// activation sums the `- 32` term needs are the lane's own 4-element sums,
+// for elements j0 .. j0 + 3, so a lane does two weight dp4a per superblock, and
+// two more for the activation sums the `- 32` term needs — the lane's own 4-element sums,
 // folded by the final warp reduction. Q6_K is the one scheme where the
 // thread-per-group body of the Q4_K/Q5_K kernels loses: its 210-byte
 // superblock is only 2-byte aligned, so that body's per-thread 16-bit loads

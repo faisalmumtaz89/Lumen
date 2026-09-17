@@ -1531,11 +1531,6 @@ pub fn dequant_layer_q8_to_f16(
                 Ok(Some(f16_buf))
             }
             GpuWeightBuf::Q4Aligned(_) => Ok(None), // Q4Aligned uses dp4a path, no F16 cache needed
-            GpuWeightBuf::Q8Split(_) => Err(RuntimeError::Compute(
-                "F16 cache requested for a Q8Split base: the caches are built before the \
-                 split-clone pass releases raw planes, so this is an ordering regression"
-                    .to_string(),
-            )),
             _ => Ok(None), // F16Raw already in the right format for HGEMM -- no dequant needed
         }
     };

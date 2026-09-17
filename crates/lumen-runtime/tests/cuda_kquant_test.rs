@@ -46,16 +46,27 @@ fn compile_dp4a_loader(ctx: &Arc<CudaContext>, src: &str) -> (Ptx, &'static str)
     let (major, minor) = ctx.compute_capability().expect("compute capability");
     let cc = (major * 10 + minor) as u32;
     let mut last = String::new();
+    // Every spelling `cuda::ffi::arch_name` knows at or above sm_61, `compute_61`
+    // first and the rest descending, so the target this picks is the one
+    // `dp4a_arch_for` picks on the same device and toolkit (that function is
+    // crate-private, so an integration test cannot call it).
     let candidates: Vec<(&'static str, u32)> = vec![
         ("compute_61", 61),
+        ("compute_121", 121),
         ("compute_120", 120),
+        ("compute_110", 110),
+        ("compute_103", 103),
         ("compute_100", 100),
         ("compute_90", 90),
         ("compute_89", 89),
+        ("compute_88", 88),
+        ("compute_87", 87),
         ("compute_86", 86),
         ("compute_80", 80),
         ("compute_75", 75),
+        ("compute_72", 72),
         ("compute_70", 70),
+        ("compute_62", 62),
     ];
     for (arch, arch_cc) in candidates {
         if arch_cc > cc {

@@ -25,13 +25,19 @@ fn compile(ctx: &Arc<CudaContext>, src: &str) -> Ptx {
     let cc = (major * 10 + minor) as u32;
     let mut last = String::new();
     for (arch, arch_cc) in [
-        ("compute_120", 120u32),
+        ("compute_121", 121u32),
+        ("compute_120", 120),
+        ("compute_110", 110),
+        ("compute_103", 103),
         ("compute_100", 100),
         ("compute_90", 90),
         ("compute_89", 89),
+        ("compute_88", 88),
+        ("compute_87", 87),
         ("compute_86", 86),
         ("compute_80", 80),
         ("compute_75", 75),
+        ("compute_72", 72),
         ("compute_70", 70),
     ] {
         if arch_cc > cc {

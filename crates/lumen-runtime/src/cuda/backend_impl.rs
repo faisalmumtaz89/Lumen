@@ -12064,6 +12064,14 @@ unsafe fn launch_matvec(
                 kernels.quantize_f32_to_q8_1.as_ref(),
                 input_q8_1_scratch.as_deref_mut(),
             ) {
+                // the quantize below writes `(in_dim / 32) * 36` bytes into the scratch
+                let needed_q8 = (in_dim / 32) * 36;
+                if q8_1_buf.len() < needed_q8 {
+                    return Err(RuntimeError::Compute(format!(
+                        "matvec {label}: Q8Split Q8_1 scratch {} bytes (need {needed_q8})",
+                        q8_1_buf.len()
+                    )));
+                }
                 launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
                 return launch_matvec_preq8_1_split(
                     device,
@@ -13186,6 +13194,14 @@ unsafe fn launch_matvec_residual(
                 kernels.quantize_f32_to_q8_1.as_ref(),
                 input_q8_1_scratch.as_deref_mut(),
             ) {
+                // the quantize below writes `(in_dim / 32) * 36` bytes into the scratch
+                let needed_q8 = (in_dim / 32) * 36;
+                if q8_1_buf.len() < needed_q8 {
+                    return Err(RuntimeError::Compute(format!(
+                        "matvec {label}: Q8Split Q8_1 scratch {} bytes (need {needed_q8})",
+                        q8_1_buf.len()
+                    )));
+                }
                 launch_quantize_input_q8_1(device, quant_fn, input, q8_1_buf, in_dim, label)?;
                 return launch_matvec_preq8_1_residual_split(
                     device,

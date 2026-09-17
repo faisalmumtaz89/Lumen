@@ -76,8 +76,9 @@ impl Drop for KquantSourceScope {
 /// tensor-type index before any tensor data is read: `Some` when a planned
 /// dense FFN projection is Q4_K, Q5_K or Q6_K, carrying the K-quant scheme
 /// with the most planned layer planes (Q4_K for a Q4_K_M file, Q5_K for a
-/// Q5_K_M file) — the LBC header's primary scheme. Planned = layers below
-/// `num_layers` (the MTP `nextn` layer is excluded by the layer count).
+/// Q5_K_M file) — the LBC header's primary scheme. Planned = the tensor the
+/// planner reads for a layer below `num_layers` (the MTP `nextn` layer is
+/// excluded by the layer count), resolved through the planner's own lookup.
 pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
     const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
     const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];
@@ -90,7 +91,21 @@ pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<Q
         let Some((layer, suffix)) = rest.split_once('.') else {
             continue;
         };
-        if layer.parse::<u32>().map_or(true, |l| l >= num_layers) {
+        let Ok(l) = layer.parse::<u32>() else {
+            continue;
+        };
+        if l >= num_layers {
+            continue;
+        }
+        // Count only the tensor the planner will read for this layer and suffix:
+        // it builds the name with `layer_tensor_name` and takes `find_tensor`'s
+        // first match, so a non-canonical spelling (`blk.00.ffn_gate.weight`) or a
+        // second tensor of the same name is never planned, and must not decide a
+        // scheme the planes do not have.
+        if !gguf
+            .find_tensor(&layer_tensor_name(l as usize, suffix))
+            .is_some_and(|planned| std::ptr::eq(planned, t))
+        {
             continue;
         }
         let slot = match t.ggml_type {
@@ -116,7 +131,7 @@ pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<Q
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
 use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
-use crate::tensor_io::read_tensor_data;
+use crate::tensor_io::{layer_tensor_name, read_tensor_data};
 use crate::tensor_names::*;
 use lumen_format::header::LbcHeader;
 use lumen_format::quantization::QuantScheme;

@@ -58,9 +58,11 @@ impl ArchConverter for Qwen35Converter {
 /// Whether a layer's `ssm_out` keeps its source scheme. The layer plan and the
 /// layer write both call this one function, so the two cannot disagree. Under
 /// source fidelity — which a K-quant source conversion takes by default — a Q5_K or
-/// Q8_0 `ssm_out` is kept (the runtime's dedicated kernels serve them); a K-quant
-/// source conversion also keeps a Q4_K or Q6_K one (the general K-quant kernels serve
-/// them). Only on a target that serves K-quant planes: the Metal target requantises it.
+/// Q8_0 `ssm_out` is kept, and a K-quant source conversion also keeps a Q4_K or Q6_K
+/// one. A K-quant artifact serves every kept K-quant `ssm_out` through the general
+/// K-quant kernels, Q5_K included; outside one, a kept Q5_K `ssm_out` has its own
+/// dedicated kernel. A kept Q8_0 one takes its split sibling either way. Only on a
+/// target that serves K-quant planes: the Metal target requantises it.
 pub(crate) fn ssm_out_keeps_source(target: ConvertTarget, src: Option<GgmlType>) -> bool {
     crate::convert::target_serves_kquant(target)
         && crate::convert::source_fidelity()
