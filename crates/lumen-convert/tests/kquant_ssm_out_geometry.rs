@@ -1,12 +1,13 @@
 //! What a K-quant source preserves by default has to be a plane the runtime serves.
 //! The GDN output projection is read at `gdn_v_dim` — `hidden` rows of
 //! `gdn_v_dim / block_elems` blocks — so an `ssm_out` whose row width is not whole
-//! blocks for its scheme is refused at load
-//! (`lumen_format::serving_rules::validate_projection_geometry`, which the converter
-//! also runs over the planned layers before it writes a byte). The K-quant source
-//! policy requantises such a plane instead of carrying it, which is the `ssm_out`
-//! 0.31.0 wrote for the same file. The explicit `LUMEN_CONVERT_SOURCE_FIDELITY`
-//! switch is outside this rule and unchanged, so these fixtures set no environment.
+//! blocks for its scheme is rejected by
+//! `lumen_format::serving_rules::validate_projection_geometry`, which the converter
+//! runs over the planned layers before it writes a byte. The K-quant source policy
+//! plans such a plane as 0.31.0 planned it — requantised to Q8_0, or a stored Q8_0
+//! unchanged, which that gate then refuses either way — instead of carrying it. The
+//! explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside this rule and unchanged,
+//! so these fixtures set no environment.
 //!
 //! GGUF sizes a tensor from its flattened element count, so a K-quant plane whose row
 //! is narrower than a superblock is a file the converter reads without complaint —

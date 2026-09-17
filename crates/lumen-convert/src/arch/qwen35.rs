@@ -67,12 +67,16 @@ impl ArchConverter for Qwen35Converter {
 /// requantises it.
 ///
 /// What the DEFAULT keeps has to be servable, exactly as the head arm's default does
-/// (`convert.rs`): the loaders read this plane at `gdn_v_dim` and refuse a row that
-/// is not whole blocks, so a K-quant source whose `gdn_v_dim` is not whole blocks for
-/// the source scheme takes the requantised `ssm_out` 0.31.0 wrote for it instead of a
-/// plane the artifact would be refused for. The explicit
+/// (`convert.rs`): the kernels read this plane at `gdn_v_dim` and would truncate a row
+/// that is not whole blocks, and the converter's own post-planning gate
+/// (`serving_rules::validate_layer_plan`) refuses such a plan before a byte is
+/// written, so a K-quant source whose `gdn_v_dim` is not whole blocks for the source
+/// scheme takes the `ssm_out` 0.31.0 planned for it — requantised to Q8_0, or a stored
+/// Q8_0 unchanged, which that gate refuses either way at a width that is not whole
+/// 32-element blocks — rather than a kept plane the gate would refuse. The explicit
 /// `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside that rule: it keeps the Q5_K and
-/// Q8_0 `ssm_out` 0.31.0 kept, at every width.
+/// Q8_0 `ssm_out` 0.31.0 kept, at every width, and where that gate refuses the plan
+/// the conversion is refused with it, exactly as in 0.31.0.
 pub(crate) fn ssm_out_keeps_source(
     target: ConvertTarget,
     src: Option<GgmlType>,
@@ -525,7 +529,9 @@ fn compute_layer_shape_qwen35(
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta are Q8_0 on default paths (Metal's GDN kernels read only
     // Q8_0; CUDA also serves F32 gates). Shared logic in gdn_gates handles the
-    // force-requant and the `--dequantize` / source-fidelity exceptions.
+    // force-requant and the `--dequantize` / source-fidelity exceptions, and a
+    // K-quant source's default non-Metal conversion, which keeps F32 gates of the
+    // extent the projection reads.
     let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;

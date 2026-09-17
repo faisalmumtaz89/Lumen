@@ -204,7 +204,8 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// re-quantised either way; a plane the runtime does not serve at that geometry — a Q6_K head
 /// whose row width is not whole superblocks, an embedding stored as some plane other than
 /// the one the header's vocab x hidden needs, an `ssm_out` whose GDN width is not whole
-/// blocks for its scheme — is converted as 0.31.0 converted it): CUDA serves each preserved
+/// blocks for its scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the
+/// projection reads — is converted as 0.31.0 converted it): CUDA serves each preserved
 /// plane through its own scheme's arm, and a missing kernel group is then reported at the
 /// first token instead of at load.
 pub fn kquant_artifact() -> bool {
@@ -664,10 +665,11 @@ pub fn gdn_f64_accum_default() -> bool {
 ///
 /// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in default
 /// conversions (the GGUF source is typically F32; the converter
-/// force-requantizes them to Q8_0 — source-fidelity, HF-import, and
-/// `--dequantize` non-Metal artifacts carry F32 gates and take the F32
-/// route instead). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL
-/// projects them via `mmq_q8_0_batched` (INT8 MMA) while the single-token
+/// force-requantizes them to Q8_0 — a K-quant source's default non-Metal
+/// conversion at the extent the projection reads, source-fidelity, HF-import, and
+/// `--dequantize` non-Metal artifacts carry F32 gates and take the F32 route
+/// instead). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL projects them via
+/// `mmq_q8_0_batched` (INT8 MMA) while the single-token
 /// DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile matvec — a
 /// DIFFERENT activation-quant granularity + INT8 reduction order. The
 /// `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this as

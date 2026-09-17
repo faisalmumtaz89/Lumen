@@ -225,11 +225,11 @@ OPTIONS:
     --output <path>      Path to output LBC file (default: input with .lbc extension)
     --dequantize         Dequantize tensors to F32 (larger but compatible).
                          Kernel-required exceptions stay quantized: dense
-                         models keep ssm_out Q8_0, or in its stored scheme
-                         for a K-quant source on the generic target (and
-                         under LUMEN_CONVERT_SOURCE_FIDELITY=1), the Metal
-                         target keeps ssm_alpha/ssm_beta Q8_0 (its GDN
-                         kernels read only Q8_0), and a K-quant source
+                         models keep ssm_out Q8_0, or a kept ssm_out in its
+                         stored scheme for a K-quant source on the generic
+                         target (and under LUMEN_CONVERT_SOURCE_FIDELITY=1),
+                         the Metal target keeps ssm_alpha/ssm_beta Q8_0 (its
+                         GDN kernels read only Q8_0), and a K-quant source
                          keeps a preserved Q6_K output head.
     --requant <scheme>   Requantize weights to target scheme during conversion
                          Supported: q4_0, q8_0. Dense models only (refused for
@@ -239,8 +239,8 @@ OPTIONS:
                                   (Metal has no K-quant dispatch kernels).
                          generic: keep K-quant layer tensors as-is (CUDA host);
                                   a K-quant source's Q4_K/Q5_K/Q6_K planes,
-                                  embedding, kept ssm_out and Q6_K head are
-                                  served natively there.
+                                  a kept embedding, kept ssm_out and Q6_K
+                                  head are served natively there.
                          Default: metal on macOS, generic elsewhere.
     --from-hf <dir>      Import a Hugging Face compressed-tensors checkpoint
                          directory (pack-quantized INT4 group-32, indexed

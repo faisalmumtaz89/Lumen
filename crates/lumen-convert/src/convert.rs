@@ -21,19 +21,22 @@ use crate::dequant::*;
 /// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
 /// better than the source bytes, so its default conversion and its fidelity conversion
 /// are the same file, except on a plane the runtime does not serve at that geometry:
-/// a K-quant source's default head and `ssm_out` have to be servable, so a Q6_K head
-/// whose row width is not whole superblocks, and an `ssm_out` whose GDN width is not
-/// whole blocks for its scheme, are requantised by default while the explicit
-/// switches answer for every width, as in 0.31.0. A Q4_K / Q5_K head is not among the
-/// preserved planes either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K one,
-/// so the head arm requantises it.
+/// a K-quant source's default head, `ssm_out` and F32 gates have to be servable, so a
+/// Q6_K head whose row width is not whole superblocks, an `ssm_out` whose GDN width is
+/// not whole blocks for its scheme, and an `ssm_alpha` / `ssm_beta` of an extent other
+/// than the one the projection reads, are converted by default as 0.31.0 converted
+/// them. The explicit switches answer as 0.31.0 did at every geometry: the head and the
+/// gates are kept as stored, and a Q5_K or Q8_0 `ssm_out` is kept — at a width the plan
+/// gate refuses, the conversion is refused with it. A Q4_K / Q5_K head is not among
+/// the preserved planes either: the runtime has a Q6_K head kernel and no Q4_K / Q5_K
+/// one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
     kquant_source() || source_fidelity_requested()
 }
 
 /// Whether `LUMEN_CONVERT_SOURCE_FIDELITY` asks for the policy explicitly, as
-/// opposed to a K-quant source taking it by default. The head and `ssm_out` arms
-/// need the two apart: what the default writes has to be servable, while an
+/// opposed to a K-quant source taking it by default. The head, `ssm_out` and gate
+/// arms need the two apart: what the default writes has to be servable, while an
 /// explicitly requested fidelity conversion answers exactly as it did in 0.31.0.
 pub(crate) fn source_fidelity_requested() -> bool {
     matches!(
