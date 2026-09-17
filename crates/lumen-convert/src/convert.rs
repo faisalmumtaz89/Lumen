@@ -470,14 +470,21 @@ fn do_convert_from_reader<R: Read + Seek>(
     let embedding_bytes = read_tensor_data(reader, gguf, embedding_tensor)?;
     let embedding_ggml_type = embedding_tensor.ggml_type;
     let embedding_n_elements = embedding_tensor.n_elements();
-    // The embedding gather reads the table as whole 256-element superblocks and the
-    // loader refuses an element count that is not whole superblocks, while GGUF sizes
-    // the plane from that count at `div_ceil` — so a source K-quant embedding with a
-    // partial final superblock is one the converter must not carry as stored. Such an
-    // embedding takes the F32 conversion below, the one 0.31.0 wrote for it.
+    // The embedding gather reads the table as whole 256-element superblocks, and the
+    // loader sizes the plane from the HEADER's `vocab_size * hidden_dim`, then requires
+    // the stored plane to be exactly that many bytes. The converter answers the same
+    // two questions, on the same numbers. GGUF sizes a tensor from its own flattened
+    // count at `div_ceil`, and the header's vocab is the tokenizer's token count when
+    // the source carries one (`hyperparams.rs`), so a partial final superblock and a
+    // `token_embd` with more or fewer rows than that vocab are both sources whose
+    // K-quant embedding the converter must not carry as stored. Such an embedding takes
+    // the F32 conversion below, the one 0.31.0 wrote for it.
     let kquant_embedding_servable = embedding_ggml_type.to_lbc_quant().is_some_and(|q| {
-        lumen_format::serving_rules::kquant_global_plane_len(q, embedding_n_elements as usize)
-            .is_ok()
+        lumen_format::serving_rules::kquant_global_plane_len(
+            q,
+            hp.vocab_size as usize * hp.hidden_dim as usize,
+        )
+        .is_ok_and(|len| len == embedding_bytes.len())
     });
 
     // For Q8_0, Q4_0, and F16 embeddings, keep raw bytes in the LBC file.
@@ -519,8 +526,9 @@ fn do_convert_from_reader<R: Read + Seek>(
             );
             (embedding_bytes, QuantScheme::Q4_0)
         }
-        // A K-quant source's K-quant embedding is carried as stored when its element
-        // count is whole superblocks (as F32 it would be 5-7x its size on the device;
+        // A K-quant source's K-quant embedding is carried as stored when the plane it
+        // stores is the one the header's vocab x hidden needs (as F32 it would be 5-7x
+        // its size on the device;
         // the CUDA K-quant path has the row-gather). Any other Q4_K / Q5_K / Q6_K
         // embedding is dequantised to F32 below, and so is a tied one: without
         // `output.weight` the head shares this plane and would take its scheme, and no

@@ -14,9 +14,11 @@ pub const LBC_VERSION: u32 = 4;
 
 /// The version of an artifact whose embedding is an as-stored K-quant plane, and the
 /// newest version the reader accepts: the default generic conversion of a K-quant
-/// source (`Q4_K_M`, `Q5_K_M`) whose `token_embd` is Q4_K, Q5_K or Q6_K produces one
-/// (`--dequantize`, and a source that ties its head to the embedding, leave no such
-/// plane, and those artifacts keep version 4). A 0.31.0 reader classified the embedding
+/// source (`Q4_K_M`, `Q5_K_M`) whose `token_embd` is the Q4_K, Q5_K or Q6_K plane the
+/// header's `vocab_size * hidden_dim` needs produces one (`--dequantize`, a source that
+/// ties its head to the embedding, and an embedding stored as some other plane — a
+/// partial final superblock, or rows the header's vocab does not have — each leave no
+/// such plane, and those artifacts keep version 4). A 0.31.0 reader classified the embedding
 /// global by its byte length, and a Q4_K plane has exactly Q4_0's length, so it would
 /// misread it; the version gate makes it refuse the file with `UnsupportedVersion`
 /// instead.

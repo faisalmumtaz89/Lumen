@@ -899,8 +899,10 @@ pub fn validate_expert_bank(st: &crate::index::SubtensorOffsets) -> Result<(), S
 /// embedding is uploaded as `vocab_size * hidden_dim / 256` whole
 /// superblocks, and an element count that is not whole superblocks is
 /// refused at load. GGUF sizes a tensor from its flattened count at
-/// `div_ceil`, so a source can carry a partial final superblock, which is
-/// why the converter runs this rule before it preserves one.
+/// `div_ceil`, so a source can carry a partial final superblock, and its
+/// `token_embd` can have rows the header's vocab does not — which is why the
+/// converter runs this rule on the header's `vocab_size * hidden_dim` and
+/// preserves a source plane only when it is exactly the length returned here.
 ///
 /// One rule for this global plane, read by the CUDA loader before it
 /// uploads the embedding and by the converter before it carries a source
@@ -1168,8 +1170,9 @@ mod tests {
 
     #[test]
     fn kquant_global_rejects_a_partial_final_superblock() {
-        // 257 rows of 128: 32,896 elements, which GGUF stores in
-        // `div_ceil` = 129 superblocks while the gather reads 128.
+        // 257 rows of 128: 32,896 elements — 128 whole superblocks plus a
+        // 128-element tail, which GGUF stores in `div_ceil` = 129 superblocks
+        // and the loader refuses.
         let err = kquant_global_plane_len(QuantScheme::Q4_K, 257 * 128).unwrap_err();
         assert!(err.contains("256-element block size"), "{err}");
         assert_eq!(
@@ -1184,7 +1187,7 @@ mod tests {
             kquant_global_plane_len(QuantScheme::Q6_K, 256 * 128),
             Ok(26880)
         );
-        // No other scheme has a superblock plane layout.
+        // Outside Q4_K / Q5_K / Q6_K the helper refuses.
         let err = kquant_global_plane_len(QuantScheme::Q8_0, 256).unwrap_err();
         assert!(err.contains("not one of the K-quant"), "{err}");
     }

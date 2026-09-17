@@ -1,24 +1,32 @@
 //! What a K-quant source preserves by default has to be a plane the runtime serves.
-//! The embedding gather reads the table as whole 256-element superblocks and the loader
-//! sizes the plane from the flattened element count
-//! (`lumen_format::serving_rules::kquant_global_plane_len`), so a K-quant embedding whose
-//! element count is not whole superblocks is refused at load; the K-quant source policy
-//! dequantises such an embedding instead of carrying it, which is the embedding 0.31.0
-//! wrote for the same file.
+//! The embedding gather reads the table as whole 256-element superblocks, and the loader
+//! sizes the plane from the header's `vocab_size * hidden_dim`
+//! (`lumen_format::serving_rules::kquant_global_plane_len`) and requires the stored plane
+//! to be exactly that many bytes, so a K-quant embedding whose element count is not whole
+//! superblocks, and one whose `token_embd` has rows the header's vocab does not, are both
+//! refused at load; the K-quant source policy dequantises such an embedding instead of
+//! carrying it, which is the embedding 0.31.0 wrote for the same file.
 //!
-//! GGUF sizes a tensor from its flattened element count at `div_ceil`, so a K-quant plane
-//! with a partial final superblock is a file the converter reads without complaint — the
-//! source of the first fixture (257 x 128 = 32,896 elements, stored in 129 superblocks
-//! while the gather reads 128). The quantiser's own rule is per row, and `token_embd`'s
-//! row length is the hidden width, so every standard export whose embedding is K-quant has
-//! a hidden width that is whole superblocks and a flattened count that is too; the
-//! registry's two K-quant cells are both `qwen3.8-27b`, at hidden 5120, so no shipped file
-//! converts differently. The pin is the guard against the default widening to one that
-//! does.
+//! Both are files the converter reads without complaint. GGUF sizes a tensor from its
+//! flattened element count at `div_ceil`, so a K-quant plane can end in a partial
+//! superblock — the source of the first fixture (257 x 128 = 32,896 elements: 128 whole
+//! superblocks plus a 128-element tail, which GGUF stores in `div_ceil` = 129
+//! superblocks and the loader refuses). And the header's vocab is the
+//! tokenizer's token count when the source carries one (`hyperparams.rs`), not the
+//! tensor's row count, so a padded `token_embd` is whole superblocks over a vocab that
+//! needs fewer of them — the source of the third fixture (258 rows of 128 over a
+//! 256-token tokenizer).
 //!
-//! The pin was derived by building this same fixture against the 0.31.0 converter (release
+//! The quantiser's own rule is per row, and `token_embd`'s row length is the hidden width,
+//! so every standard export whose embedding is K-quant has a hidden width that is whole
+//! superblocks and a flattened count that is too; the registry's two K-quant cells are both
+//! `qwen3.8-27b`, at hidden 5120 with 248,320 tokens and 248,320 embedding rows, so no
+//! shipped file converts differently. The pins are the guard against the default widening
+//! to one that does.
+//!
+//! Each pin was derived by building the same fixture against the 0.31.0 converter (release
 //! commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway worktree and hashing
-//! the embedding plane of its artifact; the fixture GGUF hashes the same on both trees,
+//! the embedding plane of its artifact; both fixture GGUFs hash the same on both trees,
 //! which is the cross-check that the transcription did not drift.
 use lumen_convert::convert::{convert_gguf_bytes_to_lbc, ConvertOptions, ConvertTarget};
 use lumen_convert::gguf::{GgmlType, GgufBuilder};
@@ -61,11 +69,15 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source of `vocab` rows: Q8_0 everywhere except the Q4_K
-/// `ffn_down` that makes it one (its in_dim is `2 * HID`, whole superblocks at either
-/// vocab) and the Q4_K embedding. `vocab` sets the embedding's element count, which is
-/// the property under test; the head is Q8_0, so the head rule is not what decides here.
-fn build(vocab: u64) -> Vec<u8> {
+/// A four-layer qwen35 K-quant source whose `token_embd` has `rows` rows: Q8_0 everywhere
+/// except the Q4_K `ffn_down` that makes it one (its in_dim is `2 * HID`, whole superblocks
+/// at either size) and the Q4_K embedding. `tokens` is the tokenizer's token count, which
+/// is the header's vocab when the source carries one and which the head is sized to; `None`
+/// leaves the source without a token list, so the header's vocab is `rows` itself. The
+/// embedding's geometry against that vocab is the property under test; the head is Q8_0, so
+/// the head rule is not what decides here.
+fn build(rows: u64, tokens: Option<u64>) -> Vec<u8> {
+    let vocab = tokens.unwrap_or(rows);
     let inter: u64 = 2 * HID;
     let v_heads: u64 = HID / STATE;
     let qkv_rows: u64 = (2 * GROUPS + v_heads) * STATE;
@@ -86,19 +98,24 @@ fn build(vocab: u64) -> Vec<u8> {
     b.add_u32(&k("ssm.group_count"), GROUPS as u32);
     b.add_u32(&k("ssm.state_size"), STATE as u32);
     b.add_u32(&k("ssm.conv_kernel"), 4);
-    let ne = vocab * HID;
+    if let Some(t) = tokens {
+        let toks: Vec<String> = (0..t).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = toks.iter().map(String::as_str).collect();
+        b.add_string("tokenizer.ggml.model", "gpt2");
+        b.add_string_array("tokenizer.ggml.tokens", &refs);
+    }
     b.add_tensor(
         "token_embd.weight",
         GgmlType::Q4_K,
-        &[vocab, HID],
-        bytes_for(GgmlType::Q4_K, ne),
+        &[rows, HID],
+        bytes_for(GgmlType::Q4_K, rows * HID),
     );
     b.add_f32_tensor("output_norm.weight", &[HID], &vec![1.0; HID as usize]);
     b.add_tensor(
         "output.weight",
         GgmlType::Q8_0,
         &[HID, vocab],
-        bytes_for(GgmlType::Q8_0, ne),
+        bytes_for(GgmlType::Q8_0, vocab * HID),
     );
     for l in 0..LAYERS {
         let p = format!("blk.{l}");
@@ -203,10 +220,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 const PARTIAL_EMBEDDING_0_31_0: &str =
     "7bfa89ee41f18871269c5b9b6970fc8411661211c4f11631ef51eab4afd8f839";
 
+/// The 0.31.0 embedding plane of the 258-row / 256-token fixture: the same
+/// dequantisation, over the rows the source stores.
+const PADDED_EMBEDDING_0_31_0: &str =
+    "8675651898d77ef1cbe478e28b4ef7e367fabcdd4e667f536d1a1a0ab6b7c2f2";
+
 #[test]
 fn a_kquant_embedding_of_a_partial_superblock_keeps_the_0_31_0_embedding() {
-    // 257 x 128 = 32,896 elements: 128 whole superblocks and a 128-element tail.
-    let (primary, version, quant, plane) = convert_embedding("partial", &build(257));
+    // 257 x 128 = 32,896 elements: 128 whole superblocks plus a 128-element tail.
+    let (primary, version, quant, plane) = convert_embedding("partial", &build(257, None));
     // The fixture is a K-quant source, so the policy really is the one under test.
     assert_eq!(
         primary,
@@ -235,7 +257,7 @@ fn a_kquant_embedding_of_a_partial_superblock_keeps_the_0_31_0_embedding() {
 
 #[test]
 fn a_kquant_embedding_of_whole_superblocks_is_still_carried_verbatim() {
-    let (primary, version, quant, plane) = convert_embedding("whole", &build(256));
+    let (primary, version, quant, plane) = convert_embedding("whole", &build(256, None));
     assert_eq!(
         primary,
         QuantScheme::Q4_K,
@@ -254,5 +276,42 @@ fn a_kquant_embedding_of_whole_superblocks_is_still_carried_verbatim() {
     assert_eq!(
         version, 5,
         "an as-stored K-quant embedding stamps version 5"
+    );
+}
+
+#[test]
+fn a_kquant_embedding_padded_past_the_header_vocab_keeps_the_0_31_0_embedding() {
+    // 258 rows of 128 is 33,024 elements — whole superblocks, so the count alone
+    // admits the plane. The header's vocab is the tokenizer's 256 tokens, and the
+    // loader sizes the embedding at 256 x 128: 128 superblocks, 18,432 bytes, not the
+    // 129 superblocks the source stores.
+    let (primary, version, quant, plane) = convert_embedding("padded", &build(258, Some(256)));
+    assert_eq!(
+        primary,
+        QuantScheme::Q4_K,
+        "fixture is not a K-quant source"
+    );
+    assert_eq!(
+        quant,
+        QuantScheme::F32,
+        "a K-quant embedding with rows the header's vocab does not have was carried verbatim"
+    );
+    assert_eq!(plane.len(), 258 * (HID as usize) * 4);
+    assert_eq!(
+        sha256_hex(&plane),
+        PADDED_EMBEDDING_0_31_0,
+        "the embedding plane moved from 0.31.0"
+    );
+    assert_eq!(version, 4, "no as-stored K-quant embedding, so version 4");
+    // The source count passes the superblock rule on its own; it is the header's
+    // geometry that refuses the plane, which is the rule the default has to respect.
+    assert!(
+        lumen_format::serving_rules::kquant_global_plane_len(QuantScheme::Q4_K, 258 * 128).is_ok(),
+        "the source count is whole superblocks"
+    );
+    assert_eq!(
+        lumen_format::serving_rules::kquant_global_plane_len(QuantScheme::Q4_K, 256 * 128),
+        Ok(18432),
+        "the header's geometry needs a shorter plane than the source stores"
     );
 }
