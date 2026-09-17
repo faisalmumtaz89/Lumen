@@ -214,8 +214,8 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
 /// some plane other than the one the header's vocab x hidden needs, an `ssm_out` whose GDN width is
 /// not whole blocks for its scheme, an `ssm_alpha` / `ssm_beta` of an extent other than the one the
 /// projection reads — is converted as 0.31.0 converted it): CUDA serves each preserved plane
-/// through its own scheme's arm, and a missing kernel group is then
-/// reported at the first token instead of at load.
+/// through its own scheme's arm, and a missing kernel group is then reported
+/// at the first token instead of at load.
 pub fn kquant_artifact() -> bool {
     model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
 }

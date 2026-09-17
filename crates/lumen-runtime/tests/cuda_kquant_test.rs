@@ -1009,7 +1009,8 @@ fn matvec_case(
     }
 }
 
-// The bars are written `!(x < bar)` on purpose: a NaN must fail them, and `x >= bar` would let it through.
+// The bars are written `!(x < bar)` on purpose:
+// a NaN must fail them, and `x >= bar` would let it through.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn matvec_shapes(sc: &Scheme) {
     let (ctx, stream) = create_context();

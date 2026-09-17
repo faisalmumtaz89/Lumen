@@ -36,7 +36,7 @@ const V_DIM: u64 = V_HEADS * STATE;
 // Four layers: the converter's layer kinds are positional (full attention at 3, 7, …).
 const LAYERS: u32 = 4;
 
-/// The source bytes of one plane, distinct per type and per block.
+/// The source bytes of one plane, distinct per type and per superblock.
 fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     let n = n as usize;
     match t {
