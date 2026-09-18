@@ -17,7 +17,8 @@ use std::io::{Read, Seek, SeekFrom};
 /// Metal has no K-quant matmul or dequant kernels -- any layer tensor stored
 /// as a K-quant type must be upcast to Q8_0 at convert time so Metal can
 /// dispatch to its tiled Q8_0 matmul kernels at runtime. CUDA, by contrast,
-/// dequantizes K-quant planes host-side at load
+/// serves a K-quant artifact's Q4_K / Q5_K / Q6_K layer planes natively and
+/// dequantizes every other K-quant layer plane host-side at load
 /// (lumen-runtime/src/cuda/gpu_buffers.rs).
 pub(crate) fn is_k_quant(t: GgmlType) -> bool {
     matches!(

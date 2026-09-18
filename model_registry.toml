@@ -16,7 +16,7 @@ supported_architectures = [
     "qwen35moe",  # Qwen3.5 MoE (GatedDeltaNet, sparse FFN)
 ]
 
-supported_quantizations = ["BF16", "Q8_0", "Q4_0"]
+supported_quantizations = ["BF16", "Q8_0", "Q4_0", "Q4_K_M", "Q5_K_M"]
 
 
 # =============================================================================
@@ -74,6 +74,13 @@ tokenizer = "Qwen/Qwen3.8-27B"
     [models.qwen3-8-27b.gguf_files]
     Q8_0 = { repo = "unsloth/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q8_0.gguf" }
     Q4_0 = { repo = "unsloth/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q4_0.gguf" }
+    # K-quant superblock files: on the generic target the converter keeps every
+    # Q4_K/Q5_K/Q6_K FFN plane, a kept embedding, a kept ssm_out and a preserved Q6_K
+    # head verbatim, and CUDA serves them natively. On the Metal target they convert as
+    # before (every K-quant layer plane upcast to Q8_0, the head re-quantised, a K-quant
+    # embedding dequantised to F32): Metal has no K-quant kernel.
+    Q4_K_M = { repo = "bartowski/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q4_K_M.gguf" }
+    Q5_K_M = { repo = "bartowski/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q5_K_M.gguf" }
     # BF16: 2-shard split GGUF nested under a HF subdir (same shape as the MoE
     # BF16). Both shards declared; the multi-shard reader auto-discovers shard 2.
     BF16 = { repo = "unsloth/Qwen3.8-27B-GGUF", files = [

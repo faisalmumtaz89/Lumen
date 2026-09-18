@@ -16,7 +16,7 @@
 #
 # Non-interactive / overrides (flags after `bash -s --`, or env):
 #   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.8-27b; accepts name:quant)
-#   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16; default q8_0)
+#   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16, or q4_k_m | q5_k_m for qwen3.8-27b; default q8_0)
 #   --yes, -y                        non-interactive (accept defaults, no prompts)
 #   --prefix <dir>    LUMEN_PREFIX  (install dir; default = auto-selected, see below)
 #   LUMEN_TAG         pin a release tag (e.g. v0.1.0, or a v..-rc.N prerelease); default = latest
@@ -76,7 +76,8 @@ Lumen installer — detects your platform, installs the prebuilt binaries, sets 
 
 Options (after `bash -s --`) / env:
   --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.8-27b  (accepts name:quant)
-  --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16        (default q8_0)
+  --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16 | q4_k_m | q5_k_m   (default q8_0)
+                                  q4_k_m / q5_k_m: qwen3.8-27b only, served as stored on CUDA
   --yes, -y                       non-interactive (defaults, no prompts)
   --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
   LUMEN_TAG=<tag>   install a specific release (e.g. v0.1.0, or a v..-rc.N prerelease)
@@ -436,6 +437,7 @@ need=12
 case "$QUANT" in
   bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
   q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
+  q4_k_m|q5_k_m) case "$MODEL" in *27b*) need=55 ;; *) need=16 ;; esac ;;
   *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
 esac
 free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"

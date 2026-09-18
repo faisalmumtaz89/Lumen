@@ -78,6 +78,13 @@ jobs:
       # ship unnoticed.
       - name: cuda unit tests (host-side; GPU-requiring skipped)
         run: "cargo test --locked -p lumen-runtime --lib --features cuda --release -- --skip cuda::prefill_attention::"
+      # The K-quant kill-switch caches in a OnceLock, so its OFF state is only
+      # reachable in a fresh process: this run is the one that fails if the
+      # embedding refusal is ever re-scoped on the LBC header.
+      - name: cuda unit tests (K-quant kill-switch off)
+        env:
+          LUMEN_CUDA_KQUANT: "0"
+        run: "cargo test --locked -p lumen-runtime --lib --features cuda --release -- --exact cuda::gpu_buffers::tests::kquant_embedding_refusal_follows_the_switch_whatever_the_header"
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

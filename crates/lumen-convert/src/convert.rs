@@ -15,7 +15,38 @@ use crate::dequant::*;
 /// `ssm_alpha`/`ssm_beta` gates. Requires a runtime with the matching decode
 /// kernels; the resulting artifact streams byte-for-byte the same weights the
 /// reference engine reads from the same file.
+///
+/// A K-quant source conversion ([`kquant_source`]) takes this policy without the
+/// flag: none of the Q4_K / Q5_K / Q6_K planes it carries — its layer planes, its
+/// embedding, a preserved Q6_K head — has a requantised form a runtime kernel serves
+/// better than the source bytes, so its default conversion and its fidelity conversion
+/// are the same file, except on a plane the runtime does not serve on the artifact the
+/// conversion is writing. A K-quant source's default head, `ssm_out` and F32 gates have
+/// to be servable at their geometry, so a Q6_K head whose row width is not whole
+/// superblocks or whose stored plane is not the one the header's `vocab x hidden`
+/// needs, an `ssm_out` whose GDN width is not whole blocks for its scheme, and an
+/// `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads, are
+/// converted by default as 0.31.0 converted them; and `ssm_out` has to be servable
+/// under the header as well, so `--requant` and `--dequantize`, which stamp a Q8_0
+/// / Q4_0 / F32 primary scheme the runtime's K-quant layer arms are closed on, take
+/// 0.31.0's `ssm_out` at every width. The other preserved planes go by arms that read
+/// a plane's stored scheme whatever the header is: a kept embedding survives both
+/// `--requant` schemes, while `--dequantize` dequantises it; a preserved Q6_K head
+/// survives `--requant q8_0` and `--dequantize`, while `--requant q4_0` requantises
+/// it as 0.31.0 did. The explicit switches answer as 0.31.0 did at every geometry and
+/// under either flag: the head and the gates are kept as stored, and a Q5_K or Q8_0
+/// `ssm_out` is kept — at a width the plan gate refuses, the conversion is refused
+/// with it. A Q4_K / Q5_K head is not among the preserved planes either: the runtime
+/// has a Q6_K head kernel and no Q4_K / Q5_K one, so the head arm requantises it.
 pub(crate) fn source_fidelity() -> bool {
+    kquant_source() || source_fidelity_requested()
+}
+
+/// Whether `LUMEN_CONVERT_SOURCE_FIDELITY` asks for the policy explicitly, as
+/// opposed to a K-quant source taking it by default. The head, `ssm_out` and gate
+/// arms need the two apart: what the default writes has to be servable, while an
+/// explicitly requested fidelity conversion answers exactly as it did in 0.31.0.
+pub(crate) fn source_fidelity_requested() -> bool {
     matches!(
         std::env::var("LUMEN_CONVERT_SOURCE_FIDELITY")
             .ok()
@@ -24,16 +55,122 @@ pub(crate) fn source_fidelity() -> bool {
     )
 }
 
+thread_local! {
+    static KQUANT_SOURCE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the conversion running on this thread carries a K-quant source's planes
+/// as stored: [`kquant_source_scheme`] found one (a planned dense FFN projection —
+/// `ffn_gate`, `ffn_up` or `ffn_down` — stored as Q4_K, Q5_K or Q6_K), the file is
+/// the dense architecture whose planner reads those names ([`arch::is_moe_arch`] is
+/// false) **and** the target serves such planes ([`target_serves_kquant`]). On the
+/// Metal target the answer is always false, so a K-quant source converts for Metal
+/// exactly as it did in 0.31.0. Set for the duration of one conversion by
+/// [`KquantSourceScope`]; the converter does not spawn threads.
+pub(crate) fn kquant_source() -> bool {
+    KQUANT_SOURCE.with(Cell::get)
+}
+
+/// Whether `target` serves a K-quant plane natively, so the converter carries it
+/// verbatim. The generic target does (the CUDA K-quant kernels). The Metal target has
+/// no K-quant kernel, so every K-quant plane it is given is upcast or requantised as
+/// before. One predicate, read by the K-quant source decision, the head and
+/// `ssm_out`, so no two of them can disagree.
+pub(crate) fn target_serves_kquant(target: ConvertTarget) -> bool {
+    target != ConvertTarget::Metal
+}
+
+/// Marks the conversion on this thread as reading a K-quant source until dropped.
+pub(crate) struct KquantSourceScope;
+
+impl KquantSourceScope {
+    pub(crate) fn enter(kquant_source: bool) -> Self {
+        KQUANT_SOURCE.with(|c| c.set(kquant_source));
+        Self
+    }
+}
+
+impl Drop for KquantSourceScope {
+    fn drop(&mut self) {
+        KQUANT_SOURCE.with(|c| c.set(false));
+    }
+}
+
+/// The scheme a K-quant source is stored in, decided once per file from the
+/// tensor-type index before any tensor data is read: `Some` when a planned
+/// dense FFN projection is Q4_K, Q5_K or Q6_K, carrying the K-quant scheme
+/// with the most planned layer planes (Q4_K for a Q4_K_M file, Q5_K for a
+/// Q5_K_M file) — the LBC header's primary scheme on a target that serves
+/// such planes, when neither `--requant` nor `--dequantize` sets one.
+/// Planned = the tensor `find_tensor` resolves for the canonical
+/// `blk.<layer>.<suffix>` name below `num_layers` (the MTP `nextn` layer is
+/// excluded by the layer count), which is the dense planner's own lookup by
+/// name: it excludes a non-canonical spelling and a duplicate of a canonical
+/// name, but not the layer KIND — a file that carried both `attn_qkv` and
+/// `attn_q` at one layer would count a name the planner does not read there
+/// (no exporter writes one). `ffn_gate` / `ffn_up` / `ffn_down` are the dense
+/// converter's names, so the caller applies its result only to the
+/// architecture that planner serves.
+pub(crate) fn kquant_source_scheme(gguf: &GgufFile, num_layers: u32) -> Option<QuantScheme> {
+    const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+    const SCHEMES: [QuantScheme; 3] = [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K];
+    let mut counts = [0usize; 3];
+    let mut ffn_hit = false;
+    for t in &gguf.tensors {
+        let Some(rest) = t.name.strip_prefix("blk.") else {
+            continue;
+        };
+        let Some((layer, suffix)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(l) = layer.parse::<u32>() else {
+            continue;
+        };
+        if l >= num_layers {
+            continue;
+        }
+        // Count only the tensor `find_tensor` resolves for this layer and suffix:
+        // the planner builds the same name with `layer_tensor_name` and takes the
+        // first match, so a non-canonical spelling (`blk.00.ffn_gate.weight`) or a
+        // second tensor of the same name is never planned, and must not decide a
+        // scheme the planes do not have.
+        if !gguf
+            .find_tensor(&layer_tensor_name(l as usize, suffix))
+            .is_some_and(|planned| std::ptr::eq(planned, t))
+        {
+            continue;
+        }
+        let slot = match t.ggml_type {
+            GgmlType::Q4_K => 0,
+            GgmlType::Q5_K => 1,
+            GgmlType::Q6_K => 2,
+            _ => continue,
+        };
+        counts[slot] += 1;
+        ffn_hit |= FFN.contains(&suffix);
+    }
+    if !ffn_hit {
+        return None;
+    }
+    let (slot, _) = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, c)| (**c, std::cmp::Reverse(*i)))
+        .expect("three schemes");
+    Some(SCHEMES[slot])
+}
+
 use crate::gguf::{GgmlType, GgufError, GgufFile};
 use crate::hyperparams::{detect_quant_scheme, extract_hyperparams, quant_descriptor_for};
 use crate::sharded::{MultiShardReader, ShardError, ShardedGguf};
-use crate::tensor_io::read_tensor_data;
+use crate::tensor_io::{layer_tensor_name, read_tensor_data};
 use crate::tensor_names::*;
 use lumen_format::header::LbcHeader;
 use lumen_format::quantization::QuantScheme;
 use lumen_format::streaming_writer::StreamingLbcWriter;
 use lumen_format::tokenizer::TokenizerSection;
 use lumen_format::writer::GlobalTensors;
+use std::cell::Cell;
 use std::fmt;
 use std::io::{BufWriter, Read, Seek};
 use std::path::Path;
@@ -47,10 +184,10 @@ use std::path::Path;
 /// Different GPU backends support different sets of quantization kernels.
 /// CUDA dequantizes K-quant (Q2/Q3/Q4/Q5/Q6_K) layer planes host-side at
 /// load (plus dedicated dp4a kernels for a fidelity-preserved Q5_K
-/// `ssm_out` and Q6_K output head), so K-quant layer tensors can ride
-/// through unchanged. Metal currently has
-/// **no** K-quant kernels, so layer tensors stored as K-quant in the source
-/// GGUF (e.g. `attn_q` in the Q4 MoE-35B GGUF) must be upcast to a
+/// `ssm_out` and Q6_K output head, and native kernels for a K-quant source's
+/// Q4_K / Q5_K / Q6_K planes), so K-quant layer tensors ride through unchanged.
+/// Metal has **no** K-quant kernels, so layer tensors stored as K-quant in the
+/// source GGUF (e.g. `attn_q` in the Q4 MoE-35B GGUF) must be upcast to a
 /// scheme Metal does support (Q8_0).
 ///
 /// `Generic` leaves K-quant layer tensors as-is (CUDA path).
@@ -72,14 +209,22 @@ pub enum ConvertTarget {
 pub struct ConvertOptions {
     /// LBC alignment in bytes (default: 128 KiB = 131072).
     pub alignment: u64,
-    /// If true, dequantize all quantized tensors to F32.
-    /// Produces larger files but compatible with the naive F32 backend.
+    /// If true, dequantize quantized layer tensors to F32. A kept `ssm_out` keeps its
+    /// stored scheme (the Q8_0 floor otherwise) and, on a K-quant source conversion, so
+    /// does a preserved `Q6_K` head. A K-quant embedding is dequantised (every other
+    /// embedding is handled exactly as without the flag), so such an artifact keeps
+    /// LBC version 4. Produces larger files but compatible with the naive F32
+    /// backend.
     pub dequantize_to_f32: bool,
-    /// If set, requantize weight tensors to this scheme during conversion.
+    /// If set, requantize layer weight tensors to this scheme during conversion.
     /// Q4_0 and Q8_0 are the supported targets, dense models only (the MoE
     /// converter refuses the flag). The source weights are first dequantized
-    /// to F32, then requantized to the target scheme. Norm tensors remain
-    /// F32 regardless.
+    /// to F32, then requantized to the target scheme. The embedding, a preserved `Q6_K`
+    /// head and a kept `ssm_out` keep their stored scheme, so a K-quant source conversion
+    /// can still carry a K-quant plane — and, when its embedding is one, be LBC version 5
+    /// — while its header scheme is the requant target (`--requant q4_0` does re-quantise
+    /// the head). With Q8_0 globals and a Q8_0 `ssm_out` nothing K-quant survives and the
+    /// artifact is version 4. Norm tensors remain F32 regardless.
     pub requant_to: Option<QuantScheme>,
     /// Runtime backend the LBC is being prepared for. See [`ConvertTarget`].
     pub target: ConvertTarget,
@@ -291,14 +436,30 @@ fn do_convert_from_reader<R: Read + Seek>(
 ) -> Result<ConvertStats, ConvertError> {
     let (hp, arch) = extract_hyperparams(gguf)?;
     let num_layers = hp.num_layers as usize;
+    // One decision for the whole conversion, from the tensor-type index: a
+    // K-quant source takes the source-fidelity policy and its own scheme in
+    // the header (every planning and writing site reads `kquant_source()`).
+    // Only on a target that serves K-quant planes; the Metal target upcasts or
+    // re-quantises them, exactly as it did before this policy existed. And only
+    // for the dense architecture, whose planner is the one that reads the
+    // `ffn_gate` / `ffn_up` / `ffn_down` names the scheme is read off: the MoE
+    // planner reads `ffn_*_exps` and zeroes `w_gate` / `w_up` / `w_down`, so a
+    // MoE file carrying such a tensor would take a policy none of its planes has.
+    let kquant = kquant_source_scheme(gguf, hp.num_layers)
+        .filter(|_| target_serves_kquant(opts.target) && !arch::is_moe_arch(&arch));
+    let _kquant_scope = KquantSourceScope::enter(kquant.is_some());
+    if let Some(k) = kquant {
+        eprintln!(
+            "  K-quant source ({k:?}): every Q4_K / Q5_K / Q6_K FFN plane not re-quantised \
+             by `--requant` / `--dequantize` is carried verbatim"
+        );
+    }
 
     // The MoE converter has no requant path — no layer tensor is
     // requantized — so accepting the flag would stamp a requant scheme in
     // the header that the planes do not have. Refuse before any tensor is
-    // read, keyed on the same architecture set `select_converter` uses.
-    if matches!(arch.as_str(), "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe")
-        && opts.requant_to.is_some()
-    {
+    // read, keyed on the same predicate `select_converter` uses.
+    if arch::is_moe_arch(&arch) && opts.requant_to.is_some() {
         return Err(ConvertError::UnsupportedOption(
             "--requant is not supported for MoE models (the MoE converter \
              carries layer tensors in their source quantization); convert \
@@ -313,6 +474,8 @@ fn do_convert_from_reader<R: Read + Seek>(
         target
     } else if opts.dequantize_to_f32 {
         QuantScheme::F32
+    } else if let Some(k) = kquant {
+        k
     } else {
         detect_quant_scheme(gguf, hp.num_layers)
     };
@@ -325,6 +488,27 @@ fn do_convert_from_reader<R: Read + Seek>(
     let embedding_bytes = read_tensor_data(reader, gguf, embedding_tensor)?;
     let embedding_ggml_type = embedding_tensor.ggml_type;
     let embedding_n_elements = embedding_tensor.n_elements();
+    // The embedding gather reads the table as whole 256-element superblocks, and the
+    // loader sizes the plane from the HEADER's `vocab_size * hidden_dim`, then requires
+    // the stored plane to be exactly that many bytes. The converter answers the same
+    // two questions, on the same numbers: the header's product must be whole
+    // superblocks, and the stored plane must be exactly the length that product needs.
+    // GGUF sizes a tensor from its own flattened count at `div_ceil`, and the header's
+    // vocab is the tokenizer's token count when the source carries one
+    // (`hyperparams.rs`), so the test is on the plane, not on the row count: a
+    // `token_embd` padded past that vocab, or short of it by a superblock or more,
+    // stores some other plane and takes the F32 conversion below, the one 0.31.0 wrote
+    // for it; one short by fewer elements than a superblock holds stores exactly the
+    // plane the header needs and is carried, the final superblock's padding standing
+    // where the missing rows would be (0.31.0 wrote a plane short of the header's
+    // geometry there, which its F32 gather read past).
+    let kquant_embedding_servable = embedding_ggml_type.to_lbc_quant().is_some_and(|q| {
+        lumen_format::serving_rules::kquant_global_plane_len(
+            q,
+            hp.vocab_size as usize * hp.hidden_dim as usize,
+        )
+        .is_ok_and(|len| len == embedding_bytes.len())
+    });
 
     // For Q8_0, Q4_0, and F16 embeddings, keep raw bytes in the LBC file.
     // The runtime will use GPU dequant kernels for embedding lookup.
@@ -364,6 +548,31 @@ fn do_convert_from_reader<R: Read + Seek>(
                 embedding_n_elements
             );
             (embedding_bytes, QuantScheme::Q4_0)
+        }
+        // A K-quant source's K-quant embedding is carried as stored when the plane it
+        // stores is the one the header's vocab x hidden needs (as F32 it would be 5-7x
+        // its size on the device; the CUDA K-quant path has the row-gather). Any other
+        // Q4_K / Q5_K / Q6_K embedding is dequantised to F32 below, and so is a tied
+        // one: without `output.weight` the head shares this plane and its scheme, and
+        // the head arm — where a Q6_K head's servability is decided and a Q4_K / Q5_K
+        // head requantised — never runs for a tied source.
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+            if kquant_source()
+                && kquant_embedding_servable
+                && !opts.dequantize_to_f32
+                && gguf.find_tensor(OUTPUT_PROJ_NAME).is_some() =>
+        {
+            let quant = match embedding_ggml_type {
+                GgmlType::Q4_K => QuantScheme::Q4_K,
+                GgmlType::Q5_K => QuantScheme::Q5_K,
+                _ => QuantScheme::Q6_K,
+            };
+            eprintln!(
+                "  Keeping embedding as {quant:?} ({} bytes, {} elements)",
+                embedding_bytes.len(),
+                embedding_n_elements
+            );
+            (embedding_bytes, quant)
         }
         _ => {
             let f32_data = ensure_f32_global(
@@ -451,27 +660,63 @@ fn do_convert_from_reader<R: Read + Seek>(
                     | GgmlType::Q8_K
             ) {
                 // K-quant output.weight: dequantize and requantize to a supported format.
-                // llama-quantize often keeps output.weight as Q6_K even in Q4_0 GGUFs.
+                // GGUF quantisers often keep output.weight as Q6_K even in Q4_0 files.
                 // The runtime only has fast dispatch kernels for Q8_0/Q4_0/F16/F32,
                 // so storing K-quant as-is would hit the slow F32 fallback path.
                 //
-                // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight
-                // verbatim (6.5625 bpw, the exact bytes llama.cpp serves) for the
-                // CUDA backend's dedicated Q6_K head kernel. Never on the Metal
-                // target — Metal has no Q6_K head kernel and would serve the
-                // head through the F32-dequant fallback (4 bytes/elem streamed
-                // per token), so Metal conversions requantize to the fast
-                // Q8_0 head path (same rule as every other fidelity gate).
-                if opts.target != ConvertTarget::Metal
-                    && output_proj_tensor.ggml_type == GgmlType::Q6_K
-                    && (source_fidelity()
-                        || matches!(
-                            std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
-                                .ok()
-                                .as_deref(),
-                            Some("1") | Some("true") | Some("yes") | Some("on")
-                        ))
-                {
+                // LUMEN_CONVERT_KEEP_Q6K_OUTPUT=1: preserve a Q6_K output.weight for the
+                // CUDA backend's dedicated Q6_K head kernel — the exact source bytes,
+                // 6.5625 bpw. A K-quant source keeps a Q6_K head as stored too (the same
+                // dedicated head kernel serves it). Never on the Metal target — Metal has no
+                // Q6_K head kernel and would serve the head through the F32-dequant
+                // fallback (4 bytes/elem streamed per token), so Metal conversions
+                // requantize to the fast Q8_0 head path (the rule of every other
+                // fidelity gate).
+                let keep_head = target_serves_kquant(opts.target)
+                    && match output_proj_tensor.ggml_type {
+                        GgmlType::Q6_K => {
+                            let requested = source_fidelity_requested()
+                                || matches!(
+                                    std::env::var("LUMEN_CONVERT_KEEP_Q6K_OUTPUT")
+                                        .ok()
+                                        .as_deref(),
+                                    Some("1") | Some("true") | Some("yes") | Some("on")
+                                );
+                            // A K-quant source takes this preservation by DEFAULT, so
+                            // it must not write a head the runtime then refuses, under
+                            // either rule the runtime reads it by. The head matvec
+                            // reads `hidden_dim / 256` whole superblocks per row, and
+                            // the loader rejects a width that is not whole superblocks;
+                            // the loader also sizes the plane from the header's
+                            // `vocab_size * hidden_dim`: the host read refuses one
+                            // holding fewer elements than that product, and the CUDA
+                            // upload refuses any length other than the one it needs, so
+                            // the default keeps the head only when the stored plane is
+                            // exactly that length — the test the embedding keep above
+                            // makes, on the same two numbers. A head failing either is
+                            // requantised — the conversion 0.31.0 gave it. The two
+                            // explicit switches are outside this rule: they answer at
+                            // every width and every stored length, on every source, as
+                            // they did before the policy.
+                            let servable =
+                                lumen_format::serving_rules::validate_output_head_row_alignment(
+                                    QuantScheme::Q6_K,
+                                    hp.hidden_dim as usize,
+                                )
+                                .is_ok();
+                            let plane_matches_header =
+                                lumen_format::serving_rules::kquant_global_plane_len(
+                                    QuantScheme::Q6_K,
+                                    hp.vocab_size as usize * hp.hidden_dim as usize,
+                                )
+                                .is_ok_and(|len| len == output_proj_bytes.len());
+                            requested || (kquant_source() && servable && plane_matches_header)
+                        }
+                        // A Q4_K / Q5_K head is not carried verbatim on any target: it is
+                        // requantised like every other head, K-quant source or not.
+                        _ => false,
+                    };
+                if keep_head {
                     eprintln!(
                         "  K-quant output.weight (Q6_K): kept verbatim ({} bytes)",
                         output_proj_bytes.len()

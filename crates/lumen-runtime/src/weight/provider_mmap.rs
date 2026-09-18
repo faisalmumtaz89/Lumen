@@ -117,7 +117,7 @@ impl MmapWeightProvider {
         let embedding_bytes =
             backend.read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant)?;
         let final_norm = bytes_to_f32(
             &backend.read_range(lbc.header.final_norm.offset, lbc.header.final_norm.length)?,
         );
@@ -128,7 +128,7 @@ impl MmapWeightProvider {
             vocab_size,
             hidden_dim,
             outproj_header_quant,
-        );
+        )?;
 
         let prefetch_window = mmap_config.prefetch_window;
 

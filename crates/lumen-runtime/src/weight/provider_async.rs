@@ -158,7 +158,7 @@ impl AsyncWeightProvider {
         let embedding_bytes = fallback_backend
             .read_range(lbc.header.embedding.offset, lbc.header.embedding.length)?;
         let (embedding, embedding_raw, embedding_quant) =
-            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant);
+            read_embedding_global(embedding_bytes, vocab_size, hidden_dim, embed_header_quant)?;
         let final_norm = read_f32_tensor(
             &fallback_backend,
             lbc.header.final_norm.offset,
@@ -171,7 +171,7 @@ impl AsyncWeightProvider {
             vocab_size,
             hidden_dim,
             outproj_header_quant,
-        );
+        )?;
 
         let num_layers = lbc.header.num_layers as usize;
         let layer_indices = lbc.layer_indices.clone();

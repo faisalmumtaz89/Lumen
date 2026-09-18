@@ -37,6 +37,9 @@ pub mod shaders;
 pub(crate) mod types;
 
 pub use backend_impl::CudaBackend;
+/// The kernel-source `#define` reader, for the out-of-crate K-quant correctness suite
+/// (`tests/cuda_kquant_test.rs`), which pins the launcher's geometry to the kernels' own macros.
+pub use decode::kernel_define;
 
 pub use attention_decode::{
     decode_attention_geometry_within, decode_attention_merge_shared_bytes,

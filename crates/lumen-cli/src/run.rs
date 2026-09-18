@@ -1463,17 +1463,7 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
     }
 
     // Parse model:quant tag syntax (e.g., "qwen3.5-9b:q4_0").
-    let (model_name, explicit_quant) = if let Some(colon_pos) = value.rfind(':') {
-        let name = &value[..colon_pos];
-        let tag = &value[colon_pos + 1..];
-        if tag.is_empty() {
-            (value, None) // trailing colon, treat as no tag
-        } else {
-            (name, Some(tag.to_uppercase()))
-        }
-    } else {
-        (value, None)
-    };
+    let (model_name, explicit_quant) = crate::registry::split_model_tag(value);
 
     // Try resolving as a preset name.
     let reg = crate::registry::load_registry();
@@ -2012,10 +2002,16 @@ fn create_backend(
     // hardware-validated. Metal has bf16 embed pipelines wired at every
     // dispatch site but the raw path has not been validated on hardware;
     // CPU's set_embedding_raw is a no-op. Both keep the F32 dequant copy.
+    // A K-quant (Q4_K/Q5_K/Q6_K) embedding is gathered natively on CUDA; Metal and
+    // CPU have no K-quant gather and keep the F32 dequant copy.
     if (matches!(
         embedding_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
-    ) || (use_cuda && embedding_quant == QuantScheme::Bf16))
+    ) || (use_cuda
+        && matches!(
+            embedding_quant,
+            QuantScheme::Bf16 | QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K
+        )))
         && !embedding_raw.is_empty()
     {
         if verbose {

@@ -7,6 +7,7 @@ use crate::dequant::*;
 use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor_io::*;
 use crate::tensor_names::*;
+use lumen_format::hyperparams::GdnDims;
 use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
 use lumen_format::quantization::QuantScheme;
 use lumen_format::streaming_writer::LayerShape;
@@ -54,6 +55,93 @@ impl ArchConverter for Qwen35Converter {
 // ---------------------------------------------------------------------------
 // Qwen3.5 (dense) layer shape computation
 // ---------------------------------------------------------------------------
+
+/// Whether a layer's `ssm_out` keeps its source scheme. The layer plan and the
+/// layer write both call this one function, on the same `gdn_v_dim` and the same
+/// conversion flags, so the two cannot disagree. Under source fidelity — which a
+/// K-quant source conversion takes by default — a Q5_K or Q8_0 `ssm_out` is kept, and
+/// a K-quant source conversion also keeps a Q4_K or Q6_K one. A K-quant artifact
+/// serves every kept K-quant `ssm_out` through the general K-quant kernels, Q5_K
+/// included; outside one, a kept Q5_K `ssm_out` has its own dedicated kernel. A kept
+/// Q8_0 one takes its split sibling either way. Only on a target that serves K-quant
+/// planes: the Metal target requantises it.
+///
+/// What the DEFAULT keeps has to be servable, exactly as the head arm's default does
+/// (`convert.rs`), and servable on the artifact the conversion is actually writing:
+///
+/// - Geometry: the kernels read this plane at `gdn_v_dim` and would truncate a row
+///   that is not whole blocks, and the converter's own post-planning gate
+///   (`serving_rules::validate_layer_plan`) refuses such a plan before a byte is
+///   written, so a K-quant source whose `gdn_v_dim` is not whole blocks for the source
+///   scheme takes the `ssm_out` 0.31.0 planned for it — requantised to Q8_0, or a
+///   stored Q8_0 unchanged, which that gate refuses either way at a width that is not
+///   whole 32-element blocks — rather than a kept plane the gate would refuse.
+/// - Header: `--requant` and `--dequantize` stamp a Q8_0 / Q4_0 / F32 primary scheme,
+///   and CUDA's Q4_K / Q5_K / Q6_K layer arms are scoped on a K-quant header
+///   (`runtime_defaults::kquant_artifact`), so a K-quant plane kept under one of those
+///   headers would be dequantised to F32 at load — 4 bytes per weight, against the 34
+///   bytes per 32 weights of the Q8_0 `ssm_out` 0.31.0 wrote there, and against the
+///   144 bytes per 256 weights the source stores a Q4_K one in. The default therefore
+///   keeps nothing on those two routes: they write the `ssm_out` 0.31.0 wrote for
+///   them. The other preserved planes go by arms that read a plane's stored scheme
+///   whatever the header is: a kept embedding survives both `--requant` schemes, while
+///   `--dequantize` dequantises it; a preserved Q6_K head survives `--requant q8_0`
+///   and `--dequantize`, while `--requant q4_0` requantises it as 0.31.0 did.
+///
+/// The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside both rules: it keeps
+/// the Q5_K and Q8_0 `ssm_out` 0.31.0 kept, at every width and under `--requant` /
+/// `--dequantize` as well (both of those schemes are served whatever the header is),
+/// and where that gate refuses the plan the conversion is refused with it, exactly as
+/// in 0.31.0.
+pub(crate) fn ssm_out_keeps_source(
+    target: ConvertTarget,
+    src: Option<GgmlType>,
+    gdn_v_dim: usize,
+    requant_to: Option<QuantScheme>,
+    dequantize: bool,
+) -> bool {
+    if !crate::convert::target_serves_kquant(target) {
+        return false;
+    }
+    // 0.31.0's answer under the explicit switch, unchanged at every width and flag.
+    let explicit = crate::convert::source_fidelity_requested()
+        && matches!(src, Some(GgmlType::Q5_K) | Some(GgmlType::Q8_0));
+    // The K-quant source default: the same schemes plus Q4_K and Q6_K, only at a width
+    // the kernels read whole blocks at, and only on the route that stamps the K-quant
+    // header those two schemes' arms are scoped on.
+    let default_keep = crate::convert::kquant_source()
+        && requant_to.is_none()
+        && !dequantize
+        && matches!(
+            src,
+            Some(GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q8_0)
+        )
+        && src.and_then(|t| t.to_lbc_quant()).is_some_and(|q| {
+            lumen_format::serving_rules::validate_projection_row_width("ssm_out", q, gdn_v_dim)
+                .is_ok()
+        });
+    explicit || default_keep
+}
+
+/// The width the loaders read a kept `ssm_out` at: the GDN V projection dimension,
+/// `num_v_heads * head_dim`. Read from the source's SSM metadata through the same
+/// keys, and with the same Qwen3.5-9B fallback, that `hyperparams::extract_hyperparams`
+/// reads it with — `ssm.time_step_rank` is the presence signal for GDN dimensions, and
+/// an undeclared shape resolves to [`GdnDims::QWEN35_9B`] — so this predicate and the
+/// post-planning gate, which runs on `ModelHyperparams::gdn_dims()`, measure one width.
+fn gdn_v_dim(gguf: &GgufFile) -> usize {
+    let prefix = gguf.get_string("general.architecture").unwrap_or_default();
+    let default = GdnDims::QWEN35_9B;
+    match gguf.get_u32(&format!("{prefix}.ssm.time_step_rank")) {
+        Some(num_v_heads) => {
+            let head_dim = gguf
+                .get_u32(&format!("{prefix}.ssm.state_size"))
+                .unwrap_or(default.head_dim);
+            num_v_heads as usize * head_dim as usize
+        }
+        None => default.v_dim() as usize,
+    }
+}
 
 /// Compute the LayerShape for a single Qwen3.5 (dense) layer.
 ///
@@ -299,8 +387,9 @@ fn compute_layer_shape_qwen35(
             None => {
                 // SOURCE_FIDELITY passthrough: a None target keeps the source
                 // scheme verbatim (the ssm_out caller only passes None for
-                // sources the runtime serves natively: Q5_K, Q8_0). Must
-                // mirror `write_layer_blob`'s None-target verbatim copy.
+                // sources the runtime serves natively — `ssm_out_keeps_source`:
+                // Q5_K, Q8_0, and on a K-quant source conversion Q4_K and Q6_K).
+                // Must mirror `write_layer_blob`'s None-target verbatim copy.
                 let quant = src_quant.ok_or_else(|| ConvertError::UnsupportedTensorType {
                     tensor: name.clone(),
                     ggml_type: format!("{:?}", tensor.ggml_type),
@@ -461,7 +550,9 @@ fn compute_layer_shape_qwen35(
     // SSM tensors (linear attention layers only) — never requantized to user target.
     // ssm_alpha/beta are Q8_0 on default paths (Metal's GDN kernels read only
     // Q8_0; CUDA also serves F32 gates). Shared logic in gdn_gates handles the
-    // force-requant and the `--dequantize` / source-fidelity exceptions.
+    // force-requant and the `--dequantize` / source-fidelity exceptions, and a
+    // K-quant source's default non-Metal conversion, which keeps F32 gates of the
+    // extent the projection reads.
     let ssm = compute_ssm_slices(gguf, layer, &mut blob_size, dequantize, target)?;
     let ssm_a = ssm.ssm_a;
     let ssm_conv1d = ssm.ssm_conv1d;
@@ -482,26 +573,22 @@ fn compute_layer_shape_qwen35(
     // "force F32 unless requant handles it" shipped LBCs that lost 100%+
     // Metal prefill on Qwen3.5-9B.)
     // SOURCE_FIDELITY: keep ssm_out in its source format when the runtime can
-    // serve it (Q5_K in Q4_0-preset files, Q8_0 in Q8 files). The Q8_0 floor
-    // below guards the historical hazard — REQUANTIZING ssm_out DOWN to 4-bit
-    // corrupts the recurrence; serving the provider's own Q5_K is the
-    // reference engine's configuration, not a down-requant.
+    // serve it (`ssm_out_keeps_source`). The Q8_0 floor below guards the
+    // historical hazard — REQUANTIZING ssm_out DOWN to 4-bit corrupts the
+    // recurrence; serving the provider's own K-quant is the reference
+    // engine's configuration, not a down-requant.
     let ssm_out_src = gguf
         .find_tensor(&layer_tensor_name(layer, SSM_OUT))
         .map(|t| t.ggml_type);
-    let ssm_out_target = if target != ConvertTarget::Metal
-        && crate::convert::source_fidelity()
-        && matches!(
-            ssm_out_src,
-            Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
-        ) {
-        None
-    } else {
-        match requant_to {
-            Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-            other => other.or(Some(QuantScheme::Q8_0)),
-        }
-    };
+    let ssm_out_target =
+        if ssm_out_keeps_source(target, ssm_out_src, gdn_v_dim(gguf), requant_to, dequantize) {
+            None
+        } else {
+            match requant_to {
+                Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                other => other.or(Some(QuantScheme::Q8_0)),
+            }
+        };
     let ssm_out = compute_slice_with_requant(gguf, layer, SSM_OUT, &mut blob_size, ssm_out_target)?;
 
     // Dense FFN weights (present in all layers)
@@ -718,21 +805,17 @@ fn write_qwen35_layer_blob<R: Read + Seek>(
             // MUST stay in sync for layer-shape symmetry). (Target is
             // irrelevant here: ssm_out is always force-requanted.)
             // SOURCE_FIDELITY: keep the source scheme verbatim (None target =
-            // passthrough) — must mirror the plan's `ssm_out_target` above.
+            // passthrough) — the same `ssm_out_keeps_source` the plan used.
             let src = gguf.find_tensor(&name).map(|t| t.ggml_type);
-            let ssm_out_target = if target != ConvertTarget::Metal
-                && crate::convert::source_fidelity()
-                && matches!(
-                    src,
-                    Some(crate::gguf::GgmlType::Q5_K) | Some(crate::gguf::GgmlType::Q8_0)
-                ) {
-                None
-            } else {
-                match requant_to {
-                    Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
-                    other => other.or(Some(QuantScheme::Q8_0)),
-                }
-            };
+            let ssm_out_target =
+                if ssm_out_keeps_source(target, src, gdn_v_dim(gguf), requant_to, dequantize) {
+                    None
+                } else {
+                    match requant_to {
+                        Some(QuantScheme::Q4_0) => Some(QuantScheme::Q8_0),
+                        other => other.or(Some(QuantScheme::Q8_0)),
+                    }
+                };
             append_tensor_to_blob_requant(
                 blob,
                 reader,

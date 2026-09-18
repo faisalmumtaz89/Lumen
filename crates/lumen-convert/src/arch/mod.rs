@@ -100,13 +100,23 @@ impl Converter {
     }
 }
 
+/// Whether the architecture string `arch` selects the MoE converter, including
+/// the alternate GGUF spellings. One predicate for the converter choice, the
+/// `--requant` refusal and the K-quant source decision, so no two of them can
+/// disagree about which planner reads a file's tensors. Distinct from
+/// `ModelHyperparams::is_moe`, which reads the expert-count metadata rather
+/// than the architecture this converter dispatches on.
+pub(crate) fn is_moe_arch(arch: &str) -> bool {
+    matches!(arch, "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe")
+}
+
 /// Select the appropriate Converter based on architecture string.
 ///
 /// `num_experts` is forwarded to the MoE variant when the architecture is
 /// `qwen35moe` (also accepts the alternate GGUF spellings
 /// `qwen3_5_moe` and `qwen3.5_moe`). The dense `qwen35` path ignores it.
 pub(crate) fn select_converter(arch: &str, num_experts: Option<u32>) -> Converter {
-    if matches!(arch, "qwen35moe" | "qwen3_5_moe" | "qwen3.5_moe") {
+    if is_moe_arch(arch) {
         Converter::Qwen35Moe(qwen35_moe::Qwen35MoeConverter {
             num_experts: num_experts.unwrap_or(0),
         })

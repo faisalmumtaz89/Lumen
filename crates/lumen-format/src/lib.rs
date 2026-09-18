@@ -28,7 +28,9 @@ pub mod tokenizer;
 pub mod writer;
 
 pub use error::FormatError;
-pub use header::{Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION};
+pub use header::{
+    Endianness, GlobalTensorRange, LbcHeader, LBC_MAGIC, LBC_VERSION, LBC_VERSION_KQUANT_EMBEDDING,
+};
 pub use hyperparams::ModelHyperparams;
 pub use index::{ExpertSlice, LayerIndex, SliceFields, SubtensorOffsets, TensorSlice};
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};

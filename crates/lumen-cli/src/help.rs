@@ -38,7 +38,10 @@ ARGUMENTS:
     <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.8-27b, qwen3.5-moe
 
 OPTIONS:
-    --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16
+    --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16;
+                          Q4_K_M, Q5_K_M for qwen3.8-27b (served as stored on CUDA; on
+                          Apple Silicon they convert to an artifact larger than the
+                          Q8_0 one, as before)
     --yes, -y             Skip download confirmation prompt
     -h, --help            Print this help message
 
@@ -71,7 +74,10 @@ EXAMPLES:
 MODELS:
     Run 'lumen models' to see available models.
     Quantization tag: q8_0 (best quality / production default), q4_0 (smaller),
-                      bf16 (full precision, fastest prefill on supported GPUs)
+                      bf16 (full precision, fastest prefill on supported GPUs),
+                      q4_k_m / q5_k_m (qwen3.8-27b only, served as stored on CUDA;
+                      on Apple Silicon they convert to an artifact larger than
+                      the q8_0 one)
 
 OPTIONS:
     --model <name|path>   Model name from registry (e.g. qwen3-5-9b:q8_0) or path to .lbc/.gguf file
@@ -219,16 +225,32 @@ OPTIONS:
     --output <path>      Path to output LBC file (default: input with .lbc extension)
     --dequantize         Dequantize tensors to F32 (larger but compatible).
                          Kernel-required exceptions stay quantized: dense
-                         models keep ssm_out Q8_0 by default, and the Metal
-                         target keeps ssm_alpha/ssm_beta Q8_0 (its GDN
-                         kernels read only Q8_0).
+                         models keep ssm_out Q8_0 (a K-quant source's kept
+                         ssm_out is off under this flag, whose F32 header the
+                         K-quant layer kernels are closed on; a Q5_K or Q8_0
+                         one is still kept under
+                         LUMEN_CONVERT_SOURCE_FIDELITY=1), the Metal target
+                         keeps ssm_alpha/ssm_beta Q8_0 (its GDN kernels read
+                         only Q8_0), and a K-quant source keeps a preserved
+                         Q6_K output head and its K-quant embedding is
+                         dequantized.
     --requant <scheme>   Requantize weights to target scheme during conversion
                          Supported: q4_0, q8_0. Dense models only (refused for
                          MoE: expert tensors carry their source quantization).
+                         A K-quant source's kept embedding survives
+                         either requant header; q8_0 also keeps a
+                         preserved Q6_K head, while q4_0 requantises
+                         it. Its ssm_out takes the Q8_0 floor: the
+                         K-quant layer kernels are closed on that header.
     --target <backend>   Runtime backend the LBC is being prepared for.
                          metal:   upcast K-quant layer tensors (Q2..Q6_K) to Q8_0
                                   (Metal has no K-quant dispatch kernels).
-                         generic: keep K-quant layer tensors as-is (CUDA host).
+                         generic: keep K-quant layer tensors as-is (CUDA host);
+                                  a K-quant source's Q4_K/Q5_K/Q6_K planes,
+                                  a kept embedding, kept ssm_out and Q6_K
+                                  head are served natively there (the kept
+                                  ssm_out needs this target's own header, so
+                                  --requant / --dequantize drop it).
                          Default: metal on macOS, generic elsewhere.
     --from-hf <dir>      Import a Hugging Face compressed-tensors checkpoint
                          directory (pack-quantized INT4 group-32, indexed

@@ -193,6 +193,55 @@ pub(crate) fn model_dense_quant() -> Option<QuantScheme> {
     }
 }
 
+/// Whether the artifact's HEADER carries a K-quant primary scheme: the scheme recorded by
+/// `set_model_primary_quant` (`lumen run` / `lumen-server`, before the backend loads a layer) is
+/// Q4_K, Q5_K or Q6_K — the scheme a K-quant source's conversion stamps. It is a statement about
+/// the header alone, and a K-quant header does not by itself mean a K-quant plane is present: a
+/// `--target metal` conversion of a K-quant source upcasts every K-quant layer plane to Q8_0,
+/// dequantises the embedding and re-quantises the head, yet still takes a K-quant primary scheme
+/// (on a dense GDN file layer 0 has no `attn_q`, so the converter's scheme detection reads
+/// `blk.0.ffn_gate`), and that artifact is plane for plane a Q8_0 one. CUDA therefore scopes its
+/// K-quant-only behaviour on this predicate AND on the artifact's own planes: the native plane
+/// upload on each plane's stored scheme, and the raw-plane release after the Q8 split clone and the
+/// K-quant receipts on [`kquant_planes_present`], the loader's census of the schemes the planes are
+/// stored in — so an artifact without an as-stored K-quant plane keeps its kernels of record, its
+/// planes and its memory. A K-quant source converted with `--requant q8_0` keeps its K-quant
+/// embedding and a `Q6_K` head under a Q8_0 header (`--requant q4_0` keeps the embedding and
+/// re-quantises the head; a Q4_K / Q5_K head is re-quantised either way; its `ssm_out` is the one
+/// 0.31.0 wrote, because the layer arms are the header-scoped ones while the embedding and head
+/// arms read a plane's own scheme whatever the header says; and a plane the runtime does not serve
+/// at that geometry — a Q6_K head whose row width is not whole superblocks, a head or an
+/// embedding stored as some plane other than the one the header's vocab x hidden needs, an
+/// `ssm_out` whose GDN width is not whole blocks for its scheme, an `ssm_alpha` / `ssm_beta` of
+/// an extent other than the one the projection reads — is converted as 0.31.0 converted it):
+/// CUDA serves each preserved plane through its own scheme's arm, and a missing kernel group is
+/// then reported at the first token instead of at load.
+pub fn kquant_artifact() -> bool {
+    model_dense_quant().is_some_and(|q| q.is_kquant_superblock())
+}
+
+/// Whether the artifact both declares a K-quant primary scheme in its header and
+/// actually CARRIES an as-stored K-quant plane — the predicate the raw-plane release
+/// after the Q8 split clone and the K-quant receipts are scoped on. `header` is
+/// `model_dense_quant`'s value, `embedding` and `output_head` the two globals'
+/// stored schemes, and `any_layer_plane` whether any layer slice of non-zero length
+/// is stored in one of the three superblock schemes (the loader's census, taken while
+/// it walks the layers it is uploading anyway). A K-quant header over Q8_0 / F32
+/// planes — what a `--target metal` conversion of a K-quant source produces — is
+/// false, and so is a preserved K-quant plane under a Q8_0 / Q4_0 / F32 header
+/// (`--requant` / `--dequantize`), which keeps 0.31.0's scoping rule.
+pub fn kquant_planes_present(
+    header: Option<QuantScheme>,
+    embedding: QuantScheme,
+    output_head: QuantScheme,
+    any_layer_plane: bool,
+) -> bool {
+    header.is_some_and(|q| q.is_kquant_superblock())
+        && (any_layer_plane
+            || embedding.is_kquant_superblock()
+            || output_head.is_kquant_superblock())
+}
+
 /// Public diagnostic wrapper over `model_dense_quant` for the
 /// `dump_quant_hint` example (which lives outside the crate and so cannot see
 /// the `pub(crate)` accessor). Behaviourally identical; not used on any hot
@@ -646,14 +695,15 @@ pub fn gdn_f64_accum_default() -> bool {
 ///
 /// The GDN `ssm_alpha` / `ssm_beta` weights are stored `Q8Raw` in default
 /// conversions (the GGUF source is typically F32; the converter
-/// force-requantizes them to Q8_0 — source-fidelity, HF-import, and
-/// `--dequantize` non-Metal artifacts carry F32 gates and take the F32
-/// route instead). With the keeper Q8-prefill-MMQ default ON, the batched PREFILL
-/// projects them via `mmq_q8_0_batched` (INT8 MMA) while the single-token
-/// DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile matvec — a
-/// DIFFERENT activation-quant granularity + INT8 reduction order. The
-/// `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this as
-/// alpha relD 19.45% / beta relD 20.96% decode-vs-prefill, while the
+/// force-requantizes them to Q8_0 — a K-quant source's default non-Metal
+/// conversion at the extent the projection reads, source-fidelity, HF-import,
+/// and `--dequantize` non-Metal artifacts carry F32 gates and take the F32
+/// route instead). With the keeper Q8-prefill-MMQ default ON, the batched
+/// PREFILL projects them via `mmq_q8_0_batched` (INT8 MMA) while the
+/// single-token DECODE uses the per-token Q8_1/dp4a `matvec_q8_0_q8_1` tile
+/// matvec — a DIFFERENT activation-quant granularity + INT8 reduction
+/// order. The `[GDNPROJSS]` whole-buffer-sumsq probe at GDN L0 measured this
+/// as alpha relD 19.45% / beta relD 20.96% decode-vs-prefill, while the
 /// (F16/bf16) qkv + gate projections were 0.000% (BIT-IDENTICAL). The
 /// 256-expert top-K router amplifies the ~20% alpha/beta divergence into a
 /// 5-of-8 expert flip that cascades 40 layers and derails greedy decode.
@@ -950,6 +1000,35 @@ pub fn profile_attn_leaf() -> Option<&'static str> {
             .into_iter()
             .find(|s| *s == v)
     })
+}
+
+/// The Q8_0 prefill projection route: MMQ (INT8 dp4a on the AoS plane) when
+/// `LUMEN_CUDA_Q8_PROJ_MMQ` is set to anything but 0/false/no, or by default on a
+/// MoE model; otherwise dequant -> F16 -> HGEMM.
+#[cfg(feature = "cuda")]
+pub(crate) fn q8_proj_mmq_enabled() -> bool {
+    match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
+        Some(v) => !matches!(v, "0" | "false" | "no"),
+        None => model_is_moe(),
+    }
+}
+
+/// Whether the split-clone pass releases a Q8_0 plane's raw copy once its split
+/// sibling exists (the plane is then resident once, in the split layout, and the
+/// prefill dequantizes that layout). Off when the prefill reads the AoS bytes
+/// directly — `LUMEN_CUDA_Q8_PROJ_MMQ` set at all (the residual site keys on the
+/// variable's presence) or a MoE model — and under the rollback switch
+/// `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1`. The artifact scoping is the call site's, not this
+/// accessor's: only an artifact that carries an as-stored K-quant plane releases
+/// (`cuda::backend_impl`, under `kquant_artifact()` and the loader's plane census);
+/// an artifact whose planes are Q4_0 / Q8_0 / BF16 keeps both copies as shipped.
+pub fn q8_split_release_raw_enabled() -> bool {
+    if matches!(std::env::var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW"), Ok(v) if v == "1") {
+        return false;
+    }
+    // The variable's presence alone keeps the raw planes: the residual prefill site keys
+    // on presence, the projection site on the value, and MoE models default to MMQ.
+    !(std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok() || model_is_moe())
 }
 
 /// `LUMEN_CUDA_Q8_SPLIT_SSMOUT` (default ON): clone the GDN `ssm_out` Q8
@@ -1452,6 +1531,20 @@ pub fn q4_1_down_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_KQUANT=0`: kill-switch for the general K-quant kernels — a
+/// rollback to refusing at load the Q4_K / Q5_K / Q6_K layer planes of an artifact
+/// whose header scheme is K-quant, and a Q4_K / Q5_K / Q6_K embedding plane whatever
+/// the header carries (the gather reads the plane's own scheme, and `--requant q8_0`
+/// of a K-quant source preserves such an embedding under a Q8_0 header), never an A/B
+/// axis: those kernels are such a plane's only route on this backend. Default ON.
+pub fn cuda_kquant_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_KQUANT") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// `LUMEN_CUDA_Q6K_HEAD=0`: kill-switch for the source-fidelity Q6_K output
 /// head planes. When OFF the CUDA init skips the plane build and serves the
 /// head from the provider's F32 dequant copy (SGEMV; ~5 GB extra VRAM —
@@ -1844,6 +1937,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
     "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
     "LUMEN_CUDA_GPU_SAMPLE",
+    "LUMEN_CUDA_KQUANT",
     "LUMEN_CUDA_LEGACY_DEFAULTS",
     "LUMEN_CUDA_MAX_SEQ_LEN",
     "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
@@ -1894,6 +1988,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_Q8_SPLIT",
     "LUMEN_CUDA_Q8_SPLIT_ATTN",
     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+    "LUMEN_CUDA_Q8_SPLIT_KEEP_RAW",
     "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
     "LUMEN_CUDA_Q8_SPLIT_WO",
     "LUMEN_CUDA_ROPE_TAB",
@@ -1908,6 +2003,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_DUMP_GDN_L0_BIN",
     "LUMEN_DUMP_NORMED",
     "LUMEN_FREQUENCY_PENALTY",
+    "LUMEN_KQUANT_LBC",
     "LUMEN_KV_PRECISION",
     "LUMEN_METAL_ATTN_PRECISE",
     "LUMEN_METAL_BF16_GATE_UP_NR",
@@ -2695,6 +2791,43 @@ mod fixed_horizon_bench_tests {
         assert!(!env_is_exactly_one(name));
     }
 
+    /// The accessor is the policy half of the release predicate: with the switches clear it
+    /// allows the release; the rollback switch, a MoE model, and any prefill route that reads
+    /// the raw bytes directly (`LUMEN_CUDA_Q8_PROJ_MMQ` present at all) refuse it. The artifact
+    /// half — only an artifact carrying a K-quant plane releases — is the call site's
+    /// (`cuda::backend_impl::preload_weights`).
+    #[test]
+    fn q8_split_raw_release_default_and_switches() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_tests();
+        for name in ["LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "LUMEN_CUDA_Q8_PROJ_MMQ"] {
+            std::env::remove_var(name);
+        }
+        assert!(
+            q8_split_release_raw_enabled(),
+            "default with the policy switches clear: the accessor allows the release"
+        );
+        set_model_is_moe(true);
+        assert!(
+            !q8_split_release_raw_enabled(),
+            "a MoE model prefills Q8 through MMQ: the raw plane stays"
+        );
+        reset_for_tests();
+        std::env::set_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "1");
+        assert!(!q8_split_release_raw_enabled(), "=1 keeps the raw plane");
+        std::env::set_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW", "0");
+        assert!(q8_split_release_raw_enabled(), "=0 is the default");
+        std::env::remove_var("LUMEN_CUDA_Q8_SPLIT_KEEP_RAW");
+        for v in ["1", "0", "false"] {
+            std::env::set_var("LUMEN_CUDA_Q8_PROJ_MMQ", v);
+            assert!(
+                !q8_split_release_raw_enabled(),
+                "LUMEN_CUDA_Q8_PROJ_MMQ={v}: the residual MMQ site keys on the variable's presence, so the raw plane stays"
+            );
+        }
+        std::env::remove_var("LUMEN_CUDA_Q8_PROJ_MMQ");
+    }
+
     /// Off is shipping behaviour: the resolver reports false.
     #[test]
     fn token_ids_off_is_shipping_behaviour() {
@@ -2887,6 +3020,29 @@ mod tests {
                 "primary scheme must round-trip for {scheme:?}"
             );
         }
+    }
+
+    /// The header alone does not scope CUDA's K-quant routes: a `--target metal`
+    /// conversion of a K-quant source keeps a K-quant primary scheme over Q8_0 / F32
+    /// planes, and the predicate must be false for it; a preserved K-quant plane under
+    /// a requantised header stays out of scope, as in 0.31.0.
+    #[test]
+    fn kquant_planes_present_needs_a_plane_not_just_the_header() {
+        use QuantScheme::{F32, Q4_0, Q4_K, Q6_K, Q8_0};
+        // the `--target metal` artifact of a K-quant source: K-quant header, no plane
+        assert!(!kquant_planes_present(Some(Q4_K), F32, Q8_0, false));
+        // the registry cells: a K-quant layer plane, and the two globals besides
+        assert!(kquant_planes_present(Some(Q4_K), Q4_K, Q6_K, true));
+        assert!(kquant_planes_present(Some(Q4_K), F32, Q8_0, true));
+        assert!(kquant_planes_present(Some(Q4_K), Q4_K, Q8_0, false));
+        assert!(kquant_planes_present(Some(Q4_K), F32, Q6_K, false));
+        // the scoping rule of `kquant_artifact`: a preserved K-quant plane under a
+        // requantised or dequantised header is out of scope — 0.31.0's header rule
+        assert!(!kquant_planes_present(Some(Q8_0), Q4_K, Q6_K, true));
+        assert!(!kquant_planes_present(Some(Q4_0), Q4_K, Q6_K, true));
+        assert!(!kquant_planes_present(Some(F32), Q4_K, Q6_K, true));
+        // a legacy caller that never recorded a header scheme
+        assert!(!kquant_planes_present(None, Q4_K, Q6_K, true));
     }
 
     #[test]
@@ -4064,6 +4220,7 @@ mod tests {
         "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
         "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
         "LUMEN_CUDA_GPU_SAMPLE",
+        "LUMEN_CUDA_KQUANT",
         "LUMEN_CUDA_LEGACY_DEFAULTS",
         "LUMEN_CUDA_MAX_SEQ_LEN",
         "LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ",
@@ -4110,6 +4267,7 @@ mod tests {
         "LUMEN_CUDA_Q8_SPLIT",
         "LUMEN_CUDA_Q8_SPLIT_ATTN",
         "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+        "LUMEN_CUDA_Q8_SPLIT_KEEP_RAW",
         "LUMEN_CUDA_Q8_SPLIT_SSMOUT",
         "LUMEN_CUDA_Q8_SPLIT_WO",
         "LUMEN_CUDA_ROPE_TAB",
@@ -4124,6 +4282,7 @@ mod tests {
         "LUMEN_DUMP_GDN_L0_BIN",
         "LUMEN_DUMP_NORMED",
         "LUMEN_FREQUENCY_PENALTY",
+        "LUMEN_KQUANT_LBC",
         "LUMEN_KV_PRECISION",
         "LUMEN_METAL_ATTN_PRECISE",
         "LUMEN_METAL_BF16_GATE_UP_NR",

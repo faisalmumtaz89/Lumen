@@ -111,7 +111,10 @@ MODEL (positional or --model):
 
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
-                           (q8_0, q4_0, bf16). Default: q8_0
+                           (q8_0, q4_0, bf16; q4_k_m, q5_k_m for qwen3.8-27b,
+                           served as stored on CUDA only — on Apple Silicon the
+                           cached artifact is larger than the q8_0 one).
+                           Default: q8_0
     --host <HOST>          Listen host. Default: 127.0.0.1
     --port <N>             Listen port. Default: 8000
     --context-len <N>      Max sequence length (KV cache size).
@@ -574,14 +577,30 @@ impl ServerWeights {
     }
 }
 
+/// Which raw global planes a backend takes as stored (the rest are handed over as the
+/// provider's F32 dequant).
+#[derive(Default, Clone, Copy)]
+struct RawAcceptance {
+    /// Drop the F32 copy of a plane the backend takes raw.
+    skip_f32_when_raw: bool,
+    q6k_head: bool,
+    bf16_head: bool,
+    bf16_embedding: bool,
+    kquant_embedding: bool,
+}
+
 fn wire_global_tensors_and_raw(
     backend: &mut dyn ComputeBackend,
     g: &WeightGlobals<'_>,
-    skip_f32_when_raw: bool,
-    accept_q6k_head: bool,
-    accept_bf16_head: bool,
-    accept_bf16_embedding: bool,
+    accept: RawAcceptance,
 ) {
+    let RawAcceptance {
+        skip_f32_when_raw,
+        q6k_head: accept_q6k_head,
+        bf16_head: accept_bf16_head,
+        bf16_embedding: accept_bf16_embedding,
+        kquant_embedding: accept_kquant_embedding,
+    } = accept;
     // When a native-quant raw blob is present for a scheme the backend uploads
     // directly (Q8_0/Q4_0/F16), `init()` builds the GPU buffer straight from the
     // raw bytes and never needs the F32 dequant. Materializing that F32 here via
@@ -600,11 +619,18 @@ fn wire_global_tensors_and_raw(
     // hardware-validated; Metal's bf16 embed pipelines are wired but the raw
     // path is not hardware-validated, and CPU's set_embedding_raw is a
     // no-op. Both keep the F32 dequant copy.
+    // A K-quant embedding is gathered natively by CUDA from the stored planes
+    // (`accept_kquant_embedding`); Metal and CPU have no K-quant gather.
     let embedding_has_raw = (matches!(
         g.embedding_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
     ) || (accept_bf16_embedding
-        && g.embedding_quant == QuantScheme::Bf16))
+        && g.embedding_quant == QuantScheme::Bf16)
+        || (accept_kquant_embedding
+            && matches!(
+                g.embedding_quant,
+                QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K
+            )))
         && !g.embedding_raw.is_empty();
     // Q6_K (source-fidelity head) is CUDA-only: the CUDA backend splits the
     // superblocks into dp4a planes; Metal/CPU have no Q6_K head kernel.
@@ -809,10 +835,11 @@ async fn run(args: Args) -> Result<(), String> {
                 wire_global_tensors_and_raw(
                     &mut metal,
                     &provider.globals(),
-                    true,
-                    false,
-                    true,
-                    false,
+                    RawAcceptance {
+                        skip_f32_when_raw: true,
+                        bf16_head: true,
+                        ..RawAcceptance::default()
+                    },
                 );
                 metal
                     .init(&hyperparams_capped)
@@ -853,10 +880,13 @@ async fn run(args: Args) -> Result<(), String> {
                 wire_global_tensors_and_raw(
                     &mut cuda,
                     &provider.globals(),
-                    false,
-                    true,
-                    true,
-                    true,
+                    RawAcceptance {
+                        q6k_head: true,
+                        bf16_head: true,
+                        bf16_embedding: true,
+                        kquant_embedding: true,
+                        ..RawAcceptance::default()
+                    },
                 );
                 cuda.init(&hyperparams_capped)
                     .map_err(|e| format!("CUDA init: {e}"))?;
@@ -874,7 +904,7 @@ async fn run(args: Args) -> Result<(), String> {
             let mut cpu = NaiveF32Backend::new();
             // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
             // directly and does not build a GPU buffer from the raw.
-            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), false, false, false, false);
+            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
             // The CPU cache stores whatever precision the session asks for.

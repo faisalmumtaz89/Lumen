@@ -602,6 +602,69 @@ pub fn validate_projection_geometry(
     Ok(())
 }
 
+/// The row-width half of [`validate_projection_geometry`], asked before a
+/// plane is planned: the converter knows the scheme it would keep and the
+/// width the kernels will read that plane at, but not yet its length. A
+/// K-quant source takes plane preservation by DEFAULT, so the default must
+/// not plan a projection the loaders then refuse; the explicit
+/// `LUMEN_CONVERT_SOURCE_FIDELITY` switch is outside the rule and answers for
+/// every width, as in 0.31.0.
+///
+/// One rule and one block table: this asks `validate_projection_geometry`
+/// itself, with the zero-length slice that function documents as an absence
+/// sentinel, so only the width half can fail.
+pub fn validate_projection_row_width(
+    name: &str,
+    quant: QuantScheme,
+    in_dim: usize,
+) -> Result<(), String> {
+    validate_projection_geometry(
+        name,
+        &crate::index::TensorSlice {
+            offset: 0,
+            length: 0,
+            quant,
+        },
+        in_dim,
+        &[],
+    )
+}
+
+/// The output-head matvec kernels lay blocks out per row
+/// ([vocab rows] x [hidden/block_elems blocks]), so the row width itself
+/// must be block-aligned — flattened vocab*hidden divisibility alone
+/// admits totals whose rows split blocks (e.g. hidden=48 under Q8_0, or a
+/// Q6_K head on a hidden below one 256-element superblock), which the
+/// kernels misindex. The embedding keeps the flattened check: its lookup
+/// kernels tolerate blocks crossing row boundaries.
+///
+/// One rule for this global plane, read by the CUDA loader before it
+/// uploads the head and obeyed by the converter for a K-quant source's
+/// default head, so the default and the loader cannot disagree about which
+/// head geometry is servable. The explicit `LUMEN_CONVERT_SOURCE_FIDELITY`
+/// / `LUMEN_CONVERT_KEEP_Q6K_OUTPUT` switches are outside the rule: they
+/// answer for every width, as in 0.31.0.
+pub fn validate_output_head_row_alignment(
+    quant: QuantScheme,
+    hidden_dim: usize,
+) -> Result<(), String> {
+    let row_block_elems = match quant {
+        QuantScheme::Q8_0 | QuantScheme::Q4_0 => Some(32usize),
+        QuantScheme::Q6_K => Some(256usize),
+        _ => None,
+    };
+    if let Some(elems) = row_block_elems {
+        if hidden_dim % elems != 0 {
+            return Err(format!(
+                "output_proj is {quant:?} but hidden_dim {hidden_dim} is \
+                 not a multiple of the {elems}-element block row layout \
+                 the head kernels require (malformed hyperparams)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Exact byte extents for the F32 attention vectors the kernels read at
 /// hyperparam-derived lengths: per-head Q/K norms at `head_dim` values
 /// per head (CUDA's `rmsnorm_per_head_inplace` indexes
@@ -859,6 +922,40 @@ pub fn validate_expert_bank(st: &crate::index::SubtensorOffsets) -> Result<(), S
     Ok(())
 }
 
+/// The embedding gather indexes the table flattened — element
+/// `token_id * hidden_dim + i`, superblock `e >> 8` — so a K-quant
+/// embedding is uploaded as `vocab_size * hidden_dim / 256` whole
+/// superblocks, and an element count that is not whole superblocks is
+/// refused at load. GGUF sizes a tensor from its flattened count at
+/// `div_ceil`, so a source can carry a partial final superblock, and its
+/// `token_embd` can have rows the header's vocab does not — which is why the
+/// converter runs this rule on the header's `vocab_size * hidden_dim` and
+/// preserves a source plane only when it is exactly the length returned here.
+///
+/// One rule for this global plane, read by the CUDA loader before it
+/// uploads the embedding and by the converter before it carries a source
+/// embedding verbatim. `Ok` carries the only valid raw byte length.
+pub fn kquant_global_plane_len(quant: QuantScheme, n_elements: usize) -> Result<usize, String> {
+    let block_bytes = match quant {
+        QuantScheme::Q4_K => 144usize,
+        QuantScheme::Q5_K => 176,
+        QuantScheme::Q6_K => 210,
+        other => {
+            return Err(format!(
+                "{other:?} is not one of the K-quant superblock schemes a \
+                 global plane is stored in (malformed hyperparams)"
+            ))
+        }
+    };
+    if n_elements % 256 != 0 {
+        return Err(format!(
+            "{quant:?} global of {n_elements} elements is not a multiple \
+             of the 256-element block size (malformed hyperparams)"
+        ));
+    }
+    Ok(n_elements / 256 * block_bytes)
+}
+
 /// A MoE layer's expert bank must hold exactly the header's declared
 /// expert count. The runtime sizes GPU offset tables and dispatch grids
 /// from the header count but fills only `min(header, bank.len())` entries
@@ -1077,6 +1174,50 @@ mod tests {
         st.layer_type = Some(1);
         let err = validate_gdn_conv1d(0, &st, usize::MAX, 2).unwrap_err();
         assert!(err.contains("overflows"), "{err}");
+    }
+
+    #[test]
+    fn output_head_rejects_row_misaligned_hidden() {
+        // Total block-aligned but rows split blocks: vocab=2 x hidden=48
+        // gives 96 elements (3 Q8_0 blocks), yet each row is 1.5 blocks —
+        // the flattened length check alone accepts it.
+        let err = validate_output_head_row_alignment(QuantScheme::Q8_0, 48).unwrap_err();
+        assert!(err.contains("block row layout"), "{err}");
+        let err = validate_output_head_row_alignment(QuantScheme::Q4_0, 48).unwrap_err();
+        assert!(err.contains("block row layout"), "{err}");
+        // A Q6_K head row below one superblock: the matvec reads
+        // `hidden_dim / 256 == 0` superblocks per row.
+        let err = validate_output_head_row_alignment(QuantScheme::Q6_K, 128).unwrap_err();
+        assert!(err.contains("256-element"), "{err}");
+        assert!(validate_output_head_row_alignment(QuantScheme::Q8_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q4_0, 64).is_ok());
+        assert!(validate_output_head_row_alignment(QuantScheme::Q6_K, 512).is_ok());
+        // Float heads have no block rows; any hidden width is fine.
+        assert!(validate_output_head_row_alignment(QuantScheme::F16, 48).is_ok());
+    }
+
+    #[test]
+    fn kquant_global_rejects_a_partial_final_superblock() {
+        // 257 rows of 128: 32,896 elements — 128 whole superblocks plus a
+        // 128-element tail, which GGUF stores in `div_ceil` = 129 superblocks
+        // and the loader refuses.
+        let err = kquant_global_plane_len(QuantScheme::Q4_K, 257 * 128).unwrap_err();
+        assert!(err.contains("256-element block size"), "{err}");
+        assert_eq!(
+            kquant_global_plane_len(QuantScheme::Q4_K, 256 * 128),
+            Ok(18432)
+        );
+        assert_eq!(
+            kquant_global_plane_len(QuantScheme::Q5_K, 256 * 128),
+            Ok(22528)
+        );
+        assert_eq!(
+            kquant_global_plane_len(QuantScheme::Q6_K, 256 * 128),
+            Ok(26880)
+        );
+        // Outside Q4_K / Q5_K / Q6_K the helper refuses.
+        let err = kquant_global_plane_len(QuantScheme::Q8_0, 256).unwrap_err();
+        assert!(err.contains("not one of the K-quant"), "{err}");
     }
 
     #[test]

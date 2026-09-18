@@ -13,3 +13,6 @@ serde_json = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"

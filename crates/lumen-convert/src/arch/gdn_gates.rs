@@ -2,14 +2,16 @@
 //!
 //! GGUF stores ssm_alpha/ssm_beta as F32. Metal's GDN gate kernels read them
 //! as Q8_0 only, so default conversions force-requantize them; CUDA also
-//! serves F32 gates (source-fidelity / `--dequantize` non-Metal artifacts).
-//! This module centralises that logic so both the dense and MoE converters
-//! handle it identically.
+//! serves F32 gates (a K-quant source's default non-Metal conversion, at the
+//! extent the projection reads; source-fidelity and `--dequantize` non-Metal
+//! artifacts). This module centralises that logic so both the dense and MoE
+//! converters handle it identically.
 
 use crate::convert::{ConvertError, ConvertTarget};
 use crate::gguf::{GgmlType, GgufFile};
 use crate::tensor_io::*;
 use crate::tensor_names::*;
+use lumen_format::hyperparams::GdnDims;
 use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
 use std::io::{Read, Seek};
@@ -40,9 +42,11 @@ enum SsmForm {
 /// scalars (a, conv1d, dt, norm) are always F32 — the runtime slots are typed
 /// `f32`.
 fn ssm_tensor_form(
+    gguf: &GgufFile,
     name: &str,
     suffix: &str,
     t: GgmlType,
+    n_elements: u64,
     dequantize: bool,
     target: ConvertTarget,
 ) -> Result<SsmForm, ConvertError> {
@@ -57,7 +61,14 @@ fn ssm_tensor_form(
         }
         if target != ConvertTarget::Metal && crate::convert::source_fidelity() && t == GgmlType::F32
         {
-            return Ok(SsmForm::KeepSource);
+            // What the DEFAULT keeps has to be servable, exactly as the head and
+            // `ssm_out` arms' defaults are: the projection reads a gate at
+            // `num_v_heads x hidden`, so a source that stores another extent takes
+            // the Q8_0 gate 0.31.0's default wrote for it. The explicit switch is
+            // outside that rule and answers at every extent, as in 0.31.0.
+            if crate::convert::source_fidelity_requested() || n_elements == gdn_gate_extent(gguf) {
+                return Ok(SsmForm::KeepSource);
+            }
         }
         if t == GgmlType::Q8_0 {
             return Ok(SsmForm::KeepSource);
@@ -85,6 +96,24 @@ fn ssm_tensor_form(
     })
 }
 
+/// The extent the runtimes read a kept F32 `ssm_alpha` / `ssm_beta` at: the GDN gate
+/// projection's `num_v_heads x hidden` elements. Read through the same metadata keys,
+/// and with the same Qwen3.5-9B fallback, that `hyperparams::extract_hyperparams` reads
+/// them with, so this predicate and the projection — which runs on the hyperparameters'
+/// `hidden_dim` and `gdn_dims().num_v_heads` — measure one extent. A file without
+/// `embedding_length` resolves to 0 and keeps 0.31.0's Q8_0 gate; `extract_hyperparams`
+/// refuses such a file before a layer is planned anyway.
+fn gdn_gate_extent(gguf: &GgufFile) -> u64 {
+    let prefix = gguf.get_string("general.architecture").unwrap_or_default();
+    let hidden = gguf
+        .get_u32(&format!("{prefix}.embedding_length"))
+        .unwrap_or(0);
+    let num_v_heads = gguf
+        .get_u32(&format!("{prefix}.ssm.time_step_rank"))
+        .unwrap_or(GdnDims::QWEN35_9B.num_v_heads);
+    u64::from(hidden) * u64::from(num_v_heads)
+}
+
 /// Compute a [`TensorSlice`] for a single SSM tensor, applying force-requant
 /// to Q8_0 for ssm_alpha/ssm_beta when needed.
 ///
@@ -102,34 +131,41 @@ pub(crate) fn compute_ssm_tensor_slice(
         Some(t) => t,
         None => return Ok(None),
     };
-    let (length, quant) =
-        match ssm_tensor_form(&name, suffix, tensor.ggml_type, dequantize, target)? {
-            SsmForm::KeepSource => {
-                let size =
-                    tensor
-                        .byte_size()
-                        .ok_or_else(|| ConvertError::UnsupportedTensorType {
-                            tensor: name.clone(),
-                            ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
-                        })?;
-                let quant = tensor.ggml_type.to_lbc_quant().ok_or_else(|| {
-                    ConvertError::UnsupportedTensorType {
-                        tensor: name.clone(),
-                        ggml_type: format!("{:?}", tensor.ggml_type),
-                    }
+    let form = ssm_tensor_form(
+        gguf,
+        &name,
+        suffix,
+        tensor.ggml_type,
+        tensor.n_elements(),
+        dequantize,
+        target,
+    )?;
+    let (length, quant) = match form {
+        SsmForm::KeepSource => {
+            let size = tensor
+                .byte_size()
+                .ok_or_else(|| ConvertError::UnsupportedTensorType {
+                    tensor: name.clone(),
+                    ggml_type: format!("{:?} (unknown block geometry)", tensor.ggml_type),
                 })?;
-                (size, quant)
-            }
-            SsmForm::F32 => (tensor.n_elements() * 4, QuantScheme::F32),
-            SsmForm::Q8 => {
-                let n_elements = tensor.n_elements() as usize;
-                assert!(
-                    n_elements % 32 == 0,
-                    "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
-                );
-                (((n_elements / 32) * 34) as u64, QuantScheme::Q8_0)
-            }
-        };
+            let quant = tensor.ggml_type.to_lbc_quant().ok_or_else(|| {
+                ConvertError::UnsupportedTensorType {
+                    tensor: name.clone(),
+                    ggml_type: format!("{:?}", tensor.ggml_type),
+                }
+            })?;
+            (size, quant)
+        }
+        SsmForm::F32 => (tensor.n_elements() * 4, QuantScheme::F32),
+        SsmForm::Q8 => {
+            let n_elements = tensor.n_elements() as usize;
+            assert!(
+                n_elements % 32 == 0,
+                "Q8_0 requires elements divisible by 32, got {n_elements} for {name}"
+            );
+            (((n_elements / 32) * 34) as u64, QuantScheme::Q8_0)
+        }
+    };
     let slice = TensorSlice {
         offset: *blob_offset,
         length,
@@ -201,7 +237,16 @@ pub(crate) fn write_ssm_tensors<R: Read + Seek>(
     for suffix in &SSM_SUFFIXES {
         let name = layer_tensor_name(layer, suffix);
         if let Some(tensor) = gguf.find_tensor(&name) {
-            match ssm_tensor_form(&name, suffix, tensor.ggml_type, dequantize, target)? {
+            let form = ssm_tensor_form(
+                gguf,
+                &name,
+                suffix,
+                tensor.ggml_type,
+                tensor.n_elements(),
+                dequantize,
+                target,
+            )?;
+            match form {
                 SsmForm::KeepSource => {
                     append_tensor_to_blob_requant(blob, reader, gguf, &name, false, None)?;
                 }

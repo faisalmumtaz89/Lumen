@@ -30,6 +30,7 @@ use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
 use super::kv_cache::KvView;
 use super::types::LaunchConfig;
+use lumen_format::quantization::QuantScheme;
 
 /// Pre-allocated GPU scratch buffers for the batched prefill path.
 ///
@@ -320,6 +321,7 @@ pub(crate) unsafe fn launch_embed_batch(
     embedding_f16: Option<&CudaSlice<u8>>,
     embedding_bf16: Option<&CudaSlice<u8>>,
     embedding_q4: Option<&CudaSlice<u8>>,
+    embedding_kquant: Option<(QuantScheme, &CudaSlice<u8>)>,
     token_ids_gpu: &CudaSlice<u32>,
     output: &mut CudaSlice<f32>,
     batch: usize,
@@ -335,7 +337,7 @@ pub(crate) unsafe fn launch_embed_batch(
     let batch_u32 = batch as u32;
     let hd = hidden_dim as u32;
 
-    // Dispatch priority: BF16 > F16 > Q4_0 > Q8_0 > F32 (same order as
+    // Dispatch priority: BF16 > F16 > K-quant (Q4_K/Q5_K/Q6_K) > Q4_0 > Q8_0 > F32 (same order as
     // embed_token_gpu)
     if let Some(emb_bf16) = embedding_bf16 {
         device
@@ -359,6 +361,31 @@ pub(crate) unsafe fn launch_embed_batch(
             .arg(&hd)
             .launch(launch_cfg)
             .map_err(|e| RuntimeError::Compute(format!("embed_batch_f16 launch: {e}")))?;
+    } else if let Some((scheme, emb_kq)) = embedding_kquant {
+        if !scheme.is_kquant_superblock() {
+            return Err(RuntimeError::Compute(format!(
+                "embed_batch: {scheme:?} is not a K-quant embedding scheme"
+            )));
+        }
+        let group = super::decode::kquant_kernels(kernels, scheme);
+        let tag = super::decode::kquant_tag(scheme);
+        let group = group.ok_or_else(|| {
+            RuntimeError::Compute(format!("embed_batch_{tag}: kernels not loaded"))
+        })?;
+        device
+            .stream
+            .launch_builder(&group.embed_batch)
+            .arg(emb_kq)
+            .arg(token_ids_gpu)
+            .arg(output)
+            .arg(&batch_u32)
+            .arg(&hd)
+            .launch(launch_cfg)
+            .map_err(|e| RuntimeError::Compute(format!("embed_batch_{tag} launch: {e}")))?;
+        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        super::decode::announce_route_once(&SEEN, || {
+            format!("[CUDA] embed_batch_{tag}: ACTIVE (token_embd batch, in={hidden_dim})")
+        });
     } else if let Some(emb_q4) = embedding_q4 {
         device
             .stream
@@ -462,6 +489,26 @@ fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
         && moe_bf16_native_enabled()
 }
 
+/// One line per process for the Q8_0 dequant -> F16 -> HGEMM prefill route on a raw AoS plane.
+fn announce_q8_hgemm_once() {
+    static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !Q8_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[CUDA] Prefill Q8_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
+    }
+}
+
+/// The same route on a plane resident only in the split layout (raw copy released after the
+/// split clone): its own line, so a route receipt shows which dequant fed the HGEMM.
+fn announce_q8_split_hgemm_once() {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[CUDA] Prefill Q8_0 split-layout HGEMM: ACTIVE (dequant split->F16->tensor core path)"
+        );
+    }
+}
+
 /// Batched GEMM projection: out = input * weight^T.
 ///
 /// For F32 weights, uses cuBLAS SGEMM directly. For Q8_0 weights with a
@@ -469,7 +516,8 @@ fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
 /// without F16 cache, dequantizes to the F32 scratch buffer then calls cuBLAS
 /// SGEMM. For native F16 weights (`F16Raw`), uses cublasGemmEx HGEMM directly
 /// (no dequant needed -- weights are already F16). For Q4_0, falls back to
-/// per-row matvec.
+/// per-row matvec. For a K-quant plane, dequantizes the whole plane to the F16
+/// scratch with the scheme's kernel, then HGEMM.
 ///
 /// cuBLAS column-major mapping for row-major data:
 /// Row-major W[out_dim, in_dim] = col-major W_cm[in_dim, out_dim]
@@ -536,12 +584,14 @@ pub(crate) unsafe fn launch_gemm_projection(
     // `ssm_alpha` and `ssm_beta` weights are stored as F32 in the
     // GGUF source and an F32 SGEMM dispatch is the canonical reference path.
     // Default conversions force-requantize them to Q8_0 at LBC creation
-    // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`; source-fidelity,
-    // HF-import, and `--dequantize` non-Metal artifacts keep F32), so the
-    // default runtime path runs them through HGEMM-F16 / MMQ-Q8 — both of which introduce
-    // ~0.4-3.4% per-element rounding noise from the requant step. When the
-    // `gdn_alpha`/`gdn_beta` projection is routed through F32 SGEMM, it matches
-    // that canonical F32 path (modulo SGEMM accumulator order).
+    // time (see `crates/lumen-convert/src/arch/gdn_gates.rs`; a K-quant source's
+    // default non-Metal conversion at the extent the projection reads,
+    // source-fidelity, HF-import, and `--dequantize` non-Metal artifacts keep
+    // F32), so the default runtime path runs them through HGEMM-F16 /
+    // MMQ-Q8 — both of which introduce ~0.4-3.4% per-element rounding
+    // noise from the requant step. When the `gdn_alpha`/`gdn_beta`
+    // projection is routed through F32 SGEMM, it matches that canonical F32
+    // path (modulo SGEMM accumulator order).
     //
     // Default-ON for MoE BF16 (`model_is_moe_bf16()`): empirically this F32
     // alpha/beta path is what kills the BF16 GQ-001 arith-05 repetition that the
@@ -654,10 +704,7 @@ pub(crate) unsafe fn launch_gemm_projection(
             // restores llama-matching INT8 numerics so the products are correct.
             // Dense q8 keeps the faster HGEMM path (no router to amplify drift).
             // Env `LUMEN_CUDA_Q8_PROJ_MMQ=0|1` overrides the per-model default.
-            let mmq_enabled = match std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").ok().as_deref() {
-                Some(v) => !matches!(v, "0" | "false" | "no"),
-                None => crate::runtime_defaults::model_is_moe(),
-            };
+            let mmq_enabled = crate::runtime_defaults::q8_proj_mmq_enabled();
             let use_mmq = mmq_enabled
                 && !force_alpha_beta_f32
                 && kernels.mmq_q8_0_batched.is_some()
@@ -742,11 +789,7 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
-                static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !Q8_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("[CUDA] Prefill Q8_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
-                }
+                announce_q8_hgemm_once();
 
                 // Step 1: Dequantize Q8_0 -> F16 in scratch buffer.
                 launch_dequant_q8_0_to_f16(
@@ -917,6 +960,50 @@ pub(crate) unsafe fn launch_gemm_projection(
                 )?;
             }
         }
+        GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+            // K-quant prefill: dequantize the whole plane to the F16 scratch
+            // with the scheme's kernel, then HGEMM — the Ct4Raw pattern below.
+            let (scheme, w_kq) =
+                super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                return Err(RuntimeError::Compute(format!(
+                    "gemm {label}: {scheme:?} requires the F16 HGEMM path \
+                     (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
+                     LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
+                    dequant_f16.len(),
+                )));
+            }
+            launch_dequant_kquant_to_f16(
+                device,
+                kernels,
+                scheme,
+                w_kq,
+                dequant_f16,
+                num_elements,
+                label,
+            )?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
+            launch_cublas_hgemm(
+                device,
+                dequant_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                0.0,
+                label,
+            )?;
+        }
         GpuWeightBuf::Ct4Raw(w_ct4) => {
             // CtInt4G32 prefill: dequantize to F16 scratch, then HGEMM —
             // the same pattern as the Q4Raw arm above. No F32 fallback
@@ -1020,16 +1107,89 @@ pub(crate) unsafe fn launch_gemm_projection(
                 label,
             )?;
         }
-        // split-layout: prefill never dispatches against Q8Split/Q4Split
-        // siblings. These are decode-only reorganizations; the prefill path
-        // operates on the original AoS Q8Raw/Q4Raw via dequant->F16->cuBLAS
-        // HGEMM. If we somehow get here the caller has confused decode/prefill
-        // dispatch.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        GpuWeightBuf::Q8Split(w_split) => {
+            // A Q8_0 plane resident only in the split layout (its raw copy was released
+            // after the split clone): the same dequant -> F16 -> HGEMM route as `Q8Raw`,
+            // reading the split layout, and the same F32 SGEMM fallback conditions (the
+            // alpha/beta F32 override is `Q8Raw`-only, so it is not one of them here). The
+            // MMQ route needs the AoS bytes, so a model that prefills Q8 through MMQ
+            // keeps its raw planes and never reaches this arm.
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q8_split_to_f32(
+                    device,
+                    kernels,
+                    w_split,
+                    dequant_scratch,
+                    num_elements,
+                    in_dim,
+                    label,
+                )?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 0.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM fallback (dequant Q8_0 split) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                announce_q8_split_hgemm_once();
+                launch_dequant_q8_split_to_f16(
+                    device,
+                    kernels,
+                    w_split,
+                    dequant_f16,
+                    num_elements,
+                    in_dim,
+                    label,
+                )?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
+                launch_cublas_hgemm(
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    0.0,
+                    label,
+                )?;
+            }
+        }
+        GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "prefill GEMM {label}: Q8Split/Q4Split sibling \
-                 routed to prefill; prefill must use the original Q8Raw/Q4Raw \
-                 buffer (dequant->HGEMM path)",
+                "prefill GEMM {label}: Q4Split sibling routed to prefill; prefill must use \
+                 the original Q4Raw buffer (dequant->HGEMM path)",
             )));
         }
     }
@@ -1044,7 +1204,8 @@ pub(crate) unsafe fn launch_gemm_projection(
 /// For Q8_0 without F16 cache, dequantizes to F32 scratch then SGEMM.
 /// For native F16 weights (`F16Raw`), uses cublasGemmEx HGEMM directly with
 /// beta=1.0 (no dequant needed). For Q4_0, falls back to per-row matvec +
-/// residual.
+/// residual. For a K-quant plane, dequantizes to the F16 scratch, copies the
+/// residual into `output`, then HGEMM with beta=1.0.
 ///
 /// # Safety
 ///
@@ -1454,6 +1615,53 @@ pub(crate) unsafe fn launch_gemm_residual(
                 )?;
             }
         }
+        GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+            // K-quant prefill with residual: dequantize to the F16 scratch,
+            // copy the residual into `output`, HGEMM with beta = 1.0.
+            let (scheme, w_kq) =
+                super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                return Err(RuntimeError::Compute(format!(
+                    "gemm {label}: {scheme:?} requires the F16 HGEMM path \
+                     (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
+                     LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
+                    dequant_f16.len(),
+                )));
+            }
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy ({scheme:?}) {label}: {e}"))
+            })?;
+            launch_dequant_kquant_to_f16(
+                device,
+                kernels,
+                scheme,
+                w_kq,
+                dequant_f16,
+                num_elements,
+                label,
+            )?;
+            launch_f32_to_f16_fast(
+                device,
+                kernels,
+                input,
+                activation_f16,
+                batch * in_dim,
+                label,
+            )?;
+            launch_cublas_hgemm(
+                device,
+                dequant_f16,
+                activation_f16,
+                output,
+                out_dim,
+                batch,
+                in_dim,
+                1.0,
+                label,
+            )?;
+        }
         GpuWeightBuf::Ct4Raw(w_ct4) => {
             // CtInt4G32 prefill: dequantize to F16 scratch, then HGEMM —
             // the same pattern as the Q4Raw arm above. No F32 fallback
@@ -1554,13 +1762,97 @@ pub(crate) unsafe fn launch_gemm_residual(
                 label,
             )?;
         }
-        // split-layout: prefill never dispatches against Q8Split/Q4Split
-        // siblings.
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        GpuWeightBuf::Q8Split(w_split) => {
+            // Split-layout-only Q8_0 plane (raw copy released): the `Q8Raw` residual
+            // route on the split layout — residual copied into the output, then the
+            // dequant -> F16 -> HGEMM accumulate (beta = 1), or the F32 SGEMM fallback
+            // under the same conditions. MMQ models keep their raw planes (see the
+            // projection arm).
+            let num_elements = out_dim * in_dim;
+            let f16_bytes_needed = num_elements * 2;
+            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+                if dequant_scratch.len() < num_elements {
+                    return Err(RuntimeError::Compute(format!(
+                        "sgemm_residual {label}: dequant scratch too small: have {} elements, \
+                         need {} (out_dim={out_dim}, in_dim={in_dim})",
+                        dequant_scratch.len(),
+                        num_elements,
+                    )));
+                }
+                launch_dequant_q8_split_to_f32(
+                    device,
+                    kernels,
+                    w_split,
+                    dequant_scratch,
+                    num_elements,
+                    in_dim,
+                    label,
+                )?;
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "dtod residual copy (dequant Q8_0 split fallback) {label}: {e}"
+                    ))
+                })?;
+                let cfg = GemmConfig {
+                    transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: out_dim as i32,
+                    n: batch as i32,
+                    k: in_dim as i32,
+                    alpha: 1.0f32,
+                    lda: in_dim as i32,
+                    ldb: in_dim as i32,
+                    beta: 1.0f32,
+                    ldc: out_dim as i32,
+                };
+                device
+                    .blas
+                    .gemm(cfg, &*dequant_scratch, input, output)
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!(
+                            "cuBLAS SGEMM+residual fallback (dequant Q8_0 split) {label}: {e}"
+                        ))
+                    })?;
+            } else {
+                device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                    RuntimeError::Compute(format!(
+                        "dtod residual copy (dequant Q8_0 split) {label}: {e}"
+                    ))
+                })?;
+                launch_dequant_q8_split_to_f16(
+                    device,
+                    kernels,
+                    w_split,
+                    dequant_f16,
+                    num_elements,
+                    in_dim,
+                    label,
+                )?;
+                launch_f32_to_f16_fast(
+                    device,
+                    kernels,
+                    input,
+                    activation_f16,
+                    batch * in_dim,
+                    label,
+                )?;
+                launch_cublas_hgemm(
+                    device,
+                    dequant_f16,
+                    activation_f16,
+                    output,
+                    out_dim,
+                    batch,
+                    in_dim,
+                    1.0,
+                    label,
+                )?;
+            }
+        }
+        GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "prefill residual GEMM {label}: Q8Split/Q4Split \
-                 sibling routed to prefill; prefill must use the original \
-                 Q8Raw/Q4Raw buffer",
+                "prefill residual GEMM {label}: Q4Split sibling routed to prefill; prefill \
+                 must use the original Q4Raw buffer",
             )));
         }
     }
@@ -2041,6 +2333,105 @@ unsafe fn launch_dequant_q8_0_to_f16(
     Ok(())
 }
 
+/// `dequant_q8_split_to_f32`: the F32 tile of a Q8_0 plane resident in the split layout.
+unsafe fn launch_dequant_q8_split_to_f32(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    split: &CudaSlice<u8>,
+    f32_out: &mut CudaSlice<f32>,
+    num_elements: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    // 32 elements per 34-byte block, nb * 34 bytes per row: the kernel indexes the row base
+    // from the element id and divides by `in_dim`, so a short plane reads out of bounds. `<`
+    // rather than the K-quant sibling's `!=`: the plane is exact today (`repack_q8_raw_to_split`
+    // allocates out_dim * nb * 34), and only shortness is unsafe.
+    let expected_w = num_elements / 32 * 34;
+    if in_dim == 0
+        || in_dim % 32 != 0
+        || num_elements % in_dim != 0
+        || split.len() < expected_w
+        || f32_out.len() < num_elements
+        || u32::try_from(num_elements).is_err()
+        || u32::try_from(in_dim).is_err()
+    {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_q8_split_to_f32 {label}: {num_elements} elements x {in_dim} do not fit the plane ({} bytes) \
+             or the output, or exceed the kernel's u32 extents",
+            split.len()
+        )));
+    }
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    let in_dim_u32 = in_dim as u32;
+    device
+        .stream
+        .launch_builder(&kernels.dequant_q8_split_to_f32)
+        .arg(split)
+        .arg(f32_out)
+        .arg(&n)
+        .arg(&in_dim_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q8_split_to_f32 {label}: {e}")))?;
+    Ok(())
+}
+
+/// `dequant_q8_split_to_f16`: the F16 tile of a Q8_0 plane resident in the split layout
+/// (bit-identical to `dequant_q8_0_to_f16` on the raw plane).
+unsafe fn launch_dequant_q8_split_to_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    split: &CudaSlice<u8>,
+    f16_out: &mut CudaSlice<u8>,
+    num_elements: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    // 32 elements per 34-byte block, nb * 34 bytes per row: the kernel indexes the row base
+    // from the element id and divides by `in_dim`, so a short plane reads out of bounds. `<`
+    // rather than the K-quant sibling's `!=`: the plane is exact today (`repack_q8_raw_to_split`
+    // allocates out_dim * nb * 34), and only shortness is unsafe.
+    let expected_w = num_elements / 32 * 34;
+    if in_dim == 0
+        || in_dim % 32 != 0
+        || num_elements % in_dim != 0
+        || split.len() < expected_w
+        || f16_out.len() < num_elements * 2
+        || u32::try_from(num_elements).is_err()
+        || u32::try_from(in_dim).is_err()
+    {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_q8_split_to_f16 {label}: {num_elements} elements x {in_dim} do not fit the plane ({} bytes) \
+             or the output, or exceed the kernel's u32 extents",
+            split.len()
+        )));
+    }
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    let in_dim_u32 = in_dim as u32;
+    device
+        .stream
+        .launch_builder(&kernels.dequant_q8_split_to_f16)
+        .arg(split)
+        .arg(f16_out)
+        .arg(&n)
+        .arg(&in_dim_u32)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("dequant_q8_split_to_f16 {label}: {e}")))?;
+    Ok(())
+}
+
 /// Dequantize Q4_0 weights to F16 scratch buffer for cuBLAS HGEMM.
 ///
 /// Each thread dequantizes one element from Q4_0 format to F16: reads the
@@ -2074,6 +2465,60 @@ unsafe fn launch_dequant_q4_0_to_f16(
         .arg(&n)
         .launch(launch_cfg)
         .map_err(|e| RuntimeError::Compute(format!("dequant_q4_0_to_f16 {label}: {e}")))?;
+    Ok(())
+}
+
+/// Dequantize a whole K-quant plane into the F16 scratch with the scheme's
+/// `dequant_<tag>_to_f16` kernel (one thread per element). The kernel indexes
+/// superblocks from the element id, so the byte length is checked first.
+unsafe fn launch_dequant_kquant_to_f16(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    scheme: QuantScheme,
+    data: &CudaSlice<u8>,
+    f16_out: &mut CudaSlice<u8>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    if !scheme.is_kquant_superblock() {
+        return Err(RuntimeError::Compute(format!(
+            "dequant to F16 {label}: {scheme:?} is not a K-quant scheme"
+        )));
+    }
+    let group = super::decode::kquant_kernels(kernels, scheme);
+    let (block_bytes, tag) = super::decode::kquant_layout(scheme);
+    let group = group.ok_or_else(|| {
+        RuntimeError::Compute(format!("dequant_{tag}_to_f16 {label}: kernels not loaded"))
+    })?;
+    let expected_w = num_elements / 256 * block_bytes;
+    let needed_out = num_elements * 2;
+    if num_elements % 256 != 0
+        || data.len() != expected_w
+        || f16_out.len() < needed_out
+        || u32::try_from(num_elements).is_err()
+    {
+        return Err(RuntimeError::Compute(format!(
+            "dequant_{tag}_to_f16 {label}: shape mismatch: {num_elements} elements, \
+             weight {} bytes (expected {expected_w}), out {} bytes (need {needed_out})",
+            data.len(),
+            f16_out.len(),
+        )));
+    }
+    let config = LaunchConfig::for_elements(num_elements);
+    let launch_cfg = CudarcLaunchConfig {
+        grid_dim: (config.grid_dim, 1, 1),
+        block_dim: (config.block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n = num_elements as u32;
+    device
+        .stream
+        .launch_builder(&group.dequant_to_f16)
+        .arg(data)
+        .arg(f16_out)
+        .arg(&n)
+        .launch(launch_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("dequant_{tag}_to_f16 {label}: {e}")))?;
     Ok(())
 }
 
@@ -2174,9 +2619,12 @@ unsafe fn launch_matvec_slice(
 
     match weight {
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
-        GpuWeightBuf::Ct4Raw(_) => {
+        GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::Q4KRaw(_)
+        | GpuWeightBuf::Q5KRaw(_)
+        | GpuWeightBuf::Q6KRaw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec_slice {label}: CtInt4G32 is served by the prefill \
+                "matvec_slice {label}: CtInt4G32 and K-quant planes are served by the prefill \
                  HGEMM path, not the per-row fallback"
             )));
         }
@@ -2273,12 +2721,13 @@ unsafe fn launch_matvec_slice(
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec BF16 {label} prefill: {e}")))?;
         }
-        // split-layout: prefill never dispatches against Q8Split/Q4Split
-        // siblings.
+        // split-layout: the per-row prefill matvec serves neither sibling (the batched
+        // GEMM serves Q8Split; Q4Split keeps its raw plane)
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec prefill fallback {label}: Q8Split/Q4Split \
-                 sibling routed to prefill",
+                "matvec_slice {label}: a split-layout plane reached the per-row prefill \
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
+                 and Q4Split has no prefill route (its raw plane is kept)",
             )));
         }
     }
@@ -2764,10 +3213,13 @@ unsafe fn launch_matvec_residual_slice(
 
     match weight {
         GpuWeightBuf::F32(_) => unreachable!("F32 uses cuBLAS SGEMM path"),
-        GpuWeightBuf::Ct4Raw(_) => {
+        GpuWeightBuf::Ct4Raw(_)
+        | GpuWeightBuf::Q4KRaw(_)
+        | GpuWeightBuf::Q5KRaw(_)
+        | GpuWeightBuf::Q6KRaw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec_slice_residual {label}: CtInt4G32 is served by the \
-                 prefill HGEMM path, not the per-row fallback"
+                "matvec_res {label}: CtInt4G32 and K-quant planes are served by the prefill \
+                 HGEMM path, not the per-row fallback"
             )));
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
@@ -2876,12 +3328,13 @@ unsafe fn launch_matvec_residual_slice(
                     RuntimeError::Compute(format!("matvec+res BF16 {label} prefill: {e}"))
                 })?;
         }
-        // split-layout: prefill never dispatches against Q8Split/Q4Split
-        // siblings.
+        // split-layout: the per-row prefill matvec serves neither sibling (the batched
+        // GEMM serves Q8Split; Q4Split keeps its raw plane)
         GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec+residual prefill fallback {label}: Q8Split/Q4Split \
-                 sibling routed to prefill",
+                "matvec_res {label}: a split-layout plane reached the per-row prefill \
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
+                 and Q4Split has no prefill route (its raw plane is kept)",
             )));
         }
     }

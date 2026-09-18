@@ -815,6 +815,28 @@ mod inner {
         }
         s
     }
+
+    #[cfg(test)]
+    mod registry_files {
+        //! requires network access: HEADs the registry's K-quant files and checks the advertised
+        //! Content-Length against the sizes pinned below (README.md rounds them to 16.2 / 19.5 GB)
+        use super::*;
+
+        #[test]
+        #[ignore = "requires network access to huggingface.co"]
+        fn k_quant_registry_files_resolve_to_their_pinned_sizes() {
+            let reg = crate::registry::load_registry();
+            let entry = reg.resolve("qwen3.8-27b").expect("qwen3.8-27b");
+            for (key, size) in [("Q4_K_M", 17_442_399_968u64), ("Q5_K_M", 20_923_877_088u64)] {
+                let src = &entry.gguf_files[key];
+                let url = model_url("https://huggingface.co", &src.repo, src.file());
+                let got = get_remote_size(&url)
+                    .expect("HEAD")
+                    .expect("Content-Length");
+                assert_eq!(got, size, "{key}: {url}");
+            }
+        }
+    }
 }
 
 #[cfg(feature = "download")]

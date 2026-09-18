@@ -143,17 +143,7 @@ fn pull_cmd(args: &[String]) {
     });
 
     // Parse model:quant tag syntax (e.g., "qwen3.5-9b:q4_0").
-    let (resolved_name, tag_quant) = if let Some(pos) = model_name.rfind(':') {
-        let name = &model_name[..pos];
-        let tag = &model_name[pos + 1..];
-        if tag.is_empty() {
-            (model_name, None)
-        } else {
-            (name, Some(tag.to_uppercase()))
-        }
-    } else {
-        (model_name, None)
-    };
+    let (resolved_name, tag_quant) = registry::split_model_tag(model_name);
 
     let entry = reg.resolve(resolved_name).unwrap_or_else(|| {
         eprintln!("Unknown model: {resolved_name}");

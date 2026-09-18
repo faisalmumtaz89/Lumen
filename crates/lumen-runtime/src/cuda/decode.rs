@@ -8,6 +8,7 @@ use super::ffi::CudaDevice;
 use super::shaders;
 use crate::error::RuntimeError;
 use cudarc::driver::CudaFunction;
+use lumen_format::QuantScheme;
 
 /// kernel-load chatter throttle.
 ///
@@ -49,6 +50,173 @@ macro_rules! cuda_log {
             eprintln!($($arg)*);
         }
     };
+}
+
+/// Bytes per 256-element superblock, and the kernel-name tag, of a K-quant scheme.
+pub(super) fn kquant_layout(scheme: QuantScheme) -> (usize, &'static str) {
+    match scheme {
+        QuantScheme::Q4_K => (144, "q4_k"),
+        QuantScheme::Q5_K => (176, "q5_k"),
+        QuantScheme::Q6_K => (210, "q6_k"),
+        other => unreachable!("kquant_layout on {other:?}"),
+    }
+}
+
+/// The kernel group that serves `scheme`, when this build loaded it.
+pub(super) fn kquant_kernels(kernels: &KernelSet, scheme: QuantScheme) -> Option<&KquantKernels> {
+    match scheme {
+        QuantScheme::Q4_K => kernels.kq4.as_ref(),
+        QuantScheme::Q5_K => kernels.kq5.as_ref(),
+        QuantScheme::Q6_K => kernels.kq6.as_ref(),
+        _ => None,
+    }
+}
+
+/// The receipt tag of a K-quant scheme (`q4_k`, `q5_k`, `q6_k`).
+pub(super) fn kquant_tag(scheme: QuantScheme) -> &'static str {
+    kquant_layout(scheme).1
+}
+
+/// Load one scheme's five K-quant kernels as a group from `source`. The kernel names are
+/// `matvec_<tag>_q8_1`, `matvec_<tag>_q8_1_residual`, `dequant_<tag>_to_f16`,
+/// `embed_token_<tag>`, `embed_batch_<tag>`. One `[CUDA] kquant <tag>: OK` or
+/// `FAILED` line per scheme.
+fn load_kquant_kernels(
+    load: &dyn Fn(&str, &str) -> Result<CudaFunction, RuntimeError>,
+    scheme: QuantScheme,
+    source: &str,
+) -> Option<KquantKernels> {
+    let tag = kquant_tag(scheme);
+    let group = (|| -> Result<KquantKernels, RuntimeError> {
+        let prefix = tag.replace('_', "").to_uppercase(); // q4_k -> Q4K
+        let matvec_threads = kernel_define(source, &format!("{prefix}_THREADS"))?;
+        let matvec_rows_per_cta = kernel_define(source, &format!("{prefix}_NR"))?;
+        if matvec_threads == 0
+            || matvec_threads % 32 != 0
+            || matvec_threads > 1024
+            || matvec_rows_per_cta == 0
+        {
+            return Err(RuntimeError::Compute(format!(
+                "kquant {tag}: matvec geometry {matvec_threads} threads x {matvec_rows_per_cta} rows per CTA is not launchable"
+            )));
+        }
+        // The Q6_K body is one warp per row: a CTA of T threads covers exactly T/32 rows;
+        // any other pairing leaves rows unwritten or indexes past the CTA's rows. The kernel
+        // file static_asserts the same; this is the launcher's own check.
+        if scheme == QuantScheme::Q6_K && matvec_threads != 32 * matvec_rows_per_cta {
+            return Err(RuntimeError::Compute(format!(
+                "kquant q6_k: {matvec_threads} threads x {matvec_rows_per_cta} rows per CTA is not one warp per row"
+            )));
+        }
+        Ok(KquantKernels {
+            matvec: load(source, &format!("matvec_{tag}_q8_1"))?,
+            matvec_residual: load(source, &format!("matvec_{tag}_q8_1_residual"))?,
+            dequant_to_f16: load(source, &format!("dequant_{tag}_to_f16"))?,
+            embed_token: load(source, &format!("embed_token_{tag}"))?,
+            embed_batch: load(source, &format!("embed_batch_{tag}"))?,
+            matvec_threads,
+            matvec_rows_per_cta,
+        })
+    })();
+    match group {
+        Ok(k) => {
+            cuda_log!(
+                "[CUDA] kquant {tag}: OK ({} threads x {} rows per CTA)",
+                k.matvec_threads,
+                k.matvec_rows_per_cta
+            );
+            Some(k)
+        }
+        Err(e) => {
+            // printed when the header says K-quant, the one case where the loader can
+            // refuse and name this line; behind `LUMEN_CUDA_VERBOSE` otherwise — an
+            // artifact whose header is not K-quant can still carry a preserved K-quant
+            // embedding, and a missing group is then reported at the first token. The
+            // kernels load before any plane is read, so this line cannot wait for the
+            // loader's plane census: a K-quant header over Q8_0 planes prints it and is
+            // not refused, the census having found nothing the group serves
+            if crate::runtime_defaults::kquant_artifact() {
+                eprintln!("[CUDA] kquant {tag}: FAILED: {e}");
+            } else {
+                cuda_log!("[CUDA] kquant {tag}: FAILED: {e}");
+            }
+            None
+        }
+    }
+}
+
+/// `#define <name> <number>` in a kernel source: the numeric launch geometry a
+/// kernel file declares for itself. Block and line comments are stripped first
+/// (a commented-out define does not count), the name must be the whole macro
+/// name, and exactly one numeric definition may exist — two would leave the
+/// compiled kernel and the launcher free to disagree.
+pub fn kernel_define(source: &str, name: &str) -> Result<u32, RuntimeError> {
+    let stripped = strip_c_comments(source);
+    let mut found: Vec<u32> = Vec::new();
+    for line in stripped.lines() {
+        let Some(rest) = line.trim().strip_prefix('#') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix("define") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some(rest) = rest.trim_start().strip_prefix(name) else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        match rest.split_whitespace().next().map(str::parse::<u32>) {
+            Some(Ok(v)) => found.push(v),
+            _ => {
+                return Err(RuntimeError::Compute(format!(
+                    "kernel source defines `{name}` as something other than a number"
+                )))
+            }
+        }
+    }
+    match found.as_slice() {
+        [v] => Ok(*v),
+        [] => Err(RuntimeError::Compute(format!(
+            "kernel source declares no numeric `#define {name}`"
+        ))),
+        _ => Err(RuntimeError::Compute(format!(
+            "kernel source defines `{name}` {} times; the launcher needs exactly one",
+            found.len()
+        ))),
+    }
+}
+
+/// The source with `/* ... */` and `// ...` comments removed; newlines inside a block
+/// comment are kept so the line structure survives. Kernel sources hold no string
+/// literals containing `//` or `/*`, so literals are not special-cased.
+fn strip_c_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("/*") {
+            match tail.find("*/") {
+                Some(end) => {
+                    out.extend(tail[..end].chars().filter(|c| *c == '\n'));
+                    rest = &tail[end + 2..];
+                }
+                None => break,
+            }
+        } else if rest.starts_with("//") {
+            match rest.find('\n') {
+                Some(end) => rest = &rest[end..],
+                None => break,
+            }
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// Name the route a dispatch site actually took, once per process.
@@ -232,6 +400,10 @@ pub(crate) struct KernelSet {
     // Q8_0 dequantization for batched prefill GEMM (replaces per-row matvec fallback)
     pub(crate) dequant_q8_0_to_f16: CudaFunction,
     pub(crate) dequant_q8_0_to_f32: CudaFunction,
+    /// The same two tiles from the split (SoA) layout, for a Q8_0 plane whose raw copy
+    /// was released after the split clone.
+    pub(crate) dequant_q8_split_to_f16: CudaFunction,
+    pub(crate) dequant_q8_split_to_f32: CudaFunction,
     pub(crate) dequant_q4_0_to_f16: CudaFunction,
     pub(crate) dequant_q4_0_to_f32: CudaFunction,
 
@@ -556,6 +728,13 @@ pub(crate) struct KernelSet {
     pub(crate) matvec_ct4_residual_t160: Option<CudaFunction>,
     pub(crate) matvec_ct4_residual_t192: Option<CudaFunction>,
     pub(crate) dequant_ct4_to_f16: Option<CudaFunction>,
+    /// General K-quant kernels, one group per scheme (`load_fn_dp4a`, so
+    /// `compute_61`-first and no fast-math). `None` when the group did not load on this
+    /// device: no dp4a NVRTC target, a declared geometry the loader could not read or
+    /// launch, or a kernel that failed to compile or load.
+    pub(crate) kq4: Option<KquantKernels>,
+    pub(crate) kq5: Option<KquantKernels>,
+    pub(crate) kq6: Option<KquantKernels>,
     pub(crate) matvec_q8_split_output_proj_nr8: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr16: Option<CudaFunction>,
     pub(crate) matvec_q8_split_output_proj_nr64: Option<CudaFunction>,
@@ -905,6 +1084,24 @@ pub(crate) struct KvF16Kernels {
     pub(crate) prep_fused: CudaFunction,
 }
 
+/// The kernels that serve one K-quant scheme (Q4_K, Q5_K or Q6_K) natively:
+/// the decode matvec and its residual sibling, the F16 dequant tile for the
+/// prefill HGEMM, and the embedding row-gather (one token / a batch). They
+/// load as a group: a scheme with any of the five missing is not served.
+pub(crate) struct KquantKernels {
+    pub(crate) matvec: CudaFunction,
+    pub(crate) matvec_residual: CudaFunction,
+    pub(crate) dequant_to_f16: CudaFunction,
+    pub(crate) embed_token: CudaFunction,
+    pub(crate) embed_batch: CudaFunction,
+    /// The matvec's launch geometry as its source declares it
+    /// (`#define <TAG>_THREADS`, `#define <TAG>_NR`): threads per CTA and
+    /// rows per CTA. The launcher takes both from here, so the geometry has
+    /// one home — the kernel file.
+    pub(crate) matvec_threads: u32,
+    pub(crate) matvec_rows_per_cta: u32,
+}
+
 pub(crate) fn compile_all_kernels(
     device: &CudaDevice,
     kv_precision: crate::kv::KvPrecision,
@@ -1156,6 +1353,14 @@ pub(crate) fn compile_all_kernels(
         },
         dequant_q8_0_to_f16: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f16")?,
         dequant_q8_0_to_f32: load_fn(shaders::DEQUANT_Q8_0_KERNEL_SOURCE, "dequant_q8_0_to_f32")?,
+        dequant_q8_split_to_f16: load_fn(
+            shaders::DEQUANT_Q8_SPLIT_KERNEL_SOURCE,
+            "dequant_q8_split_to_f16",
+        )?,
+        dequant_q8_split_to_f32: load_fn(
+            shaders::DEQUANT_Q8_SPLIT_KERNEL_SOURCE,
+            "dequant_q8_split_to_f32",
+        )?,
         dequant_q4_0_to_f16: load_fn(
             shaders::DEQUANT_Q4_0_F16_KERNEL_SOURCE,
             "dequant_q4_0_to_f16",
@@ -2254,6 +2459,21 @@ pub(crate) fn compile_all_kernels(
                 None
             }
         },
+        kq4: load_kquant_kernels(
+            &load_fn_dp4a,
+            QuantScheme::Q4_K,
+            shaders::MATVEC_Q4_K_Q8_1_KERNEL_SOURCE,
+        ),
+        kq5: load_kquant_kernels(
+            &load_fn_dp4a,
+            QuantScheme::Q5_K,
+            shaders::MATVEC_Q5_K_Q8_1_KERNEL_SOURCE,
+        ),
+        kq6: load_kquant_kernels(
+            &load_fn_dp4a,
+            QuantScheme::Q6_K,
+            shaders::MATVEC_Q6_K_Q8_1_KERNEL_SOURCE,
+        ),
         matvec_q8_split_output_proj_nr8: match load_fn_sm80_fast_math(
             shaders::MATVEC_Q8_SPLIT_OUTPUT_PROJ_KERNEL_SOURCE,
             "matvec_q8_split_output_proj_nr8",
@@ -4002,5 +4222,92 @@ mod announce_route_once_tests {
         assert!(announce_route_once(&TWO, String::new));
         assert!(!announce_route_once(&ONE, String::new));
         assert!(!announce_route_once(&TWO, String::new));
+    }
+}
+
+#[cfg(test)]
+mod kquant_geometry_tests {
+    //! Each of the three general K-quant kernel files declares the CTA geometry its
+    //! matvec is launched with, and `load_kquant_kernels` reads exactly that. The two
+    //! dedicated files are outside this rule: `matvec_q6k_head.cu`'s `Q6_NR` /
+    //! `Q6_THREADS` and `matvec_q5k_split.cu`'s `Q5_NR` / `Q5_THREADS` are compiled in,
+    //! and the head and `ssm_out` launchers carry the matching geometry as literals.
+
+    use super::kernel_define;
+
+    #[test]
+    fn every_k_quant_kernel_source_declares_its_matvec_geometry() {
+        use super::super::shaders::{
+            MATVEC_Q4_K_Q8_1_KERNEL_SOURCE, MATVEC_Q5_K_Q8_1_KERNEL_SOURCE,
+            MATVEC_Q6_K_Q8_1_KERNEL_SOURCE,
+        };
+        for (prefix, src) in [
+            ("Q4K", MATVEC_Q4_K_Q8_1_KERNEL_SOURCE),
+            ("Q5K", MATVEC_Q5_K_Q8_1_KERNEL_SOURCE),
+            ("Q6K", MATVEC_Q6_K_Q8_1_KERNEL_SOURCE),
+        ] {
+            let threads = kernel_define(src, &format!("{prefix}_THREADS")).unwrap();
+            let rows = kernel_define(src, &format!("{prefix}_NR")).unwrap();
+            assert!(
+                threads % 32 == 0 && (32..=1024).contains(&threads),
+                "{prefix}: {threads} threads"
+            );
+            assert!(rows >= 1, "{prefix}: {rows} rows per CTA");
+        }
+        // The measured geometry (see the kernel headers): Q4_K / Q5_K 2 rows per 64-thread
+        // CTA, Q6_K one warp per row at 4 rows per 128-thread CTA. A change here is a change
+        // of the shipped kernels and is made in the kernel file, never here.
+        assert_eq!(
+            kernel_define(MATVEC_Q4_K_Q8_1_KERNEL_SOURCE, "Q4K_THREADS").unwrap(),
+            64
+        );
+        assert_eq!(
+            kernel_define(MATVEC_Q4_K_Q8_1_KERNEL_SOURCE, "Q4K_NR").unwrap(),
+            2
+        );
+        assert_eq!(
+            kernel_define(MATVEC_Q5_K_Q8_1_KERNEL_SOURCE, "Q5K_THREADS").unwrap(),
+            64
+        );
+        assert_eq!(
+            kernel_define(MATVEC_Q5_K_Q8_1_KERNEL_SOURCE, "Q5K_NR").unwrap(),
+            2
+        );
+        assert_eq!(
+            kernel_define(MATVEC_Q6_K_Q8_1_KERNEL_SOURCE, "Q6K_THREADS").unwrap(),
+            128
+        );
+        assert_eq!(
+            kernel_define(MATVEC_Q6_K_Q8_1_KERNEL_SOURCE, "Q6K_NR").unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn kernel_define_ignores_comments_and_rejects_ambiguity() {
+        let src = "/* #define Q4K_NR 8 */\n// #define Q4K_NR 16\n#define Q4K_NR 2\n";
+        assert_eq!(
+            kernel_define(src, "Q4K_NR").unwrap(),
+            2,
+            "commented-out defines do not count"
+        );
+        let twice = "#define Q4K_NR 2\n#if __CUDA_ARCH__ >= 800\n#define Q4K_NR 4\n#endif\n";
+        assert!(
+            kernel_define(twice, "Q4K_NR").is_err(),
+            "two live definitions are ambiguous"
+        );
+        let expr = "#define Q4K_NR (Q4K_THREADS / 32)\n";
+        assert!(
+            kernel_define(expr, "Q4K_NR").is_err(),
+            "an expression is not a number"
+        );
+        assert!(
+            kernel_define("#define Q4K_NR4 8\n", "Q4K_NR").is_err(),
+            "whole-name match only"
+        );
+        assert_eq!(
+            kernel_define("  #  define   Q4K_NR   2  // rows\n", "Q4K_NR").unwrap(),
+            2
+        );
     }
 }
