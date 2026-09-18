@@ -35,6 +35,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   their raw copies released after the split clone (0.86 GB on the 27B Q4_K_M);
   `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1` keeps the raw copies.
 
+### Fixed
+
+- The host dequantiser decoded a Q3_K block's six-bit scales from the wrong bytes and
+  bit positions, so a Q3_K plane converted for CUDA was served from wrong weights.
+
 ## [0.31.0] — 2026-09-11
 
 ### Removed

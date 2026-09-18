@@ -53,6 +53,32 @@ fn decode_k_scales(scales: &[u8]) -> ([u8; 8], [u8; 8]) {
     (sc, m)
 }
 
+/// Decode the 16 six-bit Q3_K scales from the block's 12 packed scale bytes.
+///
+/// Scale `i` takes its low four bits from one nibble of bytes 0..8 and its high
+/// two bits from a 2-bit field of bytes 8..12:
+///
+/// - scales 0..4   low nibble of bytes 0..4
+/// - scales 4..8   low nibble of bytes 4..8
+/// - scales 8..12  high nibble of bytes 0..4
+/// - scales 12..16 high nibble of bytes 4..8
+/// - scale `i`     high two bits from byte `8 + i % 4`, at bit position `2 * (i / 4)`
+///
+/// Each decoded value is a 6-bit magnitude; the dequantiser reads it as `sc - 32`.
+fn decode_q3_k_scales(scale_bytes: &[u8]) -> [u8; 16] {
+    let mut sc = [0u8; 16];
+    for j in 0..4 {
+        sc[j] = scale_bytes[j] & 0x0F;
+        sc[j + 4] = scale_bytes[j + 4] & 0x0F;
+        sc[j + 8] = scale_bytes[j] >> 4;
+        sc[j + 12] = scale_bytes[j + 4] >> 4;
+    }
+    for (i, v) in sc.iter_mut().enumerate() {
+        *v |= ((scale_bytes[8 + i % 4] >> (2 * (i / 4))) & 3) << 4;
+    }
+    sc
+}
+
 /// Dequantize a K-quant weight buffer to F32.
 ///
 /// Supports every K-quant scheme an LBC stores: the GGML blocks Q6_K, Q4_K, Q5_K,
@@ -312,21 +338,7 @@ pub fn dequant_kquant_to_f32(
                 let scale_bytes = &bp[96..108];
                 let d = host_f16_to_f32(u16::from_le_bytes([bp[108], bp[109]]));
 
-                // Decode 16 6-bit scales from 12 bytes (standard packed layout)
-                let mut sc_arr = [0u8; 16];
-                for j in 0..4 {
-                    sc_arr[j] = scale_bytes[j] & 0x0F;
-                    sc_arr[j + 4] = (scale_bytes[j] >> 4) & 0x0F;
-                }
-                for j in 0..4 {
-                    sc_arr[j + 8] = scale_bytes[4 + j] & 0x0F;
-                    sc_arr[j + 12] = (scale_bytes[4 + j] >> 4) & 0x0F;
-                }
-                for (j, sc) in sc_arr.iter_mut().enumerate() {
-                    let byte_idx = 8 + j / 4;
-                    let bit_shift = 2 * (j % 4);
-                    *sc |= ((scale_bytes[byte_idx] >> bit_shift) & 3) << 4;
-                }
+                let sc_arr = decode_q3_k_scales(scale_bytes);
 
                 // GGML `dequantize_row_q3_K` traversal: same grouped/shifted
                 // scheme as Q2_K (two 128-value groups; four shift passes over
@@ -340,7 +352,7 @@ pub fn dequant_kquant_to_f32(
                 'q3blocks: for _group in 0..2 {
                     let mut shift = 0u8;
                     for _j in 0..4 {
-                        let scale0 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                        let scale0 = d * (f32::from(sc_arr[is]) - 32.0);
                         is += 1;
                         for l in 0..16usize {
                             if written >= n_elements {
@@ -351,7 +363,7 @@ pub fn dequant_kquant_to_f32(
                             out[written] = scale0 * ((q_lo | (h << 2)) as i32 - 4) as f32;
                             written += 1;
                         }
-                        let scale1 = d * (sc_arr[is] as i8 as f32 - 32.0);
+                        let scale1 = d * (f32::from(sc_arr[is]) - 32.0);
                         is += 1;
                         for l in 0..16usize {
                             if written >= n_elements {
@@ -413,6 +425,80 @@ mod f16_tests {
             let exp = ((bits >> 10) & 0x1f) as i32 - 15;
             let frac = 1.0 + (bits & 0x3ff) as f32 / 1024.0;
             assert_eq!(v, sign * frac * 2f32.powi(exp), "{bits:#06x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod q3_k_scale_tests {
+    use super::decode_q3_k_scales;
+
+    /// The 16 scales GGML's `dequantize_row_q3_K` derives, expressed the way the
+    /// reference does: three little-endian u32 words masked and recombined, rather
+    /// than the per-index byte reads the dequantiser uses.
+    fn reference_scales(packed: &[u8; 12]) -> [u8; 16] {
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let a0 = u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+        let a1 = u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]);
+        let tmp = u32::from_le_bytes([packed[8], packed[9], packed[10], packed[11]]);
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&((a0 & KMASK2) | ((tmp & KMASK1) << 4)).to_le_bytes());
+        out[4..8].copy_from_slice(&((a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4)).to_le_bytes());
+        out[8..12]
+            .copy_from_slice(&(((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)).to_le_bytes());
+        out[12..16]
+            .copy_from_slice(&(((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4)).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn q3_k_scales_match_two_hand_decoded_blocks() {
+        // Block 1: every scale byte distinct, all four 2-bit fields of each high
+        // byte in use. Scale 0 is the low nibble of byte 0 (2) plus bits 0..2 of
+        // byte 8 (0x1B & 3 = 3) shifted to bits 4..6, so 3 * 16 + 2 = 50. Scale 11
+        // is the high nibble of byte 3 (7) plus bits 4..6 of byte 11
+        // (0x4E >> 4 & 3 = 0), so 7.
+        let block1 = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x1B, 0x2C, 0x3D, 0x4E,
+        ];
+        assert_eq!(
+            decode_q3_k_scales(&block1),
+            [50, 4, 22, 40, 42, 60, 62, 48, 17, 35, 53, 7, 9, 11, 13, 31]
+        );
+
+        // Block 2: the 16 nibble sources hold the 16 distinct values 0..16, and each
+        // high byte's four 2-bit fields are a permutation of 0..4 with the four
+        // permutations distinct, so every scale names both its nibble and its field.
+        let block2 = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xE4, 0x1B, 0x4E, 0xB1,
+        ];
+        assert_eq!(
+            decode_q3_k_scales(&block2),
+            [1, 51, 37, 23, 25, 43, 61, 15, 32, 18, 4, 54, 56, 10, 28, 46]
+        );
+    }
+
+    #[test]
+    fn q3_k_scales_match_the_reference_shuffle() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4096 {
+            let mut packed = [0u8; 12];
+            for chunk in packed.chunks_mut(8) {
+                let bytes = next().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            assert_eq!(
+                decode_q3_k_scales(&packed),
+                reference_scales(&packed),
+                "packed scales {packed:02x?}"
+            );
         }
     }
 }
