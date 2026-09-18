@@ -46,8 +46,8 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source: Q8_0 everywhere except the Q4_K `ffn_down` that
-/// makes it one and the Q4_K `ssm_out`, which is servable at this width. `alpha_n` and
+/// A four-layer qwen35 K-quant source: the quantized tensors Q8_0 except the Q4_K `ffn_down`
+/// that makes it one and the Q4_K `ssm_out`, which is servable at this width. `alpha_n` and
 /// `beta_n` set the stored element count of the two F32 gates, the property under test.
 pub fn build(alpha_n: u64, beta_n: u64) -> Vec<u8> {
     let inter: u64 = 2 * HID;

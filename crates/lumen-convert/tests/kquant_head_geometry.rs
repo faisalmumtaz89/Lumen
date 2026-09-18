@@ -68,8 +68,8 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source of hidden width `hid`: Q8_0 everywhere except
-/// the Q4_K `ffn_down` that makes it one (its in_dim is `2 * hid`, so the layer
+/// A four-layer qwen35 K-quant source of hidden width `hid`: the quantized tensors Q8_0
+/// except the Q4_K `ffn_down` that makes it one (its in_dim is `2 * hid`, so the layer
 /// contract gate passes at either width) and the Q6_K head. `hid` sets the head's
 /// row length, which is the property under test.
 fn build(hid: u64) -> Vec<u8> {

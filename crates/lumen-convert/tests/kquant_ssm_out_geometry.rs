@@ -64,9 +64,9 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source: Q8_0 everywhere except the Q4_K `ffn_down`
-/// that makes it one (its in_dim is `2 * hid`, so the layer contract gate passes at
-/// either width) and the Q4_K `ssm_out` under test. `v_heads` sets the GDN V
+/// A four-layer qwen35 K-quant source: the quantized tensors Q8_0 except the Q4_K
+/// `ffn_down` that makes it one (its in_dim is `2 * hid`, so the layer contract gate
+/// passes at either width) and the Q4_K `ssm_out` under test. `v_heads` sets the GDN V
 /// dimension `v_heads * STATE`, which is the width `ssm_out` is read at and the
 /// property under test; `hid` is the row count.
 fn build(hid: u64, v_heads: u64) -> Vec<u8> {

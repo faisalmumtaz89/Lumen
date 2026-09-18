@@ -71,9 +71,9 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source: Q8_0 everywhere except the Q4_K `ffn_down`
-/// that makes it one and the Q4_K `ssm_out` under test, whose row width is the whole
-/// superblocks the loader reads.
+/// A four-layer qwen35 K-quant source: the quantized tensors Q8_0 except the Q4_K
+/// `ffn_down` that makes it one and the Q4_K `ssm_out` under test, whose row width is
+/// the whole superblocks the loader reads.
 fn build() -> Vec<u8> {
     let qkv_rows: u64 = (2 * GROUPS + V_HEADS) * STATE;
     let kvd = (HID / HEADS as u64) * KVH as u64;

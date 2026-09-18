@@ -223,7 +223,7 @@ pub fn kquant_artifact() -> bool {
 /// Whether the artifact both declares a K-quant primary scheme in its header and
 /// actually CARRIES an as-stored K-quant plane — the predicate the raw-plane release
 /// after the Q8 split clone and the K-quant receipts are scoped on. `header` is
-/// [`model_dense_quant`]'s value, `embedding` and `output_head` the two globals'
+/// `model_dense_quant`'s value, `embedding` and `output_head` the two globals'
 /// stored schemes, and `any_layer_plane` whether any layer slice of non-zero length
 /// is stored in one of the three superblock schemes (the loader's census, taken while
 /// it walks the layers it is uploading anyway). A K-quant header over Q8_0 / F32

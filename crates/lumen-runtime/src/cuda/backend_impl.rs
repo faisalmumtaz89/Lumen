@@ -18131,6 +18131,89 @@ mod raw_global_len_tests {
     }
 }
 
+/// Widest input any decode matvec feeds through the shared F16/Q8_1 scratch.
+///
+/// Four widths reach those buffers: hidden, intermediate, the attention
+/// output projection's q_dim, and the GDN exit projection's value dim. The
+/// GDN term resolves through `gdn_dims()` — the same resolution the loader
+/// checks the GDN planes against and the kernels run on — so a file whose
+/// GDN layers arrive without `ssm.*` metadata is sized for the value dim it
+/// really consumes instead of for zero. The dimension bounds the reader
+/// enforces on the header keep these products inside u32.
+fn decode_scratch_max_dim(hyperparams: &ModelHyperparams) -> u32 {
+    hyperparams
+        .hidden_dim
+        .max(hyperparams.intermediate_dim)
+        .max(hyperparams.num_heads * hyperparams.head_dim)
+        .max(hyperparams.gdn_dims().v_dim())
+}
+
+#[cfg(test)]
+mod decode_scratch_width_tests {
+    use super::*;
+    use lumen_format::hyperparams::GdnDims;
+
+    fn hp(
+        hidden: u32,
+        inter: u32,
+        heads: u32,
+        head_dim: u32,
+        gdn: Option<GdnDims>,
+    ) -> ModelHyperparams {
+        ModelHyperparams {
+            num_layers: 4,
+            num_heads: heads,
+            num_kv_heads: 1,
+            head_dim,
+            hidden_dim: hidden,
+            intermediate_dim: inter,
+            vocab_size: 256,
+            max_seq_len: 512,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: true,
+            gdn,
+        }
+    }
+
+    const GDN_27B: GdnDims = GdnDims {
+        num_v_heads: 48,
+        num_k_heads: 16,
+        head_dim: 128,
+        conv_kernel: 4,
+    };
+
+    /// The width covers the resolved GDN value dim. That widens only the first shape below;
+    /// the 27B, 9B and headerless 9B-era shapes keep the width they have always had.
+    #[test]
+    fn scratch_width_covers_the_resolved_gdn_value_dim() {
+        // No `ssm.*` block and a body narrower than the fallback: the width
+        // is the 9B value dim 4096, which is the width the GDN planes the
+        // loader admitted on that same fallback actually feed.
+        assert_eq!(decode_scratch_max_dim(&hp(256, 512, 2, 128, None)), 4096);
+        // Declared 27B: intermediate 17408 dominates both the 6144 value dim
+        // and the 6144 q_dim, so the width is unchanged.
+        assert_eq!(
+            decode_scratch_max_dim(&hp(5120, 17408, 24, 256, Some(GDN_27B))),
+            17408
+        );
+        // Declared 9B: intermediate 12288 dominates the 4096 value dim.
+        assert_eq!(
+            decode_scratch_max_dim(&hp(4096, 12288, 16, 256, Some(GdnDims::QWEN35_9B))),
+            12288
+        );
+        // Headerless 9B-era file: the same 12288, because intermediate
+        // already sits above the fallback value dim.
+        assert_eq!(
+            decode_scratch_max_dim(&hp(4096, 12288, 16, 256, None)),
+            12288
+        );
+    }
+}
+
 impl ComputeBackend for CudaBackend {
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         super::gpu_buffers::kquant_plane_counters().reset();
@@ -18299,14 +18382,7 @@ impl ComputeBackend for CudaBackend {
             // attention wo consumes q_dim and the GDN exit projection
             // (ssm_out) consumes value_dim.
             input_f16: {
-                let gdn_value_dim = hyperparams.gdn.as_ref().map_or(0, |_| {
-                    let gd = hyperparams.gdn_dims();
-                    (gd.num_v_heads * gd.head_dim) as usize
-                });
-                let max_in = hidden_dim
-                    .max(inter_dim)
-                    .max(num_heads * head_dim)
-                    .max(gdn_value_dim);
+                let max_in = decode_scratch_max_dim(hyperparams) as usize;
                 self.device.alloc_zeros::<u8>(max_in * 2)?
             },
             // Q8_1 scratch for dp4a matvec: max input width / 32 * 36 bytes.
@@ -18323,14 +18399,7 @@ impl ComputeBackend for CudaBackend {
                     && (kernels.mul_mat_vec_q_q8_0.is_some()
                         || kernels.mul_mat_vec_q_q4_0.is_some()))
             {
-                let gdn_value_dim = hyperparams.gdn.as_ref().map_or(0, |_| {
-                    let gd = hyperparams.gdn_dims();
-                    (gd.num_v_heads * gd.head_dim) as usize
-                });
-                let max_dim = hidden_dim
-                    .max(inter_dim)
-                    .max(num_heads * head_dim)
-                    .max(gdn_value_dim) as u32;
+                let max_dim = decode_scratch_max_dim(hyperparams);
                 let buf_bytes = decode::q8_1_buffer_bytes(max_dim) as usize;
                 match self.device.alloc_zeros::<u8>(buf_bytes) {
                     Ok(buf) => {

@@ -72,13 +72,13 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
     }
 }
 
-/// A four-layer qwen35 K-quant source whose `token_embd` has `rows` rows: Q8_0 everywhere
-/// except the Q4_K `ffn_down` that makes it one (its in_dim is `2 * HID`, whole superblocks
-/// at either size) and the Q4_K embedding. `tokens` is the tokenizer's token count, which
-/// is the header's vocab when the source carries one and which the head is sized to; `None`
-/// leaves the source without a token list, so the header's vocab is `rows` itself. The
-/// embedding's geometry against that vocab is the property under test; the head is Q8_0, so
-/// the head rule is not what decides here.
+/// A four-layer qwen35 K-quant source whose `token_embd` has `rows` rows: the quantized
+/// tensors Q8_0 except the Q4_K `ffn_down` that makes it one (its in_dim is `2 * HID`,
+/// whole superblocks at either size) and the Q4_K embedding. `tokens` is the tokenizer's
+/// token count, which is the header's vocab when the source carries one and which the head
+/// is sized to; `None` leaves the source without a token list, so the header's vocab is
+/// `rows` itself. The embedding's geometry against that vocab is the property under test;
+/// the head is Q8_0, so the head rule is not what decides here.
 fn build(rows: u64, tokens: Option<u64>) -> Vec<u8> {
     let vocab = tokens.unwrap_or(rows);
     let inter: u64 = 2 * HID;
