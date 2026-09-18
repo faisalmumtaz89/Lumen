@@ -32,7 +32,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Changed
 
 - CUDA keeps a K-quant artifact's Q8_0 planes resident once, in the split layout,
-  their raw copies released after the split clone (0.87 GB on the 27B Q4_K_M);
+  their raw copies released after the split clone (0.86 GB on the 27B Q4_K_M);
   `LUMEN_CUDA_Q8_SPLIT_KEEP_RAW=1` keeps the raw copies.
 
 ## [0.31.0] — 2026-09-11

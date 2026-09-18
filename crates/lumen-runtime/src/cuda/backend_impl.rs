@@ -15780,6 +15780,10 @@ unsafe fn repack_all_layers_q8_clone_to_split(
             }
         };
         let Some(raw_buf) = src_ref else { continue };
+        // The release below drops the whole raw allocation, which the repack accepts at
+        // any length at or above the computed clone size, so the freed bytes are the
+        // buffer's own length, not `job.size_bytes`.
+        let raw_len = raw_buf.len();
         match repack_q8_raw_to_split(device, repack_kernel, raw_buf, job.out_dim, job.in_dim) {
             Ok(split_buf) => {
                 let split_buf = std::sync::Arc::new(split_buf);
@@ -15819,7 +15823,7 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                 if release_raw {
                     *base = GpuWeightBuf::Q8Split(split_buf);
                     raw_released += 1;
-                    raw_released_bytes += job.size_bytes;
+                    raw_released_bytes += raw_len;
                 }
                 layers_with_split.insert(job.layer_idx);
                 bytes_cloned += job.size_bytes;
