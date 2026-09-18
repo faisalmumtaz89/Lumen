@@ -1,24 +1,43 @@
-//! What a K-quant source preserves by default has to be a plane the runtime serves.
-//! The head matvec reads `hidden_dim / 256` whole superblocks per row, so a Q6_K head
-//! whose row width is not whole superblocks is refused at load
-//! (`lumen_format::serving_rules::validate_output_head_row_alignment`); the K-quant
-//! source policy requantises such a head instead of carrying it, which is the head
-//! 0.31.0 wrote for the same file. The explicit `LUMEN_CONVERT_SOURCE_FIDELITY` /
-//! `LUMEN_CONVERT_KEEP_Q6K_OUTPUT` switches are outside this rule and unchanged —
-//! `q6k_head_gate.rs` pins them — so these fixtures set no environment.
+//! What a K-quant source preserves by default has to be a plane the runtime serves. The
+//! head matvec reads `hidden_dim / 256` whole superblocks per row, so a Q6_K head whose
+//! row width is not whole superblocks is refused at load
+//! (`lumen_format::serving_rules::validate_output_head_row_alignment`), and the loader
+//! sizes the head plane from the header's `vocab_size * hidden_dim`, so a head stored
+//! as a plane shorter than that product is refused there as well (`weight/kquant.rs` on
+//! the host read, `lumen_format::serving_rules::kquant_global_plane_len` on the CUDA
+//! upload); the K-quant source policy requantises a head failing either rule instead of
+//! carrying it, which is the head 0.31.0 wrote for the same file. The explicit
+//! `LUMEN_CONVERT_SOURCE_FIDELITY` / `LUMEN_CONVERT_KEEP_Q6K_OUTPUT` switches are
+//! outside both rules and unchanged — `q6k_head_gate.rs` pins them — so these fixtures
+//! set no environment.
 //!
 //! GGUF sizes a tensor from its flattened element count, so a K-quant plane whose row
 //! is narrower than a superblock is a file the converter reads without complaint —
 //! the source of the first fixture. The registry's two K-quant cells are both
 //! `qwen3.8-27b`, at hidden 5120, and no K-quant tensor of a standard export has a row
 //! length that is not a multiple of the 256-element superblock, so no shipped file
-//! converts differently; the pin is the guard against the default widening to one that
-//! does.
+//! converts differently on that rule; the pin is the guard against the default widening
+//! to one that does.
 //!
-//! The pin was derived by building this same fixture against the 0.31.0 converter
+//! The header's vocab is the tokenizer's token count when the source carries one, else
+//! `token_embd`'s row count (`hyperparams.rs`), and nothing compares `output.weight`'s
+//! rows to it, so a head of fewer rows than the vocab is a file the converter reads
+//! without complaint as well — the source of the third fixture, a shape no other
+//! fixture in this crate's tests builds. The length rule is an equality, as the
+//! embedding keep's is: a head plane longer than the header's `vocab_size * hidden_dim`
+//! is requantised by it too — the host read would accept such a plane, the CUDA upload
+//! refuses any length but the one that product needs (`cuda/backend_impl.rs`) — so the
+//! head of a default artifact is either exactly the plane that product needs or the one
+//! 0.31.0 wrote.
+//!
+//! The pins were derived by building these same fixtures against the 0.31.0 converter
 //! (release commit `1958662`, `crates/lumen-convert` unmodified) in a throwaway
-//! worktree and hashing the head plane of its artifact; the fixture GGUF hashes the
-//! same on both trees, which is the cross-check that the transcription did not drift.
+//! worktree and reading the head plane of each artifact — hashed for the first, and
+//! for the third its length, since that head plane is the source tensor requantised
+//! and 0.31.0 sized it from the tensor, not from the header (so it is shorter than
+//! `vocab_size * hidden_dim` at both commits, which is why the third pin is on the
+//! bytes the converter writes and not on a load). The fixture GGUFs hash the same on
+//! both trees, which is the cross-check that the transcription did not drift.
 use lumen_convert::convert::{convert_gguf_bytes_to_lbc, ConvertOptions, ConvertTarget};
 use lumen_convert::gguf::{GgmlType, GgufBuilder};
 use lumen_format::quantization::QuantScheme;
@@ -71,8 +90,9 @@ fn bytes_for(t: GgmlType, n: u64) -> Vec<u8> {
 /// A four-layer qwen35 K-quant source of hidden width `hid`: the quantized tensors Q8_0
 /// except the Q4_K `ffn_down` that makes it one (its in_dim is `2 * hid`, so the layer
 /// contract gate passes at either width) and the Q6_K head. `hid` sets the head's
-/// row length, which is the property under test.
-fn build(hid: u64) -> Vec<u8> {
+/// row length and `head_rows` its row count against the `VOCAB` the header takes from
+/// `token_embd`, which are the two properties under test.
+fn build(hid: u64, head_rows: u64) -> Vec<u8> {
     let inter: u64 = 2 * hid;
     let v_heads: u64 = hid / STATE;
     let qkv_rows: u64 = (2 * GROUPS + v_heads) * STATE;
@@ -104,8 +124,8 @@ fn build(hid: u64) -> Vec<u8> {
     b.add_tensor(
         "output.weight",
         GgmlType::Q6_K,
-        &[hid, VOCAB],
-        bytes_for(GgmlType::Q6_K, ne),
+        &[hid, head_rows],
+        bytes_for(GgmlType::Q6_K, head_rows * hid),
     );
     for l in 0..LAYERS {
         let p = format!("blk.{l}");
@@ -208,9 +228,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// requantised to Q8_0.
 const NARROW_HEAD_0_31_0: &str = "72efe354aa57b13c6f888d37d19ebf1abcc0121e3445a85c65957bcff891590e";
 
+/// The 0.31.0 head plane of the short-head fixture: its 65,280-element Q6_K source head
+/// requantised to Q8_0, 34 bytes per 32 elements. The length is the pin — the bytes are
+/// the same requantisation the first fixture's digest already covers.
+const SHORT_HEAD_0_31_0_LEN: usize = 69_360;
+
 #[test]
 fn a_q6k_head_narrower_than_a_superblock_keeps_the_0_31_0_head() {
-    let (primary, quant, plane) = convert_head("narrow", &build(128));
+    let (primary, quant, plane) = convert_head("narrow", &build(128, VOCAB));
     // The fixture is a K-quant source, so the policy really is the one under test.
     assert_eq!(
         primary,
@@ -234,7 +259,7 @@ fn a_q6k_head_narrower_than_a_superblock_keeps_the_0_31_0_head() {
 
 #[test]
 fn a_q6k_head_of_whole_superblock_rows_is_still_carried_verbatim() {
-    let (primary, quant, plane) = convert_head("wide", &build(256));
+    let (primary, quant, plane) = convert_head("wide", &build(256, VOCAB));
     assert_eq!(
         primary,
         QuantScheme::Q4_K,
@@ -248,4 +273,41 @@ fn a_q6k_head_of_whole_superblock_rows_is_still_carried_verbatim() {
     );
     lumen_format::serving_rules::validate_output_head_row_alignment(quant, 256)
         .expect("the written head must pass the loader's own head rule");
+}
+
+/// The head's row width is whole superblocks here, so the length rule is the one that
+/// decides. 0.31.0 sized a requantised head from the source tensor rather than from the
+/// header, so the plane pinned below is itself shorter than `vocab_size * hidden_dim` at
+/// both commits; the pin is on the bytes the converter writes.
+#[test]
+fn a_q6k_head_short_of_the_headers_vocab_keeps_the_0_31_0_head() {
+    // 255 rows of 256 elements: whole superblocks, one row short of the header's vocab.
+    let (primary, quant, plane) = convert_head("short", &build(256, VOCAB - 1));
+    assert_eq!(
+        primary,
+        QuantScheme::Q4_K,
+        "fixture is not a K-quant source"
+    );
+    lumen_format::serving_rules::validate_output_head_row_alignment(QuantScheme::Q6_K, 256).expect(
+        "the head's row width must be servable, so that the length rule is the one under test",
+    );
+    assert_ne!(
+        lumen_format::serving_rules::kquant_global_plane_len(
+            QuantScheme::Q6_K,
+            (VOCAB * 256) as usize
+        )
+        .unwrap(),
+        bytes_for(GgmlType::Q6_K, (VOCAB - 1) * 256).len(),
+        "the fixture's head plane is the length the header's vocab x hidden needs"
+    );
+    assert_eq!(
+        quant,
+        QuantScheme::Q8_0,
+        "a Q6_K head short of the header's vocab x hidden was carried verbatim"
+    );
+    assert_eq!(
+        plane.len(),
+        SHORT_HEAD_0_31_0_LEN,
+        "the head plane moved from 0.31.0"
+    );
 }

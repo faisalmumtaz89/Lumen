@@ -23,7 +23,8 @@ use crate::dequant::*;
 /// are the same file, except on a plane the runtime does not serve on the artifact the
 /// conversion is writing. A K-quant source's default head, `ssm_out` and F32 gates have
 /// to be servable at their geometry, so a Q6_K head whose row width is not whole
-/// superblocks, an `ssm_out` whose GDN width is not whole blocks for its scheme, and an
+/// superblocks or whose stored plane is not the one the header's `vocab x hidden`
+/// needs, an `ssm_out` whose GDN width is not whole blocks for its scheme, and an
 /// `ssm_alpha` / `ssm_beta` of an extent other than the one the projection reads, are
 /// converted by default as 0.31.0 converted them; and `ssm_out` has to be servable
 /// under the header as well, so `--requant` and `--dequantize`, which stamp a Q8_0
@@ -681,21 +682,35 @@ fn do_convert_from_reader<R: Read + Seek>(
                                         .as_deref(),
                                     Some("1") | Some("true") | Some("yes") | Some("on")
                                 );
-                            // A K-quant source takes this preservation by DEFAULT, so it
-                            // must not write a head the runtime then refuses: the head
-                            // matvec reads `hidden_dim / 256` whole superblocks per row,
-                            // and the loader rejects a width that is not whole
-                            // superblocks. Such a head is requantised — the conversion
-                            // 0.31.0 gave it. The two explicit switches are outside this
-                            // rule: they answer for every width, on every source, as they
-                            // did before the policy.
+                            // A K-quant source takes this preservation by DEFAULT, so
+                            // it must not write a head the runtime then refuses, under
+                            // either rule the runtime reads it by. The head matvec
+                            // reads `hidden_dim / 256` whole superblocks per row, and
+                            // the loader rejects a width that is not whole superblocks;
+                            // the loader also sizes the plane from the header's
+                            // `vocab_size * hidden_dim`: the host read refuses one
+                            // holding fewer elements than that product, and the CUDA
+                            // upload refuses any length other than the one it needs, so
+                            // the default keeps the head only when the stored plane is
+                            // exactly that length — the test the embedding keep above
+                            // makes, on the same two numbers. A head failing either is
+                            // requantised — the conversion 0.31.0 gave it. The two
+                            // explicit switches are outside this rule: they answer at
+                            // every width and every stored length, on every source, as
+                            // they did before the policy.
                             let servable =
                                 lumen_format::serving_rules::validate_output_head_row_alignment(
                                     QuantScheme::Q6_K,
                                     hp.hidden_dim as usize,
                                 )
                                 .is_ok();
-                            requested || (kquant_source() && servable)
+                            let plane_matches_header =
+                                lumen_format::serving_rules::kquant_global_plane_len(
+                                    QuantScheme::Q6_K,
+                                    hp.vocab_size as usize * hp.hidden_dim as usize,
+                                )
+                                .is_ok_and(|len| len == output_proj_bytes.len());
+                            requested || (kquant_source() && servable && plane_matches_header)
                         }
                         // A Q4_K / Q5_K head is not carried verbatim on any target: it is
                         // requantised like every other head, K-quant source or not.
