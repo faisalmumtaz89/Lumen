@@ -13131,8 +13131,7 @@ unsafe fn launch_matvec(
             )));
         }
         // split-layout: a Q8Split base is served by the early dispatch at the top of
-        // `launch_matvec` (`launch_matvec_preq8_1_split`); a Q4Split is a sibling
-        // buffer, never a base. Either reaching this match is a bug.
+        // `launch_matvec` (`launch_matvec_preq8_1_split`), so reaching this match is a bug.
         GpuWeightBuf::Ct4Raw(_)
         | GpuWeightBuf::Q4KRaw(_)
         | GpuWeightBuf::Q5KRaw(_)
@@ -13142,7 +13141,7 @@ unsafe fn launch_matvec(
                  handled by the early dp4a path"
             )));
         }
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        GpuWeightBuf::Q8Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "split-layout plane reached fallback match in matvec {label} — a Q8Split \
                  base is a plane whose raw copy was released; its decode dispatch goes \
@@ -14054,8 +14053,8 @@ unsafe fn launch_matvec_residual(
             )));
         }
         // split-layout: a Q8Split base is served by the early dispatch at the top of
-        // `launch_matvec_residual` (`launch_matvec_preq8_1_residual_split`); a Q4Split
-        // is a sibling buffer, never a base. Either reaching this match is a bug.
+        // `launch_matvec_residual` (`launch_matvec_preq8_1_residual_split`), so reaching
+        // this match is a bug.
         GpuWeightBuf::Ct4Raw(_)
         | GpuWeightBuf::Q4KRaw(_)
         | GpuWeightBuf::Q5KRaw(_)
@@ -14065,7 +14064,7 @@ unsafe fn launch_matvec_residual(
                  handled by the early dp4a path"
             )));
         }
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        GpuWeightBuf::Q8Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "split-layout plane reached fallback match in matvec+residual {label} — a \
                  Q8Split base is a plane whose raw copy was released; its decode dispatch \

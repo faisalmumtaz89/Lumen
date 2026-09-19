@@ -1186,12 +1186,6 @@ pub(crate) unsafe fn launch_gemm_projection(
                 )?;
             }
         }
-        GpuWeightBuf::Q4Split(_) => {
-            return Err(RuntimeError::Compute(format!(
-                "prefill GEMM {label}: Q4Split sibling routed to prefill; prefill must use \
-                 the original Q4Raw buffer (dequant->HGEMM path)",
-            )));
-        }
     }
     Ok(())
 }
@@ -1848,12 +1842,6 @@ pub(crate) unsafe fn launch_gemm_residual(
                     label,
                 )?;
             }
-        }
-        GpuWeightBuf::Q4Split(_) => {
-            return Err(RuntimeError::Compute(format!(
-                "prefill residual GEMM {label}: Q4Split sibling routed to prefill; prefill \
-                 must use the original Q4Raw buffer",
-            )));
         }
     }
     Ok(())
@@ -2721,13 +2709,12 @@ unsafe fn launch_matvec_slice(
                 .launch(launch_cfg)
                 .map_err(|e| RuntimeError::Compute(format!("matvec BF16 {label} prefill: {e}")))?;
         }
-        // split-layout: the per-row prefill matvec serves neither sibling (the batched
-        // GEMM serves Q8Split; Q4Split keeps its raw plane)
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        // split-layout: the per-row prefill matvec does not serve the sibling (the
+        // batched GEMM serves Q8Split)
+        GpuWeightBuf::Q8Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "matvec_slice {label}: a split-layout plane reached the per-row prefill \
-                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
-                 and Q4Split has no prefill route (its raw plane is kept)",
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm",
             )));
         }
     }
@@ -3328,13 +3315,12 @@ unsafe fn launch_matvec_residual_slice(
                     RuntimeError::Compute(format!("matvec+res BF16 {label} prefill: {e}"))
                 })?;
         }
-        // split-layout: the per-row prefill matvec serves neither sibling (the batched
-        // GEMM serves Q8Split; Q4Split keeps its raw plane)
-        GpuWeightBuf::Q8Split(_) | GpuWeightBuf::Q4Split(_) => {
+        // split-layout: the per-row prefill matvec does not serve the sibling (the
+        // batched GEMM serves Q8Split)
+        GpuWeightBuf::Q8Split(_) => {
             return Err(RuntimeError::Compute(format!(
                 "matvec_res {label}: a split-layout plane reached the per-row prefill \
-                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm \
-                 and Q4Split has no prefill route (its raw plane is kept)",
+                 matvec; the batched prefill serves Q8Split through its dequant -> GEMM arm",
             )));
         }
     }
