@@ -35,10 +35,11 @@ USAGE:
     lumen pull <model-name> [OPTIONS]
 
 ARGUMENTS:
-    <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.8-27b, qwen3.5-moe
+    <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.8-27b, qwen3.5-moe.
+                          Append `:<quant>`, or pass --quant, unless the model has a single one
 
 OPTIONS:
-    --quant <scheme>      Quantization format (default: Q8_0). Available: Q8_0, Q4_0, BF16;
+    --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;
                           Q4_K_M, Q5_K_M for qwen3.8-27b (served as stored on CUDA; on
                           Apple Silicon they convert to an artifact larger than the
                           Q8_0 one, as before)
@@ -46,9 +47,9 @@ OPTIONS:
     -h, --help            Print this help message
 
 EXAMPLES:
-    lumen pull qwen3-5-9b                 Download Qwen3.5 9B (Q8_0)
+    lumen pull qwen3.5-9b:q8_0            Download Qwen3.5 9B (Q8_0)
     lumen pull qwen3.5-9b --quant Q4_0    Download Qwen3.5 9B (Q4_0)
-    lumen pull qwen3-5-9b --yes           Download Qwen3.5 9B without confirmation"
+    lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation"
     );
 }
 
