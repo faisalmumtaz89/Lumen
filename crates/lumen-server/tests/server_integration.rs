@@ -1303,11 +1303,18 @@ async fn post_status(
     (status, json)
 }
 
+/// The panic-budget thresholds are process-global environment variables the engine
+/// reads once per worker at spawn (`engine.rs`), so every test that sets them around a
+/// `boot_server_with_panic_backend()` holds this lock across the boot: without it one
+/// test's `set_var` lands in another test's worker.
+static PANIC_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// G1: a single panic inside `process_job` does not kill the
 /// worker.  The in-flight client receives a structured error; the next
 /// request lands successfully.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_recovers_from_single_panic() {
+    let _env = PANIC_ENV_LOCK.lock().await;
     // Clear any panic-budget overrides set by prior tests in the
     // same process so this test runs under production defaults.
     let saved_max = std::env::var("LUMEN_SERVER_PANIC_MAX").ok();
@@ -1396,11 +1403,12 @@ async fn worker_recovers_from_single_panic() {
 /// process see the production defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_survives_100_panic_recovery_cycles() {
+    let _env = PANIC_ENV_LOCK.lock().await;
     // Save current env so we can restore after the test.  Using
     // `set_var` is a deliberate test-only contract (the engine
     // resolves these once per worker at spawn time; the test sets
-    // them, spawns, then restores).  Other tests in this file do
-    // not share the panic-budget worker lifetime.
+    // them, spawns, then restores).  The other panic-budget tests set
+    // the same variables, so `PANIC_ENV_LOCK` keeps them apart.
     let saved_max = std::env::var("LUMEN_SERVER_PANIC_MAX").ok();
     let saved_window = std::env::var("LUMEN_SERVER_PANIC_WINDOW_SECS").ok();
     std::env::set_var("LUMEN_SERVER_PANIC_MAX", "10000");
@@ -1504,6 +1512,7 @@ async fn worker_survives_100_panic_recovery_cycles() {
 /// panics in tight succession; the 4th trips the UNHEALTHY drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_drains_inbox_when_panic_budget_exhausted() {
+    let _env = PANIC_ENV_LOCK.lock().await;
     // Production defaults: 3 panics in 60s budget.  Save and clear
     // any overrides from prior tests in the same process.
     let saved_max = std::env::var("LUMEN_SERVER_PANIC_MAX").ok();

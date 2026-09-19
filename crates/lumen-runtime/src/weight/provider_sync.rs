@@ -443,7 +443,25 @@ pub fn read_output_proj_global(
         // reinterpreted as F32 (a length no multiple of four bytes panics there).
         (header_quant, true)
     } else {
-        // Unknown format -- try F32 interpretation (backward compat)
+        // Unknown format -- try F32 interpretation (backward compat). That reading panics
+        // on a length no multiple of four and silently yields a short head on any length
+        // below the declared one, while every consumer sizes the head from the header:
+        // refuse both here.
+        if raw_bytes.len() % 4 != 0 {
+            return Err(RuntimeError::Compute(format!(
+                "output head plane is {} bytes, which the F32 reading it falls through to \
+                 cannot take: that length is not a multiple of 4",
+                raw_bytes.len()
+            )));
+        }
+        if raw_bytes.len() < expected_f32_bytes {
+            return Err(RuntimeError::Compute(format!(
+                "output head plane is {} bytes: read as F32 it holds {} of the \
+                 {n_elements} elements a {vocab_size} x {hidden_dim} head declares",
+                raw_bytes.len(),
+                raw_bytes.len() / 4
+            )));
+        }
         (QuantScheme::F32, false)
     };
 
@@ -819,6 +837,48 @@ mod tests {
                 .contains("K-quant embedding plane failed to dequantise"),
             "{err}"
         );
+    }
+
+    /// The head's F32 fall-through reads a plane of any length, while every consumer
+    /// sizes the head from the header's `vocab_size * hidden_dim`: a plane shorter than
+    /// that product yields fewer rows than the head matvec indexes. A Q8_0 head one row
+    /// short of the header's vocab reaches that path — its length matches no scheme and
+    /// its header quant is not a K-quant.
+    #[test]
+    fn a_head_plane_shorter_than_the_header_is_an_error() {
+        let (vocab, hidden) = (256usize, 256usize);
+        let short = vec![0u8; (255 * hidden / 32) * 34];
+        let err = read_output_proj_global(short, vocab, hidden, QuantScheme::Q8_0)
+            .expect_err("a head one row short of the header's vocab must be refused");
+        assert!(
+            err.to_string().contains("output head plane is 69360 bytes"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("17340 of the 65536 elements"),
+            "{err}"
+        );
+        // A Q6_K-length plane under a header that is not a K-quant takes the same path:
+        // its scheme is not confirmed, so only the F32 reading is left to it.
+        let q6k_len = vec![0u8; (vocab * hidden / 256) * 210];
+        let err = read_output_proj_global(q6k_len, vocab, hidden, QuantScheme::Q8_0)
+            .expect_err("a plane of Q6_K length under a Q8_0 header must be refused");
+        assert!(
+            err.to_string().contains("13440 of the 65536 elements"),
+            "{err}"
+        );
+        // An odd byte count is no F32 head at any size: the F32 reading panics on it.
+        let unaligned = vec![0u8; vocab * hidden * 4 + 1];
+        let err = read_output_proj_global(unaligned, vocab, hidden, QuantScheme::F32)
+            .expect_err("a length that is no multiple of 4 must be refused");
+        assert!(err.to_string().contains("not a multiple of 4"), "{err}");
+        // A plane longer than that product is still read as F32, as before.
+        let long = vec![0u8; vocab * hidden * 4 + 4];
+        let (f32_data, kept, quant) =
+            read_output_proj_global(long, vocab, hidden, QuantScheme::F32).unwrap();
+        assert_eq!(quant, QuantScheme::F32);
+        assert!(kept.is_empty());
+        assert_eq!(f32_data.len(), vocab * hidden + 1);
     }
 
     /// A K-quant embedding plane is recognised by its superblock length and

@@ -1039,9 +1039,8 @@ pub fn q8_split_ssmout_enabled() -> bool {
 }
 
 /// `LUMEN_CUDA_Q4_SPLIT_WO=1` (probe): clone the full-attention `wo` into its
-/// Q4 split sibling, routing its decode through the residual-split kernel an
-/// earlier campaign recorded as broken — exists to re-test that verdict on
-/// current source. Default OFF.
+/// Q4 split sibling, routing its decode through the residual-split kernel, which
+/// has produced NaN logits. Default OFF.
 pub fn q4_split_wo_probe_enabled() -> bool {
     matches!(std::env::var("LUMEN_CUDA_Q4_SPLIT_WO"), Ok(v) if v == "1")
 }
@@ -4157,7 +4156,7 @@ mod tests {
     /// allowlisted makes `validate_lumen_env_vars()` emit a spurious
     /// "unknown LUMEN var — typo?" warning the moment an operator sets it.
     ///
-    /// REGENERATE (from repo root) with the campaign one-liner:
+    /// REGENERATE (from repo root) with:
     ///   grep -rhoE '"LUMEN_[A-Z0-9_]+"' crates --include='*.rs' | tr -d '"' | sort -u
     /// then drop `LUMEN_BUILD_VERSION` — it is a compile-time `option_env!`
     /// baked in at build time, never present in the runtime process env, so it

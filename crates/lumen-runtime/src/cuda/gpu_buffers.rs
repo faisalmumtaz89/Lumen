@@ -70,16 +70,6 @@ pub enum GpuWeightBuf {
     /// prefill serves this variant with `dequant_q8_split_to_f16` / `_to_f32` (a
     /// tile bit-identical to the raw dequant) on its usual dequant -> GEMM route.
     Q8Split(std::sync::Arc<CudaSlice<u8>>),
-    /// Repacked Q4_0 in per-row split (SoA) layout: each row holds
-    /// `[f16 scale * nb][nibble[16] * nb]` for a total of 18*nb bytes
-    /// (same density as `Q4Raw`, 10% denser than `Q4Aligned`'s 20*nb).
-    /// Native `int*` loads (4 loads per block vs 16 byte loads in Q4Raw).
-    ///
-    /// Used only for the decode path; produced by `repack_q4_raw_to_split()`
-    /// when `LUMEN_CUDA_Q4_SPLIT=1` is set at session start. Original Q4Raw
-    /// is preserved alongside for prefill. Consumed by `matvec_q4_split_q8_1`.
-    #[allow(dead_code)]
-    Q4Split(CudaSlice<u8>),
     /// CtInt4G32 (imported compressed-tensors pack-quantized INT4 g32)
     /// repacked into 20-byte decode blocks: `d bf16 (2B) | zp u8 (1B) |
     /// pad (1B) | 16 GGML-paired nibble bytes` per 32 elements, row-major.
@@ -216,10 +206,6 @@ pub struct LayerWeightsGpu {
     /// enablement, Q8Raw eligibility, the clone budget, and allocation
     /// success.
     pub q8_split_attn_gate: Option<std::sync::Arc<CudaSlice<u8>>>,
-    #[allow(dead_code)]
-    pub q8_split_ssm_alpha: Option<std::sync::Arc<CudaSlice<u8>>>,
-    #[allow(dead_code)]
-    pub q8_split_ssm_beta: Option<std::sync::Arc<CudaSlice<u8>>>,
     /// Per-row split siblings for Q4Raw GDN weights (decode-only). Currently
     /// always `None` (no populator); the decode projection reads them as
     /// optional split siblings and falls back to the base Q4Raw matvec.
@@ -1256,8 +1242,6 @@ pub fn upload_layer_weights(
         // GDN split siblings start as None (decode-only optional siblings).
         q8_split_ssm_out: None,
         q8_split_attn_gate: None,
-        q8_split_ssm_alpha: None,
-        q8_split_ssm_beta: None,
         q4_split_attn_gate: None,
         q4_split_ssm_alpha: None,
         q4_split_ssm_beta: None,
@@ -1416,8 +1400,7 @@ fn makes_f16_cache(w: &GpuWeightBuf, quantised_cached: bool) -> bool {
         | GpuWeightBuf::Q6KRaw(_)
         | GpuWeightBuf::F16Raw(_)
         | GpuWeightBuf::Bf16Raw(_)
-        | GpuWeightBuf::Q8Split(_)
-        | GpuWeightBuf::Q4Split(_) => false,
+        | GpuWeightBuf::Q8Split(_) => false,
     }
 }
 
@@ -1546,7 +1529,6 @@ pub fn dequant_layer_q8_to_f16(
         // GDN layer: skip ALL F16 dequant to avoid OOM on A100-80GB.
         // Qwen3.5-9B Q8_0 weights (~10 GB) + 24 GDN layers × 8 weights × ~100 MB F16 each
         // = ~19 GB F16 caches → exceeds available VRAM after standard layers + CUDA overhead.
-        // Attempted 3 times (C26, C27, C29) with graceful OOM — always fails at layer 13-22.
         // GDN GEMMs use dequant+SGEMM fallback. Decode uses dp4a/scalar.
         return Ok(());
     } else {

@@ -1,8 +1,10 @@
-//! The K-quant source fixture the two `kquant_gate_extent*` binaries share: a dense
-//! qwen35 GGUF whose two F32 GDN gates are built at a caller-chosen element count.
+//! The K-quant source fixture the `kquant_gate_extent*` and interrupted-conversion
+//! binaries share: a dense qwen35 GGUF whose two F32 GDN gates are built at a
+//! caller-chosen element count. Each binary uses the helpers it needs.
 //! The default policy and the explicit `LUMEN_CONVERT_SOURCE_FIDELITY` switch need
 //! separate binaries — the switch is a process-wide environment variable — and both
 //! read the same fixture from here.
+#![allow(dead_code)]
 use lumen_convert::convert::{convert_gguf_bytes_to_lbc, ConvertOptions, ConvertTarget};
 use lumen_convert::gguf::{GgmlType, GgufBuilder};
 use lumen_format::quantization::QuantScheme;
