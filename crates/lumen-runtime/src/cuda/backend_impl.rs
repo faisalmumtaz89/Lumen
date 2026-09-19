@@ -4099,10 +4099,9 @@ impl CudaBackend {
             // fused_glu_fired = true reuses the downstream skip-SwiGLU +
             // down-reads-scratch.gate logic unchanged.
             //
-            // A/B isolation: fires by default under Q8_MMVQ=1, but an explicit
+            // Fires by default under Q8_MMVQ=1; an explicit
             // `LUMEN_CUDA_FFN_FUSED_GLU=0` (which already means "use the separate
-            // dp4a gate/up path") opts OUT, so the reviewer can measure the
-            // combined mmvq config WITH vs WITHOUT gate-fusion.
+            // dp4a gate/up path") opts out of the fusion.
             let mmvq_glu_opt_out = matches!(
                 std::env::var("LUMEN_CUDA_FFN_FUSED_GLU").ok().as_deref(),
                 Some("0") | Some("false") | Some("no") | Some("off") | Some("OFF")
@@ -15984,10 +15983,9 @@ unsafe fn repack_all_layers_q4_clone_to_split(
                     kv_heads * head_dim,
                     hidden,
                 );
-                // Probe flag: the residual-split wo kernel was recorded as
-                // producing NaN logits in an earlier campaign; this arm exists
-                // to re-test that verdict on current source before any wider
-                // rollout. Never enabled by the primary flag.
+                // The residual-split wo kernel has produced NaN logits, so it
+                // sits behind its own probe flag and is never enabled by the
+                // primary one.
                 if crate::runtime_defaults::q4_split_wo_probe_enabled() {
                     push_if_q4raw(
                         &mut jobs,

@@ -343,8 +343,8 @@ pub fn dequant_kquant_to_f32(
                 // GGML `dequantize_row_q3_K` traversal: same grouped/shifted
                 // scheme as Q2_K (two 128-value groups; four shift passes over
                 // the same 32 qs bytes; `q[l]`/`q[l+16]` runs; hmask selector
-                // `m` advances per pass). The naive linear scan corrupts ~82%
-                // of values. See the converter fix in
+                // `m` advances per pass). A naive linear scan corrupts ~82%
+                // of values. The converter reads the same traversal in
                 // lumen-convert/src/dequant.rs::dequantize_q3_k.
                 let mut q_off = 0usize;
                 let mut is = 0usize;

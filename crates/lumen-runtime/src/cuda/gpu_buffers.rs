@@ -1546,7 +1546,6 @@ pub fn dequant_layer_q8_to_f16(
         // GDN layer: skip ALL F16 dequant to avoid OOM on A100-80GB.
         // Qwen3.5-9B Q8_0 weights (~10 GB) + 24 GDN layers × 8 weights × ~100 MB F16 each
         // = ~19 GB F16 caches → exceeds available VRAM after standard layers + CUDA overhead.
-        // Attempted 3 times (C26, C27, C29) with graceful OOM — always fails at layer 13-22.
         // GDN GEMMs use dequant+SGEMM fallback. Decode uses dp4a/scalar.
         return Ok(());
     } else {

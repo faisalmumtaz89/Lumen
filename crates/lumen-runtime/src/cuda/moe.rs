@@ -21,9 +21,9 @@ use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
 use std::sync::atomic::AtomicUsize;
 
-/// AUDIT (ported to): per-process MoE-FFN-decode call counter for the
-/// `LUMEN_DUMP_EXPERTS` expert-ID dump. Increments once per MoE layer per
-/// decode token; for a single forward pass `call` == MoE-layer index.
+/// Per-process MoE-FFN-decode call counter for the `LUMEN_DUMP_EXPERTS`
+/// expert-ID dump. Increments once per MoE layer per decode token; for a
+/// single forward pass `call` == MoE-layer index.
 static MOE_DUMP_CALL: AtomicUsize = AtomicUsize::new(0);
 
 /// Precomputed per-MoE-layer metadata used by the CUDA forward path.
@@ -818,17 +818,14 @@ pub(crate) fn moe_fused_norm_router_enabled() -> bool {
     })
 }
 
-// NOTE: `LUMEN_CUDA_MOE_ROUTER_SINGLE_CTA` was deleted 2026-07-14 (flag-cleanup
-// retention audit). The single-CTA `moe_router_fused_v2` router is now the
-// fallback: the dispatch sites below take the two-launch parallel router when
-// `LUMEN_CUDA_MOE_ROUTER_PARALLEL` is on (its default) and this kernel
-// otherwise. Its former `=0` off-arm
-// dispatched the atomicAdd "last-CTA" router (`moe_router_fused_atomic_v2`),
-// which faults with `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens: a
-// persistent cross-launch `done_counter` can leave `expert_ids[]` uninitialized,
-// after which `moe_batched_gate_up_swiglu_q8_0_v2` indexes out of bounds. The
-// crash-on-set arm is removed (CONCURRENT_ENCODER_FULL precedent). The single-CTA
-// kernel caches `normed_x` in shmem and warp-parallelizes per-expert dot products
+// The single-CTA `moe_router_fused_v2` router is the fallback: the dispatch sites
+// below take the two-launch parallel router when `LUMEN_CUDA_MOE_ROUTER_PARALLEL`
+// is on (its default) and this kernel otherwise. There is no arm for the atomicAdd
+// "last-CTA" router (`moe_router_fused_atomic_v2`), which faults with
+// `CUDA_ERROR_ILLEGAL_ADDRESS` at prefill ≥16 tokens: a persistent cross-launch
+// `done_counter` can leave `expert_ids[]` uninitialized, after which
+// `moe_batched_gate_up_swiglu_q8_0_v2` indexes out of bounds. The single-CTA kernel
+// caches `normed_x` in shmem and warp-parallelizes per-expert dot products
 // (+1-3 μs/launch over the atomicAdd path).
 
 /// read `LUMEN_CUDA_MOE_ROUTER_PARALLEL` once via OnceLock (default ON, via
@@ -1482,8 +1479,8 @@ pub(crate) fn encode_moe_ffn_decode(
             }
         }
 
-        // (ported AUDIT): dump expert_ids/weights right
-        // after router fires (convergent point for all 3 V2 router variants).
+        // Dump expert_ids/weights right after the router fires (convergent
+        // point for all 3 V2 router variants).
         // Diagnostic-only; no-op unless LUMEN_DUMP_EXPERTS is set. Adds a dtoh sync.
         if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
             device.synchronize()?;
@@ -1738,9 +1735,9 @@ pub(crate) fn encode_moe_ffn_decode(
         // num_experts is read implicitly via expert_ids range; suppress unused warning
         // when the batched branch is taken.
         let _ = num_experts;
-        // (ported AUDIT): expert-ID dump. When LUMEN_DUMP_EXPERTS is set, read
-        // back expert_ids + expert_weights and print them with a per-process MoE
-        // call counter (counter == MoE-layer index for a single forward pass).
+        // Expert-ID dump. When LUMEN_DUMP_EXPERTS is set, read back expert_ids
+        // + expert_weights and print them with a per-process MoE call counter
+        // (counter == MoE-layer index for a single forward pass).
         // Diagnostic-only; no-op unless the env var is set. Adds a dtoh sync.
         if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
             device.synchronize()?;
@@ -3483,7 +3480,7 @@ pub(crate) fn encode_moe_ffn_decode_fused_norm(
         }
     }
 
-    // (ported AUDIT): fused-norm-router expert dump.
+    // Fused-norm-router expert dump.
     if std::env::var("LUMEN_DUMP_EXPERTS").is_ok() {
         device.synchronize()?;
         let ids = device.dtoh_copy(&scratch.expert_ids).unwrap_or_default();
