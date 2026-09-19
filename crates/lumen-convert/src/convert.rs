@@ -627,7 +627,7 @@ fn do_convert_from_reader<R: Read + Seek>(
             // Handle requantization of output_proj
             if let Some(QuantScheme::Q4_0) = requant_target {
                 let f32_data = ensure_f32_global(
-                    output_proj_bytes.clone(),
+                    output_proj_bytes,
                     output_proj_tensor.ggml_type,
                     OUTPUT_PROJ_NAME,
                     output_proj_tensor.n_elements(),
@@ -744,7 +744,7 @@ fn do_convert_from_reader<R: Read + Seek>(
                         "  K-quant output.weight (Q6_K): kept verbatim ({} bytes)",
                         output_proj_bytes.len()
                     );
-                    (output_proj_bytes.to_vec(), false, QuantScheme::Q6_K)
+                    (output_proj_bytes, false, QuantScheme::Q6_K)
                 } else {
                     let f32_data = ensure_f32_global(
                         output_proj_bytes,
