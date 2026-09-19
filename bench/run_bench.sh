@@ -462,8 +462,8 @@ parse_model_name() {
     local name quant
 
     # Extract quant suffix (last -q..._... or -f16 segment)
-    if echo "$bn" | grep -qE -- '-[qQ][0-9]+_[0-9a-zA-Z]+$'; then
-        quant="$(echo "$bn" | grep -oE -- '[qQ][0-9]+_[0-9a-zA-Z]+$')"
+    if echo "$bn" | grep -qE -- '-[qQ][0-9]+(_[0-9a-zA-Z]+)+$'; then
+        quant="$(echo "$bn" | grep -oE -- '[qQ][0-9]+(_[0-9a-zA-Z]+)+$')"
         name="${bn%-"$quant"}"
     elif echo "$bn" | grep -qE -- '-[fF]16$'; then
         quant="F16"
