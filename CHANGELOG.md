@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-09-20
+
 ### Added
 
 - **K-quant artifacts are served natively on CUDA.** A `Q4_K_M` or `Q5_K_M` source (a
@@ -39,6 +41,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - The host dequantiser decoded a Q3_K block's six-bit scales from the wrong bytes and
   bit positions, so a Q3_K plane converted for CUDA was served from wrong weights.
+- The loader refuses an output head plane shorter than the header declares, or not a
+  multiple of four bytes, instead of reading it as F32 and dropping the raw bytes —
+  which skipped the CUDA length check and read past the end of the plane.
+- A converted artifact is written through a process-unique temp file, flushed and
+  synced, then renamed into place; an interrupted or failed conversion no longer leaves
+  a truncated artifact that the cache reports as present.
+- `pull --help` no longer promises a quantization default the CLI does not implement.
+- Quantization listings print in a stable order.
+- The bench name split parses multi-part quant suffixes such as `q4_k_m`.
+- `LUMEN_CUDA_Q6K_HEAD` is documented in `docs/environment-variables.md`.
+- The converter moves the output head plane instead of copying it (1.04 GB on the
+  27B path).
 
 ## [0.31.0] — 2026-09-11
 
@@ -1525,6 +1539,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.32.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.28.0...v0.29.0
