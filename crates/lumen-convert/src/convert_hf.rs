@@ -28,7 +28,7 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use crate::arch::qwen35_moe::is_qwen35moe_full_attention_layer;
-use crate::convert::{ConvertError, ConvertStats};
+use crate::convert::{tmp_artifact_path, ConvertError, ConvertStats, TmpGuard};
 use crate::ct_planes::{permute_k_blocks, permute_rows, permute_zero_point_rows};
 use crate::dequant::convert_bf16_bytes_to_f32;
 use crate::gguf::GgufFile;
@@ -904,15 +904,7 @@ pub fn convert_hf_ct_to_lbc(
     // partial file never carries the final name. `create_new` refuses to
     // follow a pre-existing path (symlink or a concurrent conversion's
     // file); the guard removes the multi-GB partial on any error exit.
-    struct TmpGuard(Option<std::path::PathBuf>);
-    impl Drop for TmpGuard {
-        fn drop(&mut self) {
-            if let Some(p) = &self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-    let tmp_path = lbc_path.with_extension(format!("lbc.tmp.{}", std::process::id()));
+    let tmp_path = tmp_artifact_path(lbc_path);
     let output_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -173,7 +173,7 @@ use lumen_format::writer::GlobalTensors;
 use std::cell::Cell;
 use std::fmt;
 use std::io::{BufWriter, Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -426,6 +426,29 @@ pub fn convert_gguf_bytes_to_lbc(
 // ---------------------------------------------------------------------------
 // Core conversion logic
 // ---------------------------------------------------------------------------
+
+/// Removes the temp file a conversion writes into, unless it is disarmed by setting
+/// the path to `None` once the artifact has been renamed into place. Drop runs on an
+/// error return and on a panic, so neither leaves a multi-GB file behind.
+pub(crate) struct TmpGuard(pub(crate) Option<PathBuf>);
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// The temp path a conversion to `lbc_path` writes into: a sibling, so the rename that
+/// publishes it stays within one filesystem, and unique per process. The suffix extends
+/// the whole file name — replacing its extension would map every output whose name
+/// differs only after a dot onto one temp path.
+pub(crate) fn tmp_artifact_path(lbc_path: &Path) -> PathBuf {
+    let mut name = lbc_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    lbc_path.with_file_name(name)
+}
 
 fn do_convert_from_reader<R: Read + Seek>(
     gguf: &GgufFile,
@@ -830,8 +853,17 @@ fn do_convert_from_reader<R: Read + Seek>(
     header.output_proj.quant = output_proj_quant;
     header.weight_tying = weight_tying;
 
-    // Create LBC file with streaming writer
-    let output_file = std::fs::File::create(lbc_path)?;
+    // Write to a unique sibling temp file and rename into place at the end,
+    // so a failed conversion never destroys an existing artifact and a
+    // partial file never carries the final name. `create_new` refuses to
+    // follow a pre-existing path (symlink or a concurrent conversion's
+    // file); the guard removes the multi-GB partial on any error exit.
+    let tmp_path = tmp_artifact_path(lbc_path);
+    let output_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    let mut tmp_guard = TmpGuard(Some(tmp_path.clone()));
     let writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
     let global_tensors = GlobalTensors {
@@ -910,7 +942,16 @@ fn do_convert_from_reader<R: Read + Seek>(
         }
     }
 
-    streaming.finish()?;
+    // Flush + sync explicitly: a drop-time flush error would otherwise be
+    // silently ignored and the command could report success on a short file.
+    let mut writer = streaming.finish()?;
+    std::io::Write::flush(&mut writer)?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()?;
+    std::fs::rename(&tmp_path, lbc_path)?;
+    tmp_guard.0 = None;
 
     let output_size = std::fs::metadata(lbc_path)?.len();
 
