@@ -188,7 +188,8 @@ fn pull_cmd(args: &[String]) {
 
     // Validate the requested quant exists in the registry for this model.
     let gguf_source = entry.gguf_files.get(quant).unwrap_or_else(|| {
-        let available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+        let mut available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+        available.sort();
         eprintln!("No {quant} GGUF available for {}", entry.display_name);
         eprintln!("Available quantizations: {}", available.join(", "));
         std::process::exit(1);
@@ -326,7 +327,8 @@ fn models_cmd() {
         let reg = registry::load_registry();
         println!("Available models:");
         for entry in reg.list() {
-            let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            quants.sort();
             println!(
                 "  {:<20} {} ({})",
                 entry.key,
@@ -347,7 +349,9 @@ fn models_cmd() {
     let cached_stems: Vec<&str> = cached.iter().map(|(name, _, _)| name.as_str()).collect();
     let mut available = Vec::new();
     for entry in reg.list() {
-        for quant in entry.gguf_files.keys() {
+        let mut quants: Vec<&String> = entry.gguf_files.keys().collect();
+        quants.sort();
+        for quant in quants {
             let stem = format!("{}-{}", entry.key, quant);
             if !cached_stems.contains(&stem.as_str()) {
                 available.push((entry.key.clone(), entry.display_name.clone(), quant.clone()));

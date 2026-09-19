@@ -163,7 +163,8 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
         let key_lower = entry.key.to_lowercase();
         let dist = levenshtein(&input_lower, &key_lower);
         if dist <= 3 || key_lower.starts_with(&input_lower) || input_lower.starts_with(&key_lower) {
-            let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            quants.sort();
             candidates.push((
                 dist,
                 format!(
@@ -186,7 +187,8 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
         {
             // Resolve to display the canonical entry info.
             if let Some(entry) = registry.resolve(alias) {
-                let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+                let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+                quants.sort();
                 let line = format!(
                     "  {:<20} {} ({})",
                     alias,
@@ -1482,7 +1484,9 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
                 eprintln!("Error: unknown model '{}'\n", model_name);
                 eprintln!("Available models:");
                 for entry in reg.list() {
-                    let quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+                    let mut quants: Vec<&str> =
+                        entry.gguf_files.keys().map(|s| s.as_str()).collect();
+                    quants.sort();
                     eprintln!(
                         "  {:<20} {} ({})",
                         entry.key,
@@ -1508,7 +1512,8 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
         let in_registry = entry.gguf_files.contains_key(q.as_str());
         let in_cache = crate::cache::cached_lbc(&entry.key, q.as_str()).is_some();
         if !in_registry && !in_cache {
-            let available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            let mut available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            available.sort();
             eprintln!(
                 "Error: quantization '{}' not available for {}\n",
                 q, entry.display_name
@@ -1594,7 +1599,8 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
     let gguf_source = match entry.gguf_files.get(quant) {
         Some(src) => src.clone(),
         None => {
-            let available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            let mut available: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
+            available.sort();
             eprintln!(
                 "Error: no {quant} GGUF available for {}",
                 entry.display_name
