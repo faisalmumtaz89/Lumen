@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use lumen_convert::test_checkpoint::{self, Modules};
+use lumen_convert::test_checkpoint::{self, Modules, Tokenizer};
 use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
 use lumen_format::QuantScheme;
 
@@ -106,7 +106,7 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup()
     // The header's own scheme serves, so the refusal rests entirely on the
     // per-slice scan past it.
     let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir);
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Embedded);
 
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
@@ -126,6 +126,33 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup()
     assert!(
         !stderr.contains("listening"),
         "the server got past admission:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
+    assert!(
+        cfg!(feature = "bin"),
+        "this test spawns the server binary: run with --features lumen-server/bin"
+    );
+    // The refusal is decided from the header and index, so it comes before
+    // anything else the server reads out of the artifact — the tokenizer
+    // included. An artifact with none is still refused for its scheme.
+    let dir = workdir("no-tokenizer");
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert!(lbc.tokenizer.is_none());
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+
+    let (code, stderr) = run_server(&artifact, "cpu");
+    assert_ne!(code, Some(0), "the server started: {stderr}");
+    assert!(
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("no embedded tokenizer"),
+        "the tokenizer was read before admission:\n{stderr}"
     );
 }
 

@@ -386,12 +386,21 @@ pub fn write_q4_0_artifact(dir: &Path) -> PathBuf {
     path
 }
 
+/// Whether a synthetic artifact carries a tokenizer section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tokenizer {
+    /// The placeholder vocabulary the donor GGUF carries.
+    Embedded,
+    /// No section at all: what a binary sees before it has one to build.
+    Absent,
+}
+
 /// A Q4_0 artifact with one layer slice retagged FP8: the header's own
 /// scheme serves, so admission has to rest on the per-slice scan past it.
 /// `lumen convert` writes no such artifact — a planar module anywhere makes
 /// the primary planar — so it is reassembled here from a Q4_0 artifact's own
 /// parts, which holds that scan to a file a binary actually opens.
-pub fn write_planar_slice_artifact(dir: &Path) -> PathBuf {
+pub fn write_planar_slice_artifact(dir: &Path, tokenizer: Tokenizer) -> PathBuf {
     let q4 = write_q4_0_artifact(dir);
     let source = lumen_format::reader::LbcFile::open(&q4).unwrap();
     let bytes = std::fs::read(&q4).unwrap();
@@ -409,23 +418,23 @@ pub fn write_planar_slice_artifact(dir: &Path) -> PathBuf {
         .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
         .collect();
 
-    // The server builds a tokenizer from the artifact before it admits it,
-    // so one has to be here for the scan to be reached at all. The same
-    // placeholder vocabulary the donor GGUF carries.
-    let tokenizer = lumen_format::tokenizer::TokenizerSection {
-        model_type: "gpt2".into(),
-        pre_tokenizer: "default".into(),
-        tokens: (0..VOCAB).map(|i| format!("t{i}")).collect(),
-        token_types: Vec::new(),
-        scores: Vec::new(),
-        merges: Vec::new(),
-        bos_token_id: 0,
-        eos_token_id: 1,
-        pad_token_id: None,
-        add_bos_token: false,
-        add_eos_token: false,
-        add_space_prefix: false,
-        chat_template: None,
+    let section = match tokenizer {
+        Tokenizer::Embedded => Some(lumen_format::tokenizer::TokenizerSection {
+            model_type: "gpt2".into(),
+            pre_tokenizer: "default".into(),
+            tokens: (0..VOCAB).map(|i| format!("t{i}")).collect(),
+            token_types: Vec::new(),
+            scores: Vec::new(),
+            merges: Vec::new(),
+            bos_token_id: 0,
+            eos_token_id: 1,
+            pad_token_id: None,
+            add_bos_token: false,
+            add_eos_token: false,
+            add_space_prefix: false,
+            chat_template: None,
+        }),
+        Tokenizer::Absent => None,
     };
 
     let path = dir.join("planar-slice.lbc");
@@ -449,7 +458,7 @@ pub fn write_planar_slice_artifact(dir: &Path) -> PathBuf {
             ),
         },
         &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-        Some(&tokenizer),
+        section.as_ref(),
     )
     .unwrap();
     drop(out);

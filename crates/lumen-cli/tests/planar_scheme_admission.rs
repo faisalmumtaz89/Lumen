@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use lumen_convert::test_checkpoint::{self, Modules};
+use lumen_convert::test_checkpoint::{self, Modules, Tokenizer};
 use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
 use lumen_format::QuantScheme;
 
@@ -18,16 +18,20 @@ use lumen_format::QuantScheme;
 /// GPU. Returns (exit code, stderr).
 fn run_cli(artifact: &Path, extra: &[&str]) -> (Option<i32>, String) {
     // `--tokens` rather than `--prompt`: the synthetic artifact's vocabulary
-    // is 32 placeholder tokens, and the tokenizer runs before admission.
-    let mut args = vec![
-        "run",
-        "--model",
-        artifact.to_str().unwrap(),
-        "--tokens",
-        "1",
-        "--max-tokens",
-        "1",
-    ];
+    // is 32 placeholder tokens, no text to tokenize against.
+    run_cli_with(artifact, &["--tokens", "1"], extra)
+}
+
+/// `lumen run` with the prompt given as text, so the tokenizer is on the
+/// path the run takes.
+fn run_cli_prompt(artifact: &Path, extra: &[&str]) -> (Option<i32>, String) {
+    run_cli_with(artifact, &["--prompt", "hi"], extra)
+}
+
+fn run_cli_with(artifact: &Path, input: &[&str], extra: &[&str]) -> (Option<i32>, String) {
+    let mut args = vec!["run", "--model", artifact.to_str().unwrap()];
+    args.extend_from_slice(input);
+    args.extend_from_slice(&["--max-tokens", "1"]);
     args.extend_from_slice(extra);
     let out = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .args(&args)
@@ -107,7 +111,7 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
     // The header's own scheme serves, so the refusal rests entirely on the
     // per-slice scan past it.
     let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir);
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Embedded);
 
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
@@ -123,6 +127,30 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
     assert!(
         stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
+    );
+}
+
+#[test]
+fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_on_a_prompt() {
+    // The refusal is decided from the header and index, so it comes before
+    // anything else the run reads out of the artifact — the tokenizer a
+    // text prompt needs included. An artifact with none is still refused
+    // for its scheme.
+    let dir = workdir("no-tokenizer");
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert!(lbc.tokenizer.is_none());
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+
+    let (code, stderr) = run_cli_prompt(&artifact, &["--simd"]);
+    assert_eq!(code, Some(1), "exit code\n{stderr}");
+    assert!(
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("no embedded tokenizer"),
+        "the tokenizer was read before admission:\n{stderr}"
     );
 }
 
