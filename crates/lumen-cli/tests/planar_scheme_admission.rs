@@ -56,9 +56,13 @@ fn an_nvfp4_artifact_is_refused_by_name_on_every_backend() {
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
 
-    // Every backend and weight-provider selection the CLI offers on this
-    // host. No flag is the mmap provider, which `--streaming` also takes
-    // with the weights left out of GPU residency.
+    // The selections that run anywhere: no flag (the mmap provider, and
+    // the CLI's own choice of backend), `--streaming` (the same provider
+    // with the weights left out of GPU residency), the SIMD CPU backend and
+    // the two synchronous/asynchronous providers. `--metal` and `--cuda`
+    // are not here because each needs its device present; the refusal
+    // happens before any backend is constructed, which is what the no-flag
+    // case shows.
     for extra in [
         &[][..],
         &["--streaming"][..],
