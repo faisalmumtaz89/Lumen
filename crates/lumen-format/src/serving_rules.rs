@@ -1211,6 +1211,81 @@ mod tests {
         }
     }
 
+    /// A one-layer file built by hand: a primary that serves, one layer
+    /// slice and a head whose schemes the caller picks. `lumen convert`
+    /// writes no such artifact — a planar module anywhere makes the primary
+    /// planar — so this is where the scan past the header is exercised.
+    fn hand_built_lbc(
+        primary: QuantScheme,
+        w_gate: QuantScheme,
+        head: QuantScheme,
+    ) -> crate::reader::LbcFile {
+        let hyperparams = crate::hyperparams::ModelHyperparams {
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            hidden_dim: 8,
+            intermediate_dim: 16,
+            vocab_size: 32,
+            max_seq_len: 64,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let mut header = crate::header::LbcHeader::new(
+            hyperparams,
+            crate::quantization::QuantizationDescriptor {
+                scheme: primary,
+                group_size: crate::quantization::QuantGroupSize::Group(32),
+                block_byte_size: 18,
+                scale_offset_in_block: None,
+            },
+        );
+        header.output_proj.quant = head;
+        let mut subtensors = layer(Some(0));
+        subtensors.w_gate = sl(18, w_gate);
+        crate::reader::LbcFile {
+            header,
+            layer_indices: vec![crate::index::LayerIndex {
+                layer_offset_bytes: 0,
+                layer_length_bytes: 18,
+                subtensors,
+            }],
+            path: std::path::PathBuf::from("hand-built.lbc"),
+            tokenizer: None,
+        }
+    }
+
+    #[test]
+    fn a_planar_slice_or_head_under_a_servable_primary_is_named() {
+        // The header alone says nothing: Q4_0 and CtInt4G32 both serve, and
+        // a reader that stopped there would read the planar bytes as the
+        // scheme the header named.
+        for primary in [QuantScheme::Q4_0, QuantScheme::CtInt4G32] {
+            let servable = hand_built_lbc(primary, primary, QuantScheme::F16);
+            assert_eq!(unservable_scheme(&servable), None, "{primary:?}: control");
+
+            let slice = hand_built_lbc(primary, QuantScheme::Fp8E4M3, QuantScheme::F16);
+            assert_eq!(
+                unservable_scheme(&slice),
+                Some(QuantScheme::Fp8E4M3),
+                "{primary:?}: one layer slice"
+            );
+
+            let head = hand_built_lbc(primary, primary, QuantScheme::Nvfp4);
+            assert_eq!(
+                unservable_scheme(&head),
+                Some(QuantScheme::Nvfp4),
+                "{primary:?}: the head"
+            );
+        }
+    }
+
     #[test]
     fn attn_vector_extents_pin_every_field_and_exempt_gdn() {
         let (head_dim, q_dim, kv_dim) = (4usize, 8usize, 2usize);

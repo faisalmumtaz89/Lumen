@@ -103,22 +103,68 @@ fn an_fp8_artifact_is_refused_by_name() {
 }
 
 #[test]
-fn an_unservable_head_under_a_servable_body_is_refused_by_name() {
+fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
     // The header's own scheme serves, so the refusal rests entirely on the
-    // scan past it. The head is what that scan has left to find: a body
-    // weight in a planar scheme would name the header itself.
+    // per-slice scan past it. `lumen convert` writes no such artifact — a
+    // planar module anywhere makes the primary planar — so this one is
+    // assembled from a Q4_0 artifact's own parts, with one layer slice
+    // retagged, to hold that scan to a file a binary actually opens.
     let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_artifact(&dir, Modules::Int4WithNvfp4Head)
-        .expect("convert the synthetic compressed-tensors checkpoint");
+    let q4 = test_checkpoint::write_q4_0_artifact(&dir);
+    let source = lumen_format::reader::LbcFile::open(&q4).unwrap();
+    let bytes = std::fs::read(&q4).unwrap();
+    let at = |off: u64, len: u64| bytes[off as usize..(off + len) as usize].to_vec();
+
+    // The writer CRCs the header bytes as it serializes them, so the field
+    // has to be back at its pre-checksum value first.
+    let mut header = source.header.clone();
+    header.header_checksum = 0;
+    let mut indices = source.layer_indices.clone();
+    indices[0].subtensors.w_gate.quant = QuantScheme::Fp8E4M3;
+    let blobs: Vec<Vec<u8>> = source
+        .layer_indices
+        .iter()
+        .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
+        .collect();
+    let artifact = dir.join("planar-slice.lbc");
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&artifact).unwrap());
+    lumen_format::writer::write_lbc(
+        &mut out,
+        &header,
+        &indices,
+        &lumen_format::GlobalTensors {
+            embedding: at(
+                source.header.embedding.offset,
+                source.header.embedding.length,
+            ),
+            final_norm: at(
+                source.header.final_norm.offset,
+                source.header.final_norm.length,
+            ),
+            output_proj: at(
+                source.header.output_proj.offset,
+                source.header.output_proj.length,
+            ),
+        },
+        &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        source.tokenizer.as_ref(),
+    )
+    .unwrap();
+    drop(out);
+
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
-    assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
-    assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
-    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
+    assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
+    assert!(!scheme_has_no_serving_kernels(QuantScheme::Q4_0));
+    assert_eq!(
+        lbc.layer_indices[0].subtensors.w_gate.quant,
+        QuantScheme::Fp8E4M3
+    );
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
 
     let (code, stderr) = run_cli(&artifact, &["--simd"]);
     assert_eq!(code, Some(1), "exit code\n{stderr}");
     assert!(
-        stderr.contains("Nvfp4") && stderr.contains("no serving kernels for this scheme yet"),
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
     );
 }

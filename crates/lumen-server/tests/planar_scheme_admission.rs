@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 use lumen_convert::test_checkpoint::{self, Modules};
-use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
+use lumen_format::serving_rules::unservable_scheme;
 use lumen_format::QuantScheme;
 
 /// Start the server on `artifact` and return its stderr. `--port 0` keeps a
@@ -93,31 +93,6 @@ fn an_fp8_artifact_is_refused_by_name_at_startup() {
     assert_ne!(code, Some(0), "the server started: {stderr}");
     assert!(
         stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
-        "the refusal does not name the scheme:\n{stderr}"
-    );
-}
-
-#[test]
-fn an_unservable_head_under_a_servable_body_is_refused_by_name_at_startup() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
-    // The header's own scheme serves, so the refusal rests entirely on the
-    // scan past it. The head is what that scan has left to find: a body
-    // weight in a planar scheme would name the header itself.
-    let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_artifact(&dir, Modules::Int4WithNvfp4Head)
-        .expect("convert the synthetic compressed-tensors checkpoint");
-    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
-    assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
-    assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
-    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
-
-    let (code, stderr) = run_server(&artifact, "cpu");
-    assert_ne!(code, Some(0), "the server started: {stderr}");
-    assert!(
-        stderr.contains("Nvfp4") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
     );
 }

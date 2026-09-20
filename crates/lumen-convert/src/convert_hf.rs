@@ -1173,32 +1173,35 @@ pub fn convert_hf_ct_to_lbc(
     }
     let (output_proj, output_proj_quant) = (head.bytes, head.quant);
 
-    // The header's primary scheme names what the body weights actually
-    // carry — a checkpoint that merely retains a quantization config while
-    // storing everything unquantized must not be mislabeled. A planar
-    // scheme carried anywhere in the body becomes the primary, the narrower
-    // of the two first; INT4 group-32 becomes it only when the body carries
-    // no planar scheme at all. That order is what makes a reader which does
-    // not know the planar tags refuse the file at its header, rather than
-    // open it and read a planar slice as the scheme the header named.
-    let body_carries = |scheme: QuantScheme| {
-        layer_shapes.iter().any(|ls| {
-            let s = &ls.index.subtensors;
-            [
-                Some(&s.wq),
-                Some(&s.wk),
-                Some(&s.wv),
-                Some(&s.wo),
-                Some(&s.w_gate),
-                Some(&s.w_up),
-                Some(&s.w_down),
-                s.attn_gate.as_ref(),
-                s.ssm_out.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|t| t.quant == scheme)
-        })
+    // The header's primary scheme names what the weights actually carry — a
+    // checkpoint that merely retains a quantization config while storing
+    // everything unquantized must not be mislabeled. A planar scheme carried
+    // by ANY module, a body slice or the head, becomes the primary, the
+    // narrower of the two first; INT4 group-32 becomes it only when no
+    // module carries a planar scheme at all. That order is what makes a
+    // reader which does not know the planar tags refuse the file at its
+    // header: an unknown primary is an error there, while an unknown head
+    // tag reads as a float, so a planar head under a servable primary would
+    // be read as one.
+    let carries = |scheme: QuantScheme| {
+        output_proj_quant == scheme
+            || layer_shapes.iter().any(|ls| {
+                let s = &ls.index.subtensors;
+                [
+                    Some(&s.wq),
+                    Some(&s.wk),
+                    Some(&s.wv),
+                    Some(&s.wo),
+                    Some(&s.w_gate),
+                    Some(&s.w_up),
+                    Some(&s.w_down),
+                    s.attn_gate.as_ref(),
+                    s.ssm_out.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|t| t.quant == scheme)
+            })
     };
     let primary = [
         QuantScheme::Nvfp4,
@@ -1206,10 +1209,10 @@ pub fn convert_hf_ct_to_lbc(
         QuantScheme::CtInt4G32,
     ]
     .into_iter()
-    .find(|&scheme| body_carries(scheme))
+    .find(|&scheme| carries(scheme))
     .ok_or_else(|| {
         ConvertError::UnsupportedArchitecture(
-            "checkpoint contains no quantized body tensors (nothing to import)".into(),
+            "checkpoint contains no quantized tensors (nothing to import)".into(),
         )
     })?;
 

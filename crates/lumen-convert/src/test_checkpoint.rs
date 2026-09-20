@@ -52,10 +52,8 @@ pub enum Modules {
     /// FP8, and the head, which stays BF16: one planar projection in the
     /// body is enough to make that planar scheme the primary.
     Int4WithOneFp8,
-    /// INT4 group-32 projections under an NVFP4 head. The head is not a
-    /// body weight, so the primary stays INT4 — the only shape in which an
-    /// artifact carries a scheme with no serving kernels behind a primary
-    /// that serves.
+    /// INT4 group-32 projections under an NVFP4 head: the head alone is
+    /// planar, and a planar module anywhere makes the primary planar.
     Int4WithNvfp4Head,
 }
 
@@ -63,9 +61,8 @@ impl Modules {
     /// The primary scheme an artifact built from these modules carries.
     pub fn primary_scheme(self) -> QuantScheme {
         match self {
-            Self::Nvfp4AndFp8 => QuantScheme::Nvfp4,
+            Self::Nvfp4AndFp8 | Self::Int4WithNvfp4Head => QuantScheme::Nvfp4,
             Self::Fp8Only | Self::Int4WithOneFp8 => QuantScheme::Fp8E4M3,
-            Self::Int4WithNvfp4Head => QuantScheme::CtInt4G32,
         }
     }
 
@@ -479,19 +476,21 @@ mod tests {
     }
 
     #[test]
-    fn an_nvfp4_head_leaves_an_int4_checkpoint_s_primary_scheme_alone() {
+    fn an_nvfp4_head_makes_nvfp4_an_int4_checkpoint_s_primary_scheme() {
         let dir = temp_dir("int4-nvfp4-head");
         let artifact = write_artifact(&dir, Modules::Int4WithNvfp4Head).unwrap();
         let lbc = LbcFile::open(&artifact).unwrap();
-        // The primary is derived from the body, which is INT4 throughout;
-        // the head's scheme is reachable only from its own descriptor.
+        // The body is INT4 throughout and the head alone is planar, but the
+        // primary is what a reader checks before it reads anything: it names
+        // the planar scheme, so a reader that does not know that tag refuses
+        // the file at its header instead of reading the head as a float.
         assert_eq!(
             slice_bytes(&artifact, |st| &st.w_gate).1,
             QuantScheme::CtInt4G32
         );
-        assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
-        assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
         assert_eq!(lbc.header.output_proj.quant, QuantScheme::Nvfp4);
+        assert_eq!(lbc.header.quantization.scheme, QuantScheme::Nvfp4);
+        assert!(scheme_has_no_serving_kernels(QuantScheme::Nvfp4));
         assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
     }
 }
