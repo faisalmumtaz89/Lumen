@@ -12,7 +12,7 @@ use std::path::Path;
 
 use lumen_format::index::TensorSlice;
 use lumen_format::reader::LbcFile;
-use lumen_format::{ModelHyperparams, QuantScheme};
+use lumen_format::{LbcHeader, ModelHyperparams, QuantScheme};
 
 /// One verbose sub-tensor line: name, absolute file offset, length, scheme.
 /// The columns are fixed — a separate instrument parses this exact format.
@@ -54,19 +54,46 @@ fn per_layer_lines(lbc: &LbcFile) -> Vec<String> {
 /// The `=== HEADER ===` body, line by line. `index_end` is where the index
 /// the reader parsed ends: entries are variable-length, so it comes from the
 /// reader rather than from any sum taken here.
+///
+/// Every field of `LbcHeader` is named in the destructuring below — the ones
+/// printed here, the ones a later section prints, and the structural ones —
+/// so a field added to the header stops it compiling until it is placed.
 fn header_lines(lbc: &LbcFile) -> Vec<String> {
-    let h = &lbc.header;
+    let LbcHeader {
+        version,
+        num_layers,
+        alignment,
+        layer_index_offset,
+        payload_offset,
+        weight_tying,
+        tokenizer_section_offset,
+        tokenizer_section_length,
+        quantization,
+        // Printed by a later section of the dump, not this one.
+        hyperparams: _,
+        embedding: _,
+        final_norm: _,
+        output_proj: _,
+        // Structural: the reader has already used or checked these, and a
+        // dump of the layout has nothing to point at for them.
+        magic: _,
+        endianness: _,
+        header_checksum: _,
+        has_expert_index: _,
+        expert_index_offset: _,
+        tokenizer_section_crc32: _,
+    } = &lbc.header;
     vec![
-        field("version", h.version),
-        field("num_layers", h.num_layers),
-        field("alignment", h.alignment),
-        field("layer_index_off", h.layer_index_offset),
+        field("version", version),
+        field("num_layers", num_layers),
+        field("alignment", alignment),
+        field("layer_index_off", layer_index_offset),
         field("index_end", lbc.layer_index_end),
-        field("payload_offset", h.payload_offset),
-        field("weight_tying", h.weight_tying),
-        field("tokenizer_off", h.tokenizer_section_offset),
-        field("tokenizer_len", h.tokenizer_section_length),
-        field("primary_quant", format!("{:?}", h.quantization.scheme)),
+        field("payload_offset", payload_offset),
+        field("weight_tying", weight_tying),
+        field("tokenizer_off", tokenizer_section_offset),
+        field("tokenizer_len", tokenizer_section_length),
+        field("primary_quant", format!("{:?}", quantization.scheme)),
     ]
 }
 
@@ -443,6 +470,55 @@ mod tests {
             );
         }
         assert_eq!(lines.len(), 15, "a field is printed that is not named here");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_header_section_prints_every_field_it_names_once() {
+        let bytes = lumen_format::test_model::generate_test_model_q8_0_gdn(
+            &lumen_format::test_model::TestModelQ8Config {
+                num_layers: 3,
+                ..Default::default()
+            },
+        );
+        let path = std::env::temp_dir().join(format!("lumen-dump-flds-{}.lbc", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let lbc = LbcFile::open(&path).unwrap();
+        let h = &lbc.header;
+
+        // Every name the section prints, against the value the reader holds
+        // for it — so a line that is dropped, renamed, or paired with the
+        // wrong field is a failure here.
+        let named: [(&str, String); 10] = [
+            ("version", h.version.to_string()),
+            ("num_layers", h.num_layers.to_string()),
+            ("alignment", h.alignment.to_string()),
+            ("layer_index_off", h.layer_index_offset.to_string()),
+            ("index_end", lbc.layer_index_end.to_string()),
+            ("payload_offset", h.payload_offset.to_string()),
+            ("weight_tying", h.weight_tying.to_string()),
+            ("tokenizer_off", h.tokenizer_section_offset.to_string()),
+            ("tokenizer_len", h.tokenizer_section_length.to_string()),
+            ("primary_quant", format!("{:?}", h.quantization.scheme)),
+        ];
+        let lines = header_lines(&lbc);
+        for (name, value) in &named {
+            let prefix = format!("{name:<15} = ");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with(&prefix)).count(),
+                1,
+                "{name} is not printed exactly once: {lines:?}"
+            );
+            assert!(
+                lines.contains(&field(name, value)),
+                "{name} is not printed with the reader's value {value}: {lines:?}"
+            );
+        }
+        assert_eq!(
+            lines.len(),
+            named.len(),
+            "a header field is printed that is not named here: {lines:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
