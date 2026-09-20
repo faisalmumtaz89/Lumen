@@ -234,23 +234,19 @@ mod tests {
             .collect()
     }
 
-    /// Decode every tensor of a reference-vector directory and compare bit
-    /// for bit with the values the producing toolchain's own dequantizer
-    /// wrote. Reference vectors are large, so they live outside the repo;
-    /// point `LUMEN_NVFP4_FIXTURE` at the directory to run this.
+    /// Decode every tensor of a reference-vector directory, compare bit for
+    /// bit with the values the producing toolchain's own dequantizer wrote,
+    /// and hold the directory to the fixture's exact shape — so a tensor
+    /// that goes missing fails here instead of quietly shrinking the
+    /// comparison. `Ok` carries what was compared, `Err` the disagreement.
+    /// A file that is absent or malformed panics with its path: that is a
+    /// broken directory rather than a decode result.
     ///
     /// Per tensor the directory holds, for NVFP4, `<tag>.packed.u8`,
     /// `<tag>.blockscale.u8`, `<tag>.globalscale.f32`, `<tag>.expected.f32`,
     /// and for FP8 `<tag>.e4m3.u8`, `<tag>.scale.f32`, `<tag>.expected.f32`.
-    #[test]
-    #[ignore = "needs LUMEN_NVFP4_FIXTURE pointing at a reference-vector directory"]
-    fn decode_is_bit_identical_to_the_reference_vectors() {
-        let Ok(dir) = std::env::var("LUMEN_NVFP4_FIXTURE") else {
-            println!("SKIP: LUMEN_NVFP4_FIXTURE is not set");
-            return;
-        };
-        let dir = std::path::PathBuf::from(dir);
-        let mut names: Vec<String> = std::fs::read_dir(&dir)
+    fn check_reference_vectors(dir: &std::path::Path) -> Result<String, String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
@@ -263,7 +259,8 @@ mod tests {
                 let scales = std::fs::read(dir.join(format!("{tag}.blockscale.u8"))).unwrap();
                 let global = read_f32(&dir.join(format!("{tag}.globalscale.f32")));
                 assert_eq!(global.len(), 1, "{tag}: global scale is not one value");
-                let out = dequantize_nvfp4(&packed, &scales, global[0]).unwrap();
+                let out = dequantize_nvfp4(&packed, &scales, global[0])
+                    .map_err(|e| format!("{tag}: {e}"))?;
                 nvfp4_words += out.len();
                 (tag, out)
             } else if let Some(tag) = name.strip_suffix(".e4m3.u8") {
@@ -277,33 +274,96 @@ mod tests {
                 continue;
             };
             let expected = read_f32(&dir.join(format!("{tag}.expected.f32")));
-            assert_eq!(decoded.len(), expected.len(), "{tag}: value count");
+            if decoded.len() != expected.len() {
+                return Err(format!(
+                    "{tag}: decoded {} values against {} expected",
+                    decoded.len(),
+                    expected.len()
+                ));
+            }
             let mismatches: Vec<usize> = (0..decoded.len())
                 .filter(|&i| decoded[i].to_bits() != expected[i].to_bits())
                 .collect();
-            assert!(
-                mismatches.is_empty(),
-                "{tag}: {} of {} values differ; first at {}: {:#010x} vs {:#010x}",
-                mismatches.len(),
-                decoded.len(),
-                mismatches[0],
-                decoded[mismatches[0]].to_bits(),
-                expected[mismatches[0]].to_bits()
-            );
+            if let Some(&first) = mismatches.first() {
+                return Err(format!(
+                    "{tag}: {} of {} values differ; first at {first}: {:#010x} vs {:#010x}",
+                    mismatches.len(),
+                    decoded.len(),
+                    decoded[first].to_bits(),
+                    expected[first].to_bits()
+                ));
+            }
             tensors += 1;
         }
-        // The fixture's exact shape, so a tensor that goes missing from the
-        // directory fails here instead of quietly shrinking the comparison.
-        assert_eq!(
-            (tensors, nvfp4_words, fp8_words),
-            (12, 12_288, 12_288),
-            "{}: unexpected fixture shape",
-            dir.display()
-        );
-        println!(
+        if (tensors, nvfp4_words, fp8_words) != (12, 12_288, 12_288) {
+            return Err(format!(
+                "{}: unexpected fixture shape: {tensors} tensors, {nvfp4_words} NVFP4 and \
+                 {fp8_words} FP8 values",
+                dir.display()
+            ));
+        }
+        Ok(format!(
             "bit-identical: {tensors} tensors, {nvfp4_words} NVFP4 and {fp8_words} FP8 values, \
              0 mismatches"
+        ))
+    }
+
+    /// Reference vectors are large, so they live outside the repo; point
+    /// `LUMEN_NVFP4_FIXTURE` at the directory to run this.
+    #[test]
+    #[ignore = "needs LUMEN_NVFP4_FIXTURE pointing at a reference-vector directory"]
+    fn decode_is_bit_identical_to_the_reference_vectors() {
+        let Ok(dir) = std::env::var("LUMEN_NVFP4_FIXTURE") else {
+            println!("SKIP: LUMEN_NVFP4_FIXTURE is not set");
+            return;
+        };
+        match check_reference_vectors(&std::path::PathBuf::from(dir)) {
+            Ok(report) => println!("{report}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A directory of the fixture's exact shape — six NVFP4 and six FP8
+    /// tensors of 2048 values each — with every weight code zero. Both
+    /// formats decode a zero code to `+0.0`, and `+0.0` times any positive
+    /// finite scale is `+0.0`, so the expected vectors are exact without a
+    /// second decoder to write them.
+    fn write_zero_reference_vectors(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let expected = vec![0u8; 2048 * 4];
+        for i in 0..6 {
+            let write = |name: String, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
+            // 2048 weights: two nibbles per byte, one E4M3 block scale per 16.
+            write(format!("nvfp4-{i}.packed.u8"), &[0u8; 1024]);
+            write(format!("nvfp4-{i}.blockscale.u8"), &[0x38u8; 128]);
+            write(
+                format!("nvfp4-{i}.globalscale.f32"),
+                &4.417_783e-4f32.to_le_bytes(),
+            );
+            write(format!("nvfp4-{i}.expected.f32"), &expected);
+            write(format!("fp8-{i}.e4m3.u8"), &[0u8; 2048]);
+            write(format!("fp8-{i}.scale.f32"), &3.330_776e-3f32.to_le_bytes());
+            write(format!("fp8-{i}.expected.f32"), &expected);
+        }
+    }
+
+    #[test]
+    fn the_reference_comparison_holds_a_directory_to_the_fixture_s_shape() {
+        let dir = std::env::temp_dir().join(format!("lumen-refvec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_zero_reference_vectors(&dir);
+        let report = check_reference_vectors(&dir).expect("a whole directory was rejected");
+        assert!(report.contains("12 tensors"), "{report}");
+
+        // One tensor short, the comparison must fail rather than shrink to
+        // what is left.
+        std::fs::remove_file(dir.join("nvfp4-3.packed.u8")).unwrap();
+        let err = check_reference_vectors(&dir).expect_err("11 tensors passed the shape check");
+        assert!(
+            err.contains("unexpected fixture shape") && err.contains("11 tensors"),
+            "{err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
