@@ -24,6 +24,8 @@
 //!
 //! [`QuantScheme::CtInt4G32`]: lumen_format::QuantScheme::CtInt4G32
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::io::BufWriter;
 use std::path::Path;
 
@@ -83,6 +85,9 @@ struct Importer<'a> {
     num_v_heads: usize,
     num_k_heads: usize,
     gdn_head_dim: usize,
+    /// Every module name [`Importer::check_declared`] has been handed. The
+    /// whole declaration is held against this set once the model is lowered.
+    checked_modules: RefCell<BTreeSet<String>>,
 }
 
 /// One lowered tensor: final LBC bytes + quant tag.
@@ -430,9 +435,13 @@ impl<'a> Importer<'a> {
     /// compressed-tensors dialect names no module at all, so neither half
     /// has anything to compare against there and every module passes.
     ///
-    /// Every lowered module passes here, the ones whose weight
-    /// [`Self::lower_linear`] fetched and the one lowered in place.
+    /// Every module whose weight is fetched as planes passes here, the ones
+    /// [`Self::lower_linear`] fetches and the one lowered in place. The name
+    /// is recorded so [`Self::check_every_declared_module_was_checked`] can
+    /// hold the other half of the declaration — the modules it names that
+    /// never carried planes at all — to the same rule.
     fn check_declared(&self, base: &str, lowered: Lowered) -> Result<Lowered, ConvertError> {
+        self.checked_modules.borrow_mut().insert(base.to_owned());
         match self.ckpt.quant.declared.get(base) {
             Some(&declared) if lowered.quant != declared => {
                 Err(ConvertError::UnsupportedArchitecture(format!(
@@ -450,6 +459,31 @@ impl<'a> Importer<'a> {
                 )))
             }
             _ => Ok(lowered),
+        }
+    }
+
+    /// Close the declaration once every module is lowered: the set of
+    /// declared modules must be exactly the set that carried planes. A
+    /// module the declaration names but that no plane fetch ever saw was
+    /// lowered somewhere else — unquantized, as an embedding or as one of
+    /// the F32 GDN projections — so the declaration and the shard disagree
+    /// about it, and which one is the truth decides how it is read.
+    fn check_every_declared_module_was_checked(&self) -> Result<(), ConvertError> {
+        let checked = self.checked_modules.borrow();
+        let mut declared: Vec<_> = self
+            .ckpt
+            .quant
+            .declared
+            .iter()
+            .filter(|(base, _)| !checked.contains(base.as_str()))
+            .collect();
+        declared.sort_by(|(a, _), (b, _)| a.cmp(b));
+        match declared.first() {
+            Some((base, scheme)) => Err(ConvertError::UnsupportedArchitecture(format!(
+                "{base}: the checkpoint declares {scheme:?} but the module carries \
+                 no {scheme:?} tensors"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -1078,6 +1112,7 @@ pub fn convert_hf_ct_to_lbc(
         num_v_heads,
         num_k_heads,
         gdn_head_dim: gdn.head_dim as usize,
+        checked_modules: RefCell::new(BTreeSet::new()),
     };
 
     let hidden = hp.hidden_dim as usize;
@@ -1121,6 +1156,9 @@ pub fn convert_hf_ct_to_lbc(
     let final_norm_vals = importer.fetch_f32(&format!("{prefix}norm.weight"), &[hidden as u64])?;
     let final_norm = Importer::f32_le(&final_norm_vals.iter().map(|v| v + 1.0).collect::<Vec<_>>());
     let head = importer.lower_linear("lm_head", hp.vocab_size as usize, hidden, None)?;
+    // The head is the last module lowered, so every module the checkpoint
+    // declares has had its chance to carry the planes it is declared with.
+    importer.check_every_declared_module_was_checked()?;
     match head.quant {
         // The schemes the format carries a global head in. Every other one
         // has no head representation, and converting it would produce an
@@ -1426,6 +1464,51 @@ mod tests {
             err.contains(base) && err.contains("Nvfp4"),
             "the refusal does not name the module and what it carries: {err}"
         );
+    }
+
+    #[test]
+    fn a_declared_module_that_carries_no_planes_is_refused() {
+        // `in_proj_a` is lowered as F32 — the path that fetches no planes at
+        // all — so its BF16 tensor can satisfy no declaration, and the
+        // declaration is the only place the checkpoint says otherwise.
+        let base = "model.layers.0.linear_attn.in_proj_a";
+        let err = convert_with_declaration("inproj-a", |layers| {
+            layers.insert(base.to_owned(), serde_json::json!({ "quant_algo": "FP8" }));
+        })
+        .expect_err("a BF16 module declared FP8 converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Fp8E4M3"),
+            "the refusal does not name the module and its declared algorithm: {err}"
+        );
+    }
+
+    #[test]
+    fn a_declared_embedding_is_refused() {
+        // The embedding is lowered as BF16 bytes straight from the shard,
+        // nowhere near a plane fetch.
+        let base = "model.embed_tokens";
+        let err = convert_with_declaration("embedding", |layers| {
+            layers.insert(
+                base.to_owned(),
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            );
+        })
+        .expect_err("a BF16 embedding declared NVFP4 converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4"),
+            "the refusal does not name the module and its declared algorithm: {err}"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_whose_declared_modules_all_carry_planes_converts() {
+        // The control for the two refusals above: with the declaration left
+        // as the fixture writes it, every declared module carries the planes
+        // it names, and nothing is refused.
+        convert_with_declaration("declared-intact", |_| {})
+            .expect("the fixture's own declaration was refused");
     }
 
     fn rand_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
@@ -2146,6 +2229,7 @@ mod tests {
             num_v_heads: VH,
             num_k_heads: KH,
             gdn_head_dim: GHD,
+            checked_modules: RefCell::new(BTreeSet::new()),
         }
     }
 
