@@ -51,6 +51,10 @@ jobs:
         run: cargo clippy --locked --workspace --release
       - name: cpu test suite
         run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli -p lumen-runtime -p lumen-server --features lumen-server/bin --release
+      # Example targets are not tested by default, so the structure dumper's
+      # own tests need their own selection to run at all.
+      - name: example tests
+        run: cargo test --locked -p lumen-format --examples --release
       - name: detector self-test
         run: python3 quality/detectors.py --selftest
 

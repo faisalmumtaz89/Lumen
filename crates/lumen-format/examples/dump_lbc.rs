@@ -20,6 +20,37 @@ fn slice_line(name: &str, off: u64, len: u64, quant: QuantScheme) -> String {
     format!("        {name:<22} off={off:>12} len={len:>12} quant={quant:?}")
 }
 
+/// The per-layer section, line by line: for every layer, its own line and
+/// then one line per sub-tensor it carries. A slice's offset is relative to
+/// the layer blob, so the layer's offset is added to say where the bytes are
+/// in the file. Zero-length slices are the format's absence sentinels and
+/// have no bytes to point at, so they are left out.
+fn per_layer_lines(lbc: &LbcFile) -> Vec<String> {
+    let mut out = Vec::new();
+    for (li, layer) in lbc.layer_indices.iter().enumerate() {
+        let slices: Vec<(String, &TensorSlice)> = layer.subtensors.named_slices();
+        let layer_sub_total: u64 = slices.iter().map(|(_, s)| s.length).sum();
+        let type_str = if layer.subtensors.layer_type.unwrap_or(0) == 1 {
+            "GDN "
+        } else {
+            "FULL"
+        };
+        out.push(format!(
+            "layer {li:>3} [{type_str}] blob_len={:>12} sub_total={:>12} (off={})",
+            layer.layer_length_bytes, layer_sub_total, layer.layer_offset_bytes
+        ));
+        out.extend(
+            slices
+                .iter()
+                .filter(|(_, s)| s.length != 0)
+                .map(|(name, s)| {
+                    slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
+                }),
+        );
+    }
+    out
+}
+
 fn main() {
     let path_arg = std::env::args().nth(1).expect("usage: dump_lbc <path.lbc>");
     let path = Path::new(&path_arg);
@@ -106,36 +137,25 @@ fn main() {
     };
 
     println!("=== PER-LAYER ===");
-    for (li, layer) in lbc.layer_indices.iter().enumerate() {
+    for line in per_layer_lines(&lbc) {
+        println!("{line}");
+    }
+
+    for layer in &lbc.layer_indices {
         sum_layer_blob_lengths += layer.layer_length_bytes;
-        let lt = layer.subtensors.layer_type.unwrap_or(0);
-        let is_gdn = lt == 1;
+        let is_gdn = layer.subtensors.layer_type.unwrap_or(0) == 1;
         if is_gdn {
             n_gdn += 1;
         } else {
             n_full += 1;
         }
         let slices: Vec<(String, &TensorSlice)> = layer.subtensors.named_slices();
+        sum_subtensor_lengths += slices.iter().map(|(_, s)| s.length).sum::<u64>();
 
-        // Compact per-layer line: type + total subtensor bytes.
-        let layer_sub_total: u64 = slices.iter().map(|(_, s)| s.length).sum();
-        sum_subtensor_lengths += layer_sub_total;
-
-        let type_str = if is_gdn { "GDN " } else { "FULL" };
-        println!(
-            "layer {li:>3} [{type_str}] blob_len={:>12} sub_total={:>12} (off={})",
-            layer.layer_length_bytes, layer_sub_total, layer.layer_offset_bytes
-        );
         for (name, s) in &slices {
             if s.length == 0 {
                 continue;
             }
-            // The slice offset is relative to the layer blob; print where
-            // the bytes are in the file.
-            println!(
-                "{}",
-                slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
-            );
             let q = format!("{:?}", s.quant);
             let e = quant_tally.entry(q).or_insert((0, 0));
             e.0 += 1;
@@ -315,5 +335,56 @@ mod tests {
             slice_line("w_gate", 4096, 2304, QuantScheme::Q4_0),
             "        w_gate                 off=        4096 len=        2304 quant=Q4_0"
         );
+    }
+
+    #[test]
+    fn every_layer_prints_its_slices_at_their_file_offsets() {
+        // A hybrid model: layer 0 is GDN, the other three full attention,
+        // so a dump that stopped after the first layer of each kind would
+        // leave two out.
+        let bytes = lumen_format::test_model::generate_test_model_q8_0_gdn(
+            &lumen_format::test_model::TestModelQ8Config {
+                num_layers: 4,
+                ..Default::default()
+            },
+        );
+        let path = std::env::temp_dir().join(format!("lumen-dump-lbc-{}.lbc", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let lbc = LbcFile::open(&path).unwrap();
+        assert_eq!(lbc.layer_indices.len(), 4);
+        // Every layer but the first sits at a non-zero file offset, so a
+        // line printing the blob-relative offset cannot match by accident.
+        assert!(lbc.layer_indices[1..]
+            .iter()
+            .all(|l| l.layer_offset_bytes > 0));
+
+        // Split the output back into one block per layer.
+        let lines = per_layer_lines(&lbc);
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+        for line in lines {
+            if line.starts_with("layer ") {
+                blocks.push(Vec::new());
+            }
+            blocks
+                .last_mut()
+                .expect("a slice line before any layer line")
+                .push(line);
+        }
+        assert_eq!(blocks.len(), lbc.layer_indices.len(), "one block per layer");
+
+        for (li, layer) in lbc.layer_indices.iter().enumerate() {
+            let expected: Vec<String> = layer
+                .subtensors
+                .named_slices()
+                .iter()
+                .filter(|(_, s)| s.length != 0)
+                .map(|(name, s)| {
+                    slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
+                })
+                .collect();
+            assert!(!expected.is_empty(), "layer {li} carries no slices");
+            assert_eq!(blocks[li][1..], expected[..], "layer {li}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
