@@ -49,9 +49,14 @@ pub enum Modules {
     /// Every projection FP8, the head left in BF16.
     Fp8Only,
     /// INT4 group-32 projections except the GDN output projection, which is
-    /// FP8, and the head, which stays BF16: a primary scheme that serves
-    /// over a body that carries one slice which does not.
+    /// FP8, and the head, which stays BF16: one planar projection in the
+    /// body is enough to make that planar scheme the primary.
     Int4WithOneFp8,
+    /// INT4 group-32 projections under an NVFP4 head. The head is not a
+    /// body weight, so the primary stays INT4 — the only shape in which an
+    /// artifact carries a scheme with no serving kernels behind a primary
+    /// that serves.
+    Int4WithNvfp4Head,
 }
 
 impl Modules {
@@ -59,8 +64,8 @@ impl Modules {
     pub fn primary_scheme(self) -> QuantScheme {
         match self {
             Self::Nvfp4AndFp8 => QuantScheme::Nvfp4,
-            Self::Fp8Only => QuantScheme::Fp8E4M3,
-            Self::Int4WithOneFp8 => QuantScheme::CtInt4G32,
+            Self::Fp8Only | Self::Int4WithOneFp8 => QuantScheme::Fp8E4M3,
+            Self::Int4WithNvfp4Head => QuantScheme::CtInt4G32,
         }
     }
 
@@ -68,13 +73,15 @@ impl Modules {
     /// config group for every Linear; the planar schemes are the ModelOpt
     /// dialect, which declares each module by name.
     fn is_modelopt(self) -> bool {
-        !matches!(self, Self::Int4WithOneFp8)
+        !matches!(self, Self::Int4WithOneFp8 | Self::Int4WithNvfp4Head)
     }
 
     fn weight_of(self, base: &str) -> Weight {
         match self {
             Self::Nvfp4AndFp8 if base.contains("linear_attn") => Weight::Fp8,
             Self::Nvfp4AndFp8 => Weight::Nvfp4,
+            Self::Int4WithNvfp4Head if base == "lm_head" => Weight::Nvfp4,
+            Self::Int4WithNvfp4Head => Weight::Int4G32,
             Self::Fp8Only | Self::Int4WithOneFp8 if base == "lm_head" => Weight::Bf16,
             Self::Fp8Only => Weight::Fp8,
             Self::Int4WithOneFp8 if base.ends_with("out_proj") => Weight::Fp8,
@@ -452,18 +459,39 @@ mod tests {
     }
 
     #[test]
-    fn one_fp8_projection_does_not_change_an_int4_checkpoint_s_primary_scheme() {
+    fn one_fp8_projection_makes_fp8_an_int4_checkpoint_s_primary_scheme() {
         let dir = temp_dir("int4-one-fp8");
         let artifact = write_artifact(&dir, Modules::Int4WithOneFp8).unwrap();
         let lbc = LbcFile::open(&artifact).unwrap();
-        // The header names a scheme that serves; the single FP8 slice is
-        // reachable only by scanning the layer index.
-        assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
-        assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
+        // Every other projection is INT4, and the one FP8 slice still names
+        // the header — so the header alone refuses the artifact.
+        assert_eq!(
+            slice_bytes(&artifact, |st| &st.w_gate).1,
+            QuantScheme::CtInt4G32
+        );
         assert_eq!(
             slice_bytes(&artifact, |st| st.ssm_out.as_ref().unwrap()).1,
             QuantScheme::Fp8E4M3
         );
+        assert_eq!(lbc.header.quantization.scheme, QuantScheme::Fp8E4M3);
+        assert!(scheme_has_no_serving_kernels(QuantScheme::Fp8E4M3));
         assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+    }
+
+    #[test]
+    fn an_nvfp4_head_leaves_an_int4_checkpoint_s_primary_scheme_alone() {
+        let dir = temp_dir("int4-nvfp4-head");
+        let artifact = write_artifact(&dir, Modules::Int4WithNvfp4Head).unwrap();
+        let lbc = LbcFile::open(&artifact).unwrap();
+        // The primary is derived from the body, which is INT4 throughout;
+        // the head's scheme is reachable only from its own descriptor.
+        assert_eq!(
+            slice_bytes(&artifact, |st| &st.w_gate).1,
+            QuantScheme::CtInt4G32
+        );
+        assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
+        assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
+        assert_eq!(lbc.header.output_proj.quant, QuantScheme::Nvfp4);
+        assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
     }
 }

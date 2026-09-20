@@ -1137,10 +1137,12 @@ pub fn convert_hf_ct_to_lbc(
 
     // The header's primary scheme names what the body weights actually
     // carry — a checkpoint that merely retains a quantization config while
-    // storing everything unquantized must not be mislabeled. Where a body
-    // mixes schemes the narrowest one present wins, which is the order
-    // below: 4.5 bits per weight for NVFP4, 4.625 for INT4 group-32, 8 for
-    // FP8.
+    // storing everything unquantized must not be mislabeled. A planar
+    // scheme carried anywhere in the body becomes the primary, the narrower
+    // of the two first; INT4 group-32 becomes it only when the body carries
+    // no planar scheme at all. That order is what makes a reader which does
+    // not know the planar tags refuse the file at its header, rather than
+    // open it and read a planar slice as the scheme the header named.
     let body_carries = |scheme: QuantScheme| {
         layer_shapes.iter().any(|ls| {
             let s = &ls.index.subtensors;
@@ -1162,8 +1164,8 @@ pub fn convert_hf_ct_to_lbc(
     };
     let primary = [
         QuantScheme::Nvfp4,
-        QuantScheme::CtInt4G32,
         QuantScheme::Fp8E4M3,
+        QuantScheme::CtInt4G32,
     ]
     .into_iter()
     .find(|&scheme| body_carries(scheme))
