@@ -618,6 +618,10 @@ fn planar_slice_len_fn(quant: QuantScheme) -> Option<fn(u64, u64) -> Option<u64>
 /// this path verbatim under `--target cuda`/generic — the Q8_0 upcast is
 /// Metal-target-only) are covered here; CtInt4G32 is enforced in
 /// `upload_projection_tensor`'s ct4 branch.
+///
+/// The planar branch below is reached only from the CUDA upload path, which
+/// no artifact gets to today — admission refuses a planar scheme first — so
+/// it is exercised at upload once a backend serves those schemes.
 pub fn validate_projection_geometry(
     name: &str,
     slice: &crate::index::TensorSlice,
