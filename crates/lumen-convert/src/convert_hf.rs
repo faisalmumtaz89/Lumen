@@ -884,10 +884,23 @@ impl<'a> Importer<'a> {
 /// `rope_parameters` as well: configs that nest the RoPE scalars there
 /// declare no `rope_theta` at the level above, so a top-level-only lookup
 /// compares nothing at all and a donor with the wrong theta passes.
-fn config_scalar(tc: &serde_json::Value, key: &str) -> Option<f64> {
-    tc.get(key)
-        .or_else(|| tc.get("rope_parameters").and_then(|rp| rp.get(key)))
-        .and_then(|v| v.as_f64())
+///
+/// Absent (or null) is `None`: the comparison is skipped. Present but not a
+/// number is an error — reading it as absent would fail open, the same way
+/// it would for the integer keys.
+fn config_scalar(tc: &serde_json::Value, key: &str) -> Result<Option<f64>, ConvertError> {
+    let value = match tc.get(key) {
+        None | Some(serde_json::Value::Null) => {
+            match tc.get("rope_parameters").and_then(|rp| rp.get(key)) {
+                None | Some(serde_json::Value::Null) => return Ok(None),
+                Some(v) => v,
+            }
+        }
+        Some(v) => v,
+    };
+    value.as_f64().map(Some).ok_or_else(|| {
+        ConvertError::UnsupportedArchitecture(format!("checkpoint {key} = {value} is not a number"))
+    })
 }
 
 /// Convert an HF pack-quantized checkpoint directory to LBC, taking
@@ -1001,7 +1014,7 @@ pub fn convert_hf_ct_to_lbc(
         ("rope_theta", donor_theta),
         ("rms_norm_eps", f64::from(hp.norm_eps)),
     ] {
-        if let Some(got) = config_scalar(&tc, key) {
+        if let Some(got) = config_scalar(&tc, key)? {
             let tol = want.abs().max(1e-12) * 1e-6;
             if (got - want).abs() > tol {
                 return Err(ConvertError::UnsupportedArchitecture(format!(
@@ -1264,20 +1277,55 @@ mod tests {
     #[test]
     fn config_scalar_reads_flat_and_nested_rope_theta() {
         let flat = serde_json::json!({ "rope_theta": 1.0e7, "rms_norm_eps": 1.0e-6 });
-        assert_eq!(config_scalar(&flat, "rope_theta"), Some(1.0e7));
-        assert_eq!(config_scalar(&flat, "rms_norm_eps"), Some(1.0e-6));
+        assert_eq!(config_scalar(&flat, "rope_theta").unwrap(), Some(1.0e7));
+        assert_eq!(config_scalar(&flat, "rms_norm_eps").unwrap(), Some(1.0e-6));
         // The checkpoint shape that made the comparison silently vacuous.
         let nested = serde_json::json!({
             "rope_parameters": { "rope_type": "default", "rope_theta": 1.0e7 },
             "rms_norm_eps": 1.0e-6
         });
-        assert_eq!(config_scalar(&nested, "rope_theta"), Some(1.0e7));
-        assert_eq!(config_scalar(&nested, "rms_norm_eps"), Some(1.0e-6));
+        assert_eq!(config_scalar(&nested, "rope_theta").unwrap(), Some(1.0e7));
+        assert_eq!(
+            config_scalar(&nested, "rms_norm_eps").unwrap(),
+            Some(1.0e-6)
+        );
         // Absent everywhere stays absent: the comparison is skipped, not failed.
-        assert_eq!(config_scalar(&serde_json::json!({}), "rope_theta"), None);
-        // A present non-numeric value is not a number.
+        assert_eq!(
+            config_scalar(&serde_json::json!({}), "rope_theta").unwrap(),
+            None
+        );
+        // A present value that is not a number is refused by key name, so a
+        // donor mismatch cannot hide behind it.
         let textual = serde_json::json!({ "rope_parameters": { "rope_theta": "1e7" } });
-        assert_eq!(config_scalar(&textual, "rope_theta"), None);
+        let err = config_scalar(&textual, "rope_theta")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rope_theta"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_rope_theta_that_disagrees_with_the_donor_is_refused() {
+        use crate::test_checkpoint::{write_checkpoint as write_synthetic, Modules};
+        let dir = std::env::temp_dir().join(format!("lumen-rope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = write_synthetic(&dir, Modules::Nvfp4AndFp8);
+
+        // The donor GGUF declares 10000; the checkpoint nests another theta
+        // one level down, where the comparison has to reach for it.
+        let path = ckpt.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["text_config"]["rope_parameters"] = serde_json::json!({ "rope_theta": 500000.0 });
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let err = convert_hf_ct_to_lbc(&ckpt.dir, &ckpt.donor, &dir.join("out.lbc"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rope_theta") && err.contains("500000"),
+            "the refusal does not name the scalar and its value: {err}"
+        );
     }
 
     fn rand_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
