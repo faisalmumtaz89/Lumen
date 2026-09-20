@@ -1063,7 +1063,9 @@ pub fn convert_hf_ct_to_lbc(
     // The header's primary scheme names what the body weights actually
     // carry — a checkpoint that merely retains a quantization config while
     // storing everything unquantized must not be mislabeled. Where a body
-    // mixes schemes the densest-by-bytes one wins, which is the order below.
+    // mixes schemes the narrowest one present wins, which is the order
+    // below: 4.5 bits per weight for NVFP4, 4.625 for INT4 group-32, 8 for
+    // FP8.
     let body_carries = |scheme: QuantScheme| {
         layer_shapes.iter().any(|ls| {
             let s = &ls.index.subtensors;
@@ -1083,14 +1085,18 @@ pub fn convert_hf_ct_to_lbc(
             .any(|t| t.quant == scheme)
         })
     };
-    let primary = [QuantScheme::Nvfp4, QuantScheme::CtInt4G32]
-        .into_iter()
-        .find(|&scheme| body_carries(scheme))
-        .ok_or_else(|| {
-            ConvertError::UnsupportedArchitecture(
-                "checkpoint contains no quantized body tensors (nothing to import)".into(),
-            )
-        })?;
+    let primary = [
+        QuantScheme::Nvfp4,
+        QuantScheme::CtInt4G32,
+        QuantScheme::Fp8E4M3,
+    ]
+    .into_iter()
+    .find(|&scheme| body_carries(scheme))
+    .ok_or_else(|| {
+        ConvertError::UnsupportedArchitecture(
+            "checkpoint contains no quantized body tensors (nothing to import)".into(),
+        )
+    })?;
 
     let qd = quant_descriptor_for(primary);
     let mut header = LbcHeader::new(hp, qd);

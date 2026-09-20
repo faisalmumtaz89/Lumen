@@ -4,7 +4,32 @@
 //!
 //! Host-only, no GPU: the refusal is decided from the header and index.
 
+use std::path::Path;
 use std::process::Command;
+
+use lumen_convert::test_checkpoint::{self, Modules};
+use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
+use lumen_format::QuantScheme;
+
+/// Start the server on `artifact` and return its stderr. `--port 0` keeps a
+/// successful start from binding a fixed port.
+fn run_server(artifact: &Path, backend: &str) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
+        .args([
+            "--model",
+            artifact.to_str().unwrap(),
+            "--backend",
+            backend,
+            "--port",
+            "0",
+        ])
+        .output()
+        .expect("run lumen-server");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
 
 fn workdir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -23,29 +48,15 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
         "this test spawns the server binary: run with --features lumen-server/bin"
     );
     let dir = workdir("nvfp4");
-    let artifact = lumen_convert::test_checkpoint::write_nvfp4_artifact(&dir)
+    let artifact = test_checkpoint::write_artifact(&dir, Modules::Nvfp4AndFp8)
         .expect("convert the synthetic ModelOpt checkpoint");
 
     // The rule's own answer for this artifact, before the binary is asked.
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
-    assert_eq!(
-        lumen_format::serving_rules::unservable_scheme(&lbc),
-        Some(lumen_format::QuantScheme::Nvfp4)
-    );
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
-        .args([
-            "--model",
-            artifact.to_str().unwrap(),
-            "--backend",
-            "cpu",
-            "--port",
-            "0",
-        ])
-        .output()
-        .expect("run lumen-server");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_ne!(out.status.code(), Some(0), "the server started: {stderr}");
+    let (code, stderr) = run_server(&artifact, "cpu");
+    assert_ne!(code, Some(0), "the server started: {stderr}");
     assert!(
         stderr.contains("Nvfp4") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
@@ -59,24 +70,58 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
 }
 
 #[test]
+fn an_fp8_artifact_is_refused_by_name_at_startup() {
+    assert!(
+        cfg!(feature = "bin"),
+        "this test spawns the server binary: run with --features lumen-server/bin"
+    );
+    let dir = workdir("fp8");
+    let artifact = test_checkpoint::write_artifact(&dir, Modules::Fp8Only)
+        .expect("convert the synthetic ModelOpt checkpoint");
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert_eq!(lbc.header.quantization.scheme, QuantScheme::Fp8E4M3);
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+
+    let (code, stderr) = run_server(&artifact, "cpu");
+    assert_ne!(code, Some(0), "the server started: {stderr}");
+    assert!(
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme:\n{stderr}"
+    );
+}
+
+#[test]
+fn one_unservable_layer_slice_is_refused_by_name_at_startup() {
+    assert!(
+        cfg!(feature = "bin"),
+        "this test spawns the server binary: run with --features lumen-server/bin"
+    );
+    // The header's own scheme serves, so only the per-slice scan can find
+    // the one projection that does not.
+    let dir = workdir("mixed");
+    let artifact = test_checkpoint::write_artifact(&dir, Modules::Int4WithOneFp8)
+        .expect("convert the synthetic compressed-tensors checkpoint");
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert_eq!(lbc.header.quantization.scheme, QuantScheme::CtInt4G32);
+    assert!(!scheme_has_no_serving_kernels(QuantScheme::CtInt4G32));
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+
+    let (code, stderr) = run_server(&artifact, "cpu");
+    assert_ne!(code, Some(0), "the server started: {stderr}");
+    assert!(
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme:\n{stderr}"
+    );
+}
+
+#[test]
 fn an_existing_scheme_still_passes_admission() {
     let dir = workdir("q4");
-    let artifact = lumen_convert::test_checkpoint::write_q4_0_artifact(&dir);
+    let artifact = test_checkpoint::write_q4_0_artifact(&dir);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
-    assert_eq!(lumen_format::serving_rules::unservable_scheme(&lbc), None);
+    assert_eq!(unservable_scheme(&lbc), None);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
-        .args([
-            "--model",
-            artifact.to_str().unwrap(),
-            "--backend",
-            "cpu",
-            "--port",
-            "0",
-        ])
-        .output()
-        .expect("run lumen-server");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (_, stderr) = run_server(&artifact, "cpu");
     assert!(
         !stderr.contains("no serving kernels for this scheme yet"),
         "a Q4_0 artifact was refused by the planar rule:\n{stderr}"
