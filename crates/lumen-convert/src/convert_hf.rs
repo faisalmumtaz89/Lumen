@@ -29,7 +29,9 @@ use std::path::Path;
 
 use crate::arch::qwen35_moe::is_qwen35moe_full_attention_layer;
 use crate::convert::{tmp_artifact_path, ConvertError, ConvertStats, TmpGuard};
-use crate::ct_planes::{permute_k_blocks, permute_rows, permute_zero_point_rows};
+use crate::ct_planes::{
+    permute_col_blocks, permute_k_blocks, permute_rows, permute_zero_point_rows,
+};
 use crate::dequant::convert_bf16_bytes_to_f32;
 use crate::gguf::GgufFile;
 use crate::hf_ct::{HfCtCheckpoint, HfDtype};
@@ -39,7 +41,7 @@ use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
 use lumen_format::streaming_writer::{LayerShape, StreamingLbcWriter};
 use lumen_format::tokenizer::TokenizerSection;
 use lumen_format::writer::GlobalTensors;
-use lumen_format::{CtInt4G32Planes, LbcHeader, Nvfp4Planes, QuantScheme};
+use lumen_format::{CtInt4G32Planes, Fp8Planes, LbcHeader, Nvfp4Planes, QuantScheme};
 
 /// GDN v-head reorder: output head `i` takes HF head `ratio*(i % groups) + i/groups`.
 fn v_head_perm(num_v_heads: usize, num_k_heads: usize) -> Vec<usize> {
@@ -337,6 +339,64 @@ impl<'a> Importer<'a> {
         }))
     }
 
+    /// Fetch the two FP8 planes of `{base}`, validated against the logical
+    /// shape `[n, k]`. `None` when the module's weight is not E4M3 bytes.
+    fn fetch_fp8_planes(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<Option<(Vec<u8>, f32)>, ConvertError> {
+        let wname = format!("{base}.weight");
+        let Some(info) = self.ckpt.tensor_info(&wname) else {
+            return Ok(None);
+        };
+        if info.dtype != HfDtype::F8E4M3 {
+            return Ok(None);
+        }
+        if info.shape != [n as u64, k as u64] {
+            return Err(ConvertError::TensorShapeMismatch {
+                tensor: wname,
+                expected: format!("[{n}, {k}]"),
+                got: format!("{:?}", info.shape),
+            });
+        }
+        let planes = Fp8Planes::for_shape(n as u64, k as u64).map_err(ConvertError::Format)?;
+        let weight = self.ckpt.tensor_bytes(&wname)?;
+        if weight.len() as u64 != planes.weight_bytes {
+            return Err(ConvertError::TensorShapeMismatch {
+                tensor: wname,
+                expected: format!("{} bytes for [{n}, {k}]", planes.weight_bytes),
+                got: format!("{} bytes", weight.len()),
+            });
+        }
+        let scale = self.fetch_scalar(&format!("{base}.weight_scale"))?;
+        Ok(Some((weight, scale)))
+    }
+
+    /// Lower an FP8 module: the E4M3 weight bytes then the per-tensor scale.
+    /// `row_perm` moves whole logical rows; the scale is per tensor.
+    fn lower_fp8(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Option<Lowered>, ConvertError> {
+        let Some((weight, scale)) = self.fetch_fp8_planes(base, n, k)? else {
+            return Ok(None);
+        };
+        let mut bytes = match row_perm {
+            Some(perm) => permute_rows(&weight, k, perm),
+            None => weight,
+        };
+        bytes.extend_from_slice(&scale.to_le_bytes());
+        Ok(Some(Lowered {
+            bytes,
+            quant: QuantScheme::Fp8E4M3,
+        }))
+    }
+
     /// Lower a Linear-module weight: CtInt4G32 planes when quantized, Bf16
     /// bytes otherwise. `row_perm` (logical output rows) is applied to
     /// either representation.
@@ -348,6 +408,9 @@ impl<'a> Importer<'a> {
         row_perm: Option<&[usize]>,
     ) -> Result<Lowered, ConvertError> {
         if let Some(lowered) = self.lower_nvfp4(base, expect_n, expect_k, row_perm)? {
+            return Ok(lowered);
+        }
+        if let Some(lowered) = self.lower_fp8(base, expect_n, expect_k, row_perm)? {
             return Ok(lowered);
         }
         if let Some((qweight, scale, zero, n, k)) = self.fetch_planes(base)? {
@@ -613,66 +676,72 @@ impl<'a> Importer<'a> {
             // INPUT columns in head-sized blocks.
             let lowered = {
                 let base = self.name(layer, "linear_attn.out_proj");
-                match self.fetch_planes(&base)? {
-                    Some((qweight, scale, zp, n, k)) => {
-                        if (n, k) != (hidden, v_rows) {
-                            return Err(ConvertError::TensorShapeMismatch {
-                                tensor: base,
-                                expected: format!("[{hidden}, {v_rows}]"),
-                                got: format!("[{n}, {k}]"),
-                            });
-                        }
-                        let (q, s, z) = permute_k_blocks(
-                            &qweight,
-                            &scale,
-                            &zp,
-                            n,
-                            k,
-                            self.gdn_head_dim,
-                            &self.head_perm,
-                        );
-                        let mut bytes = q;
-                        bytes.extend_from_slice(&s);
-                        bytes.extend_from_slice(&z);
-                        Lowered {
-                            bytes,
-                            quant: QuantScheme::CtInt4G32,
-                        }
+                if let Some((weight, scale)) = self.fetch_fp8_planes(&base, hidden, v_rows)? {
+                    // The v-head reorder permutes this tensor's INPUT
+                    // columns, in head-sized blocks of one byte per weight.
+                    let mut bytes =
+                        permute_col_blocks(&weight, v_rows, self.gdn_head_dim, &self.head_perm);
+                    bytes.extend_from_slice(&scale.to_le_bytes());
+                    Lowered {
+                        bytes,
+                        quant: QuantScheme::Fp8E4M3,
                     }
-                    None => {
-                        // Unquantized out_proj (e.g. layer 0): Bf16 with the
-                        // column-block permutation applied per row.
-                        let name = format!("{base}.weight");
-                        let info = self
-                            .ckpt
-                            .tensor_info(&name)
-                            .ok_or_else(|| ConvertError::MissingTensor(name.clone()))?;
-                        if info.dtype != HfDtype::Bf16
-                            || info.shape != [hidden as u64, v_rows as u64]
-                        {
-                            return Err(ConvertError::UnsupportedTensorType {
-                                tensor: name,
-                                ggml_type: format!(
-                                    "{:?} {:?} (expected BF16 [{hidden}, {v_rows}])",
-                                    info.dtype, info.shape
-                                ),
-                            });
-                        }
-                        let bytes = self.ckpt.tensor_bytes(&name)?;
-                        let block = self.gdn_head_dim * 2;
-                        let row = v_rows * 2;
-                        let mut out = vec![0u8; bytes.len()];
-                        for r in 0..hidden {
-                            for (i, &src) in self.head_perm.iter().enumerate() {
-                                out[r * row + i * block..r * row + (i + 1) * block]
-                                    .copy_from_slice(
-                                        &bytes[r * row + src * block..r * row + (src + 1) * block],
-                                    );
+                } else {
+                    match self.fetch_planes(&base)? {
+                        Some((qweight, scale, zp, n, k)) => {
+                            if (n, k) != (hidden, v_rows) {
+                                return Err(ConvertError::TensorShapeMismatch {
+                                    tensor: base,
+                                    expected: format!("[{hidden}, {v_rows}]"),
+                                    got: format!("[{n}, {k}]"),
+                                });
+                            }
+                            let (q, s, z) = permute_k_blocks(
+                                &qweight,
+                                &scale,
+                                &zp,
+                                n,
+                                k,
+                                self.gdn_head_dim,
+                                &self.head_perm,
+                            );
+                            let mut bytes = q;
+                            bytes.extend_from_slice(&s);
+                            bytes.extend_from_slice(&z);
+                            Lowered {
+                                bytes,
+                                quant: QuantScheme::CtInt4G32,
                             }
                         }
-                        Lowered {
-                            bytes: out,
-                            quant: QuantScheme::Bf16,
+                        None => {
+                            // Unquantized out_proj (e.g. layer 0): Bf16 with the
+                            // column-block permutation applied per row.
+                            let name = format!("{base}.weight");
+                            let info = self
+                                .ckpt
+                                .tensor_info(&name)
+                                .ok_or_else(|| ConvertError::MissingTensor(name.clone()))?;
+                            if info.dtype != HfDtype::Bf16
+                                || info.shape != [hidden as u64, v_rows as u64]
+                            {
+                                return Err(ConvertError::UnsupportedTensorType {
+                                    tensor: name,
+                                    ggml_type: format!(
+                                        "{:?} {:?} (expected BF16 [{hidden}, {v_rows}])",
+                                        info.dtype, info.shape
+                                    ),
+                                });
+                            }
+                            let bytes = self.ckpt.tensor_bytes(&name)?;
+                            Lowered {
+                                bytes: permute_col_blocks(
+                                    &bytes,
+                                    v_rows * 2,
+                                    self.gdn_head_dim * 2,
+                                    &self.head_perm,
+                                ),
+                                quant: QuantScheme::Bf16,
+                            }
                         }
                     }
                 }
@@ -1106,7 +1175,7 @@ pub fn convert_hf_ct_to_lbc(
         num_layers: hp.num_layers,
         architecture: arch,
         tensor_count,
-        quant_scheme: QuantScheme::CtInt4G32,
+        quant_scheme: primary,
     })
 }
 
@@ -1679,110 +1748,168 @@ mod tests {
         }
     }
 
-    // ---- ModelOpt NVFP4 import ----
+    // ---- ModelOpt import: NVFP4 and FP8 ----
 
-    /// One NVFP4 module's source planes.
-    struct Nvfp4Module {
+    /// One ModelOpt module's source planes.
+    enum PlaneSet {
+        Nvfp4 {
+            weight: Vec<u8>,
+            block_scale: Vec<u8>,
+            global: f32,
+        },
+        Fp8 {
+            weight: Vec<u8>,
+            scale: f32,
+        },
+    }
+
+    struct Module {
         base: String,
         n: usize,
         k: usize,
-        weight: Vec<u8>,
-        block_scale: Vec<u8>,
-        global: f32,
+        planes: PlaneSet,
     }
 
-    /// Write a ModelOpt checkpoint carrying NVFP4 MLP modules on `layers`
-    /// layers plus an NVFP4 head, and return the modules for comparison.
-    fn write_nvfp4_checkpoint(
-        tag: &str,
-        layers: usize,
-        hidden: usize,
-        inter: usize,
-        vocab: usize,
-    ) -> (std::path::PathBuf, Vec<Nvfp4Module>) {
-        let mut seed = 21u64;
-        let mut modules: Vec<Nvfp4Module> = Vec::new();
-        for layer in 0..layers {
-            for (suffix, n, k) in [
-                ("mlp.gate_proj", inter, hidden),
-                ("mlp.up_proj", inter, hidden),
-                ("mlp.down_proj", hidden, inter),
-            ] {
-                let p = Nvfp4Planes::for_shape(n as u64, k as u64).unwrap();
-                modules.push(Nvfp4Module {
-                    base: format!("model.layers.{layer}.{suffix}"),
-                    n,
-                    k,
-                    weight: rand_bytes(p.weight_bytes as usize, &mut seed),
-                    block_scale: rand_bytes(p.block_scale_bytes as usize, &mut seed),
-                    global: 1.5e-4 * (layer + 1) as f32,
-                });
+    impl Module {
+        fn nvfp4(base: &str, n: usize, k: usize, seed: &mut u64) -> Self {
+            let p = Nvfp4Planes::for_shape(n as u64, k as u64).unwrap();
+            Module {
+                base: base.to_owned(),
+                n,
+                k,
+                planes: PlaneSet::Nvfp4 {
+                    weight: rand_bytes(p.weight_bytes as usize, seed),
+                    block_scale: rand_bytes(p.block_scale_bytes as usize, seed),
+                    global: 1.5e-4 + (rng(seed) % 97) as f32 * 1e-6,
+                },
             }
         }
-        let p = Nvfp4Planes::for_shape(vocab as u64, hidden as u64).unwrap();
-        modules.push(Nvfp4Module {
-            base: "lm_head".to_owned(),
-            n: vocab,
-            k: hidden,
-            weight: rand_bytes(p.weight_bytes as usize, &mut seed),
-            block_scale: rand_bytes(p.block_scale_bytes as usize, &mut seed),
-            global: 1.271_566e-4,
-        });
-        let dir = write_modules(tag, &modules, &[]);
-        (dir, modules)
+
+        fn fp8(base: &str, n: usize, k: usize, seed: &mut u64) -> Self {
+            let p = Fp8Planes::for_shape(n as u64, k as u64).unwrap();
+            Module {
+                base: base.to_owned(),
+                n,
+                k,
+                planes: PlaneSet::Fp8 {
+                    weight: rand_bytes(p.weight_bytes as usize, seed),
+                    scale: 9.7e-4 + (rng(seed) % 89) as f32 * 1e-6,
+                },
+            }
+        }
+
+        fn source_weight(&self) -> &[u8] {
+            match &self.planes {
+                PlaneSet::Nvfp4 { weight, .. } | PlaneSet::Fp8 { weight, .. } => weight,
+            }
+        }
+
+        /// The tensors this module contributes to a checkpoint shard.
+        fn entries(&self) -> Vec<(String, String, Vec<u64>, Vec<u8>)> {
+            let (n, k) = (self.n as u64, self.k as u64);
+            match &self.planes {
+                PlaneSet::Nvfp4 {
+                    weight,
+                    block_scale,
+                    global,
+                } => vec![
+                    (
+                        format!("{}.weight", self.base),
+                        "U8".into(),
+                        vec![n, k / 2],
+                        weight.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale", self.base),
+                        "F8_E4M3".into(),
+                        vec![n, k / 16],
+                        block_scale.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale_2", self.base),
+                        "F32".into(),
+                        vec![],
+                        global.to_le_bytes().to_vec(),
+                    ),
+                ],
+                PlaneSet::Fp8 { weight, scale } => vec![
+                    (
+                        format!("{}.weight", self.base),
+                        "F8_E4M3".into(),
+                        vec![n, k],
+                        weight.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale", self.base),
+                        "F32".into(),
+                        vec![],
+                        scale.to_le_bytes().to_vec(),
+                    ),
+                ],
+            }
+        }
+
+        /// The lowered bytes this module must produce: its planes verbatim,
+        /// in their fixed order, after `row_perm` if the role has one.
+        fn expected_bytes(&self, row_perm: Option<&[usize]>) -> Vec<u8> {
+            match &self.planes {
+                PlaneSet::Nvfp4 {
+                    weight,
+                    block_scale,
+                    global,
+                } => {
+                    let (w, s) = match row_perm {
+                        Some(p) => (
+                            permute_rows(weight, self.k / 2, p),
+                            permute_rows(block_scale, self.k / 16, p),
+                        ),
+                        None => (weight.clone(), block_scale.clone()),
+                    };
+                    let mut out = w;
+                    out.extend_from_slice(&s);
+                    out.extend_from_slice(&global.to_le_bytes());
+                    out
+                }
+                PlaneSet::Fp8 { weight, scale } => {
+                    let mut out = match row_perm {
+                        Some(p) => permute_rows(weight, self.k, p),
+                        None => weight.clone(),
+                    };
+                    out.extend_from_slice(&scale.to_le_bytes());
+                    out
+                }
+            }
+        }
     }
 
-    /// Serialize modules into a one-shard ModelOpt checkpoint. `patch`
-    /// replaces named tensors' (dtype, shape, bytes) to build corruptions.
-    fn write_modules(
+    /// Serialize modules into a one-shard ModelOpt checkpoint, plus any
+    /// extra tensors. `patch` replaces a named tensor to build corruptions.
+    fn write_modelopt_checkpoint(
         tag: &str,
-        modules: &[Nvfp4Module],
-        patch: &[(&str, &str, Vec<u64>, Vec<u8>)],
+        modules: &[Module],
+        extra: &[(String, String, Vec<u64>, Vec<u8>)],
+        patch: &[(String, String, Vec<u64>, Vec<u8>)],
+        config: Option<serde_json::Value>,
     ) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("lumen-nvfp4-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lumen-modelopt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut planned: Vec<(String, String, Vec<u64>, Vec<u8>)> = Vec::new();
         let mut quantized_layers = serde_json::Map::new();
         for m in modules {
-            planned.push((
-                format!("{}.weight", m.base),
-                "U8".into(),
-                vec![m.n as u64, m.k as u64 / 2],
-                m.weight.clone(),
-            ));
-            planned.push((
-                format!("{}.weight_scale", m.base),
-                "F8_E4M3".into(),
-                vec![m.n as u64, m.k as u64 / 16],
-                m.block_scale.clone(),
-            ));
-            planned.push((
-                format!("{}.weight_scale_2", m.base),
-                "F32".into(),
-                vec![],
-                m.global.to_le_bytes().to_vec(),
-            ));
-            quantized_layers.insert(
-                m.base.clone(),
-                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
-            );
-        }
-        for (name, dtype, shape, bytes) in patch {
-            match planned.iter_mut().find(|(n, ..)| n == name) {
-                Some(entry) => {
-                    *entry = (
-                        (*name).to_owned(),
-                        (*dtype).to_owned(),
-                        shape.clone(),
-                        bytes.clone(),
-                    )
+            planned.extend(m.entries());
+            let algo = match m.planes {
+                PlaneSet::Nvfp4 { .. } => {
+                    serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 })
                 }
-                None => planned.push((
-                    (*name).to_owned(),
-                    (*dtype).to_owned(),
-                    shape.clone(),
-                    bytes.clone(),
-                )),
+                PlaneSet::Fp8 { .. } => serde_json::json!({ "quant_algo": "FP8" }),
+            };
+            quantized_layers.insert(m.base.clone(), algo);
+        }
+        planned.extend(extra.iter().cloned());
+        for entry in patch {
+            match planned.iter_mut().find(|(n, ..)| *n == entry.0) {
+                Some(slot) => *slot = entry.clone(),
+                None => planned.push(entry.clone()),
             }
         }
         let entries: Vec<(&str, &str, &[u64], &[u8])> = planned
@@ -1795,7 +1922,7 @@ mod tests {
             .collect();
         write_checkpoint(
             &dir,
-            &crate::hf_ct::test_fixture::modelopt_config(),
+            &config.unwrap_or_else(crate::hf_ct::test_fixture::modelopt_config),
             &[("model-00001.safetensors", shard_bytes(&entries))],
             &weight_map,
         );
@@ -1809,24 +1936,65 @@ mod tests {
         dir
     }
 
-    fn nvfp4_importer(ckpt: &HfCtCheckpoint) -> Importer<'_> {
+    fn modelopt_importer(ckpt: &HfCtCheckpoint) -> Importer<'_> {
         Importer {
             ckpt,
             prefix: "model.".to_owned(),
-            head_perm: vec![0],
-            num_v_heads: 1,
-            num_k_heads: 1,
-            gdn_head_dim: 8,
+            head_perm: v_head_perm(VH, KH),
+            num_v_heads: VH,
+            num_k_heads: KH,
+            gdn_head_dim: GHD,
         }
+    }
+
+    /// Two layers of NVFP4 MLP modules plus an NVFP4 head.
+    fn nvfp4_modules(seed: &mut u64) -> Vec<Module> {
+        let mut modules = Vec::new();
+        for layer in 0..2usize {
+            for (suffix, n, k) in [
+                ("mlp.gate_proj", INTER, HID),
+                ("mlp.up_proj", INTER, HID),
+                ("mlp.down_proj", HID, INTER),
+            ] {
+                modules.push(Module::nvfp4(
+                    &format!("model.layers.{layer}.{suffix}"),
+                    n,
+                    k,
+                    seed,
+                ));
+            }
+        }
+        modules.push(Module::nvfp4("lm_head", VOCAB, HID, seed));
+        modules
+    }
+
+    /// One GDN layer's three FP8 modules and one full-attention layer's four.
+    fn fp8_modules(seed: &mut u64) -> Vec<Module> {
+        let o_cols = 4 * 8;
+        vec![
+            Module::fp8(
+                "model.layers.0.linear_attn.in_proj_qkv",
+                QKV_ROWS,
+                HID,
+                seed,
+            ),
+            Module::fp8("model.layers.0.linear_attn.in_proj_z", V_ROWS, HID, seed),
+            Module::fp8("model.layers.0.linear_attn.out_proj", HID, V_ROWS, seed),
+            Module::fp8("model.layers.3.self_attn.q_proj", 4 * 8 * 2, HID, seed),
+            Module::fp8("model.layers.3.self_attn.k_proj", 2 * 8, HID, seed),
+            Module::fp8("model.layers.3.self_attn.v_proj", 2 * 8, HID, seed),
+            Module::fp8("model.layers.3.self_attn.o_proj", HID, o_cols, seed),
+        ]
     }
 
     #[test]
     fn nvfp4_modules_lower_to_their_planes_verbatim() {
-        // Two layers x {gate, up, down} + the head = 7 modules, 21 planes.
-        let (dir, modules) = write_nvfp4_checkpoint("ok", 2, 32, 64, 48);
+        let mut seed = 21u64;
+        let modules = nvfp4_modules(&mut seed);
+        assert_eq!(modules.len(), 7, "2 layers x 3 + the head");
+        let dir = write_modelopt_checkpoint("nvfp4", &modules, &[], &[], None);
         let ckpt = HfCtCheckpoint::open(&dir).unwrap();
-        let importer = nvfp4_importer(&ckpt);
-        assert_eq!(modules.len(), 7);
+        let importer = modelopt_importer(&ckpt);
         for m in &modules {
             let lowered = importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
             assert_eq!(lowered.quant, QuantScheme::Nvfp4, "{}", m.base);
@@ -1834,72 +2002,121 @@ mod tests {
             assert_eq!(
                 lowered.bytes.len() as u64,
                 planes.total_bytes(),
-                "{} total bytes",
+                "{}",
                 m.base
             );
-            // The planes are carried verbatim, in their fixed order.
-            let mut expected = m.weight.clone();
-            expected.extend_from_slice(&m.block_scale);
-            expected.extend_from_slice(&m.global.to_le_bytes());
-            assert_eq!(lowered.bytes, expected, "{} plane bytes", m.base);
+            assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
         }
     }
 
     #[test]
-    fn nvfp4_planes_must_carry_the_declared_dtype_and_shape() {
-        let (_, modules) = write_nvfp4_checkpoint("probe", 1, 32, 64, 48);
-        let base = modules[0].base.clone();
-        let (n, k) = (modules[0].n, modules[0].k);
-        let good = Nvfp4Planes::for_shape(n as u64, k as u64).unwrap();
-        for (tag, patch, needle) in [
-            (
-                "dtype",
-                (
-                    format!("{base}.weight"),
-                    "I32",
-                    vec![n as u64, k as u64 / 8],
-                    vec![0u8; good.weight_bytes as usize],
-                ),
-                "weight",
-            ),
-            (
-                "wshape",
-                (
-                    format!("{base}.weight"),
-                    "U8",
-                    vec![n as u64 / 2, k as u64],
-                    vec![0u8; good.weight_bytes as usize],
-                ),
-                "weight",
-            ),
-            (
-                "sshape",
-                (
-                    format!("{base}.weight_scale"),
-                    "F8_E4M3",
-                    vec![n as u64, k as u64 / 32],
-                    vec![0u8; good.block_scale_bytes as usize / 2],
-                ),
-                "weight_scale",
-            ),
-            (
-                "sdtype",
-                (
-                    format!("{base}.weight_scale"),
-                    "BF16",
-                    vec![n as u64, k as u64 / 16],
-                    vec![0u8; good.block_scale_bytes as usize * 2],
-                ),
-                "weight_scale",
-            ),
-        ] {
-            let dir = write_modules(
-                tag,
-                &modules,
-                &[(patch.0.as_str(), patch.1, patch.2.clone(), patch.3.clone())],
+    fn fp8_modules_lower_to_their_planes_verbatim() {
+        let mut seed = 33u64;
+        let modules = fp8_modules(&mut seed);
+        assert_eq!(
+            modules.len(),
+            7,
+            "one GDN layer's 3 and one attention layer's 4"
+        );
+        let dir = write_modelopt_checkpoint("fp8", &modules, &[], &[], None);
+        let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+        let importer = modelopt_importer(&ckpt);
+        for m in &modules {
+            let lowered = importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
+            assert_eq!(lowered.quant, QuantScheme::Fp8E4M3, "{}", m.base);
+            let planes = Fp8Planes::for_shape(m.n as u64, m.k as u64).unwrap();
+            assert_eq!(
+                lowered.bytes.len() as u64,
+                planes.total_bytes(),
+                "{}",
+                m.base
             );
+            assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
+        }
+    }
+
+    #[test]
+    fn modelopt_planes_must_carry_the_declared_dtype_and_shape() {
+        let mut seed = 5u64;
+        let nvfp4 = Module::nvfp4("model.layers.0.mlp.gate_proj", INTER, HID, &mut seed);
+        let fp8 = Module::fp8(
+            "model.layers.0.linear_attn.in_proj_z",
+            V_ROWS,
+            HID,
+            &mut seed,
+        );
+        let np = Nvfp4Planes::for_shape(INTER as u64, HID as u64).unwrap();
+        let fq = Fp8Planes::for_shape(V_ROWS as u64, HID as u64).unwrap();
+        let cases: Vec<(&str, usize, String, String, Vec<u64>, Vec<u8>, &str)> = vec![
+            // NVFP4: weight dtype, weight shape, scale shape, scale dtype.
+            (
+                "n-dtype",
+                0,
+                format!("{}.weight", nvfp4.base),
+                "I32".into(),
+                vec![INTER as u64, HID as u64 / 8],
+                vec![0u8; np.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "n-wshape",
+                0,
+                format!("{}.weight", nvfp4.base),
+                "U8".into(),
+                vec![INTER as u64 / 2, HID as u64],
+                vec![0u8; np.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "n-sshape",
+                0,
+                format!("{}.weight_scale", nvfp4.base),
+                "F8_E4M3".into(),
+                vec![INTER as u64, HID as u64 / 32],
+                vec![0u8; np.block_scale_bytes as usize / 2],
+                "weight_scale",
+            ),
+            (
+                "n-sdtype",
+                0,
+                format!("{}.weight_scale", nvfp4.base),
+                "BF16".into(),
+                vec![INTER as u64, HID as u64 / 16],
+                vec![0u8; np.block_scale_bytes as usize * 2],
+                "weight_scale",
+            ),
+            // FP8: a transposed weight of the same byte count, and a scale
+            // that is a vector rather than one value.
+            (
+                "f-wshape",
+                1,
+                format!("{}.weight", fp8.base),
+                "F8_E4M3".into(),
+                vec![HID as u64, V_ROWS as u64],
+                vec![0u8; fq.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "f-scount",
+                1,
+                format!("{}.weight_scale", fp8.base),
+                "F32".into(),
+                vec![2],
+                vec![0u8; 8],
+                "weight_scale",
+            ),
+        ];
+        for (tag, which, name, dtype, shape, bytes, needle) in cases {
+            let modules = vec![
+                Module::nvfp4("model.layers.0.mlp.gate_proj", INTER, HID, &mut 7),
+                Module::fp8("model.layers.0.linear_attn.in_proj_z", V_ROWS, HID, &mut 9),
+            ];
+            let (n, k) = (modules[which].n, modules[which].k);
+            let base = modules[which].base.clone();
+            let dir =
+                write_modelopt_checkpoint(tag, &modules, &[], &[(name, dtype, shape, bytes)], None);
             let ckpt = HfCtCheckpoint::open(&dir).unwrap();
-            let err = match nvfp4_importer(&ckpt).lower_linear(&base, n, k, None) {
+            let err = match modelopt_importer(&ckpt).lower_linear(&base, n, k, None) {
                 Ok(l) => panic!("{tag}: accepted, {} bytes as {:?}", l.bytes.len(), l.quant),
                 Err(e) => e.to_string(),
             };
@@ -1908,31 +2125,318 @@ mod tests {
     }
 
     #[test]
-    fn nvfp4_row_permutation_moves_whole_rows_of_both_planes() {
-        let (dir, modules) = write_nvfp4_checkpoint("perm", 1, 32, 64, 48);
+    fn modelopt_row_permutations_invert_to_the_source() {
+        let mut seed = 77u64;
+        let mut modules = nvfp4_modules(&mut seed);
+        modules.extend(fp8_modules(&mut seed));
+        let dir = write_modelopt_checkpoint("perm", &modules, &[], &[], None);
         let ckpt = HfCtCheckpoint::open(&dir).unwrap();
-        let importer = nvfp4_importer(&ckpt);
-        let m = &modules[0];
-        let perm: Vec<usize> = (0..m.n).rev().collect();
+        let importer = modelopt_importer(&ckpt);
+        let perm = v_head_perm(VH, KH);
+        let qkv_row_perm = expand_head_perm(&perm, GHD, 2 * QK_ROWS);
+        let v_row_perm = expand_head_perm(&perm, GHD, 0);
+        let inverse = |p: &[usize]| {
+            let mut inv = vec![0usize; p.len()];
+            for (i, &src) in p.iter().enumerate() {
+                inv[src] = i;
+            }
+            inv
+        };
+
+        // The two row-permuted FP8 roles: every permuted plane equals its
+        // source after the inverse permutation.
+        for (base, n, k, row_perm) in [
+            (
+                "model.layers.0.linear_attn.in_proj_qkv",
+                QKV_ROWS,
+                HID,
+                &qkv_row_perm,
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                &v_row_perm,
+            ),
+        ] {
+            let m = modules.iter().find(|m| m.base == base).unwrap();
+            let lowered = importer.lower_linear(base, n, k, Some(row_perm)).unwrap();
+            assert_eq!(lowered.quant, QuantScheme::Fp8E4M3);
+            assert_eq!(
+                lowered.bytes,
+                m.expected_bytes(Some(row_perm)),
+                "{base} forward"
+            );
+            let weight = &lowered.bytes[..n * k];
+            assert_eq!(
+                permute_rows(weight, k, &inverse(row_perm)),
+                m.source_weight(),
+                "{base} inverse"
+            );
+            // The permutation really moved something.
+            assert_ne!(weight, m.source_weight(), "{base} is a no-op permutation");
+        }
+
+        // The NVFP4 roles carry no permutation in this architecture, but the
+        // transform is exercised the same way when one is asked for.
+        let m = modules.iter().find(|m| m.base == "lm_head").unwrap();
+        let rev: Vec<usize> = (0..m.n).rev().collect();
         let lowered = importer
-            .lower_linear(&m.base, m.n, m.k, Some(&perm))
+            .lower_linear(&m.base, m.n, m.k, Some(&rev))
             .unwrap();
         let planes = Nvfp4Planes::for_shape(m.n as u64, m.k as u64).unwrap();
-        assert_eq!(lowered.bytes.len() as u64, planes.total_bytes());
-        // Undoing the permutation on both planes returns the source bytes.
         let w = &lowered.bytes[..planes.weight_bytes as usize];
         let s = &lowered.bytes[planes.weight_bytes as usize
             ..(planes.weight_bytes + planes.block_scale_bytes) as usize];
-        let mut inverse = vec![0usize; m.n];
-        for (i, &src) in perm.iter().enumerate() {
-            inverse[src] = i;
-        }
-        assert_eq!(permute_rows(w, m.k / 2, &inverse), m.weight);
-        assert_eq!(permute_rows(s, m.k / 16, &inverse), m.block_scale);
-        // The global scale is per tensor: the permutation cannot move it.
+        let PlaneSet::Nvfp4 {
+            weight,
+            block_scale,
+            global,
+        } = &m.planes
+        else {
+            unreachable!()
+        };
+        assert_eq!(permute_rows(w, m.k / 2, &inverse(&rev)), *weight);
+        assert_eq!(permute_rows(s, m.k / 16, &inverse(&rev)), *block_scale);
         assert_eq!(
             &lowered.bytes[(planes.weight_bytes + planes.block_scale_bytes) as usize..],
-            &m.global.to_le_bytes()
+            &global.to_le_bytes()
         );
+    }
+
+    /// The donor GGUF the synthetic conversions take their metadata from.
+    fn synthetic_donor(path: &std::path::Path) {
+        let mut b = GgufBuilder::new();
+        b.add_string("general.architecture", "qwen35");
+        b.add_u32("qwen35.block_count", 4);
+        b.add_u32("qwen35.attention.head_count", 4);
+        b.add_u32("qwen35.attention.head_count_kv", 2);
+        b.add_u32("qwen35.attention.key_length", 8);
+        b.add_u32("qwen35.embedding_length", HID as u32);
+        b.add_u32("qwen35.feed_forward_length", INTER as u32);
+        b.add_u32("qwen35.context_length", 64);
+        b.add_f32("qwen35.rope.freq_base", 10000.0);
+        b.add_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-5);
+        b.add_u32("qwen35.ssm.time_step_rank", VH as u32);
+        b.add_u32("qwen35.ssm.group_count", KH as u32);
+        b.add_u32("qwen35.ssm.state_size", GHD as u32);
+        b.add_u32("qwen35.ssm.conv_kernel", 4);
+        let token_names: Vec<String> = (0..VOCAB).map(|i| format!("t{i}")).collect();
+        let token_refs: Vec<&str> = token_names.iter().map(String::as_str).collect();
+        b.add_string_array("tokenizer.ggml.tokens", &token_refs);
+        b.add_f32_tensor(
+            "token_embd.weight",
+            &[VOCAB as u64, HID as u64],
+            &vec![0.0; VOCAB * HID],
+        );
+        std::fs::write(path, b.build()).unwrap();
+    }
+
+    #[test]
+    fn modelopt_checkpoint_converts_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("lumen-mo-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let donor_path = dir.join("donor.gguf");
+        synthetic_donor(&donor_path);
+
+        // Layers 0-2 are GDN, layer 3 is full attention (the qwen35 schedule).
+        let mut seed = 101u64;
+        let mut modules = Vec::new();
+        let mut extra: Vec<(String, String, Vec<u64>, Vec<u8>)> = Vec::new();
+        let mut bf16 = |name: String, shape: Vec<u64>, seed: &mut u64| {
+            let n: usize = shape.iter().product::<u64>() as usize;
+            let vals = rand_f32(n, seed);
+            extra.push((name, "BF16".into(), shape, bf16_bytes(&vals)));
+            vals
+        };
+        let mut fp32_vals: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let emb = bf16(
+            "model.embed_tokens.weight".into(),
+            vec![VOCAB as u64, HID as u64],
+            &mut seed,
+        );
+        fp32_vals.insert("model.embed_tokens.weight".into(), emb);
+        let fnorm = bf16("model.norm.weight".into(), vec![HID as u64], &mut seed);
+        fp32_vals.insert("model.norm.weight".into(), fnorm);
+        for layer in 0..4usize {
+            let l = |s: &str| format!("model.layers.{layer}.{s}");
+            bf16(l("input_layernorm.weight"), vec![HID as u64], &mut seed);
+            bf16(
+                l("post_attention_layernorm.weight"),
+                vec![HID as u64],
+                &mut seed,
+            );
+            for (suffix, n, k) in [
+                ("mlp.gate_proj", INTER, HID),
+                ("mlp.up_proj", INTER, HID),
+                ("mlp.down_proj", HID, INTER),
+            ] {
+                modules.push(Module::nvfp4(&l(suffix), n, k, &mut seed));
+            }
+            if layer == 3 {
+                modules.push(Module::fp8(
+                    &l("self_attn.q_proj"),
+                    4 * 8 * 2,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(&l("self_attn.k_proj"), 2 * 8, HID, &mut seed));
+                modules.push(Module::fp8(&l("self_attn.v_proj"), 2 * 8, HID, &mut seed));
+                modules.push(Module::fp8(&l("self_attn.o_proj"), HID, 4 * 8, &mut seed));
+                bf16(l("self_attn.q_norm.weight"), vec![8], &mut seed);
+                bf16(l("self_attn.k_norm.weight"), vec![8], &mut seed);
+            } else {
+                modules.push(Module::fp8(
+                    &l("linear_attn.in_proj_qkv"),
+                    QKV_ROWS,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(
+                    &l("linear_attn.in_proj_z"),
+                    V_ROWS,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(
+                    &l("linear_attn.out_proj"),
+                    HID,
+                    V_ROWS,
+                    &mut seed,
+                ));
+                bf16(l("linear_attn.A_log"), vec![VH as u64], &mut seed);
+                bf16(
+                    l("linear_attn.conv1d.weight"),
+                    vec![QKV_ROWS as u64, 1, 4],
+                    &mut seed,
+                );
+                bf16(l("linear_attn.dt_bias"), vec![VH as u64], &mut seed);
+                bf16(
+                    l("linear_attn.in_proj_b.weight"),
+                    vec![VH as u64, HID as u64],
+                    &mut seed,
+                );
+                bf16(
+                    l("linear_attn.in_proj_a.weight"),
+                    vec![VH as u64, HID as u64],
+                    &mut seed,
+                );
+                bf16(l("linear_attn.norm.weight"), vec![GHD as u64], &mut seed);
+            }
+        }
+        modules.push(Module::nvfp4("lm_head", VOCAB, HID, &mut seed));
+
+        let mut cfg = crate::hf_ct::test_fixture::modelopt_config();
+        cfg["text_config"] = serde_json::json!({
+            "hidden_size": HID, "num_hidden_layers": 4,
+            "intermediate_size": INTER, "vocab_size": VOCAB,
+            "rope_parameters": { "rope_theta": 10000.0 },
+        });
+        let hf_dir = write_modelopt_checkpoint("e2e", &modules, &extra, &[], Some(cfg));
+
+        let lbc_path = dir.join("out.lbc");
+        let stats = convert_hf_ct_to_lbc(&hf_dir, &donor_path, &lbc_path).unwrap();
+        assert_eq!(stats.quant_scheme, QuantScheme::Nvfp4);
+
+        let lbc = LbcFile::open(&lbc_path).unwrap();
+        let file = std::fs::read(&lbc_path).unwrap();
+        // The header names what the body and the head carry.
+        assert_eq!(lbc.header.quantization.scheme, QuantScheme::Nvfp4);
+        assert_eq!(lbc.header.output_proj.quant, QuantScheme::Nvfp4);
+        assert_eq!(lbc.header.embedding.quant, QuantScheme::Bf16);
+        assert_eq!(lbc.header.final_norm.quant, QuantScheme::F32);
+
+        let by_base: std::collections::HashMap<&str, &Module> =
+            modules.iter().map(|m| (m.base.as_str(), m)).collect();
+        let at = |s: &lumen_format::index::TensorSlice, base: u64| -> &[u8] {
+            &file[(base + s.offset) as usize..(base + s.offset + s.length) as usize]
+        };
+        // The head: its three planes, verbatim.
+        let head = &lbc.header.output_proj;
+        assert_eq!(
+            &file[head.offset as usize..(head.offset + head.length) as usize],
+            by_base["lm_head"].expected_bytes(None).as_slice()
+        );
+
+        let perm = v_head_perm(VH, KH);
+        let qkv_row_perm = expand_head_perm(&perm, GHD, 2 * QK_ROWS);
+        let v_row_perm = expand_head_perm(&perm, GHD, 0);
+        let (mut nvfp4_slices, mut fp8_slices) = (0usize, 0usize);
+        for layer in 0..4usize {
+            let idx = &lbc.layer_indices[layer];
+            let base = idx.layer_offset_bytes;
+            let st = &idx.subtensors;
+            let l = |s: &str| format!("model.layers.{layer}.{s}");
+            for (suffix, slice) in [
+                ("mlp.gate_proj", &st.w_gate),
+                ("mlp.up_proj", &st.w_up),
+                ("mlp.down_proj", &st.w_down),
+            ] {
+                let m = by_base[l(suffix).as_str()];
+                assert_eq!(slice.quant, QuantScheme::Nvfp4, "{}", m.base);
+                assert_eq!(
+                    at(slice, base),
+                    m.expected_bytes(None).as_slice(),
+                    "{}",
+                    m.base
+                );
+                nvfp4_slices += 1;
+            }
+            if layer == 3 {
+                for (suffix, slice) in [
+                    ("self_attn.q_proj", &st.wq),
+                    ("self_attn.k_proj", &st.wk),
+                    ("self_attn.v_proj", &st.wv),
+                    ("self_attn.o_proj", &st.wo),
+                ] {
+                    let m = by_base[l(suffix).as_str()];
+                    assert_eq!(slice.quant, QuantScheme::Fp8E4M3, "{}", m.base);
+                    assert_eq!(
+                        at(slice, base),
+                        m.expected_bytes(None).as_slice(),
+                        "{}",
+                        m.base
+                    );
+                    fp8_slices += 1;
+                }
+            } else {
+                // The two row-permuted GDN projections.
+                let qkv = by_base[l("linear_attn.in_proj_qkv").as_str()];
+                assert_eq!(st.wq.quant, QuantScheme::Fp8E4M3);
+                assert_eq!(
+                    at(&st.wq, base),
+                    qkv.expected_bytes(Some(&qkv_row_perm)).as_slice()
+                );
+                let z = by_base[l("linear_attn.in_proj_z").as_str()];
+                let gate = st.attn_gate.as_ref().unwrap();
+                assert_eq!(gate.quant, QuantScheme::Fp8E4M3);
+                assert_eq!(
+                    at(gate, base),
+                    z.expected_bytes(Some(&v_row_perm)).as_slice()
+                );
+                // out_proj: the v-head reorder moves INPUT column blocks, so
+                // the inverse permutation returns the source bytes.
+                let out = by_base[l("linear_attn.out_proj").as_str()];
+                let slice = st.ssm_out.as_ref().unwrap();
+                assert_eq!(slice.quant, QuantScheme::Fp8E4M3);
+                let bytes = at(slice, base);
+                let mut inverse = vec![0usize; perm.len()];
+                for (i, &src) in perm.iter().enumerate() {
+                    inverse[src] = i;
+                }
+                assert_eq!(
+                    permute_col_blocks(&bytes[..HID * V_ROWS], V_ROWS, GHD, &inverse),
+                    out.source_weight(),
+                    "out_proj column blocks"
+                );
+                assert_ne!(&bytes[..HID * V_ROWS], out.source_weight());
+                fp8_slices += 3;
+            }
+        }
+        // Every quantized module of the checkpoint reached the artifact.
+        assert_eq!((nvfp4_slices, fp8_slices), (12, 13));
+        assert_eq!(modules.len(), 12 + 13 + 1, "with the head");
     }
 }
