@@ -39,4 +39,3 @@ codecompass.config.json
 /dist/
 /.ttsvenv
 /packaging/site/
-/crates/lumen-format/examples/
