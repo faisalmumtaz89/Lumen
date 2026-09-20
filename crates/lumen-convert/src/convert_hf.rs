@@ -880,6 +880,16 @@ impl<'a> Importer<'a> {
     }
 }
 
+/// How many activation scales the checkpoint carries. A ModelOpt export
+/// stores one `input_scale` per quantized module for a runtime that also
+/// quantizes activations; this import reads weights only, so they are
+/// counted and left behind rather than dropped in silence.
+fn activation_scale_count(ckpt: &HfCtCheckpoint) -> usize {
+    ckpt.tensor_names()
+        .filter(|name| name.ends_with(".input_scale"))
+        .count()
+}
+
 /// Read a numeric scalar from a checkpoint config, looking inside
 /// `rope_parameters` as well: configs that nest the RoPE scalars there
 /// declare no `rope_theta` at the level above, so a top-level-only lookup
@@ -1030,6 +1040,13 @@ pub fn convert_hf_ct_to_lbc(
         eprintln!(
             "  Checkpoint keeps unquantized: {}",
             ckpt.quant.ignore.join(", ")
+        );
+    }
+    let activation_scales = activation_scale_count(&ckpt);
+    if activation_scales > 0 {
+        eprintln!(
+            "  Checkpoint drops {activation_scales} input_scale tensors: \
+             activation scales the artifact does not carry"
         );
     }
     let importer = Importer {
@@ -2135,6 +2152,33 @@ mod tests {
             );
             assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
         }
+    }
+
+    #[test]
+    fn activation_scales_are_counted_and_left_behind() {
+        let mut seed = 9u64;
+        let base = "model.layers.0.linear_attn.in_proj_z";
+        let modules = vec![Module::fp8(base, V_ROWS, HID, &mut seed)];
+        let extra: Vec<(String, String, Vec<u64>, Vec<u8>)> = [base, "model.layers.0.mlp.up_proj"]
+            .iter()
+            .map(|m| {
+                (
+                    format!("{m}.input_scale"),
+                    "F32".to_owned(),
+                    vec![],
+                    1.0f32.to_le_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let dir = write_modelopt_checkpoint("input-scale", &modules, &extra, &[], None);
+        let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+        assert_eq!(activation_scale_count(&ckpt), 2);
+        // Counting them changes nothing about what the module lowers to.
+        let lowered = modelopt_importer(&ckpt)
+            .lower_linear(base, V_ROWS, HID, None)
+            .unwrap();
+        assert_eq!(lowered.quant, QuantScheme::Fp8E4M3);
+        assert_eq!(lowered.bytes, modules[0].expected_bytes(None));
     }
 
     #[test]
