@@ -532,6 +532,41 @@ pub fn validate_layer_quants(
     Ok(())
 }
 
+/// How one matrix's planes are sized for a planar scheme, or `None` for a
+/// scheme with a fixed per-row layout. The returned function gives the exact
+/// slice length of an `[out_dim, in_dim]` matrix, and `None` for a width with
+/// no valid geometry (`in_dim` not a whole number of quantization groups).
+///
+/// Exhaustive on the scheme: a new one must say which kind it is here, or it
+/// silently gets neither rule.
+fn planar_slice_len_fn(quant: QuantScheme) -> Option<fn(u64, u64) -> Option<u64>> {
+    match quant {
+        QuantScheme::Nvfp4 => Some(|n, k| {
+            crate::Nvfp4Planes::for_shape(n, k)
+                .ok()
+                .map(|p| p.total_bytes())
+        }),
+        QuantScheme::Fp8E4M3 => Some(|n, k| {
+            crate::Fp8Planes::for_shape(n, k)
+                .ok()
+                .map(|p| p.total_bytes())
+        }),
+        QuantScheme::F32
+        | QuantScheme::F16
+        | QuantScheme::Bf16
+        | QuantScheme::Q8_0
+        | QuantScheme::Q4_0
+        | QuantScheme::Q4_1
+        | QuantScheme::Q4_K
+        | QuantScheme::Q5_0
+        | QuantScheme::Q5_K
+        | QuantScheme::Q6_K
+        | QuantScheme::Q2_K
+        | QuantScheme::Q3_K
+        | QuantScheme::CtInt4G32 => None,
+    }
+}
+
 /// Enforce projection geometry for every fixed-layout scheme: the launchers
 /// derive row counts from hyperparams, so a slice whose byte length decodes
 /// to any other row count is read at the wrong geometry — in-bounds, silent
@@ -549,6 +584,42 @@ pub fn validate_projection_geometry(
     in_dim: usize,
     allowed_out: &[usize],
 ) -> Result<(), String> {
+    // A planar scheme has no per-row layout — the slice holds one matrix's
+    // concatenated planes — so the block table below cannot describe it and
+    // would leave `row_bytes` None, skipping the length check entirely.
+    // Both halves of the rule still apply: the width must be a whole number
+    // of quantization groups, and the length must be exactly what one
+    // allowed out_dim plans.
+    if let Some(slice_len) = planar_slice_len_fn(slice.quant) {
+        if in_dim == 0 {
+            return Err(format!("{name} role has in_dim 0 (malformed hyperparams)."));
+        }
+        if slice_len(1, in_dim as u64).is_none() {
+            return Err(format!(
+                "{name} is {:?} but in_dim {in_dim} is not a whole number of \
+                 quantization groups — the planes would not cover the row \
+                 (malformed hyperparams).",
+                slice.quant
+            ));
+        }
+        if slice.length > 0 {
+            let expected: Vec<u64> = allowed_out
+                .iter()
+                .filter_map(|&out| slice_len(out as u64, in_dim as u64))
+                .collect();
+            if !expected.contains(&slice.length) {
+                return Err(format!(
+                    "{name} is {} bytes ({:?}, in_dim {in_dim}) but this role \
+                     requires out_dim in {allowed_out:?}, whose planes are \
+                     {expected:?} bytes. The kernels derive dimensions from \
+                     hyperparams, so this tensor would be read at the wrong \
+                     geometry. Re-convert with `lumen convert`.",
+                    slice.length, slice.quant
+                ));
+            }
+        }
+        return Ok(());
+    }
     // (block elements, block bytes) per fixed-layout scheme. A width that
     // does not divide into whole blocks is malformed row geometry — the
     // kernels truncate to in_dim/block blocks per row — so it must FAIL,
@@ -566,7 +637,11 @@ pub fn validate_projection_geometry(
         QuantScheme::Q4_K => Some((256, 144)),
         QuantScheme::Q5_K => Some((256, 176)),
         QuantScheme::Q6_K => Some((256, 210)),
-        _ => None,
+        // No fixed row layout: CtInt4G32's geometry is enforced in
+        // `upload_projection_tensor`'s ct4 branch, and the planar schemes
+        // returned above. Exhaustive so a new scheme must be classified
+        // here rather than skipping the length check below.
+        QuantScheme::CtInt4G32 | QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3 => None,
     };
     let row_bytes = match block {
         Some((elems, bytes)) => {
@@ -1253,5 +1328,85 @@ mod tests {
             err.starts_with("expert 1: down is Q4_0 but expert 0's is Q8_0"),
             "{err}"
         );
+    }
+
+    /// Every planar shape the source checkpoint stores, by role: the FFN
+    /// matrices and the head (NVFP4), the GDN in/out projections and the
+    /// four attention projections (FP8). `(quant, in_dim, out_dim, bytes)`.
+    const PLANAR_SHAPES: [(QuantScheme, usize, usize, u64); 8] = [
+        (QuantScheme::Nvfp4, 5120, 17408, 50_135_044),
+        (QuantScheme::Nvfp4, 17408, 5120, 50_135_044),
+        (QuantScheme::Nvfp4, 5120, 248_320, 715_161_604),
+        (QuantScheme::Fp8E4M3, 5120, 10240, 52_428_804),
+        (QuantScheme::Fp8E4M3, 5120, 6144, 31_457_284),
+        (QuantScheme::Fp8E4M3, 6144, 5120, 31_457_284),
+        (QuantScheme::Fp8E4M3, 5120, 12288, 62_914_564),
+        (QuantScheme::Fp8E4M3, 5120, 1024, 5_242_884),
+    ];
+
+    #[test]
+    fn planar_projection_geometry_accepts_every_source_shape() {
+        for (quant, in_dim, out_dim, bytes) in PLANAR_SHAPES {
+            validate_projection_geometry("wq", &sl(bytes, quant), in_dim, &[out_dim])
+                .unwrap_or_else(|e| panic!("{quant:?} [{out_dim}, {in_dim}] rejected: {e}"));
+            // Also accepted when the role allows several out_dims.
+            assert!(
+                validate_projection_geometry("wq", &sl(bytes, quant), in_dim, &[7, out_dim])
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn planar_projection_geometry_rejects_corrupted_slices() {
+        // The four ways a planar slice can be the wrong geometry: one byte
+        // short, one byte long, a length that decodes to a DIFFERENT
+        // out_dim, and a truncated plane set.
+        let (nvfp4, fp8) = (QuantScheme::Nvfp4, QuantScheme::Fp8E4M3);
+        for (quant, in_dim, out_dim, bad) in [
+            (nvfp4, 5120usize, 248_320usize, 715_161_603u64),
+            (nvfp4, 5120, 248_320, 715_161_605),
+            (nvfp4, 5120, 248_320, 50_135_044),
+            (fp8, 5120, 10240, 52_428_804 / 2),
+        ] {
+            let err =
+                validate_projection_geometry("output_proj", &sl(bad, quant), in_dim, &[out_dim])
+                    .unwrap_err();
+            assert!(
+                err.contains(&bad.to_string()) && err.contains("out_dim"),
+                "{quant:?} {bad} bytes not refused by size: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_projection_geometry_no_longer_skips_the_length_check() {
+        // The fixed-row block table has no entry for a planar scheme, so
+        // before the planar rule every length passed: the length check is
+        // reached only when a row width was derived. A byte count that is
+        // no valid geometry must now fail for both schemes.
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            assert!(
+                validate_projection_geometry("w_gate", &sl(1, quant), 5120, &[17408]).is_err(),
+                "{quant:?}: a 1-byte projection slice still passes"
+            );
+        }
+        // The absence sentinel still passes, as it does for every scheme.
+        assert!(
+            validate_projection_geometry("wo", &sl(0, QuantScheme::Nvfp4), 5120, &[5120]).is_ok()
+        );
+    }
+
+    #[test]
+    fn planar_projection_row_width_rejects_a_misaligned_in_dim() {
+        // NVFP4 groups 16 weights along k, so a width that is not a whole
+        // number of groups has no valid geometry at all — the converter
+        // must not plan one. FP8 has no group, so every width is fine.
+        let err = validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 24).unwrap_err();
+        assert!(err.contains("24"), "{err}");
+        assert!(validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 128).is_ok());
+        assert!(validate_projection_row_width("ssm_out", QuantScheme::Fp8E4M3, 24).is_ok());
+        let err = validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 0).unwrap_err();
+        assert!(err.contains("in_dim 0"), "{err}");
     }
 }
