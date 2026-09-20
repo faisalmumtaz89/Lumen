@@ -1142,7 +1142,21 @@ pub(crate) fn run_inference(args: &[String]) {
     // same message instead of misreading packed planes downstream. The scan
     // covers per-tensor slices, not just the primary scheme.
     {
-        let has_ct4 = lumen_format::reader::LbcFile::open(path)
+        let opened = lumen_format::reader::LbcFile::open(path).ok();
+        // A scheme with no kernels is refused first, and on every backend:
+        // the artifact parses, so without this it would reach a provider and
+        // fail as a missing kernel or, worse, a misread plane.
+        if let Some(scheme) = opened
+            .as_ref()
+            .and_then(lumen_format::serving_rules::unservable_scheme)
+        {
+            eprintln!(
+                "Error: {}",
+                lumen_format::serving_rules::no_serving_kernels_message(scheme)
+            );
+            std::process::exit(1);
+        }
+        let has_ct4 = opened
             .map(|lbc| lbc.uses_quant(QuantScheme::CtInt4G32))
             .unwrap_or(false);
         if has_ct4 {
@@ -1936,6 +1950,15 @@ fn create_backend(
     #[allow(unused_variables)] embedding_quant: QuantScheme,
     #[allow(unused_variables)] weight_tying: bool,
 ) -> Box<dyn ComputeBackend> {
+    // Backend construction is the last admission point: a scheme with no
+    // kernels never reaches a backend, whichever one was selected.
+    if lumen_format::serving_rules::scheme_has_no_serving_kernels(primary_quant) {
+        eprintln!(
+            "Error: {}",
+            lumen_format::serving_rules::no_serving_kernels_message(primary_quant)
+        );
+        std::process::exit(1);
+    }
     // CtInt4G32 has CUDA kernels only; no other backend can serve the
     // packed planes. (Belt-and-braces: the run dispatcher already rejects
     // Ct4 for non-CUDA modes before any provider opens.)

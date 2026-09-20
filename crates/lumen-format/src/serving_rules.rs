@@ -532,6 +532,46 @@ pub fn validate_layer_quants(
     Ok(())
 }
 
+/// Whether a scheme has no serving kernels on any backend: the artifact can
+/// carry it and the reader can parse it, but nothing can compute with it.
+/// The binaries refuse such an artifact at admission, before a weight
+/// provider opens, so the failure names the scheme instead of surfacing as a
+/// missing kernel or a misread plane much later.
+///
+/// Exhaustive on the scheme: a new one must declare which side it is on.
+pub fn scheme_has_no_serving_kernels(quant: QuantScheme) -> bool {
+    match quant {
+        QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3 => true,
+        QuantScheme::F32
+        | QuantScheme::F16
+        | QuantScheme::Bf16
+        | QuantScheme::Q8_0
+        | QuantScheme::Q4_0
+        | QuantScheme::Q4_1
+        | QuantScheme::Q4_K
+        | QuantScheme::Q5_0
+        | QuantScheme::Q5_K
+        | QuantScheme::Q6_K
+        | QuantScheme::Q2_K
+        | QuantScheme::Q3_K
+        | QuantScheme::CtInt4G32 => false,
+    }
+}
+
+/// The first unservable scheme an artifact carries, from its header and
+/// index alone — the primary descriptor, the three globals and every layer
+/// slice ([`LbcFile::uses_quant`](crate::reader::LbcFile::uses_quant)).
+pub fn unservable_scheme(lbc: &crate::reader::LbcFile) -> Option<QuantScheme> {
+    [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3]
+        .into_iter()
+        .find(|&quant| lbc.uses_quant(quant))
+}
+
+/// The refusal both binaries print, written once so they cannot diverge.
+pub fn no_serving_kernels_message(quant: QuantScheme) -> String {
+    format!("this model ({quant:?}) has no serving kernels for this scheme yet")
+}
+
 /// How one matrix's planes are sized for a planar scheme, or `None` for a
 /// scheme with a fixed per-row layout. The returned function gives the exact
 /// slice length of an `[out_dim, in_dim]` matrix, and `None` for a width with
@@ -1408,5 +1448,43 @@ mod tests {
         assert!(validate_projection_row_width("ssm_out", QuantScheme::Fp8E4M3, 24).is_ok());
         let err = validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 0).unwrap_err();
         assert!(err.contains("in_dim 0"), "{err}");
+    }
+
+    #[test]
+    fn no_serving_kernels_is_exactly_the_two_planar_schemes() {
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            assert!(scheme_has_no_serving_kernels(quant), "{quant:?}");
+        }
+        // Every scheme a shipped artifact can carry stays servable: this rule
+        // must not refuse anything that serves today.
+        for quant in [
+            QuantScheme::F32,
+            QuantScheme::F16,
+            QuantScheme::Bf16,
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+            QuantScheme::Q4_1,
+            QuantScheme::Q4_K,
+            QuantScheme::Q5_0,
+            QuantScheme::Q5_K,
+            QuantScheme::Q6_K,
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+            QuantScheme::CtInt4G32,
+        ] {
+            assert!(!scheme_has_no_serving_kernels(quant), "{quant:?}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_scheme() {
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            let message = no_serving_kernels_message(quant);
+            assert!(message.contains(&format!("{quant:?}")), "{message}");
+            assert!(
+                message.contains("no serving kernels for this scheme yet"),
+                "{message}"
+            );
+        }
     }
 }

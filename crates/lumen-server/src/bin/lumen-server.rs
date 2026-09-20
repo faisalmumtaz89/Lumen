@@ -712,6 +712,13 @@ async fn run(args: Args) -> Result<(), String> {
     let backend_choice = select_backend(args.backend);
     eprintln!("[lumen-server] backend: {backend_choice:?}");
 
+    // A scheme with no kernels is refused first, and on every backend: the
+    // artifact parses, so without this it would reach the provider and fail
+    // as a missing kernel or, worse, a misread plane.
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc) {
+        return Err(lumen_format::serving_rules::no_serving_kernels_message(scheme).into());
+    }
+
     // CtInt4G32 has CUDA kernels only; no other backend can serve the packed
     // planes. Check the lightweight header/index HERE — per-tensor slices,
     // not just the primary scheme — before the provider reads multi-GB
