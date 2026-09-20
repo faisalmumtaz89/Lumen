@@ -422,10 +422,33 @@ impl<'a> Importer<'a> {
         }))
     }
 
-    /// Lower a Linear-module weight: CtInt4G32 planes when quantized, Bf16
-    /// bytes otherwise. `row_perm` (logical output rows) is applied to
-    /// either representation.
+    /// Lower a Linear-module weight, and hold the result to what the
+    /// checkpoint declares for that module: a module exported as one scheme
+    /// but declared as another is refused by name, because which one is the
+    /// truth decides how every weight of it is read.
     fn lower_linear(
+        &self,
+        base: &str,
+        expect_n: usize,
+        expect_k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Lowered, ConvertError> {
+        let lowered = self.lower_weight(base, expect_n, expect_k, row_perm)?;
+        if let Some(&declared) = self.ckpt.quant.declared.get(base) {
+            if lowered.quant != declared {
+                return Err(ConvertError::UnsupportedArchitecture(format!(
+                    "{base}: the checkpoint declares {declared:?} but carries {:?} tensors",
+                    lowered.quant
+                )));
+            }
+        }
+        Ok(lowered)
+    }
+
+    /// Lower whatever representation the module's tensors carry: planar
+    /// NVFP4 or FP8 planes, CtInt4G32 planes, or Bf16 bytes. `row_perm`
+    /// (logical output rows) is applied to every representation.
+    fn lower_weight(
         &self,
         base: &str,
         expect_n: usize,
@@ -2063,6 +2086,51 @@ mod tests {
                 m.base
             );
             assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
+        }
+    }
+
+    #[test]
+    fn modelopt_modules_must_carry_the_algorithm_they_are_declared_with() {
+        // Each module, declared as the other kind than the planes it holds.
+        for (base, n, k, planes, declared) in [
+            (
+                "model.layers.0.mlp.up_proj",
+                INTER,
+                HID,
+                "NVFP4",
+                serde_json::json!({ "quant_algo": "FP8" }),
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                "FP8",
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            ),
+        ] {
+            let mut seed = 11u64;
+            let modules = vec![if planes == "NVFP4" {
+                Module::nvfp4(base, n, k, &mut seed)
+            } else {
+                Module::fp8(base, n, k, &mut seed)
+            }];
+            let dir =
+                write_modelopt_checkpoint(&format!("declared-{planes}"), &modules, &[], &[], None);
+            let path = dir.join("hf_quant_config.json");
+            let mut qc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            qc["quantization"]["quantized_layers"][base] = declared;
+            std::fs::write(&path, serde_json::to_vec(&qc).unwrap()).unwrap();
+
+            let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+            let err = match modelopt_importer(&ckpt).lower_linear(base, n, k, None) {
+                Ok(l) => panic!("{planes} planes declared otherwise: accepted {:?}", l.quant),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(base) && err.contains("Nvfp4") && err.contains("Fp8E4M3"),
+                "{planes}: the refusal does not name the module and both schemes: {err}"
+            );
         }
     }
 

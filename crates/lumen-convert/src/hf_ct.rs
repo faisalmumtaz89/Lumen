@@ -16,6 +16,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use lumen_format::QuantScheme;
+
 use crate::convert::ConvertError;
 
 /// Tensor element types the supported checkpoints contain.
@@ -74,12 +76,17 @@ impl HfTensorInfo {
     }
 }
 
-/// A checkpoint's quantization declaration, validated at open time. Every
-/// field is checked against the checkpoint.
+/// A checkpoint's quantization declaration, reduced to what the importer
+/// acts on. Everything else the declaration carries is checked at open time
+/// (see [`preflight`]) and dropped.
 #[derive(Debug, Clone)]
 pub struct HfQuantConfig {
     /// Module prefixes excluded from quantization (kept in floating point).
     pub ignore: Vec<String>,
+    /// The weight scheme the checkpoint declares for one module, by module
+    /// name. ModelOpt declares this per module; compressed-tensors declares
+    /// one group covering every `Linear`, so the map is empty there.
+    pub declared: HashMap<String, QuantScheme>,
 }
 
 /// An open checkpoint: validated shard set + tensor index + quant config.
@@ -162,15 +169,17 @@ fn preflight_modelopt(dir: &Path) -> Result<HfQuantConfig, ConvertError> {
         .get("quantized_layers")
         .and_then(|v| v.as_object())
         .ok_or_else(|| bad("hf_quant_config.json has no quantized_layers map".into()))?;
+    let mut declared = HashMap::with_capacity(layers.len());
     for (name, spec) in layers {
         let group_size = spec.get("group_size").unwrap_or(&serde_json::Value::Null);
-        match spec.get("quant_algo").and_then(|v| v.as_str()) {
+        let scheme = match spec.get("quant_algo").and_then(|v| v.as_str()) {
             Some("NVFP4") => {
                 if group_size.as_u64() != Some(16) {
                     return Err(bad(format!(
                         "layer {name}: unsupported NVFP4 group_size {group_size} (need 16)"
                     )));
                 }
+                QuantScheme::Nvfp4
             }
             Some("FP8") => {
                 // FP8 is quantized per tensor here; a group size would mean a
@@ -180,16 +189,19 @@ fn preflight_modelopt(dir: &Path) -> Result<HfQuantConfig, ConvertError> {
                         "layer {name}: FP8 with group_size {group_size} is not supported"
                     )));
                 }
+                QuantScheme::Fp8E4M3
             }
             other => {
                 return Err(bad(format!(
                     "layer {name}: unsupported quant_algo {other:?} (need \"NVFP4\" or \"FP8\")"
                 )))
             }
-        }
+        };
+        declared.insert(name.clone(), scheme);
     }
     Ok(HfQuantConfig {
         ignore: string_list(q, "exclude_modules")?,
+        declared,
     })
 }
 
@@ -279,6 +291,7 @@ fn preflight_ct_int4_g32(qc: &serde_json::Value) -> Result<HfQuantConfig, Conver
     }
     Ok(HfQuantConfig {
         ignore: string_list(qc, "ignore")?,
+        declared: HashMap::new(),
     })
 }
 
