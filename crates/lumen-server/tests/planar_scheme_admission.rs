@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 use lumen_convert::test_checkpoint::{self, Modules};
-use lumen_format::serving_rules::unservable_scheme;
+use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
 use lumen_format::QuantScheme;
 
 /// Start the server on `artifact` and return its stderr. `--port 0` keeps a
@@ -94,6 +94,38 @@ fn an_fp8_artifact_is_refused_by_name_at_startup() {
     assert!(
         stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup() {
+    assert!(
+        cfg!(feature = "bin"),
+        "this test spawns the server binary: run with --features lumen-server/bin"
+    );
+    // The header's own scheme serves, so the refusal rests entirely on the
+    // per-slice scan past it.
+    let dir = workdir("mixed");
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir);
+
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
+    assert!(!scheme_has_no_serving_kernels(QuantScheme::Q4_0));
+    assert_eq!(
+        lbc.layer_indices[0].subtensors.w_gate.quant,
+        QuantScheme::Fp8E4M3
+    );
+    assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
+
+    let (code, stderr) = run_server(&artifact, "cpu");
+    assert_ne!(code, Some(0), "the server started: {stderr}");
+    assert!(
+        stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("listening"),
+        "the server got past admission:\n{stderr}"
     );
 }
 

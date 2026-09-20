@@ -105,52 +105,9 @@ fn an_fp8_artifact_is_refused_by_name() {
 #[test]
 fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
     // The header's own scheme serves, so the refusal rests entirely on the
-    // per-slice scan past it. `lumen convert` writes no such artifact — a
-    // planar module anywhere makes the primary planar — so this one is
-    // assembled from a Q4_0 artifact's own parts, with one layer slice
-    // retagged, to hold that scan to a file a binary actually opens.
+    // per-slice scan past it.
     let dir = workdir("mixed");
-    let q4 = test_checkpoint::write_q4_0_artifact(&dir);
-    let source = lumen_format::reader::LbcFile::open(&q4).unwrap();
-    let bytes = std::fs::read(&q4).unwrap();
-    let at = |off: u64, len: u64| bytes[off as usize..(off + len) as usize].to_vec();
-
-    // The writer CRCs the header bytes as it serializes them, so the field
-    // has to be back at its pre-checksum value first.
-    let mut header = source.header.clone();
-    header.header_checksum = 0;
-    let mut indices = source.layer_indices.clone();
-    indices[0].subtensors.w_gate.quant = QuantScheme::Fp8E4M3;
-    let blobs: Vec<Vec<u8>> = source
-        .layer_indices
-        .iter()
-        .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
-        .collect();
-    let artifact = dir.join("planar-slice.lbc");
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&artifact).unwrap());
-    lumen_format::writer::write_lbc(
-        &mut out,
-        &header,
-        &indices,
-        &lumen_format::GlobalTensors {
-            embedding: at(
-                source.header.embedding.offset,
-                source.header.embedding.length,
-            ),
-            final_norm: at(
-                source.header.final_norm.offset,
-                source.header.final_norm.length,
-            ),
-            output_proj: at(
-                source.header.output_proj.offset,
-                source.header.output_proj.length,
-            ),
-        },
-        &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-        source.tokenizer.as_ref(),
-    )
-    .unwrap();
-    drop(out);
+    let artifact = test_checkpoint::write_planar_slice_artifact(&dir);
 
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
