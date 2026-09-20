@@ -62,6 +62,19 @@ fn expand_head_perm(head_perm: &[usize], rows_per_head: usize, prefix_rows: usiz
     out
 }
 
+/// Largest finite f16. The prefill path converts dequantized weights to f16
+/// tiles, so a weight above this saturates to infinity there.
+const F16_MAX: f32 = 65_504.0;
+
+/// Upper bound on an NVFP4 tensor's global scale: its largest possible
+/// weight is the largest E2M1 magnitude (6.0) times the largest E4M3 block
+/// scale (448.0) times this scale.
+const NVFP4_MAX_GLOBAL_SCALE: f32 = F16_MAX / (6.0 * 448.0);
+
+/// Upper bound on an FP8 tensor's scale: its largest possible weight is the
+/// largest finite E4M3 magnitude (448.0) times this scale.
+const FP8_MAX_SCALE: f32 = F16_MAX / 448.0;
+
 struct Importer<'a> {
     ckpt: &'a HfCtCheckpoint,
     prefix: String,
@@ -225,8 +238,9 @@ impl<'a> Importer<'a> {
     }
 
     /// Read a per-tensor F32 scalar plane: exactly one value, four bytes,
-    /// whatever shape the producer gave it (`[]` and `[1]` both occur).
-    fn fetch_scalar(&self, name: &str) -> Result<f32, ConvertError> {
+    /// whatever shape the producer gave it (`[]` and `[1]` both occur), and
+    /// finite, strictly positive and no larger than `max`.
+    fn fetch_scalar(&self, name: &str, max: f32) -> Result<f32, ConvertError> {
         let info = self
             .ckpt
             .tensor_info(name)
@@ -246,7 +260,18 @@ impl<'a> Importer<'a> {
                 got: format!("{} bytes", bytes.len()),
             });
         }
-        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // Refused by name, never clamped: a scale is what every weight of the
+        // tensor is multiplied by, so a non-finite or non-positive one makes
+        // the whole tensor meaningless, and one above `max` can push a
+        // dequantized weight past what the F16 prefill tile holds.
+        if !value.is_finite() || value <= 0.0 || value > max {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_owned(),
+                ggml_type: format!("scale {value:e} (need finite, > 0 and <= {max:e})"),
+            });
+        }
+        Ok(value)
     }
 
     /// Fetch the three NVFP4 planes of `{base}`, validated against the
@@ -263,7 +288,7 @@ impl<'a> Importer<'a> {
         if self.ckpt.tensor_info(&global_name).is_none() {
             return Ok(None);
         }
-        let global = self.fetch_scalar(&global_name)?;
+        let global = self.fetch_scalar(&global_name, NVFP4_MAX_GLOBAL_SCALE)?;
         let planes = Nvfp4Planes::for_shape(n as u64, k as u64).map_err(ConvertError::Format)?;
         let expect_plane = |suffix: &str,
                             dtype: HfDtype,
@@ -370,7 +395,7 @@ impl<'a> Importer<'a> {
                 got: format!("{} bytes", weight.len()),
             });
         }
-        let scale = self.fetch_scalar(&format!("{base}.weight_scale"))?;
+        let scale = self.fetch_scalar(&format!("{base}.weight_scale"), FP8_MAX_SCALE)?;
         Ok(Some((weight, scale)))
     }
 
@@ -2438,5 +2463,168 @@ mod tests {
         // Every quantized module of the checkpoint reached the artifact.
         assert_eq!((nvfp4_slices, fp8_slices), (12, 13));
         assert_eq!(modules.len(), 12 + 13 + 1, "with the head");
+    }
+
+    /// The scalar policy, exercised on both scalar kinds: a scale is refused
+    /// by name for every way it can be wrong, never clamped. The last two
+    /// rows are the declaration's own fields, refused at open time.
+    #[test]
+    fn scalar_rejection_matrix() {
+        let bad_f32 = |v: f32| ("F32".to_owned(), vec![], v.to_le_bytes().to_vec());
+        // (case, scheme, the value or shape written, the needle the refusal must name)
+        let mut rows: Vec<(String, String, String, String, bool)> = Vec::new();
+
+        for (scheme, base, n, k, scalar, max) in [
+            (
+                "NVFP4",
+                "model.layers.0.mlp.gate_proj",
+                INTER,
+                HID,
+                "weight_scale_2",
+                NVFP4_MAX_GLOBAL_SCALE,
+            ),
+            (
+                "FP8",
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                "weight_scale",
+                FP8_MAX_SCALE,
+            ),
+        ] {
+            let name = format!("{base}.{scalar}");
+            let cases: Vec<(&str, (String, Vec<u64>, Vec<u8>))> = vec![
+                ("zero", bad_f32(0.0)),
+                ("negative", bad_f32(-1.0e-4)),
+                ("nan", bad_f32(f32::NAN)),
+                ("positive_infinity", bad_f32(f32::INFINITY)),
+                ("over_the_f16_bound", bad_f32(max * 1.000_01)),
+                ("wrong_dtype", ("BF16".to_owned(), vec![], vec![0x80, 0x3f])),
+                ("wrong_count", ("F32".to_owned(), vec![2], vec![0u8; 8])),
+            ];
+            for (case, (dtype, shape, bytes)) in cases {
+                let mut seed = 3u64;
+                let modules = vec![if scheme == "NVFP4" {
+                    Module::nvfp4(base, n, k, &mut seed)
+                } else {
+                    Module::fp8(base, n, k, &mut seed)
+                }];
+                let dir = write_modelopt_checkpoint(
+                    &format!("scalar-{scheme}-{case}"),
+                    &modules,
+                    &[],
+                    &[(name.clone(), dtype, shape, bytes)],
+                    None,
+                );
+                let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+                let err = match modelopt_importer(&ckpt).lower_linear(base, n, k, None) {
+                    Ok(l) => panic!("{scheme}/{case}: accepted, {} bytes", l.bytes.len()),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    err.contains(&name),
+                    "{scheme}/{case}: refusal does not name {name}: {err}"
+                );
+                rows.push((scheme.to_owned(), case.to_owned(), name.clone(), err, false));
+            }
+
+            // The real checkpoint's largest measured scale of this kind is
+            // accepted: the policy refuses what is wrong, not what is real.
+            let real_max: f32 = if scheme == "NVFP4" {
+                4.417_782_8e-4
+            } else {
+                3.330_775_8e-3
+            };
+            let mut seed = 3u64;
+            let modules = vec![if scheme == "NVFP4" {
+                Module::nvfp4(base, n, k, &mut seed)
+            } else {
+                Module::fp8(base, n, k, &mut seed)
+            }];
+            let dir = write_modelopt_checkpoint(
+                &format!("scalar-{scheme}-real-max"),
+                &modules,
+                &[],
+                &[(
+                    name.clone(),
+                    "F32".to_owned(),
+                    vec![],
+                    real_max.to_le_bytes().to_vec(),
+                )],
+                None,
+            );
+            let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+            let lowered = modelopt_importer(&ckpt)
+                .lower_linear(base, n, k, None)
+                .unwrap_or_else(|e| panic!("{scheme}: the measured maximum was refused: {e}"));
+            assert_eq!(
+                &lowered.bytes[lowered.bytes.len() - 4..],
+                &real_max.to_le_bytes(),
+                "{scheme}: the scale is carried verbatim"
+            );
+            rows.push((
+                scheme.to_owned(),
+                "measured_maximum_accepted".to_owned(),
+                name.clone(),
+                format!("accepted, scale {real_max:e} carried verbatim"),
+                true,
+            ));
+        }
+
+        // The declaration's own two refusals, at open time.
+        let mut seed = 3u64;
+        let modules = vec![Module::nvfp4(
+            "model.layers.0.mlp.gate_proj",
+            INTER,
+            HID,
+            &mut seed,
+        )];
+        for (case, mutate, needle) in [
+            (
+                "unsupported_group_size",
+                Box::new(|qc: &mut serde_json::Value| {
+                    qc["quantization"]["quantized_layers"]["model.layers.0.mlp.gate_proj"] =
+                        serde_json::json!({ "quant_algo": "NVFP4", "group_size": 32 });
+                }) as Box<dyn Fn(&mut serde_json::Value)>,
+                "group_size",
+            ),
+            (
+                "unknown_dialect",
+                Box::new(|qc: &mut serde_json::Value| {
+                    qc["quantization"]["quant_algo"] = serde_json::json!("W4A16_AWQ");
+                }),
+                "quant_algo",
+            ),
+        ] {
+            let dir = write_modelopt_checkpoint(&format!("decl-{case}"), &modules, &[], &[], None);
+            let mut qc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("hf_quant_config.json")).unwrap())
+                    .unwrap();
+            mutate(&mut qc);
+            std::fs::write(
+                dir.join("hf_quant_config.json"),
+                serde_json::to_vec(&qc).unwrap(),
+            )
+            .unwrap();
+            let err = HfCtCheckpoint::open(&dir).unwrap_err().to_string();
+            assert!(err.contains(needle), "{case}: {err}");
+            rows.push((
+                "declaration".to_owned(),
+                case.to_owned(),
+                "hf_quant_config.json".to_owned(),
+                err,
+                false,
+            ));
+        }
+
+        assert_eq!(rows.len(), 18, "7 refusals + 1 acceptance per kind, + 2");
+        println!("MATRIX_BEGIN");
+        for (scheme, case, subject, outcome, accepted) in &rows {
+            println!(
+                "{{\"scheme\": {scheme:?}, \"case\": {case:?}, \"subject\": {subject:?}, \
+                 \"accepted\": {accepted}, \"message\": {outcome:?}}}"
+            );
+        }
+        println!("MATRIX_END");
     }
 }
