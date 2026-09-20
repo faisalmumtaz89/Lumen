@@ -1950,15 +1950,6 @@ fn create_backend(
     #[allow(unused_variables)] embedding_quant: QuantScheme,
     #[allow(unused_variables)] weight_tying: bool,
 ) -> Box<dyn ComputeBackend> {
-    // Backend construction is the last admission point: a scheme with no
-    // kernels never reaches a backend, whichever one was selected.
-    if lumen_format::serving_rules::scheme_has_no_serving_kernels(primary_quant) {
-        eprintln!(
-            "Error: {}",
-            lumen_format::serving_rules::no_serving_kernels_message(primary_quant)
-        );
-        std::process::exit(1);
-    }
     // CtInt4G32 has CUDA kernels only; no other backend can serve the
     // packed planes. (Belt-and-braces: the run dispatcher already rejects
     // Ct4 for non-CUDA modes before any provider opens.)
