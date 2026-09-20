@@ -18,6 +18,7 @@ pub mod header;
 pub mod hyperparams;
 pub mod index;
 pub mod large_model;
+pub mod planar_dequant;
 pub mod quantization;
 pub mod reader;
 pub(crate) mod rng;
@@ -34,6 +35,7 @@ pub use header::{
 pub use hyperparams::ModelHyperparams;
 pub use index::{ExpertSlice, LayerIndex, SliceFields, SubtensorOffsets, TensorSlice};
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
+pub use planar_dequant::{dequantize_fp8, dequantize_nvfp4, e2m1_to_f32, e4m3_to_f32, NVFP4_GROUP};
 pub use quantization::{
     CtInt4G32Planes, Fp8Planes, Nvfp4Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor,
 };
