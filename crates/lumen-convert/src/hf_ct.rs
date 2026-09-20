@@ -97,6 +97,11 @@ pub struct HfQuantConfig {
     /// name. ModelOpt declares this per module; compressed-tensors declares
     /// one group covering every `Linear`, so the map is empty there.
     pub declared: HashMap<String, QuantScheme>,
+    /// Whether `declared` is meant to name every quantized module. It is
+    /// under ModelOpt, so a module that carries planes and is absent from
+    /// the map is an undeclared one; under compressed-tensors an absent
+    /// module says nothing, because no module is named at all.
+    pub declares_every_module: bool,
 }
 
 /// An open checkpoint: validated shard set + tensor index + quant config.
@@ -212,6 +217,7 @@ fn preflight_modelopt(dir: &Path) -> Result<HfQuantConfig, ConvertError> {
     Ok(HfQuantConfig {
         ignore: string_list(q, "exclude_modules")?,
         declared,
+        declares_every_module: true,
     })
 }
 
@@ -302,6 +308,7 @@ fn preflight_ct_int4_g32(qc: &serde_json::Value) -> Result<HfQuantConfig, Conver
     Ok(HfQuantConfig {
         ignore: string_list(qc, "ignore")?,
         declared: HashMap::new(),
+        declares_every_module: false,
     })
 }
 

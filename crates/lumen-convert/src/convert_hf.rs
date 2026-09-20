@@ -422,21 +422,35 @@ impl<'a> Importer<'a> {
         }))
     }
 
-    /// Hold a lowered module to what the checkpoint declares for it: a
-    /// module exported as one scheme but declared as another is refused by
-    /// name, because which one is the truth decides how every weight of it
-    /// is read. Every lowered module passes here, the ones whose weight
+    /// Hold a lowered module to what the checkpoint declares for it, in the
+    /// dialect that declares each module by name: a module exported as one
+    /// scheme but declared as another is refused by name, and so is one that
+    /// carries planes the declaration does not mention — which one is the
+    /// truth decides how every weight of the module is read. The
+    /// compressed-tensors dialect names no module at all, so neither half
+    /// has anything to compare against there and every module passes.
+    ///
+    /// Every lowered module passes here, the ones whose weight
     /// [`Self::lower_linear`] fetched and the one lowered in place.
     fn check_declared(&self, base: &str, lowered: Lowered) -> Result<Lowered, ConvertError> {
-        if let Some(&declared) = self.ckpt.quant.declared.get(base) {
-            if lowered.quant != declared {
-                return Err(ConvertError::UnsupportedArchitecture(format!(
+        match self.ckpt.quant.declared.get(base) {
+            Some(&declared) if lowered.quant != declared => {
+                Err(ConvertError::UnsupportedArchitecture(format!(
                     "{base}: the checkpoint declares {declared:?} but carries {:?} tensors",
                     lowered.quant
-                )));
+                )))
             }
+            // Bf16 is the one unquantized form a module lowers to, and an
+            // unquantized module is not one the declaration covers.
+            None if self.ckpt.quant.declares_every_module && lowered.quant != QuantScheme::Bf16 => {
+                Err(ConvertError::UnsupportedArchitecture(format!(
+                    "{base}: the checkpoint declares no algorithm for this module \
+                     but carries {:?} tensors",
+                    lowered.quant
+                )))
+            }
+            _ => Ok(lowered),
         }
-        Ok(lowered)
     }
 
     /// Lower a Linear-module weight and hold it to the checkpoint's
@@ -1393,6 +1407,22 @@ mod tests {
         assert!(
             err.contains(base) && err.contains("Nvfp4") && err.contains("Fp8E4M3"),
             "the refusal does not name the module and both schemes: {err}"
+        );
+    }
+
+    #[test]
+    fn a_modelopt_module_that_carries_planes_must_be_declared() {
+        // Dropped from the declaration, the module still holds its NVFP4
+        // planes: nothing in the checkpoint says which reading is right.
+        let base = "model.layers.0.mlp.up_proj";
+        let err = convert_with_declaration("undeclared", |layers| {
+            assert!(layers.remove(base).is_some(), "{base} was not declared");
+        })
+        .expect_err("an undeclared NVFP4 module converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4"),
+            "the refusal does not name the module and what it carries: {err}"
         );
     }
 
