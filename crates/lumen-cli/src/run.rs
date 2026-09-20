@@ -925,6 +925,24 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
 
+    // A scheme with no kernels is refused first, from the header and index
+    // alone, before anything else is read out of the artifact — the
+    // tokenizer a text prompt needs, the backend choice, every provider.
+    // The artifact parses, so without this it would reach a provider and
+    // fail as a missing kernel or, worse, a misread plane. An artifact that
+    // does not parse is reported where it is next opened.
+    if let Some(scheme) = lumen_format::reader::LbcFile::open(path)
+        .ok()
+        .as_ref()
+        .and_then(lumen_format::serving_rules::unservable_scheme)
+    {
+        eprintln!(
+            "Error: {}",
+            lumen_format::serving_rules::no_serving_kernels_message(scheme)
+        );
+        std::process::exit(1);
+    }
+
     // Resolve prompt tokens: either from --tokens (raw IDs) or --prompt (text -> tokenizer).
     let (prompt_tokens, tokenizer) = if let Some(ref tokens) = tokens_str {
         // --tokens mode: parse integer IDs (existing behavior, unchanged).
@@ -1142,21 +1160,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // same message instead of misreading packed planes downstream. The scan
     // covers per-tensor slices, not just the primary scheme.
     {
-        let opened = lumen_format::reader::LbcFile::open(path).ok();
-        // A scheme with no kernels is refused first, and on every backend:
-        // the artifact parses, so without this it would reach a provider and
-        // fail as a missing kernel or, worse, a misread plane.
-        if let Some(scheme) = opened
-            .as_ref()
-            .and_then(lumen_format::serving_rules::unservable_scheme)
-        {
-            eprintln!(
-                "Error: {}",
-                lumen_format::serving_rules::no_serving_kernels_message(scheme)
-            );
-            std::process::exit(1);
-        }
-        let has_ct4 = opened
+        let has_ct4 = lumen_format::reader::LbcFile::open(path)
             .map(|lbc| lbc.uses_quant(QuantScheme::CtInt4G32))
             .unwrap_or(false);
         if has_ct4 {
