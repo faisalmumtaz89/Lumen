@@ -12,7 +12,7 @@ use std::path::Path;
 
 use lumen_format::index::TensorSlice;
 use lumen_format::reader::LbcFile;
-use lumen_format::QuantScheme;
+use lumen_format::{ModelHyperparams, QuantScheme};
 
 /// One verbose sub-tensor line: name, absolute file offset, length, scheme.
 /// The columns are fixed — a separate instrument parses this exact format.
@@ -51,6 +51,71 @@ fn per_layer_lines(lbc: &LbcFile) -> Vec<String> {
     out
 }
 
+/// The `=== HEADER ===` body, line by line. `index_end` is where the index
+/// the reader parsed ends: entries are variable-length, so it comes from the
+/// reader rather than from any sum taken here.
+fn header_lines(lbc: &LbcFile) -> Vec<String> {
+    let h = &lbc.header;
+    vec![
+        field("version", h.version),
+        field("num_layers", h.num_layers),
+        field("alignment", h.alignment),
+        field("layer_index_off", h.layer_index_offset),
+        field("index_end", lbc.layer_index_end),
+        field("payload_offset", h.payload_offset),
+        field("weight_tying", h.weight_tying),
+        field("tokenizer_off", h.tokenizer_section_offset),
+        field("tokenizer_len", h.tokenizer_section_length),
+        field("primary_quant", format!("{:?}", h.quantization.scheme)),
+    ]
+}
+
+/// The `=== HYPERPARAMS ===` body: every field of the struct, one per line,
+/// so an instrument can be pointed at any of them by name. A field added to
+/// `ModelHyperparams` is added here too — the destructuring below stops
+/// compiling until it is.
+fn hyperparams_lines(hp: &ModelHyperparams) -> Vec<String> {
+    let ModelHyperparams {
+        num_layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        hidden_dim,
+        intermediate_dim,
+        vocab_size,
+        max_seq_len,
+        rope_params,
+        num_experts,
+        num_active_experts,
+        norm_eps,
+        rotary_dim,
+        rope_neox,
+        gdn,
+    } = hp;
+    vec![
+        field("num_layers", num_layers),
+        field("num_heads", num_heads),
+        field("num_kv_heads", num_kv_heads),
+        field("head_dim", head_dim),
+        field("hidden_dim", hidden_dim),
+        field("intermediate_dim", intermediate_dim),
+        field("vocab_size", vocab_size),
+        field("max_seq_len", max_seq_len),
+        field("rope_params", format!("{rope_params:?}")),
+        field("num_experts", format!("{num_experts:?}")),
+        field("num_active_experts", format!("{num_active_experts:?}")),
+        field("norm_eps", norm_eps),
+        field("rotary_dim", format!("{rotary_dim:?}")),
+        field("rope_neox", rope_neox),
+        field("gdn", format!("{gdn:?}")),
+    ]
+}
+
+/// One `<name> = <value>` line in the shared column width.
+fn field(name: &str, value: impl std::fmt::Display) -> String {
+    format!("{name:<15} = {value}")
+}
+
 fn main() {
     let path_arg = std::env::args().nth(1).expect("usage: dump_lbc <path.lbc>");
     let path = Path::new(&path_arg);
@@ -66,25 +131,14 @@ fn main() {
     println!("file_total      = {file_total} bytes");
     println!();
     println!("=== HEADER ===");
-    println!("version         = {}", h.version);
-    println!("num_layers      = {}", h.num_layers);
-    println!("alignment       = {}", h.alignment);
-    println!("layer_index_off = {}", h.layer_index_offset);
-    println!("payload_offset  = {}", h.payload_offset);
-    println!("weight_tying    = {}", h.weight_tying);
-    println!("tokenizer_off   = {}", h.tokenizer_section_offset);
-    println!("tokenizer_len   = {}", h.tokenizer_section_length);
-    println!("primary_quant   = {:?}", h.quantization.scheme);
+    for line in header_lines(&lbc) {
+        println!("{line}");
+    }
     println!();
     println!("=== HYPERPARAMS ===");
-    println!("vocab_size      = {}", hp.vocab_size);
-    println!("hidden_dim      = {}", hp.hidden_dim);
-    println!("intermediate    = {}", hp.intermediate_dim);
-    println!("num_heads       = {}", hp.num_heads);
-    println!("num_kv_heads    = {}", hp.num_kv_heads);
-    println!("head_dim        = {}", hp.head_dim);
-    println!("num_experts     = {:?}", hp.num_experts);
-    println!("gdn             = {:?}", hp.gdn);
+    for line in hyperparams_lines(hp) {
+        println!("{line}");
+    }
     println!();
 
     // -- Top-level (global) tensors --
@@ -335,6 +389,61 @@ mod tests {
             slice_line("w_gate", 4096, 2304, QuantScheme::Q4_0),
             "        w_gate                 off=        4096 len=        2304 quant=Q4_0"
         );
+    }
+
+    #[test]
+    fn the_header_prints_where_the_index_ends_and_hyperparams_print_every_field() {
+        let bytes = lumen_format::test_model::generate_test_model_q8_0_gdn(
+            &lumen_format::test_model::TestModelQ8Config {
+                num_layers: 3,
+                ..Default::default()
+            },
+        );
+        let path = std::env::temp_dir().join(format!("lumen-dump-hdr-{}.lbc", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let lbc = LbcFile::open(&path).unwrap();
+
+        // The printed offset is the reader's own, and it is where the index
+        // ends: the bytes up to it parse, one byte fewer does not.
+        assert!(header_lines(&lbc).contains(&field("index_end", lbc.layer_index_end)));
+        let end = lbc.layer_index_end as usize;
+        assert!(end > lbc.header.layer_index_offset as usize);
+        assert!(end <= lbc.header.payload_offset as usize);
+        LbcFile::from_bytes(&bytes[..end], path.clone())
+            .expect("the index does not end where index_end says");
+        assert!(
+            LbcFile::from_bytes(&bytes[..end - 1], path.clone()).is_err(),
+            "the index ends before index_end says"
+        );
+
+        // Every field of the struct, once each, in the shared column width.
+        let lines = hyperparams_lines(&lbc.header.hyperparams);
+        for name in [
+            "num_layers",
+            "num_heads",
+            "num_kv_heads",
+            "head_dim",
+            "hidden_dim",
+            "intermediate_dim",
+            "vocab_size",
+            "max_seq_len",
+            "rope_params",
+            "num_experts",
+            "num_active_experts",
+            "norm_eps",
+            "rotary_dim",
+            "rope_neox",
+            "gdn",
+        ] {
+            let prefix = format!("{name:<15} = ");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with(&prefix)).count(),
+                1,
+                "{name} is not printed exactly once: {lines:?}"
+            );
+        }
+        assert_eq!(lines.len(), 15, "a field is printed that is not named here");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

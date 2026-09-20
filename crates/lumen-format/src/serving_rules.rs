@@ -1258,6 +1258,7 @@ mod tests {
             }],
             path: std::path::PathBuf::from("hand-built.lbc"),
             tokenizer: None,
+            layer_index_end: 0,
         }
     }
 

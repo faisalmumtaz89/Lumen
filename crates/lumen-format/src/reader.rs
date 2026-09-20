@@ -26,6 +26,10 @@ pub struct LbcFile {
     pub path: PathBuf,
     /// Embedded tokenizer data (v3+). `None` for v2 files or v3 files without tokenizer.
     pub tokenizer: Option<TokenizerSection>,
+    /// File offset one past the last byte parsed as the layer index. Index
+    /// entries are variable-length, so this is the only place that boundary
+    /// is known without re-walking them.
+    pub layer_index_end: u64,
 }
 
 impl LbcFile {
@@ -105,7 +109,7 @@ impl LbcFile {
             all
         };
 
-        let (header, layer_indices) = parse_lbc(&data)?;
+        let (header, layer_indices, layer_index_end) = parse_lbc(&data)?;
 
         // Read tokenizer section from disk if present (v3+)
         let tokenizer =
@@ -140,12 +144,13 @@ impl LbcFile {
             layer_indices,
             path: path.to_path_buf(),
             tokenizer,
+            layer_index_end,
         })
     }
 
     /// Parse from an in-memory buffer (useful for tests).
     pub fn from_bytes(data: &[u8], path: PathBuf) -> Result<Self, FormatError> {
-        let (header, layer_indices) = parse_lbc(data)?;
+        let (header, layer_indices, layer_index_end) = parse_lbc(data)?;
 
         // Parse tokenizer section from the same buffer (v3+)
         let tokenizer =
@@ -177,6 +182,7 @@ impl LbcFile {
             layer_indices,
             path,
             tokenizer,
+            layer_index_end,
         })
     }
 }
@@ -222,7 +228,9 @@ fn peek_header_offsets(data: &[u8]) -> Result<(u64, u32), FormatError> {
 ///
 /// The tokenizer section (if any) is NOT parsed here -- callers handle it
 /// separately because `open()` may not have the tokenizer bytes in memory.
-fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
+/// Returns the header, the layer index, and the offset one past the index's
+/// last byte.
+fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>, u64), FormatError> {
     let mut cursor = Cursor::new(data);
 
     // Header
@@ -374,7 +382,7 @@ fn parse_lbc(data: &[u8]) -> Result<(LbcHeader, Vec<LayerIndex>), FormatError> {
         layer_indices.push(idx);
     }
 
-    Ok((header, layer_indices))
+    Ok((header, layer_indices, cursor.pos as u64))
 }
 
 /// Parse the tokenizer section from raw bytes, verifying its CRC32 and
