@@ -34,7 +34,9 @@ pub use header::{
 pub use hyperparams::ModelHyperparams;
 pub use index::{ExpertSlice, LayerIndex, SliceFields, SubtensorOffsets, TensorSlice};
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
-pub use quantization::{CtInt4G32Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor};
+pub use quantization::{
+    CtInt4G32Planes, Fp8Planes, Nvfp4Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor,
+};
 pub use reader::LbcFile;
 pub use streaming_writer::{LayerShape, StreamingLbcWriter};
 pub use tokenizer::TokenizerSection;

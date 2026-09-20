@@ -224,6 +224,91 @@ impl CtInt4G32Planes {
     }
 }
 
+/// Byte sizes of the three planes of a [`QuantScheme::Nvfp4`] tensor slice
+/// for logical shape `[n, k]`, in their fixed slice order. The single source
+/// of truth for the plane derivation — the converter sizes writes with it and
+/// the runtime locates planes with it.
+///
+/// Requires `k % 16 == 0` (the group size); `n` may be any positive value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nvfp4Planes {
+    /// Packed E2M1 nibbles, two per byte along k.
+    pub weight_bytes: u64,
+    /// One E4M3 scale per group of 16 along k.
+    pub block_scale_bytes: u64,
+    /// One F32 scale for the whole tensor.
+    pub global_scale_bytes: u64,
+}
+
+impl Nvfp4Planes {
+    pub fn for_shape(n: u64, k: u64) -> Result<Self, crate::FormatError> {
+        if n == 0 || k == 0 || k % 16 != 0 {
+            return Err(crate::FormatError::UnsupportedQuantization(format!(
+                "Nvfp4 requires n > 0 and k % 16 == 0, got [{n}, {k}]"
+            )));
+        }
+        let overflow = || {
+            crate::FormatError::UnsupportedQuantization(format!(
+                "Nvfp4 shape [{n}, {k}] overflows plane arithmetic"
+            ))
+        };
+        let elements = n
+            .checked_mul(k)
+            .filter(|v| *v <= u64::MAX - 4)
+            .ok_or_else(overflow)?;
+        Ok(Self {
+            weight_bytes: elements / 2,
+            block_scale_bytes: elements / 16,
+            global_scale_bytes: 4,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        // Cannot overflow: the two planes sum to 9/16 of n*k, which for_shape
+        // capped 4 bytes below u64::MAX.
+        self.weight_bytes + self.block_scale_bytes + self.global_scale_bytes
+    }
+}
+
+/// Byte sizes of the two planes of a [`QuantScheme::Fp8E4M3`] tensor slice
+/// for logical shape `[n, k]`, in their fixed slice order. The single source
+/// of truth for the plane derivation, as [`Nvfp4Planes`] is for NVFP4.
+///
+/// The scale is per tensor, so there is no group-size constraint on `k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fp8Planes {
+    /// One E4M3 byte per weight.
+    pub weight_bytes: u64,
+    /// One F32 scale for the whole tensor.
+    pub scale_bytes: u64,
+}
+
+impl Fp8Planes {
+    pub fn for_shape(n: u64, k: u64) -> Result<Self, crate::FormatError> {
+        if n == 0 || k == 0 {
+            return Err(crate::FormatError::UnsupportedQuantization(format!(
+                "Fp8E4M3 requires n > 0 and k > 0, got [{n}, {k}]"
+            )));
+        }
+        Ok(Self {
+            weight_bytes: n
+                .checked_mul(k)
+                .filter(|v| *v <= u64::MAX - 4)
+                .ok_or_else(|| {
+                    crate::FormatError::UnsupportedQuantization(format!(
+                        "Fp8E4M3 shape [{n}, {k}] overflows plane arithmetic"
+                    ))
+                })?,
+            scale_bytes: 4,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        // Cannot overflow: for_shape capped n*k 4 bytes below u64::MAX.
+        self.weight_bytes + self.scale_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +379,61 @@ mod tests {
         assert!(CtInt4G32Planes::for_shape(0, 64).is_err());
         assert!(CtInt4G32Planes::for_shape(16, 0).is_err());
         assert!(CtInt4G32Planes::for_shape(16, 48).is_err());
+    }
+
+    #[test]
+    fn nvfp4_planes_match_source_checkpoint_shapes() {
+        // Every NVFP4 shape of the source checkpoint (Qwen3.8-27B mixed
+        // precision): gate/up [17408, 5120], down [5120, 17408], the head
+        // [248320, 5120]. Planes: packed nibbles, one E4M3 scale per 16
+        // weights, one F32 scale per tensor.
+        for (n, k) in [(17408, 5120), (5120, 17408)] {
+            let p = Nvfp4Planes::for_shape(n, k).unwrap();
+            assert_eq!(p.weight_bytes, 44_564_480);
+            assert_eq!(p.block_scale_bytes, 5_570_560);
+            assert_eq!(p.global_scale_bytes, 4);
+            assert_eq!(p.total_bytes(), 50_135_044);
+        }
+        let head = Nvfp4Planes::for_shape(248_320, 5120).unwrap();
+        assert_eq!(head.weight_bytes, 635_699_200);
+        assert_eq!(head.block_scale_bytes, 79_462_400);
+        assert_eq!(head.total_bytes(), 715_161_604);
+    }
+
+    #[test]
+    fn nvfp4_planes_reject_bad_shapes() {
+        assert!(Nvfp4Planes::for_shape(0, 32).is_err());
+        assert!(Nvfp4Planes::for_shape(16, 0).is_err());
+        // k not a whole number of 16-element groups.
+        assert!(Nvfp4Planes::for_shape(16, 24).is_err());
+        assert!(Nvfp4Planes::for_shape(u64::MAX, 16).is_err());
+    }
+
+    #[test]
+    fn fp8_planes_match_source_checkpoint_shapes() {
+        // Every FP8 shape of the source checkpoint: the GDN in-projections
+        // and out-projection, and the four attention projections.
+        for (n, k, weight) in [
+            (10240u64, 5120u64, 52_428_800u64),
+            (6144, 5120, 31_457_280),
+            (5120, 6144, 31_457_280),
+            (12288, 5120, 62_914_560),
+            (1024, 5120, 5_242_880),
+        ] {
+            let p = Fp8Planes::for_shape(n, k).unwrap();
+            assert_eq!(p.weight_bytes, weight, "weights for [{n}, {k}]");
+            assert_eq!(p.scale_bytes, 4);
+            assert_eq!(p.total_bytes(), weight + 4);
+        }
+    }
+
+    #[test]
+    fn fp8_planes_reject_bad_shapes() {
+        assert!(Fp8Planes::for_shape(0, 32).is_err());
+        assert!(Fp8Planes::for_shape(16, 0).is_err());
+        assert!(Fp8Planes::for_shape(u64::MAX, 2).is_err());
+        // No group-size constraint: the scale is per tensor.
+        assert!(Fp8Planes::for_shape(3, 7).is_ok());
     }
 
     #[test]
