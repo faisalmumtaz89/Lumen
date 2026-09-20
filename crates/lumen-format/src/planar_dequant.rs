@@ -292,7 +292,14 @@ mod tests {
             );
             tensors += 1;
         }
-        assert!(tensors > 0, "{}: no tensors found", dir.display());
+        // The fixture's exact shape, so a tensor that goes missing from the
+        // directory fails here instead of quietly shrinking the comparison.
+        assert_eq!(
+            (tensors, nvfp4_words, fp8_words),
+            (12, 12_288, 12_288),
+            "{}: unexpected fixture shape",
+            dir.display()
+        );
         println!(
             "bit-identical: {tensors} tensors, {nvfp4_words} NVFP4 and {fp8_words} FP8 values, \
              0 mismatches"
