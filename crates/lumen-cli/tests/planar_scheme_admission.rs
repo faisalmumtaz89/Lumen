@@ -143,8 +143,8 @@ fn the_benchmark_runner_refuses_an_unservable_artifact() {
 #[test]
 fn an_existing_scheme_still_passes_admission() {
     // The control for the rule above: a Q4_0 artifact must reach the same
-    // code path and NOT be refused by it. Whatever happens afterwards is the
-    // behaviour this PR leaves alone.
+    // code path and NOT be refused by it. What the run does after admission
+    // is another test's subject.
     let dir = workdir("q4");
     let artifact = test_checkpoint::write_q4_0_artifact(&dir);
     let (_, stderr) = run_cli(&artifact, &["--simd"]);

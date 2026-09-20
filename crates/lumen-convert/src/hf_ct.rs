@@ -77,8 +77,18 @@ impl HfTensorInfo {
 }
 
 /// A checkpoint's quantization declaration, reduced to what the importer
-/// acts on. Everything else the declaration carries is checked at open time
-/// (see [`preflight`]) and dropped.
+/// acts on. What each dialect's preflight reads before building it:
+///
+/// - ModelOpt: from `hf_quant_config.json`, `quantization.quant_algo` (must
+///   be MIXED_PRECISION), every `quantized_layers` entry (each must name
+///   NVFP4 with group size 16, or FP8 with none) and `exclude_modules`.
+///   From `config.json`, only `quantization_config.quant_method`.
+/// - compressed-tensors: from `config.json`, the whole
+///   `quantization_config` — format, the single config group's targets,
+///   weight spec, both activation specs and `actorder`, and `ignore`.
+///
+/// Neither reads `kv_cache_quant_algo`: it declares a serving-time cache
+/// precision, and the artifact holds weights only.
 #[derive(Debug, Clone)]
 pub struct HfQuantConfig {
     /// Module prefixes excluded from quantization (kept in floating point).

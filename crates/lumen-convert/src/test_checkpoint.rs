@@ -95,7 +95,7 @@ fn rand_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
 }
 
 fn bf16_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
-    // Small finite values: 0x3C00-ish exponents keep every weight around 1.
+    // Small finite values: 0x3F80 is bf16 1.0, so every weight is in [1, 2).
     (0..len)
         .flat_map(|_| {
             *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -410,6 +410,16 @@ mod tests {
             file[begin as usize..(begin + slice.length) as usize].to_vec(),
             slice.quant,
         )
+    }
+
+    #[test]
+    fn the_synthetic_floating_point_weights_are_all_in_one_binade() {
+        let mut seed = 1u64;
+        for pair in bf16_bytes(256, &mut seed).chunks_exact(2) {
+            let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
+            let value = f32::from_bits(bits);
+            assert!((1.0..2.0).contains(&value), "{value}");
+        }
     }
 
     #[test]
