@@ -422,18 +422,12 @@ impl<'a> Importer<'a> {
         }))
     }
 
-    /// Lower a Linear-module weight, and hold the result to what the
-    /// checkpoint declares for that module: a module exported as one scheme
-    /// but declared as another is refused by name, because which one is the
-    /// truth decides how every weight of it is read.
-    fn lower_linear(
-        &self,
-        base: &str,
-        expect_n: usize,
-        expect_k: usize,
-        row_perm: Option<&[usize]>,
-    ) -> Result<Lowered, ConvertError> {
-        let lowered = self.lower_weight(base, expect_n, expect_k, row_perm)?;
+    /// Hold a lowered module to what the checkpoint declares for it: a
+    /// module exported as one scheme but declared as another is refused by
+    /// name, because which one is the truth decides how every weight of it
+    /// is read. Every lowered module passes here, the ones whose weight
+    /// [`Self::lower_linear`] fetched and the one lowered in place.
+    fn check_declared(&self, base: &str, lowered: Lowered) -> Result<Lowered, ConvertError> {
         if let Some(&declared) = self.ckpt.quant.declared.get(base) {
             if lowered.quant != declared {
                 return Err(ConvertError::UnsupportedArchitecture(format!(
@@ -443,6 +437,19 @@ impl<'a> Importer<'a> {
             }
         }
         Ok(lowered)
+    }
+
+    /// Lower a Linear-module weight and hold it to the checkpoint's
+    /// declaration for that module.
+    fn lower_linear(
+        &self,
+        base: &str,
+        expect_n: usize,
+        expect_k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Lowered, ConvertError> {
+        let lowered = self.lower_weight(base, expect_n, expect_k, row_perm)?;
+        self.check_declared(base, lowered)
     }
 
     /// Lower whatever representation the module's tensors carry: planar
@@ -722,8 +729,9 @@ impl<'a> Importer<'a> {
             ));
             // out_proj: [hidden, v_rows]; the v-head reorder permutes its
             // INPUT columns in head-sized blocks.
+            let out_base = self.name(layer, "linear_attn.out_proj");
             let lowered = {
-                let base = self.name(layer, "linear_attn.out_proj");
+                let base = out_base.clone();
                 if let Some((weight, scale)) = self.fetch_fp8_planes(&base, hidden, v_rows)? {
                     // The v-head reorder permutes this tensor's INPUT
                     // columns, in head-sized blocks of one byte per weight.
@@ -794,7 +802,7 @@ impl<'a> Importer<'a> {
                     }
                 }
             };
-            ssm_out = Some(push(lowered, &mut blob));
+            ssm_out = Some(push(self.check_declared(&out_base, lowered)?, &mut blob));
         }
 
         // -- FFN --
@@ -1342,6 +1350,49 @@ mod tests {
         assert!(
             err.contains("rope_theta") && err.contains("500000"),
             "the refusal does not name the scalar and its value: {err}"
+        );
+    }
+
+    /// Convert a synthetic one-layer ModelOpt checkpoint whose
+    /// `quantized_layers` declaration `edit` has rewritten. The modules
+    /// carry NVFP4 MLP and head planes and FP8 GDN projections.
+    fn convert_with_declaration(
+        tag: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<ConvertStats, ConvertError> {
+        use crate::test_checkpoint::{write_checkpoint as write_synthetic, Modules};
+        let dir = std::env::temp_dir().join(format!("lumen-decl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = write_synthetic(&dir, Modules::Nvfp4AndFp8);
+        let path = ckpt.dir.join("hf_quant_config.json");
+        let mut qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        edit(
+            qc["quantization"]["quantized_layers"]
+                .as_object_mut()
+                .unwrap(),
+        );
+        std::fs::write(&path, serde_json::to_vec(&qc).unwrap()).unwrap();
+        convert_hf_ct_to_lbc(&ckpt.dir, &ckpt.donor, &dir.join("out.lbc"))
+    }
+
+    #[test]
+    fn the_gdn_output_projection_must_carry_the_algorithm_it_is_declared_with() {
+        // This module is lowered where the column-block permutation is
+        // applied, off the path the other projections take.
+        let base = "model.layers.0.linear_attn.out_proj";
+        let err = convert_with_declaration("outproj", |layers| {
+            layers.insert(
+                base.to_owned(),
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            );
+        })
+        .expect_err("FP8 out_proj planes declared NVFP4 were converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4") && err.contains("Fp8E4M3"),
+            "the refusal does not name the module and both schemes: {err}"
         );
     }
 
