@@ -130,15 +130,12 @@ fn main() {
             if s.length == 0 {
                 continue;
             }
-            // Verbose only for first GDN and first FULL layer to keep output readable.
-            if li == 0 || (is_gdn && n_gdn == 1) || (!is_gdn && n_full == 1) {
-                // The slice offset is relative to the layer blob; print where
-                // the bytes are in the file.
-                println!(
-                    "{}",
-                    slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
-                );
-            }
+            // The slice offset is relative to the layer blob; print where
+            // the bytes are in the file.
+            println!(
+                "{}",
+                slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
+            );
             let q = format!("{:?}", s.quant);
             let e = quant_tally.entry(q).or_insert((0, 0));
             e.0 += 1;
