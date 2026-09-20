@@ -3,7 +3,9 @@
 //! whose schemes do serve is not touched by that rule.
 //!
 //! The refusal is the point where the CLI stops: it happens before a weight
-//! provider opens, so it holds on a machine with no GPU at all.
+//! provider opens, so it holds on a machine with no GPU at all. The benchmark
+//! runner, the other entry point that opens an artifact from here, refuses on
+//! the same rule.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,6 +107,28 @@ fn one_unservable_layer_slice_is_refused_by_name() {
     assert!(
         stderr.contains("Fp8E4M3") && stderr.contains("no serving kernels for this scheme yet"),
         "the refusal does not name the scheme:\n{stderr}"
+    );
+}
+
+#[test]
+fn the_benchmark_runner_refuses_an_unservable_artifact() {
+    let dir = workdir("bench");
+    let artifact = test_checkpoint::write_artifact(&dir, Modules::Nvfp4AndFp8)
+        .expect("convert the synthetic ModelOpt checkpoint");
+    let err = lumen_bench::runner::ensure_model(&lumen_bench::config::ModelSpec::Path(artifact))
+        .expect_err("the runner resolved an artifact with no serving kernels")
+        .to_string();
+    assert!(
+        err.contains("Nvfp4") && err.contains("no serving kernels for this scheme yet"),
+        "the refusal does not name the scheme: {err}"
+    );
+
+    // The control: an artifact whose scheme serves still resolves.
+    let q4 = test_checkpoint::write_q4_0_artifact(&dir);
+    assert_eq!(
+        lumen_bench::runner::ensure_model(&lumen_bench::config::ModelSpec::Path(q4.clone()))
+            .unwrap(),
+        q4
     );
 }
 
