@@ -1,12 +1,13 @@
-//! HF safetensors checkpoint reader for compressed-tensors "pack-quantized"
-//! INT4 group-32 asymmetric models (the [`QuantScheme::CtInt4G32`] source
-//! dialect).
+//! HF safetensors checkpoint reader for two source dialects: compressed-tensors
+//! "pack-quantized" INT4 group-32 asymmetric models (the
+//! [`QuantScheme::CtInt4G32`] source dialect) and ModelOpt mixed-precision
+//! NVFP4 + FP8 exports.
 //!
 //! Reads a checkpoint directory (`config.json` +
-//! `model.safetensors.index.json` + shards), enforces a strict one-dialect
-//! preflight, and serves exact tensor bytes by name. Anything outside the
-//! supported dialect is rejected at open time with a clear error — never
-//! silently reinterpreted.
+//! `model.safetensors.index.json` + shards), dispatches on the declared
+//! dialect and enforces that dialect's preflight, then serves exact tensor
+//! bytes by name. Anything outside a supported dialect is rejected at open
+//! time with a clear error — never silently reinterpreted.
 //!
 //! [`QuantScheme::CtInt4G32`]: lumen_format::QuantScheme::CtInt4G32
 
@@ -25,6 +26,10 @@ pub enum HfDtype {
     Bf16,
     I32,
     I64,
+    /// Raw bytes: two packed E2M1 nibbles per element.
+    U8,
+    /// 8-bit float, 4 exponent + 3 mantissa bits.
+    F8E4M3,
 }
 
 impl HfDtype {
@@ -35,6 +40,8 @@ impl HfDtype {
             "BF16" => Some(Self::Bf16),
             "I32" => Some(Self::I32),
             "I64" => Some(Self::I64),
+            "U8" => Some(Self::U8),
+            "F8_E4M3" => Some(Self::F8E4M3),
             _ => None,
         }
     }
@@ -44,6 +51,7 @@ impl HfDtype {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 => 2,
             Self::I64 => 8,
+            Self::U8 | Self::F8E4M3 => 1,
         }
     }
 }
@@ -66,10 +74,10 @@ impl HfTensorInfo {
     }
 }
 
-/// The quantization dialect this importer supports, validated at open time.
-/// One accepted configuration; every field is checked against the checkpoint.
+/// A checkpoint's quantization declaration, validated at open time. Every
+/// field is checked against the checkpoint.
 #[derive(Debug, Clone)]
-pub struct CtQuantConfig {
+pub struct HfQuantConfig {
     /// Module prefixes excluded from quantization (kept in floating point).
     pub ignore: Vec<String>,
 }
@@ -79,7 +87,7 @@ pub struct CtQuantConfig {
 pub struct HfCtCheckpoint {
     shard_paths: Vec<PathBuf>,
     tensors: HashMap<String, HfTensorInfo>,
-    pub quant: CtQuantConfig,
+    pub quant: HfQuantConfig,
     pub config: serde_json::Value,
 }
 
@@ -93,13 +101,102 @@ fn read_json(path: &Path) -> Result<serde_json::Value, ConvertError> {
         .map_err(|e| bad(format!("{}: invalid JSON: {e}", path.display())))
 }
 
-/// Validate `quantization_config` against the one supported dialect:
-/// compressed-tensors "pack-quantized", a single group targeting `Linear`
-/// with int4, group-32, asymmetric, group-strategy weights.
-fn preflight(config: &serde_json::Value) -> Result<CtQuantConfig, ConvertError> {
+/// Parse an optional array-of-strings field; absent or null is empty.
+fn string_list(qc: &serde_json::Value, key: &str) -> Result<Vec<String>, ConvertError> {
+    match qc.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter()
+                .map(|entry| {
+                    entry.as_str().map(str::to_owned).ok_or_else(|| {
+                        bad(format!("quantization {key} entry {entry} is not a string"))
+                    })
+                })
+                .collect()
+        }
+        Some(other) => Err(bad(format!("quantization {key} is not an array: {other}"))),
+    }
+}
+
+/// Dispatch on the declared dialect and validate the checkpoint against that
+/// one. A `quant_method` this importer does not implement is refused by name,
+/// never read as one of the dialects it does.
+fn preflight(dir: &Path, config: &serde_json::Value) -> Result<HfQuantConfig, ConvertError> {
     let qc = config
         .get("quantization_config")
         .ok_or_else(|| bad("checkpoint has no quantization_config".into()))?;
+    match qc.get("quant_method").and_then(|v| v.as_str()) {
+        Some("modelopt") => preflight_modelopt(dir),
+        // compressed-tensors either names itself here or omits the key.
+        None | Some("compressed-tensors") => preflight_ct_int4_g32(qc),
+        Some(other) => Err(bad(format!(
+            "unsupported quantization quant_method {other:?} \
+             (need \"compressed-tensors\" or \"modelopt\")"
+        ))),
+    }
+}
+
+/// Validate a ModelOpt mixed-precision export. Which plane each matrix
+/// carries is declared per layer in `hf_quant_config.json`, alongside the
+/// NVFP4 group size — `quantization_config` holds no group size at all.
+fn preflight_modelopt(dir: &Path) -> Result<HfQuantConfig, ConvertError> {
+    let path = dir.join("hf_quant_config.json");
+    if !path.is_file() {
+        return Err(bad(
+            "ModelOpt checkpoint has no hf_quant_config.json (the per-layer \
+             quantization declaration)"
+                .into(),
+        ));
+    }
+    let quant = read_json(&path)?;
+    let q = quant
+        .get("quantization")
+        .ok_or_else(|| bad("hf_quant_config.json has no quantization object".into()))?;
+    let algo = q.get("quant_algo").and_then(|v| v.as_str()).unwrap_or("");
+    if algo != "MIXED_PRECISION" {
+        return Err(bad(format!(
+            "unsupported ModelOpt quant_algo {algo:?} (need \"MIXED_PRECISION\")"
+        )));
+    }
+    let layers = q
+        .get("quantized_layers")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| bad("hf_quant_config.json has no quantized_layers map".into()))?;
+    for (name, spec) in layers {
+        let group_size = spec.get("group_size").unwrap_or(&serde_json::Value::Null);
+        match spec.get("quant_algo").and_then(|v| v.as_str()) {
+            Some("NVFP4") => {
+                if group_size.as_u64() != Some(16) {
+                    return Err(bad(format!(
+                        "layer {name}: unsupported NVFP4 group_size {group_size} (need 16)"
+                    )));
+                }
+            }
+            Some("FP8") => {
+                // FP8 is quantized per tensor here; a group size would mean a
+                // blocked layout with scales this importer does not read.
+                if !group_size.is_null() {
+                    return Err(bad(format!(
+                        "layer {name}: FP8 with group_size {group_size} is not supported"
+                    )));
+                }
+            }
+            other => {
+                return Err(bad(format!(
+                    "layer {name}: unsupported quant_algo {other:?} (need \"NVFP4\" or \"FP8\")"
+                )))
+            }
+        }
+    }
+    Ok(HfQuantConfig {
+        ignore: string_list(q, "exclude_modules")?,
+    })
+}
+
+/// Validate `quantization_config` against the compressed-tensors dialect:
+/// "pack-quantized", a single group targeting `Linear` with int4, group-32,
+/// asymmetric, group-strategy weights.
+fn preflight_ct_int4_g32(qc: &serde_json::Value) -> Result<HfQuantConfig, ConvertError> {
     let fmt = qc.get("format").and_then(|v| v.as_str()).unwrap_or("");
     if fmt != "pack-quantized" {
         return Err(bad(format!(
@@ -180,20 +277,9 @@ fn preflight(config: &serde_json::Value) -> Result<CtQuantConfig, ConvertError> 
     if !field("input_activations").is_null() || !field("output_activations").is_null() {
         return Err(bad("activation quantization is not supported".into()));
     }
-    let mut ignore = Vec::new();
-    match qc.get("ignore") {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::Array(arr)) => {
-            for entry in arr {
-                let s = entry.as_str().ok_or_else(|| {
-                    bad(format!("quantization ignore entry {entry} is not a string"))
-                })?;
-                ignore.push(s.to_owned());
-            }
-        }
-        Some(other) => return Err(bad(format!("quantization ignore is not an array: {other}"))),
-    }
-    Ok(CtQuantConfig { ignore })
+    Ok(HfQuantConfig {
+        ignore: string_list(qc, "ignore")?,
+    })
 }
 
 /// Parse one safetensors header: `u64 LE header length` + JSON map of
@@ -326,7 +412,7 @@ impl HfCtCheckpoint {
     /// Open and fully validate a checkpoint directory.
     pub fn open(dir: &Path) -> Result<Self, ConvertError> {
         let config = read_json(&dir.join("config.json"))?;
-        let quant = preflight(&config)?;
+        let quant = preflight(dir, &config)?;
 
         let index = read_json(&dir.join("model.safetensors.index.json"))?;
         let weight_map = index
@@ -449,6 +535,35 @@ pub(crate) mod test_fixture {
         out.extend_from_slice(&hjson);
         out.extend_from_slice(&data);
         out
+    }
+
+    /// A config.json matching the ModelOpt mixed-precision dialect. The
+    /// per-layer quantization declarations live in `hf_quant_config.json`
+    /// ([`modelopt_quant_config`]), not here.
+    pub(crate) fn modelopt_config() -> serde_json::Value {
+        serde_json::json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "producer": { "name": "modelopt", "version": "0.47.0.dev0" }
+            }
+        })
+    }
+
+    /// An hf_quant_config.json declaring one NVFP4 and one FP8 layer.
+    pub(crate) fn modelopt_quant_config() -> serde_json::Value {
+        serde_json::json!({
+            "producer": { "name": "modelopt", "version": "0.47.0.dev0" },
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": "FP8",
+                "exclude_modules": ["mtp*"],
+                "quantized_layers": {
+                    "model.layers.0.mlp.gate_proj": { "quant_algo": "NVFP4", "group_size": 16 },
+                    "model.layers.0.self_attn.q_proj": { "quant_algo": "FP8" }
+                }
+            }
+        })
     }
 
     /// A config.json matching the one supported dialect.
@@ -666,10 +781,142 @@ mod tests {
             .contains("trailing"));
     }
 
+    const MO_NVFP4: &str = "model.layers.0.mlp.gate_proj";
+    const MO_FP8: &str = "model.layers.0.self_attn.q_proj";
+    const MO_SHARD: &str = "model-00001.safetensors";
+
+    /// Write a ModelOpt checkpoint: `config.json` + `hf_quant_config.json` +
+    /// one shard holding an NVFP4 plane pair and an FP8 plane.
+    fn write_modelopt_checkpoint(
+        dir: &PathBuf,
+        config: &serde_json::Value,
+        quant_config: &serde_json::Value,
+    ) {
+        let packed = format!("{MO_NVFP4}.weight");
+        let scale = format!("{MO_NVFP4}.weight_scale");
+        let fp8 = format!("{MO_FP8}.weight");
+        let shard = shard_bytes(&[
+            (&packed, "U8", &[4, 8], &[0u8; 32]),
+            (&scale, "F8_E4M3", &[4, 1], &[0u8; 4]),
+            (&fp8, "F8_E4M3", &[4, 16], &[0u8; 64]),
+        ]);
+        write_checkpoint(
+            dir,
+            config,
+            &[(MO_SHARD, shard)],
+            &[(&packed, MO_SHARD), (&scale, MO_SHARD), (&fp8, MO_SHARD)],
+        );
+        std::fs::write(
+            dir.join("hf_quant_config.json"),
+            serde_json::to_vec(quant_config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opens_modelopt_mixed_precision_checkpoint() {
+        let dir = temp_dir("modelopt");
+        write_modelopt_checkpoint(
+            &dir,
+            &test_fixture::modelopt_config(),
+            &test_fixture::modelopt_quant_config(),
+        );
+        let ckpt = HfCtCheckpoint::open(&dir).unwrap();
+        // exclude_modules, which only the ModelOpt branch reads: the
+        // compressed-tensors branch refuses this config outright.
+        assert_eq!(ckpt.quant.ignore, vec!["mtp*".to_owned()]);
+        // The two dtypes this dialect adds, each one byte per element.
+        let packed = ckpt.tensor_info(&format!("{MO_NVFP4}.weight")).unwrap();
+        assert_eq!(packed.dtype, HfDtype::U8);
+        assert_eq!(packed.byte_len(), 32);
+        let scale = ckpt
+            .tensor_info(&format!("{MO_NVFP4}.weight_scale"))
+            .unwrap();
+        assert_eq!(scale.dtype, HfDtype::F8E4M3);
+        assert_eq!(scale.byte_len(), 4);
+        assert_eq!(
+            ckpt.tensor_bytes(&format!("{MO_FP8}.weight"))
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_quant_method() {
+        let mut cfg = test_fixture::modelopt_config();
+        cfg["quantization_config"]["quant_method"] = serde_json::json!("awq");
+        let dir = temp_dir("qmethod");
+        write_modelopt_checkpoint(&dir, &cfg, &test_fixture::modelopt_quant_config());
+        let err = HfCtCheckpoint::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("quant_method") && err.contains("awq"),
+            "unknown quant_method not refused by name: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_modelopt_layer_group_size_that_is_not_the_one_supported() {
+        // The group size is declared per layer, inside each NVFP4 entry of
+        // quantized_layers — a wrong one, and an absent one, must both fail.
+        for (layer, patch) in [
+            (
+                MO_NVFP4,
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 32 }),
+            ),
+            (MO_NVFP4, serde_json::json!({ "quant_algo": "NVFP4" })),
+            // FP8 is per tensor and carries no group size at all.
+            (
+                MO_FP8,
+                serde_json::json!({ "quant_algo": "FP8", "group_size": 16 }),
+            ),
+        ] {
+            let mut qc = test_fixture::modelopt_quant_config();
+            qc["quantization"]["quantized_layers"][layer] = patch.clone();
+            let dir = temp_dir("gsize");
+            write_modelopt_checkpoint(&dir, &test_fixture::modelopt_config(), &qc);
+            let err = HfCtCheckpoint::open(&dir).unwrap_err().to_string();
+            assert!(
+                err.contains("group_size") && err.contains(layer),
+                "layer group_size {patch} not refused by name: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_modelopt_unknown_layer_quant_algo() {
+        let mut qc = test_fixture::modelopt_quant_config();
+        qc["quantization"]["quantized_layers"][MO_FP8]["quant_algo"] =
+            serde_json::json!("INT4_AWQ");
+        let dir = temp_dir("algo");
+        write_modelopt_checkpoint(&dir, &test_fixture::modelopt_config(), &qc);
+        let err = HfCtCheckpoint::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("INT4_AWQ") && err.contains(MO_FP8),
+            "unknown layer quant_algo not refused by name: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_modelopt_without_hf_quant_config() {
+        let dir = temp_dir("noqc");
+        write_modelopt_checkpoint(
+            &dir,
+            &test_fixture::modelopt_config(),
+            &test_fixture::modelopt_quant_config(),
+        );
+        std::fs::remove_file(dir.join("hf_quant_config.json")).unwrap();
+        let err = HfCtCheckpoint::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("hf_quant_config.json"),
+            "absent per-layer declaration not refused by name: {err}"
+        );
+    }
+
     #[test]
     fn rejects_unsupported_dtype() {
         let dir = temp_dir("dtype");
-        let shard = shard_bytes(&[("a.weight_packed", "U8", &[4], &[0u8; 4])]);
+        let shard = shard_bytes(&[("a.weight_packed", "F64", &[4], &[0u8; 32])]);
         write_checkpoint(
             &dir,
             &good_config(),

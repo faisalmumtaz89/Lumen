@@ -645,6 +645,16 @@ impl<'a> Importer<'a> {
     }
 }
 
+/// Read a numeric scalar from a checkpoint config, looking inside
+/// `rope_parameters` as well: configs that nest the RoPE scalars there
+/// declare no `rope_theta` at the level above, so a top-level-only lookup
+/// compares nothing at all and a donor with the wrong theta passes.
+fn config_scalar(tc: &serde_json::Value, key: &str) -> Option<f64> {
+    tc.get(key)
+        .or_else(|| tc.get("rope_parameters").and_then(|rp| rp.get(key)))
+        .and_then(|v| v.as_f64())
+}
+
 /// Convert an HF pack-quantized checkpoint directory to LBC, taking
 /// tokenizer + hyperparameter metadata from `donor_gguf` (a GGUF of the
 /// same model).
@@ -756,7 +766,7 @@ pub fn convert_hf_ct_to_lbc(
         ("rope_theta", donor_theta),
         ("rms_norm_eps", f64::from(hp.norm_eps)),
     ] {
-        if let Some(got) = tc.get(key).and_then(|v| v.as_f64()) {
+        if let Some(got) = config_scalar(&tc, key) {
             let tol = want.abs().max(1e-12) * 1e-6;
             if (got - want).abs() > tol {
                 return Err(ConvertError::UnsupportedArchitecture(format!(
@@ -770,7 +780,7 @@ pub fn convert_hf_ct_to_lbc(
     let num_k_heads = gdn.num_k_heads as usize;
     if !ckpt.quant.ignore.is_empty() {
         eprintln!(
-            "  Checkpoint keeps unquantized (compressed-tensors ignore): {}",
+            "  Checkpoint keeps unquantized: {}",
             ckpt.quant.ignore.join(", ")
         );
     }
@@ -999,6 +1009,25 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         *seed >> 33
+    }
+
+    #[test]
+    fn config_scalar_reads_flat_and_nested_rope_theta() {
+        let flat = serde_json::json!({ "rope_theta": 1.0e7, "rms_norm_eps": 1.0e-6 });
+        assert_eq!(config_scalar(&flat, "rope_theta"), Some(1.0e7));
+        assert_eq!(config_scalar(&flat, "rms_norm_eps"), Some(1.0e-6));
+        // The checkpoint shape that made the comparison silently vacuous.
+        let nested = serde_json::json!({
+            "rope_parameters": { "rope_type": "default", "rope_theta": 1.0e7 },
+            "rms_norm_eps": 1.0e-6
+        });
+        assert_eq!(config_scalar(&nested, "rope_theta"), Some(1.0e7));
+        assert_eq!(config_scalar(&nested, "rms_norm_eps"), Some(1.0e-6));
+        // Absent everywhere stays absent: the comparison is skipped, not failed.
+        assert_eq!(config_scalar(&serde_json::json!({}), "rope_theta"), None);
+        // A present non-numeric value is not a number.
+        let textual = serde_json::json!({ "rope_parameters": { "rope_theta": "1e7" } });
+        assert_eq!(config_scalar(&textual, "rope_theta"), None);
     }
 
     fn rand_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
