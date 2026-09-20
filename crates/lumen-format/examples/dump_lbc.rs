@@ -12,6 +12,13 @@ use std::path::Path;
 
 use lumen_format::index::TensorSlice;
 use lumen_format::reader::LbcFile;
+use lumen_format::QuantScheme;
+
+/// One verbose sub-tensor line: name, absolute file offset, length, scheme.
+/// The columns are fixed — a separate instrument parses this exact format.
+fn slice_line(name: &str, off: u64, len: u64, quant: QuantScheme) -> String {
+    format!("        {name:<22} off={off:>12} len={len:>12} quant={quant:?}")
+}
 
 fn main() {
     let path_arg = std::env::args().nth(1).expect("usage: dump_lbc <path.lbc>");
@@ -125,9 +132,11 @@ fn main() {
             }
             // Verbose only for first GDN and first FULL layer to keep output readable.
             if li == 0 || (is_gdn && n_gdn == 1) || (!is_gdn && n_full == 1) {
+                // The slice offset is relative to the layer blob; print where
+                // the bytes are in the file.
                 println!(
-                    "        {name:<22} len={:>12} quant={:?}",
-                    s.length, s.quant
+                    "{}",
+                    slice_line(name, layer.layer_offset_bytes + s.offset, s.length, s.quant)
                 );
             }
             let q = format!("{:?}", s.quant);
@@ -297,4 +306,17 @@ fn main() {
         emb.quant,
         g(emb.length)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_verbose_slice_line_has_fixed_columns() {
+        assert_eq!(
+            slice_line("w_gate", 4096, 2304, QuantScheme::Q4_0),
+            "        w_gate                 off=        4096 len=        2304 quant=Q4_0"
+        );
+    }
 }
