@@ -6,8 +6,6 @@
 
 use std::process::Command;
 
-mod fixture;
-
 fn workdir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "lumen-admission-server-{tag}-{}",
@@ -25,7 +23,8 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
         "this test spawns the server binary: run with --features lumen-server/bin"
     );
     let dir = workdir("nvfp4");
-    let artifact = fixture::write_nvfp4_artifact(&dir);
+    let artifact = lumen_convert::test_checkpoint::write_nvfp4_artifact(&dir)
+        .expect("convert the synthetic ModelOpt checkpoint");
 
     // The rule's own answer for this artifact, before the binary is asked.
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
@@ -62,7 +61,7 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
 #[test]
 fn an_existing_scheme_still_passes_admission() {
     let dir = workdir("q4");
-    let artifact = fixture::write_q4_0_artifact(&dir);
+    let artifact = lumen_convert::test_checkpoint::write_q4_0_artifact(&dir);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lumen_format::serving_rules::unservable_scheme(&lbc), None);
 

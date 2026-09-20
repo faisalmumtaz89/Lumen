@@ -8,8 +8,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-mod fixture;
-
 /// `lumen run` against an artifact, with the CPU backend so the test needs no
 /// GPU. Returns (exit code, stderr).
 fn run_cli(artifact: &Path, extra: &[&str]) -> (Option<i32>, String) {
@@ -46,7 +44,8 @@ fn workdir(tag: &str) -> PathBuf {
 #[test]
 fn an_nvfp4_artifact_is_refused_by_name_on_every_backend() {
     let dir = workdir("nvfp4");
-    let artifact = fixture::write_nvfp4_artifact(&dir);
+    let artifact = lumen_convert::test_checkpoint::write_nvfp4_artifact(&dir)
+        .expect("convert the synthetic ModelOpt checkpoint");
     // The rule's own answer for this artifact, before the binary is asked.
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(
@@ -77,7 +76,7 @@ fn an_existing_scheme_still_passes_admission() {
     // code path and NOT be refused by it. Whatever happens afterwards is the
     // behaviour this PR leaves alone.
     let dir = workdir("q4");
-    let artifact = fixture::write_q4_0_artifact(&dir);
+    let artifact = lumen_convert::test_checkpoint::write_q4_0_artifact(&dir);
     let (_, stderr) = run_cli(&artifact, &["--simd"]);
     assert!(
         !stderr.contains("no serving kernels for this scheme yet"),

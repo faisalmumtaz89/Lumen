@@ -1,8 +1,14 @@
-//! Synthetic artifacts for the admission tests: the smallest ModelOpt
-//! checkpoint the converter accepts, converted to an `.lbc`, and a Q4_0
-//! artifact to act as its control.
+//! Synthetic ModelOpt checkpoint generator for end-to-end testing.
+//!
+//! Writes the smallest checkpoint this importer accepts — one GDN layer with
+//! NVFP4 MLP modules, FP8 GDN projections and an NVFP4 head — plus the donor
+//! GGUF it takes its hyperparameters from, and converts the pair to an
+//! `.lbc`. The counterpart of [`lumen_format::test_model`] for the ModelOpt
+//! import path, so the binaries' admission tests share one source.
 
 use std::path::{Path, PathBuf};
+
+use crate::convert::ConvertError;
 
 const HID: usize = 64;
 const INTER: usize = 64;
@@ -63,7 +69,7 @@ fn shard_bytes(entries: &[(String, &str, Vec<u64>, Vec<u8>)]) -> (Vec<u8>, Strin
 
 /// Write the donor GGUF the converter takes its hyperparameters from.
 fn write_donor(path: &Path) {
-    use lumen_convert::gguf::GgufBuilder;
+    use crate::gguf::GgufBuilder;
     let mut b = GgufBuilder::new();
     b.add_string("general.architecture", "qwen35");
     b.add_u32("qwen35.block_count", 1);
@@ -92,7 +98,7 @@ fn write_donor(path: &Path) {
 
 /// A one-layer ModelOpt checkpoint — NVFP4 MLP and head, FP8 GDN
 /// projections — converted to an `.lbc`. Returns the artifact's path.
-pub fn write_nvfp4_artifact(dir: &Path) -> PathBuf {
+pub fn write_nvfp4_artifact(dir: &Path) -> Result<PathBuf, ConvertError> {
     let mut seed = 42u64;
     let mut entries: Vec<(String, &str, Vec<u64>, Vec<u8>)> = Vec::new();
     let mut quantized: Vec<String> = Vec::new();
@@ -222,10 +228,14 @@ pub fn write_nvfp4_artifact(dir: &Path) -> PathBuf {
     let donor = dir.join("donor.gguf");
     write_donor(&donor);
     let artifact = dir.join("nvfp4.lbc");
-    let stats = lumen_convert::convert_hf::convert_hf_ct_to_lbc(&ckpt, &donor, &artifact)
-        .expect("convert the synthetic ModelOpt checkpoint");
-    assert_eq!(stats.quant_scheme, lumen_format::QuantScheme::Nvfp4);
-    artifact
+    let stats = crate::convert_hf::convert_hf_ct_to_lbc(&ckpt, &donor, &artifact)?;
+    if stats.quant_scheme != lumen_format::QuantScheme::Nvfp4 {
+        return Err(ConvertError::UnsupportedArchitecture(format!(
+            "the synthetic checkpoint converted as {:?}, not Nvfp4",
+            stats.quant_scheme
+        )));
+    }
+    Ok(artifact)
 }
 
 /// A Q4_0 artifact: the control for "an existing scheme is unaffected".

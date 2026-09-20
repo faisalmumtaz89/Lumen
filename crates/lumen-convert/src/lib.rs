@@ -12,4 +12,5 @@ pub(crate) mod hyperparams;
 pub mod sharded;
 pub(crate) mod tensor_io;
 pub(crate) mod tensor_names;
+pub mod test_checkpoint;
 pub mod tokenizer_data;
