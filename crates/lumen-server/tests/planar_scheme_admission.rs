@@ -55,18 +55,25 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
 
-    let (code, stderr) = run_server(&artifact, "cpu");
-    assert_ne!(code, Some(0), "the server started: {stderr}");
-    assert!(
-        stderr.contains("Nvfp4") && stderr.contains("no serving kernels for this scheme yet"),
-        "the refusal does not name the scheme:\n{stderr}"
-    );
-    // It stopped at admission: the provider never opened, so the server
-    // never bound a port.
-    assert!(
-        !stderr.contains("listening"),
-        "the server got past admission:\n{stderr}"
-    );
+    // The named backend and the one the server picks for itself.
+    for backend in ["cpu", "auto"] {
+        let (code, stderr) = run_server(&artifact, backend);
+        assert_ne!(
+            code,
+            Some(0),
+            "backend {backend}: the server started: {stderr}"
+        );
+        assert!(
+            stderr.contains("Nvfp4") && stderr.contains("no serving kernels for this scheme yet"),
+            "backend {backend}: the refusal does not name the scheme:\n{stderr}"
+        );
+        // It stopped at admission: the provider never opened, so the server
+        // never bound a port.
+        assert!(
+            !stderr.contains("listening"),
+            "backend {backend}: the server got past admission:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -116,6 +123,10 @@ fn one_unservable_layer_slice_is_refused_by_name_at_startup() {
 
 #[test]
 fn an_existing_scheme_still_passes_admission() {
+    assert!(
+        cfg!(feature = "bin"),
+        "this test spawns the server binary: run with --features lumen-server/bin"
+    );
     let dir = workdir("q4");
     let artifact = test_checkpoint::write_q4_0_artifact(&dir);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();

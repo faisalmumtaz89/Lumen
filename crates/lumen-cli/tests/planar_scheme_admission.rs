@@ -56,8 +56,16 @@ fn an_nvfp4_artifact_is_refused_by_name_on_every_backend() {
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Nvfp4));
 
-    // Every backend selection the CLI offers on this host, plus the default.
-    for extra in [&[][..], &["--simd"][..], &["--sync"][..], &["--async"][..]] {
+    // Every backend and weight-provider selection the CLI offers on this
+    // host. No flag is the mmap provider, which `--streaming` also takes
+    // with the weights left out of GPU residency.
+    for extra in [
+        &[][..],
+        &["--streaming"][..],
+        &["--simd"][..],
+        &["--sync"][..],
+        &["--async"][..],
+    ] {
         let (code, stderr) = run_cli(&artifact, extra);
         assert_eq!(code, Some(1), "backend {extra:?}: exit code\n{stderr}");
         assert!(
