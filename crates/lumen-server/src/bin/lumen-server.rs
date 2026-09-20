@@ -681,6 +681,16 @@ async fn run(args: Args) -> Result<(), String> {
     // section. Same pattern as `tests/server_soak.rs:289-317`.
     let lbc = lumen_format::reader::LbcFile::open(&lbc_path)
         .map_err(|e| format!("open LBC {lbc_path:?}: {e}"))?;
+
+    // A scheme with no kernels is refused first, from the header and index
+    // alone, before anything else is read out of the artifact — the
+    // tokenizer, the backend choice, the provider. The artifact parses, so
+    // without this it would reach the provider and fail as a missing kernel
+    // or, worse, a misread plane.
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc) {
+        return Err(lumen_format::serving_rules::no_serving_kernels_message(scheme).into());
+    }
+
     let tok_section = lbc
         .tokenizer
         .as_ref()
@@ -711,13 +721,6 @@ async fn run(args: Args) -> Result<(), String> {
     // Resolve the backend first — the weight-provider choice depends on it.
     let backend_choice = select_backend(args.backend);
     eprintln!("[lumen-server] backend: {backend_choice:?}");
-
-    // A scheme with no kernels is refused first, and on every backend: the
-    // artifact parses, so without this it would reach the provider and fail
-    // as a missing kernel or, worse, a misread plane.
-    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc) {
-        return Err(lumen_format::serving_rules::no_serving_kernels_message(scheme).into());
-    }
 
     // CtInt4G32 has CUDA kernels only; no other backend can serve the packed
     // planes. Check the lightweight header/index HERE — per-tensor slices,
