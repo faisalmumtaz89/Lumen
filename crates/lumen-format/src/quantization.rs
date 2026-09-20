@@ -53,6 +53,25 @@ pub enum QuantScheme {
     ///
     /// Dequantization: `w = (q - zp) * scale` per 32-element group along k.
     CtInt4G32,
+    /// NVFP4: 4-bit E2M1 weights with E4M3 block scales over groups of 16
+    /// and one F32 scale for the whole tensor (imported from ModelOpt
+    /// safetensors checkpoints).
+    ///
+    /// A tensor slice with this scheme holds the three source planes
+    /// byte-for-byte, concatenated in fixed order for logical shape `[n, k]`
+    /// (`k % 16 == 0`, two nibbles per byte along k).
+    ///
+    /// Dequantization: `w = E2M1(nibble) * f32(E4M3(block_scale) * scale)`,
+    /// the two scales folded first.
+    Nvfp4,
+    /// FP8: 8-bit E4M3 weights with one F32 scale for the whole tensor
+    /// (imported from ModelOpt safetensors checkpoints).
+    ///
+    /// A tensor slice with this scheme holds both source planes
+    /// byte-for-byte, the weight bytes then the scale.
+    ///
+    /// Dequantization: `w = E4M3(byte) * scale`.
+    Fp8E4M3,
 }
 
 /// Number of elements sharing a scale/zero-point.
@@ -93,6 +112,9 @@ impl QuantScheme {
             Self::Q3_K => 3.0,
             // 4 (packed) + 16/32 (BF16 scale) + 4/32 (packed zero-point).
             Self::CtInt4G32 => 4.625,
+            // 4 (packed) + 8/16 (E4M3 block scale).
+            Self::Nvfp4 => 4.5,
+            Self::Fp8E4M3 => 8.0,
         }
     }
 
@@ -124,6 +146,8 @@ impl QuantScheme {
             Self::Q2_K => 10,
             Self::Q3_K => 11,
             Self::CtInt4G32 => 12,
+            Self::Nvfp4 => 13,
+            Self::Fp8E4M3 => 14,
         }
     }
 
@@ -143,6 +167,8 @@ impl QuantScheme {
             10 => Ok(Self::Q2_K),
             11 => Ok(Self::Q3_K),
             12 => Ok(Self::CtInt4G32),
+            13 => Ok(Self::Nvfp4),
+            14 => Ok(Self::Fp8E4M3),
             _ => Err(crate::FormatError::UnsupportedQuantization(format!(
                 "unknown quant scheme tag: {tag}"
             ))),
@@ -202,7 +228,7 @@ impl CtInt4G32Planes {
 mod tests {
     use super::*;
 
-    const ALL_SCHEMES: [QuantScheme; 13] = [
+    const ALL_SCHEMES: [QuantScheme; 15] = [
         QuantScheme::F32,
         QuantScheme::F16,
         QuantScheme::Bf16,
@@ -216,6 +242,8 @@ mod tests {
         QuantScheme::Q2_K,
         QuantScheme::Q3_K,
         QuantScheme::CtInt4G32,
+        QuantScheme::Nvfp4,
+        QuantScheme::Fp8E4M3,
     ];
 
     #[test]
@@ -229,7 +257,7 @@ mod tests {
 
     #[test]
     fn invalid_tags_return_error() {
-        assert!(QuantScheme::from_u8(13).is_err());
+        assert!(QuantScheme::from_u8(15).is_err());
         assert!(QuantScheme::from_u8(255).is_err());
     }
 
@@ -270,7 +298,7 @@ mod tests {
 
     #[test]
     fn bits_per_weight_correctness() {
-        let expected: [(QuantScheme, f32); 13] = [
+        let expected: [(QuantScheme, f32); 15] = [
             (QuantScheme::F32, 32.0),
             (QuantScheme::F16, 16.0),
             (QuantScheme::Bf16, 16.0),
@@ -286,6 +314,9 @@ mod tests {
             // Effective density including scale + zero-point metadata
             // (4 payload bits + 0.5 scale + 0.125 zero-point per weight).
             (QuantScheme::CtInt4G32, 4.625),
+            // 4 payload bits + 0.5 for the E4M3 scale of every 16 weights.
+            (QuantScheme::Nvfp4, 4.5),
+            (QuantScheme::Fp8E4M3, 8.0),
         ];
         for (scheme, bits) in expected {
             assert_eq!(
@@ -314,6 +345,8 @@ mod tests {
         assert!(QuantScheme::Q2_K.is_quantized());
         assert!(QuantScheme::Q3_K.is_quantized());
         assert!(QuantScheme::CtInt4G32.is_quantized());
+        assert!(QuantScheme::Nvfp4.is_quantized());
+        assert!(QuantScheme::Fp8E4M3.is_quantized());
     }
 
     #[test]
@@ -335,5 +368,7 @@ mod tests {
         assert!(!QuantScheme::Q4_1.is_kquant_superblock());
         assert!(!QuantScheme::Q5_0.is_kquant_superblock());
         assert!(!QuantScheme::CtInt4G32.is_kquant_superblock());
+        assert!(!QuantScheme::Nvfp4.is_kquant_superblock());
+        assert!(!QuantScheme::Fp8E4M3.is_kquant_superblock());
     }
 }

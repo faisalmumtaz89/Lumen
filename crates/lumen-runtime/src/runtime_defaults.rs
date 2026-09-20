@@ -156,7 +156,9 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
         | QuantScheme::Q6_K
         | QuantScheme::Q2_K
         | QuantScheme::Q3_K
-        | QuantScheme::CtInt4G32 => HINT_QUANTISED,
+        | QuantScheme::CtInt4G32
+        | QuantScheme::Nvfp4
+        | QuantScheme::Fp8E4M3 => HINT_QUANTISED,
         // F32/F16 → leave as legacy (HINT_UNSET == 0 means
         // "fall through to legacy default ON" in the resolvers).
         QuantScheme::F32 | QuantScheme::F16 => HINT_UNSET,
