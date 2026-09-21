@@ -5,23 +5,37 @@
 //! Host-only, no GPU: the refusal is decided from what `LbcFile::open`
 //! parsed, before any weight provider opens.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use lumen_convert::test_checkpoint::{self, Modules, Tokenizer};
 use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_scheme};
 use lumen_format::QuantScheme;
+
+/// How long the server is given to refuse and exit. A refusal is decided
+/// before any weight provider opens, so it is immediate; this bound only fires
+/// when the server does not refuse at all, in which case the test fails here
+/// instead of leaving a started server running until CI's own limit.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Start the server on `artifact` and return its stderr. `--port 0` keeps a
 /// successful start from binding a fixed port. The binary needs the `bin`
 /// feature, and Cargo names its path whether or not the feature built it, so
 /// the feature is checked rather than the path trusted: without it the test
 /// fails instead of passing against a stale or absent binary.
+///
+/// The wait is bounded: a server still running at `REFUSAL_TIMEOUT` is killed
+/// and this panics with its stderr, so a server that fails to refuse is a red
+/// test rather than a hang. A refusal writes a few hundred bytes to stderr and
+/// exits well inside the bound.
 fn run_server(artifact: &Path, backend: &str) -> (Option<i32>, String) {
     if !cfg!(feature = "bin") {
         panic!("this test spawns the server binary: run with --features lumen-server/bin");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
         .args([
             "--model",
             artifact.to_str().unwrap(),
@@ -30,8 +44,35 @@ fn run_server(artifact: &Path, backend: &str) -> (Option<i32>, String) {
             "--port",
             "0",
         ])
-        .output()
-        .expect("run lumen-server");
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen-server");
+
+    let deadline = Instant::now() + REFUSAL_TIMEOUT;
+    loop {
+        if child.try_wait().expect("wait for lumen-server").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill lumen-server");
+            let status = child.wait().expect("reap lumen-server");
+            let mut pipe = child.stderr.take().expect("capture server stderr");
+            let mut stderr = Vec::new();
+            pipe.read_to_end(&mut stderr).expect("read server stderr");
+            panic!(
+                "the server did not refuse (backend {backend}); it was killed after {}s with \
+                 status {status:?}:\n{}",
+                REFUSAL_TIMEOUT.as_secs(),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let out = child
+        .wait_with_output()
+        .expect("collect lumen-server output");
     (
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
