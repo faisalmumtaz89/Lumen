@@ -818,7 +818,7 @@ mod tests {
     /// Write a ModelOpt checkpoint: `config.json` + `hf_quant_config.json` +
     /// one shard holding an NVFP4 plane pair and an FP8 plane.
     fn write_modelopt_checkpoint(
-        dir: &PathBuf,
+        dir: &Path,
         config: &serde_json::Value,
         quant_config: &serde_json::Value,
     ) {

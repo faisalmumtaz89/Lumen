@@ -13,8 +13,14 @@ use lumen_format::serving_rules::{scheme_has_no_serving_kernels, unservable_sche
 use lumen_format::QuantScheme;
 
 /// Start the server on `artifact` and return its stderr. `--port 0` keeps a
-/// successful start from binding a fixed port.
+/// successful start from binding a fixed port. The binary needs the `bin`
+/// feature, and Cargo names its path whether or not the feature built it, so
+/// the feature is checked rather than the path trusted: without it the test
+/// fails instead of passing against a stale or absent binary.
 fn run_server(artifact: &Path, backend: &str) -> (Option<i32>, String) {
+    if !cfg!(feature = "bin") {
+        panic!("this test spawns the server binary: run with --features lumen-server/bin");
+    }
     let out = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
         .args([
             "--model",
@@ -44,10 +50,6 @@ fn workdir(tag: &str) -> std::path::PathBuf {
 
 #[test]
 fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
     let dir = workdir("nvfp4");
     let artifact = test_checkpoint::write_artifact(&dir, Modules::Nvfp4AndFp8)
         .expect("convert the synthetic ModelOpt checkpoint");
@@ -79,10 +81,6 @@ fn an_nvfp4_artifact_is_refused_by_name_at_startup() {
 
 #[test]
 fn an_fp8_artifact_is_refused_by_name_at_startup() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
     let dir = workdir("fp8");
     let artifact = test_checkpoint::write_artifact(&dir, Modules::Fp8Only)
         .expect("convert the synthetic ModelOpt checkpoint");
@@ -100,10 +98,6 @@ fn an_fp8_artifact_is_refused_by_name_at_startup() {
 
 #[test]
 fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
     // The header's own scheme serves, so the refusal rests entirely on the
     // per-slice scan past it.
     let dir = workdir("mixed");
@@ -136,10 +130,6 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup()
 
 #[test]
 fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
     // The refusal is decided from what `LbcFile::open` parsed — the header,
     // the index and the tokenizer section — before the tokenizer is built.
     // An artifact with no section parses with none, so it is still refused
@@ -165,10 +155,6 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
 
 #[test]
 fn an_existing_scheme_still_passes_admission() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
     let dir = workdir("q4");
     let artifact = test_checkpoint::write_q4_0_artifact(&dir, Tokenizer::Absent);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
