@@ -1,9 +1,13 @@
 //! LBC structure dumper: prints an artifact's layout and its streamed bytes per token.
 //!
-//! Pure file-structure parse: opens an .lbc via `LbcFile::open` (header + index
-//! only, no weight payload load, no GPU) and prints every top-level tensor and
-//! every per-layer subtensor with name/length/quant, plus the derived overhead
-//! and per-pool streamed-bytes decomposition.
+//! Pure file-structure parse: opens an .lbc via `LbcFile::open`, which reads
+//! and CRC-checks the header, the layer index and the tokenizer section; its
+//! index read is sized `layer_index_offset + num_layers *
+//! MAX_LAYER_INDEX_ENTRY_SIZE`, which on a large model reaches past the
+//! payload offset and pulls the first bytes of the payload into its buffer,
+//! uninterpreted; it does not parse weight data. No GPU, and it prints every
+//! top-level tensor and every per-layer subtensor with name/length/quant,
+//! plus the derived overhead and per-pool streamed-bytes decomposition.
 //!
 //! Run: `cargo run -p lumen-format --example dump_lbc -- <path-to.lbc>`
 
