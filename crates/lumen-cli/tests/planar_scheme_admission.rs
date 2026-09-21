@@ -132,10 +132,10 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
 
 #[test]
 fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_on_a_prompt() {
-    // The refusal is decided from the header and index, so it comes before
-    // anything else the run reads out of the artifact — the tokenizer a
-    // text prompt needs included. An artifact with none is still refused
-    // for its scheme.
+    // The refusal is decided from what `LbcFile::open` parsed — the header,
+    // the index and the tokenizer section — before the tokenizer is built.
+    // An artifact with no section parses with none, so a text prompt still
+    // sees it refused for its scheme, not for the tokenizer it lacks.
     let dir = workdir("no-tokenizer");
     let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
@@ -150,7 +150,7 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_on_a_prompt() {
     );
     assert!(
         !stderr.contains("no embedded tokenizer"),
-        "the tokenizer was read before admission:\n{stderr}"
+        "the missing-tokenizer refusal fired instead of the scheme refusal:\n{stderr}"
     );
 }
 

@@ -2,7 +2,8 @@
 //! kernels, by name, before the weight provider opens — and starts its
 //! admission unchanged for an artifact whose schemes do serve.
 //!
-//! Host-only, no GPU: the refusal is decided from the header and index.
+//! Host-only, no GPU: the refusal is decided from what `LbcFile::open`
+//! parsed, before any weight provider opens.
 
 use std::path::Path;
 use std::process::Command;
@@ -135,9 +136,10 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
         cfg!(feature = "bin"),
         "this test spawns the server binary: run with --features lumen-server/bin"
     );
-    // The refusal is decided from the header and index, so it comes before
-    // anything else the server reads out of the artifact — the tokenizer
-    // included. An artifact with none is still refused for its scheme.
+    // The refusal is decided from what `LbcFile::open` parsed — the header,
+    // the index and the tokenizer section — before the tokenizer is built.
+    // An artifact with no section parses with none, so it is still refused
+    // for its scheme, not for the tokenizer it lacks.
     let dir = workdir("no-tokenizer");
     let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
@@ -152,7 +154,7 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
     );
     assert!(
         !stderr.contains("no embedded tokenizer"),
-        "the tokenizer was read before admission:\n{stderr}"
+        "the missing-tokenizer refusal fired instead of the scheme refusal:\n{stderr}"
     );
 }
 

@@ -925,13 +925,15 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
 
-    // The artifact is opened once, here, and what `LbcFile::open` parses —
-    // the header, the index and the tokenizer section — serves the rest of
-    // the run. A scheme with no kernels is refused first, from that parse,
-    // before the tokenizer is built, before the backend is chosen, before
-    // any weight byte is read. The artifact parses, so without this it
-    // would reach a provider and fail as a missing kernel or, worse, a
-    // misread plane.
+    // This one `LbcFile` serves admission, the prompt tokenizer and the
+    // CtInt4G32 gate; the weight providers open the file again. A scheme
+    // with no kernels is refused first: the refusal is decided from what
+    // `LbcFile::open` parsed — the header, the index and the tokenizer
+    // section (the open's index read may also pull the first bytes of the
+    // payload into its buffer, uninterpreted) — before the tokenizer is
+    // built, before the backend is chosen and before any weight provider
+    // opens. The artifact parses, so without this it would reach a provider
+    // and fail as a missing kernel or, worse, a misread plane.
     let mut lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
         eprintln!("Error parsing model file: {e}");
         std::process::exit(1);
