@@ -1185,6 +1185,9 @@ pub(crate) fn run_inference(args: &[String]) {
             }
         }
     }
+    // The gate above is the last use of the parsed file: in `--tokens` mode
+    // its tokenizer section is still held, and it is not kept through the run.
+    drop(lbc);
 
     if use_async {
         run_with_async(
