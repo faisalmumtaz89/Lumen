@@ -64,12 +64,16 @@ const MAX_LAYER_INDEX_ENTRY_SIZE: usize = 20480;
 impl LbcFile {
     /// Open and parse an LBC file from disk.
     ///
-    /// It reads and CRC-checks the header, the layer index, and the tokenizer
-    /// section. Its index read is sized `layer_index_offset + num_layers *
-    /// MAX_LAYER_INDEX_ENTRY_SIZE`, which on a large model reaches past the
-    /// payload offset and pulls the first bytes of the payload into its buffer,
-    /// uninterpreted; it does not parse weight data. When the file is shorter
-    /// than that index read, the whole file is read instead.
+    /// The header is read and CRC-checked over the header's own bytes. The
+    /// layer index carries no checksum in the format: it is parsed and each
+    /// slice's offset and length are bounds-checked against its layer blob, so
+    /// a corrupted offset that still lies inside the blob is trusted. The
+    /// tokenizer section is read and CRC-checked. The index read is sized
+    /// `layer_index_offset + num_layers * MAX_LAYER_INDEX_ENTRY_SIZE`, which on
+    /// a large model reaches past the payload offset and pulls the first bytes
+    /// of the payload into its buffer, uninterpreted; it does not parse weight
+    /// data. When the file is shorter than that index read, the whole file is
+    /// read instead.
     pub fn open(path: &Path) -> Result<Self, FormatError> {
         let mut file = std::fs::File::open(path)?;
         let file_len = file.metadata()?.len();
