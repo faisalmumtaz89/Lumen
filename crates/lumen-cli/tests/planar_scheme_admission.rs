@@ -111,7 +111,11 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name() {
     // The header's own scheme serves, so the refusal rests entirely on the
     // per-slice scan past it.
     let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Embedded);
+    let artifact = test_checkpoint::write_planar_slice_artifact(
+        &dir,
+        Tokenizer::Embedded,
+        QuantScheme::Fp8E4M3,
+    );
 
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
@@ -137,7 +141,8 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_on_a_prompt() {
     // An artifact with no section parses with none, so a text prompt still
     // sees it refused for its scheme, not for the tokenizer it lacks.
     let dir = workdir("no-tokenizer");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
+    let artifact =
+        test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent, QuantScheme::Fp8E4M3);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert!(lbc.tokenizer.is_none());
     assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
@@ -155,6 +160,71 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_on_a_prompt() {
 }
 
 #[test]
+fn a_ct_int4_slice_is_turned_away_by_the_gate_after_admission() {
+    // CtInt4G32 has CUDA kernels, so admission passes it and the gate after
+    // it decides: on a build without the cuda feature that gate names the
+    // feature; with it, the backend the run was not given.
+    let dir = workdir("ct-int4");
+    let artifact = test_checkpoint::write_planar_slice_artifact(
+        &dir,
+        Tokenizer::Absent,
+        QuantScheme::CtInt4G32,
+    );
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert_eq!(unservable_scheme(&lbc), None);
+    assert!(lbc.uses_quant(QuantScheme::CtInt4G32));
+
+    let (code, stderr) = run_cli(&artifact, &["--simd"]);
+    assert_eq!(code, Some(1), "exit code\n{stderr}");
+    assert!(
+        !stderr.contains("no serving kernels for this scheme yet"),
+        "admission refused a scheme that has kernels:\n{stderr}"
+    );
+    let expected = if cfg!(feature = "cuda") {
+        "this model (CtInt4G32) requires the CUDA backend (--cuda)"
+    } else {
+        "this model (CtInt4G32) requires a lumen build with the `cuda` feature"
+    };
+    assert!(
+        stderr.contains(expected),
+        "the CtInt4G32 gate did not fire, or not with its message:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_text_prompt_reaches_the_embedded_tokenizer_past_admission() {
+    // A servable artifact with a tokenizer section: admission passes it and
+    // the run builds the tokenizer from the section the open parsed. The
+    // placeholder vocabulary has no merges, so tokenizing the prompt yields
+    // nothing, and that is where the run stops.
+    let dir = workdir("prompt");
+    let artifact = test_checkpoint::write_q4_0_artifact(&dir, Tokenizer::Embedded);
+    let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
+    assert_eq!(unservable_scheme(&lbc), None);
+    assert_eq!(lbc.tokenizer.as_ref().map(|t| t.tokens.len()), Some(32));
+
+    let (code, stderr) = run_cli_prompt(&artifact, &["--simd"]);
+    assert!(
+        !stderr.contains("no serving kernels for this scheme yet")
+            && !stderr.contains("no embedded tokenizer"),
+        "the run did not get past admission and the tokenizer:\n{stderr}"
+    );
+    assert_eq!(code, Some(1), "exit code\n{stderr}");
+    // The whole of what the run printed, apart from the warnings the binary
+    // gives about the test harness's own environment variables: nothing
+    // before the tokenizer's empty answer, nothing after it.
+    let printed: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("[lumen] WARNING: "))
+        .collect();
+    assert_eq!(
+        printed,
+        ["Error: prompt produced no tokens after tokenization"],
+        "the run did not stop where the placeholder tokenizer leaves it:\n{stderr}"
+    );
+}
+
+#[test]
 fn the_benchmark_runner_refuses_an_unservable_artifact() {
     let dir = workdir("bench");
     let artifact = test_checkpoint::write_artifact(&dir, Modules::Nvfp4AndFp8)
@@ -168,7 +238,7 @@ fn the_benchmark_runner_refuses_an_unservable_artifact() {
     );
 
     // The control: an artifact whose scheme serves still resolves.
-    let q4 = test_checkpoint::write_q4_0_artifact(&dir);
+    let q4 = test_checkpoint::write_q4_0_artifact(&dir, Tokenizer::Absent);
     assert_eq!(
         lumen_bench::runner::ensure_model(&lumen_bench::config::ModelSpec::Path(q4.clone()))
             .unwrap(),
@@ -182,7 +252,7 @@ fn an_existing_scheme_still_passes_admission() {
     // code path and NOT be refused by it. What the run does after admission
     // is another test's subject.
     let dir = workdir("q4");
-    let artifact = test_checkpoint::write_q4_0_artifact(&dir);
+    let artifact = test_checkpoint::write_q4_0_artifact(&dir, Tokenizer::Absent);
     let (_, stderr) = run_cli(&artifact, &["--simd"]);
     assert!(
         !stderr.contains("no serving kernels for this scheme yet"),

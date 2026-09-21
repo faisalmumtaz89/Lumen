@@ -366,8 +366,34 @@ pub fn write_artifact(dir: &Path, modules: Modules) -> Result<PathBuf, ConvertEr
     Ok(artifact)
 }
 
-/// A Q4_0 artifact: the control for "an existing scheme is unaffected".
-pub fn write_q4_0_artifact(dir: &Path) -> PathBuf {
+pub use lumen_format::test_model::Tokenizer;
+
+/// A Q4_0 artifact, with a placeholder tokenizer section when `tokenizer`
+/// says so: the control for "an existing scheme is unaffected".
+pub fn write_q4_0_artifact(dir: &Path, tokenizer: Tokenizer) -> PathBuf {
+    let path = dir.join("q4_0.lbc");
+    std::fs::write(&path, q4_0_bytes(tokenizer, |_| {})).unwrap();
+    path
+}
+
+/// A Q4_0 artifact with one layer slice retagged `scheme`: the header's own
+/// scheme serves, so a check on the per-slice scan past it rests on that
+/// slice alone. `lumen convert` writes no such artifact — a planar module
+/// anywhere makes the primary planar — so it is rewritten from a Q4_0
+/// artifact's own parts, which holds that scan to a file a binary actually
+/// opens.
+pub fn write_planar_slice_artifact(
+    dir: &Path,
+    tokenizer: Tokenizer,
+    scheme: QuantScheme,
+) -> PathBuf {
+    let path = dir.join("planar-slice.lbc");
+    let bytes = q4_0_bytes(tokenizer, |index| index[0].subtensors.w_gate.quant = scheme);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn q4_0_bytes(tokenizer: Tokenizer, edit: impl FnOnce(&mut [lumen_format::LayerIndex])) -> Vec<u8> {
     let bytes = lumen_format::test_model::generate_test_model_q4_0(
         &lumen_format::test_model::TestModelQ4Config {
             num_layers: 1,
@@ -381,27 +407,7 @@ pub fn write_q4_0_artifact(dir: &Path) -> PathBuf {
             seed: 7,
         },
     );
-    let path = dir.join("q4_0.lbc");
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
-pub use lumen_format::test_model::Tokenizer;
-
-/// A Q4_0 artifact with one layer slice retagged FP8: the header's own
-/// scheme serves, so admission has to rest on the per-slice scan past it.
-/// `lumen convert` writes no such artifact — a planar module anywhere makes
-/// the primary planar — so it is rewritten from a Q4_0 artifact's own parts,
-/// which holds that scan to a file a binary actually opens.
-pub fn write_planar_slice_artifact(dir: &Path, tokenizer: Tokenizer) -> PathBuf {
-    let q4 = write_q4_0_artifact(dir);
-    let bytes =
-        lumen_format::test_model::rewrite(&std::fs::read(&q4).unwrap(), tokenizer, |index| {
-            index[0].subtensors.w_gate.quant = QuantScheme::Fp8E4M3
-        });
-    let path = dir.join("planar-slice.lbc");
-    std::fs::write(&path, bytes).unwrap();
-    path
+    lumen_format::test_model::rewrite(&bytes, tokenizer, edit)
 }
 
 #[cfg(test)]

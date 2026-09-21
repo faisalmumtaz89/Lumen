@@ -107,7 +107,11 @@ fn a_planar_layer_slice_under_a_servable_primary_is_refused_by_name_at_startup()
     // The header's own scheme serves, so the refusal rests entirely on the
     // per-slice scan past it.
     let dir = workdir("mixed");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Embedded);
+    let artifact = test_checkpoint::write_planar_slice_artifact(
+        &dir,
+        Tokenizer::Embedded,
+        QuantScheme::Fp8E4M3,
+    );
 
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(lbc.header.quantization.scheme, QuantScheme::Q4_0);
@@ -141,7 +145,8 @@ fn an_unservable_artifact_with_no_tokenizer_is_refused_by_scheme_at_startup() {
     // An artifact with no section parses with none, so it is still refused
     // for its scheme, not for the tokenizer it lacks.
     let dir = workdir("no-tokenizer");
-    let artifact = test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent);
+    let artifact =
+        test_checkpoint::write_planar_slice_artifact(&dir, Tokenizer::Absent, QuantScheme::Fp8E4M3);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert!(lbc.tokenizer.is_none());
     assert_eq!(unservable_scheme(&lbc), Some(QuantScheme::Fp8E4M3));
@@ -165,7 +170,7 @@ fn an_existing_scheme_still_passes_admission() {
         "this test spawns the server binary: run with --features lumen-server/bin"
     );
     let dir = workdir("q4");
-    let artifact = test_checkpoint::write_q4_0_artifact(&dir);
+    let artifact = test_checkpoint::write_q4_0_artifact(&dir, Tokenizer::Absent);
     let lbc = lumen_format::reader::LbcFile::open(&artifact).unwrap();
     assert_eq!(unservable_scheme(&lbc), None);
 
