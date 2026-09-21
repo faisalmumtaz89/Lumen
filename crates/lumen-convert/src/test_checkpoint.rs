@@ -386,84 +386,21 @@ pub fn write_q4_0_artifact(dir: &Path) -> PathBuf {
     path
 }
 
-/// Whether a synthetic artifact carries a tokenizer section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tokenizer {
-    /// A placeholder vocabulary of `VOCAB` tokens, built here: the Q4_0
-    /// artifact this one is reassembled from has no tokenizer section, and
-    /// the server reads that section before it can be driven at all.
-    Embedded,
-    /// No section at all: what a binary sees before it has one to build.
-    Absent,
-}
+pub use lumen_format::test_model::Tokenizer;
 
 /// A Q4_0 artifact with one layer slice retagged FP8: the header's own
 /// scheme serves, so admission has to rest on the per-slice scan past it.
 /// `lumen convert` writes no such artifact — a planar module anywhere makes
-/// the primary planar — so it is reassembled here from a Q4_0 artifact's own
-/// parts, which holds that scan to a file a binary actually opens.
+/// the primary planar — so it is rewritten from a Q4_0 artifact's own parts,
+/// which holds that scan to a file a binary actually opens.
 pub fn write_planar_slice_artifact(dir: &Path, tokenizer: Tokenizer) -> PathBuf {
     let q4 = write_q4_0_artifact(dir);
-    let source = lumen_format::reader::LbcFile::open(&q4).unwrap();
-    let bytes = std::fs::read(&q4).unwrap();
-    let at = |off: u64, len: u64| bytes[off as usize..(off + len) as usize].to_vec();
-
-    // The writer CRCs the header bytes as it serializes them, so the field
-    // has to be back at its pre-checksum value first.
-    let mut header = source.header.clone();
-    header.header_checksum = 0;
-    let mut indices = source.layer_indices.clone();
-    indices[0].subtensors.w_gate.quant = QuantScheme::Fp8E4M3;
-    let blobs: Vec<Vec<u8>> = source
-        .layer_indices
-        .iter()
-        .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
-        .collect();
-
-    let section = match tokenizer {
-        Tokenizer::Embedded => Some(lumen_format::tokenizer::TokenizerSection {
-            model_type: "gpt2".into(),
-            pre_tokenizer: "default".into(),
-            tokens: (0..VOCAB).map(|i| format!("t{i}")).collect(),
-            token_types: Vec::new(),
-            scores: Vec::new(),
-            merges: Vec::new(),
-            bos_token_id: 0,
-            eos_token_id: 1,
-            pad_token_id: None,
-            add_bos_token: false,
-            add_eos_token: false,
-            add_space_prefix: false,
-            chat_template: None,
-        }),
-        Tokenizer::Absent => None,
-    };
-
+    let bytes =
+        lumen_format::test_model::rewrite(&std::fs::read(&q4).unwrap(), tokenizer, |index| {
+            index[0].subtensors.w_gate.quant = QuantScheme::Fp8E4M3
+        });
     let path = dir.join("planar-slice.lbc");
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-    lumen_format::writer::write_lbc(
-        &mut out,
-        &header,
-        &indices,
-        &lumen_format::GlobalTensors {
-            embedding: at(
-                source.header.embedding.offset,
-                source.header.embedding.length,
-            ),
-            final_norm: at(
-                source.header.final_norm.offset,
-                source.header.final_norm.length,
-            ),
-            output_proj: at(
-                source.header.output_proj.offset,
-                source.header.output_proj.length,
-            ),
-        },
-        &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-        section.as_ref(),
-    )
-    .unwrap();
-    drop(out);
+    std::fs::write(&path, bytes).unwrap();
     path
 }
 

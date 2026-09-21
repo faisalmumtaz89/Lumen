@@ -473,62 +473,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The same artifact with a tokenizer section appended, so the header's
-    /// tokenizer offset and length are set. The test models embed none.
-    fn with_tokenizer(bytes: &[u8]) -> Vec<u8> {
-        let src = LbcFile::from_bytes(bytes, std::path::PathBuf::from("src.lbc")).unwrap();
-        let at = |off: u64, len: u64| bytes[off as usize..(off + len) as usize].to_vec();
-        // The writer checksums the header bytes it serializes, so the field
-        // goes back to its pre-checksum value first.
-        let mut header = src.header.clone();
-        header.header_checksum = 0;
-        let blobs: Vec<Vec<u8>> = src
-            .layer_indices
-            .iter()
-            .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
-            .collect();
-        let section = lumen_format::tokenizer::TokenizerSection {
-            model_type: "gpt2".into(),
-            pre_tokenizer: "default".into(),
-            tokens: (0..header.hyperparams.vocab_size)
-                .map(|i| format!("t{i}"))
-                .collect(),
-            token_types: Vec::new(),
-            scores: Vec::new(),
-            merges: Vec::new(),
-            bos_token_id: 0,
-            eos_token_id: 1,
-            pad_token_id: None,
-            add_bos_token: false,
-            add_eos_token: false,
-            add_space_prefix: false,
-            chat_template: None,
-        };
-        let mut out = Vec::new();
-        lumen_format::writer::write_lbc(
-            &mut out,
-            &header,
-            &src.layer_indices,
-            &lumen_format::GlobalTensors {
-                embedding: at(header.embedding.offset, header.embedding.length),
-                final_norm: at(header.final_norm.offset, header.final_norm.length),
-                output_proj: at(header.output_proj.offset, header.output_proj.length),
-            },
-            &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-            Some(&section),
-        )
-        .unwrap();
-        out
-    }
-
     #[test]
     fn the_header_section_prints_every_field_it_names_once() {
-        let bytes = with_tokenizer(&lumen_format::test_model::generate_test_model_q8_0_gdn(
-            &lumen_format::test_model::TestModelQ8Config {
-                num_layers: 3,
-                ..Default::default()
-            },
-        ));
+        // The test models embed no tokenizer, so one is added to set the
+        // header's tokenizer offset and length.
+        let bytes = lumen_format::test_model::rewrite(
+            &lumen_format::test_model::generate_test_model_q8_0_gdn(
+                &lumen_format::test_model::TestModelQ8Config {
+                    num_layers: 3,
+                    ..Default::default()
+                },
+            ),
+            lumen_format::test_model::Tokenizer::Embedded,
+            |_| {},
+        );
         let path = std::env::temp_dir().join(format!("lumen-dump-flds-{}.lbc", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let lbc = LbcFile::open(&path).unwrap();
