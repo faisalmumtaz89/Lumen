@@ -389,7 +389,9 @@ pub fn write_q4_0_artifact(dir: &Path) -> PathBuf {
 /// Whether a synthetic artifact carries a tokenizer section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tokenizer {
-    /// The placeholder vocabulary the donor GGUF carries.
+    /// A placeholder vocabulary of `VOCAB` tokens, built here: the Q4_0
+    /// artifact this one is reassembled from has no tokenizer section, and
+    /// the server reads that section before it can be driven at all.
     Embedded,
     /// No section at all: what a binary sees before it has one to build.
     Absent,
