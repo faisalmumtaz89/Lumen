@@ -11,10 +11,9 @@ use std::process::Command;
 
 #[test]
 fn a_removed_env_name_refuses_server_startup_with_its_remedy() {
-    assert!(
-        cfg!(feature = "bin"),
-        "this test spawns the server binary: run with --features lumen-server/bin"
-    );
+    if !cfg!(feature = "bin") {
+        panic!("this test spawns the server binary: run with --features lumen-server/bin");
+    }
     let bin = env!("CARGO_BIN_EXE_lumen-server");
     for (name, remedy) in lumen_runtime::runtime_defaults::REMOVED_LUMEN_ENV_VARS {
         let out = Command::new(bin)
