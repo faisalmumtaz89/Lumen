@@ -65,10 +65,11 @@ impl LbcFile {
     /// Open and parse an LBC file from disk.
     ///
     /// The header is read and CRC-checked over the header's own bytes. The
-    /// layer index carries no checksum in the format: it is parsed and each
-    /// slice's offset and length are bounds-checked against its layer blob, so
-    /// a corrupted offset that still lies inside the blob is trusted. The
-    /// tokenizer section is read and CRC-checked. The index read is sized
+    /// layer index is trusted, not verified: the format carries no checksum for
+    /// it, so the index is parsed and each slice's offset and length are
+    /// bounds-checked against its layer blob, but a corrupted offset that still
+    /// lies inside the blob is used as-is. The tokenizer section is read and
+    /// CRC-checked. The index read is sized
     /// `layer_index_offset + num_layers * MAX_LAYER_INDEX_ENTRY_SIZE`, which on
     /// a large model reaches past the payload offset and pulls the first bytes
     /// of the payload into its buffer, uninterpreted; it does not parse weight
