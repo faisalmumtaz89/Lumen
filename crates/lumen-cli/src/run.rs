@@ -925,12 +925,12 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
 
-    // A scheme with no kernels is refused first, from the header and index
-    // alone, before anything else is read out of the artifact — the
-    // tokenizer a text prompt needs, the backend choice, every provider.
-    // The artifact parses, so without this it would reach a provider and
-    // fail as a missing kernel or, worse, a misread plane. An artifact that
-    // does not parse is reported where it is next opened.
+    // A scheme with no kernels is refused first, from what `LbcFile::open`
+    // parses — the header, the index and the tokenizer section — before the
+    // tokenizer is built, before the backend is chosen, before any weight
+    // byte is read. The artifact parses, so without this it would reach a
+    // provider and fail as a missing kernel or, worse, a misread plane. An
+    // artifact that does not parse is reported where it is next opened.
     if let Some(scheme) = lumen_format::reader::LbcFile::open(path)
         .ok()
         .as_ref()

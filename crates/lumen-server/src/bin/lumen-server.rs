@@ -682,11 +682,11 @@ async fn run(args: Args) -> Result<(), String> {
     let lbc = lumen_format::reader::LbcFile::open(&lbc_path)
         .map_err(|e| format!("open LBC {lbc_path:?}: {e}"))?;
 
-    // A scheme with no kernels is refused first, from the header and index
-    // alone, before anything else is read out of the artifact — the
-    // tokenizer, the backend choice, the provider. The artifact parses, so
-    // without this it would reach the provider and fail as a missing kernel
-    // or, worse, a misread plane.
+    // A scheme with no kernels is refused first, from what the open above
+    // parsed — the header, the index and the tokenizer section — before the
+    // tokenizer is built, before the backend is chosen, before any weight
+    // byte is read. The artifact parses, so without this it would reach the
+    // provider and fail as a missing kernel or, worse, a misread plane.
     if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc) {
         return Err(lumen_format::serving_rules::no_serving_kernels_message(scheme).into());
     }
