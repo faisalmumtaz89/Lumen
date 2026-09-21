@@ -925,17 +925,18 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
 
-    // A scheme with no kernels is refused first, from what `LbcFile::open`
-    // parses — the header, the index and the tokenizer section — before the
-    // tokenizer is built, before the backend is chosen, before any weight
-    // byte is read. The artifact parses, so without this it would reach a
-    // provider and fail as a missing kernel or, worse, a misread plane. An
-    // artifact that does not parse is reported where it is next opened.
-    if let Some(scheme) = lumen_format::reader::LbcFile::open(path)
-        .ok()
-        .as_ref()
-        .and_then(lumen_format::serving_rules::unservable_scheme)
-    {
+    // The artifact is opened once, here, and what `LbcFile::open` parses —
+    // the header, the index and the tokenizer section — serves the rest of
+    // the run. A scheme with no kernels is refused first, from that parse,
+    // before the tokenizer is built, before the backend is chosen, before
+    // any weight byte is read. The artifact parses, so without this it
+    // would reach a provider and fail as a missing kernel or, worse, a
+    // misread plane.
+    let mut lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
+        eprintln!("Error parsing model file: {e}");
+        std::process::exit(1);
+    });
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc) {
         eprintln!(
             "Error: {}",
             lumen_format::serving_rules::no_serving_kernels_message(scheme)
@@ -965,12 +966,9 @@ pub(crate) fn run_inference(args: &[String]) {
             eprintln!("Error: --prompt must not be empty");
             std::process::exit(1);
         }
-        // Load tokenizer from LBC file header (targeted seek, not full-file read).
-        let lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
-            eprintln!("Error parsing model file: {e}");
-            std::process::exit(1);
-        });
-        let tok_section = lbc.tokenizer.unwrap_or_else(|| {
+        // The tokenizer section the open above parsed, taken so the file
+        // stays usable for the checks after it.
+        let tok_section = lbc.tokenizer.take().unwrap_or_else(|| {
             eprintln!("Error: This model has no embedded tokenizer (LBC v2).");
             eprintln!("Re-convert with: lumen convert --input model.gguf --output model.lbc");
             std::process::exit(1);
@@ -1154,15 +1152,13 @@ pub(crate) fn run_inference(args: &[String]) {
         save_path: session_save_path.clone(),
     };
 
-    // CtInt4G32 has CUDA kernels only. Reject here — from the lightweight
-    // header/index, before any provider opens or multi-GB global expansion —
-    // so every run mode (async/sync/mmap, CPU/Metal) fails fast with the
-    // same message instead of misreading packed planes downstream. The scan
-    // covers per-tensor slices, not just the primary scheme.
+    // CtInt4G32 has CUDA kernels only. Reject here — from the index the
+    // open above parsed, before any provider opens or multi-GB global
+    // expansion — so every run mode (async/sync/mmap, CPU/Metal) fails fast
+    // with the same message instead of misreading packed planes downstream.
+    // The scan covers per-tensor slices, not just the primary scheme.
     {
-        let has_ct4 = lumen_format::reader::LbcFile::open(path)
-            .map(|lbc| lbc.uses_quant(QuantScheme::CtInt4G32))
-            .unwrap_or(false);
+        let has_ct4 = lbc.uses_quant(QuantScheme::CtInt4G32);
         if has_ct4 {
             if !cfg!(feature = "cuda") {
                 eprintln!(
