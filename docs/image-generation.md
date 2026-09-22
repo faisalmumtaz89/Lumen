@@ -60,6 +60,7 @@ curl http://localhost:8000/v1/images/generations \
 | `num_inference_steps` | `40` | 1–200 |
 | `seed` | `42` | any `u64` |
 | `true_cfg_scale` | `1.0` | must be `1.0`: one conditional pass per step, no negative prompt |
+| `n` | `1` | must be `1`: one image per request |
 | `response_format` | `b64_json` | `b64_json` or `url` (a `data:` URL carrying the same bytes) |
 | `output_format` | `png` | `png` only |
 

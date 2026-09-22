@@ -8,7 +8,8 @@
 //! `merges.txt`, which is what the reference tokenizer loads. The pre-tokenizer
 //! is the Qwen family's: a GPT-2-style pattern, then byte-level mapping.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -267,32 +268,56 @@ impl Tokenizer {
 
     /// Encode one pre-tokenized word with the BPE merge loop.
     fn encode_word(&self, word: &str) -> Option<Vec<u32>> {
-        // Symbols are indices into a growing pool, and each carries its own
-        // byte buffer, so a merge replaces a pair with one entry rather than
-        // rebuilding strings. The pair scan is over a linked list of live
-        // symbols, so a merge costs its neighbourhood rather than the word.
+        // The live symbols form a linked list over their starting positions,
+        // and every adjacent pair with a merge rule sits in a min-heap keyed by
+        // (rank, position): the lowest-ranked pair merges first, the leftmost on
+        // a tie — the reference's order. A merge folds the right symbol into
+        // the left and queues only the two pairs it creates, so a word costs
+        // O(n log n) heap work rather than a rescan per merge, plus string work
+        // proportional to the merged symbols' lengths (bounded by the longest
+        // vocabulary token). Entries a merge made stale are dropped when
+        // popped: their pair no longer has that rank.
         let mut syms: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-        if syms.is_empty() {
+        let n = syms.len();
+        if n == 0 {
             return None;
         }
-        loop {
-            let mut best: Option<(usize, u32)> = None;
-            for i in 0..syms.len().saturating_sub(1) {
-                // Borrow rather than clone: the map lookup takes &str.
-                let pair = format!("{} {}", syms[i], syms[i + 1]);
-                if let Some(&rank) = self.merges.get(&pair) {
-                    if best.map_or(true, |(_, r)| rank < r) {
-                        best = Some((i, rank));
-                    }
+        let rank = |a: &str, b: &str| self.merges.get(&format!("{a} {b}")).copied();
+        // `n` marks "no neighbour" on either side.
+        let mut prev: Vec<usize> = (0..n).map(|i| if i == 0 { n } else { i - 1 }).collect();
+        let mut next: Vec<usize> = (1..=n).collect();
+        let mut heap = BinaryHeap::new();
+        for i in 0..n - 1 {
+            if let Some(r) = rank(&syms[i], &syms[i + 1]) {
+                heap.push(Reverse((r, i)));
+            }
+        }
+        while let Some(Reverse((r, i))) = heap.pop() {
+            let j = next[i];
+            // A folded-away symbol has an empty string, which no rule names.
+            if j == n || syms[i].is_empty() || rank(&syms[i], &syms[j]) != Some(r) {
+                continue;
+            }
+            let right = std::mem::take(&mut syms[j]);
+            syms[i].push_str(&right);
+            next[i] = next[j];
+            if next[i] < n {
+                prev[next[i]] = i;
+                if let Some(r) = rank(&syms[i], &syms[next[i]]) {
+                    heap.push(Reverse((r, i)));
                 }
             }
-            let Some((i, _)) = best else { break };
-            let merged = format!("{}{}", syms[i], syms[i + 1]);
-            syms.splice(i..i + 2, [merged]);
+            if prev[i] < n {
+                if let Some(r) = rank(&syms[prev[i]], &syms[i]) {
+                    heap.push(Reverse((r, prev[i])));
+                }
+            }
         }
-        let mut ids = Vec::with_capacity(syms.len());
-        for s in syms {
-            ids.push(*self.encoder.get(&s)?);
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < n {
+            ids.push(*self.encoder.get(&syms[i])?);
+            i = next[i];
         }
         Some(ids)
     }

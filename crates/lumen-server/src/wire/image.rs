@@ -25,6 +25,10 @@ pub struct ImageGenerationRequest {
     pub true_cfg_scale: f32,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Images per request. One is generated; any other count is refused
+    /// rather than answered with fewer images than asked for.
+    #[serde(default = "default_n")]
+    pub n: usize,
     /// `"b64_json"` (default) or `"url"`.
     #[serde(default = "default_response_format")]
     pub response_format: String,
@@ -41,6 +45,9 @@ fn default_steps() -> usize {
 }
 fn default_guidance() -> f32 {
     1.0
+}
+fn default_n() -> usize {
+    1
 }
 fn default_response_format() -> String {
     "b64_json".to_string()
@@ -103,6 +110,17 @@ impl ImageGenerationRequest {
             return Err(format!(
                 "num_inference_steps {} exceeds the {MAX_STEPS} maximum",
                 self.num_inference_steps
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the request asks for the one image a generation produces.
+    pub fn check_n(&self) -> Result<(), String> {
+        if self.n != 1 {
+            return Err(format!(
+                "n is {}: one image is generated per request",
+                self.n
             ));
         }
         Ok(())
@@ -181,6 +199,21 @@ mod tests {
             "past the step cap"
         );
         assert!(mk("512x512", 200).check_steps().is_ok(), "at the step cap");
+    }
+
+    /// Any count but one is refused: fewer images than asked for is a wrong
+    /// answer, not a partial one.
+    #[test]
+    fn n_must_be_one() {
+        let parse = |body: &str| serde_json::from_str::<ImageGenerationRequest>(body).unwrap();
+        assert!(parse(r#"{"prompt":"x"}"#).check_n().is_ok());
+        assert!(parse(r#"{"prompt":"x","n":1}"#).check_n().is_ok());
+        for n in [0, 2, 4] {
+            let err = parse(&format!(r#"{{"prompt":"x","n":{n}}}"#))
+                .check_n()
+                .unwrap_err();
+            assert!(err.contains(&format!("n is {n}")), "{err}");
+        }
     }
 
     /// A non-finite guidance scale would silently compare false against every
