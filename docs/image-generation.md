@@ -8,11 +8,13 @@ CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in wi
 
 - NVIDIA CUDA, compute capability 8.0+ (the CPU path exists for reference checks only
   and takes minutes per image).
-- Device memory for the image components alone: the text encoder's language tower
-  (14.1 GiB of BF16 weights), the transformer (13.3 GiB) and the VAE decoder (about 1 GiB)
-  load one at a time, so a 32 GiB card holds the pipeline. A text model served on the
-  same device is evicted for the duration of each generation and restored before the
-  response is returned (see below).
+- Device memory: the text encoder's language tower (14.1 GiB of BF16 weights), the
+  transformer (13.3 GiB) and the VAE decoder (about 1 GiB) load one at a time, and a
+  generation's device memory peaks at 15.5 GiB for a 1024×1024 image and 21.0 GiB for a
+  2048×2048 one (the VAE decode). The server refuses to start on a device with less than
+  21.0 GiB in total, naming both amounts. A text model served on the same device is
+  evicted for the duration of each generation and restored before the response is
+  returned (see below).
 
 ## Convert the checkpoint
 
