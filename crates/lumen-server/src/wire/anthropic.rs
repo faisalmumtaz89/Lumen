@@ -178,6 +178,7 @@ impl MessagesRequest {
             max_tokens: self.max_tokens,
             stop_text: self.stop_sequences,
             eos_token_ids: eos,
+            ignore_eos: false,
             sampling,
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
             enable_thinking,

@@ -1651,6 +1651,7 @@ fn make_job_request(max_tokens: usize) -> JobRequest {
         max_tokens,
         stop_text: Vec::new(),
         eos_token_ids: Vec::new(),
+        ignore_eos: false,
         sampling: SamplingParams {
             temperature: 0.0,
             seed: Some(42),
@@ -2507,6 +2508,7 @@ fn make_stop_job_request(max_tokens: usize, stop: Vec<String>) -> JobRequest {
         max_tokens,
         stop_text: stop,
         eos_token_ids: Vec::new(),
+        ignore_eos: false,
         sampling: SamplingParams {
             temperature: 0.0,
             seed: Some(42),

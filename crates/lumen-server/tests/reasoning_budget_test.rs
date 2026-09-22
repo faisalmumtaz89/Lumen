@@ -111,6 +111,7 @@ fn job(max_tokens: usize, enable_thinking: bool, reasoning_budget: usize) -> Job
         max_tokens,
         stop_text: Vec::new(),
         eos_token_ids: Vec::new(),
+        ignore_eos: false,
         sampling: SamplingParams {
             temperature: 0.0,
             seed: Some(42),
@@ -195,6 +196,52 @@ async fn thinking_off_is_deterministic_and_budget_exact() {
     assert!(
         !a.full_text().contains("</think>"),
         "thinking-off must NEVER inject </think>"
+    );
+}
+
+/// An EOS token ends the answer where it appears and renders nothing; with
+/// `ignore_eos` it still renders nothing but decoding carries on to the
+/// budget, and the token counts toward it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ignore_eos_keeps_decoding_and_renders_no_eos_text() {
+    let handle = boot_engine();
+    let free = drain(&handle, job(12, false, 0)).await;
+    // An ASCII token, so the byte tokenizer renders it whole and the text
+    // comparison below is byte-exact.
+    let eos = *free
+        .token_ids
+        .iter()
+        .find(|&&t| t < 0x80)
+        .expect("the greedy stream has an ASCII token to use as EOS");
+    let first = free.token_ids.iter().position(|&t| t == eos).unwrap();
+
+    let mut stop = job(12, false, 0);
+    stop.eos_token_ids = vec![eos];
+    let stopped = drain(&handle, stop).await;
+    assert_eq!(stopped.finish, FinishReason::Stop);
+    assert_eq!(stopped.token_ids, free.token_ids[..first].to_vec());
+    assert_eq!(stopped.completion_tokens, first + 1);
+
+    let mut go = job(12, false, 0);
+    go.eos_token_ids = vec![eos];
+    go.ignore_eos = true;
+    let ignored = drain(&handle, go).await;
+    assert_eq!(ignored.finish, FinishReason::Length);
+    assert_eq!(ignored.completion_tokens, 12);
+    let kept: Vec<usize> = (0..12).filter(|&i| free.token_ids[i] != eos).collect();
+    assert!(
+        kept.len() < 12,
+        "the EOS token must be skipped, not emitted"
+    );
+    assert_eq!(
+        ignored.token_ids,
+        kept.iter().map(|&i| free.token_ids[i]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ignored.full_text(),
+        kept.iter()
+            .map(|&i| free.fragments[i].as_str())
+            .collect::<String>()
     );
 }
 

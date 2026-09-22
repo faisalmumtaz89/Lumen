@@ -208,6 +208,7 @@ fn job() -> JobRequest {
         max_tokens: 2,
         stop_text: Vec::new(),
         eos_token_ids: Vec::new(),
+        ignore_eos: false,
         sampling: SamplingParams {
             temperature: 0.0,
             seed: Some(1),

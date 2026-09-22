@@ -54,6 +54,7 @@ Sampling defaults are resolved per request from the wire payload:
 |---|---|---|
 | `temperature` | `0.7` | `0` = greedy (argmax) |
 | `seed` | **fresh random per request** | so identical requests **vary** |
+| `ignore_eos` | `false` | `true` keeps decoding past the model's end-of-sequence tokens, which then render nothing; `max_tokens`, `stop` strings and the context limit still end the answer. OpenAI `/v1/chat/completions` and `/v1/completions` |
 | `repetition_penalty` | `1.05` dense / `1.03` MoE (model-aware; `LUMEN_REPETITION_PENALTY` overrides) | server-internal, not exposed in the OpenAI/Anthropic request schema; source of truth `runtime_defaults::repetition_penalty_default` (MoE capped at 1.03 — 1.05+ corrupts MoE arithmetic) |
 
 The server follows the OpenAI / llama.cpp convention: **with no `seed`, every request samples from a fresh random seed, so the same prompt returns different text each time.** For reproducible output, pass an explicit `seed` (OpenAI `/v1/chat/completions` and `/v1/completions`):

@@ -294,6 +294,9 @@ pub struct JobRequest {
     /// Token ids that count as EOS (model EOS plus any role markers like
     /// `<|im_end|>`).
     pub eos_token_ids: Vec<u32>,
+    /// Keep decoding past an EOS token instead of stopping there; the token
+    /// counts toward `max_tokens` and renders nothing.
+    pub ignore_eos: bool,
 
     /// Sampling parameters. The runtime currently honors `temperature` and
     /// `seed`; other fields are forward-compatible no-ops.
@@ -2181,6 +2184,18 @@ impl EngineWorker {
 
             // EOS check (token-id based).
             if request.eos_token_ids.contains(&token_id) {
+                if request.ignore_eos {
+                    // Ignored: the token never reaches the decoder (its text
+                    // would sit in the byte buffer between the halves of a
+                    // pending character) and emits nothing, but it still
+                    // counts toward the answer budget checked after every
+                    // emission below.
+                    if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
+                        finish_reason = FinishReason::Length;
+                        break;
+                    }
+                    continue;
+                }
                 // Emit the residual decoded text but NOT the EOS token text.
                 let _ = self
                     .tokenizer
