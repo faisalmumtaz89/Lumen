@@ -135,7 +135,7 @@ Each remote-A100 invocation gets a fresh GPU container. Cross-invocation re-runs
 | **Median** | Primary reported value |
 | **Stddev** | Reported in detail tables when available |
 
-Individual per-run measurements are preserved in `bench/results/<timestamp>/results.json`.
+Per-configuration medians and standard deviations are written to `bench/results/<timestamp>/results.json`; each individual run's raw output is kept under `bench/results/<timestamp>/raw/`.
 
 ## Bench report JSON schema
 
