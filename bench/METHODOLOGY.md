@@ -149,23 +149,23 @@ The bench harness in `bench/run_bench.sh` writes `bench/results/<timestamp>/resu
 | `hardware` | string | Auto-detected host description (CPU brand, GPU cores, total RAM) |
 | `runs_per_config` | int | Measured runs per (engine, model, quant, M, G) cell |
 | `warmup_runs` | int | Warmup runs discarded before measurement starts |
-| `prompt_lengths` | int| All M values exercised in this run (the M axis of the envelope) |
-| `gen_lengths` | int| All G values exercised in this run (the G axis of the envelope) |
-| `results` | object| One entry per (engine, model, quant, M, G) cell (see below) |
+| `prompt_lengths` | int[] | All M values exercised in this run (the M axis of the envelope) |
+| `gen_lengths` | int[] | All G values exercised in this run (the G axis of the envelope) |
+| `results` | object[] | One entry per (engine, model, quant, M, G) cell (see below) |
 
 ### Per-result-row fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `engine` | string | `lumen` / `mlx` / `llamacpp` (one row per engine per cell) |
-| `model_file` | string | Basename of the model weights file (LBC / safetensors-dir / GGUF) |
+| `model_file` | string | Stem of the `.lbc` file the cell was run from (the same stem on every engine's row) |
 | `model_name` | string | Human-readable model identifier (e.g. `Qwen3.5 9B`) |
 | `quant` | string | Quantization label (`Q8_0`, `Q4_0`, `BF16`, ...) |
 | `prompt_len` | int | **M (context length).** Prompt token count for this cell. |
 | `gen_len` | int | **G (generation length).** Tokens decoded post-prefill for this cell. |
-| `prefill_tps_median` | float \| null | Prefill throughput (tok/s), median over `runs_per_config` measured runs. Null when unsupported or all runs failed. |
+| `prefill_tps_median` | float \| null | Prefill throughput (tok/s), median over the runs that succeeded (up to `runs_per_config`; failed runs are skipped). Null when unsupported or all runs failed. |
 | `prefill_tps_stddev` | float \| null | Prefill throughput stddev across measured runs. Null mirrors `prefill_tps_median`. |
-| `decode_tps_median` | float \| null | Decode throughput (tok/s) for this (M, G) cell, median over `runs_per_config` measured runs. Null when unsupported or all runs failed. |
+| `decode_tps_median` | float \| null | Decode throughput (tok/s) for this (M, G) cell, median over the runs that succeeded (up to `runs_per_config`; failed runs are skipped). Null when unsupported or all runs failed. |
 | `decode_tps_stddev` | float \| null | Decode throughput stddev across measured runs. Null mirrors `decode_tps_median`. |
 | `unsupported` | bool | True when the (engine, model, quant) combination is structurally not supported (e.g. llama.cpp on Qwen3.5-9B's GDN layers); both throughput fields will be null. |
 
