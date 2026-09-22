@@ -24,6 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Device-memory check for the image endpoint.** At startup the server refuses a CUDA
   device whose total memory is below the 21.0 GiB a 2048×2048 generation reaches, naming
   the device's memory and the requirement, instead of failing the first request.
+- **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
+  the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
+  random delays at the worker's synchronisation points; see `docs/server.md`.
 
 ## [0.32.0] — 2026-09-20
 

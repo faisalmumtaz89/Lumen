@@ -101,6 +101,16 @@ curl -fsS http://localhost:8000/v1/messages \
 
 `LUMEN_CHAT_ENABLE_THINKING=1` (accepts `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` for off) flips the default for requests that do not specify the toggle.
 
+## Fault injection (test builds)
+
+`cargo build -p lumen-server --features bin,fault-injection` compiles two hooks into the engine worker for
+recovery and timing tests; a build without the feature has none of this code.
+
+| Variable | Effect |
+|---|---|
+| `LUMEN_FAULT_PANIC_AT` | `prefill` or `decode:<n>`: the worker panics at that point of the first job that reaches it (`decode:<n>` is before the token after `n` generated ones), once per process. The client gets the supervisor's error, `engine recovered from panic: …` — HTTP 500 for a non-streaming request, an `error` event on a stream — and the next request is served. A malformed value is a startup error. |
+| `LUMEN_FAULT_PERTURB_US` | `<max>`: every job sleeps a random `0..=max` microseconds before its prefill and before every decode step. |
+
 ## Embed as a library
 
 Custom embedders own the tokenizer and weight provider; the runtime owns the GPU.

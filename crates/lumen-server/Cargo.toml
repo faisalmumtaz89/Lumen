@@ -21,6 +21,10 @@ bin = ["dep:lumen-cli", "dep:lumen-convert", "dep:mimalloc"]
 # Keep the system allocator in the binary: the sanitizers track that heap and
 # not mimalloc's (scripts/sanitize_server.sh).
 system-allocator = []
+# Panic and timing-perturbation hooks in the worker, driven by
+# LUMEN_FAULT_PANIC_AT and LUMEN_FAULT_PERTURB_US (src/fault.rs). Test builds
+# only; a build without it has no such code.
+fault-injection = []
 
 # Standalone server binary; gated on the `bin` feature.
 # Gated on the `bin` feature so embedders that don't want the lumen-cli

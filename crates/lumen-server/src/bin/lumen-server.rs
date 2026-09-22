@@ -746,6 +746,8 @@ async fn run(args: Args) -> Result<(), String> {
     // Read and validate the image endpoint's configuration before the text
     // model loads, so a misconfiguration costs seconds rather than a full
     // model load per attempt.
+    #[cfg(feature = "fault-injection")]
+    lumen_server::fault::validate()?;
     #[cfg(feature = "image")]
     let image_config = image_config_from_env()?;
     #[cfg(not(feature = "image"))]
