@@ -10,6 +10,7 @@
 use std::process::Command;
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn a_removed_env_name_refuses_server_startup_with_its_remedy() {
     assert!(
         cfg!(feature = "bin"),

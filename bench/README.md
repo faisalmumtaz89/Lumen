@@ -78,10 +78,9 @@ bench/results/
   <timestamp>/
     results.md       # human-readable summary
     results.json     # machine-parseable JSON (schema: METHODOLOGY.md §"Bench report JSON schema")
-  archive/           # archived legacy results preserved here
 ```
 
-`bench/results/` is git-tracked only for the small summary text files; per-run raw directories are gitignored.
+`bench/results/` is gitignored.
 
 ## Report Format
 
@@ -95,4 +94,4 @@ The canonical results live in [RESULTS.md](RESULTS.md). Each row is `Quant × Me
 - TTFT as a separate metric (prefill throughput is reported)
 - Power consumption
 
-See [METHODOLOGY.md](METHODOLOGY.md) for the full set of methodology decisions and the [archive](results/archive/) for historical results from earlier scopes.
+See [METHODOLOGY.md](METHODOLOGY.md) for the full set of methodology decisions.
