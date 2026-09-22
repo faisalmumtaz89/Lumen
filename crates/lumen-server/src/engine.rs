@@ -1886,6 +1886,8 @@ impl EngineWorker {
             return;
         }
 
+        #[cfg(feature = "fault-injection")]
+        crate::fault::before_prefill();
         // Suffix prefill: reuses KV when the new prompt extends the prior
         // job's tokens; falls back to cold prefill otherwise.
         let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session.extend_with_cache(
@@ -2136,6 +2138,8 @@ impl EngineWorker {
                 finish_reason = FinishReason::Length;
                 break;
             }
+            #[cfg(feature = "fault-injection")]
+            crate::fault::before_decode_step(reasoning_generated + answer_generated);
             let res = session.next_token(self.backend(), self.weights.as_ref());
             let token_id = match res {
                 Ok(id) => id,

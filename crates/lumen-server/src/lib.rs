@@ -47,6 +47,8 @@
 
 pub mod engine;
 pub mod error;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod router;
 pub mod router_image;
 pub mod sse;
