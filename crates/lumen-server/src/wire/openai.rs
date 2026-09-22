@@ -124,6 +124,10 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub stop: Option<Value>,
+    /// Keep decoding past the model's end-of-sequence tokens (which then
+    /// render nothing) until `max_tokens` or another stop. Off by default.
+    #[serde(default)]
+    pub ignore_eos: bool,
     #[serde(default)]
     pub tools: Vec<ToolDef>,
     /// Per-request reasoning toggle. `Some(true)` opens the `<think>` block so
@@ -246,6 +250,7 @@ impl ChatCompletionRequest {
             max_tokens,
             stop_text,
             eos_token_ids: eos,
+            ignore_eos: self.ignore_eos,
             sampling,
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
             enable_thinking,
@@ -285,6 +290,10 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<Value>,
+    /// Keep decoding past the model's end-of-sequence tokens (which then
+    /// render nothing) until `max_tokens` or another stop. Off by default.
+    #[serde(default)]
+    pub ignore_eos: bool,
 }
 
 impl CompletionRequest {
@@ -341,6 +350,7 @@ impl CompletionRequest {
             max_tokens,
             stop_text,
             eos_token_ids: eos,
+            ignore_eos: self.ignore_eos,
             sampling,
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
             // Legacy text-completions have no chat template / `<think>` block,
@@ -2157,6 +2167,48 @@ mod tests {
         });
         let r: Result<ChatCompletionRequest, _> = serde_json::from_value(body);
         assert!(r.is_err(), "unknown top-level field must still be rejected");
+    }
+
+    /// `ignore_eos` reaches the job on both endpoints, off by default, and
+    /// leaves the EOS set itself in place: the engine still needs it to know
+    /// which tokens to skip.
+    #[test]
+    fn ignore_eos_reaches_the_job_and_defaults_off() {
+        let engine = EngineHandle::new_for_test(512);
+        let eos = engine.eos_tokens_for_request();
+        assert!(!eos.is_empty(), "the test engine must have EOS ids to drop");
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ChatCompletionRequest>(body)
+                .unwrap()
+                .into_job(&engine)
+                .unwrap()
+        };
+        let completion = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"model": "m", "prompt": "hi"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<CompletionRequest>(body)
+                .unwrap()
+                .into_job(&engine)
+                .unwrap()
+        };
+        let job = chat(serde_json::json!({}));
+        assert!(!job.ignore_eos);
+        assert_eq!(job.eos_token_ids, eos);
+        assert!(!chat(serde_json::json!({"ignore_eos": false})).ignore_eos);
+        let job = chat(serde_json::json!({"ignore_eos": true}));
+        assert!(job.ignore_eos);
+        assert_eq!(job.eos_token_ids, eos);
+        assert!(!completion(serde_json::json!({})).ignore_eos);
+        assert!(completion(serde_json::json!({"ignore_eos": true})).ignore_eos);
     }
 
     // ---- F16(b): synchronous oversize-prompt guard returns 400 in into_job ----
