@@ -36,6 +36,8 @@ use lumen_runtime::CudaBackend;
 use lumen_runtime::MetalF32Backend;
 use lumen_runtime::RuntimeConfig;
 
+#[cfg(feature = "image")]
+use lumen_server::build_router_with_images;
 use lumen_server::{build_router, EngineWorker, ModelInfo, Tokenize};
 
 // ---------------------------------------------------------------------------
@@ -138,6 +140,20 @@ OPTIONS:
     -h, --help             Print this help
     -V, --version          Print version
 
+ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
+    LUMEN_IMAGE_LBI=<dir>  Converted image components (transformer.lbi,
+                           vae.lbi, text_encoder.lbi). With LUMEN_IMAGE_CKPT,
+                           enables POST /v1/images/generations.
+    LUMEN_IMAGE_CKPT=<dir> The source checkpoint, for processor/vocab.json,
+                           processor/merges.txt and processor/added_tokens.json.
+    LUMEN_IMAGE_MODEL_ID=<id>
+                           The model id the endpoint reports and accepts
+                           (default Qwen-Image-2.1).
+    LUMEN_IMAGE_DEVICE=cuda|gpu|cpu
+                           Where generations run (default cuda). On the CUDA
+                           text engine's device, each generation evicts the
+                           text model for its duration.
+
 ENVIRONMENT VARIABLES (CUDA backend):
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                            Per-decode-step CPU sleep in microseconds, applied
@@ -166,6 +182,7 @@ ENDPOINTS:
     POST /v1/chat/completions        OpenAI chat completion (SSE optional)
     POST /v1/completions             OpenAI text completion (SSE optional)
     POST /v1/messages                Anthropic messages (SSE optional)
+    POST /v1/images/generations      Text to image (--features image, LUMEN_IMAGE_* set)
 "
     );
 }
@@ -516,15 +533,66 @@ struct WeightGlobals<'a> {
     weight_tying: bool,
 }
 
+/// Rebuilds the CUDA backend for the engine's exclusive-lease restore.
+///
+/// The image endpoint needs the whole card, so the engine evicts the text
+/// model for the duration of a generation and rebuilds it afterwards. Every
+/// input the original construction used is captured here — the provider is
+/// shared (`Arc`, not re-opened), so a restore re-uploads from the same host
+/// weights rather than re-reading the checkpoint.
+#[cfg(feature = "cuda")]
+struct CudaFactory {
+    device: usize,
+    kv_precision: KvPrecision,
+    hyperparams: lumen_format::ModelHyperparams,
+    weights: ServerWeights,
+}
+
+#[cfg(feature = "cuda")]
+impl lumen_server::BackendFactory for CudaFactory {
+    fn device(&self) -> usize {
+        self.device
+    }
+
+    fn build(&self) -> Result<Box<dyn ComputeBackend>, String> {
+        let mut cuda = CudaBackend::new(self.device)
+            .map_err(|e| format!("CUDA backend unavailable (device {}): {e}", self.device))?;
+        // The store is chosen before init(): the backend compiles the store's
+        // kernels as a group and allocates every cache in it.
+        cuda.set_kv_precision(self.kv_precision)
+            .map_err(|e| format!("CUDA KV precision: {e}"))?;
+        // Keep the F32 dequant (skip=false) until the skip is validated on
+        // real CUDA hardware; the CPU embed fallback is statically unreachable
+        // after init(), so this holds unread host heap, not a live dependency.
+        wire_global_tensors_and_raw(
+            &mut cuda,
+            &self.weights.globals(),
+            RawAcceptance {
+                q6k_head: true,
+                bf16_head: true,
+                bf16_embedding: true,
+                kquant_embedding: true,
+                ..RawAcceptance::default()
+            },
+        );
+        cuda.init(&self.hyperparams)
+            .map_err(|e| format!("CUDA init: {e}"))?;
+        cuda.preload_weights(self.weights.as_dyn())
+            .map_err(|e| format!("CUDA preload_weights: {e}"))?;
+        Ok(Box::new(cuda))
+    }
+}
+
 /// The server's weight provider — either the legacy full-copy `SyncWeightProvider`
 /// or the zero-copy `MmapWeightProvider`. Both implement `WeightProvider`
 /// (`Send + Sync`), so either can back the engine's `Arc<dyn WeightProvider>`.
 /// The Metal default is `Mmap` (no-copy residency, ~10 GB lighter); `--sync`,
 /// CUDA, and CPU use `Sync`. Both are proven byte-identical on the Metal
 /// GPU-resident path by `metal_sync_mmap_argmax_parity_test`.
+#[derive(Clone)]
 enum ServerWeights {
-    Sync(SyncWeightProvider),
-    Mmap(MmapWeightProvider),
+    Sync(Arc<SyncWeightProvider>),
+    Mmap(Arc<MmapWeightProvider>),
 }
 
 impl ServerWeights {
@@ -563,16 +631,16 @@ impl ServerWeights {
     /// Borrow as `&dyn WeightProvider` for `preload_weights`.
     fn as_dyn(&self) -> &dyn WeightProvider {
         match self {
-            ServerWeights::Sync(p) => p,
-            ServerWeights::Mmap(p) => p,
+            ServerWeights::Sync(p) => &**p,
+            ServerWeights::Mmap(p) => &**p,
         }
     }
 
     /// Consume into the `Arc<dyn WeightProvider>` the engine worker owns.
     fn into_arc(self) -> Arc<dyn WeightProvider> {
         match self {
-            ServerWeights::Sync(p) => Arc::new(p),
-            ServerWeights::Mmap(p) => Arc::new(p),
+            ServerWeights::Sync(p) => p,
+            ServerWeights::Mmap(p) => p,
         }
     }
 }
@@ -674,6 +742,25 @@ fn wire_global_tensors_and_raw(
 // ---------------------------------------------------------------------------
 
 async fn run(args: Args) -> Result<(), String> {
+    // Read and validate the image endpoint's configuration before the text
+    // model loads, so a misconfiguration costs seconds rather than a full
+    // model load per attempt.
+    #[cfg(feature = "image")]
+    let image_config = image_config_from_env()?;
+    #[cfg(not(feature = "image"))]
+    for name in [
+        "LUMEN_IMAGE_LBI",
+        "LUMEN_IMAGE_CKPT",
+        "LUMEN_IMAGE_MODEL_ID",
+        "LUMEN_IMAGE_DEVICE",
+    ] {
+        if std::env::var_os(name).is_some() {
+            return Err(format!(
+                "{name} is set but this lumen-server was built without the image endpoint \
+                 (`--features image`)"
+            ));
+        }
+    }
     let lbc_path = resolve_model_path(&args.model, args.quant.as_deref())?;
     eprintln!("[lumen-server] model: {}", lbc_path.display());
 
@@ -751,16 +838,16 @@ async fn run(args: Args) -> Result<(), String> {
             release_with_dontneed: true,
         };
         eprintln!("[lumen-server] weights: mmap/no-copy (zero CPU copy; --sync to force legacy)");
-        ServerWeights::Mmap(
+        ServerWeights::Mmap(Arc::new(
             MmapWeightProvider::open(&lbc_path, mmap_config)
                 .map_err(|e| format!("open weights (mmap) {lbc_path:?}: {e}"))?,
-        )
+        ))
     } else {
         eprintln!("[lumen-server] weights: sync (full CPU copy)");
-        ServerWeights::Sync(
+        ServerWeights::Sync(Arc::new(
             SyncWeightProvider::open(&lbc_path)
                 .map_err(|e| format!("open weights (sync) {lbc_path:?}: {e}"))?,
-        )
+        ))
     };
 
     // Plumb model-aware defaults into the runtime BEFORE
@@ -821,9 +908,17 @@ async fn run(args: Args) -> Result<(), String> {
         eprintln!("[lumen-server] context_length: {context_length}");
     }
 
+    // The CUDA backend is built by the factory that can also rebuild it, so
+    // the image endpoint can evict and restore the engine's backend; the other
+    // backends have no factory and get the plain `spawn`, which cannot be
+    // evicted.
+    #[cfg(feature = "cuda")]
+    let mut cuda_factory: Option<Arc<CudaFactory>> = None;
+
     // Build the concrete backend, wire global tensors + raw quantized blobs,
     // call init(), then preload_weights() (required for GPU-resident upload
     // on Metal AND CUDA; `tests/server_soak.rs:357-366` documents the requirement).
+
     let (backend, kv_precision): (Box<dyn ComputeBackend>, KvPrecision) = match backend_choice {
         BackendChoice::Metal => {
             #[cfg(target_os = "macos")]
@@ -862,37 +957,16 @@ async fn run(args: Args) -> Result<(), String> {
         BackendChoice::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                let mut cuda = CudaBackend::new(args.backend_device).map_err(|e| {
-                    format!(
-                        "CUDA backend unavailable (device {}): {e}",
-                        args.backend_device
-                    )
-                })?;
-                // The store is chosen before init(): the backend compiles the
-                // store's kernels as a group and allocates every cache in it.
                 let kv_precision = resolve_kv_precision(args.kv_precision, KvPrecision::F32);
-                cuda.set_kv_precision(kv_precision)
-                    .map_err(|e| format!("CUDA KV precision: {e}"))?;
-                // CUDA: keep the F32 dequant (skip=false) until the skip is
-                // validated on real CUDA hardware; the CPU embed fallback is
-                // statically unreachable after init(), so this holds unread
-                // host heap, not a live dependency.
-                wire_global_tensors_and_raw(
-                    &mut cuda,
-                    &provider.globals(),
-                    RawAcceptance {
-                        q6k_head: true,
-                        bf16_head: true,
-                        bf16_embedding: true,
-                        kquant_embedding: true,
-                        ..RawAcceptance::default()
-                    },
-                );
-                cuda.init(&hyperparams_capped)
-                    .map_err(|e| format!("CUDA init: {e}"))?;
-                cuda.preload_weights(provider.as_dyn())
-                    .map_err(|e| format!("CUDA preload_weights: {e}"))?;
-                (Box::new(cuda), kv_precision)
+                let factory = Arc::new(CudaFactory {
+                    device: args.backend_device,
+                    kv_precision,
+                    hyperparams: hyperparams_capped,
+                    weights: provider.clone(),
+                });
+                let cuda = lumen_server::BackendFactory::build(factory.as_ref())?;
+                cuda_factory = Some(factory);
+                (cuda, kv_precision)
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -941,6 +1015,29 @@ async fn run(args: Args) -> Result<(), String> {
     // `vocab_size`/`num_layers` from this, and `Session` sizes its KV from
     // `RuntimeConfig.max_seq_len`, but passing capped keeps the snapshot
     // internally consistent — no native-262144 value leaks downstream).
+    #[cfg(feature = "cuda")]
+    let handle = match cuda_factory {
+        Some(factory) => EngineWorker::spawn_rebuildable(
+            runtime_cfg,
+            hyperparams_capped,
+            backend,
+            factory,
+            provider.into_arc(),
+            tokenizer,
+            model_info,
+            args.inbox_size,
+        ),
+        None => EngineWorker::spawn(
+            runtime_cfg,
+            hyperparams_capped,
+            backend,
+            provider.into_arc(),
+            tokenizer,
+            model_info,
+            args.inbox_size,
+        ),
+    };
+    #[cfg(not(feature = "cuda"))]
     let handle = EngineWorker::spawn(
         runtime_cfg,
         hyperparams_capped,
@@ -952,6 +1049,32 @@ async fn run(args: Args) -> Result<(), String> {
     );
 
     // Bind and serve. Graceful shutdown on Ctrl-C / SIGTERM.
+    // The image endpoint, enabled only when a converted checkpoint is pointed
+    // at. Absent, the route does not exist and the text surface is unchanged.
+    #[cfg(feature = "image")]
+    let app = match image_config {
+        Some(config) => {
+            eprintln!(
+                "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}",
+                config.model_id,
+                if config.use_gpu { "cuda" } else { "cpu" },
+                config.lbi_dir.display(),
+                config.checkpoint_dir.display(),
+                if config.use_gpu && handle.holds_device(lumen_image::pipeline::GPU_DEVICE) {
+                    "; each generation evicts the text model for its duration"
+                } else {
+                    ""
+                },
+            );
+            let state = std::sync::Arc::new(lumen_server::router_image::ImageState {
+                config,
+                engine: handle.clone(),
+            });
+            build_router_with_images(handle, state)
+        }
+        None => build_router(handle),
+    };
+    #[cfg(not(feature = "image"))]
     let app = build_router(handle);
     let bind_addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -982,6 +1105,86 @@ async fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("axum serve: {e}"))?;
     eprintln!("[lumen-server] stopped");
     Ok(())
+}
+
+/// The image endpoint's configuration from `LUMEN_IMAGE_*`, `None` when the
+/// endpoint is not configured. Every value is checked here: an empty or
+/// unknown value is refused rather than silently defaulted, and the
+/// checkpoint's files are opened and checked once, the way a generation opens
+/// them.
+#[cfg(feature = "image")]
+fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageConfig>, String> {
+    // A value is returned as set, with paths untouched (a directory name may
+    // end in a space); only the enumerated values are trimmed at their match.
+    let var = |name: &str| -> Result<Option<String>, String> {
+        match std::env::var(name) {
+            Ok(v) if v.trim().is_empty() => Err(format!("{name} is set but empty")),
+            Ok(v) => Ok(Some(v)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(e) => Err(format!("{name}: {e}")),
+        }
+    };
+    let model_id = var("LUMEN_IMAGE_MODEL_ID")?
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "Qwen-Image-2.1".to_string());
+    let use_gpu = match var("LUMEN_IMAGE_DEVICE")?.as_deref().map(str::trim) {
+        None | Some("cuda") | Some("gpu") => true,
+        Some("cpu") => false,
+        Some(other) => {
+            return Err(format!(
+                "LUMEN_IMAGE_DEVICE={other:?} is not one of cuda, gpu, cpu"
+            ))
+        }
+    };
+    let (lbi, ckpt) = match (var("LUMEN_IMAGE_LBI")?, var("LUMEN_IMAGE_CKPT")?) {
+        (None, None) => {
+            for name in ["LUMEN_IMAGE_MODEL_ID", "LUMEN_IMAGE_DEVICE"] {
+                if var(name)?.is_some() {
+                    return Err(format!(
+                        "{name} is set but LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are not"
+                    ));
+                }
+            }
+            return Ok(None);
+        }
+        (Some(lbi), Some(ckpt)) => (lbi, ckpt),
+        (Some(_), None) => return Err("LUMEN_IMAGE_LBI is set but LUMEN_IMAGE_CKPT is not".into()),
+        (None, Some(_)) => return Err("LUMEN_IMAGE_CKPT is set but LUMEN_IMAGE_LBI is not".into()),
+    };
+    if use_gpu {
+        match lumen_runtime::cuda::ffi::device_count() {
+            Ok(0) => {
+                return Err(
+                    "the image endpoint runs on CUDA (LUMEN_IMAGE_DEVICE) but no CUDA device \
+                     is available; set LUMEN_IMAGE_DEVICE=cpu for the CPU reference"
+                        .to_string(),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "the image endpoint runs on CUDA (LUMEN_IMAGE_DEVICE) but CUDA failed to initialise: {e}"
+                ))
+            }
+        }
+    }
+    let lbi_dir = std::path::PathBuf::from(lbi);
+    let checkpoint_dir = std::path::PathBuf::from(ckpt);
+    lumen_image::pipeline::PipelinePaths::from_roots(&lbi_dir, &checkpoint_dir)
+        .check(use_gpu)
+        .map_err(|e| {
+            format!(
+                "the image endpoint's files are unusable (LUMEN_IMAGE_LBI must hold \
+                 transformer.lbi, vae.lbi and text_encoder.lbi; LUMEN_IMAGE_CKPT must hold \
+                 processor/vocab.json, merges.txt and added_tokens.json): {e}"
+            )
+        })?;
+    Ok(Some(lumen_server::router_image::ImageConfig {
+        lbi_dir,
+        checkpoint_dir,
+        model_id,
+        use_gpu,
+    }))
 }
 
 /// `--kv-precision` values: `f16` / `f32` (case-insensitive).

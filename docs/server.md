@@ -38,7 +38,11 @@ POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
 GET  /v1/models             # Model list
+POST /v1/images/generations # Text to image (`--features image` builds with
+                            # LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT set)
 ```
+
+The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
 
 Both wire formats support SSE streaming. Tool-call parsing is template-driven: v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with a streaming parser that uses partial-marker hold-back; additional templates are registered as new model families ship. Reference embedder: [`crates/lumen-server/tests/server_integration.rs`](../crates/lumen-server/tests/server_integration.rs). Reference binary: [`crates/lumen-server/src/bin/lumen-server.rs`](../crates/lumen-server/src/bin/lumen-server.rs).
 

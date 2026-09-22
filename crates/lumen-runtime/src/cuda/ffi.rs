@@ -359,6 +359,23 @@ impl CudaDevice {
         self.stream.alloc_zeros(len).map_err(cuda_driver_err)
     }
 
+    /// Allocate `len` elements without initializing them.
+    ///
+    /// `alloc_zeros` memsets the whole buffer, which is wasted work whenever the
+    /// caller is about to write every element — a GEMM output, a conversion
+    /// destination. The memory must be fully written before it is read.
+    ///
+    /// # Safety
+    ///
+    /// The returned buffer holds indeterminate values; reading it before
+    /// writing is undefined.
+    pub unsafe fn alloc_uninit<T: DeviceRepr>(
+        &self,
+        len: usize,
+    ) -> Result<CudaSlice<T>, RuntimeError> {
+        self.stream.alloc(len).map_err(cuda_driver_err)
+    }
+
     /// Copy device buffer contents back to host.
     pub fn dtoh_copy<T: DeviceRepr>(
         &self,

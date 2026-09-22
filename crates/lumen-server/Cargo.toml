@@ -9,6 +9,9 @@ rust-version.workspace = true
 
 [features]
 default = []
+# The image endpoint. Off by default: it pulls in the image crate and its CUDA
+# path, and a text-only deployment should not carry either.
+image = ["cuda", "dep:lumen-image", "lumen-image/cuda"]
 cuda = ["lumen-runtime/cuda"]
 # opt-in `lumen-server` standalone binary. Activates the
 # `lumen-cli` dependency for tokenizer reuse + LBC tokenizer wiring. Library
@@ -25,6 +28,7 @@ path = "src/bin/lumen-server.rs"
 required-features = ["bin"]
 
 [dependencies]
+lumen-image = { workspace = true, optional = true }
 lumen-runtime.workspace = true
 lumen-format.workspace = true
 thiserror.workspace = true

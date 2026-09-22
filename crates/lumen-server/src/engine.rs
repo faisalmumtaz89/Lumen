@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lumen_format::ModelHyperparams;
@@ -25,7 +25,7 @@ use lumen_runtime::session::{Session, SuffixPrefillResult};
 use lumen_runtime::weight::cache::WeightProvider;
 use lumen_runtime::{RuntimeConfig, RuntimeError, ServerMemoryBreakdown};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ServerError;
 use crate::tokenstop::StopMatcher;
@@ -91,6 +91,15 @@ const POOL_CHANNEL_CAPACITY: usize = 16;
 /// (client-side disconnect, server-side panic) leave the client in a
 /// clean "stream closed" state rather than wedged on `recv().await`.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Prefix of the error a text request gets while the text model's rebuild
+/// keeps failing; retryable, like [`EVICTED_MESSAGE`].
+pub const RESTORE_FAILED_PREFIX: &str = "restoring the text model failed: ";
+
+/// The refusal a text request gets while the model is evicted for an image
+/// generation. `ServerError::classify_runtime` maps it to the retryable
+/// `EngineUnavailable` shape when it arrives as a token-stream error.
+pub const EVICTED_MESSAGE: &str = "the model is evicted for an image generation; retry shortly";
 
 /// Cancellation flag shared between handler and worker.
 ///
@@ -320,7 +329,9 @@ pub type JobResponseChannel = PooledReceiver;
 
 /// Internal message shape: a job plus its reply senders.
 struct WorkerJob {
-    request: JobRequest,
+    /// `None` for a lease control message (evict / restore), which carries no
+    /// inference work and replies through `lease_reply` instead.
+    request: Option<JobRequest>,
     tokens_tx: mpsc::Sender<TokenEvent>,
     /// Per-job cancellation flag. The worker checks this
     /// between token emissions; the wire-layer's [`CancellationGuard`]
@@ -329,6 +340,35 @@ struct WorkerJob {
     /// cadence and [`EngineWorker::send_event_polling_cancel`] for the
     /// observation site.
     cancel: CancellationFlag,
+    /// Set only on a lease control message: which direction to drive, plus
+    /// the acknowledgement channel the worker replies on once the eviction
+    /// or restore has completed.
+    lease_reply: Option<(LeaseOp, oneshot::Sender<Result<(), String>>)>,
+}
+
+impl WorkerJob {
+    fn control(op: LeaseOp, reply: oneshot::Sender<Result<(), String>>) -> Self {
+        let (tokens_tx, _rx) = mpsc::channel::<TokenEvent>(1);
+        Self {
+            request: None,
+            tokens_tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            lease_reply: Some((op, reply)),
+        }
+    }
+}
+
+/// Which direction a lease control message drives.
+#[derive(Clone, Copy)]
+enum LeaseOp {
+    /// Free the device backend.
+    Evict,
+    /// Rebuild the device backend.
+    Restore,
+    /// Rebuild the device backend after a failed restore, on behalf of a
+    /// text request; refused while a lease is outstanding, whose own restore
+    /// rebuilds when it ends.
+    Retry,
 }
 
 /// RAII guard that cancels its associated job on Drop.
@@ -523,6 +563,137 @@ impl Drop for PooledReceiver {
     }
 }
 
+/// Send a lease control message (evict or restore) and wait for the worker's
+/// ack.
+///
+/// Both ends block: the send waits on the worker's bounded `tokio::sync::mpsc`
+/// inbox with `blocking_send`, and the ack is a oneshot read with
+/// `blocking_recv`. On a multi-threaded runtime this runs under `block_in_place`,
+/// which parks only this thread and lets the runtime move its other tasks
+/// elsewhere. A current-thread runtime cannot block at all; callers on one
+/// must invoke this from a blocking context.
+fn lease_round_trip(handle: &EngineHandle, op: LeaseOp) -> Option<Result<(), String>> {
+    let send_and_wait = || {
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<(), String>>();
+        if handle
+            .sender
+            .blocking_send(WorkerJob::control(op, reply_tx))
+            .is_err()
+        {
+            return None;
+        }
+        // Wait for the answer without a bound: the message is queued behind
+        // whatever the worker is running, and giving up on it would leave
+        // the eviction to land later with nobody holding the lease. The
+        // only way the wait ends without an answer is the worker dropping
+        // the reply sender, which means the worker is gone.
+        Some(match reply_rx.blocking_recv() {
+            Ok(r) => r,
+            Err(_) => Err("the worker went away before answering the lease".to_string()),
+        })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(send_and_wait)
+        }
+        _ => send_and_wait(),
+    }
+}
+
+/// Serialises device access between the text engine and an exclusive lease.
+///
+/// A lease exists because the image pipeline needs the whole card: the text
+/// model and the image components together exceed a 32 GiB device, so they
+/// cannot coexist. The holder of this lease is the only user of the device for
+/// its lifetime.
+///
+/// The lease never frees a backend under a running request: the eviction is
+/// a message on the worker's inbox, handled by the worker thread itself
+/// between jobs. A job the worker dequeues after the eviction is answered
+/// with the evicted refusal rather than run.
+pub(crate) struct DeviceLease {
+    mutex: Mutex<()>,
+    /// Set while a lease is outstanding. While set, [`EngineHandle::submit`]
+    /// refuses new jobs rather than queueing them behind an image generation
+    /// that may run for minutes.
+    leased: AtomicBool,
+    /// Set while the worker sits evicted because its last restore failed and
+    /// no lease is held; [`EngineHandle::submit`] retries the restore before
+    /// admitting a job, so the refusal, if any, precedes the stream.
+    restore_failed: AtomicBool,
+    /// The device ordinal the text backend holds, `None` on a worker whose
+    /// backend cannot be rebuilt (built with [`EngineWorker::spawn`]). Lease
+    /// acquisition then fails with a clear error instead of freeing memory it
+    /// could never restore.
+    device: Option<usize>,
+    condvar: Condvar,
+}
+
+impl DeviceLease {
+    /// Take the lease, blocking until any previous lease is released.
+    ///
+    /// Admission closes the moment the flag is set; a job already admitted
+    /// runs to completion on the worker before the eviction message queued
+    /// behind it, so the caller waits for that work through the eviction's
+    /// acknowledgement rather than here. Waiting here for the worker to go
+    /// idle would let a steady stream of text requests keep the flag from
+    /// ever being set.
+    ///
+    /// Returns `None` when the worker was built without a factory, since
+    /// there would be no way to restore the text model afterwards.
+    pub(crate) fn acquire(self: &Arc<Self>) -> Option<LeaseGuard> {
+        self.device?;
+        let mut guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        // The check-and-set is made under `mutex`, so two callers cannot both
+        // observe `leased == false` and proceed: a second generation would
+        // otherwise start on a device the first is still using.
+        while self.leased.load(Ordering::Acquire) {
+            let (g, _) = self
+                .condvar
+                .wait_timeout(guard, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        }
+        self.leased.store(true, Ordering::Release);
+        drop(guard);
+        Some(LeaseGuard {
+            lease: Arc::clone(self),
+        })
+    }
+
+    /// A lease for a worker that cannot rebuild its backend (test handles).
+    #[cfg(test)]
+    pub(crate) fn unavailable() -> Arc<Self> {
+        Arc::new(Self {
+            mutex: Mutex::new(()),
+            leased: AtomicBool::new(false),
+            restore_failed: AtomicBool::new(false),
+            device: None,
+            condvar: Condvar::new(),
+        })
+    }
+}
+
+/// RAII handle for an exclusive device lease. Dropping it admits text
+/// requests again.
+///
+/// Owns its `Arc` rather than borrowing the engine so it can be moved onto
+/// another thread — the image handler takes it before handing the device work
+/// to a blocking task.
+pub(crate) struct LeaseGuard {
+    lease: Arc<DeviceLease>,
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        // Cleared and signalled under the mutex, so a waiter that has checked
+        // the flag but not yet started waiting cannot miss the wake-up.
+        let _guard = self.lease.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.lease.leased.store(false, Ordering::Release);
+        self.lease.condvar.notify_all();
+    }
+}
+
 /// Cheap clonable handle handlers use to submit jobs.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -542,6 +713,36 @@ pub struct EngineHandle {
     /// Pool size cap = `inbox_capacity + 1`.  Sits next to `channel_pool`
     /// so [`PooledReceiver::drop`] can read it without an extra lock.
     pool_cap: usize,
+    /// Shared with the worker; drives the exclusive-lease protocol.
+    lease: Arc<DeviceLease>,
+}
+
+/// Held for the duration of an exclusive device use. Dropping it restores the
+/// text model to the device and admits text requests again.
+///
+/// Owns a handle clone so the guard can be moved across threads. It must be
+/// dropped from a blocking context — a plain thread or `spawn_blocking` —
+/// because the restore blocks on the worker's acknowledgement; dropped inside
+/// an async task on a current-thread runtime, the send panics and the lease is
+/// released without the model being restored.
+pub struct ExclusiveGuard {
+    handle: EngineHandle,
+    /// Dropped after `Drop::drop` has restored the backend, which is what
+    /// orders the release after the restore.
+    _lease: LeaseGuard,
+}
+
+impl Drop for ExclusiveGuard {
+    fn drop(&mut self) {
+        // Restore synchronously, before the `_lease` field drops and admits
+        // text requests again: a request admitted the instant the flag
+        // clears then always finds a live backend. If the restore fails the
+        // worker stays evicted and answers each request with an error while
+        // retrying the rebuild for it, until one succeeds.
+        if let Some(Err(e)) = lease_round_trip(&self.handle, LeaseOp::Restore) {
+            eprintln!("[server engine] {RESTORE_FAILED_PREFIX}{e}");
+        }
+    }
 }
 
 impl EngineHandle {
@@ -566,6 +767,35 @@ impl EngineHandle {
         request: JobRequest,
         event_buffer: usize,
     ) -> Result<JobResponseChannel, ServerError> {
+        // Refuse rather than queue while an image generation holds the
+        // device. The text model is not resident, so there is nothing to
+        // serve from; a caller gets an immediate retryable answer instead of
+        // waiting out a generation that runs for minutes.
+        if self.lease.leased.load(Ordering::Acquire) {
+            return Err(ServerError::EngineUnavailable(EVICTED_MESSAGE.to_string()));
+        }
+        // A restore that failed leaves the worker evicted with no lease held.
+        // The next request retries it here, before admission, so the refusal
+        // (if the rebuild fails again) reaches a streaming client as a
+        // retryable status rather than as an error frame after the headers.
+        if self.lease.restore_failed.load(Ordering::Acquire) {
+            match self.retry_restore().await {
+                Some(Ok(())) => {}
+                Some(Err(e)) if e == EVICTED_MESSAGE => {
+                    return Err(ServerError::EngineUnavailable(e))
+                }
+                Some(Err(e)) => {
+                    return Err(ServerError::EngineUnavailable(format!(
+                        "{RESTORE_FAILED_PREFIX}{e}; the next request retries it"
+                    )))
+                }
+                None => {
+                    return Err(ServerError::EngineUnavailable(
+                        "the engine worker is gone".to_string(),
+                    ))
+                }
+            }
+        }
         let (tx, rx, return_sender, pool_handle) = self.take_channel_pair(event_buffer);
         // Stage the channel pair in a `PooledReceiver` first.  If the
         // worker send fails below, we drop the receiver and the channel
@@ -601,9 +831,10 @@ impl EngineHandle {
         match self
             .sender
             .send(WorkerJob {
-                request,
+                request: Some(request),
                 tokens_tx: tx,
                 cancel: worker_cancel,
+                lease_reply: None,
             })
             .await
         {
@@ -741,6 +972,7 @@ impl EngineHandle {
             breakdown: Arc::new(Mutex::new(ServerMemoryBreakdown::default())),
             channel_pool: Arc::new(Mutex::new(VecDeque::new())),
             pool_cap: 2,
+            lease: DeviceLease::unavailable(),
         }
     }
 
@@ -798,6 +1030,77 @@ impl EngineHandle {
     #[doc(hidden)]
     pub fn breakdown_arc(&self) -> Arc<Mutex<ServerMemoryBreakdown>> {
         Arc::clone(&self.breakdown)
+    }
+
+    /// Whether the text model occupies CUDA device `device`.
+    ///
+    /// Only a worker built with a backend factory holds a device at all — the
+    /// server does that for its CUDA text backend and for nothing else — and
+    /// it holds the one the factory builds on. A text engine elsewhere (CPU,
+    /// or another card) needs no eviction for an image generation on `device`.
+    pub fn holds_device(&self, device: usize) -> bool {
+        self.lease.device == Some(device)
+    }
+
+    /// Whether an exclusive lease is held or being acquired: from the moment
+    /// `try_exclusive` closes admission until its guard is dropped.
+    pub fn is_leased(&self) -> bool {
+        self.lease.leased.load(Ordering::Acquire)
+    }
+
+    /// Ask the worker to rebuild after a failed restore and await its answer,
+    /// blocking nothing, so it runs on any runtime flavour and needs no spare
+    /// blocking thread; `None` when the worker is gone.
+    async fn retry_restore(&self) -> Option<Result<(), String>> {
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<(), String>>();
+        self.sender
+            .send(WorkerJob::control(LeaseOp::Retry, reply_tx))
+            .await
+            .ok()?;
+        Some(match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => Err("the worker went away before answering the restore".to_string()),
+        })
+    }
+
+    /// Take the device exclusively for the guard's lifetime, evicting the
+    /// text model from the device.
+    ///
+    /// The backend is dropped and its device memory released before this
+    /// returns, so the caller's own device allocations see the freed card.
+    /// While the lease is held, text requests are refused with a retryable
+    /// `EngineUnavailable` error instead of queueing for the lease's duration.
+    ///
+    /// Blocks: it waits for any previous lease and then for the worker's
+    /// acknowledgement of the eviction, which comes after whatever job the
+    /// worker is running. Call it, and drop the guard, from a blocking
+    /// context — a plain thread or `spawn_blocking` — never from an async
+    /// task on a current-thread runtime.
+    ///
+    /// A worker that cannot rebuild its backend (the plain
+    /// [`EngineWorker::spawn`] constructor) refuses with a `Runtime` error; a
+    /// worker that is gone or whose eviction failed answers `EngineUnavailable`,
+    /// the retryable shape.
+    pub fn try_exclusive(&self) -> Result<ExclusiveGuard, ServerError> {
+        let guard = self.lease.acquire().ok_or_else(|| {
+            ServerError::Runtime(
+                "the image endpoint needs a rebuildable text engine, which this server was \
+                 not started with"
+                    .to_string(),
+            )
+        })?;
+        match lease_round_trip(self, LeaseOp::Evict) {
+            Some(Ok(())) => Ok(ExclusiveGuard {
+                handle: self.clone(),
+                _lease: guard,
+            }),
+            Some(Err(e)) => Err(ServerError::EngineUnavailable(format!(
+                "evicting the text model failed: {e}"
+            ))),
+            None => Err(ServerError::EngineUnavailable(
+                "the engine worker is gone".to_string(),
+            )),
+        }
     }
 }
 
@@ -866,13 +1169,43 @@ pub trait Tokenize: Send + Sync + 'static {
     fn eos_tokens(&self) -> Vec<u32>;
 }
 
+/// Rebuilds the compute backend after an eviction.
+///
+/// The worker owns the only handle to the device backend, so a lease that
+/// frees device memory (an image generation, which needs the whole card)
+/// releases it and calls this to build a fresh one. `EngineWorker::spawn`
+/// takes a backend directly and no eviction is possible; a worker built with
+/// [`EngineWorker::spawn_rebuildable`] carries a factory and can be evicted.
+///
+/// `Send` is required because the worker runs on its own thread. The factory
+/// is invoked only on the worker thread, never concurrently.
+pub trait BackendFactory: Send + Sync {
+    /// Build a backend ready for `EngineWorker`'s first job, in the same
+    /// configuration as the one the worker started with.
+    fn build(&self) -> Result<Box<dyn ComputeBackend>, String>;
+
+    /// The CUDA device ordinal the backend is built on, which is the device
+    /// an eviction frees.
+    fn device(&self) -> usize;
+}
+
 /// The worker that owns the runtime engine. Spawn one per server instance
 /// via [`EngineWorker::spawn`]; the returned [`EngineHandle`] is what HTTP
 /// handlers use.
 pub struct EngineWorker {
     config: RuntimeConfig,
     hyperparams: ModelHyperparams,
-    backend: Box<dyn ComputeBackend>,
+    /// `None` while the backend is evicted for an exclusive lease. Present
+    /// at every other moment, including throughout `process_job`.
+    backend: Option<Box<dyn ComputeBackend>>,
+    /// Present only on a rebuildable worker; see [`EngineWorker::spawn_rebuildable`].
+    factory: Option<Arc<dyn BackendFactory>>,
+    /// Why the last restore failed, while the backend stays absent for it.
+    /// A request arriving then is answered with this rather than the
+    /// transient "retry shortly" of a lease in progress.
+    restore_failed: Option<String>,
+    /// Shared with the handle, which reads the lease flags at admission.
+    lease: Arc<DeviceLease>,
     weights: Arc<dyn WeightProvider>,
     tokenizer: Arc<dyn Tokenize>,
     /// Retained on the worker for log/telemetry hooks; the public-facing
@@ -914,10 +1247,37 @@ impl EngineWorker {
         model_info: ModelInfo,
         inbox_size: usize,
     ) -> EngineHandle {
-        Self::spawn_with_disk_cache(
+        Self::spawn_inner(
             config,
             hyperparams,
             backend,
+            None,
+            weights,
+            tokenizer,
+            model_info,
+            inbox_size,
+            None,
+        )
+    }
+
+    /// Like [`Self::spawn`], but the worker can rebuild its backend from
+    /// `factory`, so [`EngineHandle::try_exclusive`] can evict the model and
+    /// restore it. Use this when an image endpoint shares the device.
+    pub fn spawn_rebuildable(
+        config: RuntimeConfig,
+        hyperparams: ModelHyperparams,
+        backend: Box<dyn ComputeBackend>,
+        factory: Arc<dyn BackendFactory>,
+        weights: Arc<dyn WeightProvider>,
+        tokenizer: Arc<dyn Tokenize>,
+        model_info: ModelInfo,
+        inbox_size: usize,
+    ) -> EngineHandle {
+        Self::spawn_inner(
+            config,
+            hyperparams,
+            backend,
+            Some(factory),
             weights,
             tokenizer,
             model_info,
@@ -933,6 +1293,30 @@ impl EngineWorker {
         config: RuntimeConfig,
         hyperparams: ModelHyperparams,
         backend: Box<dyn ComputeBackend>,
+        weights: Arc<dyn WeightProvider>,
+        tokenizer: Arc<dyn Tokenize>,
+        model_info: ModelInfo,
+        inbox_size: usize,
+        disk_kv: Option<DiskKvConfig>,
+    ) -> EngineHandle {
+        Self::spawn_inner(
+            config,
+            hyperparams,
+            backend,
+            None,
+            weights,
+            tokenizer,
+            model_info,
+            inbox_size,
+            disk_kv,
+        )
+    }
+
+    fn spawn_inner(
+        config: RuntimeConfig,
+        hyperparams: ModelHyperparams,
+        backend: Box<dyn ComputeBackend>,
+        factory: Option<Arc<dyn BackendFactory>>,
         weights: Arc<dyn WeightProvider>,
         tokenizer: Arc<dyn Tokenize>,
         model_info: ModelInfo,
@@ -962,10 +1346,20 @@ impl EngineWorker {
             pool_deque.push_back(pair);
         }
         let channel_pool: ChannelPool = Arc::new(Mutex::new(pool_deque));
+        let lease = Arc::new(DeviceLease {
+            mutex: Mutex::new(()),
+            leased: AtomicBool::new(false),
+            restore_failed: AtomicBool::new(false),
+            device: factory.as_ref().map(|f| f.device()),
+            condvar: Condvar::new(),
+        });
         let worker = Self {
             config,
             hyperparams,
-            backend,
+            backend: Some(backend),
+            factory,
+            restore_failed: None,
+            lease: Arc::clone(&lease),
             weights,
             tokenizer: Arc::clone(&tokenizer),
             model_info: Arc::clone(&model_info),
@@ -994,6 +1388,7 @@ impl EngineWorker {
             breakdown,
             channel_pool,
             pool_cap,
+            lease,
         }
     }
 
@@ -1006,47 +1401,20 @@ impl EngineWorker {
         // servers, swap to a session pool keyed by conversation id; the
         // single-session design is correct for the single-client agent use
         // case Lumen targets first.)
-        let session = Session::new(
-            self.config.clone(),
-            self.hyperparams,
-            SamplingParams::default(),
-        );
-        let mut session = match session {
-            Ok(mut s) => {
-                s.set_bench_top2(self.bench_top2);
-                s
-            }
+        let mut session = match self.fresh_session() {
+            Ok(s) => s,
             Err(e) => {
-                // Drain inbox with errors and shut down.
-                while let Some(job) = self.inbox.blocking_recv() {
-                    let _ = job
-                        .tokens_tx
-                        .blocking_send(TokenEvent::Error(format!("session init failed: {e}")));
-                }
+                self.drain_unhealthy(&format!("session init failed: {e}"));
                 return;
             }
         };
-
-        // Install the per-token-id byte decoder for the greedy anti-restate
-        // guard's sub-word-doubling rule. The closure captures an `Arc` clone
-        // of the worker's tokenizer and maps a token id to its raw decoded
-        // bytes. When the guard is disabled (dense, or LUMEN_ANTI_RESTATE=0)
-        // the closure is simply never invoked.
-        {
-            let tok = Arc::clone(&self.tokenizer);
-            session.set_token_decoder(Arc::new(move |id: u32| tok.decode_id_bytes(id)));
-        }
 
         // validate KV precision against backend once at worker
         // startup so a misconfigured server fails fast with a clear error
         // (Metal requires F16, CUDA requires F32) instead of silently
         // corrupting KV writes inside the first job.
-        if let Err(e) = session.validate_backend(self.backend.as_ref()) {
-            while let Some(job) = self.inbox.blocking_recv() {
-                let _ = job.tokens_tx.blocking_send(TokenEvent::Error(format!(
-                    "backend / KV precision mismatch: {e}"
-                )));
-            }
+        if let Err(e) = session.validate_backend(self.backend()) {
+            self.drain_unhealthy(&format!("backend / KV precision mismatch: {e}"));
             return;
         }
 
@@ -1092,6 +1460,30 @@ impl EngineWorker {
         let panic_budget = max_panics_in_window();
         let mut recent_panics: VecDeque<Instant> = VecDeque::with_capacity(panic_budget + 1);
         while let Some(job) = self.inbox.blocking_recv() {
+            // A lease control message: free or rebuild the device backend.
+            // Handled here, outside `process_job`, because it must run even
+            // while the engine is evicted (when `self.backend` is `None`) and
+            // because it is not inference work.
+            if let Some((op, reply)) = job.lease_reply {
+                let result = match op {
+                    LeaseOp::Evict => self.evict(&mut session),
+                    LeaseOp::Restore => self.restore(&mut session),
+                    // A retry queued before a lease's eviction would rebuild
+                    // under the image generation; the flag set at acquisition
+                    // tells the two apart.
+                    LeaseOp::Retry if self.lease.leased.load(Ordering::Acquire) => {
+                        Err(EVICTED_MESSAGE.to_string())
+                    }
+                    LeaseOp::Retry => self.restore(&mut session),
+                };
+                if reply.send(result).is_err() {
+                    // The requester is gone, so a failed eviction/restore has
+                    // no one to report to. Record it; the request path's own
+                    // error handling covers a subsequent job.
+                    eprintln!("[server engine] lease acknowledgment lost");
+                }
+                continue;
+            }
             // The top-2 bench record is per request: a cancelled or failed job leaves its
             // entries in the session, so the record is emptied (and the surface re-armed) at
             // every job boundary rather than only drained on a clean completion.
@@ -1103,17 +1495,40 @@ impl EngineWorker {
             // channel pair is owned by the [`PooledReceiver`] on the
             // wire side and stays alive until that drop.
             let reply_tx = job.tokens_tx.clone();
+            let Some(request) = job.request else {
+                // Unreachable: a control message took the branch above.
+                continue;
+            };
+            // A job admitted in the window between `submit`'s check of the
+            // lease flags and its enqueue can arrive after an eviction or a
+            // failed restore; either way there is no backend to run on, so
+            // the job is answered rather than run.
+            if self.backend.is_none() {
+                let message = match &self.restore_failed {
+                    Some(e) => format!("{RESTORE_FAILED_PREFIX}{e}; the next request retries it"),
+                    None => EVICTED_MESSAGE.to_string(),
+                };
+                let _ = self.send_event_polling_cancel(
+                    &reply_tx,
+                    &job.cancel,
+                    TokenEvent::Error(message),
+                );
+                continue;
+            }
+            let cancel = Arc::clone(&job.cancel);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                self.process_job(&mut session, job);
+                self.process_job(&mut session, request, job.tokens_tx, job.cancel);
             }));
             if let Err(payload) = result {
                 // Per-job panic.  Notify the in-flight client first so
                 // it doesn't hang on `recv().await`, then decide
                 // whether to recover or shut down.
                 let msg = panic_payload_message(payload.as_ref());
-                let _ = reply_tx.blocking_send(TokenEvent::Error(format!(
-                    "engine recovered from panic: {msg}"
-                )));
+                let _ = self.send_event_polling_cancel(
+                    &reply_tx,
+                    &cancel,
+                    TokenEvent::Error(format!("engine recovered from panic: {msg}")),
+                );
                 drop(reply_tx);
                 let now = Instant::now();
                 // Drop timestamps older than the rolling window.
@@ -1138,11 +1553,7 @@ impl EngineWorker {
                         panic_budget,
                         panic_window_dur.as_secs(),
                     );
-                    while let Some(stale) = self.inbox.blocking_recv() {
-                        let _ = stale.tokens_tx.blocking_send(TokenEvent::Error(
-                            "engine unhealthy: too many panics; restart required".into(),
-                        ));
-                    }
+                    self.drain_unhealthy("engine unhealthy: too many panics; restart required");
                     return;
                 }
                 // Rebuild the per-worker `Session` because its KV
@@ -1151,24 +1562,17 @@ impl EngineWorker {
                 // buffers + sampler state are reallocated; the cost
                 // is bounded and dominated by `Vec::with_capacity` on
                 // recovery, not by re-staging weights.
-                match Session::new(
-                    self.config.clone(),
-                    self.hyperparams,
-                    SamplingParams::default(),
-                ) {
-                    Ok(mut s) => {
-                        s.set_bench_top2(self.bench_top2);
+                match self.fresh_session() {
+                    Ok(s) => {
                         session = s;
-                        if let Err(e) = session.validate_backend(self.backend.as_ref()) {
+                        if let Err(e) = session.validate_backend(self.backend()) {
                             eprintln!(
                                 "[server engine] re-validate_backend after panic failed: {e}; \
                                  draining inbox"
                             );
-                            while let Some(stale) = self.inbox.blocking_recv() {
-                                let _ = stale.tokens_tx.blocking_send(TokenEvent::Error(format!(
-                                    "engine unhealthy: backend revalidation failed: {e}"
-                                )));
-                            }
+                            self.drain_unhealthy(&format!(
+                                "engine unhealthy: backend revalidation failed: {e}"
+                            ));
                             return;
                         }
                     }
@@ -1177,11 +1581,9 @@ impl EngineWorker {
                             "[server engine] Session::new after panic failed: {e}; \
                              draining inbox"
                         );
-                        while let Some(stale) = self.inbox.blocking_recv() {
-                            let _ = stale.tokens_tx.blocking_send(TokenEvent::Error(format!(
-                                "engine unhealthy: session reinit failed: {e}"
-                            )));
-                        }
+                        self.drain_unhealthy(&format!(
+                            "engine unhealthy: session reinit failed: {e}"
+                        ));
                         return;
                     }
                 }
@@ -1267,7 +1669,7 @@ impl EngineWorker {
             0
         };
 
-        let metal_current_allocated_bytes = self.backend.current_allocated_bytes();
+        let metal_current_allocated_bytes = self.backend().current_allocated_bytes();
 
         let tokio_active_tasks = current_tokio_alive_tasks();
 
@@ -1442,12 +1844,13 @@ impl EngineWorker {
         }
     }
 
-    fn process_job(&self, session: &mut Session, job: WorkerJob) {
-        let WorkerJob {
-            request,
-            tokens_tx,
-            cancel,
-        } = job;
+    fn process_job(
+        &self,
+        session: &mut Session,
+        request: JobRequest,
+        tokens_tx: mpsc::Sender<TokenEvent>,
+        cancel: CancellationFlag,
+    ) {
         // Move the per-request sampling params (temperature / seed) onto the
         // long-lived per-worker session for this job and re-seed its RNG.
         // The session is constructed once in `run()` with
@@ -1484,7 +1887,7 @@ impl EngineWorker {
         // job's tokens; falls back to cold prefill otherwise.
         let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session.extend_with_cache(
             &request.prompt_tokens,
-            self.backend.as_ref(),
+            self.backend(),
             self.weights.as_ref(),
             request.suffix_threshold.max(1),
         );
@@ -1641,7 +2044,7 @@ impl EngineWorker {
                         finish_reason = FinishReason::Length;
                         break;
                     }
-                    match session.extend(ids, self.backend.as_ref(), self.weights.as_ref()) {
+                    match session.extend(ids, self.backend(), self.weights.as_ref()) {
                         Ok(_) => {
                             let mut inject_text = String::new();
                             for &id in ids.iter() {
@@ -1730,7 +2133,7 @@ impl EngineWorker {
                 finish_reason = FinishReason::Length;
                 break;
             }
-            let res = session.next_token(self.backend.as_ref(), self.weights.as_ref());
+            let res = session.next_token(self.backend(), self.weights.as_ref());
             let token_id = match res {
                 Ok(id) => id,
                 Err(e) => {
@@ -1907,6 +2310,96 @@ impl EngineWorker {
         // Suppress unused-warning for prior_tokens; we keep the read in
         // case future logging instrumentation wants it.
         let _ = prior_tokens;
+    }
+
+    /// Release the device backend, freeing its memory, including the device
+    /// KV cache it owns. The session is replaced by a fresh one so its
+    /// positions do not outlive that cache; the next request prefills from
+    /// scratch.
+    fn evict(&mut self, session: &mut Session) -> Result<(), String> {
+        // A lease is being granted, so a text job dequeued after this must
+        // answer as evicted rather than retry a restore that failed before
+        // it: the lease's own restore rebuilds when it ends.
+        self.restore_failed = None;
+        self.lease.restore_failed.store(false, Ordering::Release);
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        // Replace the session first so its positions never outlive the
+        // backend's device KV cache; the session itself holds only host memory.
+        *session = self
+            .fresh_session()
+            .map_err(|e| format!("resetting the session for eviction failed: {e}"))?;
+        self.backend = None;
+        Ok(())
+    }
+
+    /// A session with the worker's per-session hooks installed: the top-2
+    /// bench record and the token-id byte decoder the greedy anti-restate
+    /// guard's sub-word-doubling rule reads (when that guard is off the
+    /// decoder is never invoked). Every session the worker runs — the first
+    /// one and each rebuild — comes from here, so no rebuild loses a hook.
+    fn fresh_session(&self) -> Result<Session, RuntimeError> {
+        let mut session = Session::new(
+            self.config.clone(),
+            self.hyperparams,
+            SamplingParams::default(),
+        )?;
+        session.set_bench_top2(self.bench_top2);
+        let tok = Arc::clone(&self.tokenizer);
+        session.set_token_decoder(Arc::new(move |id: u32| tok.decode_id_bytes(id)));
+        Ok(session)
+    }
+
+    /// Rebuild the device backend after an eviction.
+    fn restore(&mut self, session: &mut Session) -> Result<(), String> {
+        if self.backend.is_some() {
+            return Ok(());
+        }
+        let result = self.rebuild(session);
+        self.restore_failed = result.as_ref().err().cloned();
+        self.lease
+            .restore_failed
+            .store(result.is_err(), Ordering::Release);
+        result
+    }
+
+    fn rebuild(&mut self, session: &mut Session) -> Result<(), String> {
+        let factory = self.factory.clone().ok_or_else(|| {
+            "this worker has no backend factory; it cannot be restored".to_string()
+        })?;
+        let backend = factory.build()?;
+        if let Err(e) = session.validate_backend(backend.as_ref()) {
+            return Err(format!("the restored backend failed validation: {e}"));
+        }
+        self.backend = Some(backend);
+        Ok(())
+    }
+
+    /// Answer every remaining job with `message` and return when the inbox
+    /// closes: the worker's terminal state once it cannot serve. Lease
+    /// requests are answered too, so an image request learns the engine is
+    /// unhealthy rather than that its worker vanished.
+    fn drain_unhealthy(&mut self, message: &str) {
+        while let Some(stale) = self.inbox.blocking_recv() {
+            if let Some((_, reply)) = stale.lease_reply {
+                let _ = reply.send(Err(message.to_string()));
+                continue;
+            }
+            let _ = self.send_event_polling_cancel(
+                &stale.tokens_tx,
+                &stale.cancel,
+                TokenEvent::Error(message.to_string()),
+            );
+        }
+    }
+
+    /// The live backend. Panics only if called while evicted, which the
+    /// request path cannot do: the lease protocol restores before releasing.
+    fn backend(&self) -> &dyn ComputeBackend {
+        self.backend
+            .as_deref()
+            .expect("backend accessed while evicted")
     }
 }
 
@@ -2350,6 +2843,7 @@ mod pool_tests {
             breakdown,
             channel_pool: Arc::clone(&channel_pool),
             pool_cap: 2,
+            lease: DeviceLease::unavailable(),
         };
 
         assert_eq!(handle.channel_pool_len(), 0, "pool starts empty");
