@@ -61,11 +61,11 @@ The 11-flag canonical env stack is documented at [METHODOLOGY.md § Required env
 |------|---------|-------------|
 | `--quick` | (off) | Smaller subset (single M, single G, fewer trials) |
 | `--lumen-only` | (off) | Skip llama-bench and MLX baselines |
-| `--models <filter>` | all | Filter by registry name fragment |
+| `--models <fragments>` | all | Comma-separated substrings matched against the `.lbc` filename stems |
 | `--prompt-lengths "L L L"` | `32 128 512 1024` | M axis |
 | `--gen-lengths "L L L"` | `32 128 256` | G axis |
-| `RUNS` env var | 5 | Measured runs per cell |
-| `WARMUP_RUNS` env var | 1 | Warmup runs discarded |
+| `--runs N` | 5 (3 with `--quick`) | Measured runs per cell |
+| `--warmup N` | 1 | Warmup runs discarded |
 
 CUDA-via-Modal (legacy) flag list is preserved in `modal/bench_real_models.py` source.
 

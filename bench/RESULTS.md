@@ -306,7 +306,7 @@ Lumen's `lumen run` per-process measurement includes the model cold-load in the 
 
 ### Metal production status
 
-The dense-9B Q8 and Q4 configs clear the 0.9× llama.cpp competitive gate on decode. The BF16 dense-9B config and the Q8 / Q4 MoE-35B-A3B configs are functional and production-ready: BF16 dense-9B is below the 0.5× sanity floor on prefill (a known structural baseline), and the MoE configs have no external baseline because llama-bench cannot load GDN MoE. The BF16 dense-9B and both MoE configs require `LUMEN_METAL_MMAP_ONLY=1` to fit the 96 GB residency budget.
+The dense-9B Q8 and Q4 configs clear the 0.9× llama.cpp competitive gate on decode. The BF16 dense-9B config and the Q8 / Q4 MoE-35B-A3B configs are functional and production-ready: BF16 dense-9B is below the 0.9× gate (0.83× decode, 0.66× prefill), and the MoE configs have no external baseline because llama-bench cannot load GDN MoE. The BF16 dense-9B and both MoE configs require `LUMEN_METAL_MMAP_ONLY=1` to fit the 96 GB residency budget.
 
 ---
 
@@ -318,4 +318,3 @@ The dense-9B Q8 and Q4 configs clear the 0.9× llama.cpp competitive gate on dec
 - The full opt-in environment-variable stack is required to reproduce these numbers; see [METHODOLOGY.md](METHODOLOGY.md).
 - The long-context numbers in this historical table were taken on the tiled streaming-softmax decode kernel, since retired: decode attention now runs one kernel at every context (see the CHANGELOG).
 - **Envelope citation rule.** When citing decode tok/s, ALWAYS report the (M, G) pair, not M alone. Decode rate is the result of *both* the per-step KV-scan cost (M-driven, ~linear in M) and the gen-length-sensitive tail-growth effect (G-driven, ~ -39% at fixed M = 128 going from gen128 to gen512). Citing only M was the methodology gap that motivated C-17; the (M, G) envelope above is the corrected reporting surface. The bench JSON schema (`bench/results/<timestamp>/results.json`) records `prompt_len` and `gen_len` as separate top-level result-row fields so downstream readers can re-compute envelopes by either axis.
-- For Qwen3.5-MoE 35B-A3B, both per-expert (default) and batched (`LUMEN_CUDA_MOE_BATCHED=1`) paths are byte-identical.
