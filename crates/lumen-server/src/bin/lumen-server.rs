@@ -1098,6 +1098,8 @@ async fn run(args: Args) -> Result<(), String> {
             eprintln!("[lumen-server] ctrl_c watcher failed: {e}");
         }
         eprintln!("[lumen-server] shutdown requested");
+        #[cfg(feature = "image")]
+        lumen_server::router_image::request_shutdown();
     };
 
     axum::serve(listener, app)

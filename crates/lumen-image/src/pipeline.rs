@@ -15,6 +15,7 @@
 //! text encoder's language tower is 14.1 GiB of BF16 weights and the
 //! transformer 13.3 GiB, so they do not fit on the card together.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use crate::dit::{Dit, DitConfig, DitForwardArgs};
@@ -163,6 +164,8 @@ pub enum PipelineError {
     Lbi(crate::lbi::LbiError),
     /// A request outside what this pipeline implements.
     Unsupported(String),
+    /// The progress callback asked to stop.
+    Cancelled,
 }
 
 impl std::fmt::Display for PipelineError {
@@ -174,6 +177,7 @@ impl std::fmt::Display for PipelineError {
             Self::Vae(e) => write!(f, "vae: {e}"),
             Self::Lbi(e) => write!(f, "lbi: {e}"),
             Self::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -299,10 +303,14 @@ pub fn initial_noise(seq: usize, channels: usize, seed: u64) -> Vec<f32> {
 ///
 /// Components are loaded and dropped in sequence so peak memory is the largest
 /// single component rather than their sum.
+///
+/// `progress` is called with `(steps done, steps total)` once the prompt is
+/// encoded and after every denoising step; `Break` stops the generation
+/// there with [`PipelineError::Cancelled`].
 pub fn generate_cpu(
     paths: &PipelinePaths,
     req: &GenerationRequest<'_>,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
 ) -> Result<Rgba, PipelineError> {
     let lat_h = latent_side(req.height);
     let lat_w = latent_side(req.width);
@@ -338,6 +346,9 @@ pub fn generate_cpu(
     img_mask.resize(text_seq + seq / 4, true);
 
     // 4-5. Denoise.
+    if progress(0, req.steps).is_break() {
+        return Err(PipelineError::Cancelled);
+    }
     let dit = Dit::load(&paths.transformer)?;
     let cfg = DitConfig::qwen_image_2_1();
     let sched = SigmaSchedule::new(req.steps, seq, &SchedulerConfig::qwen_image_2_1());
@@ -359,7 +370,9 @@ pub fn generate_cpu(
             out.data.clone()
         };
         latents = sched.step(step, &latents, &pred, false);
-        progress(step + 1, req.steps);
+        if progress(step + 1, req.steps).is_break() {
+            return Err(PipelineError::Cancelled);
+        }
     }
     drop(dit);
 
@@ -388,7 +401,7 @@ pub const GPU_DEVICE: usize = 0;
 pub fn generate_gpu(
     paths: &PipelinePaths,
     req: &GenerationRequest<'_>,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
 ) -> Result<Rgba, PipelineError> {
     use crate::cuda::dit_gpu::DitGpu;
     use crate::cuda::vae_gpu::VaeGpu;
@@ -434,6 +447,9 @@ pub fn generate_gpu(
     img_mask.resize(text_seq + seq / 4, true);
 
     // 4-5. Denoise.
+    if progress(0, req.steps).is_break() {
+        return Err(PipelineError::Cancelled);
+    }
     let cfg = DitConfig::qwen_image_2_1();
     let sched = SigmaSchedule::new(req.steps, seq, &SchedulerConfig::qwen_image_2_1());
     let mut latents = starting_latents(req, seq, cfg.in_channels)?;
@@ -458,7 +474,9 @@ pub fn generate_gpu(
                 out.data.clone()
             };
             latents = sched.step(step, &latents, &pred, false);
-            progress(step + 1, req.steps);
+            if progress(step + 1, req.steps).is_break() {
+                return Err(PipelineError::Cancelled);
+            }
         }
     }
 

@@ -14,8 +14,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   by the new `lumen-image` crate's `lbi-convert`. On a CUDA device shared with the text
   model, each generation takes the device exclusively — the text model is evicted for
   its duration and restored before the image is returned; text requests meanwhile get a
-  retryable `503`. Configured by `LUMEN_IMAGE_LBI`, `LUMEN_IMAGE_CKPT`,
-  `LUMEN_IMAGE_MODEL_ID` and `LUMEN_IMAGE_DEVICE`; see `docs/image-generation.md`.
+  retryable `503`. A generation whose client disconnects, or that is running when the
+  server is stopped, ends at its next denoising step. Configured by `LUMEN_IMAGE_LBI`,
+  `LUMEN_IMAGE_CKPT`, `LUMEN_IMAGE_MODEL_ID` and `LUMEN_IMAGE_DEVICE`; see
+  `docs/image-generation.md`.
 - **`ignore_eos` request field** on `/v1/chat/completions` and `/v1/completions`: `true`
   keeps decoding past the model's end-of-sequence tokens, which then render nothing;
   `max_tokens`, `stop` strings and the context limit still end the answer. Off by default.

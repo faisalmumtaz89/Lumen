@@ -71,9 +71,11 @@ Generations run one at a time. When the text model is served on the same CUDA de
 generation evicts it and restores it before the image is returned; text requests made
 meanwhile get a retryable `503` with the message `the model is evicted for an image
 generation; retry shortly`. A text model on the CPU or on another device is not
-affected. A request whose client disconnects while it waits its turn is dropped: if it
-was still queued nothing is evicted, and if the eviction had already been requested the
-text model is restored at once instead of after a generation nobody collects.
+affected. A request whose client disconnects is dropped: if it was still queued nothing
+is evicted, and if its generation was running it stops at the next denoising step and the
+text model is restored then (the disconnect is seen when the connection carries no further
+pipelined request behind the image request). Stopping the server (Ctrl-C) stops a generation that is still
+denoising the same way and answers it with `503`; one already decoding its image completes.
 
 Errors are the same JSON shape as the text endpoints: validation failures are `400` with
 `param` naming the field, a generation failure is `500`.

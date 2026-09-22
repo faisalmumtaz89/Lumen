@@ -88,10 +88,11 @@ fn run() -> Result<(), String> {
     let started = std::time::Instant::now();
     let mut last = 0usize;
     let mut report = |done: usize, total: usize| {
-        if done == total || done % 5 == 0 {
+        if done > 0 && (done == total || done % 5 == 0) {
             println!("  step {done}/{total}");
         }
         last = done;
+        std::ops::ControlFlow::Continue(())
     };
     let image = if gpu {
         #[cfg(feature = "cuda")]

@@ -29,18 +29,35 @@ const MAX_PROMPT_BYTES: usize = 8 * 1024;
 #[cfg(feature = "image")]
 static GENERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Cleared when the request's handler is dropped, which is how a client that
-/// disconnected after its turn came becomes visible to the blocking task (a
-/// started blocking task cannot be aborted, so it checks before it runs the
-/// pipeline).
+/// Set when the request's handler is dropped, which is how a client that
+/// disconnected becomes visible to the blocking task: a started blocking task
+/// cannot be aborted, so it reads the flag before the pipeline and at every
+/// step boundary and stops there.
 #[cfg(feature = "image")]
-struct RequestAlive(std::sync::Arc<std::sync::atomic::AtomicBool>);
+struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 #[cfg(feature = "image")]
-impl Drop for RequestAlive {
+impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Set once for the process by [`request_shutdown`]; a running generation
+/// stops at its next step boundary instead of holding the shutdown for the
+/// rest of its steps.
+#[cfg(feature = "image")]
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop every running and waiting generation: the server is shutting down.
+#[cfg(feature = "image")]
+pub fn request_shutdown() {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "image")]
+fn shutting_down() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Where a generation runs and how long it may take.
@@ -162,8 +179,8 @@ pub async fn generate_image(
     // running alongside would fail both. The text engine's lease serialises
     // only the generations that evict it; this covers the rest.
     let one_at_a_time = GENERATION.lock().await;
-    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let _alive = RequestAlive(std::sync::Arc::clone(&alive));
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(std::sync::Arc::clone(&cancelled));
 
     // The pipeline blocks for tens of seconds; keep it off the async reactor.
     let image = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
@@ -178,6 +195,25 @@ pub async fn generate_image(
             seed,
             init_latents: None,
         };
+        // A client that left, or a shutdown that began, has no reader for the
+        // image. Checked before the lease, so a request that is already over
+        // never evicts the text model; again after it, since the grant can
+        // wait behind a running text request, so the guard's drop restores
+        // the model straight away instead of after a generation nobody
+        // collects; and at every step of a running generation, which stops
+        // there. The response carries only the finished image, so the step
+        // counts have no reader.
+        let stop = || cancelled.load(std::sync::atomic::Ordering::Acquire) || shutting_down();
+        let stopped = || {
+            if shutting_down() {
+                ServerError::EngineUnavailable("the server is shutting down".to_string())
+            } else {
+                ServerError::Internal("the client disconnected".to_string())
+            }
+        };
+        if stop() {
+            return Err(stopped());
+        }
         // Take the device exclusively when the text model is on it: the model
         // is evicted for the duration and restored when the guard is dropped
         // below, before the PNG is encoded. Without it the two do not fit the card
@@ -188,26 +224,28 @@ pub async fn generate_image(
         } else {
             None
         };
-        // A client that left while the lease was being granted (behind a
-        // running text request) has no reader for the image: the guard's
-        // drop restores the text model straight away instead of after a
-        // generation nobody collects.
-        if !alive.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(ServerError::Internal(
-                "the client disconnected before the generation started".to_string(),
-            ));
+        if stop() {
+            return Err(stopped());
         }
-        // The response carries only the finished image, so step progress has
-        // no reader here.
+        let mut progress = |_, _| {
+            if stop() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        };
+        let failed = |e: lumen_image::pipeline::PipelineError| match e {
+            lumen_image::pipeline::PipelineError::Cancelled => stopped(),
+            e => ServerError::Runtime(format!("generation failed: {e}")),
+        };
         let rgba = if cfg.use_gpu {
             #[cfg(feature = "cuda")]
             {
-                lumen_image::pipeline::generate_gpu(&paths, &gen_req, &mut |_, _| {})
-                    .map_err(|e| ServerError::Runtime(format!("generation failed: {e}")))?
+                lumen_image::pipeline::generate_gpu(&paths, &gen_req, &mut progress)
+                    .map_err(failed)?
             }
         } else {
-            lumen_image::pipeline::generate_cpu(&paths, &gen_req, &mut |_, _| {})
-                .map_err(|e| ServerError::Runtime(format!("generation failed: {e}")))?
+            lumen_image::pipeline::generate_cpu(&paths, &gen_req, &mut progress).map_err(failed)?
         };
         drop(lease);
         Ok(lumen_image::png::encode(&rgba))
