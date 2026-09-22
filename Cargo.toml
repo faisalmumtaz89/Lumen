@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/lumen-format",
+    "crates/lumen-image",
     "crates/lumen-runtime",
     "crates/lumen-convert",
     "crates/lumen-bench",
@@ -70,6 +71,7 @@ description = "GPU-resident LLM inference engine in Rust with Metal GPU accelera
 lumen-format = { path = "crates/lumen-format" }
 lumen-runtime = { path = "crates/lumen-runtime" }
 lumen-convert = { path = "crates/lumen-convert" }
+lumen-image = { path = "crates/lumen-image" }
 lumen-bench = { path = "crates/lumen-bench" }
 lumen-server = { path = "crates/lumen-server" }
 thiserror = "2"

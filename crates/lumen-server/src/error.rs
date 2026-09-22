@@ -98,6 +98,10 @@ impl ServerError {
             Self::bad_request_field(message, "messages", "context_length_exceeded")
         } else if message.contains("prompt is empty") {
             Self::bad_request_field(message, "messages", "empty_prompt")
+        } else if message == crate::engine::EVICTED_MESSAGE
+            || message.starts_with(crate::engine::RESTORE_FAILED_PREFIX)
+        {
+            Self::EngineUnavailable(message)
         } else {
             Self::Runtime(message)
         }

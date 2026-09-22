@@ -102,9 +102,10 @@ curl http://localhost:8000/v1/models
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
+POST /v1/images/generations # Text to image (`--features image`), see docs/image-generation.md
 ```
 
-Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**.
+Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**. Serving Qwen-Image-2.1 next to a text model: **[docs/image-generation.md](docs/image-generation.md)**.
 
 ## Performance
 
@@ -154,6 +155,7 @@ Rust is pinned via `rust-toolchain.toml`; CUDA needs `libnvrtc` + `libcublas` pr
 - [Getting started](docs/getting-started.md) — install, pull, run (binaries, Docker, source)
 - [CLI reference](docs/cli.md) — all subcommands and flags (or `lumen run --help`)
 - [HTTP server](docs/server.md) — endpoints, reasoning, library embedding
+- [Image generation](docs/image-generation.md) — Qwen-Image-2.1 on the same device as a text model
 - [Model support](docs/support.md) — live support matrix and verification status
 - [Production deployment](docs/production.md) — serving mode, GPU sizing, known limitations
 - [Environment variables](docs/environment-variables.md) — all `LUMEN_*` flags

@@ -1,0 +1,97 @@
+[package]
+name = "lumen-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# CUDA execution of the same ops the CPU reference implements. The reference
+# stays the default so a plain `cargo test` needs no GPU.
+cuda = ["dep:lumen-runtime", "lumen-runtime/cuda", "dep:cudarc"]
+
+[dependencies]
+lumen-format = { path = "../lumen-format" }
+lumen-runtime = { path = "../lumen-runtime", optional = true }
+cudarc = { version = "=0.19.3", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading", "cuda-12020"], optional = true }
+fancy-regex = "0.14"
+unicode-normalization = "0.1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lbi-convert"
+path = "src/bin/lbi_convert.rs"
+
+[[bin]]
+name = "dit-check"
+path = "src/bin/dit_check.rs"
+
+[[bin]]
+name = "vae-check"
+path = "src/bin/vae_check.rs"
+
+[[bin]]
+name = "vae-check-gpu"
+path = "src/bin/vae_check_gpu.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "text-check"
+path = "src/bin/text_check.rs"
+
+[[bin]]
+name = "text-check-gpu"
+path = "src/bin/text_check_gpu.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "cuda-ops-check"
+path = "src/bin/cuda_ops_check.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "dit-check-gpu"
+path = "src/bin/dit_check_gpu.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "dit-policy-check"
+path = "src/bin/dit_policy_check.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "dit-stage-check"
+path = "src/bin/dit_stage_check.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "e2e-check"
+path = "src/bin/e2e_check.rs"
+
+[[bin]]
+name = "tokenizer-check"
+path = "src/bin/tokenizer_check.rs"
+
+[[bin]]
+name = "generate"
+path = "src/bin/generate.rs"
+
+[[bin]]
+name = "vae-input-check"
+path = "src/bin/vae_input_check.rs"
+
+[[bin]]
+name = "tokenizer-corpus-check"
+path = "src/bin/tokenizer_corpus_check.rs"
+
+[[bin]]
+name = "lbi-verify"
+path = "src/bin/lbi_verify.rs"
+
+[dev-dependencies]
+serde_json = "1"

@@ -7,6 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **Text-to-image serving.** `lumen-server --features image` exposes
+  `POST /v1/images/generations` for Qwen-Image-2.1, converted to three `.lbi` containers
+  by the new `lumen-image` crate's `lbi-convert`. On a CUDA device shared with the text
+  model, each generation takes the device exclusively — the text model is evicted for
+  its duration and restored before the image is returned; text requests meanwhile get a
+  retryable `503`. Configured by `LUMEN_IMAGE_LBI`, `LUMEN_IMAGE_CKPT`,
+  `LUMEN_IMAGE_MODEL_ID` and `LUMEN_IMAGE_DEVICE`; see `docs/image-generation.md`.
+
 ## [0.32.0] — 2026-09-20
 
 ### Added

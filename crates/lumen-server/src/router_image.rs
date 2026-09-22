@@ -1,0 +1,271 @@
+//! `POST /v1/images/generations`.
+//!
+//! Registered only when an image model is configured, so a text-only deployment
+//! never sees the route and never loads the image crate's device path.
+//!
+//! The handler is deliberately blocking on a worker thread: the pipeline is
+//! CPU- or GPU-bound for tens of seconds and would otherwise stall the async
+//! reactor that serves the text endpoints.
+
+use axum::response::Response;
+
+use crate::error::ServerError;
+
+#[cfg(feature = "image")]
+use {
+    crate::wire::image::{ImageDatum, ImageGenerationRequest, ImageGenerationResponse},
+    axum::response::IntoResponse,
+    axum::Json,
+};
+
+/// The longest prompt the endpoint accepts, in bytes. The tokenizer's cost grows
+/// faster than linearly, so this bounds a request's CPU time.
+#[cfg(feature = "image")]
+const MAX_PROMPT_BYTES: usize = 8 * 1024;
+
+/// Held for the whole of a generation, taken in the async handler so a
+/// request waiting its turn holds no thread and simply goes away with its
+/// connection; see the handler.
+#[cfg(feature = "image")]
+static GENERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Cleared when the request's handler is dropped, which is how a client that
+/// disconnected after its turn came becomes visible to the blocking task (a
+/// started blocking task cannot be aborted, so it checks before it runs the
+/// pipeline).
+#[cfg(feature = "image")]
+struct RequestAlive(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "image")]
+impl Drop for RequestAlive {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Where a generation runs and how long it may take.
+#[derive(Debug, Clone)]
+pub struct ImageConfig {
+    /// Directory holding `transformer.lbi`, `vae.lbi`, `text_encoder.lbi`.
+    pub lbi_dir: std::path::PathBuf,
+    /// The checkpoint directory, for the tokenizer files.
+    pub checkpoint_dir: std::path::PathBuf,
+    /// The model id this endpoint reports and accepts.
+    pub model_id: String,
+    /// Run on the GPU. `false` uses the CPU reference, which is correct but
+    /// takes minutes per image.
+    pub use_gpu: bool,
+}
+
+/// The generation endpoint's state.
+pub struct ImageState {
+    pub config: ImageConfig,
+    /// The text engine, so a generation can take the device exclusively and
+    /// release it when it finishes.
+    pub engine: crate::engine::EngineHandle,
+}
+
+/// Base64, so the response carries a PNG without a separate file store.
+#[cfg(feature = "image")]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(feature = "image")]
+pub async fn generate_image(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ImageState>>,
+    crate::router::OpenAiJson(req): crate::router::OpenAiJson<ImageGenerationRequest>,
+) -> Result<Response, ServerError> {
+    let engine = state.engine.clone();
+    if let Some(model) = &req.model {
+        if model != &state.config.model_id {
+            return Err(ServerError::bad_request_field(
+                format!(
+                    "unknown model {model:?}; this server serves {:?}",
+                    state.config.model_id
+                ),
+                "model",
+                "unknown_model",
+            ));
+        }
+    }
+    if req.output_format != "png" {
+        return Err(ServerError::bad_request_field(
+            format!(
+                "output_format {:?} is not supported; only \"png\"",
+                req.output_format
+            ),
+            "output_format",
+            "unsupported_value",
+        ));
+    }
+    if !matches!(req.response_format.as_str(), "b64_json" | "url") {
+        return Err(ServerError::bad_request_field(
+            format!(
+                "response_format {:?} is not supported; use \"b64_json\" or \"url\"",
+                req.response_format
+            ),
+            "response_format",
+            "unsupported_value",
+        ));
+    }
+    req.check_steps()
+        .map_err(|m| ServerError::bad_request_field(m, "num_inference_steps", "invalid_value"))?;
+    req.check_guidance()
+        .map_err(|m| ServerError::bad_request_field(m, "true_cfg_scale", "invalid_value"))?;
+    let (width, height) = req
+        .dimensions()
+        .map_err(|m| ServerError::bad_request_field(m, "size", "invalid_value"))?;
+    // The tokenizer is quadratic in the prompt, so an unbounded prompt is a
+    // cheap way to pin a worker; the text endpoints already bound theirs.
+    if req.prompt.len() > MAX_PROMPT_BYTES {
+        return Err(ServerError::bad_request_field(
+            format!(
+                "prompt is {} bytes, above the {MAX_PROMPT_BYTES} maximum",
+                req.prompt.len()
+            ),
+            "prompt",
+            "invalid_value",
+        ));
+    }
+
+    let cfg = state.config.clone();
+    let prompt = req.prompt.clone();
+    let steps = req.num_inference_steps;
+    let seed = req.seed.unwrap_or(42);
+    let out_format = req.response_format.clone();
+
+    // One generation at a time: each loads a component set that fills the
+    // card (or, on the CPU path, the host) on its own, so a second one
+    // running alongside would fail both. The text engine's lease serialises
+    // only the generations that evict it; this covers the rest.
+    let one_at_a_time = GENERATION.lock().await;
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _alive = RequestAlive(std::sync::Arc::clone(&alive));
+
+    // The pipeline blocks for tens of seconds; keep it off the async reactor.
+    let image = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let _one_at_a_time = one_at_a_time;
+        let paths =
+            lumen_image::pipeline::PipelinePaths::from_roots(&cfg.lbi_dir, &cfg.checkpoint_dir);
+        let gen_req = lumen_image::pipeline::GenerationRequest {
+            prompt: &prompt,
+            height,
+            width,
+            steps,
+            seed,
+            init_latents: None,
+        };
+        // Take the device exclusively when the text model is on it: the model
+        // is evicted for the duration and restored when the guard is dropped
+        // below, before the PNG is encoded. Without it the two do not fit the card
+        // together. A text engine off that device (CPU, another card) needs
+        // no eviction.
+        let lease = if cfg.use_gpu && engine.holds_device(lumen_image::pipeline::GPU_DEVICE) {
+            Some(engine.try_exclusive()?)
+        } else {
+            None
+        };
+        // A client that left while the lease was being granted (behind a
+        // running text request) has no reader for the image: the guard's
+        // drop restores the text model straight away instead of after a
+        // generation nobody collects.
+        if !alive.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ServerError::Internal(
+                "the client disconnected before the generation started".to_string(),
+            ));
+        }
+        // The response carries only the finished image, so step progress has
+        // no reader here.
+        let rgba = if cfg.use_gpu {
+            #[cfg(feature = "cuda")]
+            {
+                lumen_image::pipeline::generate_gpu(&paths, &gen_req, &mut |_, _| {})
+                    .map_err(|e| ServerError::Runtime(format!("generation failed: {e}")))?
+            }
+        } else {
+            lumen_image::pipeline::generate_cpu(&paths, &gen_req, &mut |_, _| {})
+                .map_err(|e| ServerError::Runtime(format!("generation failed: {e}")))?
+        };
+        drop(lease);
+        Ok(lumen_image::png::encode(&rgba))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("generation task failed: {e}")))??;
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let datum = if out_format == "url" {
+        // No file store is configured, so a url response carries the same bytes
+        // as a data URL rather than a link that would 404.
+        ImageDatum {
+            b64_json: None,
+            url: Some(format!("data:image/png;base64,{}", base64_encode(&image))),
+        }
+    } else {
+        ImageDatum {
+            b64_json: Some(base64_encode(&image)),
+            url: None,
+        }
+    };
+    Ok(Json(ImageGenerationResponse {
+        created,
+        data: vec![datum],
+    })
+    .into_response())
+}
+
+#[cfg(not(feature = "image"))]
+pub async fn generate_image() -> Result<Response, ServerError> {
+    Err(ServerError::bad_request(
+        "this server was built without the image feature",
+    ))
+}
+
+#[cfg(all(test, feature = "image"))]
+mod tests {
+    use super::base64_encode;
+
+    /// The padding cases are where a hand-written encoder goes wrong, so all
+    /// three lengths are pinned against the RFC 4648 vectors.
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_high_bytes() {
+        assert_eq!(base64_encode(&[0xFF, 0xFF, 0xFF]), "////");
+        assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+    }
+}

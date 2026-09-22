@@ -61,6 +61,35 @@ pub fn build_router(engine: EngineHandle) -> Router {
         .with_state(state)
 }
 
+/// As [`build_router`], additionally serving `POST /v1/images/generations`.
+///
+/// Separate rather than a flag on `build_router`: the image route carries its
+/// own state (where the converted components live), and a text-only deployment
+/// should not have the route present at all — a request to it should 404 the way
+/// any unknown path does, not 400 with a message about a feature.
+#[cfg(feature = "image")]
+pub fn build_router_with_images(
+    engine: EngineHandle,
+    images: std::sync::Arc<crate::router_image::ImageState>,
+) -> Router {
+    let state = AppState { engine };
+    Router::new()
+        .route(
+            "/v1/images/generations",
+            post(crate::router_image::generate_image),
+        )
+        .with_state(images)
+        .merge(
+            Router::new()
+                .route("/v1/models", get(list_models))
+                .route("/v1/chat/completions", post(chat_completions))
+                .route("/v1/completions", post(completions))
+                .route("/v1/messages", post(messages))
+                .route("/debug/memory_breakdown", get(memory_breakdown))
+                .with_state(state),
+        )
+}
+
 // ----------------------------- OpenAiJson extractor ---------------------
 //
 // custom JSON extractor that maps deserialization errors to

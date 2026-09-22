@@ -48,16 +48,19 @@
 pub mod engine;
 pub mod error;
 pub mod router;
+pub mod router_image;
 pub mod sse;
 pub mod tokenstop;
 pub mod wire;
 
 pub use engine::{
-    CancellationFlag, CancellationGuard, DiskKvConfig, EngineHandle, EngineWorker, FinishReason,
-    IdentityByteTokenizer, JobRequest, JobResponseChannel, ModelInfo, PooledReceiver, TokenEvent,
-    Tokenize,
+    BackendFactory, CancellationFlag, CancellationGuard, DiskKvConfig, EngineHandle, EngineWorker,
+    ExclusiveGuard, FinishReason, IdentityByteTokenizer, JobRequest, JobResponseChannel, ModelInfo,
+    PooledReceiver, TokenEvent, Tokenize, EVICTED_MESSAGE, RESTORE_FAILED_PREFIX,
 };
 pub use error::ServerError;
+#[cfg(feature = "image")]
+pub use router::build_router_with_images;
 pub use router::{build_router, AppState};
 pub use sse::SseSafeEmitter;
 pub use tokenstop::StopMatcher;
