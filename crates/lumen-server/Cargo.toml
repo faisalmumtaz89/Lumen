@@ -18,6 +18,9 @@ cuda = ["lumen-runtime/cuda"]
 # consumers that embed lumen-server without the bin keep their default
 # (empty) feature surface so the dep graph stays minimal.
 bin = ["dep:lumen-cli", "dep:lumen-convert", "dep:mimalloc"]
+# Keep the system allocator in the binary: the sanitizers track that heap and
+# not mimalloc's (scripts/sanitize_server.sh).
+system-allocator = []
 
 # Standalone server binary; gated on the `bin` feature.
 # Gated on the `bin` feature so embedders that don't want the lumen-cli

@@ -12,6 +12,7 @@
 //! already lives in `crates/lumen-server/src/`.
 
 // Match the rest of the production binaries on mimalloc.
+#[cfg(not(feature = "system-allocator"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

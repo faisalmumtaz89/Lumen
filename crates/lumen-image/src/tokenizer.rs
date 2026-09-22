@@ -407,6 +407,90 @@ mod tests {
             assert_eq!(back, b as usize);
         }
     }
+
+    /// A tokenizer over the complete byte alphabet and nothing else, the
+    /// floor every real checkpoint's vocabulary contains.
+    fn byte_alphabet() -> Tokenizer {
+        let map = byte_to_unicode();
+        let decoder: Vec<String> = map.iter().map(|c| c.to_string()).collect();
+        Tokenizer {
+            encoder: decoder
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.clone(), i as u32))
+                .collect(),
+            decoder,
+            merges: HashMap::new(),
+            byte_map: map,
+            char_map: map.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect(),
+            specials: vec![
+                ("<|im_start|>".to_string(), 300),
+                ("<|im_end|>".to_string(), 301),
+            ],
+        }
+    }
+
+    /// Text whose UTF-8 contains every byte value that can occur in a prompt:
+    /// the code points 0–255 (JSON carries NUL as `\u0000`), plus one
+    /// character for each two-, three- and four-byte lead byte. The text is in
+    /// NFC, as the encoder leaves it. The bytes that never appear in valid
+    /// UTF-8 (0xC0/0xC1 and 0xF5–0xFF encode nothing) are the only ones
+    /// missing, and the test checks that set exactly.
+    fn byte_sweep() -> String {
+        let mut text: String = (0u32..=255).map(|c| char::from_u32(c).unwrap()).collect();
+        text.extend(
+            (0x13F..=0x7FF)
+                .step_by(0x40)
+                .map(|c| char::from_u32(c).unwrap()),
+        );
+        text.extend(
+            (0xFFF..=0xFFFF)
+                .step_by(0x1000)
+                .map(|c| char::from_u32(if c == 0xDFFF { 0xD7FF } else { c }).unwrap()),
+        );
+        text.extend(
+            [0x10000, 0x50000, 0x90000, 0xD0000, 0x10FFFF]
+                .into_iter()
+                .map(|c| char::from_u32(c).unwrap()),
+        );
+        let text: String = text.nfc().collect();
+        let mut seen = [false; 256];
+        for &b in text.as_bytes() {
+            seen[b as usize] = true;
+        }
+        let missing: Vec<u8> = (0..=255u8).filter(|&b| !seen[b as usize]).collect();
+        assert_eq!(
+            missing,
+            [&[0xC0, 0xC1][..], &(0xF5..=0xFF).collect::<Vec<u8>>()].concat(),
+            "the sweep must cover every byte valid UTF-8 can carry"
+        );
+        text
+    }
+
+    /// Every byte a prompt can carry encodes and decodes back to itself, one
+    /// id per byte, alone and inside a chat template. A missing base symbol
+    /// would make `encode_word` drop the whole piece silently, so the ids are
+    /// counted, not just the text compared.
+    #[test]
+    fn every_prompt_byte_round_trips_through_encode_and_decode() {
+        let t = byte_alphabet();
+        let sweep = byte_sweep();
+        let ids = t.encode(&sweep).unwrap();
+        assert_eq!(ids.len(), sweep.len());
+        assert_eq!(t.decode(&ids), sweep);
+        for c in sweep.chars() {
+            let one = c.to_string();
+            let ids = t.encode(&one).unwrap();
+            assert_eq!(ids.len(), one.len(), "{c:?} (U+{:04X})", c as u32);
+            assert_eq!(t.decode(&ids), one, "U+{:04X}", c as u32);
+        }
+        let framed = format!("<|im_start|>{sweep}<|im_end|>");
+        let ids = t.encode(&framed).unwrap();
+        assert_eq!(ids.first(), Some(&300));
+        assert_eq!(ids.last(), Some(&301));
+        assert_eq!(ids.len(), sweep.len() + 2);
+        assert_eq!(t.decode(&ids[1..ids.len() - 1]), sweep);
+    }
 }
 
 #[cfg(test)]
