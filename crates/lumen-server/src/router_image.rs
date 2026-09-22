@@ -18,8 +18,8 @@ use {
     axum::Json,
 };
 
-/// The longest prompt the endpoint accepts, in bytes. The tokenizer's cost grows
-/// faster than linearly, so this bounds a request's CPU time.
+/// The longest prompt the endpoint accepts, in bytes; it bounds a request's
+/// tokenizer and text-encoder cost.
 #[cfg(feature = "image")]
 const MAX_PROMPT_BYTES: usize = 8 * 1024;
 
@@ -152,11 +152,13 @@ pub async fn generate_image(
         .map_err(|m| ServerError::bad_request_field(m, "num_inference_steps", "invalid_value"))?;
     req.check_guidance()
         .map_err(|m| ServerError::bad_request_field(m, "true_cfg_scale", "invalid_value"))?;
+    req.check_n()
+        .map_err(|m| ServerError::bad_request_field(m, "n", "invalid_value"))?;
     let (width, height) = req
         .dimensions()
         .map_err(|m| ServerError::bad_request_field(m, "size", "invalid_value"))?;
-    // The tokenizer is quadratic in the prompt, so an unbounded prompt is a
-    // cheap way to pin a worker; the text endpoints already bound theirs.
+    // Tokenizing and encoding grow with the prompt, so an unbounded prompt is
+    // a cheap way to pin a worker; the text endpoints already bound theirs.
     if req.prompt.len() > MAX_PROMPT_BYTES {
         return Err(ServerError::bad_request_field(
             format!(
