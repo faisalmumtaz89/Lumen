@@ -1177,9 +1177,14 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
         .check(use_gpu)
         .map_err(|e| {
             format!(
-                "the image endpoint's files are unusable (LUMEN_IMAGE_LBI must hold \
+                "the image endpoint cannot start: {e} (LUMEN_IMAGE_LBI must hold \
                  transformer.lbi, vae.lbi and text_encoder.lbi; LUMEN_IMAGE_CKPT must hold \
-                 processor/vocab.json, merges.txt and added_tokens.json): {e}"
+                 processor/vocab.json, merges.txt and added_tokens.json{})",
+                if use_gpu {
+                    "; the CUDA device must have the memory a 2048x2048 generation uses"
+                } else {
+                    ""
+                }
             )
         })?;
     Ok(Some(lumen_server::router_image::ImageConfig {

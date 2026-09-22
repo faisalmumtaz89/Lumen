@@ -21,6 +21,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **`ignore_eos` request field** on `/v1/chat/completions` and `/v1/completions`: `true`
   keeps decoding past the model's end-of-sequence tokens, which then render nothing;
   `max_tokens`, `stop` strings and the context limit still end the answer. Off by default.
+- **Device-memory check for the image endpoint.** At startup the server refuses a CUDA
+  device whose total memory is below the 21.0 GiB a 2048×2048 generation reaches, naming
+  the device's memory and the requirement, instead of failing the first request.
 
 ## [0.32.0] — 2026-09-20
 

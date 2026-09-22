@@ -129,6 +129,15 @@ impl PipelinePaths {
                 )));
             }
         }
+        #[cfg(feature = "cuda")]
+        if gpu {
+            let dev = lumen_runtime::cuda::ffi::CudaDevice::new(GPU_DEVICE)
+                .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
+            let total = dev
+                .total_memory()
+                .map_err(|e| PipelineError::Unsupported(format!("device memory query: {e}")))?;
+            check_device_memory(total as u64)?;
+        }
         Ok(())
     }
 }
@@ -390,6 +399,28 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
+/// The most device memory a generation uses, in bytes: 21,491 MiB, measured
+/// as the device's used memory at the peak of a 2048x2048 generation (the
+/// VAE decode; a 1024x1024 generation peaks at 15,923 MiB in the text-encoder
+/// phase) on an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
+/// less total memory would fail a request at that size after the text model
+/// had been evicted for it, so the startup check refuses it instead.
+pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
+
+/// Refuse a device whose total memory is below [`PEAK_DEVICE_BYTES`].
+pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
+    if total_bytes < PEAK_DEVICE_BYTES {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        return Err(PipelineError::Unsupported(format!(
+            "the device has {:.1} GiB of memory ({total_bytes} bytes) and a generation at \
+             2048x2048 needs {:.1} GiB ({PEAK_DEVICE_BYTES} bytes)",
+            gib(total_bytes),
+            gib(PEAK_DEVICE_BYTES),
+        )));
+    }
+    Ok(())
+}
+
 /// Generate one image on the GPU.
 ///
 /// Same sequence as [`generate_cpu`], with each component's device
@@ -496,4 +527,26 @@ pub fn generate_gpu(
         .decode(&denorm, 1, lat_h, lat_w)
         .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
     Ok(Rgba::from_planar_rgba(lat_w * 16, lat_h * 16, &decoded))
+}
+
+#[cfg(test)]
+mod device_memory_tests {
+    use super::{check_device_memory, PEAK_DEVICE_BYTES};
+
+    /// A device below the measured peak is refused with both amounts in the
+    /// message; one at or above it passes.
+    #[test]
+    fn a_small_device_is_refused_with_both_amounts_named() {
+        let err = check_device_memory(16 << 30).unwrap_err().to_string();
+        assert!(
+            err.contains("16.0 GiB") && err.contains(&(16u64 << 30).to_string()),
+            "{err}"
+        );
+        assert!(
+            err.contains("21.0 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
+            "{err}"
+        );
+        assert!(check_device_memory(PEAK_DEVICE_BYTES).is_ok());
+        assert!(check_device_memory(32 << 30).is_ok());
+    }
 }
