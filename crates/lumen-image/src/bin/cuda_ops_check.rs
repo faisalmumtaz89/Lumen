@@ -15,7 +15,7 @@
 //! AdaLN kernels reading the per-token modulation row. They are held within
 //! 1e-3 — above the transcendental and reduction-order ulp differences, below
 //! what one missing intermediate rounding produces — and `pack_rows` and
-//! `add_gated` exactly.
+//! the residual update exactly.
 //!
 //! Usage: `cuda-ops-check`
 
@@ -556,18 +556,29 @@ fn run() -> Result<usize, String> {
         );
     }
 
-    // swiglu against `bf16(bf16(silu(g)) * u)`.
-    let n = 1000usize;
-    let g = bf16_values(pseudo(n, 74));
-    let u = bf16_values(pseudo(n, 75));
-    let want: Vec<f32> = g
-        .iter()
-        .zip(&u)
-        .map(|(&gv, &uv)| bf16_round(bf16_round(lumen_image::tensor::silu(gv)) * uv))
-        .collect();
-    let out = ops::swiglu(&dev, &ops, &upload_bits(&dev, &g)?, &upload_bits(&dev, &u)?)
-        .map_err(|e| e.to_string())?;
-    rep.check("swiglu", &download_bits(&dev, &out)?, &want, 1e-3);
+    // swiglu against `bf16(bf16(silu(g)) * u)`; 1003 leaves a tail shorter
+    // than the kernel's eight elements per thread, 8193 spans several blocks
+    // of 2048 and ends in a tail, and a length of 7 is all tail, which must
+    // give the same bits as the eight-wide path.
+    let mut wide = Vec::new();
+    for n in [1000usize, 1003, 8193, 7] {
+        let g = bf16_values(pseudo(8193, 74))[..n].to_vec();
+        let u = bf16_values(pseudo(8193, 75))[..n].to_vec();
+        let want: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(&gv, &uv)| bf16_round(bf16_round(lumen_image::tensor::silu(gv)) * uv))
+            .collect();
+        let out = ops::swiglu(&dev, &ops, &upload_bits(&dev, &g)?, &upload_bits(&dev, &u)?)
+            .map_err(|e| e.to_string())?;
+        let got = download_bits(&dev, &out)?;
+        rep.check(&format!("swiglu {n}"), &got, &want, 1e-3);
+        if n == 1000 {
+            wide = got;
+        } else if n == 7 {
+            rep.check("swiglu tail == eight-wide", &got, &wide[..7], 0.0);
+        }
+    }
 
     // gelu_tanh against the reference's `gelu_tanh`, rounded.
     let n = 512usize;
@@ -604,6 +615,8 @@ fn run() -> Result<usize, String> {
         ("mod 4x", 5usize, 64usize, 0usize, 256usize),
         ("mod mlp chunk", 5, 64, 128, 256),
         ("mod narrow", 5, 48, 0, 48),
+        ("mod wide", 3, 4096, 4096, 4 * 4096),
+        ("mod ragged", 3, 1000, 2000, 4000),
     ] {
         // Rows at scale 1e-3 make the epsilon count; a per-row offset of 100
         // makes a one-pass `E[x^2] - mean^2` variance cancel to noise.
@@ -652,8 +665,13 @@ fn run() -> Result<usize, String> {
             1e-3,
         );
 
-        // add_gated == `x = bf16(x + bf16(t * y))`, in place.
-        let want: Vec<f32> = (0..rows)
+        // add_gated_layernorm_scale == `x = bf16(x + bf16(t * y))` in place,
+        // then layernorm_scale of the updated x. The scale comes either from
+        // the gate's buffer at the next chunk (wrapping to 0), as a block's
+        // norms read the shared modulation, or from a buffer of its own one
+        // row wide, as `norm_out` reads its scale; a kernel that mixes up the
+        // chunks or the strides cannot pass.
+        let updated: Vec<f32> = (0..rows)
             .flat_map(|r| {
                 x[r * cols..(r + 1) * cols]
                     .iter()
@@ -663,25 +681,73 @@ fn run() -> Result<usize, String> {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let mut gx = upload_bits(&dev, &x)?;
-        ops::add_gated(
-            &dev,
-            &ops,
-            &mut gx,
-            &upload_bits(&dev, &y)?,
-            &g_factors,
-            &g_row,
-            off,
-            cols,
-            stride,
-        )
-        .map_err(|e| e.to_string())?;
-        rep.check(
-            &format!("add_gated {case}"),
-            &download_bits(&dev, &gx)?,
-            &want,
-            0.0,
-        );
+        let own_scale = bf16_values(pseudo(if single_row { cols } else { 2 * cols }, 47));
+        let g_own_scale = upload_bits(&dev, &own_scale)?;
+        let chunk_off = if off + 2 * cols <= stride {
+            off + cols
+        } else {
+            0
+        };
+        for (source, scale, g_scale, scale_off, scale_stride) in [
+            ("shared", &factors, &g_factors, chunk_off, stride),
+            ("own", &own_scale, &g_own_scale, 0, cols),
+        ] {
+            let ln = layer_norm_rows(&Matrix::new(rows, cols, updated.clone()), 1e-6);
+            let want: Vec<f32> = (0..rows)
+                .flat_map(|r| {
+                    let f = &scale[mod_row[r] as usize * scale_stride + scale_off..][..cols];
+                    ln.data[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(f)
+                        .map(|(&xv, &f)| bf16_round(bf16_round(xv) * f))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut gx = upload_bits(&dev, &x)?;
+            let out = ops::add_gated_layernorm_scale(
+                &dev,
+                &ops,
+                &mut gx,
+                &upload_bits(&dev, &y)?,
+                &g_factors,
+                (off, stride),
+                g_scale,
+                (scale_off, scale_stride),
+                &g_row,
+                cols,
+                1e-6,
+            )
+            .map_err(|e| e.to_string())?;
+            let name = format!("add_gated_layernorm_scale {case} {source}");
+            rep.check(
+                &format!("{name} residual"),
+                &download_bits(&dev, &gx)?,
+                &updated,
+                0.0,
+            );
+            let got = download_bits(&dev, &out)?;
+            rep.check(&format!("{name} norm"), &got, &want, 1e-3);
+            // The norm half is layernorm_scale's arithmetic in its order, so
+            // it must reproduce that kernel on the updated rows bit for bit.
+            let separate = ops::layernorm_scale(
+                &dev,
+                &ops,
+                &gx,
+                g_scale,
+                &g_row,
+                scale_off,
+                cols,
+                scale_stride,
+                1e-6,
+            )
+            .map_err(|e| e.to_string())?;
+            rep.check(
+                &format!("{name} == layernorm_scale"),
+                &got,
+                &download_bits(&dev, &separate)?,
+                0.0,
+            );
+        }
     }
 
     Ok(rep.failures)
