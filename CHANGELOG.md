@@ -49,6 +49,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   reference's starting noise is closer to the reference's (46.0 dB PSNR instead of
   41.6 dB), and on an RTX 5090 a 1024×1024 generation takes 15.39 s instead of 15.78 s
   with the transformer resident (medians of 6 interleaved runs each).
+- **Faster image attention.** The CUDA attention kernel copies its key and value tiles in
+  the background while the tensor cores work, and skips the masking and rescaling steps
+  that cannot change a result: on an RTX 5090 a 1024×1024 generation takes 14.76 s
+  instead of 15.12 s with the transformer resident (medians of 8 interleaved runs each),
+  with identical images.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.
