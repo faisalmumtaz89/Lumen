@@ -54,6 +54,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   that cannot change a result: on an RTX 5090 a 1024×1024 generation takes 14.76 s
   instead of 15.12 s with the transformer resident (medians of 8 interleaved runs each),
   with identical images.
+- **`LUMEN_IMAGE_PIN_TEXT_ENCODER=1`** keeps the image text encoder's weights in
+  page-locked host memory (14.1 GiB, copied at startup) and loads the encoder from there
+  for each generation: on an RTX 5090 host the load takes 0.45 s instead of 0.75 s
+  (medians of 4 interleaved runs each), with identical output. Off by default.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

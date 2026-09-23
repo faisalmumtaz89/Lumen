@@ -467,10 +467,14 @@ pub fn generate_gpu(
 /// every page in again. A container replaced on disk afterwards (a conversion
 /// renames its new file into place) is not seen until the sources are opened
 /// again.
+///
+/// [`GpuSources::pin_text_encoder`] adds page-locked host copies of the text
+/// encoder, the one component every generation loads.
 #[cfg(feature = "cuda")]
 pub struct GpuSources {
     tokenizer: Tokenizer,
     text_encoder: LbiFile,
+    text_pinned: Option<crate::cuda::text_gpu::PinnedMatrices>,
     transformer: LbiFile,
     vae: LbiFile,
 }
@@ -489,9 +493,26 @@ impl GpuSources {
                 paths.added_tokens.as_deref(),
             )?,
             text_encoder: open(&paths.text_encoder)?,
+            text_pinned: None,
             transformer: open(&paths.transformer)?,
             vae: open(&paths.vae)?,
         })
+    }
+
+    /// Copy the text encoder's matrices into page-locked host memory (14.1 GiB
+    /// for Qwen-Image-2.1), from which every later load uploads them at the
+    /// link's full rate. Page-locked memory is held for the sources' lifetime
+    /// and is not bounded by the host's memlock or cgroup memory limits, so
+    /// whether the host can spare it is the caller's decision.
+    pub fn pin_text_encoder(&mut self) -> Result<(), PipelineError> {
+        let config =
+            crate::text_encoder::TextEncoderConfig::from_lbi_config(self.text_encoder.config())?;
+        let ctx = cudarc::driver::CudaContext::new(GPU_DEVICE)
+            .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
+        let pinned = crate::cuda::text_gpu::PinnedMatrices::copy(&self.text_encoder, &config, &ctx)
+            .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
+        self.text_pinned = Some(pinned);
+        Ok(())
     }
 
     fn load_dit(
@@ -620,8 +641,13 @@ fn encode_prompt_gpu(
     let hidden = {
         let config =
             crate::text_encoder::TextEncoderConfig::from_lbi_config(sources.text_encoder.config())?;
-        let encoder = crate::cuda::text_gpu::TextGpu::load_with(&sources.text_encoder, dev, config)
-            .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
+        let encoder = crate::cuda::text_gpu::TextGpu::load_with(
+            &sources.text_encoder,
+            sources.text_pinned.as_ref(),
+            dev,
+            config,
+        )
+        .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
         encoder
             .forward(ids)
             .map_err(|e| PipelineError::Unsupported(format!("{e}")))?

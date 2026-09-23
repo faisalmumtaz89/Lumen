@@ -277,6 +277,7 @@ individual switches also accept `=0`.
 | `LUMEN_FAULT_PERTURB_US` | unset | test hook | `--features fault-injection` builds only: every job sleeps a random `0..=max` microseconds before its prefill and before each decode step. | Timing-perturbation tests only. |
 | `LUMEN_IMAGE_MODEL_ID` | `Qwen-Image-2.1` | config | The model id the endpoint reports and accepts. Refused, like `LUMEN_IMAGE_DEVICE`, when set without `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT`. | Rename the served image model. |
 | `LUMEN_IMAGE_DEVICE` | `cuda` | config | `cuda`/`gpu` or `cpu`; anything else refuses to start. A build without `--features image` refuses to start when any `LUMEN_IMAGE_*` variable is set. On the CUDA text engine's device, each generation evicts the text model for its duration and text requests get a retryable 503 meanwhile. | `cpu` for validation only (minutes per image). |
+| `LUMEN_IMAGE_PIN_TEXT_ENCODER` | `0` | config | `1` copies the text encoder's weights into page-locked host memory at startup (14.1 GiB, held for the server's lifetime) and loads the encoder from there for each generation; `0` or unset loads it from the file. Anything else refuses to start, as does `1` with `LUMEN_IMAGE_DEVICE=cpu` or without `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT`; the server also refuses to start if the copy cannot be made. Page-locked memory is not bounded by memlock or cgroup memory limits. | A host with the memory to spare, for faster generations. |
 
 ## Diagnostics / dumps (general, off in production)
 

@@ -72,6 +72,9 @@ pub struct ImageConfig {
     /// Run on the GPU. `false` uses the CPU reference, which is correct but
     /// takes minutes per image.
     pub use_gpu: bool,
+    /// Keep a page-locked host copy of the text encoder (CUDA only), from
+    /// which each generation loads it faster.
+    pub pin_text_encoder: bool,
 }
 
 /// The generation endpoint's state.
