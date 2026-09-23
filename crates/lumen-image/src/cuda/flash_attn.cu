@@ -31,7 +31,19 @@
 // Shared rows are padded to 136 elements (272 bytes) so the eight row reads of
 // an `ldmatrix` land in distinct bank groups.
 //
-// Compiled for compute_80 or later: bf16 `mma.sync` and `ldmatrix` need it.
+// The key and value tiles arrive by `cp.async`, one buffer each: V(t) is copied
+// while Q Kᵀ(t) and the softmax run, and K(t+1) while P V(t) runs, so the
+// loads overlap the tensor-core work instead of preceding it. Only a tile past
+// the sequence end or a block holding text rows can mask a score; every other
+// tile takes a path without the mask arithmetic, and a row whose running
+// maximum did not move skips the rescale of its accumulators (a factor of
+// exactly 1). For scores above the masked sentinel (-1e29 in log2 units, far
+// beyond any bf16 activations this model produces) each row's arithmetic is
+// the same on every path; a row whose scores all fall below it is treated as
+// masked only on the masking path.
+//
+// Compiled for compute_80 or later: bf16 `mma.sync`, `ldmatrix` and `cp.async`
+// need it.
 // NVRTC-compatible: no includes, extern "C" linkage.
 
 #define FA_BQ 64
@@ -84,6 +96,42 @@ __device__ __forceinline__ void fa_mma(
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// `cp.async`: a 16-byte global -> shared copy that bypasses the registers and
+// completes in the background; `src_bytes` 0 writes zeros instead of reading.
+__device__ __forceinline__ void fa_cp_async16(unsigned int dst, const void* src, unsigned int src_bytes)
+{
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(dst), "l"(src), "r"(src_bytes));
+}
+
+__device__ __forceinline__ void fa_cp_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most `n` of this thread's committed copy groups are pending.
+#define FA_CP_WAIT(n) asm volatile("cp.async.wait_group " #n ";\n" ::)
+
+// Start copying a 64x128 bf16 tile (rows `row0..row0+64` of one head) into
+// padded shared memory; rows past `seq` are zero-filled.
+__device__ __forceinline__ void fa_load_tile_async(
+    unsigned short* dst,
+    const unsigned short* __restrict__ src,
+    unsigned int row0,
+    unsigned int seq,
+    unsigned int row_stride,
+    unsigned int tid)
+{
+    for (unsigned int i = tid; i < FA_BK * (FA_D / 8); i += FA_THREADS) {
+        unsigned int r = i / (FA_D / 8);
+        unsigned int c = (i % (FA_D / 8)) * 8;
+        unsigned int row = row0 + r;
+        bool inside = row < seq;
+        const unsigned short* from = src + (unsigned long long)(inside ? row : 0u) * row_stride + c;
+        fa_cp_async16(fa_smem_addr(dst + r * FA_PAD + c), from, inside ? 16u : 0u);
+    }
 }
 
 // Copy a 64x128 bf16 tile (rows `row0..row0+64` of one head) into padded
@@ -165,10 +213,15 @@ flash_attn_bf16(
     const bool block_has_text = q0 < text_count;
     const unsigned int tiles = (seq + FA_BK - 1) / FA_BK;
 
+    // The copies run in the background: V(t) arrives while Q Kᵀ(t) is
+    // computed, and K(t+1) while P V(t) is.
+    fa_load_tile_async(s_k, k + head_off, 0, seq, row_stride, tid);
+    fa_cp_commit();
     for (unsigned int t = 0; t < tiles; t++) {
         const unsigned int k0 = t * FA_BK;
-        fa_load_tile(s_k, k + head_off, k0, seq, row_stride, tid);
-        fa_load_tile(s_v, v + head_off, k0, seq, row_stride, tid);
+        fa_load_tile_async(s_v, v + head_off, k0, seq, row_stride, tid);
+        fa_cp_commit();
+        FA_CP_WAIT(1);   // K(t) has landed; V(t) may still be in flight
         __syncthreads();
 
         // S = Q Kᵀ for this warp's 16 rows x 64 keys: 8 n-tiles of 8 keys.
@@ -189,21 +242,32 @@ flash_attn_bf16(
             }
         }
 
-        // Scale into log2 units and mask: keys past the sequence, and keys a
-        // text query may not see.
-        const bool partial = k0 + FA_BK > seq;
+        // Scale into log2 units and mask keys past the sequence and keys a
+        // text query may not see. Only a tile past the sequence end or a block
+        // holding text rows can mask anything; every other tile takes the
+        // unmasked path.
+        const bool masking = block_has_text || k0 + FA_BK > seq;
         float tmax0 = FA_NEG_INF, tmax1 = FA_NEG_INF;
-        for (unsigned int n = 0; n < 8; n++) {
-            unsigned int key = k0 + n * 8 + (lane & 3) * 2;
-            for (unsigned int e = 0; e < 4; e++) {
-                unsigned int kk = key + (e & 1);
-                unsigned int qr = (e < 2) ? qr0 : qr1;
-                float val = s[n][e] * scale_log2;
-                bool masked = (partial && kk >= seq)
-                    || (block_has_text && qr < text_count && kk > qr);
-                if (masked) val = FA_NEG_INF;
-                s[n][e] = val;
-                if (e < 2) tmax0 = fmaxf(tmax0, val); else tmax1 = fmaxf(tmax1, val);
+        if (masking) {
+            for (unsigned int n = 0; n < 8; n++) {
+                unsigned int key = k0 + n * 8 + (lane & 3) * 2;
+                for (unsigned int e = 0; e < 4; e++) {
+                    unsigned int kk = key + (e & 1);
+                    unsigned int qr = (e < 2) ? qr0 : qr1;
+                    float val = s[n][e] * scale_log2;
+                    bool masked = kk >= seq || (qr < text_count && kk > qr);
+                    if (masked) val = FA_NEG_INF;
+                    s[n][e] = val;
+                    if (e < 2) tmax0 = fmaxf(tmax0, val); else tmax1 = fmaxf(tmax1, val);
+                }
+            }
+        } else {
+            for (unsigned int n = 0; n < 8; n++) {
+                for (unsigned int e = 0; e < 4; e++) {
+                    float val = s[n][e] * scale_log2;
+                    s[n][e] = val;
+                    if (e < 2) tmax0 = fmaxf(tmax0, val); else tmax1 = fmaxf(tmax1, val);
+                }
             }
         }
         // The four lanes sharing a row combine their maxima.
@@ -215,15 +279,17 @@ flash_attn_bf16(
         float mnew0 = fmaxf(m0, tmax0);
         float mnew1 = fmaxf(m1, tmax1);
         // A row with nothing visible yet keeps its accumulators at zero.
-        float alpha0 = (mnew0 <= FA_MASKED) ? 1.0f : exp2f(m0 - mnew0);
-        float alpha1 = (mnew1 <= FA_MASKED) ? 1.0f : exp2f(m1 - mnew1);
+        // Off the masking path no score is masked, so the masked cases below
+        // arise there only for scores at or below the sentinel.
+        float alpha0 = (masking && mnew0 <= FA_MASKED) ? 1.0f : exp2f(m0 - mnew0);
+        float alpha1 = (masking && mnew1 <= FA_MASKED) ? 1.0f : exp2f(m1 - mnew1);
         float rs0 = 0.0f, rs1 = 0.0f;
         unsigned int p[4][4];   // P as A fragments: 4 k-slabs of 16 keys
         for (unsigned int n = 0; n < 8; n++) {
-            float p0 = (s[n][0] <= FA_MASKED) ? 0.0f : exp2f(s[n][0] - mnew0);
-            float p1 = (s[n][1] <= FA_MASKED) ? 0.0f : exp2f(s[n][1] - mnew0);
-            float p2 = (s[n][2] <= FA_MASKED) ? 0.0f : exp2f(s[n][2] - mnew1);
-            float p3 = (s[n][3] <= FA_MASKED) ? 0.0f : exp2f(s[n][3] - mnew1);
+            float p0 = (masking && s[n][0] <= FA_MASKED) ? 0.0f : exp2f(s[n][0] - mnew0);
+            float p1 = (masking && s[n][1] <= FA_MASKED) ? 0.0f : exp2f(s[n][1] - mnew0);
+            float p2 = (masking && s[n][2] <= FA_MASKED) ? 0.0f : exp2f(s[n][2] - mnew1);
+            float p3 = (masking && s[n][3] <= FA_MASKED) ? 0.0f : exp2f(s[n][3] - mnew1);
             rs0 += p0 + p1;
             rs1 += p2 + p3;
             // C(tile n) -> A(slab n/2): even n gives a0/a1, odd n a2/a3.
@@ -244,9 +310,21 @@ flash_attn_bf16(
         l1 = l1 * alpha1 + rs1;
         m0 = mnew0;
         m1 = mnew1;
-        for (unsigned int n = 0; n < 16; n++) {
-            o[n][0] *= alpha0; o[n][1] *= alpha0;
-            o[n][2] *= alpha1; o[n][3] *= alpha1;
+        // A row whose maximum did not move has alpha exactly 1, and scaling
+        // by 1 is exact, so the rescale is skipped then.
+        if (alpha0 != 1.0f || alpha1 != 1.0f) {
+            for (unsigned int n = 0; n < 16; n++) {
+                o[n][0] *= alpha0; o[n][1] *= alpha0;
+                o[n][2] *= alpha1; o[n][3] *= alpha1;
+            }
+        }
+
+        // Every warp is done with K(t) and V(t) has landed; start K(t+1).
+        FA_CP_WAIT(0);
+        __syncthreads();
+        if (t + 1 < tiles) {
+            fa_load_tile_async(s_k, k + head_off, k0 + FA_BK, seq, row_stride, tid);
+            fa_cp_commit();
         }
 
         // O += P V: 4 k-slabs of 16 keys x 16 n-tiles of 8 output columns.

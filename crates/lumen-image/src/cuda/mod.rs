@@ -34,8 +34,8 @@ pub const IMAGE_OPS_SOURCE: &str = include_str!("image_ops.cu");
 pub const TEXT_OPS_SOURCE: &str = include_str!("text_ops.cu");
 
 /// The fused attention kernel's source. Its own module because it targets
-/// `compute_80`: the bf16 `mma.sync` and `ldmatrix` it is built on need it,
-/// and the other sources keep NVRTC's default target.
+/// `compute_80`: the bf16 `mma.sync`, `ldmatrix` and `cp.async` it is built on
+/// need it, and the other sources keep NVRTC's default target.
 pub const FLASH_ATTN_SOURCE: &str = include_str!("flash_attn.cu");
 
 /// Kernels this module launches.
