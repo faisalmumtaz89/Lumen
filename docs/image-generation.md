@@ -9,12 +9,11 @@ CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in wi
 - NVIDIA CUDA, compute capability 8.0+ (the CPU path exists for reference checks only
   and takes minutes per image).
 - Device memory: the text encoder's language tower (14.1 GiB of BF16 weights), the
-  transformer (13.3 GiB) and the VAE decoder (about 1 GiB) load one at a time, and a
+  transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
   generation's device memory peaks at 15.5 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start on a device with less than
-  21.0 GiB in total, naming both amounts. A text model served on the same device is
-  evicted for the duration of each generation and restored before the response is
-  returned (see below).
+  21.0 GiB in total, naming both amounts. How the components are held depends on where
+  the text model runs; see [Sharing the device with a text model](#sharing-the-device-with-a-text-model).
 
 ## Convert the checkpoint
 
@@ -71,10 +70,26 @@ same bytes.
 ## Sharing the device with a text model
 
 Generations run one at a time. When the text model is served on the same CUDA device, a
-generation evicts it and restores it before the image is returned; text requests made
-meanwhile get a retryable `503` with the message `the model is evicted for an image
-generation; retry shortly`. A text model on the CPU or on another device is not
-affected. A request whose client disconnects is dropped: if it was still queued nothing
+generation evicts it, loads the three image components one at a time, and restores the
+text model before the image is returned; text requests made meanwhile get a retryable
+`503` with the message `the model is evicted for an image generation; retry shortly`.
+
+When the text model runs on the CPU or on another device, the image endpoint keeps the
+transformer and the VAE loaded on CUDA device 0 between generations (about 14.4 GiB,
+held while the server runs), and only the text encoder loads for each image; the
+server fails to start if that device cannot hold them. Prompt encoding and image
+decoding run beside the resident transformer when they fit. When one runs out of device
+memory there — a 2048×2048 decode on a 32 GiB card, a prompt of thousands of tokens, or
+any prompt on a card much smaller than 32 GiB — the transformer is released and the step
+retried: after an encoding it is loaded again for the denoising steps of the same
+generation, after a decode by the next generation. Later work at least that large
+releases it up front. Images are identical either way. Any generation that runs out pays
+for its failed attempt; work at or above a remembered size costs what the evicting mode
+costs. A single
+out-of-memory event caused by another process on the device lowers that size threshold
+for the rest of the server's life.
+
+A request whose client disconnects is dropped: if it was still queued nothing
 is evicted, and if its generation was running it stops at the next denoising step and the
 text model is restored then (the disconnect is seen when the connection carries no further
 pipelined request behind the image request). Stopping the server (Ctrl-C) stops a generation that is still

@@ -80,6 +80,11 @@ pub struct ImageState {
     /// The text engine, so a generation can take the device exclusively and
     /// release it when it finishes.
     pub engine: crate::engine::EngineHandle,
+    /// The transformer and VAE kept on the device between generations, when
+    /// the text engine is not on it; `None` when it is (each generation then
+    /// loads its components under the lease) and on the CPU.
+    #[cfg(feature = "image")]
+    pub resident: Option<std::sync::Mutex<lumen_image::pipeline::GpuResident>>,
 }
 
 /// Base64, so the response carries a PNG without a separate file store.
@@ -171,6 +176,7 @@ pub async fn generate_image(
     }
 
     let cfg = state.config.clone();
+    let resident_state = std::sync::Arc::clone(&state);
     let prompt = req.prompt.clone();
     let steps = req.num_inference_steps;
     let seed = req.seed.unwrap_or(42);
@@ -240,7 +246,16 @@ pub async fn generate_image(
             lumen_image::pipeline::PipelineError::Cancelled => stopped(),
             e => ServerError::Runtime(format!("generation failed: {e}")),
         };
-        let rgba = if cfg.use_gpu {
+        let rgba = if let Some(resident) = &resident_state.resident {
+            // One generation at a time already: `GENERATION` is held.
+            // A panic inside a generation leaves the pipeline usable: a
+            // transformer it held is reloaded by the next one.
+            resident
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generate(&gen_req, &mut progress)
+                .map_err(failed)?
+        } else if cfg.use_gpu {
             #[cfg(feature = "cuda")]
             {
                 lumen_image::pipeline::generate_gpu(&paths, &gen_req, &mut progress)
