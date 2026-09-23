@@ -28,7 +28,7 @@ pub const IMAGE_OPS_SOURCE: &str = include_str!("image_ops.cu");
 
 /// The text tower's kernel source, compiled by NVRTC at load.
 ///
-/// The tower's bf16 elementwise, norm, rotary and gather kernels, in a source
+/// The tower's bf16 elementwise, norm and rotary kernels, in a source
 /// of their own because NVRTC compiles each source into its own module; its
 /// projections and attention use the shared cuBLAS and flash paths.
 pub const TEXT_OPS_SOURCE: &str = include_str!("text_ops.cu");

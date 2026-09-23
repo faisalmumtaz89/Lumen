@@ -13,7 +13,6 @@
 //     text prefix, after `repeat_kv` gives every query head its key/value head
 //
 // Written here:
-//   - embed_gather_bf16  the prompt's rows of the bf16 embedding table
 //   - rms_norm_bf16      RMSNorm: f32 in the norm, rounded, times the weight, rounded
 //   - rope_bf16          the tower's half-split rotary, each product and the sum rounded
 //   - repeat_kv          key/value heads expanded to the query heads they serve
@@ -50,28 +49,6 @@ __device__ __forceinline__ unsigned short text_bf16_rne(float val)
     unsigned int lsb = (bits >> 16) & 1u;
     bits += 0x7fffu + lsb;
     return (unsigned short)(bits >> 16);
-}
-
-// ---------------------------------------------------------------------------
-// Gather the prompt's rows out of the resident bf16 embedding table.
-//
-// Every id is range-checked against the vocabulary on the host, so each
-// gathered row lies inside the table. One block per prompt position.
-// ---------------------------------------------------------------------------
-extern "C" __global__ void embed_gather_bf16(
-    const unsigned short* __restrict__ table,  // [vocab, hidden]
-    const unsigned int* __restrict__ ids,      // [seq]
-    unsigned short* __restrict__ out,          // [seq, hidden]
-    unsigned int seq,
-    unsigned int hidden)
-{
-    unsigned int row = blockIdx.x;
-    if (row >= seq) return;
-    const unsigned short* src = table + (unsigned long long)ids[row] * hidden;
-    unsigned short* dst = out + (unsigned long long)row * hidden;
-    for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        dst[i] = src[i];
-    }
 }
 
 // ---------------------------------------------------------------------------

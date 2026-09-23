@@ -12,8 +12,8 @@
 //! 5. denormalise the final latent and decode it
 //!
 //! The three components are loaded one at a time and dropped between uses: the
-//! text encoder's language tower is 14.1 GiB of BF16 weights and the
-//! transformer 13.3 GiB, so they do not fit on the card together.
+//! text encoder's language tower puts 12.9 GiB of BF16 weights on the device and
+//! the transformer 13.3 GiB, so a generation never holds them together.
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -411,8 +411,8 @@ pub const GPU_DEVICE: usize = 0;
 
 /// The most device memory a generation uses, in bytes: 21,491 MiB, measured
 /// as the device's used memory at the peak of a 2048x2048 generation (the
-/// VAE decode; a 1024x1024 generation peaks at 15,923 MiB in the text-encoder
-/// phase) on an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
+/// VAE decode; a 1024x1024 generation peaks at 15,663 MiB while denoising) on
+/// an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
 /// less total memory would fail a request at that size after the text model
 /// had been evicted for it, so the startup check refuses it instead.
 pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
@@ -435,9 +435,9 @@ pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
 ///
 /// Same sequence as [`generate_cpu`], with each component's device
 /// implementation. The three components still load and free one at a time: the
-/// text encoder's language tower is 14.1 GiB of BF16 weights and the transformer
-/// 13.3 GiB, so they do not fit on a 32 GiB card together and do not need to —
-/// the encoder's output is the only thing the transformer consumes.
+/// text encoder's language tower puts 12.9 GiB of BF16 weights on the device and
+/// the transformer 13.3 GiB, and the encoder's output is the only thing the
+/// transformer consumes, so neither needs the other on the device.
 #[cfg(feature = "cuda")]
 pub fn generate_gpu(
     sources: &GpuSources,
@@ -499,8 +499,8 @@ impl GpuSources {
         })
     }
 
-    /// Copy the text encoder's matrices into page-locked host memory (14.1 GiB
-    /// for Qwen-Image-2.1), from which every later load uploads them at the
+    /// Copy the text encoder's layer matrices into page-locked host memory
+    /// (12.9 GiB for Qwen-Image-2.1), from which every later load uploads them at the
     /// link's full rate. Page-locked memory is held for the sources' lifetime
     /// and is not bounded by the host's memlock or cgroup memory limits, so
     /// whether the host can spare it is the caller's decision.
@@ -529,7 +529,7 @@ impl GpuSources {
 /// another card).
 ///
 /// The text encoder still loads for each generation: the three do not fit on a
-/// 32 GiB card together with a decode's activations (1.45 GiB is left with all
+/// 32 GiB card together with a decode's activations (3.1 GiB is left with all
 /// three resident, and a 1024x1024 decode needs more), and it is the component
 /// needed first and only briefly. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory

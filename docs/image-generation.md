@@ -8,9 +8,9 @@ CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in wi
 
 - NVIDIA CUDA, compute capability 8.0+ (the CPU path exists for reference checks only
   and takes minutes per image).
-- Device memory: the text encoder's language tower (14.1 GiB of BF16 weights), the
+- Device memory: the text encoder's language tower (12.9 GiB of BF16 weights), the
   transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
-  generation's device memory peaks at 15.5 GiB for a 1024×1024 image and 21.0 GiB for a
+  generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start on a device with less than
   21.0 GiB in total, naming both amounts. How the components are held depends on where
   the text model runs; see [Sharing the device with a text model](#sharing-the-device-with-a-text-model).
@@ -97,7 +97,7 @@ it to load the new ones. Overwriting a file in place (for example with `cp`) whi
 server runs can crash it.
 
 `LUMEN_IMAGE_PIN_TEXT_ENCODER=1` (CUDA only) makes the server copy the text encoder's
-weights into page-locked host memory at startup (14.1 GiB) and keep them for its
+weights into page-locked host memory at startup (12.9 GiB) and keep them for its
 lifetime; the text encoder loads for every image, and loads from page-locked memory
 faster. Page-locked memory is not bounded by memlock or cgroup memory limits, so set it
 only on a host that can spare that memory beside everything else it runs; the server
