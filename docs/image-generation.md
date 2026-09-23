@@ -96,6 +96,13 @@ re-converting while the server runs leaves it serving the files it started with;
 it to load the new ones. Overwriting a file in place (for example with `cp`) while the
 server runs can crash it.
 
+`LUMEN_IMAGE_PIN_TEXT_ENCODER=1` (CUDA only) makes the server copy the text encoder's
+weights into page-locked host memory at startup (14.1 GiB) and keep them for its
+lifetime; the text encoder loads for every image, and loads from page-locked memory
+faster. Page-locked memory is not bounded by memlock or cgroup memory limits, so set it
+only on a host that can spare that memory beside everything else it runs; the server
+fails to start if the copy cannot be made.
+
 A request whose client disconnects is dropped: if it was still queued nothing
 is evicted, and if its generation was running it stops at the next denoising step and the
 text model is restored then (the disconnect is seen when the connection carries no further

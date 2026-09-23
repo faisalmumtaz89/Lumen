@@ -154,6 +154,10 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            Where generations run (default cuda). On the CUDA
                            text engine's device, each generation evicts the
                            text model for its duration.
+    LUMEN_IMAGE_PIN_TEXT_ENCODER=1
+                           Keep the text encoder's weights in page-locked host
+                           memory (14.1 GiB, held for the server's lifetime) so
+                           each generation loads them faster. CUDA only.
 
 ENVIRONMENT VARIABLES (CUDA backend):
     LUMEN_CUDA_DECODE_DELAY_US=<N>
@@ -756,6 +760,7 @@ async fn run(args: Args) -> Result<(), String> {
         "LUMEN_IMAGE_CKPT",
         "LUMEN_IMAGE_MODEL_ID",
         "LUMEN_IMAGE_DEVICE",
+        "LUMEN_IMAGE_PIN_TEXT_ENCODER",
     ] {
         if std::env::var_os(name).is_some() {
             return Err(format!(
@@ -1065,10 +1070,17 @@ async fn run(args: Args) -> Result<(), String> {
                     &config.lbi_dir,
                     &config.checkpoint_dir,
                 );
-                Some(
-                    lumen_image::pipeline::GpuSources::open(&paths)
-                        .map_err(|e| format!("the image endpoint cannot open its model: {e}"))?,
-                )
+                let mut sources = lumen_image::pipeline::GpuSources::open(&paths)
+                    .map_err(|e| format!("the image endpoint cannot open its model: {e}"))?;
+                if config.pin_text_encoder {
+                    sources.pin_text_encoder().map_err(|e| {
+                        format!(
+                            "LUMEN_IMAGE_PIN_TEXT_ENCODER=1, but the text encoder cannot be \
+                             page-locked: {e}"
+                        )
+                    })?;
+                }
+                Some(sources)
             } else {
                 None
             };
@@ -1088,7 +1100,7 @@ async fn run(args: Args) -> Result<(), String> {
                 sources => (None, sources),
             };
             eprintln!(
-                "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}",
+                "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}{}",
                 config.model_id,
                 if config.use_gpu { "cuda" } else { "cpu" },
                 config.lbi_dir.display(),
@@ -1099,6 +1111,11 @@ async fn run(args: Args) -> Result<(), String> {
                     "; the transformer and VAE stay loaded between generations"
                 } else {
                     "; each generation evicts the text model for its duration"
+                },
+                if config.pin_text_encoder {
+                    "; the text encoder loads from page-locked host memory"
+                } else {
+                    ""
                 },
             );
             let state = std::sync::Arc::new(lumen_server::router_image::ImageState {
@@ -1175,9 +1192,29 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
             ))
         }
     };
+    let pin_text_encoder = match var("LUMEN_IMAGE_PIN_TEXT_ENCODER")?
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("0") => false,
+        Some("1") if use_gpu => true,
+        Some("1") => return Err(
+            "LUMEN_IMAGE_PIN_TEXT_ENCODER=1 applies to the CUDA path, not LUMEN_IMAGE_DEVICE=cpu"
+                .to_string(),
+        ),
+        Some(other) => {
+            return Err(format!(
+                "LUMEN_IMAGE_PIN_TEXT_ENCODER={other:?} is not 0 or 1"
+            ))
+        }
+    };
     let (lbi, ckpt) = match (var("LUMEN_IMAGE_LBI")?, var("LUMEN_IMAGE_CKPT")?) {
         (None, None) => {
-            for name in ["LUMEN_IMAGE_MODEL_ID", "LUMEN_IMAGE_DEVICE"] {
+            for name in [
+                "LUMEN_IMAGE_MODEL_ID",
+                "LUMEN_IMAGE_DEVICE",
+                "LUMEN_IMAGE_PIN_TEXT_ENCODER",
+            ] {
                 if var(name)?.is_some() {
                     return Err(format!(
                         "{name} is set but LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are not"
@@ -1228,6 +1265,7 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
         checkpoint_dir,
         model_id,
         use_gpu,
+        pin_text_encoder,
     }))
 }
 

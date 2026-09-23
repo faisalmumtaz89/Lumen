@@ -35,9 +35,14 @@
 //! is not loaded) plus bf16 activations; the largest transient is a projection's
 //! f32 output before rounding, `[seq, 12288]` f32 (48 KiB per token).
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
+};
 use lumen_format::QuantScheme;
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::error::RuntimeError;
@@ -185,7 +190,7 @@ impl TextGpu {
     pub fn load(lbi: &Path, dev: &CudaDevice) -> Result<Self, TextGpuError> {
         let file = LbiFile::open(lbi)?;
         let config = TextEncoderConfig::from_lbi_config(file.config())?;
-        Self::load_with(&file, dev, config)
+        Self::load_with(&file, None, dev, config)
     }
 
     /// Load against an explicit architecture.
@@ -193,8 +198,12 @@ impl TextGpu {
     /// The config's own `validate` has already run — `from_lbi_config` calls it,
     /// and a caller supplying one by hand is expected to have called it — so the
     /// dimensions here are bounded and the products below cannot overflow.
+    ///
+    /// A matrix with a copy in `pinned` is uploaded from that copy instead of
+    /// the file's mapping.
     pub fn load_with(
         file: &LbiFile,
+        pinned: Option<&PinnedMatrices>,
         dev: &CudaDevice,
         config: TextEncoderConfig,
     ) -> Result<Self, TextGpuError> {
@@ -208,12 +217,12 @@ impl TextGpu {
         let hidden = c.hidden_size;
         let q_width = c.num_attention_heads * c.head_dim;
         let kv_width = c.num_key_value_heads * c.head_dim;
-        let embed = matrix(&own, file, "embed_tokens", c.vocab_size, hidden)?;
+        let embed = matrix(&own, file, pinned, "embed_tokens", c.vocab_size, hidden)?;
 
         let mut layers = Vec::with_capacity(c.num_layers);
         for i in 0..c.num_layers {
             let p = format!("layers.{i}");
-            let w = |stem: &str, n, k| matrix(&own, file, &format!("{p}.{stem}"), n, k);
+            let w = |stem: &str, n, k| matrix(&own, file, pinned, &format!("{p}.{stem}"), n, k);
             let v = |stem: &str, len| vector(&own, file, &format!("{p}.{stem}"), len);
             layers.push(GpuLayer {
                 input_norm: v("input_layernorm", hidden)?,
@@ -253,22 +262,8 @@ impl TextGpu {
             ))
             .into());
         }
-        let c = config;
-        let q_width = c.num_attention_heads * c.head_dim;
-        let kv_width = c.num_key_value_heads * c.head_dim;
-        bf16_entry(file, "embed_tokens", c.vocab_size, c.hidden_size)?;
-        for i in 0..c.num_layers {
-            for (stem, n, k) in [
-                ("self_attn.q_proj", q_width, c.hidden_size),
-                ("self_attn.k_proj", kv_width, c.hidden_size),
-                ("self_attn.v_proj", kv_width, c.hidden_size),
-                ("self_attn.o_proj", c.hidden_size, q_width),
-                ("mlp.gate_proj", c.intermediate_size, c.hidden_size),
-                ("mlp.up_proj", c.intermediate_size, c.hidden_size),
-                ("mlp.down_proj", c.hidden_size, c.intermediate_size),
-            ] {
-                bf16_entry(file, &format!("layers.{i}.{stem}"), n, k)?;
-            }
+        for (stem, n, k) in matrices(config) {
+            bf16_entry(file, &stem, n, k)?;
         }
         Ok(())
     }
@@ -625,16 +620,80 @@ fn bf16_entry(file: &LbiFile, stem: &str, n: usize, k: usize) -> Result<String, 
     Ok(name)
 }
 
-/// A `[n, k]` matrix, which must be stored bf16, uploaded as stored.
+/// Every matrix the tower uploads, `(stem, n, k)`: the embedding table and
+/// each layer's seven projections.
+fn matrices(c: &TextEncoderConfig) -> Vec<(String, usize, usize)> {
+    let q_width = c.num_attention_heads * c.head_dim;
+    let kv_width = c.num_key_value_heads * c.head_dim;
+    let mut all = vec![("embed_tokens".to_string(), c.vocab_size, c.hidden_size)];
+    for i in 0..c.num_layers {
+        for (stem, n, k) in [
+            ("self_attn.q_proj", q_width, c.hidden_size),
+            ("self_attn.k_proj", kv_width, c.hidden_size),
+            ("self_attn.v_proj", kv_width, c.hidden_size),
+            ("self_attn.o_proj", c.hidden_size, q_width),
+            ("mlp.gate_proj", c.intermediate_size, c.hidden_size),
+            ("mlp.up_proj", c.intermediate_size, c.hidden_size),
+            ("mlp.down_proj", c.hidden_size, c.intermediate_size),
+        ] {
+            all.push((format!("layers.{i}.{stem}"), n, k));
+        }
+    }
+    all
+}
+
+/// The tower's matrices copied once into page-locked host memory. The driver
+/// transfers page-locked memory straight to the device, so a load from these
+/// copies runs at the link's full rate, for the matrices' size in host memory
+/// held while they live.
+pub struct PinnedMatrices {
+    copies: HashMap<String, PinnedHostSlice<u8>>,
+}
+
+impl PinnedMatrices {
+    /// Copy every matrix [`TextGpu::load_with`] uploads.
+    pub fn copy(
+        file: &LbiFile,
+        config: &TextEncoderConfig,
+        ctx: &Arc<CudaContext>,
+    ) -> Result<Self, TextGpuError> {
+        let mut copies = HashMap::new();
+        for (stem, n, k) in matrices(config) {
+            let name = bf16_entry(file, &stem, n, k)?;
+            let bytes = file.tensor_bytes(&name).expect("entry resolved above");
+            let page_locked = |e: cudarc::driver::DriverError| {
+                RuntimeError::Compute(format!("page-lock {} bytes for {name}: {e}", bytes.len()))
+            };
+            // Safety: every byte is written by the copy below before it is read.
+            let mut copy = unsafe { ctx.alloc_pinned::<u8>(bytes.len()) }.map_err(page_locked)?;
+            copy.as_mut_slice()
+                .map_err(page_locked)?
+                .copy_from_slice(bytes);
+            copies.insert(name, copy);
+        }
+        Ok(Self { copies })
+    }
+
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        self.copies.get(name)?.as_slice().ok()
+    }
+}
+
+/// A `[n, k]` matrix, which must be stored bf16, uploaded as stored — from its
+/// page-locked copy when there is one.
 fn matrix(
     dev: &CudaDevice,
     file: &LbiFile,
+    pinned: Option<&PinnedMatrices>,
     stem: &str,
     n: usize,
     k: usize,
 ) -> Result<Weight, TextGpuError> {
     let name = bf16_entry(file, stem, n, k)?;
-    let bytes = file.tensor_bytes(&name).expect("entry resolved above");
+    let bytes = match pinned.and_then(|p| p.get(&name)) {
+        Some(copy) => copy,
+        None => file.tensor_bytes(&name).expect("entry resolved above"),
+    };
     Ok(Weight {
         bits: super::dit_gpu::ops::upload_16bit(dev, bytes)?,
         n,
