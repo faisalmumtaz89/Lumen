@@ -24,6 +24,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Device-memory check for the image endpoint.** At startup the server refuses a CUDA
   device whose total memory is below the 21.0 GiB a 2048×2048 generation reaches, naming
   the device's memory and the requirement, instead of failing the first request.
+- **Resident image weights.** When the text model runs on the CPU or another device, the
+  image endpoint keeps its transformer and VAE on CUDA device 0 between generations, and
+  only the text encoder loads per image; a step that does not fit beside the resident
+  transformer releases it and retries. On an RTX 5090 a 1024×1024 generation takes
+  17.07 s instead of 18.42 s (median of 5 interleaved runs each), with identical images.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

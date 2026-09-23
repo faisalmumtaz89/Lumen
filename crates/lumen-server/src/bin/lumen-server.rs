@@ -1057,21 +1057,44 @@ async fn run(args: Args) -> Result<(), String> {
     #[cfg(feature = "image")]
     let app = match image_config {
         Some(config) => {
+            // On a device the text model does not use, the transformer and the
+            // VAE stay loaded between generations.
+            let resident =
+                if config.use_gpu && !handle.holds_device(lumen_image::pipeline::GPU_DEVICE) {
+                    let paths = lumen_image::pipeline::PipelinePaths::from_roots(
+                        &config.lbi_dir,
+                        &config.checkpoint_dir,
+                    );
+                    Some(std::sync::Mutex::new(
+                        lumen_image::pipeline::GpuResident::load(&paths).map_err(|e| {
+                            format!(
+                                "the image endpoint cannot keep its transformer and VAE loaded \
+                                 on CUDA device {}: {e}",
+                                lumen_image::pipeline::GPU_DEVICE
+                            )
+                        })?,
+                    ))
+                } else {
+                    None
+                };
             eprintln!(
                 "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}",
                 config.model_id,
                 if config.use_gpu { "cuda" } else { "cpu" },
                 config.lbi_dir.display(),
                 config.checkpoint_dir.display(),
-                if config.use_gpu && handle.holds_device(lumen_image::pipeline::GPU_DEVICE) {
-                    "; each generation evicts the text model for its duration"
-                } else {
+                if !config.use_gpu {
                     ""
+                } else if resident.is_some() {
+                    "; the transformer and VAE stay loaded between generations"
+                } else {
+                    "; each generation evicts the text model for its duration"
                 },
             );
             let state = std::sync::Arc::new(lumen_server::router_image::ImageState {
                 config,
                 engine: handle.clone(),
+                resident,
             });
             build_router_with_images(handle, state)
         }
