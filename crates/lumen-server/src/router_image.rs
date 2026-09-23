@@ -85,6 +85,12 @@ pub struct ImageState {
     /// loads its components under the lease) and on the CPU.
     #[cfg(feature = "image")]
     pub resident: Option<std::sync::Mutex<lumen_image::pipeline::GpuResident>>,
+    /// The tokenizer and the containers' mappings, kept open for generations
+    /// that load their components under the lease; `None` when `resident`
+    /// holds them and on the CPU. With `config.use_gpu`, exactly one of the two
+    /// is set: a generation with neither runs on the CPU.
+    #[cfg(feature = "image")]
+    pub sources: Option<lumen_image::pipeline::GpuSources>,
 }
 
 /// Base64, so the response carries a PNG without a separate file store.
@@ -255,12 +261,8 @@ pub async fn generate_image(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .generate(&gen_req, &mut progress)
                 .map_err(failed)?
-        } else if cfg.use_gpu {
-            #[cfg(feature = "cuda")]
-            {
-                lumen_image::pipeline::generate_gpu(&paths, &gen_req, &mut progress)
-                    .map_err(failed)?
-            }
+        } else if let Some(sources) = &resident_state.sources {
+            lumen_image::pipeline::generate_gpu(sources, &gen_req, &mut progress).map_err(failed)?
         } else {
             lumen_image::pipeline::generate_cpu(&paths, &gen_req, &mut progress).map_err(failed)?
         };

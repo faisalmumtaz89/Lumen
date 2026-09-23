@@ -89,6 +89,13 @@ costs. A single
 out-of-memory event caused by another process on the device lowers that size threshold
 for the rest of the server's life.
 
+On CUDA the server opens the three `.lbi` files once at startup and keeps them mapped, so
+their pages count toward its resident memory (page cache the system can reclaim).
+`lbi-convert` writes each file beside its destination and renames it into place, so
+re-converting while the server runs leaves it serving the files it started with; restart
+it to load the new ones. Overwriting a file in place (for example with `cp`) while the
+server runs can crash it.
+
 A request whose client disconnects is dropped: if it was still queued nothing
 is evicted, and if its generation was running it stops at the next denoising step and the
 text model is restored then (the disconnect is seen when the connection carries no further

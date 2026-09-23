@@ -24,6 +24,7 @@ use std::process::ExitCode;
 use lumen_image::cuda::dit_gpu::DitGpu;
 use lumen_image::dit::{Dit, DitConfig, DitForwardArgs};
 use lumen_image::tensor::Matrix;
+use lumen_image::LbiFile;
 use lumen_runtime::cuda::ffi::CudaDevice;
 
 fn rel_l2(got: &[f32], want: &[f32]) -> f32 {
@@ -129,8 +130,9 @@ fn run() -> Result<usize, String> {
 
         // Scoped so the device memory is released before the next load.
         let got = {
+            let file = LbiFile::open(&lbi).map_err(|e| format!("open {}: {e}", lbi.display()))?;
             let gpu =
-                DitGpu::load_with(&lbi, &dev, cfg).map_err(|e| format!("gpu load {n}: {e}"))?;
+                DitGpu::load_with(&file, &dev, cfg).map_err(|e| format!("gpu load {n}: {e}"))?;
             gpu.forward(args)
                 .map_err(|e| format!("gpu forward {n}: {e}"))?
         };

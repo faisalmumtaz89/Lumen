@@ -740,15 +740,18 @@ impl DitGpu {
     /// Load every DiT weight from a converted `.lbi` onto the device, assuming
     /// the shipped Qwen-Image-2.1 architecture.
     pub fn load(lbi: &Path, dev: &CudaDevice) -> Result<Self, DitGpuError> {
-        Self::load_with(lbi, dev, DitConfig::qwen_image_2_1())
+        Self::load_with(&LbiFile::open(lbi)?, dev, DitConfig::qwen_image_2_1())
     }
 
-    /// Load against an explicit architecture.
-    pub fn load_with(lbi: &Path, dev: &CudaDevice, config: DitConfig) -> Result<Self, DitGpuError> {
+    /// Load from an open container against an explicit architecture.
+    pub fn load_with(
+        file: &LbiFile,
+        dev: &CudaDevice,
+        config: DitConfig,
+    ) -> Result<Self, DitGpuError> {
         let own = CudaDevice::new(dev.ctx.ordinal())?;
         let kernels = ImageKernels::load(&own)?;
         let ops = ops::load(&own)?;
-        let file = LbiFile::open(lbi)?;
         let hidden = config.inner_dim();
         let mlp = config.mlp_hidden();
         // The attention kernels are tiled for the model's 128-wide heads
@@ -784,97 +787,68 @@ impl DitGpu {
         for i in 0..config.num_layers {
             let p = format!("transformer_blocks.{i}");
             blocks.push(GpuBlock {
-                to_q: projection(
-                    &own,
-                    &file,
-                    &format!("{p}.attn.to_q.weight"),
-                    hidden,
-                    hidden,
-                )?,
-                to_k: projection(
-                    &own,
-                    &file,
-                    &format!("{p}.attn.to_k.weight"),
-                    hidden,
-                    hidden,
-                )?,
-                to_v: projection(
-                    &own,
-                    &file,
-                    &format!("{p}.attn.to_v.weight"),
-                    hidden,
-                    hidden,
-                )?,
+                to_q: projection(&own, file, &format!("{p}.attn.to_q.weight"), hidden, hidden)?,
+                to_k: projection(&own, file, &format!("{p}.attn.to_k.weight"), hidden, hidden)?,
+                to_v: projection(&own, file, &format!("{p}.attn.to_v.weight"), hidden, hidden)?,
                 to_out: projection(
                     &own,
-                    &file,
+                    file,
                     &format!("{p}.attn.to_out.0.weight"),
                     hidden,
                     hidden,
                 )?,
                 norm_q: vector(
                     &own,
-                    &file,
+                    file,
                     &format!("{p}.attn.norm_q.weight"),
                     config.attention_head_dim,
                 )?,
                 norm_k: vector(
                     &own,
-                    &file,
+                    file,
                     &format!("{p}.attn.norm_k.weight"),
                     config.attention_head_dim,
                 )?,
                 mlp_gate: projection(
                     &own,
-                    &file,
+                    file,
                     &format!("{p}.img_mlp.gate_layer.weight"),
                     mlp,
                     hidden,
                 )?,
-                mlp_proj: projection(
-                    &own,
-                    &file,
-                    &format!("{p}.img_mlp.proj.weight"),
-                    mlp,
-                    hidden,
-                )?,
-                mlp_out: projection(&own, &file, &format!("{p}.img_mlp.out.weight"), hidden, mlp)?,
+                mlp_proj: projection(&own, file, &format!("{p}.img_mlp.proj.weight"), mlp, hidden)?,
+                mlp_out: projection(&own, file, &format!("{p}.img_mlp.out.weight"), hidden, mlp)?,
             });
         }
 
         Ok(Self {
-            img_in: weight(&own, &file, "img_in.weight", hidden, config.in_channels)?,
-            text_norm: vector(
-                &own,
-                &file,
-                "txt_in.text_norm.weight",
-                config.context_in_dim,
-            )?,
+            img_in: weight(&own, file, "img_in.weight", hidden, config.in_channels)?,
+            text_norm: vector(&own, file, "txt_in.text_norm.weight", config.context_in_dim)?,
             txt_in: weight(
                 &own,
-                &file,
+                file,
                 "txt_in.in_layer.weight",
                 hidden,
                 config.context_in_dim,
             )?,
-            txt_out: weight(&own, &file, "txt_in.out_layer.weight", hidden, hidden)?,
+            txt_out: weight(&own, file, "txt_in.out_layer.weight", hidden, hidden)?,
             time_linear_1: weight(
                 &own,
-                &file,
+                file,
                 "time_text_embed.timestep_embedder.linear_1.weight",
                 hidden,
                 TIMESTEP_DIM,
             )?,
             time_linear_2: weight(
                 &own,
-                &file,
+                file,
                 "time_text_embed.timestep_embedder.linear_2.weight",
                 hidden,
                 hidden,
             )?,
-            modulation: weight(&own, &file, "modulation.1.weight", 4 * hidden, hidden)?,
-            norm_out: weight(&own, &file, "norm_out.linear.weight", hidden, hidden)?,
-            proj_out: projection(&own, &file, "proj_out.weight", config.out_channels, hidden)?,
+            modulation: weight(&own, file, "modulation.1.weight", 4 * hidden, hidden)?,
+            norm_out: weight(&own, file, "norm_out.linear.weight", hidden, hidden)?,
+            proj_out: projection(&own, file, "proj_out.weight", config.out_channels, hidden)?,
             blocks,
             rope,
             config,
