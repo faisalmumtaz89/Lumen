@@ -98,7 +98,9 @@ fn run() -> Result<(), String> {
         #[cfg(feature = "cuda")]
         {
             println!("  running on the GPU");
-            lumen_image::pipeline::generate_gpu(&paths, &req, &mut report)
+            let sources =
+                lumen_image::pipeline::GpuSources::open(&paths).map_err(|e| format!("{e}"))?;
+            lumen_image::pipeline::generate_gpu(&sources, &req, &mut report)
                 .map_err(|e| format!("{e}"))?
         }
         #[cfg(not(feature = "cuda"))]

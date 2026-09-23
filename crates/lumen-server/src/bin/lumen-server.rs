@@ -1057,26 +1057,36 @@ async fn run(args: Args) -> Result<(), String> {
     #[cfg(feature = "image")]
     let app = match image_config {
         Some(config) => {
-            // On a device the text model does not use, the transformer and the
-            // VAE stay loaded between generations.
-            let resident =
-                if config.use_gpu && !handle.holds_device(lumen_image::pipeline::GPU_DEVICE) {
-                    let paths = lumen_image::pipeline::PipelinePaths::from_roots(
-                        &config.lbi_dir,
-                        &config.checkpoint_dir,
-                    );
+            // The CUDA path's containers stay open for the server's lifetime. On
+            // a device the text model does not use, the transformer and the VAE
+            // also stay loaded between generations.
+            let sources = if config.use_gpu {
+                let paths = lumen_image::pipeline::PipelinePaths::from_roots(
+                    &config.lbi_dir,
+                    &config.checkpoint_dir,
+                );
+                Some(
+                    lumen_image::pipeline::GpuSources::open(&paths)
+                        .map_err(|e| format!("the image endpoint cannot open its model: {e}"))?,
+                )
+            } else {
+                None
+            };
+            let (resident, sources) = match sources {
+                Some(sources) if !handle.holds_device(lumen_image::pipeline::GPU_DEVICE) => (
                     Some(std::sync::Mutex::new(
-                        lumen_image::pipeline::GpuResident::load(&paths).map_err(|e| {
+                        lumen_image::pipeline::GpuResident::load(sources).map_err(|e| {
                             format!(
                                 "the image endpoint cannot keep its transformer and VAE loaded \
                                  on CUDA device {}: {e}",
                                 lumen_image::pipeline::GPU_DEVICE
                             )
                         })?,
-                    ))
-                } else {
-                    None
-                };
+                    )),
+                    None,
+                ),
+                sources => (None, sources),
+            };
             eprintln!(
                 "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}",
                 config.model_id,
@@ -1095,6 +1105,7 @@ async fn run(args: Args) -> Result<(), String> {
                 config,
                 engine: handle.clone(),
                 resident,
+                sources,
             });
             build_router_with_images(handle, state)
         }

@@ -189,10 +189,17 @@ fn align_up(offset: u64) -> u64 {
 /// Tensor bytes stream through a temporary file, so converting a checkpoint
 /// never holds more than the caller's own buffer in memory, and the index can
 /// be written in one pass at the end when every name and size is known.
+///
+/// The file is assembled beside its final path and renamed onto it by
+/// [`finish`](Self::finish), so a file already at that path stays whole until
+/// the new one replaces it — a process that has it mapped keeps reading the
+/// old contents instead of faulting on a truncated file. A symlink at the
+/// path is replaced, not written through.
 pub struct LbiWriter {
     out: BufWriter<File>,
     blob: BufWriter<File>,
     path: PathBuf,
+    part: PathBuf,
     tmp: PathBuf,
     config: Vec<u8>,
     entries: Vec<TensorEntry>,
@@ -205,13 +212,15 @@ impl LbiWriter {
     /// [`finish`](Self::finish); tensor bytes accumulate in a sibling
     /// temporary file.
     pub fn create(path: &Path, config: serde_json::Value) -> Result<Self, LbiError> {
+        let part = path.with_extension("lbi.part");
         let tmp = path.with_extension("lbi.blobs.tmp");
         Ok(Self {
-            out: BufWriter::new(File::create(path)?),
-            // Truncating create: any leftover temporary from an interrupted run
-            // is discarded rather than appended to.
+            // Truncating creates: any leftover from an interrupted run is
+            // discarded rather than appended to.
+            out: BufWriter::new(File::create(&part)?),
             blob: BufWriter::new(File::create(&tmp)?),
             path: path.to_path_buf(),
+            part,
             tmp,
             config: serde_json::to_vec(&config)?,
             entries: Vec::new(),
@@ -279,7 +288,8 @@ impl LbiWriter {
     }
 
     /// Write the header, names, config and index, append the accumulated blob
-    /// region, and remove the temporary file.
+    /// region, rename the result onto the final path, and remove the
+    /// temporary file.
     pub fn finish(mut self) -> Result<(), LbiError> {
         let mut names = Vec::new();
         let mut offsets = Vec::with_capacity(self.entries.len());
@@ -353,6 +363,7 @@ impl LbiWriter {
         self.out
             .into_inner()
             .map_err(|e| LbiError::Io(e.into_error()))?;
+        std::fs::rename(&self.part, &self.path)?;
         std::fs::remove_file(&self.tmp)?;
         Ok(())
     }

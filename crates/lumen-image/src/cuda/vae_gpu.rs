@@ -546,20 +546,20 @@ impl VaeGpu {
     /// and `decoder.up_blocks.*.upsampler.time_conv.*`, whose `upsample3d`
     /// branch is never reached on the only frame a decode can process.
     pub fn load(lbi: &Path, dev: &CudaDevice) -> Result<Self, VaeGpuError> {
-        Self::load_with(lbi, dev, None)
+        Self::load_with(&LbiFile::open(lbi)?, dev, None)
     }
 
-    /// Load against an explicit architecture, for a caller that does not want
-    /// the container's own config overlaid on the shipped defaults.
+    /// Load from an open container, against an explicit architecture for a
+    /// caller that does not want the container's own config overlaid on the
+    /// shipped defaults.
     pub fn load_with(
-        lbi: &Path,
+        file: &LbiFile,
         dev: &CudaDevice,
         config: Option<VaeConfig>,
     ) -> Result<Self, VaeGpuError> {
         let own = CudaDevice::new(dev.ctx.ordinal())?;
         let ops = load_ops(&own)?;
 
-        let file = LbiFile::open(lbi)?;
         let config = match config {
             Some(c) => c,
             None => VaeConfig::from_lbi_config(file.config())?,
@@ -570,15 +570,15 @@ impl VaeGpu {
         let temperal_upsample = config.temperal_upsample();
         let z = config.z_dim;
 
-        let post_quant_conv = GpuConv::load(&own, &file, "post_quant_conv", z, z, 1, 0)?;
-        let conv_in = GpuConv::load(&own, &file, "decoder.conv_in", dims[0], z, 3, 1)?;
+        let post_quant_conv = GpuConv::load(&own, file, "post_quant_conv", z, z, 1, 0)?;
+        let conv_in = GpuConv::load(&own, file, "decoder.conv_in", dims[0], z, 3, 1)?;
 
         let mut resnets = Vec::with_capacity(MID_BLOCK_NUM_LAYERS + 1);
         let mut attentions = Vec::with_capacity(MID_BLOCK_NUM_LAYERS);
         for i in 0..=MID_BLOCK_NUM_LAYERS {
             resnets.push(GpuResnet::load(
                 &own,
-                &file,
+                file,
                 &format!("decoder.mid_block.resnets.{i}"),
                 dims[0],
                 dims[0],
@@ -587,7 +587,7 @@ impl VaeGpu {
         for i in 0..MID_BLOCK_NUM_LAYERS {
             attentions.push(GpuAttn::load(
                 &own,
-                &file,
+                file,
                 &format!("decoder.mid_block.attentions.{i}"),
                 dims[0],
             )?);
@@ -611,7 +611,7 @@ impl VaeGpu {
             for j in 0..=config.num_res_blocks {
                 blocks.push(GpuResnet::load(
                     &own,
-                    &file,
+                    file,
                     &format!("{prefix}.resnets.{j}"),
                     current,
                     out_dim,
@@ -625,7 +625,7 @@ impl VaeGpu {
                 // member `1`.
                 Some(GpuConv::load(
                     &own,
-                    &file,
+                    file,
                     &format!("{prefix}.upsampler.resample.1"),
                     out_dim,
                     out_dim,
@@ -654,10 +654,10 @@ impl VaeGpu {
         }
 
         let head_dim = *dims.last().expect("dims has dim_mult.len() + 1 entries");
-        let norm_out = GpuNorm::load(&own, &file, "decoder.norm_out.gamma", head_dim, false)?;
+        let norm_out = GpuNorm::load(&own, file, "decoder.norm_out.gamma", head_dim, false)?;
         let conv_out = GpuConv::load(
             &own,
-            &file,
+            file,
             "decoder.conv_out",
             config.out_channels,
             head_dim,

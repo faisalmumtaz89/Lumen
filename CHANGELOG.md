@@ -36,6 +36,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   generated from the reference's starting noise is closer to the reference's (41.6 dB
   PSNR instead of 40.4 dB). A text encoder the GPU path cannot load (a matrix not stored
   as bf16, or a head width other than 128) is refused at startup.
+- **Image model files stay mapped between generations.** The CUDA image path opens its
+  three containers once at startup, so a component loaded for a generation reuses the
+  mapping's page tables instead of faulting its weights in again: on an RTX 5090 a
+  1024×1024 generation takes 15.80 s instead of 16.40 s with the transformer resident,
+  and 23.53 s instead of 24.87 s when the text model shares the card (medians of 6
+  interleaved runs each), with identical images. `lbi-convert` writes each file
+  beside its destination and renames it into place, so re-converting leaves a running
+  server on the files it opened until it is restarted.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

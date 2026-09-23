@@ -440,32 +440,67 @@ pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
 /// the encoder's output is the only thing the transformer consumes.
 #[cfg(feature = "cuda")]
 pub fn generate_gpu(
-    paths: &PipelinePaths,
+    sources: &GpuSources,
     req: &GenerationRequest<'_>,
     progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
 ) -> Result<Rgba, PipelineError> {
-    use crate::cuda::dit_gpu::DitGpu;
-    use crate::cuda::vae_gpu::VaeGpu;
     use lumen_runtime::cuda::ffi::CudaDevice;
 
-    let tokenizer = Tokenizer::from_files_with_added(
-        &paths.vocab,
-        &paths.merges,
-        paths.added_tokens.as_deref(),
-    )?;
     let dev = CudaDevice::new(GPU_DEVICE)
         .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
 
-    let ids = tokenizer.encode(&render_prompt(req.prompt))?;
-    let text = encode_prompt_gpu(paths, &dev, &ids)?;
+    let ids = sources.tokenizer.encode(&render_prompt(req.prompt))?;
+    let text = encode_prompt_gpu(sources, &dev, &ids)?;
     let latents = {
-        let dit = DitGpu::load(&paths.transformer, &dev)
-            .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
+        let dit = sources.load_dit(&dev)?;
         denoise_gpu(&dit, req, &text, progress)?
     };
-    let vae =
-        VaeGpu::load(&paths.vae, &dev).map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
+    let vae = crate::cuda::vae_gpu::VaeGpu::load_with(&sources.vae, &dev, None)
+        .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
     decode_gpu(&vae, req, &latents).map_err(PipelineError::Unsupported)
+}
+
+/// The CUDA pipeline's host side, opened once and kept for every generation:
+/// the tokenizer and the three containers' mappings. A component loaded from
+/// a mapping this process has already read reuses its page tables, so after
+/// the first generation an upload runs at copy speed instead of faulting
+/// every page in again. A container replaced on disk afterwards (a conversion
+/// renames its new file into place) is not seen until the sources are opened
+/// again.
+#[cfg(feature = "cuda")]
+pub struct GpuSources {
+    tokenizer: Tokenizer,
+    text_encoder: LbiFile,
+    transformer: LbiFile,
+    vae: LbiFile,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuSources {
+    pub fn open(paths: &PipelinePaths) -> Result<Self, PipelineError> {
+        let open = |path: &Path| {
+            LbiFile::open(path)
+                .map_err(|e| PipelineError::Unsupported(format!("{}: {e}", path.display())))
+        };
+        Ok(Self {
+            tokenizer: Tokenizer::from_files_with_added(
+                &paths.vocab,
+                &paths.merges,
+                paths.added_tokens.as_deref(),
+            )?,
+            text_encoder: open(&paths.text_encoder)?,
+            transformer: open(&paths.transformer)?,
+            vae: open(&paths.vae)?,
+        })
+    }
+
+    fn load_dit(
+        &self,
+        dev: &lumen_runtime::cuda::ffi::CudaDevice,
+    ) -> Result<crate::cuda::dit_gpu::DitGpu, PipelineError> {
+        crate::cuda::dit_gpu::DitGpu::load_with(&self.transformer, dev, DitConfig::qwen_image_2_1())
+            .map_err(|e| PipelineError::Unsupported(format!("{e}")))
+    }
 }
 
 /// The transformer and the VAE held on the device between generations, for a
@@ -485,8 +520,7 @@ pub fn generate_gpu(
 #[cfg(feature = "cuda")]
 pub struct GpuResident {
     dev: lumen_runtime::cuda::ffi::CudaDevice,
-    paths: PipelinePaths,
-    tokenizer: Tokenizer,
+    sources: GpuSources,
     dit: Option<crate::cuda::dit_gpu::DitGpu>,
     vae: crate::cuda::vae_gpu::VaeGpu,
     /// Tokens of the smallest prompt whose encoding ran out of memory beside
@@ -500,22 +534,15 @@ pub struct GpuResident {
 #[cfg(feature = "cuda")]
 impl GpuResident {
     /// Load the transformer and the VAE onto [`GPU_DEVICE`].
-    pub fn load(paths: &PipelinePaths) -> Result<Self, PipelineError> {
-        let tokenizer = Tokenizer::from_files_with_added(
-            &paths.vocab,
-            &paths.merges,
-            paths.added_tokens.as_deref(),
-        )?;
+    pub fn load(sources: GpuSources) -> Result<Self, PipelineError> {
         let dev = lumen_runtime::cuda::ffi::CudaDevice::new(GPU_DEVICE)
             .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
-        let dit = crate::cuda::dit_gpu::DitGpu::load(&paths.transformer, &dev)
-            .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
-        let vae = crate::cuda::vae_gpu::VaeGpu::load(&paths.vae, &dev)
+        let dit = sources.load_dit(&dev)?;
+        let vae = crate::cuda::vae_gpu::VaeGpu::load_with(&sources.vae, &dev, None)
             .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
         Ok(Self {
             dev,
-            paths: paths.clone(),
-            tokenizer,
+            sources,
             dit: Some(dit),
             vae,
             encode_needs_room: None,
@@ -530,23 +557,22 @@ impl GpuResident {
         req: &GenerationRequest<'_>,
         progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<Rgba, PipelineError> {
-        let ids = self.tokenizer.encode(&render_prompt(req.prompt))?;
+        let ids = self.sources.tokenizer.encode(&render_prompt(req.prompt))?;
         if self.encode_needs_room.is_some_and(|t| ids.len() >= t) {
             self.dit = None;
         }
-        let text = match encode_prompt_gpu(&self.paths, &self.dev, &ids) {
+        let text = match encode_prompt_gpu(&self.sources, &self.dev, &ids) {
             Ok(text) => text,
             Err(e) if self.dit.is_some() && is_out_of_memory(&e) => {
                 self.dit = None;
                 self.encode_needs_room = Some(smallest(self.encode_needs_room, ids.len()));
-                encode_prompt_gpu(&self.paths, &self.dev, &ids)?
+                encode_prompt_gpu(&self.sources, &self.dev, &ids)?
             }
             Err(e) => return Err(e),
         };
         let dit = match self.dit.take() {
             Some(dit) => dit,
-            None => crate::cuda::dit_gpu::DitGpu::load(&self.paths.transformer, &self.dev)
-                .map_err(|e| PipelineError::Unsupported(format!("{e}")))?,
+            None => self.sources.load_dit(&self.dev)?,
         };
         let latents = denoise_gpu(&dit, req, &text, progress);
         self.dit = Some(dit);
@@ -587,12 +613,14 @@ fn smallest(known: Option<usize>, new: usize) -> usize {
 /// stripped. The encoder is loaded for the call and freed when it returns.
 #[cfg(feature = "cuda")]
 fn encode_prompt_gpu(
-    paths: &PipelinePaths,
+    sources: &GpuSources,
     dev: &lumen_runtime::cuda::ffi::CudaDevice,
     ids: &[u32],
 ) -> Result<Matrix, PipelineError> {
     let hidden = {
-        let encoder = crate::cuda::text_gpu::TextGpu::load(&paths.text_encoder, dev)
+        let config =
+            crate::text_encoder::TextEncoderConfig::from_lbi_config(sources.text_encoder.config())?;
+        let encoder = crate::cuda::text_gpu::TextGpu::load_with(&sources.text_encoder, dev, config)
             .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
         encoder
             .forward(ids)

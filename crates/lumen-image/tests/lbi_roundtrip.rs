@@ -248,3 +248,39 @@ fn tensors_after_unaligned_neighbours_read_back() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+/// A file open for reading stays whole while a new one is written to its path:
+/// the writer assembles beside it and renames only in `finish`, so a reader's
+/// mapping never sees a truncated file (reading one past its new end faults).
+#[test]
+fn rewriting_a_path_leaves_an_open_file_whole() {
+    let old: Vec<u8> = (0..4096u32)
+        .flat_map(|v| (v as f32).to_le_bytes())
+        .collect();
+    let path = write_file(
+        "rewrite",
+        &[("w", vec![4096], QuantScheme::F32, old.clone())],
+    );
+    let reader = LbiFile::open(&path).unwrap();
+
+    let mut w = LbiWriter::create(&path, serde_json::json!({"probe": 2})).unwrap();
+    assert_eq!(reader.tensor_bytes("w").unwrap(), &old[..], "while writing");
+    w.append("w", &[2], QuantScheme::F32, &[0u8; 8]).unwrap();
+    assert_eq!(
+        LbiFile::open(&path).unwrap().config()["probe"],
+        true,
+        "the path names the old file until finish"
+    );
+    w.finish().unwrap();
+    assert_eq!(
+        reader.tensor_bytes("w").unwrap(),
+        &old[..],
+        "after the rename"
+    );
+
+    let new = LbiFile::open(&path).unwrap();
+    assert_eq!(new.config()["probe"], 2);
+    assert_eq!(new.tensor_bytes("w").unwrap(), &[0u8; 8][..]);
+    assert!(!path.with_extension("lbi.part").exists());
+    std::fs::remove_file(path).unwrap();
+}
