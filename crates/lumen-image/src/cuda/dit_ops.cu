@@ -11,7 +11,9 @@
 //   - pack_rows           the joint sequence, gathered from the text and
 //                         image projections
 //   - layernorm_scale     LayerNorm, then times the AdaLN `1 + scale`
-//   - add_gated           x + tanh(gate) * y, the residual update
+//   - add_gated_layernorm_scale
+//                         x + tanh(gate) * y, the residual update, then the
+//                         next layernorm_scale of the updated row
 //   - swiglu              silu(gate) * up, the MLP's inner activation
 //   - head_norm_rope      the per-head RMSNorm and the rotation of Q or K
 //
@@ -19,8 +21,8 @@
 // by: `bf16(1 + scale)` and `bf16(tanh(gate))`, rounded once per forward on the
 // host, as the reference rounds each of those expressions before it
 // multiplies. It is gathered per token, not broadcast per sequence: with
-// `causal_condition` the target-image tokens read the `t = 0` row of a two-row
-// modulation while every other token reads the sampled-timestep row.
+// `causal_condition` the target-image tokens read the sampled-timestep row of a
+// two-row modulation while every other token reads the `t = 0` row.
 //
 // NVRTC-compatible: no includes, extern "C" linkage.
 
@@ -179,43 +181,144 @@ extern "C" __global__ void layernorm_scale(
 }
 
 // ---------------------------------------------------------------------------
-// x[t, c] = bf16(x[t, c] + bf16(tanh_gate[mod_row[t], col_off + c] * y[t, c]))
+// The residual update followed by the next norm, one block per row:
 //
-// In place on the residual stream. `tanh_gate` holds `bf16(tanh(gate))`.
+//     x[t, c]   = bf16(x[t, c] + bf16(tanh_gate[mod_row[t], gate_off + c] * y[t, c]))
+//     out[t, c] = layernorm_scale of the updated row, reading
+//                 one_plus[mod_row[t], scale_off + c]
+//
+// The same arithmetic as the residual add and `layernorm_scale` run one after
+// the other. The row is read and written eight elements (16 bytes) at a time
+// and the updated values are kept in shared memory, where the norm's sums
+// take them in `layernorm_scale`'s order: thread i adds elements i,
+// i + ROW_THREADS, ... before the block reduction. `dim`, both offsets and
+// both strides are multiples of eight and `dim` is at most ADD_NORM_MAX_DIM;
+// the launcher refuses anything else.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void add_gated(
-    unsigned short* __restrict__ x,               // [rows, cols], updated
-    const unsigned short* __restrict__ y,         // [rows, cols]
-    const unsigned short* __restrict__ tanh_gate, // [nmod, mod_stride]
-    const int* __restrict__ mod_row,              // [rows]
-    unsigned int rows,
-    unsigned int cols,
-    unsigned int col_off,
-    unsigned int mod_stride)
+#define ADD_NORM_MAX_DIM 4096
+
+__device__ __forceinline__ void unpack8(uint4 v, float* f)
 {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    unsigned int r = i / cols;
-    unsigned int c = i % cols;
-    float g = bf16_to_f32(tanh_gate[(unsigned long long)mod_row[r] * mod_stride + col_off + c]);
-    float gy = bf16_to_f32(bf16_rne(g * bf16_to_f32(y[i])));
-    x[i] = bf16_rne(bf16_to_f32(x[i]) + gy);
+    unsigned int w[4] = {v.x, v.y, v.z, v.w};
+    for (unsigned int k = 0; k < 4; k++) {
+        f[2 * k] = __uint_as_float(w[k] << 16);
+        f[2 * k + 1] = __uint_as_float(w[k] & 0xffff0000u);
+    }
+}
+
+__device__ __forceinline__ uint4 pack8(const unsigned short* h)
+{
+    return make_uint4(
+        (unsigned int)h[0] | ((unsigned int)h[1] << 16),
+        (unsigned int)h[2] | ((unsigned int)h[3] << 16),
+        (unsigned int)h[4] | ((unsigned int)h[5] << 16),
+        (unsigned int)h[6] | ((unsigned int)h[7] << 16));
+}
+
+extern "C" __global__ void add_gated_layernorm_scale(
+    unsigned short* __restrict__ x,               // [rows, dim], updated
+    const unsigned short* __restrict__ y,         // [rows, dim]
+    const unsigned short* __restrict__ tanh_gate, // [nmod, gate_stride]
+    const unsigned short* __restrict__ one_plus,  // [nmod, scale_stride]
+    const int* __restrict__ mod_row,              // [rows]
+    unsigned short* __restrict__ out,             // [rows, dim]
+    unsigned int dim,
+    unsigned int gate_off,
+    unsigned int gate_stride,
+    unsigned int scale_off,
+    unsigned int scale_stride,
+    float eps)
+{
+    __shared__ float s_part[ROW_THREADS];
+    __shared__ __align__(16) float s_row[ADD_NORM_MAX_DIM];
+    const unsigned long long row = (unsigned long long)blockIdx.x * dim;
+    const unsigned long long m = (unsigned long long)mod_row[blockIdx.x];
+    const unsigned short* g = tanh_gate + m * gate_stride + gate_off;
+    const unsigned short* s = one_plus + m * scale_stride + scale_off;
+    float n = (float)dim;
+
+    for (unsigned int c = threadIdx.x * 8; c < dim; c += ROW_THREADS * 8) {
+        float xv[8], yv[8], gv[8];
+        unpack8(*(const uint4*)(x + row + c), xv);
+        unpack8(*(const uint4*)(y + row + c), yv);
+        unpack8(*(const uint4*)(g + c), gv);
+        unsigned short h[8];
+        for (unsigned int e = 0; e < 8; e++) {
+            float gy = bf16_to_f32(bf16_rne(gv[e] * yv[e]));
+            h[e] = bf16_rne(xv[e] + gy);
+        }
+        *(uint4*)(x + row + c) = pack8(h);
+        *(float4*)(s_row + c) = make_float4(bf16_to_f32(h[0]), bf16_to_f32(h[1]), bf16_to_f32(h[2]), bf16_to_f32(h[3]));
+        *(float4*)(s_row + c + 4) = make_float4(bf16_to_f32(h[4]), bf16_to_f32(h[5]), bf16_to_f32(h[6]), bf16_to_f32(h[7]));
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < dim; i += ROW_THREADS) {
+        sum += s_row[i];
+    }
+    float mean = block_sum(sum, s_part) / n;
+
+    float sq = 0.0f;
+    for (unsigned int i = threadIdx.x; i < dim; i += ROW_THREADS) {
+        float d = s_row[i] - mean;
+        sq += d * d;
+    }
+    float inv = rsqrtf(block_sum(sq, s_part) / n + eps);
+
+    for (unsigned int c = threadIdx.x * 8; c < dim; c += ROW_THREADS * 8) {
+        float sv[8];
+        unpack8(*(const uint4*)(s + c), sv);
+        float4 lo = *(const float4*)(s_row + c);
+        float4 hi = *(const float4*)(s_row + c + 4);
+        float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        unsigned short h[8];
+        for (unsigned int e = 0; e < 8; e++) {
+            float normed = bf16_to_f32(bf16_rne((v[e] - mean) * inv));
+            h[e] = bf16_rne(normed * sv[e]);
+        }
+        *(uint4*)(out + row + c) = pack8(h);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // out[i] = bf16(bf16(silu(gate[i])) * up[i]), silu being `g / (1 + exp(-g))`.
+// Each thread takes eight consecutive elements, loaded and stored 16 bytes at
+// a time; a tail shorter than eight goes element by element.
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ unsigned short swiglu_one(unsigned short gate, unsigned short up)
+{
+    float g = bf16_to_f32(gate);
+    float a = bf16_to_f32(bf16_rne(g / (1.0f + expf(-g))));
+    return bf16_rne(a * bf16_to_f32(up));
+}
+
 extern "C" __global__ void swiglu(
     const unsigned short* __restrict__ gate,
     const unsigned short* __restrict__ up,
     unsigned short* __restrict__ out,
     unsigned int n)
 {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = bf16_to_f32(gate[i]);
-    float a = bf16_to_f32(bf16_rne(g / (1.0f + expf(-g))));
-    out[i] = bf16_rne(a * bf16_to_f32(up[i]));
+    unsigned long long base = ((unsigned long long)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (base >= n) return;
+    if (base + 8 <= n) {
+        uint4 gv = *(const uint4*)(gate + base);
+        uint4 uv = *(const uint4*)(up + base);
+        unsigned int* gw = (unsigned int*)&gv;
+        unsigned int* uw = (unsigned int*)&uv;
+        uint4 ov;
+        unsigned int* ow = (unsigned int*)&ov;
+        for (unsigned int w = 0; w < 4; w++) {
+            unsigned short lo = swiglu_one((unsigned short)(gw[w] & 0xffffu), (unsigned short)(uw[w] & 0xffffu));
+            unsigned short hi = swiglu_one((unsigned short)(gw[w] >> 16), (unsigned short)(uw[w] >> 16));
+            ow[w] = (unsigned int)lo | ((unsigned int)hi << 16);
+        }
+        *(uint4*)(out + base) = ov;
+    } else {
+        for (unsigned long long i = base; i < n; i++) {
+            out[i] = swiglu_one(gate[i], up[i]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

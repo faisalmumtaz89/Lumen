@@ -63,6 +63,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   closer to the reference's own output (rel-L2 5.7e-5 instead of 3.6e-4) and, on an RTX
   5090, takes 0.37 s instead of 0.52 s at 1024×1024 (decode phase of one profiled
   generation each).
+- **Faster image denoising steps.** Each transformer block's residual update and the
+  norm that follows it run as one kernel that reads the row once, and SwiGLU moves eight
+  values per thread; the output is unchanged bit for bit. On an RTX 5090 these kernels
+  take 8.8 ms per step instead of 15.4 ms, and a 1024×1024 generation 14.37 s instead of
+  14.60 s (medians of 12, alternating builds).
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

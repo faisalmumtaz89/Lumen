@@ -13,9 +13,9 @@
 //! arithmetic.
 //!
 //! `modulation` carries one row per timestep, and `causal_condition` makes the
-//! target-image tokens read the `t = 0` row while every other token reads the
-//! sampled-timestep row, so the row selection lives in the AdaLN kernels
-//! (`layernorm_scale`, `add_gated`). They receive the modulation as
+//! target-image tokens read the sampled-timestep row while every other token
+//! reads the `t = 0` row, so the row selection lives in the AdaLN kernels
+//! (`layernorm_scale`, `add_gated_layernorm_scale`). They receive the modulation as
 //! `bf16(1 + scale)` and `bf16(tanh(gate))`, formed once per forward.
 //!
 //! Block activations stay on the device between launches: the joint sequence
@@ -227,13 +227,20 @@ pub mod ops {
         gelu_tanh: CudaFunction,
         pack_rows: CudaFunction,
         layernorm_scale: CudaFunction,
-        add_gated: CudaFunction,
+        add_gated_layernorm_scale: CudaFunction,
         swiglu: CudaFunction,
         head_norm_rope: CudaFunction,
     }
 
     /// Compile `dit_ops.cu` and resolve its entry points.
     pub fn load(dev: &CudaDevice) -> Result<DitOps, RuntimeError> {
+        // The kernel sizes its shared row from its own define; a launcher
+        // that allowed wider rows would overrun it.
+        if !DIT_OPS_SOURCE.contains(&format!("#define ADD_NORM_MAX_DIM {ADD_NORM_MAX_DIM}\n")) {
+            return Err(RuntimeError::Compute(format!(
+                "dit_ops.cu does not define ADD_NORM_MAX_DIM as {ADD_NORM_MAX_DIM}"
+            )));
+        }
         let module = dev.compile_and_load(DIT_OPS_SOURCE)?;
         let get = |name: &str| -> Result<CudaFunction, RuntimeError> {
             module
@@ -245,7 +252,7 @@ pub mod ops {
             gelu_tanh: get("gelu_tanh")?,
             pack_rows: get("pack_rows")?,
             layernorm_scale: get("layernorm_scale")?,
-            add_gated: get("add_gated")?,
+            add_gated_layernorm_scale: get("add_gated_layernorm_scale")?,
             swiglu: get("swiglu")?,
             head_norm_rope: get("head_norm_rope")?,
         })
@@ -506,55 +513,95 @@ pub mod ops {
         Ok(out)
     }
 
-    /// `x = bf16(x + bf16(tanh_gate[row] * y))`, in place on the residual
-    /// stream; `tanh_gate` holds `bf16(tanh(gate))`.
+    /// The widest row [`add_gated_layernorm_scale`] stages in shared memory:
+    /// `ADD_NORM_MAX_DIM` in `dit_ops.cu`, which [`load`] checks.
+    pub const ADD_NORM_MAX_DIM: usize = 4096;
+
+    /// `x = bf16(x + bf16(tanh_gate[row] * y))` in place on the residual
+    /// stream, then [`layernorm_scale`] of the updated `x` with `one_plus`:
+    /// the next projection's input. `tanh_gate` holds `bf16(tanh(gate))`.
     #[allow(clippy::too_many_arguments)]
-    pub fn add_gated(
+    pub fn add_gated_layernorm_scale(
         dev: &CudaDevice,
         k: &DitOps,
         x: &mut CudaSlice<u16>,
         y: &CudaSlice<u16>,
         tanh_gate: &CudaSlice<u16>,
+        (gate_off, gate_stride): (usize, usize),
+        one_plus: &CudaSlice<u16>,
+        (scale_off, scale_stride): (usize, usize),
         mod_row: &CudaSlice<i32>,
-        col_off: usize,
         cols: usize,
-        mod_stride: usize,
-    ) -> Result<(), RuntimeError> {
+        eps: f32,
+    ) -> Result<CudaSlice<u16>, RuntimeError> {
+        const NAME: &str = "add_gated_layernorm_scale";
         let rows = adaln_rows(
-            "add_gated",
+            NAME,
             x.len(),
             tanh_gate,
             mod_row,
-            col_off,
+            gate_off,
             cols,
-            mod_stride,
+            gate_stride,
+        )?;
+        adaln_rows(
+            NAME,
+            x.len(),
+            one_plus,
+            mod_row,
+            scale_off,
+            cols,
+            scale_stride,
         )?;
         if y.len() != x.len() {
             return Err(RuntimeError::Compute(format!(
-                "add_gated: y has {} elements, x has {}",
+                "{NAME}: y has {} elements, x has {}",
                 y.len(),
                 x.len()
             )));
         }
-        let (rows_u, cols_u) = (rows as u32, cols as u32);
-        let (off_u, stride_u) = (col_off as u32, mod_stride as u32);
-        let total = x.len() as u32;
-        // Safety: buffers match the kernel's declared shapes and geometry.
+        if cols > ADD_NORM_MAX_DIM {
+            return Err(RuntimeError::Compute(format!(
+                "{NAME}: rows of {cols} exceed the {ADD_NORM_MAX_DIM} the kernel stages"
+            )));
+        }
+        // The kernel moves eight elements (16 bytes) at a time.
+        if [cols, gate_off, gate_stride, scale_off, scale_stride]
+            .iter()
+            .any(|v| v % 8 != 0)
+        {
+            return Err(RuntimeError::Compute(format!(
+                "{NAME}: width {cols}, offsets {gate_off}/{scale_off} and strides \
+                 {gate_stride}/{scale_stride} must be multiples of 8"
+            )));
+        }
+        let out = alloc_bits(dev, x.len())?;
+        let cols_u = cols as u32;
+        let (gate_off_u, gate_stride_u) = (gate_off as u32, gate_stride as u32);
+        let (scale_off_u, scale_stride_u) = (scale_off as u32, scale_stride as u32);
+        // Safety: buffers match the kernel's declared shapes, rows fit its
+        // shared memory, every access is 16-byte aligned (the allocations are,
+        // and every offset is a multiple of eight elements), and the grid is
+        // one block per row.
         unsafe {
             dev.stream
-                .launch_builder(&k.add_gated)
+                .launch_builder(&k.add_gated_layernorm_scale)
                 .arg(x)
                 .arg(y)
                 .arg(tanh_gate)
+                .arg(one_plus)
                 .arg(mod_row)
-                .arg(&rows_u)
+                .arg(&out)
                 .arg(&cols_u)
-                .arg(&off_u)
-                .arg(&stride_u)
-                .launch(flat_grid(total))
-                .map_err(|e| RuntimeError::Compute(format!("add_gated: {e}")))?;
+                .arg(&gate_off_u)
+                .arg(&gate_stride_u)
+                .arg(&scale_off_u)
+                .arg(&scale_stride_u)
+                .arg(&eps)
+                .launch(row_grid(rows))
+                .map_err(|e| RuntimeError::Compute(format!("{NAME}: {e}")))?;
         }
-        Ok(())
+        Ok(out)
     }
 
     /// `bf16(bf16(silu(gate)) * up)`, the down projection's input.
@@ -573,7 +620,8 @@ pub mod ops {
         }
         let n = elements("swiglu", &[gate.len()])?;
         let out = alloc_bits(dev, gate.len())?;
-        // Safety: all three buffers are `n` elements and the grid covers them.
+        // Safety: all three buffers are `n` elements and the grid covers them,
+        // eight per thread.
         unsafe {
             dev.stream
                 .launch_builder(&k.swiglu)
@@ -581,7 +629,7 @@ pub mod ops {
                 .arg(up)
                 .arg(&out)
                 .arg(&n)
-                .launch(flat_grid(n))
+                .launch(flat_grid(n.div_ceil(8)))
                 .map_err(|e| RuntimeError::Compute(format!("swiglu: {e}")))?;
         }
         Ok(out)
@@ -683,6 +731,16 @@ impl DitGpu {
                 what: "attention head width".to_string(),
                 expected: vec![crate::cuda::attention::FLASH_HEAD_DIM as u64],
                 actual: vec![config.attention_head_dim as u64],
+            }
+            .into());
+        }
+        // The fused residual update and norm stage one row of the hidden
+        // width in shared memory.
+        if hidden > ops::ADD_NORM_MAX_DIM {
+            return Err(DitError::ShapeMismatch {
+                what: format!("hidden width (at most {})", ops::ADD_NORM_MAX_DIM),
+                expected: vec![ops::ADD_NORM_MAX_DIM as u64],
+                actual: vec![hidden as u64],
             }
             .into());
         }
@@ -900,51 +958,6 @@ impl DitGpu {
         // `hidden` rather than of the stride.
         let mod_stride = 4 * hidden;
         let heads = cfg.num_attention_heads;
-        let mut x = ops::pack_rows(&self.dev, &self.ops, &txt.bits, &img.bits, &source, hidden)?;
-        for block in &self.blocks {
-            let normed = self.normed_input(
-                &x,
-                &modulation,
-                &g_mod_row,
-                MOD_ATTN_SCALE * hidden,
-                hidden,
-                mod_stride,
-            )?;
-            let attn = self.attention(block, &normed, seq, heads, &g_freqs, text_count)?;
-            ops::add_gated(
-                &self.dev,
-                &self.ops,
-                &mut x,
-                &attn.bits,
-                &modulation,
-                &g_mod_row,
-                MOD_ATTN_GATE * hidden,
-                hidden,
-                mod_stride,
-            )?;
-
-            let normed = self.normed_input(
-                &x,
-                &modulation,
-                &g_mod_row,
-                MOD_MLP_SCALE * hidden,
-                hidden,
-                mod_stride,
-            )?;
-            let mlp = self.feed_forward(block, &normed, seq)?;
-            ops::add_gated(
-                &self.dev,
-                &self.ops,
-                &mut x,
-                &mlp.bits,
-                &modulation,
-                &g_mod_row,
-                MOD_MLP_GATE * hidden,
-                hidden,
-                mod_stride,
-            )?;
-        }
-
         // `QwenImage21AdaLayerNormContinuous`: scale only, read from `temb`
         // rather than from the shared modulation.
         let scale = self.linear_rows(&self.norm_out, &silu_temb, timesteps.len())?;
@@ -952,9 +965,46 @@ impl DitGpu {
             .iter()
             .map(|&s| bf16_bits(1.0 + bf16_f32(s)))
             .collect();
-        let one_plus = self.dev.htod_copy(&one_plus)?;
-        let normed =
-            self.normed_input(&x, &one_plus, &g_mod_row, NORM_OUT_SCALE, hidden, hidden)?;
+        let norm_out_scale = self.dev.htod_copy(&one_plus)?;
+
+        let mut x = ops::pack_rows(&self.dev, &self.ops, &txt.bits, &img.bits, &source, hidden)?;
+        // The first norm feeds block 0's attention, or `norm_out` directly
+        // when there are no blocks.
+        let (first_scale, first_off, first_stride) = if self.blocks.is_empty() {
+            (&norm_out_scale, NORM_OUT_SCALE, hidden)
+        } else {
+            (&modulation, MOD_ATTN_SCALE * hidden, mod_stride)
+        };
+        let mut normed =
+            self.normed_input(&x, first_scale, &g_mod_row, first_off, hidden, first_stride)?;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let attn = self.attention(block, &normed, seq, heads, &g_freqs, text_count)?;
+            normed = self.add_gated_normed(
+                &mut x,
+                &attn,
+                (&modulation, MOD_ATTN_GATE * hidden),
+                (&modulation, MOD_MLP_SCALE * hidden, mod_stride),
+                &g_mod_row,
+                mod_stride,
+            )?;
+            let mlp = self.feed_forward(block, &normed, seq)?;
+            // The next norm is the following block's attention input, or
+            // `norm_out` after the last block.
+            let next_scale = if i + 1 < self.blocks.len() {
+                (&modulation, MOD_ATTN_SCALE * hidden, mod_stride)
+            } else {
+                (&norm_out_scale, NORM_OUT_SCALE, hidden)
+            };
+            normed = self.add_gated_normed(
+                &mut x,
+                &mlp,
+                (&modulation, MOD_MLP_GATE * hidden),
+                next_scale,
+                &g_mod_row,
+                mod_stride,
+            )?;
+        }
+
         let out = self.linear(&self.proj_out, &normed)?;
         let bits = self.dev.dtoh_copy(&out.bits)?;
         self.dev.synchronize()?;
@@ -1073,6 +1123,35 @@ impl DitGpu {
         let hidden = ops::swiglu(&self.dev, &self.ops, &gate.bits, &proj.bits)?;
         let hidden = Bf16Activation::from_bits(hidden, seq, block.mlp_out.cols)?;
         self.linear(&block.mlp_out, &hidden)
+    }
+
+    /// The residual update `x += tanh_gate · y` followed by the next normed,
+    /// modulated input: `gate` is the modulation and the offset of its gate
+    /// chunk, `scale` the `1 + scale` factors, their offset and row width.
+    fn add_gated_normed(
+        &self,
+        x: &mut CudaSlice<u16>,
+        y: &Bf16Activation,
+        (gate, gate_off): (&CudaSlice<u16>, usize),
+        (scale, scale_off, scale_stride): (&CudaSlice<u16>, usize, usize),
+        mod_row: &CudaSlice<i32>,
+        mod_stride: usize,
+    ) -> Result<Bf16Activation, DitGpuError> {
+        let cols = self.config.inner_dim();
+        let bits = ops::add_gated_layernorm_scale(
+            &self.dev,
+            &self.ops,
+            x,
+            &y.bits,
+            gate,
+            (gate_off, mod_stride),
+            scale,
+            (scale_off, scale_stride),
+            mod_row,
+            cols,
+            self.config.eps,
+        )?;
+        Ok(Bf16Activation::from_bits(bits, x.len() / cols, cols)?)
     }
 
     /// `bf16(bf16(layernorm(x)) * one_plus[row])`: a block's normed, modulated
