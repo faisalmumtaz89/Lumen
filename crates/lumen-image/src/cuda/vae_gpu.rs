@@ -2,10 +2,13 @@
 //!
 //! This mirrors [`crate::vae`] step for step: the same shapes and the same
 //! operand order. The elementwise kernels keep the CPU's accumulation order
-//! per output element; the convolution and the attention products run on
-//! cuBLAS in f32, whose summation order is its own. The CPU reference is the
-//! specification — it agrees with the real checkpoint at PSNR 131.8 dB — and
-//! `vae-check-gpu` checks the GPU decode against it within 1e-5 relative error.
+//! per output element. The convolutions run on cuBLAS as TF32 tensor-core
+//! products with f32 accumulation, as the reference's cuDNN convolutions do
+//! under torch's default `allow_tf32`; the attention products run in full f32,
+//! the accuracy of the reference's f32 attention kernel. `vae-check-gpu`
+//! checks the GPU decode against the reference's own output within 1.5e-4
+//! relative error and against [`crate::vae`], which convolves in full f32,
+//! within 1e-3.
 //!
 //! The four things [`crate::vae`]'s module doc calls out are the ones a
 //! plausible "improvement" would silently break, and they carry over unchanged:
@@ -888,6 +891,7 @@ impl VaeGpu {
                 unsafe {
                     sgemm(
                         &self.dev,
+                        Math::Tf32,
                         Op::N,
                         Op::N,
                         1.0,
@@ -1183,6 +1187,7 @@ impl VaeGpu {
             unsafe {
                 sgemm(
                     &self.dev,
+                    Math::F32,
                     Op::N,
                     Op::T,
                     scale,
@@ -1219,6 +1224,7 @@ impl VaeGpu {
             unsafe {
                 sgemm(
                     &self.dev,
+                    Math::F32,
                     Op::T,
                     Op::N,
                     1.0,
@@ -1307,8 +1313,21 @@ impl Op {
     }
 }
 
+/// How an f32 GEMM multiplies, matching what the reference's operation does
+/// in f32 under torch's defaults.
+#[derive(Clone, Copy)]
+enum Math {
+    /// TF32 tensor-core products with f32 accumulation: a convolution, which
+    /// cuDNN runs this way while `torch.backends.cudnn.allow_tf32` is true,
+    /// its default.
+    Tf32,
+    /// Full f32 products: the attention, whose f32 kernel in the reference
+    /// computes at full f32 accuracy.
+    F32,
+}
+
 /// f32 `C_cm[m, n] = alpha · op(A_cm) · op(B_cm)`, `op(A)` being `[m, k]` and
-/// `op(B)` `[k, n]`.
+/// `op(B)` `[k, n]`, with the products computed as `math` says.
 ///
 /// # Safety
 ///
@@ -1317,6 +1336,7 @@ impl Op {
 #[allow(clippy::too_many_arguments)]
 unsafe fn sgemm(
     dev: &CudaDevice,
+    math: Math,
     op_a: Op,
     op_b: Op,
     alpha: f32,
@@ -1354,7 +1374,10 @@ unsafe fn sgemm(
         c_ptr as *mut std::ffi::c_void,
         cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
         ldc as i32,
-        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        match math {
+            Math::Tf32 => cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            Math::F32 => cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        },
         cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
     );
     if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {

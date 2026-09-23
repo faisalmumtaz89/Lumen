@@ -2,15 +2,20 @@
 //! compares — and against the CPU decoder on the same input.
 //!
 //! Three numbers per pair, so the check answers two questions at once:
-//!   - GPU vs the real checkpoint's output: does the GPU path decode correctly?
-//!   - GPU vs the CPU reference on the same latents: if the oracle itself is
-//!     unavailable, does the GPU path still agree with the reference?
+//!   - GPU vs the reference's own output: does the GPU path decode as the
+//!     reference does?
+//!   - GPU vs the CPU decoder on the same latents: does the GPU path compute
+//!     the same function as the independent f32 implementation?
 //!
-//! The second comparison is the sharper one, and it needs no oracle: `vae.rs`
-//! already agrees with the checkpoint at PSNR 131.8 dB, so a GPU path that
-//! matches `vae.rs` element for element inherits that agreement rather than
-//! arguing for a tolerance of its own. Both are checked: the run fails when
-//! either distance is above its bar.
+//! The reference runs its convolutions in TF32 (torch's default for cuDNN),
+//! as the GPU path does; `vae.rs` runs them in full f32. So the first
+//! comparison is the sharper one: on the `main` oracle case the GPU decode is
+//! rel-L2 5.7e-5 from the reference (the reference itself lands 5.6e-5 from its
+//! own output when cuDNN picks another algorithm), where full-f32 convolutions
+//! land 3.6e-4 away, and its 1.5e-4 bar tells the two apart. The GPU decode is
+//! 3.6e-4 from the CPU decoder, the TF32 rounding, and that bar of 1e-3 catches
+//! a decoder that computes something else. The run fails when either distance is above its
+//! bar.
 //!
 //! Usage: `vae-check-gpu <lbi-dir> <oracle-dir> [tag]`
 
@@ -176,13 +181,11 @@ fn run() -> Result<(), String> {
 
     // --- the comparisons ----------------------------------------------------
     println!("comparisons:");
-    // The GPU decoder differs from the CPU one only in f32 summation order.
-    report("gpu vs oracle", &got, &want.data, 1e-3)?;
-    report("gpu vs cpu", &got, &cpu, 1e-5)?;
-    // The CPU path is unchanged by this work, so this should reproduce
-    // `vae-check`'s own number (131.83 dB on the shipped checkpoint). Reporting it
-    // makes a bad oracle dump indistinguishable from a bad GPU path only if this
-    // line is also wrong, which is the point of printing it.
+    report("gpu vs oracle", &got, &want.data, 1.5e-4)?;
+    report("gpu vs cpu", &got, &cpu, 1e-3)?;
+    // The CPU path should reproduce `vae-check`'s own number. Reporting it makes
+    // a bad oracle dump indistinguishable from a bad GPU path only if this line
+    // is also wrong, which is the point of printing it.
     report("cpu vs oracle", &cpu, &want.data, 1e-3)?;
 
     if got.len() != want.data.len() {

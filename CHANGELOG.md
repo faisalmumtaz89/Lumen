@@ -58,6 +58,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   page-locked host memory (14.1 GiB, copied at startup) and loads the encoder from there
   for each generation: on an RTX 5090 host the load takes 0.45 s instead of 0.75 s
   (medians of 4 interleaved runs each), with identical output. Off by default.
+- **Image decoding in TF32.** The CUDA VAE runs its convolutions as TF32 tensor-core
+  products, as the reference's convolutions run under torch's defaults: the decode lands
+  closer to the reference's own output (rel-L2 5.7e-5 instead of 3.6e-4) and, on an RTX
+  5090, takes 0.37 s instead of 0.52 s at 1024×1024 (decode phase of one profiled
+  generation each).
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.
