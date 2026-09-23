@@ -1,36 +1,35 @@
-//! The Qwen-Image-2.1 diffusion transformer, on the GPU.
+//! The Qwen-Image-2.1 diffusion transformer, on the GPU, in the reference's
+//! arithmetic.
 //!
-//! This mirrors [`crate::dit`] step for step: the same operand order, the same
-//! modulation row selection, the same RoPE table, the same activation
-//! arguments. The CPU reference is the specification: the per-op check
-//! (`cuda-ops-check`) pins the elementwise kernels this forward calls to the
-//! CPU primitives within 1e-6 relative error and the attention within bf16
-//! tolerance, and the generated image is compared against the reference decode.
+//! The reference runs the transformer in bf16: every tensor between two
+//! operations is bf16, and each operation computes in f32 and rounds its result
+//! to bf16 once, nearest even. This forward does the same. The projections are
+//! cuBLAS bf16 GEMMs whose output is rounded as it is written, the kernels in
+//! `dit_ops.cu` round where the reference's operations do, and the residual
+//! stream is bf16. It follows [`crate::dit`], the f32 CPU form of the same
+//! model, in operand order, modulation row selection, RoPE table and activation
+//! arguments; the two differ by the bf16 rounding, which is the reference's.
+//! `cuda-ops-check` pins each kernel to a CPU rendering of the same bf16
+//! arithmetic.
 //!
-//! The AdaLN path has no counterpart in the text kernels.
 //! `modulation` carries one row per timestep, and `causal_condition` makes the
 //! target-image tokens read the `t = 0` row while every other token reads the
-//! sampled-timestep row. `scale_one_plus` broadcasts a single row over every
-//! token and cannot express that, so the row selection is folded into
-//! `layernorm_scale_bf16` / `add_gated_gather` in `dit_ops.cu`.
+//! sampled-timestep row, so the row selection lives in the AdaLN kernels
+//! (`layernorm_scale`, `add_gated`). They receive the modulation as
+//! `bf16(1 + scale)` and `bf16(tanh(gate))`, formed once per forward.
 //!
 //! Block activations stay on the device between launches: the joint sequence
 //! is gathered on the device from a per-row source table built on the host
 //! (index arithmetic that has to match the reference exactly), and the result
-//! comes back at the end. Only the timestep embedding, a few rows wide, goes
-//! through the host between its two linears. Every projection runs as a bf16
-//! tensor-core GEMM with f32 accumulation; inside a block the kernel that
-//! produces a projection's input rounds it to bf16 itself, the residual
-//! stream stays f32, and the projections outside the blocks convert their
-//! f32 input in a separate pass.
+//! comes back at the end. The timestep embedding and the two modulations, a
+//! few rows wide, go through the host between their linears.
 //!
-//! Weights keep the dtype the `.lbi` stores. The shipped Qwen-Image-2.1
-//! checkpoint is BF16, so the transformer is 13.3 GiB of weights and the
-//! activations fit beside it on a 32 GiB card; a forward never materialises an
-//! f32 copy of a weight matrix. A bf16 weight is multiplied by a bf16
-//! activation with f32 accumulation, the precision the upstream model runs
-//! the transformer at; the SIMT `gemm_16bit` (an f32 widening of each weight)
-//! serves F16 weights.
+//! Every weight is bf16 on the device. The shipped checkpoint stores bf16 and
+//! is uploaded as stored; a weight stored as f32 or f16 is rounded to bf16 at
+//! load, as the reference casts its weights when it loads them, except the
+//! block projections and `proj_out`, which must be stored bf16. The
+//! transformer is 13.3 GiB of weights and its activations fit beside it on a
+//! 32 GiB card.
 
 use std::path::Path;
 
@@ -39,11 +38,12 @@ use lumen_format::QuantScheme;
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::error::RuntimeError;
 
+use super::blas::Bf16Activation;
 use super::launch::{self, DevVec};
 use super::ImageKernels;
 use crate::dit::{DitConfig, DitError, DitForwardArgs};
-use crate::lbi::{LbiError, LbiFile, TensorEntry};
-use crate::tensor::{silu, Matrix};
+use crate::lbi::{LbiError, LbiFile};
+use crate::tensor::{bf16_bits, bf16_f32, bf16_round, silu, Matrix};
 
 /// Rows of the RoPE frequency table. The reference builds it as
 /// `cat(rope_params(arange(8192)), rope_params(flip(arange(1024)) * -1 - 1))`,
@@ -136,50 +136,16 @@ impl From<LbiError> for DitGpuError {
     }
 }
 
-/// A linear weight resident on the device, in the dtype the `.lbi` stores.
+/// A linear weight resident on the device as bf16.
 ///
 /// `rows` is the output width and `cols` the input width, kept alongside the
 /// buffer rather than derived from its length: which factor is which is not
 /// recoverable from an element count, and a transposed operand is a silent
 /// wrong answer.
-enum DevWeight {
-    F32 {
-        buf: DevVec,
-        rows: usize,
-        cols: usize,
-    },
-    F16 {
-        buf: CudaSlice<u16>,
-        rows: usize,
-        cols: usize,
-    },
-    Bf16 {
-        buf: CudaSlice<u16>,
-        rows: usize,
-        cols: usize,
-    },
-}
-
-impl DevWeight {
-    fn rows(&self) -> usize {
-        match self {
-            Self::F32 { rows, .. } | Self::F16 { rows, .. } | Self::Bf16 { rows, .. } => *rows,
-        }
-    }
-
-    fn cols(&self) -> usize {
-        match self {
-            Self::F32 { cols, .. } | Self::F16 { cols, .. } | Self::Bf16 { cols, .. } => *cols,
-        }
-    }
-
-    fn scheme_name(&self) -> &'static str {
-        match self {
-            Self::F32 { .. } => "f32",
-            Self::F16 { .. } => "f16",
-            Self::Bf16 { .. } => "bf16",
-        }
-    }
+struct DevWeight {
+    buf: CudaSlice<u16>,
+    rows: usize,
+    cols: usize,
 }
 
 /// One single-stream block, resident on the device.
@@ -240,44 +206,30 @@ impl RopeAxis {
     }
 }
 
-/// Which 16-bit storage a [`ops::gemm_16bit`] call reads.
-pub use ops::Gemm16;
-
 /// The kernels in `dit_ops.cu`.
 pub use ops::DitOps;
 
 /// The kernels behind the ops that no existing module provides.
 ///
 /// These live in their own module because two callers drive them: the forward
-/// here, and `cuda-ops-check`, which pins each one to the CPU reference on
-/// synthetic inputs. Routing both through one launcher is what makes that check
-/// speak for the forward's own arithmetic rather than for a copy of it.
+/// here, and `cuda-ops-check`, which pins each one to a CPU rendering of the
+/// same bf16 arithmetic on synthetic inputs. Routing both through one launcher
+/// is what makes that check speak for the forward's own arithmetic rather than
+/// for a copy of it.
 pub mod ops {
     use super::THREADS;
-    use super::{launch, DevVec, DIT_OPS_SOURCE};
     use super::{CudaDevice, CudaFunction, CudaSlice, LaunchConfig, PushKernelArg, RuntimeError};
-
-    /// Tiling of `gemm_16bit`, matching `image_ops.cu`'s `gemm_f32_bias`.
-    const GEMM_TILE: u32 = 32;
-
-    /// Which 16-bit float a weight buffer holds. The kernel widens either to
-    /// f32 on the way into its tile, so the two differ only in the widening.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Gemm16 {
-        F16,
-        Bf16,
-    }
+    use super::{DevVec, DIT_OPS_SOURCE};
 
     /// The kernels in `dit_ops.cu`.
     pub struct DitOps {
-        gemm_16bit: CudaFunction,
         zero_center_rmsnorm: CudaFunction,
-        gelu_tanh_inplace: CudaFunction,
-        add_gated_gather: CudaFunction,
+        gelu_tanh: CudaFunction,
         pack_rows: CudaFunction,
-        layernorm_scale_bf16: CudaFunction,
-        swiglu_bf16: CudaFunction,
-        head_norm_rope_bf16: CudaFunction,
+        layernorm_scale: CudaFunction,
+        add_gated: CudaFunction,
+        swiglu: CudaFunction,
+        head_norm_rope: CudaFunction,
     }
 
     /// Compile `dit_ops.cu` and resolve its entry points.
@@ -289,14 +241,13 @@ pub mod ops {
                 .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
         };
         Ok(DitOps {
-            gemm_16bit: get("gemm_16bit")?,
             zero_center_rmsnorm: get("zero_center_rmsnorm")?,
-            gelu_tanh_inplace: get("gelu_tanh_inplace")?,
-            add_gated_gather: get("add_gated_gather")?,
+            gelu_tanh: get("gelu_tanh")?,
             pack_rows: get("pack_rows")?,
-            layernorm_scale_bf16: get("layernorm_scale_bf16")?,
-            swiglu_bf16: get("swiglu_bf16")?,
-            head_norm_rope_bf16: get("head_norm_rope_bf16")?,
+            layernorm_scale: get("layernorm_scale")?,
+            add_gated: get("add_gated")?,
+            swiglu: get("swiglu")?,
+            head_norm_rope: get("head_norm_rope")?,
         })
     }
 
@@ -332,70 +283,38 @@ pub mod ops {
         }
     }
 
-    /// `out[M, N] = a[M, K] * W_16bit[N, K]^T`. Same tiling and geometry as
-    /// `gemm_f32_bias`; the kernel widens each element into its tile.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_16bit(
-        dev: &CudaDevice,
-        k: &DitOps,
-        w: &CudaSlice<u16>,
-        a: &DevVec,
-        m: usize,
-        n: usize,
-        kdim: usize,
-        kind: Gemm16,
-    ) -> Result<DevVec, RuntimeError> {
-        let out = launch::alloc(dev, m * n)?;
-        let (mu, nu, ku) = (m as u32, n as u32, kdim as u32);
-        let flag: u32 = match kind {
-            Gemm16::F16 => 0,
-            Gemm16::Bf16 => 1,
-        };
-        // Safety: both buffers are device allocations of the sizes the kernel
-        // reads, and the grid covers the output tile.
-        unsafe {
-            dev.stream
-                .launch_builder(&k.gemm_16bit)
-                .arg(&a.buf)
-                .arg(w)
-                .arg(&out.buf)
-                .arg(&mu)
-                .arg(&nu)
-                .arg(&ku)
-                .arg(&flag)
-                .launch(LaunchConfig {
-                    grid_dim: (
-                        n.div_ceil(GEMM_TILE as usize) as u32,
-                        m.div_ceil(GEMM_TILE as usize) as u32,
-                        1,
-                    ),
-                    block_dim: (GEMM_TILE, GEMM_TILE, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| RuntimeError::Compute(format!("gemm_16bit: {e}")))?;
-        }
-        Ok(out)
+    /// A buffer every element of which the kernel about to run writes.
+    fn alloc_bits(dev: &CudaDevice, len: usize) -> Result<CudaSlice<u16>, RuntimeError> {
+        // Safety: each caller's kernel writes all `len` elements before any read.
+        Ok(unsafe { dev.alloc_uninit::<u16>(len)? })
     }
 
-    /// `zero_center_rms_norm_rows`, one block per row.
+    /// The zero-centred RMSNorm over each `dim`-wide row, one block per row.
     pub fn zero_center_rmsnorm(
         dev: &CudaDevice,
         k: &DitOps,
-        x: &DevVec,
+        x: &CudaSlice<u16>,
         weight: &DevVec,
         rows: usize,
         dim: usize,
         eps: f32,
-    ) -> Result<DevVec, RuntimeError> {
-        let out = launch::alloc(dev, x.len)?;
+    ) -> Result<CudaSlice<u16>, RuntimeError> {
+        if dim == 0 || x.len() != rows * dim || weight.len != dim {
+            return Err(RuntimeError::Compute(format!(
+                "zero_center_rmsnorm: x {} / weight {} do not match {rows}x{dim}",
+                x.len(),
+                weight.len
+            )));
+        }
+        let out = alloc_bits(dev, x.len())?;
         let du = dim as u32;
-        // Safety: buffers match the kernel's declared shapes and geometry.
+        // Safety: `x` and `out` are `rows * dim`, `weight` is `dim`.
         unsafe {
             dev.stream
                 .launch_builder(&k.zero_center_rmsnorm)
-                .arg(&x.buf)
+                .arg(x)
                 .arg(&weight.buf)
-                .arg(&out.buf)
+                .arg(&out)
                 .arg(&du)
                 .arg(&eps)
                 .launch(row_grid(rows))
@@ -404,23 +323,25 @@ pub mod ops {
         Ok(out)
     }
 
-    /// GELU in place, one thread per element.
-    pub fn gelu_tanh_inplace(
+    /// GELU (tanh approximation), one thread per element.
+    pub fn gelu_tanh(
         dev: &CudaDevice,
         k: &DitOps,
-        x: &mut DevVec,
-    ) -> Result<(), RuntimeError> {
-        let n = x.len as u32;
-        // Safety: the buffer is `n` floats and the grid covers exactly that.
+        x: &CudaSlice<u16>,
+    ) -> Result<CudaSlice<u16>, RuntimeError> {
+        let n = elements("gelu_tanh", &[x.len()])?;
+        let out = alloc_bits(dev, x.len())?;
+        // Safety: both buffers are `n` elements and the grid covers them.
         unsafe {
             dev.stream
-                .launch_builder(&k.gelu_tanh_inplace)
-                .arg(&mut x.buf)
+                .launch_builder(&k.gelu_tanh)
+                .arg(x)
+                .arg(&out)
                 .arg(&n)
                 .launch(flat_grid(n))
-                .map_err(|e| RuntimeError::Compute(format!("gelu_tanh_inplace: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("gelu_tanh: {e}")))?;
         }
-        Ok(())
+        Ok(out)
     }
 
     /// The joint sequence: row `t` is `txt[source[t]]` when `source[t] >= 0`
@@ -429,18 +350,19 @@ pub mod ops {
     pub fn pack_rows(
         dev: &CudaDevice,
         k: &DitOps,
-        txt: &DevVec,
-        img: &DevVec,
+        txt: &CudaSlice<u16>,
+        img: &CudaSlice<u16>,
         source: &[i32],
         cols: usize,
-    ) -> Result<DevVec, RuntimeError> {
-        if cols == 0 || txt.len % cols != 0 || img.len % cols != 0 {
+    ) -> Result<CudaSlice<u16>, RuntimeError> {
+        if cols == 0 || txt.len() % cols != 0 || img.len() % cols != 0 {
             return Err(RuntimeError::Compute(format!(
                 "pack_rows: txt {} and img {} are not whole rows of {cols}",
-                txt.len, img.len
+                txt.len(),
+                img.len()
             )));
         }
-        let (text_rows, image_rows) = (txt.len / cols, img.len / cols);
+        let (text_rows, image_rows) = (txt.len() / cols, img.len() / cols);
         for &s in source {
             let (which, row, count) = if s >= 0 {
                 ("text", s as usize, text_rows)
@@ -456,17 +378,17 @@ pub mod ops {
         let rows = source.len();
         let total = elements("pack_rows", &[rows, cols])?;
         let g_source: CudaSlice<i32> = dev.htod_copy(source)?;
-        let out = launch::alloc(dev, rows * cols)?;
+        let out = alloc_bits(dev, rows * cols)?;
         let (rows_u, cols_u) = (rows as u32, cols as u32);
         // Safety: every source index was checked against the two row counts
         // above, and the grid covers exactly `rows * cols`.
         unsafe {
             dev.stream
                 .launch_builder(&k.pack_rows)
-                .arg(&txt.buf)
-                .arg(&img.buf)
+                .arg(txt)
+                .arg(img)
                 .arg(&g_source)
-                .arg(&out.buf)
+                .arg(&out)
                 .arg(&rows_u)
                 .arg(&cols_u)
                 .launch(flat_grid(total))
@@ -507,48 +429,47 @@ pub mod ops {
         Ok(bits)
     }
 
-    /// The geometry the two AdaLN kernels share: `x` is whole rows of `cols`,
-    /// `mod_row` names one modulation row per row of `x`, and the chunk
-    /// `col_off..col_off + cols` lies inside a modulation row of `mod_stride`.
-    /// Returns the row count. The values in `mod_row` are the caller's to
-    /// keep inside `modulation`; the forward builds them from its own
-    /// timestep count.
+    /// The geometry the two AdaLN kernels share: `x_len` is whole rows of
+    /// `cols`, `mod_row` names one modulation row per row of `x`, and the
+    /// chunk `col_off..col_off + cols` lies inside a modulation row of
+    /// `mod_stride`. Returns the row count. The values in `mod_row` are the
+    /// caller's to keep inside `modulation`; the forward builds them from its
+    /// own timestep count.
     fn adaln_rows(
         name: &str,
-        x: &DevVec,
-        modulation: &DevVec,
+        x_len: usize,
+        modulation: &CudaSlice<u16>,
         mod_row: &CudaSlice<i32>,
         col_off: usize,
         cols: usize,
         mod_stride: usize,
     ) -> Result<usize, RuntimeError> {
-        let whole_rows = cols != 0 && x.len % cols == 0 && mod_row.len() == x.len / cols;
+        let whole_rows = cols != 0 && x_len % cols == 0 && mod_row.len() == x_len / cols;
         let chunk_inside = mod_stride != 0
             && col_off
                 .checked_add(cols)
                 .is_some_and(|end| end <= mod_stride)
-            && modulation.len % mod_stride == 0;
+            && modulation.len() % mod_stride == 0;
         if !whole_rows || !chunk_inside {
             return Err(RuntimeError::Compute(format!(
-                "{name}: x {} / mod_row {} / modulation {} do not fit cols {cols} at \
+                "{name}: x {x_len} / mod_row {} / modulation {} do not fit cols {cols} at \
                  {col_off} of stride {mod_stride}",
-                x.len,
                 mod_row.len(),
-                modulation.len
+                modulation.len()
             )));
         }
-        elements(name, &[x.len])?;
-        Ok(x.len / cols)
+        elements(name, &[x_len])?;
+        Ok(x_len / cols)
     }
 
-    /// `bf16(layernorm(x) * (1 + modulation[row]))`, the input a projection
-    /// takes, in one pass over `x`.
+    /// `bf16(bf16(layernorm(x)) * one_plus[row])`, the input a projection
+    /// takes; `one_plus` holds `bf16(1 + scale)`.
     #[allow(clippy::too_many_arguments)]
-    pub fn layernorm_scale_bf16(
+    pub fn layernorm_scale(
         dev: &CudaDevice,
         k: &DitOps,
-        x: &DevVec,
-        modulation: &DevVec,
+        x: &CudaSlice<u16>,
+        one_plus: &CudaSlice<u16>,
         mod_row: &CudaSlice<i32>,
         col_off: usize,
         cols: usize,
@@ -556,73 +477,123 @@ pub mod ops {
         eps: f32,
     ) -> Result<CudaSlice<u16>, RuntimeError> {
         let rows = adaln_rows(
-            "layernorm_scale_bf16",
-            x,
-            modulation,
+            "layernorm_scale",
+            x.len(),
+            one_plus,
             mod_row,
             col_off,
             cols,
             mod_stride,
         )?;
-        // Safety: every element is written by the kernel.
-        let mut out = unsafe { dev.alloc_uninit::<u16>(x.len)? };
+        let out = alloc_bits(dev, x.len())?;
         let (cols_u, off_u, stride_u) = (cols as u32, col_off as u32, mod_stride as u32);
         // Safety: buffers match the kernel's declared shapes, and the grid is
         // one block per row.
         unsafe {
             dev.stream
-                .launch_builder(&k.layernorm_scale_bf16)
-                .arg(&x.buf)
-                .arg(&modulation.buf)
+                .launch_builder(&k.layernorm_scale)
+                .arg(x)
+                .arg(one_plus)
                 .arg(mod_row)
-                .arg(&mut out)
+                .arg(&out)
                 .arg(&cols_u)
                 .arg(&off_u)
                 .arg(&stride_u)
                 .arg(&eps)
                 .launch(row_grid(rows))
-                .map_err(|e| RuntimeError::Compute(format!("layernorm_scale_bf16: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("layernorm_scale: {e}")))?;
         }
         Ok(out)
     }
 
-    /// `bf16(silu(gate) * up)`, the down projection's input.
-    pub fn swiglu_bf16(
+    /// `x = bf16(x + bf16(tanh_gate[row] * y))`, in place on the residual
+    /// stream; `tanh_gate` holds `bf16(tanh(gate))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_gated(
         dev: &CudaDevice,
         k: &DitOps,
-        gate: &DevVec,
-        up: &DevVec,
-    ) -> Result<CudaSlice<u16>, RuntimeError> {
-        if gate.len != up.len {
+        x: &mut CudaSlice<u16>,
+        y: &CudaSlice<u16>,
+        tanh_gate: &CudaSlice<u16>,
+        mod_row: &CudaSlice<i32>,
+        col_off: usize,
+        cols: usize,
+        mod_stride: usize,
+    ) -> Result<(), RuntimeError> {
+        let rows = adaln_rows(
+            "add_gated",
+            x.len(),
+            tanh_gate,
+            mod_row,
+            col_off,
+            cols,
+            mod_stride,
+        )?;
+        if y.len() != x.len() {
             return Err(RuntimeError::Compute(format!(
-                "swiglu_bf16: gate has {} elements, up has {}",
-                gate.len, up.len
+                "add_gated: y has {} elements, x has {}",
+                y.len(),
+                x.len()
             )));
         }
-        let n = elements("swiglu_bf16", &[gate.len])?;
-        // Safety: every element is written by the kernel.
-        let mut out = unsafe { dev.alloc_uninit::<u16>(gate.len)? };
+        let (rows_u, cols_u) = (rows as u32, cols as u32);
+        let (off_u, stride_u) = (col_off as u32, mod_stride as u32);
+        let total = x.len() as u32;
+        // Safety: buffers match the kernel's declared shapes and geometry.
+        unsafe {
+            dev.stream
+                .launch_builder(&k.add_gated)
+                .arg(x)
+                .arg(y)
+                .arg(tanh_gate)
+                .arg(mod_row)
+                .arg(&rows_u)
+                .arg(&cols_u)
+                .arg(&off_u)
+                .arg(&stride_u)
+                .launch(flat_grid(total))
+                .map_err(|e| RuntimeError::Compute(format!("add_gated: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `bf16(bf16(silu(gate)) * up)`, the down projection's input.
+    pub fn swiglu(
+        dev: &CudaDevice,
+        k: &DitOps,
+        gate: &CudaSlice<u16>,
+        up: &CudaSlice<u16>,
+    ) -> Result<CudaSlice<u16>, RuntimeError> {
+        if gate.len() != up.len() {
+            return Err(RuntimeError::Compute(format!(
+                "swiglu: gate has {} elements, up has {}",
+                gate.len(),
+                up.len()
+            )));
+        }
+        let n = elements("swiglu", &[gate.len()])?;
+        let out = alloc_bits(dev, gate.len())?;
         // Safety: all three buffers are `n` elements and the grid covers them.
         unsafe {
             dev.stream
-                .launch_builder(&k.swiglu_bf16)
-                .arg(&gate.buf)
-                .arg(&up.buf)
-                .arg(&mut out)
+                .launch_builder(&k.swiglu)
+                .arg(gate)
+                .arg(up)
+                .arg(&out)
                 .arg(&n)
                 .launch(flat_grid(n))
-                .map_err(|e| RuntimeError::Compute(format!("swiglu_bf16: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("swiglu: {e}")))?;
         }
         Ok(out)
     }
 
-    /// Q or K from its projection to the attention operand: per-head RMSNorm,
-    /// the rotation, and the truncating bf16 conversion, in one warp per
-    /// (token, head) row.
-    pub fn head_norm_rope_bf16(
+    /// Q or K from its projection to the attention operand: the per-head
+    /// RMSNorm and the rotation, in one warp per (token, head) row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn head_norm_rope(
         dev: &CudaDevice,
         k: &DitOps,
-        x: &DevVec,
+        x: &CudaSlice<u16>,
         weight: &DevVec,
         freqs: &DevVec,
         seq: usize,
@@ -630,83 +601,33 @@ pub mod ops {
         eps: f32,
     ) -> Result<CudaSlice<u16>, RuntimeError> {
         const HEAD_DIM: usize = crate::cuda::attention::FLASH_HEAD_DIM;
-        let total = elements("head_norm_rope_bf16", &[seq, heads, HEAD_DIM])? as usize;
-        if x.len != total || weight.len != HEAD_DIM || freqs.len != seq * HEAD_DIM {
+        let total = elements("head_norm_rope", &[seq, heads, HEAD_DIM])? as usize;
+        if x.len() != total || weight.len != HEAD_DIM || freqs.len != seq * HEAD_DIM {
             return Err(RuntimeError::Compute(format!(
-                "head_norm_rope_bf16: x {} / weight {} / freqs {} do not match {seq}x{heads}x{HEAD_DIM}",
-                x.len, weight.len, freqs.len
+                "head_norm_rope: x {} / weight {} / freqs {} do not match {seq}x{heads}x{HEAD_DIM}",
+                x.len(),
+                weight.len,
+                freqs.len
             )));
         }
         // One warp per row of 128: a quarter of the elements as threads.
         let threads = (total / 4) as u32;
-        // Safety: every element is written by the kernel.
-        let mut out = unsafe { dev.alloc_uninit::<u16>(x.len)? };
+        let out = alloc_bits(dev, total)?;
         let (seq_u, heads_u) = (seq as u32, heads as u32);
         // Safety: buffers match the kernel's declared shapes; the grid is one
         // warp per (token, head) row.
         unsafe {
             dev.stream
-                .launch_builder(&k.head_norm_rope_bf16)
-                .arg(&x.buf)
+                .launch_builder(&k.head_norm_rope)
+                .arg(x)
                 .arg(&weight.buf)
                 .arg(&freqs.buf)
-                .arg(&mut out)
+                .arg(&out)
                 .arg(&seq_u)
                 .arg(&heads_u)
                 .arg(&eps)
                 .launch(flat_grid(threads))
-                .map_err(|e| RuntimeError::Compute(format!("head_norm_rope_bf16: {e}")))?;
-        }
-        Ok(out)
-    }
-
-    /// `x + tanh(modulation[row]) * y`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_gated(
-        dev: &CudaDevice,
-        k: &DitOps,
-        x: &DevVec,
-        y: &DevVec,
-        modulation: &DevVec,
-        mod_row: &CudaSlice<i32>,
-        col_off: usize,
-        cols: usize,
-        mod_stride: usize,
-    ) -> Result<DevVec, RuntimeError> {
-        let rows = adaln_rows(
-            "add_gated",
-            x,
-            modulation,
-            mod_row,
-            col_off,
-            cols,
-            mod_stride,
-        )?;
-        if y.len != x.len {
-            return Err(RuntimeError::Compute(format!(
-                "add_gated: y has {} elements, x has {}",
-                y.len, x.len
-            )));
-        }
-        let out = launch::alloc(dev, x.len)?;
-        let (rows_u, cols_u) = (rows as u32, cols as u32);
-        let (off_u, stride_u) = (col_off as u32, mod_stride as u32);
-        let total = x.len as u32;
-        // Safety: buffers match the kernel's declared shapes and geometry.
-        unsafe {
-            dev.stream
-                .launch_builder(&k.add_gated_gather)
-                .arg(&x.buf)
-                .arg(&y.buf)
-                .arg(&modulation.buf)
-                .arg(mod_row)
-                .arg(&out.buf)
-                .arg(&rows_u)
-                .arg(&cols_u)
-                .arg(&off_u)
-                .arg(&stride_u)
-                .launch(flat_grid(total))
-                .map_err(|e| RuntimeError::Compute(format!("add_gated_gather: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("head_norm_rope: {e}")))?;
         }
         Ok(out)
     }
@@ -755,7 +676,7 @@ impl DitGpu {
         let hidden = config.inner_dim();
         let mlp = config.mlp_hidden();
         // The attention kernels are tiled for the model's 128-wide heads
-        // (`flash_attn.cu`, `head_norm_rope_bf16`); a narrower or wider head
+        // (`flash_attn.cu`, `head_norm_rope`); a narrower or wider head
         // is refused here rather than read past a tile.
         if config.attention_head_dim != crate::cuda::attention::FLASH_HEAD_DIM {
             return Err(DitError::ShapeMismatch {
@@ -860,9 +781,10 @@ impl DitGpu {
 
     /// One forward pass over the whole joint sequence.
     ///
-    /// Equal to [`crate::dit::Dit::forward`] on the same inputs. The result has
-    /// one row per joint token, text included; the caller takes the trailing
-    /// `target_tokens` rows, as the pipeline's
+    /// The inputs and the timestep are rounded to bf16 on entry, as the
+    /// reference casts them to its dtype. The result has one row per joint
+    /// token, text included, as bf16 values widened to f32; the caller takes
+    /// the trailing `target_tokens` rows, as the pipeline's
     /// `noise_pred[:, -latents.size(1):]` does.
     pub fn forward(&self, args: DitForwardArgs<'_>) -> Result<Matrix, DitGpuError> {
         let cfg = &self.config;
@@ -902,7 +824,7 @@ impl DitGpu {
             return Err(mismatch("img_mask length", want_slots, args.img_mask.len()).into());
         }
 
-        let img = self.linear(&self.img_in, args.hidden_states)?;
+        let img = self.linear(&self.img_in, &self.upload(args.hidden_states)?)?;
         let txt = self.text_projection(args.encoder_hidden_states)?;
 
         // Each image slot stands for four latent tokens, so expand the slot
@@ -925,8 +847,8 @@ impl DitGpu {
             }
         }
         let image_tokens = next_image as usize;
-        if img.len != image_tokens * hidden {
-            return Err(mismatch("packed latent rows", image_tokens, img.len / hidden).into());
+        if img.m() != image_tokens {
+            return Err(mismatch("packed latent rows", image_tokens, img.m()).into());
         }
         let seq = source.len();
 
@@ -952,15 +874,18 @@ impl DitGpu {
             ));
         }
 
-        // With `causal_condition` the modulation carries an extra `t = 0` row,
-        // which every token outside the target image reads.
+        // The model takes the timestep in its own dtype. With `causal_condition`
+        // the modulation carries an extra `t = 0` row, which every token outside
+        // the target image reads.
+        let timestep = bf16_round(args.timestep);
         let timesteps: &[f32] = if cfg.causal_condition {
-            &[args.timestep, 0.0]
+            &[timestep, 0.0]
         } else {
-            std::slice::from_ref(&args.timestep)
+            std::slice::from_ref(&timestep)
         };
-        let temb = self.timestep_embedding(timesteps)?;
-        let g_modulation = self.linear(&self.modulation, &apply_silu(&temb))?;
+        let silu_temb = silu_bits(&self.timestep_embedding(timesteps)?);
+        let modulation = self.linear_rows(&self.modulation, &silu_temb, timesteps.len())?;
+        let modulation = self.dev.htod_copy(&adaln_factors(&modulation, hidden))?;
         let mod_row: Vec<i32> = if cfg.causal_condition {
             target_token_mask
                 .iter()
@@ -975,21 +900,23 @@ impl DitGpu {
         // `hidden` rather than of the stride.
         let mod_stride = 4 * hidden;
         let heads = cfg.num_attention_heads;
-        let mut x = ops::pack_rows(&self.dev, &self.ops, &txt, &img, &source, hidden)?;
+        let mut x = ops::pack_rows(&self.dev, &self.ops, &txt.bits, &img.bits, &source, hidden)?;
         for block in &self.blocks {
             let normed = self.normed_input(
                 &x,
-                &g_modulation,
+                &modulation,
                 &g_mod_row,
                 MOD_ATTN_SCALE * hidden,
                 hidden,
                 mod_stride,
             )?;
             let attn = self.attention(block, &normed, seq, heads, &g_freqs, text_count)?;
-            x = self.add_gated(
-                &x,
-                &attn,
-                &g_modulation,
+            ops::add_gated(
+                &self.dev,
+                &self.ops,
+                &mut x,
+                &attn.bits,
+                &modulation,
                 &g_mod_row,
                 MOD_ATTN_GATE * hidden,
                 hidden,
@@ -998,17 +925,19 @@ impl DitGpu {
 
             let normed = self.normed_input(
                 &x,
-                &g_modulation,
+                &modulation,
                 &g_mod_row,
                 MOD_MLP_SCALE * hidden,
                 hidden,
                 mod_stride,
             )?;
             let mlp = self.feed_forward(block, &normed, seq)?;
-            x = self.add_gated(
-                &x,
-                &mlp,
-                &g_modulation,
+            ops::add_gated(
+                &self.dev,
+                &self.ops,
+                &mut x,
+                &mlp.bits,
+                &modulation,
                 &g_mod_row,
                 MOD_MLP_GATE * hidden,
                 hidden,
@@ -1018,101 +947,117 @@ impl DitGpu {
 
         // `QwenImage21AdaLayerNormContinuous`: scale only, read from `temb`
         // rather than from the shared modulation.
-        let scale = self.linear(&self.norm_out, &apply_silu(&temb))?;
-        let normed = self.normed_input(&x, &scale, &g_mod_row, NORM_OUT_SCALE, hidden, hidden)?;
-        let out = self.linear_bf16(&self.proj_out, &normed)?;
-        let data = self.download(&out)?;
-        Ok(Matrix::new(seq, cfg.out_channels, data))
+        let scale = self.linear_rows(&self.norm_out, &silu_temb, timesteps.len())?;
+        let one_plus: Vec<u16> = scale
+            .iter()
+            .map(|&s| bf16_bits(1.0 + bf16_f32(s)))
+            .collect();
+        let one_plus = self.dev.htod_copy(&one_plus)?;
+        let normed =
+            self.normed_input(&x, &one_plus, &g_mod_row, NORM_OUT_SCALE, hidden, hidden)?;
+        let out = self.linear(&self.proj_out, &normed)?;
+        let bits = self.dev.dtoh_copy(&out.bits)?;
+        self.dev.synchronize()?;
+        Ok(Matrix::new(
+            seq,
+            cfg.out_channels,
+            bits.into_iter().map(bf16_f32).collect(),
+        ))
     }
 
     // -- the pieces of the forward ------------------------------------------
 
     /// `QwenImage21TextProjection`: zero-centred RMSNorm, linear, GELU, linear.
-    fn text_projection(&self, encoder_hidden_states: &Matrix) -> Result<DevVec, DitGpuError> {
+    fn text_projection(
+        &self,
+        encoder_hidden_states: &Matrix,
+    ) -> Result<Bf16Activation, DitGpuError> {
         let rows = encoder_hidden_states.rows;
         let dim = encoder_hidden_states.cols;
-        let gx = self.upload(encoder_hidden_states)?;
-        let normed = self.zero_center_rmsnorm(&gx, &self.text_norm, rows, dim)?;
-        let mut h = self.linear_buf(&self.txt_in, &normed, rows)?;
-        self.gelu_tanh_inplace(&mut h)?;
-        self.linear_buf(&self.txt_out, &h, rows)
+        let x = self.upload(encoder_hidden_states)?;
+        let normed = ops::zero_center_rmsnorm(
+            &self.dev,
+            &self.ops,
+            &x.bits,
+            &self.text_norm,
+            rows,
+            dim,
+            self.config.eps,
+        )?;
+        let h = self.linear(&self.txt_in, &Bf16Activation::from_bits(normed, rows, dim)?)?;
+        let g = ops::gelu_tanh(&self.dev, &self.ops, &h.bits)?;
+        self.linear(&self.txt_out, &Bf16Activation::from_bits(g, rows, h.k())?)
     }
 
-    /// The sinusoidal timestep embedding followed by `TimestepEmbedding`, whose
-    /// `forward` puts the activation between the two linears.
+    /// The sinusoidal timestep embedding followed by `TimestepEmbedding`,
+    /// whose `forward` puts the activation between the two linears: `temb`,
+    /// one bf16 row per timestep.
     ///
     /// The activation is `silu(linear_1(proj))` — SiLU sits *after* `linear_1`
     /// and *before* `linear_2` in the reference. Applying it to the sinusoidal
     /// `proj` as well is wrong and leaves no symptom a shape check can catch:
     /// the result is still finite and still the right shape.
-    ///
-    /// The raw `temb` comes back to the host because `silu` of it is read twice
-    /// more — by the shared modulation and by `norm_out` — and the reference
-    /// evaluates both from the one tensor this returns.
-    fn timestep_embedding(&self, timesteps: &[f32]) -> Result<Matrix, DitGpuError> {
-        let mut proj = Matrix::zeros(timesteps.len(), TIMESTEP_DIM);
-        for (r, &t) in timesteps.iter().enumerate() {
-            temporal_timesteps(t, proj.row_mut(r));
+    fn timestep_embedding(&self, timesteps: &[f32]) -> Result<Vec<u16>, DitGpuError> {
+        let mut proj = vec![0.0f32; timesteps.len() * TIMESTEP_DIM];
+        for (row, &t) in proj.chunks_mut(TIMESTEP_DIM).zip(timesteps) {
+            temporal_timesteps(t, row);
         }
-        let h = self.linear_host(&self.time_linear_1, &proj)?;
-        self.linear_host(&self.time_linear_2, &apply_silu(&h))
+        let proj: Vec<u16> = proj.into_iter().map(bf16_bits).collect();
+        let h = self.linear_rows(&self.time_linear_1, &proj, timesteps.len())?;
+        self.linear_rows(&self.time_linear_2, &silu_bits(&h), timesteps.len())
     }
 
     /// One block's attention, up to and including `to_out`.
     fn attention(
         &self,
         block: &GpuBlock,
-        act: &crate::cuda::blas::Bf16Activation,
+        act: &Bf16Activation,
         seq: usize,
         heads: usize,
         freqs: &DevVec,
         text_count: usize,
-    ) -> Result<DevVec, DitGpuError> {
+    ) -> Result<Bf16Activation, DitGpuError> {
         // The three projections read the same normed input.
-        let q = self.linear_bf16(&block.to_q, act)?;
-        let k = self.linear_bf16(&block.to_k, act)?;
-        let v = self.linear_bf16(&block.to_v, act)?;
+        let q = self.linear(&block.to_q, act)?;
+        let k = self.linear(&block.to_k, act)?;
+        let v = self.linear(&block.to_v, act)?;
 
         let eps = self.config.eps;
-        let q = ops::head_norm_rope_bf16(
+        let q = ops::head_norm_rope(
             &self.dev,
             &self.ops,
-            &q,
+            &q.bits,
             &block.norm_q,
             freqs,
             seq,
             heads,
             eps,
         )?;
-        let k = ops::head_norm_rope_bf16(
+        let k = ops::head_norm_rope(
             &self.dev,
             &self.ops,
-            &k,
+            &k.bits,
             &block.norm_k,
             freqs,
             seq,
             heads,
             eps,
         )?;
-
-        // q and k come truncated from the fused norm; v is truncated the same way here.
-        let v16 =
-            crate::cuda::attention::to_bf16(&self.dev, &self.kernels.f32_to_bf16_trunc, &v.buf)?;
-        // Safety: q, k and v16 are the `[seq, heads, 128]` bf16 operands the
-        // fused norm and the conversion just produced.
+        // Safety: q, k and v are the `[seq, heads, 128]` bf16 operands the
+        // fused norm and the projection just produced.
         let out = unsafe {
             crate::cuda::attention::fused_block_causal_attention(
                 &self.dev,
                 &self.kernels,
                 &q,
                 &k,
-                &v16,
+                &v.bits,
                 text_count,
                 seq,
                 heads,
             )
         }?;
-        self.linear_bf16(&block.to_out, &out)
+        self.linear(&block.to_out, &out)
     }
 
     /// `QwenImage21SwiGLUFeedForward`: the gate branch goes through SiLU, the
@@ -1120,198 +1065,82 @@ impl DitGpu {
     fn feed_forward(
         &self,
         block: &GpuBlock,
-        act: &crate::cuda::blas::Bf16Activation,
+        act: &Bf16Activation,
         seq: usize,
-    ) -> Result<DevVec, DitGpuError> {
-        let gate = self.linear_bf16(&block.mlp_gate, act)?;
-        let proj = self.linear_bf16(&block.mlp_proj, act)?;
-        // `silu(gate) * up`, the reference's `*g = silu(*g) * p` with the same
-        // operands in the same order, rounded for the down projection.
-        let hidden = ops::swiglu_bf16(&self.dev, &self.ops, &gate, &proj)?;
-        let hidden =
-            crate::cuda::blas::Bf16Activation::from_bits(hidden, seq, block.mlp_out.cols())?;
-        self.linear_bf16(&block.mlp_out, &hidden)
+    ) -> Result<Bf16Activation, DitGpuError> {
+        let gate = self.linear(&block.mlp_gate, act)?;
+        let proj = self.linear(&block.mlp_proj, act)?;
+        let hidden = ops::swiglu(&self.dev, &self.ops, &gate.bits, &proj.bits)?;
+        let hidden = Bf16Activation::from_bits(hidden, seq, block.mlp_out.cols)?;
+        self.linear(&block.mlp_out, &hidden)
     }
 
-    /// `bf16(layernorm(x) * (1 + modulation[row]))`: a block's normed,
-    /// modulated input, ready for its projections.
+    /// `bf16(bf16(layernorm(x)) * one_plus[row])`: a block's normed, modulated
+    /// input, ready for its projections.
     fn normed_input(
         &self,
-        x: &DevVec,
-        modulation: &DevVec,
+        x: &CudaSlice<u16>,
+        one_plus: &CudaSlice<u16>,
         mod_row: &CudaSlice<i32>,
         col_off: usize,
         cols: usize,
         mod_stride: usize,
-    ) -> Result<crate::cuda::blas::Bf16Activation, DitGpuError> {
-        let bits = ops::layernorm_scale_bf16(
+    ) -> Result<Bf16Activation, DitGpuError> {
+        let bits = ops::layernorm_scale(
             &self.dev,
             &self.ops,
             x,
-            modulation,
+            one_plus,
             mod_row,
             col_off,
             cols,
             mod_stride,
             self.config.eps,
         )?;
-        Ok(crate::cuda::blas::Bf16Activation::from_bits(
-            bits,
-            x.len / cols,
-            cols,
-        )?)
+        Ok(Bf16Activation::from_bits(bits, x.len() / cols, cols)?)
     }
 
     // -- op wrappers ---------------------------------------------------------
 
-    fn upload(&self, m: &Matrix) -> Result<DevVec, DitGpuError> {
-        Ok(launch::upload(&self.dev, &m.data)?)
+    /// A host matrix as a bf16 activation, each value rounded to nearest even
+    /// (exact for the bf16 values the pipeline passes).
+    fn upload(&self, m: &Matrix) -> Result<Bf16Activation, DitGpuError> {
+        let bits: Vec<u16> = m.data.iter().map(|&v| bf16_bits(v)).collect();
+        Ok(Bf16Activation::from_bits(
+            self.dev.htod_copy(&bits)?,
+            m.rows,
+            m.cols,
+        )?)
     }
 
-    fn download(&self, v: &DevVec) -> Result<Vec<f32>, DitGpuError> {
-        Ok(launch::download(&self.dev, v)?)
-    }
-
-    /// `out[M, N] = a[M, K] * W[N, K]^T` on a host matrix, kept on the device.
-    fn linear(&self, w: &DevWeight, a: &Matrix) -> Result<DevVec, DitGpuError> {
-        let buf = self.upload(a)?;
-        self.linear_buf(w, &buf, a.rows)
-    }
-
-    /// As [`linear`](Self::linear), with the result copied back.
-    fn linear_host(&self, w: &DevWeight, a: &Matrix) -> Result<Matrix, DitGpuError> {
-        let out = self.linear(w, a)?;
-        let data = self.download(&out)?;
-        Ok(Matrix::new(a.rows, w.rows(), data))
-    }
-
-    /// `out = a * w^T` against an activation already in bf16, so a caller
-    /// projecting several weights from one input pays the conversion once.
-    ///
-    /// Only bf16 weights reach here: every weight the Qwen-Image-2.1 container
-    /// stores is bf16.
-    fn linear_bf16(
-        &self,
-        w: &DevWeight,
-        a: &crate::cuda::blas::Bf16Activation,
-    ) -> Result<DevVec, DitGpuError> {
-        let m = a.m();
-        let n = w.rows();
-        let k = w.cols();
-        if a.k() != k {
-            return Err(DitError::ShapeMismatch {
-                what: "linear bf16 input width".to_string(),
-                expected: vec![(m * k) as u64],
-                actual: vec![(m * a.k()) as u64],
-            }
-            .into());
-        }
-        let DevWeight::Bf16 { buf, .. } = w else {
-            return Err(DitGpuError::UnsupportedStorage {
-                tensor: "a bf16 projection".to_string(),
-                scheme: w.scheme_name().to_string(),
-            });
-        };
-        // Safety: `buf` holds the `n * k` bf16 bytes the container stored, and
-        // `a` was converted from an `[m, k]` activation.
-        let out = unsafe { crate::cuda::blas::gemm_bf16(&self.dev, buf, a, n) }?;
-        Ok(DevVec {
-            buf: out,
-            len: m * n,
-        })
-    }
-
-    fn linear_buf(&self, w: &DevWeight, a: &DevVec, m: usize) -> Result<DevVec, DitGpuError> {
-        let (n, k) = (w.rows(), w.cols());
-        if a.len != m * k {
+    /// `a * w^T` with the output rounded to bf16: a bf16 `nn.Linear`.
+    fn linear(&self, w: &DevWeight, a: &Bf16Activation) -> Result<Bf16Activation, DitGpuError> {
+        if a.k() != w.cols {
             return Err(DitError::ShapeMismatch {
                 what: "linear input width".to_string(),
-                expected: vec![(m * k) as u64],
-                actual: vec![a.len as u64],
+                expected: vec![w.cols as u64],
+                actual: vec![a.k() as u64],
             }
             .into());
         }
-        let out = match w {
-            DevWeight::F32 { buf, .. } => {
-                launch::linear(&self.dev, &self.kernels, a, buf, None, m, n, k)?
-            }
-            // The linears outside the blocks (`img_in`, `txt_in`/`txt_out`,
-            // the timestep and modulation linears, `norm_out`) arrive here
-            // with an f32 input; a bf16 weight is converted once and run on
-            // the tensor cores.
-            DevWeight::Bf16 { buf, .. } => {
-                // Safety: `buf` holds the `n * k` bf16 bytes the container
-                // stored for this weight, and `a` holds `m * k` f32 elements
-                // (checked inside `Bf16Activation::new`).
-                let act = unsafe {
-                    crate::cuda::blas::Bf16Activation::new(
-                        &self.dev,
-                        &self.kernels.f32_to_bf16_bits,
-                        a,
-                        m,
-                        k,
-                    )
-                }?;
-                let m16 = unsafe { crate::cuda::blas::gemm_bf16(&self.dev, buf, &act, n) }?;
-                DevVec {
-                    buf: m16,
-                    len: m * n,
-                }
-            }
-            DevWeight::F16 { buf, .. } => self.gemm_16bit(buf, a, m, n, k, Gemm16::F16)?,
-        };
-        Ok(out)
+        // Safety: `w.buf` holds the `rows * cols` bf16 weight, checked at load.
+        Ok(unsafe { crate::cuda::blas::gemm_bf16_out(&self.dev, &w.buf, a, w.rows) }?)
     }
 
-    /// The GEMM for a weight stored as 16-bit floats.
-    fn gemm_16bit(
-        &self,
-        w: &CudaSlice<u16>,
-        a: &DevVec,
-        m: usize,
-        n: usize,
-        k: usize,
-        kind: Gemm16,
-    ) -> Result<DevVec, RuntimeError> {
-        ops::gemm_16bit(&self.dev, &self.ops, w, a, m, n, k, kind)
-    }
-
-    /// `zero_center_rms_norm_rows`, one block per row.
-    fn zero_center_rmsnorm(
-        &self,
-        x: &DevVec,
-        weight: &DevVec,
-        rows: usize,
-        dim: usize,
-    ) -> Result<DevVec, RuntimeError> {
-        ops::zero_center_rmsnorm(&self.dev, &self.ops, x, weight, rows, dim, self.config.eps)
-    }
-
-    /// GELU in place, one thread per element.
-    fn gelu_tanh_inplace(&self, x: &mut DevVec) -> Result<(), RuntimeError> {
-        ops::gelu_tanh_inplace(&self.dev, &self.ops, x)
-    }
-
-    /// `x + tanh(modulation[row]) * y`.
-    fn add_gated(
-        &self,
-        x: &DevVec,
-        y: &DevVec,
-        modulation: &DevVec,
-        mod_row: &CudaSlice<i32>,
-        col_off: usize,
-        cols: usize,
-        mod_stride: usize,
-    ) -> Result<DevVec, RuntimeError> {
-        ops::add_gated(
-            &self.dev, &self.ops, x, y, modulation, mod_row, col_off, cols, mod_stride,
-        )
+    /// [`linear`](Self::linear) on a few host rows of bf16 bits, the result
+    /// copied back: the timestep embedding and the modulations.
+    fn linear_rows(&self, w: &DevWeight, rows: &[u16], m: usize) -> Result<Vec<u16>, DitGpuError> {
+        let a = Bf16Activation::from_bits(self.dev.htod_copy(rows)?, m, rows.len() / m)?;
+        let out = self.linear(w, &a)?;
+        let bits = self.dev.dtoh_copy(&out.bits)?;
+        self.dev.synchronize()?;
+        Ok(bits)
     }
 
     /// Every joint token's frame, height and width frequency row, laid out
     /// `[seq, head_dim]` as interleaved (cos, sin) pairs — the shape
-    /// `rope_complex` reads, and the flattening of the reference's per-position
-    /// `Vec<(f32, f32)>`.
+    /// `head_norm_rope` reads, and the flattening of the reference's
+    /// per-position `Vec<(f32, f32)>`.
     fn rope_freqs(
         &self,
         frame: &[i64],
@@ -1331,6 +1160,29 @@ impl DitGpu {
         debug_assert_eq!(out.len(), frame.len() * head_dim);
         Ok(out)
     }
+}
+
+/// `bf16(silu(x))` of bf16 values, as `nn.SiLU` on a bf16 tensor computes it.
+fn silu_bits(x: &[u16]) -> Vec<u16> {
+    x.iter().map(|&b| bf16_bits(silu(bf16_f32(b)))).collect()
+}
+
+/// The shared modulation `[rows, 4 * hidden]` in the form the AdaLN kernels
+/// multiply by: `bf16(1 + scale)` for the two scale chunks and
+/// `bf16(tanh(gate))` for the two gate chunks, each expression rounded as the
+/// reference rounds it before multiplying.
+fn adaln_factors(modulation: &[u16], hidden: usize) -> Vec<u16> {
+    modulation
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let m = bf16_f32(b);
+            match (i % (4 * hidden)) / hidden {
+                MOD_ATTN_SCALE | MOD_MLP_SCALE => bf16_bits(1.0 + m),
+                _ => bf16_bits(m.tanh()),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,10 +1209,9 @@ fn looked_up<'a>(
     Ok(entry)
 }
 
-/// A projection weight for the bf16 tensor-core path: the blocks' q/k/v/out
-/// and MLP projections and `proj_out` consume activations the fused kernels
-/// write in bf16, so a weight stored any other way is refused here, at load,
-/// rather than after a forward has run every block.
+/// A projection weight inside the blocks, or `proj_out`, which must be stored
+/// bf16: a weight stored any other way is refused here, at load, rather than
+/// after a forward has run every block.
 fn projection(
     dev: &CudaDevice,
     file: &LbiFile,
@@ -1375,10 +1226,12 @@ fn projection(
             scheme: format!("{:?}", entry.quant),
         });
     }
-    upload_weight(dev, file, entry, name, rows, cols)
+    weight(dev, file, name, rows, cols)
 }
 
-/// A `[rows, cols]` linear weight, uploaded in its stored dtype.
+/// A `[rows, cols]` linear weight as bf16: uploaded as stored when it is bf16,
+/// otherwise rounded to it, as the reference casts every weight to the
+/// transformer's dtype when it loads.
 fn weight(
     dev: &CudaDevice,
     file: &LbiFile,
@@ -1387,50 +1240,32 @@ fn weight(
     cols: usize,
 ) -> Result<DevWeight, DitGpuError> {
     let entry = looked_up(file, name, &[rows as u64, cols as u64])?;
-    upload_weight(dev, file, entry, name, rows, cols)
+    let buf = match entry.quant {
+        QuantScheme::Bf16 => {
+            ops::upload_16bit(dev, file.tensor_bytes(name).expect("entry resolved above"))?
+        }
+        QuantScheme::F32 | QuantScheme::F16 => {
+            let bits: Vec<u16> = file.read_f32(name)?.into_iter().map(bf16_bits).collect();
+            dev.htod_copy(&bits)?
+        }
+        other => {
+            return Err(DitGpuError::UnsupportedStorage {
+                tensor: name.to_string(),
+                scheme: format!("{other:?}"),
+            })
+        }
+    };
+    Ok(DevWeight { buf, rows, cols })
 }
 
-fn upload_weight(
-    dev: &CudaDevice,
-    file: &LbiFile,
-    entry: &TensorEntry,
-    name: &str,
-    rows: usize,
-    cols: usize,
-) -> Result<DevWeight, DitGpuError> {
-    let bytes = file.tensor_bytes(name).expect("entry resolved above");
-    match entry.quant {
-        QuantScheme::F32 => Ok(DevWeight::F32 {
-            buf: launch::upload(dev, &file.read_f32(name)?)?,
-            rows,
-            cols,
-        }),
-        QuantScheme::F16 => Ok(DevWeight::F16 {
-            buf: ops::upload_16bit(dev, bytes)?,
-            rows,
-            cols,
-        }),
-        QuantScheme::Bf16 => Ok(DevWeight::Bf16 {
-            buf: ops::upload_16bit(dev, bytes)?,
-            rows,
-            cols,
-        }),
-        other => Err(DitGpuError::UnsupportedStorage {
-            tensor: name.to_string(),
-            scheme: format!("{other:?}"),
-        }),
-    }
-}
-
-/// A 1-D weight.
-///
-/// The per-head norm and the zero-centred norm are elementwise in the weight,
-/// so widening it to f32 on the host is exact for the checkpoint's dtypes.
+/// A 1-D weight, rounded to bf16 like every other weight and widened to f32
+/// for the kernels (exact).
 fn vector(dev: &CudaDevice, file: &LbiFile, name: &str, len: usize) -> Result<DevVec, DitGpuError> {
     let entry = looked_up(file, name, &[len as u64])?;
     match entry.quant {
         QuantScheme::F32 | QuantScheme::F16 | QuantScheme::Bf16 => {
-            Ok(launch::upload(dev, &file.read_f32(name)?)?)
+            let values: Vec<f32> = file.read_f32(name)?.into_iter().map(bf16_round).collect();
+            Ok(launch::upload(dev, &values)?)
         }
         other => Err(DitGpuError::UnsupportedStorage {
             tensor: name.to_string(),
@@ -1450,14 +1285,6 @@ fn vector(dev: &CudaDevice, file: &LbiFile, name: &str, len: usize) -> Result<De
 
 pub mod policy {
     pub use super::{attends, rope_indices, temporal_timesteps, token_metadata};
-}
-
-fn apply_silu(m: &Matrix) -> Matrix {
-    let mut out = m.clone();
-    for v in out.data.iter_mut() {
-        *v = silu(*v);
-    }
-    out
 }
 
 /// `QwenImage21TemporalTimesteps`: cos in the first half, sin in the second.

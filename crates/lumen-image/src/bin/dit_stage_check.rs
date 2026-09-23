@@ -11,10 +11,15 @@
 //!   `--layers 1`  adds exactly one block
 //!   ...
 //!
-//! The first count whose rel-L2 jumps is the block that introduces the error;
-//! if `--layers 0` already disagrees, no attention or MLP code is involved at
-//! all. This needs no oracle: it compares the two implementations on the same
-//! synthetic inputs, so it works wherever the `.lbi` does.
+//! The GPU forward is bf16, as the reference runs it, and the CPU forward f32,
+//! so the two differ by bf16 rounding that grows with depth: on these inputs
+//! rel-L2 3.0e-3 with no blocks to 5.5e-2 with all 32. A mislaid operand moves
+//! the output by order one (a dropped `1 +` in the AdaLN scale reads 1.0 to
+//! 2.3 from the first block on), so a count above 0.2 fails, and the first
+//! count whose rel-L2 jumps a hundredfold is the block that introduces the
+//! error; if `--layers 0` already fails, no attention or MLP code is involved
+//! at all. This needs no oracle: it compares the two implementations on the
+//! same synthetic inputs, so it works wherever the `.lbi` does.
 //!
 //! Usage: `dit-stage-check <lbi-dir> [--layers N]`
 
@@ -26,6 +31,9 @@ use lumen_image::dit::{Dit, DitConfig, DitForwardArgs};
 use lumen_image::tensor::Matrix;
 use lumen_image::LbiFile;
 use lumen_runtime::cuda::ffi::CudaDevice;
+
+/// The rel-L2 above which a layer count fails; see the module doc.
+const BAR: f32 = 0.2;
 
 fn rel_l2(got: &[f32], want: &[f32]) -> f32 {
     let mut num = 0f64;
@@ -148,21 +156,21 @@ fn run() -> Result<usize, String> {
         }
         let r = rel_l2(&got.data, &want.data);
         let m = max_abs(&got.data, &want.data);
-        // The first count that leaves the float-noise floor is the block that
+        // The first count that leaves the rounding floor is the block that
         // introduces the error, so the jump is what the reader looks for.
         let jump = previous.is_some_and(|p| r > (p * 100.0).max(1e-5));
         println!(
             "layers {n:2}  rel-L2={r:.3e}  max_abs={m:.3e}{}",
             if jump { "   <- error appears here" } else { "" }
         );
-        if r > 1e-4 {
+        if r > BAR {
             failures += 1;
         }
         previous = Some(r);
     }
 
     if failures > 0 {
-        eprintln!("{failures} layer count(s) disagreed above 1e-4");
+        eprintln!("{failures} layer count(s) disagreed above {BAR}");
     } else {
         println!("every truncated forward matched the CPU reference");
     }

@@ -82,9 +82,9 @@ pub unsafe fn block_causal_attention(
     // head_dim]` is the strided sub-tensor `q[(i * heads + h) * head_dim + d]`,
     // whose row stride is `heads * head_dim` and whose batch stride is
     // `head_dim` — both legal cuBLAS leading dimensions.
-    let q16 = to_bf16(dev, &kernels.f32_to_bf16_trunc, &q.buf)?;
-    let k16 = to_bf16(dev, &kernels.f32_to_bf16_trunc, &k.buf)?;
-    let v16 = to_bf16(dev, &kernels.f32_to_bf16_trunc, &v.buf)?;
+    let q16 = to_bf16(dev, &kernels.f32_to_bf16_bits, &q.buf)?;
+    let k16 = to_bf16(dev, &kernels.f32_to_bf16_bits, &k.buf)?;
+    let v16 = to_bf16(dev, &kernels.f32_to_bf16_bits, &v.buf)?;
 
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let scores = unsafe { batched_qk(dev, &q16, &k16, seq, heads, head_dim, scale)? };

@@ -40,17 +40,14 @@ pub const FLASH_ATTN_SOURCE: &str = include_str!("flash_attn.cu");
 
 /// Kernels this module launches.
 pub struct ImageKernels {
-    pub gemm_bias: cudarc::driver::CudaFunction,
     pub layernorm_noaffine: cudarc::driver::CudaFunction,
     pub scale_one_plus: cudarc::driver::CudaFunction,
     pub rope_complex: cudarc::driver::CudaFunction,
     pub mrope_interleaved: cudarc::driver::CudaFunction,
     /// `attn_block_causal`, the per-query reference `cuda-ops-check` runs.
     pub attn_block_causal: cudarc::driver::CudaFunction,
-    /// `f32_to_bf16_bits`, nearest-even, for the projections' inputs.
+    /// `f32_to_bf16_bits`, nearest-even.
     pub f32_to_bf16_bits: cudarc::driver::CudaFunction,
-    /// `f32_to_bf16_trunc`, truncating, for the attention operands.
-    pub f32_to_bf16_trunc: cudarc::driver::CudaFunction,
     /// `mask_softmax_rows`, the masked softmax from f32 scores to bf16
     /// probabilities, for the unfused attention `cuda-ops-check` compares
     /// the fused kernel against.
@@ -69,14 +66,12 @@ impl ImageKernels {
                 .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
         };
         Ok(Self {
-            gemm_bias: get("gemm_f32_bias")?,
             layernorm_noaffine: get("layernorm_noaffine")?,
             scale_one_plus: get("scale_one_plus")?,
             rope_complex: get("rope_complex")?,
             mrope_interleaved: get("mrope_interleaved")?,
             attn_block_causal: get("attn_block_causal")?,
             f32_to_bf16_bits: get("f32_to_bf16_bits")?,
-            f32_to_bf16_trunc: get("f32_to_bf16_trunc")?,
             mask_softmax_rows: get("mask_softmax_rows")?,
             flash_attn: device
                 .compile_and_load_with_arch(FLASH_ATTN_SOURCE, "compute_80")?

@@ -125,6 +125,30 @@ fn run() -> Result<(), String> {
     let mut latents = init.data.clone();
     println!("denoising {steps} steps at {seq}x{ch}, {seq_len} image tokens");
 
+    // The GPU forward is bf16, and its loop keeps bf16 latents as the
+    // pipeline's does; the CPU forward is the f32 check path. The bf16 path
+    // differs from the oracle by the reference's own kernel choices: 6.5e-4
+    // after one step and 7.5e-3 at the end on the `main` oracle case, where an
+    // image lands as close to the reference as the reference with another
+    // attention kernel; a forward that keeps its intermediates in f32 ends at
+    // 2.2e-2.
+    #[cfg(feature = "cuda")]
+    let bf16 = dit_gpu.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let bf16 = false;
+    let (step_bar, final_bar) = if bf16 { (1e-3, 1e-2) } else { (1e-5, 1e-3) };
+
+    // The pipeline derives each step's timestep from its own schedule; the
+    // oracle recorded what the reference passed.
+    for (step, &want) in timesteps.data.iter().enumerate().take(steps) {
+        let got = sched.model_timestep(step);
+        if got.to_bits() != want.to_bits() {
+            return Err(format!(
+                "step {step}: the pipeline's timestep {got} is not the oracle's {want}"
+            ));
+        }
+    }
+
     let mut first_divergence: Option<usize> = None;
     for step in 0..steps {
         let hidden = Matrix::new(seq, ch, latents.clone());
@@ -174,16 +198,16 @@ fn run() -> Result<(), String> {
             out.data.clone()
         };
 
-        let stepped = sched.step(step, &latents, &pred, false);
+        let stepped = sched.step(step, &latents, &pred, bf16);
         latents = stepped;
 
         let want_off = step * seq * ch;
         let want = &want_latents.data[want_off..want_off + seq * ch];
         let r = rel_l2(&latents, want);
-        if r > 1e-5 && first_divergence.is_none() {
+        if r > step_bar && first_divergence.is_none() {
             first_divergence = Some(step);
         }
-        if step == 0 || step + 1 == steps || step % 10 == 0 || r > 1e-5 {
+        if step == 0 || step + 1 == steps || step % 10 == 0 || r > step_bar {
             println!("  step {step:3}  rel-L2 vs oracle = {r:.3e}");
         }
     }
@@ -194,11 +218,13 @@ fn run() -> Result<(), String> {
     let final_r = rel_l2(&latents, want);
     println!("final latent rel-L2 vs oracle = {final_r:.3e}");
     match first_divergence {
-        Some(s) => println!("first step above 1e-5: {s}"),
-        None => println!("no step exceeded 1e-5 at any point"),
+        Some(s) => println!("first step above {step_bar:e}: {s}"),
+        None => println!("no step exceeded {step_bar:e} at any point"),
     }
-    if final_r > 1e-3 {
-        return Err(format!("final latent rel-L2 {final_r:.3e} is above 1e-3"));
+    if final_r > final_bar {
+        return Err(format!(
+            "final latent rel-L2 {final_r:.3e} is above {final_bar:e}"
+        ));
     }
     Ok(())
 }

@@ -10,17 +10,20 @@
 //! its running maximum or the wrong rounding cannot pass.
 //!
 //! The ops the DiT forward adds (`dit_ops.cu`) are checked through the same
-//! helpers the forward uses: a 16-bit weight must give the result its f32
-//! widening would, and the AdaLN kernels must evaluate the reference's
-//! per-token modulation expression.
+//! helpers the forward uses, against a CPU rendering of the same bf16
+//! arithmetic on bf16 inputs: rounded where the reference rounds, with the
+//! AdaLN kernels reading the per-token modulation row. They are held within
+//! 1e-3 — above the transcendental and reduction-order ulp differences, below
+//! what one missing intermediate rounding produces — and `pack_rows` and
+//! `add_gated` exactly.
 //!
 //! Usage: `cuda-ops-check`
 
 use std::process::ExitCode;
 
-use lumen_image::cuda::dit_gpu::ops::{self, Gemm16};
+use lumen_image::cuda::dit_gpu::ops;
 use lumen_image::cuda::{attention, launch, ImageKernels};
-use lumen_image::lbi::half_to_f32;
+use lumen_image::tensor::{bf16_bits, bf16_round};
 use lumen_image::tensor::{gelu_tanh, layer_norm_rows, zero_center_rms_norm_rows, Matrix};
 use lumen_runtime::cuda::ffi::CudaDevice;
 
@@ -56,8 +59,7 @@ fn pseudo(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// The fused attention from f32 operands: q and k truncated to bf16 the way
-/// the DiT's fused head norm writes them, v handed over as f32.
+/// The fused attention from f32 operands, each rounded to bf16 first.
 ///
 /// # Safety
 ///
@@ -73,9 +75,9 @@ unsafe fn fused_attention(
     seq: usize,
     heads: usize,
 ) -> Result<lumen_image::cuda::blas::Bf16Activation, String> {
-    let q16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &q.buf).map_err(|e| e.to_string())?;
-    let k16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &kk.buf).map_err(|e| e.to_string())?;
-    let v16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &v.buf).map_err(|e| e.to_string())?;
+    let q16 = attention::to_bf16(dev, &k.f32_to_bf16_bits, &q.buf).map_err(|e| e.to_string())?;
+    let k16 = attention::to_bf16(dev, &k.f32_to_bf16_bits, &kk.buf).map_err(|e| e.to_string())?;
+    let v16 = attention::to_bf16(dev, &k.f32_to_bf16_bits, &v.buf).map_err(|e| e.to_string())?;
     attention::fused_block_causal_attention(dev, k, &q16, &k16, &v16, text_count, seq, heads)
         .map_err(|e| e.to_string())
 }
@@ -91,22 +93,6 @@ fn download_bits(
         .iter()
         .map(|&b| f32::from_bits((b as u32) << 16))
         .collect())
-}
-
-/// f32 -> bf16 -> f32 by truncation, the attention operands' conversion.
-fn bf16_trunc(v: f32) -> f32 {
-    f32::from_bits(v.to_bits() & 0xffff_0000)
-}
-
-/// Round to nearest-even bf16, the kernels' `bf16_rne`, as an f32.
-fn bf16_rne(v: f32) -> f32 {
-    if v.is_nan() {
-        return f32::from_bits(0x7fc0_0000);
-    }
-    let bits = v.to_bits();
-    let lsb = (bits >> 16) & 1;
-    let rounded = bits.wrapping_add(0x7fff + lsb);
-    f32::from_bits(rounded & 0xffff_0000)
 }
 
 struct Report {
@@ -154,37 +140,6 @@ fn run() -> Result<usize, String> {
     );
     let k = ImageKernels::load(&dev).map_err(|e| format!("compiling kernels: {e}"))?;
     let mut rep = Report { failures: 0 };
-
-    // --- linear with and without bias ------------------------------------
-    for (m, n, kd, bias) in [
-        (7usize, 5usize, 9usize, false),
-        (33, 40, 64, true),
-        (64, 128, 96, true),
-    ] {
-        let a = pseudo(m * kd, 1);
-        let w = pseudo(n * kd, 2);
-        let b = pseudo(n, 3);
-        let cpu = Matrix::new(m, kd, a.clone()).linear(
-            &Matrix::new(n, kd, w.clone()),
-            if bias { Some(&b) } else { None },
-        );
-        let ga = launch::upload(&dev, &a).map_err(|e| e.to_string())?;
-        let gw = launch::upload(&dev, &w).map_err(|e| e.to_string())?;
-        let gb = if bias {
-            Some(launch::upload(&dev, &b).map_err(|e| e.to_string())?)
-        } else {
-            None
-        };
-        let out =
-            launch::linear(&dev, &k, &ga, &gw, gb.as_ref(), m, n, kd).map_err(|e| e.to_string())?;
-        let got = launch::download(&dev, &out).map_err(|e| e.to_string())?;
-        rep.check(
-            &format!("linear {m}x{n}x{kd} bias={bias}"),
-            &got,
-            &cpu.data,
-            1e-6,
-        );
-    }
 
     // --- LayerNorm with no affine params ---------------------------------
     // At scale 1e-3 the row variance (~1e-7) no longer swamps the epsilon, so
@@ -306,13 +261,13 @@ fn run() -> Result<usize, String> {
     // The 5e-3 bar pins the arithmetic and the mask, not the rounding policy
     // of the probabilities and the output: those differ from each other by
     // less than the bar and are settled end to end on the generated image.
-    // Both consume the same bf16-truncated operands, so the inputs are rounded
+    // Both consume the same bf16 operands, so the inputs are rounded
     // to bf16 on the host first and the CPU reference sees exactly what the
     // kernels see. What remains is the bf16 rounding of the probabilities and
     // the accumulation order, which is why the bar is above the f32 ops'.
     {
         let (seq, heads, head_dim, text_count) = (203usize, 2usize, 128usize, 7usize);
-        let bf16 = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(bf16_trunc).collect() };
+        let bf16 = bf16_values;
         let q = bf16(
             pseudo(seq * heads * head_dim, 71)
                 .iter()
@@ -421,7 +376,7 @@ fn run() -> Result<usize, String> {
         (128, 0, 40.0),
     ] {
         let (heads, head_dim) = (1usize, 128usize);
-        let bf16 = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(bf16_trunc).collect() };
+        let bf16 = bf16_values;
         let q = bf16(
             pseudo(seq * heads * head_dim, 91)
                 .iter()
@@ -457,9 +412,8 @@ fn run() -> Result<usize, String> {
     // --- the DiT's own additions, through the forward's helpers ------------
     let ops = ops::load(&dev).map_err(|e| e.to_string())?;
 
-    // The two f32 -> bf16 conversions on inputs that are not representable in
-    // bf16, so a kernel that rounded the wrong way could not pass: nearest-even
-    // for the projections' inputs, truncation for the attention operands.
+    // The f32 -> bf16 conversion on inputs that are not representable in
+    // bf16, so a kernel that rounded the wrong way could not pass.
     {
         let n = 4096usize;
         let mut x = pseudo(n, 68);
@@ -468,24 +422,12 @@ fn run() -> Result<usize, String> {
         x[1] = f32::from_bits(0x3f81_8000);
         x[2] = f32::from_bits(0xbf80_8000);
         let gx = launch::upload(&dev, &x).map_err(|e| e.to_string())?;
-        // Safety: `gx` holds `n` floats.
-        let rounded = unsafe {
-            lumen_image::cuda::blas::Bf16Activation::new(&dev, &k.f32_to_bf16_bits, &gx, 1, n)
-        }
-        .map_err(|e| e.to_string())?;
-        let want: Vec<f32> = x.iter().map(|&v| bf16_rne(v)).collect();
+        let rounded =
+            attention::to_bf16(&dev, &k.f32_to_bf16_bits, &gx.buf).map_err(|e| e.to_string())?;
+        let want: Vec<f32> = x.iter().map(|&v| bf16_round(v)).collect();
         rep.check(
             "f32_to_bf16_bits nearest-even",
-            &download_bits(&dev, &rounded.bits)?,
-            &want,
-            0.0,
-        );
-        let truncated =
-            attention::to_bf16(&dev, &k.f32_to_bf16_trunc, &gx.buf).map_err(|e| e.to_string())?;
-        let want: Vec<f32> = x.iter().map(|v| bf16_trunc(*v)).collect();
-        rep.check(
-            "f32_to_bf16_trunc",
-            &download_bits(&dev, &truncated)?,
+            &download_bits(&dev, &rounded)?,
             &want,
             0.0,
         );
@@ -495,8 +437,8 @@ fn run() -> Result<usize, String> {
     // index, image tokens in order, encoded as negative sources.
     {
         let (text_rows, image_rows, cols) = (3usize, 8usize, 5usize);
-        let txt = pseudo(text_rows * cols, 64);
-        let img = pseudo(image_rows * cols, 65);
+        let txt = bf16_values(pseudo(text_rows * cols, 64));
+        let img = bf16_values(pseudo(image_rows * cols, 65));
         // Two text slots, then 8 image tokens, then one more text slot.
         let source: Vec<i32> = [0, 1]
             .into_iter()
@@ -514,11 +456,10 @@ fn run() -> Result<usize, String> {
                 }
             })
             .collect();
-        let gt = launch::upload(&dev, &txt).map_err(|e| e.to_string())?;
-        let gi = launch::upload(&dev, &img).map_err(|e| e.to_string())?;
+        let gt = upload_bits(&dev, &txt)?;
+        let gi = upload_bits(&dev, &img)?;
         let out = ops::pack_rows(&dev, &ops, &gt, &gi, &source, cols).map_err(|e| e.to_string())?;
-        let got = launch::download(&dev, &out).map_err(|e| e.to_string())?;
-        rep.check("pack_rows", &got, &want, 0.0);
+        rep.check("pack_rows", &download_bits(&dev, &out)?, &want, 0.0);
         // A source past either buffer is refused before any launch.
         for bad in [text_rows as i32, -(image_rows as i32) - 1] {
             let refused = ops::pack_rows(&dev, &ops, &gt, &gi, &[bad], cols).is_err();
@@ -532,118 +473,127 @@ fn run() -> Result<usize, String> {
     }
 
     // The production projection path: bf16 weight x bf16 activation on the
-    // tensor cores, against `Matrix::linear` on the same bf16-rounded values.
-    // The operands are exact in bf16, so what remains is f32 accumulation
-    // order.
+    // tensor cores, against `Matrix::linear` on the same bf16 values. The
+    // operands are exact in bf16, so what remains is f32 accumulation order;
+    // the bf16-output form is that result rounded to nearest even.
     {
         let (m, n, kd) = (37usize, 48usize, 96usize);
-        let bf16 = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(bf16_trunc).collect() };
-        let a = bf16(pseudo(m * kd, 66));
-        let w = bf16(pseudo(n * kd, 67));
+        let a = bf16_values(pseudo(m * kd, 66));
+        let w = bf16_values(pseudo(n * kd, 67));
         let want = Matrix::new(m, kd, a.clone())
             .linear(&Matrix::new(n, kd, w.clone()), None)
             .data;
-        let ga = launch::upload(&dev, &a).map_err(|e| e.to_string())?;
-        let w_bits: Vec<u16> = w.iter().map(|x| (x.to_bits() >> 16) as u16).collect();
-        let gw = dev.htod_copy(&w_bits).map_err(|e| e.to_string())?;
-        // Safety: `ga` holds `m * kd` floats and `gw` `n * kd` bf16 elements.
-        let act = unsafe {
-            lumen_image::cuda::blas::Bf16Activation::new(&dev, &k.f32_to_bf16_bits, &ga, m, kd)
-        }
-        .map_err(|e| e.to_string())?;
+        let act = lumen_image::cuda::blas::Bf16Activation::from_bits(upload_bits(&dev, &a)?, m, kd)
+            .map_err(|e| e.to_string())?;
+        let gw = upload_bits(&dev, &w)?;
+        // Safety: `gw` holds `n * kd` bf16 elements.
         let out = unsafe { lumen_image::cuda::blas::gemm_bf16(&dev, &gw, &act, n) }
             .map_err(|e| e.to_string())?;
         let got = dev.dtoh_copy(&out).map_err(|e| e.to_string())?;
         dev.synchronize().map_err(|e| e.to_string())?;
         rep.check("gemm_bf16 cuBLAS", &got, &want, 1e-5);
+        // Safety: as above.
+        let out = unsafe { lumen_image::cuda::blas::gemm_bf16_out(&dev, &gw, &act, n) }
+            .map_err(|e| e.to_string())?;
+        let rounded: Vec<f32> = want.iter().map(|&v| bf16_round(v)).collect();
+        rep.check(
+            "gemm_bf16_out cuBLAS",
+            &download_bits(&dev, &out.bits)?,
+            &rounded,
+            1e-3,
+        );
     }
 
-    // head_norm_rope_bf16 against the reference's per-head `rms_norm_rows`
-    // (one `[head_dim]` weight shared by every head) followed by the complex
-    // rotation, truncated to bf16 as the attention operands are. The
-    // comparison is on the truncated values, so the bar is bf16's.
-    // Twice: on ordinary inputs, and on inputs small enough that `eps`
-    // dominates the mean square, where a kernel that dropped the epsilon
-    // would be off by orders of magnitude rather than an ulp.
+    // head_norm_rope against the reference's `RMSNorm` (one `[head_dim]` weight
+    // shared by every head, rounded after the normalisation and after the
+    // weight) followed by the complex rotation, rounded once. Twice: on
+    // ordinary inputs, and on inputs small enough that `eps` dominates the
+    // mean square, where a kernel that dropped the epsilon would be off by
+    // orders of magnitude rather than an ulp.
     for scale in [1.0f32, 1e-4] {
         let (seq, heads, head_dim) = (5usize, 3usize, 128usize);
-        let x: Vec<f32> = pseudo(seq * heads * head_dim, 71)
-            .iter()
-            .map(|v| v * scale)
-            .collect();
-        let w = pseudo(head_dim, 72);
-        let freqs: Vec<f32> = pseudo(seq * head_dim, 73);
-        let normed = lumen_image::tensor::rms_norm_rows(
-            &Matrix::new(seq * heads, head_dim, x.clone()),
-            &w,
-            1e-6,
+        let x = bf16_values(
+            pseudo(seq * heads * head_dim, 71)
+                .iter()
+                .map(|v| v * scale)
+                .collect(),
         );
-        let mut want = normed.data.clone();
+        let w = bf16_values(pseudo(head_dim, 72));
+        let freqs: Vec<f32> = pseudo(seq * head_dim, 73);
+        let mut normed = vec![0.0f32; x.len()];
+        for (row, out) in x.chunks(head_dim).zip(normed.chunks_mut(head_dim)) {
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+            let rms = 1.0 / (ms + 1e-6).sqrt();
+            for ((o, &v), &wv) in out.iter_mut().zip(row).zip(&w) {
+                *o = bf16_round(bf16_round(v * rms) * wv);
+            }
+        }
+        let mut want = normed.clone();
         for s_ in 0..seq {
             for h in 0..heads {
                 for p in 0..head_dim / 2 {
                     let base = (s_ * heads + h) * head_dim + 2 * p;
-                    let (xr, xi) = (normed.data[base], normed.data[base + 1]);
+                    let (xr, xi) = (normed[base], normed[base + 1]);
                     let (cr, ci) = (
                         freqs[s_ * head_dim + 2 * p],
                         freqs[s_ * head_dim + 2 * p + 1],
                     );
-                    want[base] = xr * cr - xi * ci;
-                    want[base + 1] = xr * ci + xi * cr;
+                    want[base] = bf16_round(xr * cr - xi * ci);
+                    want[base + 1] = bf16_round(xr * ci + xi * cr);
                 }
             }
         }
-        let want: Vec<f32> = want.iter().map(|v| bf16_trunc(*v)).collect();
-        let gx = launch::upload(&dev, &x).map_err(|e| e.to_string())?;
+        let gx = upload_bits(&dev, &x)?;
         let gw = launch::upload(&dev, &w).map_err(|e| e.to_string())?;
         let gf = launch::upload(&dev, &freqs).map_err(|e| e.to_string())?;
-        let out = ops::head_norm_rope_bf16(&dev, &ops, &gx, &gw, &gf, seq, heads, 1e-6)
+        let out = ops::head_norm_rope(&dev, &ops, &gx, &gw, &gf, seq, heads, 1e-6)
             .map_err(|e| e.to_string())?;
-        let got = download_bits(&dev, &out)?;
-        rep.check(&format!("head_norm_rope_bf16 x{scale}"), &got, &want, 1e-3);
+        rep.check(
+            &format!("head_norm_rope x{scale}"),
+            &download_bits(&dev, &out)?,
+            &want,
+            1e-3,
+        );
     }
 
-    // swiglu_bf16 against `silu(g) * u`, rounded to nearest-even bf16.
+    // swiglu against `bf16(bf16(silu(g)) * u)`.
     let n = 1000usize;
-    let g = pseudo(n, 74);
-    let u = pseudo(n, 75);
+    let g = bf16_values(pseudo(n, 74));
+    let u = bf16_values(pseudo(n, 75));
     let want: Vec<f32> = g
         .iter()
         .zip(&u)
-        .map(|(&gv, &uv)| bf16_rne(lumen_image::tensor::silu(gv) * uv))
+        .map(|(&gv, &uv)| bf16_round(bf16_round(lumen_image::tensor::silu(gv)) * uv))
         .collect();
-    let gg = launch::upload(&dev, &g).map_err(|e| e.to_string())?;
-    let gu = launch::upload(&dev, &u).map_err(|e| e.to_string())?;
-    let out = ops::swiglu_bf16(&dev, &ops, &gg, &gu).map_err(|e| e.to_string())?;
-    let got = download_bits(&dev, &out)?;
-    rep.check("swiglu_bf16", &got, &want, 1e-6);
+    let out = ops::swiglu(&dev, &ops, &upload_bits(&dev, &g)?, &upload_bits(&dev, &u)?)
+        .map_err(|e| e.to_string())?;
+    rep.check("swiglu", &download_bits(&dev, &out)?, &want, 1e-3);
 
-    // gelu_tanh_inplace against the reference's `gelu_tanh`.
+    // gelu_tanh against the reference's `gelu_tanh`, rounded.
     let n = 512usize;
-    let x = pseudo(n, 41);
-    let want: Vec<f32> = x.iter().map(|&v| gelu_tanh(v)).collect();
-    let mut g = launch::upload(&dev, &x).map_err(|e| e.to_string())?;
-    ops::gelu_tanh_inplace(&dev, &ops, &mut g).map_err(|e| e.to_string())?;
-    let got = launch::download(&dev, &g).map_err(|e| e.to_string())?;
-    rep.check("gelu_tanh_inplace", &got, &want, 1e-6);
+    let x = bf16_values(pseudo(n, 41));
+    let want: Vec<f32> = x.iter().map(|&v| bf16_round(gelu_tanh(v))).collect();
+    let out = ops::gelu_tanh(&dev, &ops, &upload_bits(&dev, &x)?).map_err(|e| e.to_string())?;
+    rep.check("gelu_tanh", &download_bits(&dev, &out)?, &want, 1e-3);
 
-    // zero_center_rmsnorm against `zero_center_rms_norm_rows`. The weights are
-    // small and signed, so a kernel that forgot the `+ 1` cannot pass.
+    // zero_center_rmsnorm against `zero_center_rms_norm_rows`, rounded once.
+    // The weights are small and signed, so a kernel that forgot the `+ 1`
+    // cannot pass.
     let (rows, dim) = (7usize, 384usize);
     for scale in [1.0f32, 1e-3] {
-        let x: Vec<f32> = pseudo(rows * dim, 42).iter().map(|v| v * scale).collect();
-        let w = pseudo(dim, 43);
+        let x = bf16_values(pseudo(rows * dim, 42).iter().map(|v| v * scale).collect());
+        let w = bf16_values(pseudo(dim, 43));
         let cpu = zero_center_rms_norm_rows(&Matrix::new(rows, dim, x.clone()), &w, 1e-6);
-        let gx = launch::upload(&dev, &x).map_err(|e| e.to_string())?;
+        let want: Vec<f32> = cpu.data.iter().map(|&v| bf16_round(v)).collect();
         let gw = launch::upload(&dev, &w).map_err(|e| e.to_string())?;
-        let out = ops::zero_center_rmsnorm(&dev, &ops, &gx, &gw, rows, dim, 1e-6)
-            .map_err(|e| e.to_string())?;
-        let got = launch::download(&dev, &out).map_err(|e| e.to_string())?;
+        let out =
+            ops::zero_center_rmsnorm(&dev, &ops, &upload_bits(&dev, &x)?, &gw, rows, dim, 1e-6)
+                .map_err(|e| e.to_string())?;
         rep.check(
             &format!("zero_center_rmsnorm x{scale}"),
-            &got,
-            &cpu.data,
-            1e-5,
+            &download_bits(&dev, &out)?,
+            &want,
+            1e-3,
         );
     }
 
@@ -657,172 +607,96 @@ fn run() -> Result<usize, String> {
     ] {
         // Rows at scale 1e-3 make the epsilon count; a per-row offset of 100
         // makes a one-pass `E[x^2] - mean^2` variance cancel to noise.
-        let x: Vec<f32> = pseudo(rows * cols, 44)
-            .iter()
-            .enumerate()
-            .map(|(i, v)| match (i / cols) % 3 {
-                0 => *v,
-                1 => v * 1e-3,
-                _ => v + 100.0,
-            })
-            .collect();
-        let y = pseudo(rows * cols, 45);
+        let x = bf16_values(
+            pseudo(rows * cols, 44)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| match (i / cols) % 3 {
+                    0 => *v,
+                    1 => v * 1e-3,
+                    _ => v + 100.0,
+                })
+                .collect(),
+        );
+        let y = bf16_values(pseudo(rows * cols, 45));
         // A `stride == cols` modulation is the single-row `norm_out` scale,
         // which every token reads from row 0.
         let single_row = stride == cols;
-        let modu = pseudo(if single_row { cols } else { 2 * stride }, 46);
+        let factors = bf16_values(pseudo(if single_row { cols } else { 2 * stride }, 46));
         let mod_row: Vec<i32> = (0..rows)
             .map(|r| if single_row { 0 } else { (r % 2) as i32 })
             .collect();
         let g_row = dev.htod_copy(&mod_row).map_err(|e| e.to_string())?;
+        let g_factors = upload_bits(&dev, &factors)?;
+        let row_factors = |r: usize| &factors[mod_row[r] as usize * stride + off..][..cols];
 
-        // layernorm_scale_bf16 == `bf16(layer_norm_rows(x) * (1.0 + s))`.
+        // layernorm_scale == `bf16(bf16(layer_norm_rows(x)) * f)`.
         let ln = layer_norm_rows(&Matrix::new(rows, cols, x.clone()), 1e-6);
         let want: Vec<f32> = (0..rows)
             .flat_map(|r| {
-                let m = &modu[mod_row[r] as usize * stride + off..];
                 ln.data[r * cols..(r + 1) * cols]
                     .iter()
-                    .zip(&m[..cols])
-                    .map(|(&xv, &s)| bf16_rne(xv * (1.0 + s)))
+                    .zip(row_factors(r))
+                    .map(|(&xv, &f)| bf16_round(bf16_round(xv) * f))
+                    .collect::<Vec<_>>()
             })
             .collect();
-        let gx = launch::upload(&dev, &x).map_err(|e| e.to_string())?;
-        let gm = launch::upload(&dev, &modu).map_err(|e| e.to_string())?;
-        let out = ops::layernorm_scale_bf16(&dev, &ops, &gx, &gm, &g_row, off, cols, stride, 1e-6)
-            .map_err(|e| e.to_string())?;
-        let got = download_bits(&dev, &out)?;
-        rep.check(&format!("layernorm_scale_bf16 {case}"), &got, &want, 1e-6);
+        let gx = upload_bits(&dev, &x)?;
+        let out =
+            ops::layernorm_scale(&dev, &ops, &gx, &g_factors, &g_row, off, cols, stride, 1e-6)
+                .map_err(|e| e.to_string())?;
+        rep.check(
+            &format!("layernorm_scale {case}"),
+            &download_bits(&dev, &out)?,
+            &want,
+            1e-3,
+        );
 
-        // add_gated == `*v += g.tanh() * yv`.
+        // add_gated == `x = bf16(x + bf16(t * y))`, in place.
         let want: Vec<f32> = (0..rows)
             .flat_map(|r| {
-                let m = &modu[mod_row[r] as usize * stride + off..];
                 x[r * cols..(r + 1) * cols]
                     .iter()
                     .zip(&y[r * cols..(r + 1) * cols])
-                    .zip(&m[..cols])
-                    .map(|((&xv, &yv), &g)| xv + g.tanh() * yv)
+                    .zip(row_factors(r))
+                    .map(|((&xv, &yv), &t)| bf16_round(xv + bf16_round(t * yv)))
+                    .collect::<Vec<_>>()
             })
             .collect();
-        let gy = launch::upload(&dev, &y).map_err(|e| e.to_string())?;
-        let out = ops::add_gated(&dev, &ops, &gx, &gy, &gm, &g_row, off, cols, stride)
-            .map_err(|e| e.to_string())?;
-        let got = launch::download(&dev, &out).map_err(|e| e.to_string())?;
-        rep.check(&format!("add_gated_gather {case}"), &got, &want, 1e-6);
-    }
-
-    // --- the 16-bit GEMM, against the f32 widening of the same weights ------
-    // The reference is `Matrix::linear` on the widened weights, so this pins the
-    // widening and the accumulation order at once.
-    let cases: [(usize, usize, usize, u64); 3] =
-        [(7, 5, 9, 51), (33, 40, 64, 52), (64, 128, 96, 53)];
-    for (m, n, kd, seed) in cases {
-        let a = pseudo(m * kd, seed);
-        let w = pseudo(n * kd, seed + 100);
-        let ga = launch::upload(&dev, &a).map_err(|e| e.to_string())?;
-        for (name, kind) in [("f16", Gemm16::F16), ("bf16", Gemm16::Bf16)] {
-            // Pack the weights into the storage dtype, then widen them back the
-            // way a reference implementation would. For f16 that is
-            // `half_to_f32`, the container's own software decoder, so the two
-            // sides of this comparison share no code: the kernel widens with the
-            // hardware convert and the reference with bit manipulation.
-            let bits = pack_16(&w, kind);
-            let widened: Vec<f32> = bits
-                .iter()
-                .map(|&b| match kind {
-                    Gemm16::F16 => half_to_f32(b),
-                    Gemm16::Bf16 => f32::from_bits((b as u32) << 16),
-                })
-                .collect();
-            assert!(
-                widened.iter().all(|v| v.is_finite()),
-                "{name}: the packing produced a non-finite weight"
-            );
-            let gw = dev.htod_copy(&bits).map_err(|e| e.to_string())?;
-            let out =
-                ops::gemm_16bit(&dev, &ops, &gw, &ga, m, n, kd, kind).map_err(|e| e.to_string())?;
-            let got = launch::download(&dev, &out).map_err(|e| e.to_string())?;
-            let want = Matrix::new(m, kd, a.clone()).linear(&Matrix::new(n, kd, widened), None);
-            rep.check(
-                &format!("gemm_16bit {name} {m}x{n}x{kd}"),
-                &got,
-                &want.data,
-                1e-6,
-            );
-        }
+        let mut gx = upload_bits(&dev, &x)?;
+        ops::add_gated(
+            &dev,
+            &ops,
+            &mut gx,
+            &upload_bits(&dev, &y)?,
+            &g_factors,
+            &g_row,
+            off,
+            cols,
+            stride,
+        )
+        .map_err(|e| e.to_string())?;
+        rep.check(
+            &format!("add_gated {case}"),
+            &download_bits(&dev, &gx)?,
+            &want,
+            0.0,
+        );
     }
 
     Ok(rep.failures)
 }
 
-/// Pack f32 values into a 16-bit storage dtype the way a checkpoint would.
-///
-/// bf16 is the top half of an f32, exactly. f16 is not, so it is encoded here
-/// with round-to-nearest-even — the IEEE 754 default the container's decoder
-/// assumes — rather than truncation, so the values straddling a rounding
-/// boundary are the ones a real checkpoint would produce.
-fn pack_16(values: &[f32], kind: Gemm16) -> Vec<u16> {
-    values
-        .iter()
-        .map(|&v| match kind {
-            Gemm16::Bf16 => {
-                // Round to nearest even on the 16 dropped bits.
-                let bits = v.to_bits();
-                let rem = bits & 0xffff;
-                let mut out = bits >> 16;
-                if rem > 0x8000 || (rem == 0x8000 && (out & 1) == 1) {
-                    out += 1;
-                }
-                out as u16
-            }
-            Gemm16::F16 => f32_to_f16_bits(v),
-        })
-        .collect()
+/// `values` rounded to bf16, so a kernel's bf16 input is exactly the value the
+/// CPU side computes with.
+fn bf16_values(values: Vec<f32>) -> Vec<f32> {
+    values.into_iter().map(bf16_round).collect()
 }
 
-/// f32 to f16 bits, round-to-nearest-even, denormals included.
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let biased = ((bits >> 23) & 0xff) as i32;
-    let mut man = bits & 0x7f_ffff;
-    if biased == 0xff {
-        // Infinity keeps a zero mantissa; NaN keeps a non-zero one.
-        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
-    }
-    let mut exp = biased - 127 + 15;
-    if exp >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if exp <= 0 {
-        // Subnormal: shift the implicit bit in and round on the way down.
-        if exp < -10 {
-            return sign;
-        }
-        man |= 0x80_0000;
-        let shift = (14 - exp) as u32;
-        let rem = man & ((1u32 << shift) - 1);
-        let mut out = (man >> shift) as u16;
-        let half = 1u32 << (shift - 1);
-        if rem > half || (rem == half && (out & 1) == 1) {
-            out += 1;
-        }
-        return sign | out;
-    }
-    let rem = man & 0x1fff;
-    man >>= 13;
-    if rem > 0x1000 || (rem == 0x1000 && (man & 1) == 1) {
-        man += 1;
-        if man == 0x400 {
-            man = 0;
-            exp += 1;
-            if exp >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-    }
-    sign | ((exp as u16) << 10) | (man as u16)
+/// Upload bf16 values as their bits.
+fn upload_bits(dev: &CudaDevice, values: &[f32]) -> Result<cudarc::driver::CudaSlice<u16>, String> {
+    let bits: Vec<u16> = values.iter().map(|&v| bf16_bits(v)).collect();
+    dev.htod_copy(&bits).map_err(|e| e.to_string())
 }
 
 /// The same attention the kernel implements, computed on the host.
