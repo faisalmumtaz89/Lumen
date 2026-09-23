@@ -105,12 +105,22 @@ impl SigmaSchedule {
         self.sigmas.is_empty()
     }
 
-    /// One Euler step: `sample + (sigma_next - sigma) * model_output`, computed
-    /// in f32, then cast to the model output's dtype.
+    /// The timestep the reference hands a bf16 transformer at `step`:
+    /// `bf16(bf16(sigma * 1000) / 1000)`, its timestep cast to the latents'
+    /// dtype and divided by 1000 in that dtype.
+    pub fn model_timestep(&self, step: usize) -> f32 {
+        let round = crate::tensor::bf16_round;
+        round(round(self.sigmas[step] * 1000.0) / 1000.0)
+    }
+
+    /// One Euler step: `sample + (sigma_next - sigma) * model_output`, then cast
+    /// to the model output's dtype.
     ///
-    /// `model_output` is `bf16`-or-f32 in the reference; here the values arrive
-    /// already in f32 and `out_dtype` records what to cast back to, so a caller
-    /// comparing against a bf16 reference reproduces its rounding.
+    /// The values arrive in f32 and `out_bf16` records whether the model output
+    /// was bf16. When it was, the reference's type promotion makes the product
+    /// bf16 — `dt` is cast to bf16 and the product rounded — before it is
+    /// added to the f32 sample, and the sum is rounded to bf16 again; each
+    /// rounding is to nearest even.
     pub fn step(
         &self,
         step_index: usize,
@@ -121,15 +131,15 @@ impl SigmaSchedule {
         let sigma = self.sigmas[step_index];
         let sigma_next = self.sigmas[step_index + 1];
         let dt = sigma_next - sigma;
+        let dt_bf16 = crate::tensor::bf16_round(dt);
         sample
             .iter()
             .zip(model_output)
             .map(|(&s, &m)| {
-                let prev = s + dt * m;
                 if out_bf16 {
-                    f32::from_bits((prev.to_bits() >> 16) << 16)
+                    crate::tensor::bf16_round(s + crate::tensor::bf16_round(dt_bf16 * m))
                 } else {
-                    prev
+                    s + dt * m
                 }
             })
             .collect()
@@ -172,6 +182,39 @@ mod tests {
         for w in s.sigmas.windows(2) {
             assert!(w[1] < w[0], "not monotonic at {:?}", w);
         }
+    }
+
+    /// The bf16 step rounds `dt`, the product and the sum, each to nearest
+    /// even: a sample on a tie rounds to the even neighbour, and a product that
+    /// is not a bf16 value is rounded before it is added.
+    #[test]
+    fn bf16_step_rounds_like_the_reference() {
+        let cfg = SchedulerConfig::qwen_image_2_1();
+        let s = SigmaSchedule::new(4, 4096, &cfg);
+        let tie_down = f32::from_bits(0x3f80_8000);
+        let tie_up = f32::from_bits(0x3f81_8000);
+        let out = s.step(0, &[tie_down, tie_up], &[0.0, 0.0], true);
+        assert_eq!(out[0].to_bits(), 0x3f80_0000);
+        assert_eq!(out[1].to_bits(), 0x3f82_0000);
+
+        // A model output whose product with `dt` is not a bf16 value, and a
+        // sample for which rounding that product first changes the sum.
+        // `dt` itself is not a bf16 value, so the case is also one where
+        // rounding it changes the result.
+        let round = crate::tensor::bf16_round;
+        let raw = s.sigmas[1] - s.sigmas[0];
+        let dt = round(raw);
+        let (sample, m) = (0..1000)
+            .map(|k| (1.0f32, round(1.0 + k as f32 / 64.0)))
+            .find(|&(x, m)| {
+                let want = round(x + round(dt * m));
+                want != round(x + dt * m) && want != round(x + round(raw * m))
+            })
+            .expect("a case where both roundings matter");
+        assert_eq!(
+            s.step(0, &[sample], &[m], true),
+            vec![round(sample + round(dt * m))]
+        );
     }
 
     /// A step with zero model output leaves the sample alone.

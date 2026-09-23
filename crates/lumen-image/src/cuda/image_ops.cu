@@ -1,9 +1,7 @@
 // Kernels the image pipeline needs.
 //
 // Written here:
-//   - gemm_f32_bias        linear layers with a bias
-//   - f32_to_bf16_trunc    f32 -> bf16 by truncation, for the attention operands
-//   - f32_to_bf16_bits     f32 -> bf16 rounded to nearest even, for the linears
+//   - f32_to_bf16_bits     f32 -> bf16 rounded to nearest even
 //   - mask_softmax_rows    the block-causal mask and row softmax of the scores,
 //                          for the unfused attention `cuda-ops-check` compares
 //                          the fused kernel against
@@ -18,54 +16,6 @@
 // `text_ops.cu`'s `rope_bf16`.
 //
 // NVRTC-compatible: no includes, extern "C" linkage.
-
-// ---------------------------------------------------------------------------
-// Linear with bias: C[M,N] = A[M,K] * W^T[N,K] + bias[N]
-// Same tiling as lumen-runtime's gemm_f32; the bias is added at the write.
-// ---------------------------------------------------------------------------
-#define BM 32
-#define BN 32
-#define BK 32
-
-extern "C" __global__ void gemm_f32_bias(
-    const float* __restrict__ A,      // [M, K]
-    const float* __restrict__ W,      // [N, K]
-    const float* __restrict__ bias,   // [N], read only when has_bias is 1
-    float* __restrict__ C,            // [M, N]
-    unsigned int M,
-    unsigned int N,
-    unsigned int K,
-    unsigned int has_bias)
-{
-    unsigned int tx = threadIdx.x;
-    unsigned int ty = threadIdx.y;
-    unsigned int row = blockIdx.y * BM + ty;
-    unsigned int col = blockIdx.x * BN + tx;
-
-    __shared__ float As[BM][BK + 1];
-    __shared__ float Bs[BN][BK + 1];
-
-    float sum = 0.0f;
-    unsigned int k_tiles = (K + BK - 1) / BK;
-    for (unsigned int t = 0; t < k_tiles; t++) {
-        unsigned int a_col = t * BK + tx;
-        As[ty][tx] = (row < M && a_col < K) ? A[(unsigned long long)row * K + a_col] : 0.0f;
-        unsigned int b_col = t * BK + ty;
-        Bs[tx][ty] = (col < N && b_col < K) ? W[(unsigned long long)col * K + b_col] : 0.0f;
-        __syncthreads();
-        #pragma unroll
-        for (unsigned int k = 0; k < BK; k++) {
-            sum += As[ty][k] * Bs[tx][k];
-        }
-        __syncthreads();
-    }
-    if (row < M && col < N) {
-        if (has_bias != 0) {
-            sum += bias[col];
-        }
-        C[(unsigned long long)row * N + col] = sum;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // LayerNorm with no affine parameters, one block per row.
@@ -306,12 +256,9 @@ extern "C" __global__ void attn_block_causal(
 }
 
 // ---------------------------------------------------------------------------
-// F32 -> BF16 conversion, for feeding cuBLAS GemmEx from our f32 activations.
+// F32 -> BF16 conversion, for feeding cuBLAS GemmEx from f32 values.
 //
-// Round to nearest-even, not truncation: truncation biases every activation
-// toward zero by up to one bf16 ulp, and across 32 layers and 40 steps that
-// bias compounds into a visible loss. The reference's own bf16 casts round to
-// nearest, so this is also what matches it.
+// Round to nearest-even, as the reference's own bf16 casts do.
 //
 // NVRTC compiles this module with no headers on a `default` target, so the
 // software rounding is used rather than `cvt.rn.bf16.f32`.
@@ -326,23 +273,6 @@ __device__ __forceinline__ unsigned short f32_to_bf16_rne(float val)
     unsigned int lsb = (bits >> 16) & 1u;
     bits += 0x7fffu + lsb;
     return (unsigned short)(bits >> 16);
-}
-
-// ---------------------------------------------------------------------------
-// Truncating f32 -> bf16, for the attention operands.
-//
-// The attention operands reproduce the reference more closely when truncated
-// than when rounded to nearest, the opposite of the projections' inputs, so
-// the two paths keep their own conversion.
-// ---------------------------------------------------------------------------
-extern "C" __global__ void f32_to_bf16_trunc(
-    const float* __restrict__ x,
-    unsigned short* __restrict__ out,
-    unsigned int n)
-{
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = (unsigned short)(__float_as_uint(x[i]) >> 16);
 }
 
 extern "C" __global__ void f32_to_bf16_bits(

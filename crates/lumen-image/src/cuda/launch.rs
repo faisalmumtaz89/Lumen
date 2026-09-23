@@ -48,50 +48,6 @@ fn cfg(grid: (u32, u32, u32), block: (u32, u32, u32), smem: u32) -> cudarc::driv
     }
 }
 
-/// `out[M,N] = a[M,K] * w[N,K]^T + bias`, the Linear layer the DiT and the text
-/// encoder both use.
-///
-/// When there is no bias the same weight matrix is passed twice — the kernel
-/// ignores it — rather than passing a null pointer, which would need a
-/// different cudarc argument type for no gain.
-#[allow(clippy::too_many_arguments)]
-pub fn linear(
-    dev: &CudaDevice,
-    k: &ImageKernels,
-    a: &DevVec,
-    weight: &DevVec,
-    bias: Option<&DevVec>,
-    m: usize,
-    n: usize,
-    kdim: usize,
-) -> Result<DevVec, RuntimeError> {
-    let out = alloc(dev, m * n)?;
-    let (mu, nu, ku) = (m as u32, n as u32, kdim as u32);
-    let has_bias: u32 = if bias.is_some() { 1 } else { 0 };
-    let grid = (n.div_ceil(32) as u32, m.div_ceil(32) as u32, 1);
-    let b = match bias {
-        Some(bs) => bs,
-        None => weight,
-    };
-    // Safety: the buffers are device allocations of the sizes the kernel reads,
-    // and the launch geometry is the kernel's own contract.
-    unsafe {
-        dev.stream
-            .launch_builder(&k.gemm_bias)
-            .arg(&a.buf)
-            .arg(&weight.buf)
-            .arg(&b.buf)
-            .arg(&out.buf)
-            .arg(&mu)
-            .arg(&nu)
-            .arg(&ku)
-            .arg(&has_bias)
-            .launch(cfg(grid, (32, 32, 1), 0))
-            .map_err(|e| RuntimeError::Compute(format!("gemm_f32_bias: {e}")))?;
-    }
-    Ok(out)
-}
-
 /// LayerNorm with no affine parameters over each row.
 pub fn layernorm_noaffine(
     dev: &CudaDevice,
@@ -146,7 +102,7 @@ pub fn scale_one_plus(
 }
 
 /// The DiT's complex RoPE, in place on `q`, pinned to a host rotation by
-/// `cuda-ops-check`; the forward uses the fused `head_norm_rope_bf16`.
+/// `cuda-ops-check`; the forward uses the fused `head_norm_rope`.
 pub fn rope_complex(
     dev: &CudaDevice,
     k: &ImageKernels,

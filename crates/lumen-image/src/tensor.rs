@@ -144,6 +144,27 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// f32 -> bf16 bits, rounded to nearest even (a NaN stays a NaN), as torch's
+/// `.to(torch.bfloat16)` and the device kernels round.
+pub fn bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return ((bits >> 16) | 0x0040) as u16;
+    }
+    let lsb = (bits >> 16) & 1;
+    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
+}
+
+/// bf16 bits widened to f32, exactly.
+pub fn bf16_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// `v` rounded to the nearest bf16 value.
+pub fn bf16_round(v: f32) -> f32 {
+    bf16_f32(bf16_bits(v))
+}
+
 /// RMS normalise each row with a learned scale, matching `QwenImage21RMSNorm`
 /// and the text encoder's `Qwen3VLTextRMSNorm`: compute in f32, multiply by the
 /// weight, then cast back.

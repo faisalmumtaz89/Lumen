@@ -44,6 +44,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   interleaved runs each), with identical images. `lbi-convert` writes each file
   beside its destination and renames it into place, so re-converting leaves a running
   server on the files it opened until it is restarted.
+- **Image transformer in bf16.** The CUDA transformer and the denoising loop round each
+  operation to bf16 as the checkpoint's reference does: an image generated from the
+  reference's starting noise is closer to the reference's (46.0 dB PSNR instead of
+  41.6 dB), and on an RTX 5090 a 1024×1024 generation takes 15.39 s instead of 15.78 s
+  with the transformer resident (medians of 6 interleaved runs each).
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

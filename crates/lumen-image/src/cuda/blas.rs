@@ -1,11 +1,11 @@
 //! Tensor-core GEMMs for the DiT, via cuBLAS.
 //!
 //! The DiT's projections are large and dense — `[4114, 4096] x [4096, 12288]`
-//! at 1024x1024 — and they are ~86% of its FLOPs. The weights are already
-//! bf16, so the only conversion needed is on the activation side.
+//! at 1024x1024 — and they are ~86% of its FLOPs. Weights and activations are
+//! both bf16, with f32 accumulation.
 //!
-//! Every DiT linear is bias-free (`DitGpu::linear_buf` passes no bias), so
-//! there is no epilogue here and `beta` is always 0.
+//! Every DiT linear is bias-free (`DitGpu::linear` passes no bias), so there is
+//! no epilogue here and `beta` is always 0.
 //!
 //! # Layout
 //!
@@ -28,20 +28,14 @@ use cudarc::driver::{CudaFunction, CudaSlice, DevicePtr, DevicePtrMut, PushKerne
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::error::RuntimeError;
 
-/// Threads per block in the activation conversion; each thread converts one
+/// Threads per block in the f32 -> bf16 conversion; each thread converts one
 /// element.
 const CONVERT_THREADS: usize = 256;
 
-/// An activation converted to bf16 once, reusable across the projections that
-/// share it.
+/// An `[m, k]` bf16 activation, the operand every projection multiplies.
 ///
-/// The DiT projects several weight matrices from one activation — `to_q`,
-/// `to_k` and `to_v` share the block input, the MLP's gate and up share theirs —
-/// so the conversion is done once per distinct input rather than inside every
-/// projection.
-///
-/// bf16 activations match the upstream model, which runs its transformer in
-/// bf16 and rounds at the same points.
+/// Several projections may read one activation — `to_q`, `to_k` and `to_v`
+/// share the block input, the MLP's gate and up share theirs.
 pub struct Bf16Activation {
     /// The `[m, k]` activation as bf16 bits, row-major.
     pub bits: CudaSlice<u16>,
@@ -50,12 +44,12 @@ pub struct Bf16Activation {
 }
 
 impl Bf16Activation {
-    /// The input width this activation was converted from.
+    /// The activation's width.
     pub fn k(&self) -> usize {
         self.k
     }
 
-    /// The row count this activation was converted from.
+    /// The activation's row count.
     pub fn m(&self) -> usize {
         self.m
     }
@@ -68,30 +62,6 @@ impl Bf16Activation {
                 bits.len()
             )));
         }
-        Ok(Self { bits, m, k })
-    }
-
-    /// Convert `a`, an `[m, k]` f32 activation, to bf16.
-    ///
-    /// # Safety
-    ///
-    /// `a` must hold `m * k` f32 elements.
-    pub unsafe fn new(
-        dev: &CudaDevice,
-        convert: &CudaFunction,
-        a: &crate::cuda::launch::DevVec,
-        m: usize,
-        k: usize,
-    ) -> Result<Self, RuntimeError> {
-        if m == 0 || k == 0 || a.len != m * k {
-            return Err(RuntimeError::Compute(format!(
-                "bf16 activation has {} elements, expected {m}x{k}",
-                a.len
-            )));
-        }
-        let bits: CudaSlice<u16> = unsafe { dev.alloc_uninit::<u16>(m * k) }
-            .map_err(|e| RuntimeError::Compute(format!("bf16 activation: alloc: {e}")))?;
-        convert_f32_to_bf16(dev, convert, &a.buf, &bits)?;
         Ok(Self { bits, m, k })
     }
 }
@@ -108,11 +78,53 @@ pub unsafe fn gemm_bf16(
     a: &Bf16Activation,
     n: usize,
 ) -> Result<CudaSlice<f32>, RuntimeError> {
+    gemm_ex(
+        dev,
+        w,
+        a,
+        n,
+        cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+    )
+}
+
+/// [`gemm_bf16`] with the output written as bf16, rounded to nearest even
+/// from the f32 accumulator: what a bf16 `nn.Linear` produces, through the
+/// same cuBLAS call.
+///
+/// # Safety
+///
+/// `w` must hold `n * k` bf16 elements.
+pub unsafe fn gemm_bf16_out(
+    dev: &CudaDevice,
+    w: &CudaSlice<u16>,
+    a: &Bf16Activation,
+    n: usize,
+) -> Result<Bf16Activation, RuntimeError> {
+    let m = a.m;
+    let bits = gemm_ex(
+        dev,
+        w,
+        a,
+        n,
+        cudarc::cublas::sys::cudaDataType_t::CUDA_R_16BF,
+    )?;
+    Bf16Activation::from_bits(bits, m, n)
+}
+
+/// The GEMM both entry points share, writing `C` as `c_type`, whose element
+/// size `T` must match.
+unsafe fn gemm_ex<T: cudarc::driver::DeviceRepr>(
+    dev: &CudaDevice,
+    w: &CudaSlice<u16>,
+    a: &Bf16Activation,
+    n: usize,
+    c_type: cudarc::cublas::sys::cudaDataType_t,
+) -> Result<CudaSlice<T>, RuntimeError> {
     let (m, k) = (a.m, a.k);
     check_shape(m, n, k)?;
     let a_bf16 = &a.bits;
     // Uninitialized: cuBLAS writes every element (beta = 0).
-    let mut out: CudaSlice<f32> = unsafe { dev.alloc_uninit::<f32>(m * n) }
+    let mut out: CudaSlice<T> = unsafe { dev.alloc_uninit::<T>(m * n) }
         .map_err(|e| RuntimeError::Compute(format!("gemm_bf16: alloc out: {e}")))?;
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
@@ -138,7 +150,7 @@ pub unsafe fn gemm_bf16(
         k as i32,
         &beta as *const f32 as *const std::ffi::c_void,
         c_ptr as *mut std::ffi::c_void,
-        cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
+        c_type,
         n as i32,
         cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,

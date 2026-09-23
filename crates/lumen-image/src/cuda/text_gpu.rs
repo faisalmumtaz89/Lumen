@@ -47,7 +47,7 @@ use super::blas::{convert_f32_to_bf16, gemm_bf16, Bf16Activation};
 use super::launch::{self, DevVec};
 use super::{ImageKernels, TEXT_OPS_SOURCE};
 use crate::lbi::{LbiError, LbiFile};
-use crate::tensor::Matrix;
+use crate::tensor::{bf16_bits, Matrix};
 use crate::text_encoder::{rope_tables, TextEncoderConfig, TextEncoderError};
 
 /// Every text-tower tensor sits under this prefix.
@@ -308,7 +308,7 @@ impl TextGpu {
         // dtype. A text prompt puts the same `0..seq-1` on all three rows.
         let positions: Vec<f32> = (0..seq).map(|i| i as f32).collect();
         let (cos, sin) = rope_tables(c, [&positions, &positions, &positions])?;
-        let to_bits = |m: &Matrix| m.data.iter().map(|&v| bf16_rne(v)).collect::<Vec<u16>>();
+        let to_bits = |m: &Matrix| m.data.iter().map(|&v| bf16_bits(v)).collect::<Vec<u16>>();
         let g_cos = self.dev.htod_copy(&to_bits(&cos))?;
         let g_sin = self.dev.htod_copy(&to_bits(&sin))?;
         let g_ids = self.dev.htod_copy(token_ids)?;
@@ -579,16 +579,6 @@ fn flat_grid(total: usize) -> Result<LaunchConfig, TextGpuError> {
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: 0,
     })
-}
-
-/// f32 -> bf16 bits, nearest even (NaN kept NaN), as the device kernels round.
-fn bf16_rne(v: f32) -> u16 {
-    let bits = v.to_bits();
-    if v.is_nan() {
-        return ((bits >> 16) | 0x0040) as u16;
-    }
-    let lsb = (bits >> 16) & 1;
-    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
 }
 
 // ---------------------------------------------------------------------------

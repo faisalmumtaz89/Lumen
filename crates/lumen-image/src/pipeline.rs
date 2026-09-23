@@ -640,6 +640,11 @@ fn encode_prompt_gpu(
 }
 
 /// The denoising loop: the final latents for `req`, conditioned on `text`.
+///
+/// The latents are bf16, as the reference keeps them: the starting latents are
+/// rounded to bf16, and each scheduler step rounds as `SigmaSchedule::step`
+/// documents for a bf16 model output. The transformer takes the timestep the
+/// reference hands it, `SigmaSchedule::model_timestep`.
 #[cfg(feature = "cuda")]
 fn denoise_gpu(
     dit: &crate::cuda::dit_gpu::DitGpu,
@@ -658,7 +663,10 @@ fn denoise_gpu(
     }
     let cfg = DitConfig::qwen_image_2_1();
     let sched = SigmaSchedule::new(req.steps, seq, &SchedulerConfig::qwen_image_2_1());
-    let mut latents = starting_latents(req, seq, cfg.in_channels)?;
+    let mut latents: Vec<f32> = starting_latents(req, seq, cfg.in_channels)?
+        .into_iter()
+        .map(crate::tensor::bf16_round)
+        .collect();
     let shapes = [(1u64, lat_h as u64, lat_w as u64)];
     for step in 0..req.steps {
         let hidden_states = Matrix::new(seq, cfg.in_channels, latents.clone());
@@ -666,7 +674,7 @@ fn denoise_gpu(
             .forward(DitForwardArgs {
                 hidden_states: &hidden_states,
                 encoder_hidden_states: text,
-                timestep: sched.sigmas[step],
+                timestep: sched.model_timestep(step),
                 img_shapes: &shapes,
                 img_mask: &img_mask,
             })
@@ -676,7 +684,7 @@ fn denoise_gpu(
         } else {
             out.data.clone()
         };
-        latents = sched.step(step, &latents, &pred, false);
+        latents = sched.step(step, &latents, &pred, true);
         if progress(step + 1, req.steps).is_break() {
             return Err(PipelineError::Cancelled);
         }
