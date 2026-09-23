@@ -1,53 +1,39 @@
-//! The Qwen3-VL text tower, on the GPU.
+//! The Qwen3-VL text tower, on the GPU, in the reference's arithmetic.
 //!
-//! This mirrors [`crate::text_encoder`] step for step: the same projections in
-//! the same order, the same per-head `q_norm`/`k_norm` applied after the head
-//! split and before rotary (`v` gets neither), the same interleaved mRoPE, the
-//! same causal grouped-query softmax with the same operand order, and the same
-//! return — the last layer's hidden state **without** the final RMS norm, which
-//! the pipeline's forward hook suppresses. The CPU reference is the
-//! specification, so a disagreement is a bug in one of the two rather than a
-//! tolerance question.
+//! The reference runs this tower in bf16: every tensor between two operations
+//! is bf16, and each operation computes in f32 and rounds its result to bf16
+//! once, nearest even. This forward does the same, operation for operation:
 //!
-//! # What is reused, and what is not
+//! - RMSNorm: `bf16(x * rsqrt(mean(x^2) + eps))`, then `bf16(weight * that)`
+//! - projections: cuBLAS bf16 GEMMs with f32 accumulation, rounded to bf16
+//!   once (the reference's cuBLAS may also round split-K partial sums to
+//!   bf16 for some shapes; this path does not)
+//! - per-head `q_norm`/`k_norm` after the head split, before the rotary
+//! - rotary: `bf16(bf16(x * cos) + bf16(rotate_half(x) * sin))`, with the
+//!   `cos`/`sin` tables themselves rounded to bf16
+//! - causal attention over grouped heads: the key/value heads repeated to the
+//!   query heads, then the flash kernel with the whole prompt as its causal
+//!   text prefix (f32 softmax, bf16 in and out)
+//! - residual adds and `down(bf16(silu(gate)) * up)`, each result rounded
 //!
-//! Reused unchanged: `gemm_16bit` and `gemm_f32_bias` for the projections,
-//! `rmsnorm_per_head` from `norm.cu` in its shared-weight mode, `swiglu_inplace`
-//! and `residual_add_copy` from `activations.cu`.
-//!
-//! Two kernels that look reusable are not, and both mistakes would produce a
-//! correctly-shaped, finite, wrong tensor — the failure mode this driver is
-//! written to avoid. `text_ops.cu` carries the full argument; in short:
-//!
-//! * `image_ops.cu`'s `mrope_interleaved` rotates adjacent complex pairs inside
-//!   a head, while `apply_rope` pairs channel `j` with `j + head_dim/2`. The
-//!   table is interleaved either way, so the name matches and the arithmetic
-//!   does not.
-//! * `image_ops.cu`'s `attn_block_causal` indexes keys and values by the *query*
-//!   head index, so it cannot express this tower's 32-query/8-key grouping: it
-//!   would read the wrong key heads. `attn_causal_gqa` carries the mapping.
+//! It returns the last layer's hidden state **without** the final RMS norm, the
+//! state the pipeline consumes. [`crate::text_encoder`] is the f32 CPU form of
+//! the same tower, kept as the reference checks' independent path; the two
+//! differ by bf16 rounding, which is the reference's.
 //!
 //! # Weights
 //!
-//! The tensor that needs care is the embedding table: 151936 x 4096 BF16 is
-//! ~1.16 GiB and stays resident in its stored dtype, with the prompt's rows
-//! gathered and widened by `embed_gather` — the same "only the prompt's rows"
-//! economy [`crate::text_encoder::TextEncoder`]'s mmap path gets for free, and
-//! the reason a forward does not add ~1.3 GiB by expanding the table to f32.
-//!
-//! `model.language_model.norm.weight` is deliberately **not** loaded. It is in
-//! the CPU reference's manifest because that module states what a Qwen3-VL text
-//! tower contains, but its bytes are never decoded there either: the forward
-//! stops before the norm. Loading it here would reserve a device buffer for a
-//! tensor no launch reads.
+//! Every matrix and the embedding table must be stored bf16, the checkpoint's
+//! dtype and the only one the GEMMs take. The embedding table (151936 x 4096,
+//! ~1.16 GiB) stays resident and the prompt's rows are gathered from it.
+//! `model.language_model.norm.weight` is not loaded: the forward stops before
+//! the final norm.
 //!
 //! # Memory
 //!
-//! 14.1 GiB of BF16 weights (the container also carries the vision tower,
-//! which is not loaded) plus f32 activations (a `[seq, 12288]` MLP
-//! intermediate is the largest, 1.2 MiB at the shipped 24-row prompt). The DiT
-//! is not co-resident: the encoder's output feeds the transformer, so the two
-//! run in sequence and the pipeline already holds one component at a time.
+//! 14.1 GiB of bf16 weights (the container also carries the vision tower, which
+//! is not loaded) plus bf16 activations; the largest transient is a projection's
+//! f32 output before rounding, `[seq, 12288]` f32 (48 KiB per token).
 
 use std::path::Path;
 
@@ -56,7 +42,8 @@ use lumen_format::QuantScheme;
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::error::RuntimeError;
 
-use super::dit_gpu::ops as dit_ops;
+use super::attention::{fused_block_causal_attention, FLASH_HEAD_DIM};
+use super::blas::{convert_f32_to_bf16, gemm_bf16, Bf16Activation};
 use super::launch::{self, DevVec};
 use super::{ImageKernels, TEXT_OPS_SOURCE};
 use crate::lbi::{LbiError, LbiFile};
@@ -65,29 +52,17 @@ use crate::text_encoder::{rope_tables, TextEncoderConfig, TextEncoderError};
 
 /// Every text-tower tensor sits under this prefix.
 ///
-/// A second spelling of `text_encoder.rs`'s private `PREFIX`: this module cannot
-/// see that one, and the task that produced this file is scoped to it. A drift
-/// between the two shows up as a `MissingTensor` at [`TextGpu::load`], before a
-/// single byte reaches the device — loud, not a silent numeric disagreement.
+/// A second spelling of `text_encoder.rs`'s private `PREFIX`: a drift between
+/// the two shows up as a `MissingTensor` at [`TextGpu::load`], before a single
+/// byte reaches the device.
 const PREFIX: &str = "model.language_model.";
 
-/// Threads per block for the elementwise, gather and rotary kernels.
+/// Threads per block for the elementwise and gather kernels, and the most the
+/// rotary kernel takes.
 const THREADS: u32 = 256;
 
-/// The largest block a CUDA launch may request.
-///
-/// A layer norm is 4096 wide and `rmsnorm_per_head` stages per-warp partials in
-/// a shared array sized from `blockDim.x`, so `dim` is capped here rather than
-/// passed through: a 4096-thread block is not a legal launch at all, and the
-/// kernel's strided loops make the cap free.
-const MAX_BLOCK: u32 = 1024;
-
-/// The attention kernel launches one thread per head channel, so this is both
-/// its block size and its ceiling on `head_dim`. `TextEncoderConfig`'s own
-/// `MAX_HEAD_DIM` is 4096, so a config that passed there can still be wider than
-/// a block may be; [`TextGpu::load`] refuses it rather than letting the launch
-/// fail with a bare CUDA error. The shipped tower is 128.
-const ATTN_THREADS: u32 = 1024;
+/// `TEXT_NORM_THREADS` in `text_ops.cu`, which sizes its shared reduction.
+const NORM_THREADS: u32 = 256;
 
 /// What went wrong loading or running the text tower on the device.
 #[derive(Debug)]
@@ -98,7 +73,7 @@ pub enum TextGpuError {
     /// Reusing the reference's error keeps a shape failure reported the same
     /// way whichever path found it.
     Text(TextEncoderError),
-    /// A weight is stored in a scheme with no dispatch.
+    /// A weight is stored in a scheme this forward does not take.
     UnsupportedStorage { tensor: String, scheme: String },
 }
 
@@ -110,7 +85,7 @@ impl std::fmt::Display for TextGpuError {
             Self::UnsupportedStorage { tensor, scheme } => {
                 write!(
                     f,
-                    "tensor {tensor} is stored as {scheme}, which has no dispatch"
+                    "tensor {tensor} is stored as {scheme}; the GPU text tower takes bf16"
                 )
             }
         }
@@ -137,128 +112,37 @@ impl From<LbiError> for TextGpuError {
     }
 }
 
-/// The `.lbi` storage scheme of a weight, as the two GEMMs dispatch on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Storage {
-    F32,
-    F16,
-    Bf16,
+/// A `[n, k]` linear weight resident as bf16: `n` outputs over `k` inputs.
+struct Weight {
+    bits: CudaSlice<u16>,
+    n: usize,
+    k: usize,
 }
 
-impl Storage {
-    fn of(entry: &crate::lbi::TensorEntry, tensor: &str) -> Result<Self, TextGpuError> {
-        match entry.quant {
-            QuantScheme::F32 => Ok(Self::F32),
-            QuantScheme::F16 => Ok(Self::F16),
-            QuantScheme::Bf16 => Ok(Self::Bf16),
-            other => Err(TextGpuError::UnsupportedStorage {
-                tensor: tensor.to_string(),
-                scheme: format!("{other:?}"),
-            }),
-        }
-    }
-}
-
-/// A `[rows, cols]` linear weight resident on the device, in the dtype the
-/// `.lbi` stores.
-///
-/// `rows` is the output width and `cols` the input width, kept alongside the
-/// buffer rather than derived from its length: which factor is which is not
-/// recoverable from an element count, and a transposed operand is a silent wrong
-/// answer.
-enum DevMatrix {
-    F32 {
-        buf: DevVec,
-        rows: usize,
-        cols: usize,
-    },
-    F16 {
-        buf: CudaSlice<u16>,
-        rows: usize,
-        cols: usize,
-    },
-    Bf16 {
-        buf: CudaSlice<u16>,
-        rows: usize,
-        cols: usize,
-    },
-}
-
-impl DevMatrix {
-    fn rows(&self) -> usize {
-        match self {
-            Self::F32 { rows, .. } | Self::F16 { rows, .. } | Self::Bf16 { rows, .. } => *rows,
-        }
-    }
-
-    fn cols(&self) -> usize {
-        match self {
-            Self::F32 { cols, .. } | Self::F16 { cols, .. } | Self::Bf16 { cols, .. } => *cols,
-        }
-    }
-
-    /// `out[M, N] = a[M, K] * W[N, K]^T` by weight dtype: `gemm_16bit` for a
-    /// 16-bit weight, `gemm_f32_bias` without a bias for an f32 one.
-    ///
-    /// `m` is the row count; the weight supplies both widths. The width check
-    /// runs here so a transposed operand is refused rather than read past.
-    fn gemm(
-        &self,
-        dev: &CudaDevice,
-        kernels: &ImageKernels,
-        ops: &dit_ops::DitOps,
-        a: &DevVec,
-        m: usize,
-    ) -> Result<DevVec, TextGpuError> {
-        let (n, k) = (self.rows(), self.cols());
-        if a.len != m * k {
-            return Err(TextEncoderError::BadConfig(format!(
-                "a projection input is {} values, but its weight wants {}",
-                a.len,
-                m * k
-            ))
-            .into());
-        }
-        Ok(match self {
-            Self::F32 { buf, .. } => launch::linear(dev, kernels, a, buf, None, m, n, k)?,
-            Self::F16 { buf, .. } => {
-                dit_ops::gemm_16bit(dev, ops, buf, a, m, n, k, dit_ops::Gemm16::F16)?
-            }
-            Self::Bf16 { buf, .. } => {
-                dit_ops::gemm_16bit(dev, ops, buf, a, m, n, k, dit_ops::Gemm16::Bf16)?
-            }
-        })
-    }
-}
-
-/// One decoder layer, resident on the device.
+/// One decoder layer, resident on the device. The norm weights are widened to
+/// f32, which is exact for bf16.
 struct GpuLayer {
     input_norm: DevVec,
-    q_proj: DevMatrix,
-    k_proj: DevMatrix,
-    v_proj: DevMatrix,
-    o_proj: DevMatrix,
+    q_proj: Weight,
+    k_proj: Weight,
+    v_proj: Weight,
+    o_proj: Weight,
     q_norm: DevVec,
     k_norm: DevVec,
     post_norm: DevVec,
-    gate_proj: DevMatrix,
-    up_proj: DevMatrix,
-    down_proj: DevMatrix,
-}
-
-/// The text tower's embedding table, resident in its stored dtype.
-struct DevEmbedding {
-    bytes: CudaSlice<u8>,
-    vocab: usize,
-    hidden: usize,
-    storage: Storage,
+    gate_proj: Weight,
+    up_proj: Weight,
+    down_proj: Weight,
 }
 
 /// The entry points `text_ops.cu` provides.
 struct TextOps {
     embed_gather: CudaFunction,
-    rope_half: CudaFunction,
-    attn_causal_gqa: CudaFunction,
+    rms_norm: CudaFunction,
+    rope: CudaFunction,
+    repeat_kv: CudaFunction,
+    silu_mul: CudaFunction,
+    add: CudaFunction,
 }
 
 impl TextOps {
@@ -270,9 +154,12 @@ impl TextOps {
                 .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
         };
         Ok(Self {
-            embed_gather: get("embed_gather")?,
-            rope_half: get("rope_half_interleaved")?,
-            attn_causal_gqa: get("attn_causal_gqa")?,
+            embed_gather: get("embed_gather_bf16")?,
+            rms_norm: get("rms_norm_bf16")?,
+            rope: get("rope_bf16")?,
+            repeat_kv: get("repeat_kv")?,
+            silu_mul: get("silu_mul_bf16")?,
+            add: get("add_bf16")?,
         })
     }
 }
@@ -284,21 +171,11 @@ pub struct TextGpu {
     /// retains the same primary context, so this is a second stream on the same
     /// device, not a second device.
     dev: CudaDevice,
-    /// `gemm_f32_bias`, for a tower whose weights are stored f32 (the CPU
-    /// reference's own dtype, and the test fixtures').
+    /// `f32_to_bf16_bits` for the projections' outputs and the flash kernel.
     kernels: ImageKernels,
-    /// `gemm_16bit`, for a BF16 or F16 checkpoint.
-    ops: dit_ops::DitOps,
     text_ops: TextOps,
-    /// `rmsnorm_per_head`, from `norm.cu`.
-    per_head_norm: CudaFunction,
-    /// `swiglu_inplace`, from `activations.cu`.
-    swiglu: CudaFunction,
-    /// `residual_add_copy`, from `activations.cu`.
-    residual_add: CudaFunction,
-
     config: TextEncoderConfig,
-    embed: DevEmbedding,
+    embed: Weight,
     layers: Vec<GpuLayer>,
 }
 
@@ -321,117 +198,79 @@ impl TextGpu {
         dev: &CudaDevice,
         config: TextEncoderConfig,
     ) -> Result<Self, TextGpuError> {
-        // `head_dim` is a launch block on two paths: the per-head norms index
-        // `rows * head_dim` with one row per block, and `attn_causal_gqa` runs
-        // one thread per head channel. A config wider than a legal block would
-        // otherwise fail as a bare CUDA error mid-forward.
-        if config.head_dim > ATTN_THREADS as usize {
-            return Err(TextEncoderError::BadConfig(format!(
-                "head_dim {} exceeds the {ATTN_THREADS}-thread block these kernels launch",
-                config.head_dim
-            ))
-            .into());
-        }
+        Self::check(file, &config)?;
 
         let own = CudaDevice::new(dev.ctx.ordinal())?;
         let kernels = ImageKernels::load(&own)?;
-        let ops = dit_ops::load(&own)?;
         let text_ops = TextOps::load(&own)?;
-        let per_head_norm = load_from_source(
-            &own,
-            lumen_runtime::cuda::shaders::NORM_KERNEL_SOURCE,
-            "rmsnorm_per_head",
-        )?;
-        let swiglu = load_from_source(
-            &own,
-            lumen_runtime::cuda::shaders::ACTIVATIONS_KERNEL_SOURCE,
-            "swiglu_inplace",
-        )?;
-        let residual_add = load_from_source(
-            &own,
-            lumen_runtime::cuda::shaders::ACTIVATIONS_KERNEL_SOURCE,
-            "residual_add_copy",
-        )?;
 
         let c = &config;
         let hidden = c.hidden_size;
         let q_width = c.num_attention_heads * c.head_dim;
         let kv_width = c.num_key_value_heads * c.head_dim;
-
-        let embed = load_embedding(&own, file, c)?;
+        let embed = matrix(&own, file, "embed_tokens", c.vocab_size, hidden)?;
 
         let mut layers = Vec::with_capacity(c.num_layers);
         for i in 0..c.num_layers {
             let p = format!("layers.{i}");
+            let w = |stem: &str, n, k| matrix(&own, file, &format!("{p}.{stem}"), n, k);
+            let v = |stem: &str, len| vector(&own, file, &format!("{p}.{stem}"), len);
             layers.push(GpuLayer {
-                input_norm: vector(&own, file, &format!("{p}.input_layernorm"), hidden)?,
-                q_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.self_attn.q_proj"),
-                    q_width,
-                    hidden,
-                )?,
-                k_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.self_attn.k_proj"),
-                    kv_width,
-                    hidden,
-                )?,
-                v_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.self_attn.v_proj"),
-                    kv_width,
-                    hidden,
-                )?,
-                o_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.self_attn.o_proj"),
-                    hidden,
-                    q_width,
-                )?,
-                q_norm: vector(&own, file, &format!("{p}.self_attn.q_norm"), c.head_dim)?,
-                k_norm: vector(&own, file, &format!("{p}.self_attn.k_norm"), c.head_dim)?,
-                post_norm: vector(&own, file, &format!("{p}.post_attention_layernorm"), hidden)?,
-                gate_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.mlp.gate_proj"),
-                    c.intermediate_size,
-                    hidden,
-                )?,
-                up_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.mlp.up_proj"),
-                    c.intermediate_size,
-                    hidden,
-                )?,
-                down_proj: matrix(
-                    &own,
-                    file,
-                    &format!("{p}.mlp.down_proj"),
-                    hidden,
-                    c.intermediate_size,
-                )?,
+                input_norm: v("input_layernorm", hidden)?,
+                q_proj: w("self_attn.q_proj", q_width, hidden)?,
+                k_proj: w("self_attn.k_proj", kv_width, hidden)?,
+                v_proj: w("self_attn.v_proj", kv_width, hidden)?,
+                o_proj: w("self_attn.o_proj", hidden, q_width)?,
+                q_norm: v("self_attn.q_norm", c.head_dim)?,
+                k_norm: v("self_attn.k_norm", c.head_dim)?,
+                post_norm: v("post_attention_layernorm", hidden)?,
+                gate_proj: w("mlp.gate_proj", c.intermediate_size, hidden)?,
+                up_proj: w("mlp.up_proj", c.intermediate_size, hidden)?,
+                down_proj: w("mlp.down_proj", hidden, c.intermediate_size)?,
             });
         }
 
         Ok(Self {
+            dev: own,
+            kernels,
+            text_ops,
             config,
             embed,
             layers,
-            dev: own,
-            kernels,
-            ops,
-            text_ops,
-            per_head_norm,
-            swiglu,
-            residual_add,
         })
+    }
+
+    /// Refuse, from the container's index alone, what [`Self::load_with`]
+    /// cannot run: a head width other than the one the attention kernel is
+    /// tiled for, or any matrix missing, misshapen or not stored as bf16. No
+    /// weight bytes are read, so a server can run this before it commits to
+    /// the GPU path.
+    pub fn check(file: &LbiFile, config: &TextEncoderConfig) -> Result<(), TextGpuError> {
+        if config.head_dim != FLASH_HEAD_DIM {
+            return Err(TextEncoderError::BadConfig(format!(
+                "head_dim {} is not the {FLASH_HEAD_DIM} the attention kernel is tiled for",
+                config.head_dim
+            ))
+            .into());
+        }
+        let c = config;
+        let q_width = c.num_attention_heads * c.head_dim;
+        let kv_width = c.num_key_value_heads * c.head_dim;
+        bf16_entry(file, "embed_tokens", c.vocab_size, c.hidden_size)?;
+        for i in 0..c.num_layers {
+            for (stem, n, k) in [
+                ("self_attn.q_proj", q_width, c.hidden_size),
+                ("self_attn.k_proj", kv_width, c.hidden_size),
+                ("self_attn.v_proj", kv_width, c.hidden_size),
+                ("self_attn.o_proj", c.hidden_size, q_width),
+                ("mlp.gate_proj", c.intermediate_size, c.hidden_size),
+                ("mlp.up_proj", c.intermediate_size, c.hidden_size),
+                ("mlp.down_proj", c.hidden_size, c.intermediate_size),
+            ] {
+                bf16_entry(file, &format!("layers.{i}.{stem}"), n, k)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> &TextEncoderConfig {
@@ -440,11 +279,10 @@ impl TextGpu {
 
     /// Encode a prompt to `[seq, hidden]`, **without** the final RMS norm.
     ///
-    /// Same contract as [`crate::text_encoder::TextEncoder::forward`]: all three
-    /// M-RoPE rows are the plain `0..seq-1`, because a text-to-image prompt has
-    /// no grid and the model falls back to `arange` broadcast across T, H and W.
-    /// The caller gets every row, template included, and drops the leading
-    /// system-message rows itself.
+    /// All three M-RoPE rows are the plain `0..seq-1`, because a text-to-image
+    /// prompt has no grid and the model falls back to `arange` broadcast across
+    /// T, H and W. The caller gets every row, template included, and drops the
+    /// leading system-message rows itself.
     pub fn forward(&self, token_ids: &[u32]) -> Result<Matrix, TextGpuError> {
         if token_ids.is_empty() {
             return Err(TextEncoderError::EmptyInput.into());
@@ -453,314 +291,304 @@ impl TextGpu {
         let seq = token_ids.len();
         let hidden = c.hidden_size;
 
-        // The prompt's ids, range-checked here so the gather kernel can trust
-        // them. `embed_gather` reads at `id * hidden`, so an id at or above the
-        // vocabulary would read past the end of the table.
+        // Range-checked here so the gather kernel can trust them: it reads at
+        // `id * hidden`.
         for &id in token_ids {
-            if id as usize >= self.embed.vocab {
+            if id as usize >= self.embed.n {
                 return Err(TextEncoderError::TokenOutOfRange {
                     id,
-                    vocab: self.embed.vocab,
+                    vocab: self.embed.n,
                 }
                 .into());
             }
         }
 
-        // The rotary tables are host f32, built by the reference's own function
-        // so the schedule is the specification's rather than a second
-        // implementation of it. A text prompt puts the same `0..seq-1` on all
-        // three rows, which is what makes the recomposition a no-op.
+        // The rotary tables come from the reference's own schedule in f32 and
+        // are rounded to bf16, as the reference casts them to the activations'
+        // dtype. A text prompt puts the same `0..seq-1` on all three rows.
         let positions: Vec<f32> = (0..seq).map(|i| i as f32).collect();
         let (cos, sin) = rope_tables(c, [&positions, &positions, &positions])?;
-        let g_cos = launch::upload(&self.dev, &cos.data)?;
-        let g_sin = launch::upload(&self.dev, &sin.data)?;
-
+        let to_bits = |m: &Matrix| m.data.iter().map(|&v| bf16_rne(v)).collect::<Vec<u16>>();
+        let g_cos = self.dev.htod_copy(&to_bits(&cos))?;
+        let g_sin = self.dev.htod_copy(&to_bits(&sin))?;
         let g_ids = self.dev.htod_copy(token_ids)?;
 
         let mut x = self.gather_embed(&g_ids, seq)?;
         for layer in &self.layers {
             x = self.decoder_layer(layer, &x, seq, &g_cos, &g_sin)?;
         }
-        let data = launch::download(&self.dev, &x)?;
+        let bits = self.dev.dtoh_copy(&x.bits)?;
+        self.dev.synchronize()?;
+        let data = bits
+            .iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect();
         Ok(Matrix::new(seq, hidden, data))
     }
 
     // -- the pieces of the forward ------------------------------------------
 
-    /// Gather the prompt's rows out of the resident embedding table.
-    fn gather_embed(&self, ids: &CudaSlice<u32>, seq: usize) -> Result<DevVec, TextGpuError> {
-        let out = launch::alloc(&self.dev, seq * self.embed.hidden)?;
-        let (su, hu) = (seq as u32, self.embed.hidden as u32);
-        let dt: u32 = match self.embed.storage {
-            Storage::F16 => 0,
-            Storage::Bf16 => 1,
-            Storage::F32 => 2,
-        };
-        // Safety: `out` is `seq * hidden` floats; `ids` is `seq` entries, each
-        // checked in range above; the table is `vocab * hidden * width` bytes,
-        // which `looked_up` pinned against the declared shape.
+    fn gather_embed(
+        &self,
+        ids: &CudaSlice<u32>,
+        seq: usize,
+    ) -> Result<Bf16Activation, TextGpuError> {
+        let hidden = self.embed.k;
+        let out = self.alloc_bits(seq * hidden)?;
+        let (su, hu) = (seq as u32, hidden as u32);
+        // Safety: `out` is `seq * hidden`; `forward` checked every id below
+        // the vocabulary, so each gathered row lies inside the `[vocab, hidden]` table.
         unsafe {
             self.dev
                 .stream
                 .launch_builder(&self.text_ops.embed_gather)
-                .arg(&self.embed.bytes)
+                .arg(&self.embed.bits)
                 .arg(ids)
-                .arg(&out.buf)
+                .arg(&out)
                 .arg(&su)
                 .arg(&hu)
-                .arg(&dt)
                 .launch(LaunchConfig {
-                    grid_dim: (seq as u32, 1, 1),
+                    grid_dim: (su, 1, 1),
                     block_dim: (THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 })
-                .map_err(|e| RuntimeError::Compute(format!("embed_gather: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("embed_gather_bf16: {e}")))?;
         }
-        Ok(out)
+        Ok(Bf16Activation::from_bits(out, seq, hidden)?)
     }
 
     /// One decoder layer: pre-norm attention and pre-norm MLP, each residual.
     fn decoder_layer(
         &self,
         layer: &GpuLayer,
-        x: &DevVec,
+        x: &Bf16Activation,
         seq: usize,
-        cos: &DevVec,
-        sin: &DevVec,
-    ) -> Result<DevVec, TextGpuError> {
-        let eps = self.config.rms_norm_eps;
-        let width = self.config.hidden_size;
-
-        let normed = self.rms_norm(x, &layer.input_norm, seq, width, eps)?;
+        cos: &CudaSlice<u16>,
+        sin: &CudaSlice<u16>,
+    ) -> Result<Bf16Activation, TextGpuError> {
+        let hidden = self.config.hidden_size;
+        let normed = self.rms_norm(&x.bits, &layer.input_norm, seq, hidden)?;
+        let normed = Bf16Activation::from_bits(normed, seq, hidden)?;
         let attended = self.attention(layer, &normed, seq, cos, sin)?;
-        let hidden = self.residual(x, &attended)?;
+        let h = self.add(&x.bits, &attended)?;
 
-        let normed = self.rms_norm(&hidden, &layer.post_norm, seq, width, eps)?;
-        let expanded = self.mlp(layer, &normed, seq)?;
-        self.residual(&hidden, &expanded)
+        let normed = self.rms_norm(&h, &layer.post_norm, seq, hidden)?;
+        let normed = Bf16Activation::from_bits(normed, seq, hidden)?;
+        let gate = self.project(&normed, &layer.gate_proj)?;
+        let up = self.project(&normed, &layer.up_proj)?;
+        let act = self.silu_mul(&gate, &up)?;
+        let act = Bf16Activation::from_bits(act, seq, self.config.intermediate_size)?;
+        let down = self.project(&act, &layer.down_proj)?;
+        Ok(Bf16Activation::from_bits(
+            self.add(&h, &down)?,
+            seq,
+            hidden,
+        )?)
     }
 
-    /// One attention block: per-head norms, rotary, causal GQA softmax, output
-    /// projection.
+    /// One attention block: projections, per-head norms, rotary, causal
+    /// attention over the repeated key/value heads, output projection.
     fn attention(
         &self,
         layer: &GpuLayer,
-        x: &DevVec,
+        x: &Bf16Activation,
         seq: usize,
-        cos: &DevVec,
-        sin: &DevVec,
-    ) -> Result<DevVec, TextGpuError> {
+        cos: &CudaSlice<u16>,
+        sin: &CudaSlice<u16>,
+    ) -> Result<CudaSlice<u16>, TextGpuError> {
         let c = &self.config;
-        let (head_dim, nq, nkv) = (c.head_dim, c.num_attention_heads, c.num_key_value_heads);
+        let (hd, nq, nkv) = (c.head_dim, c.num_attention_heads, c.num_key_value_heads);
 
-        // `q_norm`/`k_norm` are `[head_dim]` vectors applied to each head's
-        // slice, which is the row view `[seq * heads, head_dim]`. `v` carries
-        // neither a norm nor a rotation.
-        let q = layer
-            .q_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, x, seq)?;
-        let q = self.rms_norm(&q, &layer.q_norm, seq * nq, head_dim, c.rms_norm_eps)?;
-        let q = self.rope(q, cos, sin, seq, nq, head_dim)?;
+        let q = self.project(x, &layer.q_proj)?;
+        let mut q = self.rms_norm(&q, &layer.q_norm, seq * nq, hd)?;
+        self.rope(&mut q, cos, sin, seq, nq)?;
+        let k = self.project(x, &layer.k_proj)?;
+        let mut k = self.rms_norm(&k, &layer.k_norm, seq * nkv, hd)?;
+        self.rope(&mut k, cos, sin, seq, nkv)?;
+        let v = self.project(x, &layer.v_proj)?;
 
-        let k = layer
-            .k_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, x, seq)?;
-        let k = self.rms_norm(&k, &layer.k_norm, seq * nkv, head_dim, c.rms_norm_eps)?;
-        let k = self.rope(k, cos, sin, seq, nkv, head_dim)?;
-
-        let v = layer
-            .v_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, x, seq)?;
-
-        let context = self.causal_gqa(&q, &k, &v, seq, nq, nkv, head_dim)?;
-        layer
-            .o_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, &context, seq)
-    }
-
-    /// `down_proj(silu(gate_proj(x)) * up_proj(x))`.
-    fn mlp(&self, layer: &GpuLayer, x: &DevVec, seq: usize) -> Result<DevVec, TextGpuError> {
-        let mut gate = layer
-            .gate_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, x, seq)?;
-        let up = layer
-            .up_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, x, seq)?;
-        self.swiglu_inplace(&mut gate, &up)?;
-        layer
-            .down_proj
-            .gemm(&self.dev, &self.kernels, &self.ops, &gate, seq)
+        let k = self.repeat_kv(&k, seq)?;
+        let v = self.repeat_kv(&v, seq)?;
+        // Safety: q, k and v are `[seq, nq, 128]` bf16, the shape the kernel
+        // reads; the whole prompt is the causal text prefix.
+        let context = unsafe {
+            fused_block_causal_attention(&self.dev, &self.kernels, &q, &k, &v, seq, seq, nq)
+        }?;
+        self.project(&context, &layer.o_proj)
     }
 
     // -- op wrappers ---------------------------------------------------------
 
-    /// `rms_norm_rows` over a `[rows, dim]` view, one block per row.
+    fn alloc_bits(&self, len: usize) -> Result<CudaSlice<u16>, TextGpuError> {
+        // Safety: every caller's kernel writes all `len` elements before any read.
+        Ok(unsafe { self.dev.alloc_uninit::<u16>(len) }?)
+    }
+
+    /// `x · Wᵀ`: a cuBLAS bf16 GEMM with f32 accumulation, rounded to bf16.
+    fn project(&self, x: &Bf16Activation, w: &Weight) -> Result<CudaSlice<u16>, TextGpuError> {
+        // Safety: `w.bits` is `n * k` bf16, checked at load, and every
+        // activation fed here is `k` wide by the same config.
+        let wide = unsafe { gemm_bf16(&self.dev, &w.bits, x, w.n) }?;
+        let out = self.alloc_bits(x.m() * w.n)?;
+        // Safety: `wide` holds `m * n` f32, the length of `out`.
+        unsafe { convert_f32_to_bf16(&self.dev, &self.kernels.f32_to_bf16_bits, &wide, &out) }?;
+        Ok(out)
+    }
+
+    /// RMSNorm over each `dim`-wide row of a `[rows, dim]` view.
     fn rms_norm(
         &self,
-        x: &DevVec,
+        x: &CudaSlice<u16>,
         weight: &DevVec,
         rows: usize,
         dim: usize,
-        eps: f32,
-    ) -> Result<DevVec, TextGpuError> {
-        let out = launch::alloc(&self.dev, x.len)?;
-        let du = dim as u32;
-        // "One shared `[dim]` weight" — what `rms_norm_rows(flat, weight, eps)`
-        // does for every row, because `norm_per_head` views the matrix as
-        // `[rows, dim]` and applies the same vector to each. Every norm in the
-        // tower is a `[dim]` vector in the checkpoint, so a non-zero stride
-        // would index the weight per row and read past its end.
-        let stride = 0u32;
-        // A layer norm is 4096 wide, past the 1024 a block may hold, so the
-        // block is capped and the kernel strides the remainder. Its own
-        // `for (i = tid; i < head_dim; i += block_size)` is what makes that
-        // correct; the shared array it reduces through must be sized from the
-        // block, not from `dim`.
-        let block = (dim as u32).min(MAX_BLOCK);
-        // Safety: `x` is `rows * dim` floats; one block per row covers it.
+    ) -> Result<CudaSlice<u16>, TextGpuError> {
+        let out = self.alloc_bits(rows * dim)?;
+        let (du, eps) = (dim as u32, self.config.rms_norm_eps);
+        // Safety: `x` and `out` are `rows * dim`, `weight` is `dim`.
         unsafe {
             self.dev
                 .stream
-                .launch_builder(&self.per_head_norm)
-                .arg(&x.buf)
+                .launch_builder(&self.text_ops.rms_norm)
+                .arg(x)
                 .arg(&weight.buf)
-                .arg(&out.buf)
-                .arg(&eps)
+                .arg(&out)
                 .arg(&du)
-                .arg(&stride)
+                .arg(&eps)
                 .launch(LaunchConfig {
                     grid_dim: (rows as u32, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: (block / 32).max(1) * 4,
+                    block_dim: (NORM_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
                 })
-                .map_err(|e| RuntimeError::Compute(format!("rmsnorm_per_head: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("rms_norm_bf16: {e}")))?;
         }
         Ok(out)
     }
 
-    /// The interleaved mRoPE, in place on `x`, which is consumed.
-    ///
-    /// Taking ownership is what lets the rotation run in place: the projected
-    /// `q`/`k` are fresh buffers the caller has no other use for, so no copy is
-    /// needed and none is made.
+    /// The half-split rotary, in place on `[seq, heads, head_dim]`.
     fn rope(
         &self,
-        mut x: DevVec,
-        cos: &DevVec,
-        sin: &DevVec,
+        x: &mut CudaSlice<u16>,
+        cos: &CudaSlice<u16>,
+        sin: &CudaSlice<u16>,
         seq: usize,
         heads: usize,
-        head_dim: usize,
-    ) -> Result<DevVec, TextGpuError> {
-        let (su, hu, hdu) = (seq as u32, heads as u32, head_dim as u32);
-        let slots = (head_dim / 2) as u32;
-        // Safety: `x` is `seq * heads * head_dim` floats; `cos`/`sin` are
-        // `seq * head_dim` each, the extent the kernel indexes.
+    ) -> Result<(), TextGpuError> {
+        let hd = self.config.head_dim;
+        let (su, hu, hdu) = (seq as u32, heads as u32, hd as u32);
+        // Safety: `x` is `seq * heads * head_dim`; the tables are `seq * head_dim`.
         unsafe {
             self.dev
                 .stream
-                .launch_builder(&self.text_ops.rope_half)
-                .arg(&mut x.buf)
-                .arg(&cos.buf)
-                .arg(&sin.buf)
+                .launch_builder(&self.text_ops.rope)
+                .arg(x)
+                .arg(cos)
+                .arg(sin)
                 .arg(&su)
                 .arg(&hu)
                 .arg(&hdu)
                 .launch(LaunchConfig {
-                    grid_dim: (seq as u32, 1, 1),
-                    block_dim: (slots.min(THREADS), 1, 1),
+                    grid_dim: (su, 1, 1),
+                    block_dim: ((hd as u32 / 2).min(THREADS), 1, 1),
                     shared_mem_bytes: 0,
                 })
-                .map_err(|e| RuntimeError::Compute(format!("rope_half_interleaved: {e}")))?;
-        }
-        Ok(x)
-    }
-
-    /// Causal grouped-query attention, one block per (query position, head).
-    #[allow(clippy::too_many_arguments)]
-    fn causal_gqa(
-        &self,
-        q: &DevVec,
-        k: &DevVec,
-        v: &DevVec,
-        seq: usize,
-        nq: usize,
-        nkv: usize,
-        head_dim: usize,
-    ) -> Result<DevVec, TextGpuError> {
-        let out = launch::alloc(&self.dev, q.len)?;
-        let (su, nqu, nkvu, hdu) = (seq as u32, nq as u32, nkv as u32, head_dim as u32);
-        let scale = (head_dim as f32).powf(-0.5);
-        let smem = (2 * head_dim * 4) as u32;
-        // Safety: q/k/v/out hold `seq * heads * head_dim` floats for their
-        // head counts, sized by the projections that produced them.
-        unsafe {
-            self.dev
-                .stream
-                .launch_builder(&self.text_ops.attn_causal_gqa)
-                .arg(&q.buf)
-                .arg(&k.buf)
-                .arg(&v.buf)
-                .arg(&out.buf)
-                .arg(&su)
-                .arg(&nqu)
-                .arg(&nkvu)
-                .arg(&hdu)
-                .arg(&scale)
-                .launch(LaunchConfig {
-                    grid_dim: (seq as u32, nq as u32, 1),
-                    block_dim: (head_dim as u32, 1, 1),
-                    shared_mem_bytes: smem,
-                })
-                .map_err(|e| RuntimeError::Compute(format!("attn_causal_gqa: {e}")))?;
-        }
-        Ok(out)
-    }
-
-    /// `out[i] = silu(gate[i]) * up[i]`, in place on `gate`.
-    fn swiglu_inplace(&self, gate: &mut DevVec, up: &DevVec) -> Result<(), TextGpuError> {
-        let n = gate.len as u32;
-        // Safety: both buffers are `n` floats, and the grid covers exactly that.
-        unsafe {
-            self.dev
-                .stream
-                .launch_builder(&self.swiglu)
-                .arg(&mut gate.buf)
-                .arg(&up.buf)
-                .arg(&n)
-                .launch(flat_grid(n))
-                .map_err(|e| RuntimeError::Compute(format!("swiglu_inplace: {e}")))?;
+                .map_err(|e| RuntimeError::Compute(format!("rope_bf16: {e}")))?;
         }
         Ok(())
     }
 
-    /// `a + b` into a fresh buffer, so the pre-norm input survives the residual.
-    fn residual(&self, a: &DevVec, b: &DevVec) -> Result<DevVec, TextGpuError> {
-        let out = launch::alloc(&self.dev, a.len)?;
-        let n = a.len as u32;
-        // Safety: all three buffers are `n` floats, and the grid covers them.
+    /// `[seq, nkv, head_dim]` -> `[seq, nq, head_dim]`.
+    fn repeat_kv(&self, x: &CudaSlice<u16>, seq: usize) -> Result<CudaSlice<u16>, TextGpuError> {
+        let c = &self.config;
+        let total = seq * c.num_attention_heads * c.head_dim;
+        let out = self.alloc_bits(total)?;
+        let (su, nkv, groups, hd) = (
+            seq as u32,
+            c.num_key_value_heads as u32,
+            c.num_key_value_groups() as u32,
+            c.head_dim as u32,
+        );
+        // Safety: `x` is `seq * nkv * head_dim`, `out` is `total`; the grid covers `total`.
         unsafe {
             self.dev
                 .stream
-                .launch_builder(&self.residual_add)
-                .arg(&a.buf)
-                .arg(&b.buf)
-                .arg(&out.buf)
+                .launch_builder(&self.text_ops.repeat_kv)
+                .arg(x)
+                .arg(&out)
+                .arg(&su)
+                .arg(&nkv)
+                .arg(&groups)
+                .arg(&hd)
+                .launch(flat_grid(total)?)
+                .map_err(|e| RuntimeError::Compute(format!("repeat_kv: {e}")))?;
+        }
+        Ok(out)
+    }
+
+    /// `bf16(bf16(silu(gate)) * up)`.
+    fn silu_mul(
+        &self,
+        gate: &CudaSlice<u16>,
+        up: &CudaSlice<u16>,
+    ) -> Result<CudaSlice<u16>, TextGpuError> {
+        let out = self.alloc_bits(gate.len())?;
+        let n = gate.len() as u32;
+        // Safety: all three buffers are `n`, and the grid covers them.
+        unsafe {
+            self.dev
+                .stream
+                .launch_builder(&self.text_ops.silu_mul)
+                .arg(gate)
+                .arg(up)
+                .arg(&out)
                 .arg(&n)
-                .launch(flat_grid(n))
-                .map_err(|e| RuntimeError::Compute(format!("residual_add_copy: {e}")))?;
+                .launch(flat_grid(gate.len())?)
+                .map_err(|e| RuntimeError::Compute(format!("silu_mul_bf16: {e}")))?;
+        }
+        Ok(out)
+    }
+
+    /// `bf16(a + b)`, into a fresh buffer.
+    fn add(&self, a: &CudaSlice<u16>, b: &CudaSlice<u16>) -> Result<CudaSlice<u16>, TextGpuError> {
+        let out = self.alloc_bits(a.len())?;
+        let n = a.len() as u32;
+        // Safety: all three buffers are `n`, and the grid covers them.
+        unsafe {
+            self.dev
+                .stream
+                .launch_builder(&self.text_ops.add)
+                .arg(a)
+                .arg(b)
+                .arg(&out)
+                .arg(&n)
+                .launch(flat_grid(a.len())?)
+                .map_err(|e| RuntimeError::Compute(format!("add_bf16: {e}")))?;
         }
         Ok(out)
     }
 }
 
-/// One block per 256 elements.
-fn flat_grid(total: u32) -> LaunchConfig {
-    LaunchConfig {
+/// One thread per element, in blocks of [`THREADS`]; the kernels index with
+/// `unsigned int`, so the element count must fit one.
+fn flat_grid(total: usize) -> Result<LaunchConfig, TextGpuError> {
+    let total = u32::try_from(total).map_err(|_| {
+        RuntimeError::Compute(format!("{total} elements exceed the kernels' u32 index"))
+    })?;
+    Ok(LaunchConfig {
         grid_dim: (total.div_ceil(THREADS), 1, 1),
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: 0,
+    })
+}
+
+/// f32 -> bf16 bits, nearest even (NaN kept NaN), as the device kernels round.
+fn bf16_rne(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return ((bits >> 16) | 0x0040) as u16;
     }
+    let lsb = (bits >> 16) & 1;
+    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -794,40 +622,37 @@ fn looked_up<'a>(
     Ok(entry)
 }
 
-/// A `[rows, cols]` linear weight, uploaded in its stored dtype.
+/// The `[n, k]` matrix `stem`, checked to be stored bf16; returns its full name.
+fn bf16_entry(file: &LbiFile, stem: &str, n: usize, k: usize) -> Result<String, TextGpuError> {
+    let name = tensor_name(stem);
+    let entry = looked_up(file, &name, &[n as u64, k as u64])?;
+    if entry.quant != QuantScheme::Bf16 {
+        return Err(TextGpuError::UnsupportedStorage {
+            tensor: name,
+            scheme: format!("{:?}", entry.quant),
+        });
+    }
+    Ok(name)
+}
+
+/// A `[n, k]` matrix, which must be stored bf16, uploaded as stored.
 fn matrix(
     dev: &CudaDevice,
     file: &LbiFile,
     stem: &str,
-    rows: usize,
-    cols: usize,
-) -> Result<DevMatrix, TextGpuError> {
-    let name = tensor_name(stem);
-    let entry = looked_up(file, &name, &[rows as u64, cols as u64])?;
+    n: usize,
+    k: usize,
+) -> Result<Weight, TextGpuError> {
+    let name = bf16_entry(file, stem, n, k)?;
     let bytes = file.tensor_bytes(&name).expect("entry resolved above");
-    match Storage::of(entry, &name)? {
-        Storage::F32 => Ok(DevMatrix::F32 {
-            buf: launch::upload(dev, &file.read_f32(&name)?)?,
-            rows,
-            cols,
-        }),
-        Storage::F16 => Ok(DevMatrix::F16 {
-            buf: dit_ops::upload_16bit(dev, bytes)?,
-            rows,
-            cols,
-        }),
-        Storage::Bf16 => Ok(DevMatrix::Bf16 {
-            buf: dit_ops::upload_16bit(dev, bytes)?,
-            rows,
-            cols,
-        }),
-    }
+    Ok(Weight {
+        bits: super::dit_gpu::ops::upload_16bit(dev, bytes)?,
+        n,
+        k,
+    })
 }
 
-/// A 1-D weight, widened to f32.
-///
-/// Every such weight is elementwise, so widening it on the host is exact for the
-/// checkpoint's dtypes.
+/// A 1-D weight, widened to f32 (exact for the checkpoint's float dtypes).
 fn vector(
     dev: &CudaDevice,
     file: &LbiFile,
@@ -835,44 +660,6 @@ fn vector(
     len: usize,
 ) -> Result<DevVec, TextGpuError> {
     let name = tensor_name(stem);
-    let entry = looked_up(file, &name, &[len as u64])?;
-    Storage::of(entry, &name)?;
+    looked_up(file, &name, &[len as u64])?;
     Ok(launch::upload(dev, &file.read_f32(&name)?)?)
-}
-
-/// The embedding table, uploaded in its stored dtype.
-///
-/// The stored bytes move straight across — no re-encoding — so the gather
-/// kernel's input format is the file's.
-fn load_embedding(
-    dev: &CudaDevice,
-    file: &LbiFile,
-    cfg: &TextEncoderConfig,
-) -> Result<DevEmbedding, TextGpuError> {
-    let name = tensor_name("embed_tokens");
-    let entry = looked_up(
-        file,
-        &name,
-        &[cfg.vocab_size as u64, cfg.hidden_size as u64],
-    )?;
-    let storage = Storage::of(entry, &name)?;
-    let bytes = file.tensor_bytes(&name).expect("entry resolved above");
-    Ok(DevEmbedding {
-        bytes: dev.htod_copy(bytes)?,
-        vocab: cfg.vocab_size,
-        hidden: cfg.hidden_size,
-        storage,
-    })
-}
-
-/// Compile a source and resolve one entry point from it.
-fn load_from_source(
-    dev: &CudaDevice,
-    source: &str,
-    name: &str,
-) -> Result<CudaFunction, RuntimeError> {
-    let module = dev.compile_and_load(source)?;
-    module
-        .load_function(name)
-        .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
 }

@@ -52,18 +52,28 @@ impl PipelinePaths {
     }
 
     /// Open every required file the way a generation will, without reading
-    /// weights: the text encoder's whole tensor manifest, the transformer's
-    /// and the VAE's configuration plus the tensors that identify each
-    /// container as that component at the expected shapes (stored as bf16
-    /// when `gpu`, which is what the device transformer multiplies), and the
-    /// tokenizer with the chat template's markers as whole tokens. A
-    /// checkpoint that fails here would fail every request after the text
-    /// model had been evicted for it.
+    /// weights: the text encoder's whole tensor manifest (and, when `gpu`,
+    /// everything the device text tower would refuse to load), the
+    /// transformer's and the VAE's configuration plus the tensors that
+    /// identify each container as that component at the expected shapes
+    /// (stored as bf16 when `gpu`, which is what the device transformer
+    /// multiplies), and the tokenizer with the chat template's markers as
+    /// whole tokens. A checkpoint that fails here would fail every request
+    /// after the text model had been evicted for it.
     pub fn check(&self, gpu: bool) -> Result<(), PipelineError> {
         let named = |path: &Path, e: &dyn std::fmt::Display| {
             PipelineError::Unsupported(format!("{}: {e}", path.display()))
         };
-        TextEncoder::load(&self.text_encoder).map_err(|e| named(&self.text_encoder, &e))?;
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+        let text =
+            TextEncoder::load(&self.text_encoder).map_err(|e| named(&self.text_encoder, &e))?;
+        #[cfg(feature = "cuda")]
+        if gpu {
+            let file =
+                LbiFile::open(&self.text_encoder).map_err(|e| named(&self.text_encoder, &e))?;
+            crate::cuda::text_gpu::TextGpu::check(&file, text.config())
+                .map_err(|e| named(&self.text_encoder, &e))?;
+        }
 
         let dit = DitConfig::qwen_image_2_1();
         let hidden = dit.inner_dim();

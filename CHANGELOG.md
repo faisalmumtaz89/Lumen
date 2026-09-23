@@ -29,6 +29,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   only the text encoder loads per image; a step that does not fit beside the resident
   transformer releases it and retries. On an RTX 5090 a 1024×1024 generation takes
   17.07 s instead of 18.42 s (median of 5 interleaved runs each), with identical images.
+- **Image prompt encoding in bf16 with the flash attention kernel.** The CUDA text
+  encoder rounds each operation to bf16 as the checkpoint's reference does and runs its
+  attention through the fused kernel: on an RTX 5090 the encoder's forward pass for an
+  8,212-token prompt takes 0.87 s instead of 367–392 s (three runs each), and an image
+  generated from the reference's starting noise is closer to the reference's (41.6 dB
+  PSNR instead of 40.4 dB). A text encoder the GPU path cannot load (a matrix not stored
+  as bf16, or a head width other than 128) is refused at startup.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

@@ -1121,16 +1121,18 @@ impl DitGpu {
             eps,
         )?;
 
-        // Safety: q and k are the `[seq, heads, 128]` bf16 operands the fused
-        // norm just produced and v the projection's f32 output of the same
-        // shape.
+        // q and k come truncated from the fused norm; v is truncated the same way here.
+        let v16 =
+            crate::cuda::attention::to_bf16(&self.dev, &self.kernels.f32_to_bf16_trunc, &v.buf)?;
+        // Safety: q, k and v16 are the `[seq, heads, 128]` bf16 operands the
+        // fused norm and the conversion just produced.
         let out = unsafe {
             crate::cuda::attention::fused_block_causal_attention(
                 &self.dev,
                 &self.kernels,
                 &q,
                 &k,
-                &v,
+                &v16,
                 text_count,
                 seq,
                 heads,

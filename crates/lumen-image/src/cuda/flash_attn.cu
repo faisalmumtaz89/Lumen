@@ -1,4 +1,4 @@
-// Fused block-causal attention for the DiT, bf16 operands on the tensor cores.
+// Fused block-causal attention for the DiT and the text tower, bf16 operands on the tensor cores.
 //
 // `out[q] = softmax(scale · Q[q] · Kᵀ) · V` over one head, without ever writing
 // the `[seq, seq]` scores: each block owns 64 query rows of one head and walks
@@ -9,12 +9,13 @@
 //
 // Mask: a text query (position < text_count) attends to keys [0, q]; an image
 // query attends to every key. That is the reference's
-// `(q >= kv) or same_image_block` rule for a text prefix followed by one
-// image block, which is the only layout the caller admits.
+// `(q >= kv) or same_image_block` rule for a text prefix followed by at most
+// one image block; a text prefix of the whole sequence is plain causal
+// attention.
 //
 // Layout: Q, K and V are `[seq, heads * 128]` bf16, one head's row being 128
 // contiguous elements at column `head * 128`; the output is the same shape,
-// rounded to bf16 (nearest even) because its only consumer is the `to_out`
+// rounded to bf16 (nearest even) because its consumer is the output
 // projection, a bf16 GEMM.
 //
 // Warp work split: four warps, each owning 16 query rows

@@ -37,8 +37,8 @@ LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \
 ```
 
 Both variables must be set together; the server checks every file it will need at
-startup (tensor shapes, the VAE configuration, the tokenizer's template markers) and
-refuses to start otherwise. `LUMEN_IMAGE_MODEL_ID` renames the served image model
+startup (tensor shapes, bf16 storage for the weights the CUDA path multiplies, the VAE
+configuration, the tokenizer's template markers) and refuses to start otherwise. `LUMEN_IMAGE_MODEL_ID` renames the served image model
 (default `Qwen-Image-2.1`); `LUMEN_IMAGE_DEVICE` selects `cuda` (default; `gpu` is an
 alias) or `cpu`.
 Every variable is described in [environment-variables.md](environment-variables.md).
