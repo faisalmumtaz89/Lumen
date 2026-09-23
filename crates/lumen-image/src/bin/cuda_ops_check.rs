@@ -75,7 +75,8 @@ unsafe fn fused_attention(
 ) -> Result<lumen_image::cuda::blas::Bf16Activation, String> {
     let q16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &q.buf).map_err(|e| e.to_string())?;
     let k16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &kk.buf).map_err(|e| e.to_string())?;
-    attention::fused_block_causal_attention(dev, k, &q16, &k16, v, text_count, seq, heads)
+    let v16 = attention::to_bf16(dev, &k.f32_to_bf16_trunc, &v.buf).map_err(|e| e.to_string())?;
+    attention::fused_block_causal_attention(dev, k, &q16, &k16, &v16, text_count, seq, heads)
         .map_err(|e| e.to_string())
 }
 

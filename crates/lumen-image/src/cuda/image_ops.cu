@@ -15,7 +15,7 @@
 // The last four are the per-op references `cuda-ops-check` runs; the DiT
 // forward itself runs the fused kernels in `dit_ops.cu` and `flash_attn.cu`.
 // `mrope_interleaved` is launched by nothing: the text tower rotates with
-// `rope_half_interleaved`.
+// `text_ops.cu`'s `rope_bf16`.
 //
 // NVRTC-compatible: no includes, extern "C" linkage.
 

@@ -1,4 +1,4 @@
-//! Block-causal attention for the DiT.
+//! Block-causal attention for the DiT and the text tower.
 //!
 //! Two implementations of `softmax(Q Kᵀ / √d) V` under the same mask:
 //!
@@ -111,22 +111,21 @@ pub unsafe fn block_causal_attention(
 
 /// [`block_causal_attention`] on the fused kernel: the same mask, the scores
 /// never leaving the tensor-core tiles, and the result rounded to bf16 for
-/// the `to_out` projection that consumes it.
+/// the output projection that consumes it.
 ///
-/// `q` and `k` arrive already converted (the per-head norm writes them as
-/// bf16); `v` is the projection's f32 output and is truncated here. The head
-/// width is fixed at 128 by the kernel's tiling.
+/// `q`, `k` and `v` arrive as bf16, each caller converting them the way its
+/// model does. The head width is fixed at 128 by the kernel's tiling; a text
+/// prefix of the whole sequence is plain causal attention.
 ///
 /// # Safety
 ///
-/// `q` and `k` must hold `seq * heads * 128` bf16 elements and `v` as many
-/// f32 elements.
+/// `q`, `k` and `v` must each hold `seq * heads * 128` bf16 elements.
 pub unsafe fn fused_block_causal_attention(
     dev: &CudaDevice,
     kernels: &ImageKernels,
     q: &CudaSlice<u16>,
     k: &CudaSlice<u16>,
-    v: &DevVec,
+    v: &CudaSlice<u16>,
     text_count: usize,
     seq: usize,
     heads: usize,
@@ -137,12 +136,12 @@ pub unsafe fn fused_block_causal_attention(
         ));
     }
     let expect = seq * heads * FLASH_HEAD_DIM;
-    if q.len() != expect || k.len() != expect || v.len != expect {
+    if q.len() != expect || k.len() != expect || v.len() != expect {
         return Err(RuntimeError::Compute(format!(
             "fused attention: q/k/v hold {}/{}/{} elements, expected {seq}x{heads}x{FLASH_HEAD_DIM}",
             q.len(),
             k.len(),
-            v.len
+            v.len()
         )));
     }
     if text_count > seq {
@@ -151,7 +150,6 @@ pub unsafe fn fused_block_causal_attention(
         )));
     }
     let text_count = text_count as u32;
-    let v16 = to_bf16(dev, &kernels.f32_to_bf16_trunc, &v.buf)?;
 
     // Safety: the output is written in full by the kernel: every row below
     // `seq` of every head.
@@ -168,7 +166,7 @@ pub unsafe fn fused_block_causal_attention(
             .launch_builder(&kernels.flash_attn)
             .arg(q)
             .arg(k)
-            .arg(&v16)
+            .arg(v)
             .arg(&mut out)
             .arg(&seq_u)
             .arg(&heads_u)

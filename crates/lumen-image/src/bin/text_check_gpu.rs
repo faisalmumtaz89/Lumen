@@ -3,16 +3,18 @@
 //!
 //! Three numbers per pair, so the check answers two questions at once:
 //!   - GPU vs the real checkpoint's hidden states: does the GPU path encode
-//!     correctly, at the checkpoint's own tolerance?
-//!   - GPU vs the CPU reference on the same ids: if the oracle is unavailable,
-//!     does the GPU path still agree with the module that is the specification?
+//!     the way the reference does?
+//!   - GPU vs the CPU module on the same ids: does the GPU path compute the
+//!     same function as the independent f32 implementation?
 //!
-//! The second comparison is the sharper one for a driver bug. `text_encoder.rs`
-//! already agrees with the checkpoint (rel-L2 8.79e-06), so a GPU path that
-//! matches it element for element inherits that agreement instead of arguing for
-//! a tolerance of its own. The failure this is written to catch is a
-//! correctly-shaped, finite tensor from a mislaid operand — the DiT had three
-//! such bugs and none of them showed up as anything but a numeric disagreement.
+//! The two paths round differently, so neither comparison is exact. The GPU
+//! path rounds to bf16 where the reference does and lands closer to the oracle
+//! (rel-L2 2.9e-02 on the `main` oracle tag) than the f32 CPU module
+//! (7.3e-02); the two differ from each other by the same order (5.5e-02 to
+//! 8.0e-02). The failure this is written to catch is a correctly-shaped,
+//! finite tensor from a mislaid operand — the DiT had three such bugs — which
+//! moves both numbers far past that rounding spread instead of by a fraction
+//! of it.
 //!
 //! Usage: `text-check-gpu <lbi-dir> <oracle-dir> [tag] [drop_idx]`
 
@@ -137,8 +139,8 @@ fn run() -> Result<(), String> {
 
     let lbi = lbi_dir.join("text_encoder.lbi");
 
-    // The CPU reference first: it needs no device, and its output is the
-    // element-for-element target for the GPU path.
+    // The CPU module first: it needs no device, and its output is the
+    // independent f32 path the GPU result is compared against.
     let t0 = Instant::now();
     let cpu = TextEncoder::load(&lbi).map_err(|e| format!("{e}"))?;
     let cpu_hidden = cpu.forward(&valid).map_err(|e| format!("{e}"))?;

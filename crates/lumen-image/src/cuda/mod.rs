@@ -28,10 +28,9 @@ pub const IMAGE_OPS_SOURCE: &str = include_str!("image_ops.cu");
 
 /// The text tower's kernel source, compiled by NVRTC at load.
 ///
-/// Separate from `IMAGE_OPS_SOURCE` because NVRTC compiles each source into its
-/// own module: `text_ops.cu` needs entry points of its own (`embed_gather`,
-/// `rope_half_interleaved`, `attn_causal_gqa`), and `text_gpu` also resolves
-/// `gemm_16bit` from `DIT_OPS_SOURCE` at the same time.
+/// The tower's bf16 elementwise, norm, rotary and gather kernels, in a source
+/// of their own because NVRTC compiles each source into its own module; its
+/// projections and attention use the shared cuBLAS and flash paths.
 pub const TEXT_OPS_SOURCE: &str = include_str!("text_ops.cu");
 
 /// The fused attention kernel's source. Its own module because it targets

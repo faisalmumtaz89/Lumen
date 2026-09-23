@@ -1,258 +1,207 @@
-// Kernels the text tower's GPU forward needs that no other source provides.
+// Kernels for the text tower's GPU forward, in the reference's arithmetic.
 //
-// Reused unchanged, from sources this crate already compiles:
-//   - gemm_16bit        (dit_ops.cu)   the projections, against BF16/F16 weights
-//   - rmsnorm_per_head  (lumen-runtime's norm.cu), shared-weight mode
-//   - swiglu_inplace    (lumen-runtime's activations.cu)  silu(gate) * up
-//   - residual_add      (lumen-runtime's activations.cu)  the residual adds
+// The reference runs the tower in bf16: every tensor between two operations is
+// bf16, and each operation computes in f32 and rounds its result to bf16 once
+// (nearest even). These kernels take and return bf16 (as `unsigned short`
+// bits) and round exactly where the reference does, so the tower's output
+// follows the reference's instead of drifting from it layer by layer.
+//
+// Reused from sources this crate already compiles:
+//   - the projections: `blas::gemm_bf16` (cuBLAS, f32 accumulate) rounded to
+//     bf16 once by `f32_to_bf16_bits`
+//   - the attention: `flash_attn_bf16` with the whole prompt as its causal
+//     text prefix, after `repeat_kv` gives every query head its key/value head
 //
 // Written here:
-//   - embed_gather           gather the prompt's rows out of the embedding table
-//   - rope_half_interleaved  the text tower's interleaved mRoPE
-//   - attn_causal_gqa        causal grouped-query attention
-//
-// Two kernels that look reusable are not, and the reasons are worth recording
-// because both failures would produce a correctly-shaped, finite, wrong tensor.
+//   - embed_gather_bf16  the prompt's rows of the bf16 embedding table
+//   - rms_norm_bf16      RMSNorm: f32 in the norm, rounded, times the weight, rounded
+//   - rope_bf16          the tower's half-split rotary, each product and the sum rounded
+//   - repeat_kv          key/value heads expanded to the query heads they serve
+//   - silu_mul_bf16      silu(gate) rounded, times up, rounded
+//   - add_bf16           the residual adds
 //
 // *Rotation.* `image_ops.cu`'s `mrope_interleaved` rotates adjacent complex
-// pairs *within* a head, pairing channel 2p with channel 2p+1, and takes a
-// single real-frequency plane. `text_encoder.rs`'s `apply_rope` pairs channel j
-// with channel j + head_dim/2 against one shared angle, over a `cos`/`sin` table
-// that is itself interleaved across the rotary slots. The two are different
-// layouts and not interchangeable, so `rope_half_interleaved` mirrors
-// `apply_rope` channel for channel.
+// pairs *within* a head, pairing channel 2p with channel 2p+1. This tower pairs
+// channel j with channel j + head_dim/2 (`rotate_half`) against one shared
+// angle, so the two are not interchangeable.
 //
-// *Attention.* `image_ops.cu`'s `attn_block_causal` indexes its keys and values
-// with the *query* head index (`kbase = ((kj * heads) + h) * head_dim`), so it
-// is one query head per key/value head by construction. This tower is grouped:
-// 32 query heads over 8 key/value heads, with `groups = 4` consecutive query
-// heads sharing one key/value head. Calling it here would read the wrong key
-// heads and still return a finite tensor of the right shape. `attn_causal_gqa`
-// carries the GQA mapping instead.
+// *Grouped heads.* 32 query heads over 8 key/value heads: `groups = 4`
+// consecutive query heads share one key/value head (`repeat_kv`, which is
+// `repeat_interleave` over the head axis).
 //
 // NVRTC-compatible: no includes, extern "C" linkage.
 
-#define TEXT_ATTN_THREADS 1024
+#define TEXT_NORM_THREADS 256
 
-// ---------------------------------------------------------------------------
-// Widen one stored 16-bit float to f32.
-//
-// A second copy of `dit_ops.cu`'s `widen16` because NVRTC compiles each source
-// into its own module, so a `__device__` helper in one is not visible to the
-// other. Named apart from it so the two can never collide.
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ float embed_widen16(unsigned short h, unsigned int is_bf16)
+__device__ __forceinline__ float bf16_to_f32(unsigned short h)
 {
-    if (is_bf16 != 0) {
-        // BF16 is the upper half of an IEEE f32.
-        union { unsigned int u; float f; } cv;
-        cv.u = ((unsigned int)h) << 16;
-        return cv.f;
+    return __uint_as_float(((unsigned int)h) << 16);
+}
+
+// f32 -> bf16, nearest even. A second copy of `image_ops.cu`'s helper, because
+// NVRTC compiles each source into its own module.
+__device__ __forceinline__ unsigned short text_bf16_rne(float val)
+{
+    unsigned int bits = __float_as_uint(val);
+    // Keep a NaN a NaN: force a mantissa bit so the round cannot carry to inf.
+    if (((bits >> 23) & 0xffu) == 0xffu && (bits & 0x7fffffu) != 0u) {
+        return (unsigned short)((bits >> 16) | 0x0040u);
     }
-    // f16 -> f32 is a single hardware convert (SM 53+).
-    float r;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
-    return r;
-}
-
-// Little-endian scalar decoders, matching `text_encoder.rs::decode_row`.
-__device__ __forceinline__ unsigned short embed_u16le(const unsigned char* p)
-{
-    return (unsigned short)((unsigned int)p[0] | ((unsigned int)p[1] << 8));
-}
-
-__device__ __forceinline__ float embed_f32le(const unsigned char* p)
-{
-    unsigned int u = (unsigned int)p[0] | ((unsigned int)p[1] << 8)
-                   | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
-    union { unsigned int u; float f; } cv;
-    cv.u = u;
-    return cv.f;
+    unsigned int lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return (unsigned short)(bits >> 16);
 }
 
 // ---------------------------------------------------------------------------
-// Gather a prompt's embedding rows straight out of the stored table.
+// Gather the prompt's rows out of the resident bf16 embedding table.
 //
-// `text_encoder.rs::embed` reads only the rows the prompt addresses, never the
-// whole table, and this does the same on the device: the table stays resident in
-// its stored dtype (BF16, ~1.16 GiB for the shipped 151936x4096 vocabulary) and
-// the gathered rows are widened to f32 here, rather than expanding the whole
-// table to f32 and adding ~1.3 GiB to a forward whose weights are 14.1 GiB.
-//
-// `dtype` is the `.lbi` storage scheme: 0 = F16, 1 = BF16, 2 = F32. Every id is
-// range-checked against the vocabulary on the host before the upload, so
-// `ids[row] < vocab` and each gathered row lies inside the buffer.
-//
-// One block per prompt position; `blockDim.x` threads stride over the hidden
-// width.
+// Every id is range-checked against the vocabulary on the host, so each
+// gathered row lies inside the table. One block per prompt position.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void embed_gather(
-    const unsigned char* __restrict__ table,  // [vocab, hidden] at the stored width
-    const unsigned int* __restrict__ ids,     // [seq]
-    float* __restrict__ out,                  // [seq, hidden]
+extern "C" __global__ void embed_gather_bf16(
+    const unsigned short* __restrict__ table,  // [vocab, hidden]
+    const unsigned int* __restrict__ ids,      // [seq]
+    unsigned short* __restrict__ out,          // [seq, hidden]
     unsigned int seq,
-    unsigned int hidden,
-    unsigned int dtype)
+    unsigned int hidden)
 {
     unsigned int row = blockIdx.x;
     if (row >= seq) return;
-
-    unsigned int width = (dtype == 2) ? 4u : 2u;
-    const unsigned char* src = table + (unsigned long long)ids[row] * hidden * width;
-    float* dst = out + (unsigned long long)row * hidden;
-
+    const unsigned short* src = table + (unsigned long long)ids[row] * hidden;
+    unsigned short* dst = out + (unsigned long long)row * hidden;
     for (unsigned int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        const unsigned char* p = src + (unsigned long long)i * width;
-        float v;
-        if (dtype == 0) {
-            v = embed_widen16(embed_u16le(p), 0u);
-        } else if (dtype == 1) {
-            v = embed_widen16(embed_u16le(p), 1u);
-        } else {
-            v = embed_f32le(p);
-        }
-        dst[i] = v;
+        dst[i] = src[i];
     }
 }
 
 // ---------------------------------------------------------------------------
-// The text tower's mRoPE, in place on one `[seq, heads, head_dim]` tensor.
+// RMSNorm over each `dim`-wide row, as the reference computes it:
 //
-// `text_encoder.rs::apply_rope` is, for every head:
+//     y   = bf16(x * rsqrt(mean(x^2) + eps))     in f32, then rounded
+//     out = bf16(weight * y)                     the bf16 weight times y, rounded
 //
-//     out[j]          = x[j]          * cos[j]          - x[j + half] * sin[j]
-//     out[j + half]   = x[j + half]   * cos[j + half]   + x[j]        * sin[j + half]
-//
-// with `half = head_dim / 2` and `cos`/`sin` the `[seq, head_dim]` table
-// `rope_tables` builds (whose second half repeats its first). `v` carries no
-// norm and no rotation; `q` and `k` are rotated by their own callers.
-//
-// One block per position, `blockDim.x` threads over the rotary slots, striding
-// over the heads; the four trig values are hoisted out of the head loop because
-// every head of a position shares them.
+// The weight arrives widened to f32, which is exact for a bf16 weight. One
+// block of TEXT_NORM_THREADS per row.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void rope_half_interleaved(
-    float* __restrict__ x,                // [seq, heads * head_dim], in place
-    const float* __restrict__ cos_tab,    // [seq, head_dim]
-    const float* __restrict__ sin_tab,    // [seq, head_dim]
+extern "C" __global__ void rms_norm_bf16(
+    const unsigned short* __restrict__ x,  // [rows, dim]
+    const float* __restrict__ weight,      // [dim]
+    unsigned short* __restrict__ out,      // [rows, dim]
+    unsigned int dim,
+    float eps)
+{
+    __shared__ float partial[TEXT_NORM_THREADS / 32];
+    const unsigned short* xr = x + (unsigned long long)blockIdx.x * dim;
+    unsigned short* orow = out + (unsigned long long)blockIdx.x * dim;
+
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = bf16_to_f32(xr[i]);
+        sum += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    if (lane == 0) partial[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < (blockDim.x >> 5) ? partial[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        if (lane == 0) partial[0] = sum;
+    }
+    __syncthreads();
+    float scale = rsqrtf(partial[0] / (float)dim + eps);
+
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float y = bf16_to_f32(text_bf16_rne(bf16_to_f32(xr[i]) * scale));
+        orow[i] = text_bf16_rne(weight[i] * y);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The half-split rotary, in place on `[seq, heads, head_dim]`:
+//
+//     out = bf16( bf16(x * cos) + bf16(rotate_half(x) * sin) )
+//
+// with `rotate_half(x) = [-x[half:], x[:half]]` and `cos`/`sin` the bf16
+// `[seq, head_dim]` tables (their second half repeats the first). One block per
+// position, threads over the rotary slots, each looping over the heads.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void rope_bf16(
+    unsigned short* __restrict__ x,             // [seq, heads * head_dim], in place
+    const unsigned short* __restrict__ cos_tab, // [seq, head_dim]
+    const unsigned short* __restrict__ sin_tab, // [seq, head_dim]
     unsigned int seq,
     unsigned int heads,
     unsigned int head_dim)
 {
     unsigned int s = blockIdx.x;
-    unsigned int slots = head_dim >> 1;
+    unsigned int half = head_dim >> 1;
     if (s >= seq) return;
-
     unsigned long long trig = (unsigned long long)s * head_dim;
-    for (unsigned int j = threadIdx.x; j < slots; j += blockDim.x) {
-        float cl = cos_tab[trig + j];
-        float sl = sin_tab[trig + j];
-        float ch = cos_tab[trig + j + slots];
-        float sh = sin_tab[trig + j + slots];
+    for (unsigned int j = threadIdx.x; j < half; j += blockDim.x) {
+        float cl = bf16_to_f32(cos_tab[trig + j]), sl = bf16_to_f32(sin_tab[trig + j]);
+        float ch = bf16_to_f32(cos_tab[trig + j + half]), shi = bf16_to_f32(sin_tab[trig + j + half]);
         for (unsigned int h = 0; h < heads; h++) {
             unsigned long long base = ((unsigned long long)s * heads + h) * head_dim;
-            float lo = x[base + j];
-            float hi = x[base + j + slots];
-            x[base + j] = lo * cl - hi * sl;
-            x[base + j + slots] = hi * ch + lo * sh;
+            float lo = bf16_to_f32(x[base + j]);
+            float hi = bf16_to_f32(x[base + j + half]);
+            float lo_c = bf16_to_f32(text_bf16_rne(lo * cl));
+            float hi_s = bf16_to_f32(text_bf16_rne(-hi * sl));
+            float hi_c = bf16_to_f32(text_bf16_rne(hi * ch));
+            float lo_s = bf16_to_f32(text_bf16_rne(lo * shi));
+            x[base + j] = text_bf16_rne(lo_c + hi_s);
+            x[base + j + half] = text_bf16_rne(hi_c + lo_s);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Causal grouped-query attention.
-//
-// Mirrors `text_encoder.rs::attention` one score at a time: the same `dot *
-// scale`, the same max-subtraction softmax, the same `p * v` accumulation with
-// keys ascending, and the same GQA mapping — `kv = h / groups`, so a block of
-// `groups` consecutive query heads shares one key/value head, which is
-// `repeat_interleave` over the head axis.
-//
-// Causality is by construction, as in the reference: query `qi` forms scores
-// only for keys `0..=qi`. The reference adds -inf to the future scores and
-// softmaxes them to zero, which is the same thing as never forming them.
-//
-// One block per (query position, query head); `blockDim.x` threads stride over
-// the head dimension. Each thread walks the full head when forming a dot — the
-// same redundancy `attn_block_causal` uses — so no block-wide reduction is
-// needed and every thread computes the identical score. Only the owning thread
-// writes each output channel, so a channel accumulates its keys in ascending
-// order, exactly as the reference's inner loop does.
+// `[seq, nkv, head_dim]` -> `[seq, nkv * groups, head_dim]`: query head h reads
+// key/value head h / groups. One thread per output element.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void attn_causal_gqa(
-    const float* __restrict__ q,     // [seq, nq * head_dim]
-    const float* __restrict__ k,     // [seq, nkv * head_dim]
-    const float* __restrict__ v,     // [seq, nkv * head_dim]
-    float* __restrict__ out,         // [seq, nq * head_dim]
+extern "C" __global__ void repeat_kv(
+    const unsigned short* __restrict__ src,
+    unsigned short* __restrict__ dst,
     unsigned int seq,
-    unsigned int nq,
     unsigned int nkv,
-    unsigned int head_dim,
-    float scale)
+    unsigned int groups,
+    unsigned int head_dim)
 {
-    unsigned int qi = blockIdx.x;
-    unsigned int h = blockIdx.y;
-    if (qi >= seq || h >= nq) return;
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long nq = (unsigned long long)nkv * groups;
+    if (i >= (unsigned long long)seq * nq * head_dim) return;
+    unsigned long long d = i % head_dim;
+    unsigned long long h = (i / head_dim) % nq;
+    unsigned long long s = i / (head_dim * nq);
+    dst[i] = src[(s * nkv + h / groups) * head_dim + d];
+}
 
-    unsigned int groups = nq / nkv;
-    unsigned int kvh = h / groups;
-    unsigned int tid = threadIdx.x;
+// ---------------------------------------------------------------------------
+// out = bf16( bf16(silu(gate)) * up ), silu computed in f32 as x / (1 + e^-x).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void silu_mul_bf16(
+    const unsigned short* __restrict__ gate,
+    const unsigned short* __restrict__ up,
+    unsigned short* __restrict__ out,
+    unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = bf16_to_f32(gate[i]);
+    float a = bf16_to_f32(text_bf16_rne(g / (1.0f + expf(-g))));
+    out[i] = text_bf16_rne(a * bf16_to_f32(up[i]));
+}
 
-    extern __shared__ float sh[];
-    float* qrow = sh;
-    float* orow = sh + head_dim;
-
-    unsigned long long qbase = ((unsigned long long)qi * nq + h) * head_dim;
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        qrow[d] = q[qbase + d];
-        orow[d] = 0.0f;
-    }
-    __syncthreads();
-
-    unsigned long long kvoff = (unsigned long long)kvh * head_dim;
-
-    // Pass 1: the peak score, keys ascending. -1e30 matches the sentinel
-    // `attn_block_causal` uses; a query always has at least key 0, so the peak
-    // is a real score by the end of the loop and the sentinel never survives.
-    float peak = -1e30f;
-    for (unsigned int kj = 0; kj <= qi; kj++) {
-        const float* krow = k + (unsigned long long)kj * nkv * head_dim + kvoff;
-        float dot = 0.0f;
-        for (unsigned int d = 0; d < head_dim; d++) {
-            dot += qrow[d] * krow[d];
-        }
-        float score = dot * scale;
-        if (score > peak) peak = score;
-    }
-
-    // Pass 2: the softmax denominator.
-    float total = 0.0f;
-    for (unsigned int kj = 0; kj <= qi; kj++) {
-        const float* krow = k + (unsigned long long)kj * nkv * head_dim + kvoff;
-        float dot = 0.0f;
-        for (unsigned int d = 0; d < head_dim; d++) {
-            dot += qrow[d] * krow[d];
-        }
-        total += expf(dot * scale - peak);
-    }
-    float inv = 1.0f / total;
-
-    // Pass 3: the weighted sum, one owning thread per output channel.
-    for (unsigned int kj = 0; kj <= qi; kj++) {
-        unsigned long long kbase = (unsigned long long)kj * nkv * head_dim + kvoff;
-        const float* krow = k + kbase;
-        const float* vrow = v + kbase;
-        float dot = 0.0f;
-        for (unsigned int d = 0; d < head_dim; d++) {
-            dot += qrow[d] * krow[d];
-        }
-        float p = expf(dot * scale - peak) * inv;
-        for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-            orow[d] += p * vrow[d];
-        }
-    }
-
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        out[qbase + d] = orow[d];
-    }
+// ---------------------------------------------------------------------------
+// out = bf16(a + b), the residual adds.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void add_bf16(
+    const unsigned short* __restrict__ a,
+    const unsigned short* __restrict__ b,
+    unsigned short* __restrict__ out,
+    unsigned int n)
+{
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = text_bf16_rne(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
 }
