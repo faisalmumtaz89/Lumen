@@ -89,6 +89,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   fixed number of rows and write the same buffer, which is what makes banded and one-pass
   decodes identical: images differ from earlier builds in the last bits, with the same
   distance to the reference (PSNR 46.02 dB against 46.01).
+- **Faster image attention.** The attention kernel shared by the image transformer and its
+  text encoder lays out its shared-memory tiles with swizzled 16-byte chunks instead of
+  padded rows. The smaller tiles and fewer registers let three blocks run on each
+  multiprocessor of an RTX 5090 instead of two; the output is unchanged bit for bit. Between
+  the transformer's matrix products one attention call takes 1.50 ms instead of 1.59 ms at
+  1024×1024 and 93.6 ms instead of 99.7 ms at 3840×2176, and a 40-step 1024×1024 image
+  takes 13.78 s instead of 13.90 s on average.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

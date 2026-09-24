@@ -28,8 +28,14 @@
 // The C layout of two adjacent 8-column tiles is the A layout of one 16-wide
 // k-slab, which is what lets P feed the P·V product straight from registers.
 //
-// Shared rows are padded to 136 elements (272 bytes) so the eight row reads of
-// an `ldmatrix` land in distinct bank groups.
+// Shared tiles are 128 elements (256 bytes) a row with their 16-byte chunks
+// XOR-swizzled by the row (`fa_swz`): the eight row reads of an `ldmatrix`
+// land on eight distinct chunks, and eight threads copying eight adjacent
+// chunks (half a row) fill one aligned 128-byte span, so neither the fragment
+// loads nor the tile copies conflict. The swizzle only places values; the
+// arithmetic is the same as with plain rows. Without padding the two tiles take
+// 32 KiB, which with the kernel's registers leaves room for three blocks per
+// multiprocessor on an RTX 5090.
 //
 // The key and value tiles arrive by `cp.async`, one buffer each: V(t) is copied
 // while Q Kᵀ(t) and the softmax run, and K(t+1) while P V(t) runs, so the
@@ -49,11 +55,17 @@
 #define FA_BQ 64
 #define FA_BK 64
 #define FA_D 128
-#define FA_PAD 136
 #define FA_THREADS 128
 // A score below this is masked; the running maxima start here.
 #define FA_NEG_INF (-1e30f)
 #define FA_MASKED (-1e29f)
+
+// Element offset of (row, col) in a tile of 128-element rows whose 16-byte
+// chunks are XOR-swizzled by the row; `col` is a multiple of 8.
+__device__ __forceinline__ unsigned int fa_swz(unsigned int row, unsigned int col)
+{
+    return row * FA_D + (((col >> 3) ^ (row & 7u)) << 3);
+}
 
 __device__ __forceinline__ unsigned int fa_pack_bf16(float lo, float hi)
 {
@@ -115,7 +127,7 @@ __device__ __forceinline__ void fa_cp_commit()
 #define FA_CP_WAIT(n) asm volatile("cp.async.wait_group " #n ";\n" ::)
 
 // Start copying a 64x128 bf16 tile (rows `row0..row0+64` of one head) into
-// padded shared memory; rows past `seq` are zero-filled.
+// swizzled shared memory; rows past `seq` are zero-filled.
 __device__ __forceinline__ void fa_load_tile_async(
     unsigned short* dst,
     const unsigned short* __restrict__ src,
@@ -130,11 +142,11 @@ __device__ __forceinline__ void fa_load_tile_async(
         unsigned int row = row0 + r;
         bool inside = row < seq;
         const unsigned short* from = src + (unsigned long long)(inside ? row : 0u) * row_stride + c;
-        fa_cp_async16(fa_smem_addr(dst + r * FA_PAD + c), from, inside ? 16u : 0u);
+        fa_cp_async16(fa_smem_addr(dst + fa_swz(r, c)), from, inside ? 16u : 0u);
     }
 }
 
-// Copy a 64x128 bf16 tile (rows `row0..row0+64` of one head) into padded
+// Copy a 64x128 bf16 tile (rows `row0..row0+64` of one head) into swizzled
 // shared memory; rows past `seq` are zero-filled.
 __device__ __forceinline__ void fa_load_tile(
     unsigned short* dst,
@@ -153,7 +165,7 @@ __device__ __forceinline__ void fa_load_tile(
         if (row < seq) {
             v = *(const uint4*)(src + (unsigned long long)row * row_stride + c);
         }
-        *(uint4*)(dst + r * FA_PAD + c) = v;
+        *(uint4*)(dst + fa_swz(r, c)) = v;
     }
 }
 
@@ -168,8 +180,8 @@ flash_attn_bf16(
     unsigned int text_count,
     float scale_log2)                       // softmax scale times log2(e)
 {
-    __shared__ __align__(16) unsigned short s_k[FA_BK * FA_PAD];
-    __shared__ __align__(16) unsigned short s_v[FA_BK * FA_PAD];
+    __shared__ __align__(128) unsigned short s_k[FA_BK * FA_D];
+    __shared__ __align__(128) unsigned short s_v[FA_BK * FA_D];
 
     const unsigned int tid = threadIdx.x;
     const unsigned int warp = tid >> 5;
@@ -196,7 +208,7 @@ flash_attn_bf16(
         unsigned int c = (lane >> 4) * 8;
         for (unsigned int ks = 0; ks < 8; ks++) {
             fa_ldmatrix_x4(qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3],
-                           fa_smem_addr(s_k + r * FA_PAD + ks * 16 + c));
+                           fa_smem_addr(s_k + fa_swz(r, ks * 16 + c)));
         }
     }
     __syncthreads();
@@ -236,7 +248,7 @@ flash_attn_bf16(
                 unsigned int key = np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
                 unsigned int kc = ks * 16 + ((lane >> 3) & 1) * 8;
                 unsigned int b0, b1, b2, b3;
-                fa_ldmatrix_x4(b0, b1, b2, b3, fa_smem_addr(s_k + key * FA_PAD + kc));
+                fa_ldmatrix_x4(b0, b1, b2, b3, fa_smem_addr(s_k + fa_swz(key, kc)));
                 fa_mma(s[np * 2], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], b0, b1);
                 fa_mma(s[np * 2 + 1], qa[ks][0], qa[ks][1], qa[ks][2], qa[ks][3], b2, b3);
             }
@@ -337,7 +349,7 @@ flash_attn_bf16(
                 unsigned int key = slab * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
                 unsigned int dc = np * 16 + ((lane >> 4) & 1) * 8;
                 unsigned int b0, b1, b2, b3;
-                fa_ldmatrix_x4_trans(b0, b1, b2, b3, fa_smem_addr(s_v + key * FA_PAD + dc));
+                fa_ldmatrix_x4_trans(b0, b1, b2, b3, fa_smem_addr(s_v + fa_swz(key, dc)));
                 fa_mma(o[np * 2], p[slab][0], p[slab][1], p[slab][2], p[slab][3], b0, b1);
                 fa_mma(o[np * 2 + 1], p[slab][0], p[slab][1], p[slab][2], p[slab][3], b2, b3);
             }
