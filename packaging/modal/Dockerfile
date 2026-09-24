@@ -45,10 +45,12 @@ RUN apt-get update \
 # The prebuilt shippable binaries. Populate ./bin first (see README.md):
 #   scp <build-host>:.../release/lumen-server packaging/modal/bin/
 #   scp <build-host>:.../release/lumen        packaging/modal/bin/
+#   scp <build-host>:.../release/lbi-convert  packaging/modal/bin/
 COPY bin/lumen-server /opt/lumen/bin/lumen-server
 COPY bin/lumen        /opt/lumen/bin/lumen
+COPY bin/lbi-convert  /opt/lumen/bin/lbi-convert
 COPY LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md /opt/lumen/
-RUN chmod +x /opt/lumen/bin/lumen-server /opt/lumen/bin/lumen
+RUN chmod +x /opt/lumen/bin/lumen-server /opt/lumen/bin/lumen /opt/lumen/bin/lbi-convert
 
 ENV PATH="/opt/lumen/bin:${PATH}"
 # Default PTX cache location (override by mounting a volume + LUMEN_CACHE_DIR).

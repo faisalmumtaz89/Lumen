@@ -2,7 +2,8 @@
 
 `lumen-server` can serve Qwen-Image-2.1 text-to-image next to a text model on one
 CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in with the
-`image` Cargo feature.
+`image` Cargo feature. The Linux/CUDA release tarball and Docker image ship a
+`lumen-server` built with it and the `lbi-convert` converter.
 
 ## Requirements
 
@@ -21,7 +22,8 @@ The pipeline reads three `.lbi` containers converted from the Qwen-Image-2.1 che
 directory (the one holding `transformer/`, `vae/`, `text_encoder/` and `processor/`):
 
 ```sh
-cargo run --release -p lumen-image --bin lbi-convert -- /path/to/Qwen-Image-2.1 /path/to/lbi
+lbi-convert /path/to/Qwen-Image-2.1 /path/to/lbi
+# from source: cargo run --release -p lumen-image --bin lbi-convert -- <same arguments>
 ```
 
 This writes `transformer.lbi`, `vae.lbi` and `text_encoder.lbi`. The checkpoint's
@@ -31,7 +33,7 @@ directly at run time.
 ## Run
 
 ```sh
-cargo build --release -p lumen-server --features bin,cuda,image
+# from source: cargo build --release -p lumen-server --features bin,cuda,image
 LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \
   lumen-server qwen3.8-27b:q4_0 --backend cuda
 ```

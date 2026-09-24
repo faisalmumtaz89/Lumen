@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **Image generation in the Linux/CUDA release.** The release tarball and Docker image
+  ship a `lumen-server` built with the `image` feature and the `lbi-convert` checkpoint
+  converter, so Qwen-Image-2.1 serving needs no source build; see
+  `docs/image-generation.md`.
 - **Text-to-image serving.** `lumen-server --features image` exposes
   `POST /v1/images/generations` for Qwen-Image-2.1, converted to three `.lbi` containers
   by the new `lumen-image` crate's `lbi-convert`. On a CUDA device shared with the text
