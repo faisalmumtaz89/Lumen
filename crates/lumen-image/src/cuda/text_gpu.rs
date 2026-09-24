@@ -142,6 +142,67 @@ struct GpuLayer {
     down_proj: Weight,
 }
 
+impl GpuLayer {
+    /// Whether the layer has the shapes `c` gives a layer. The output widths
+    /// and norm lengths pin every dimension the layer's inputs have too.
+    fn fits(&self, c: &TextEncoderConfig) -> bool {
+        let q_width = c.num_attention_heads * c.head_dim;
+        let kv_width = c.num_key_value_heads * c.head_dim;
+        self.q_proj.n == q_width
+            && self.k_proj.n == kv_width
+            && self.v_proj.n == kv_width
+            && self.o_proj.n == c.hidden_size
+            && self.gate_proj.n == c.intermediate_size
+            && self.up_proj.n == c.intermediate_size
+            && self.down_proj.n == c.hidden_size
+            && self.input_norm.len == c.hidden_size
+            && self.post_norm.len == c.hidden_size
+            && self.q_norm.len == c.head_dim
+            && self.k_norm.len == c.head_dim
+    }
+
+    /// The device bytes of the layer's weights.
+    fn bytes(&self) -> usize {
+        let matrices = [
+            &self.q_proj,
+            &self.k_proj,
+            &self.v_proj,
+            &self.o_proj,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ];
+        let norms = [
+            &self.input_norm,
+            &self.q_norm,
+            &self.k_norm,
+            &self.post_norm,
+        ];
+        matrices.iter().map(|w| w.bits.len() * 2).sum::<usize>()
+            + norms.iter().map(|v| v.len * 4).sum::<usize>()
+    }
+}
+
+/// Decoder layers kept on the device between loads, the first ones in order:
+/// a load given them uploads only the layers after them.
+#[derive(Default)]
+pub struct ResidentLayers {
+    layers: Vec<GpuLayer>,
+    /// The device the layers live on.
+    ordinal: usize,
+}
+
+impl ResidentLayers {
+    /// How many layers are kept.
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+}
+
 /// The entry points `text_ops.cu` provides.
 struct TextOps {
     rms_norm: CudaFunction,
@@ -191,7 +252,7 @@ impl<'a> TextGpu<'a> {
     /// device, assuming the shipped Qwen-Image-2.1 architecture.
     pub fn load(file: &'a LbiFile, dev: &CudaDevice) -> Result<Self, TextGpuError> {
         let config = TextEncoderConfig::from_lbi_config(file.config())?;
-        Self::load_with(file, None, dev, config)
+        Self::load_with(file, None, dev, config, ResidentLayers::default())
     }
 
     /// Load against an explicit architecture.
@@ -201,14 +262,31 @@ impl<'a> TextGpu<'a> {
     /// dimensions here are bounded and the products below cannot overflow.
     ///
     /// A matrix with a copy in `pinned` is uploaded from that copy instead of
-    /// the file's mapping.
+    /// the file's mapping. The layers in `resident`, kept from an earlier load
+    /// of the same file (see [`Self::into_resident`]), are used as they are and
+    /// only the layers after them are uploaded.
     pub fn load_with(
         file: &'a LbiFile,
         pinned: Option<&PinnedMatrices>,
         dev: &CudaDevice,
         config: TextEncoderConfig,
+        resident: ResidentLayers,
     ) -> Result<Self, TextGpuError> {
         Self::check(file, &config)?;
+        let elsewhere = !resident.layers.is_empty() && resident.ordinal != dev.ctx.ordinal();
+        if elsewhere
+            || resident.layers.len() > config.num_layers
+            || !resident.layers.iter().all(|l| l.fits(&config))
+        {
+            return Err(TextEncoderError::BadConfig(format!(
+                "{} resident layers on device {} do not fit this tower of {} layers on device {}",
+                resident.layers.len(),
+                resident.ordinal,
+                config.num_layers,
+                dev.ctx.ordinal()
+            ))
+            .into());
+        }
 
         let own = CudaDevice::new(dev.ctx.ordinal())?;
         let kernels = ImageKernels::load(&own)?;
@@ -223,8 +301,8 @@ impl<'a> TextGpu<'a> {
             .tensor_bytes(&embed_name)
             .expect("entry resolved above");
 
-        let mut layers = Vec::with_capacity(c.num_layers);
-        for i in 0..c.num_layers {
+        let mut layers = resident.layers;
+        for i in layers.len()..c.num_layers {
             let p = format!("layers.{i}");
             let w = |stem: &str, n, k| matrix(&own, file, pinned, &format!("{p}.{stem}"), n, k);
             let v = |stem: &str, len| vector(&own, file, &format!("{p}.{stem}"), len);
@@ -274,6 +352,27 @@ impl<'a> TextGpu<'a> {
 
     pub fn config(&self) -> &TextEncoderConfig {
         &self.config
+    }
+
+    /// Keep the longest run of layers from the first whose weights fit in
+    /// `budget` bytes, for a later [`Self::load_with`], and free the rest.
+    pub fn into_resident(self, budget: usize) -> ResidentLayers {
+        let ordinal = self.dev.ctx.ordinal();
+        let mut used = 0usize;
+        let layers = self
+            .layers
+            .into_iter()
+            .take_while(|layer| {
+                used += layer.bytes();
+                used <= budget
+            })
+            .collect();
+        ResidentLayers { layers, ordinal }
+    }
+
+    /// The device bytes of every layer's weights, resident or uploaded.
+    pub fn layer_bytes(&self) -> usize {
+        self.layers.iter().map(GpuLayer::bytes).sum()
     }
 
     /// Encode a prompt to `[seq, hidden]`, **without** the final RMS norm.

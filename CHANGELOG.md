@@ -72,6 +72,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   embedding table: the prompt's rows are read from the container and only they reach the
   device. Each generation moves 12.9 GiB instead of 14.1 GiB and the page-locked copy
   is as much smaller, with identical images.
+- **Image text-encoder layers kept between generations.** With the transformer and VAE
+  resident, the text encoder's first layers also stay on the device when there is room:
+  each image size's device-memory need is measured on a generation that keeps the
+  transformer loaded, and later generations of that size keep as many layers as leave
+  that room plus 512 MiB, loading only the rest; a denoising or decoding step that runs
+  out of memory anyway drops them and retries. On an RTX 5090, repeated 1024×1024 generations settle at a
+  2.9 GiB encoder upload instead of 12.9 GiB, and the time from the first upload to the
+  first denoising step falls from 538 ms to 133 ms, with identical images.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.
