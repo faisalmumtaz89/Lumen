@@ -7,8 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-09-25
+
 ### Added
 
+- **Image generation in the Linux/CUDA release.** The release tarball and Docker image
+  ship a `lumen-server` built with the `image` feature and the `lbi-convert` checkpoint
+  converter, so Qwen-Image-2.1 serving needs no source build; see
+  `docs/image-generation.md`.
 - **Text-to-image serving.** `lumen-server --features image` exposes
   `POST /v1/images/generations` for Qwen-Image-2.1, converted to three `.lbi` containers
   by the new `lumen-image` crate's `lbi-convert`. On a CUDA device shared with the text
@@ -1642,6 +1648,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.33.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.29.0...v0.30.0

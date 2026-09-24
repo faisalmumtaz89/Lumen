@@ -7,7 +7,7 @@
 # Inputs (set up by the workflow):
 #   $TAG          git tag, e.g. v1.0.0 or v1.2.0-rc.1
 #   dist/         macOS arm64 tarball + .sha256 (downloaded build-macos artifact)
-#   linux-bins/   lumen, lumen-server (downloaded, validated Linux/CUDA binaries)
+#   linux-bins/   lumen, lumen-server, lbi-convert (downloaded, validated Linux/CUDA binaries)
 #
 # Outputs (into dist/, which the Release step uploads):
 #   lumen-<tag>-linux-x86_64-cuda.tar.gz (+ .sha256)
@@ -23,12 +23,12 @@ mkdir -p dist
 # ── Linux/CUDA raw-binary tarball (for users who don't want Docker) ───────────
 stage="$(mktemp -d)/lumen-${TAG}-linux-x86_64-cuda"
 mkdir -p "$stage/bin"
-cp linux-bins/lumen linux-bins/lumen-server "$stage/bin/"
+cp linux-bins/lumen linux-bins/lumen-server linux-bins/lbi-convert "$stage/bin/"
 chmod +x "$stage/bin/"*
 # Unguarded cp: a missing legal file must fail the release, not skip silently.
 for lic in LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md; do cp "$lic" "$stage/"; done
 cat > "$stage/README.txt" <<EOF
-Lumen — LLM inference for Linux x86_64 / NVIDIA CUDA
+Lumen — LLM and image inference for Linux x86_64 / NVIDIA CUDA
 Build: ${TAG}
 
 PREREQUISITES
@@ -39,9 +39,13 @@ PREREQUISITES
   - Kernels JIT-compile at first run via NVRTC; the PTX disk cache makes subsequent
     launches sub-second (set LUMEN_CACHE_DIR to persist it).
 
-INSTALL   sudo cp bin/lumen bin/lumen-server /usr/local/bin/
+INSTALL   sudo cp bin/lumen bin/lumen-server bin/lbi-convert /usr/local/bin/
 RUN       lumen pull qwen3.5-9b:q8_0
           lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 8000
+IMAGES    lbi-convert /path/to/Qwen-Image-2.1 /path/to/lbi
+          LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \\
+            lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 8000
+          (see docs/image-generation.md)
 EOF
 tar -C "$(dirname "$stage")" -czf "dist/lumen-${TAG}-linux-x86_64-cuda.tar.gz" "$(basename "$stage")"
 ( cd dist && shasum -a 256 "lumen-${TAG}-linux-x86_64-cuda.tar.gz" > "lumen-${TAG}-linux-x86_64-cuda.tar.gz.sha256" )

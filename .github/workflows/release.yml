@@ -38,13 +38,16 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: build
-        run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
+        run: |
+          cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda,image
+          cargo build --release --locked -p lumen-image --bin lbi-convert
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-cuda-bins
           path: |
             target/release/lumen
             target/release/lumen-server
+            target/release/lbi-convert
           if-no-files-found: error
           retention-days: 7
 
