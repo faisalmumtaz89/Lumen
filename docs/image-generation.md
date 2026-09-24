@@ -8,9 +8,9 @@ CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in wi
 
 - NVIDIA CUDA, compute capability 8.0+ (the CPU path exists for reference checks only
   and takes minutes per image).
-- Device memory: the text encoder's language tower (14.1 GiB of BF16 weights), the
+- Device memory: the text encoder's language tower (12.9 GiB of BF16 weights), the
   transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
-  generation's device memory peaks at 15.5 GiB for a 1024×1024 image and 21.0 GiB for a
+  generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start on a device with less than
   21.0 GiB in total, naming both amounts. How the components are held depends on where
   the text model runs; see [Sharing the device with a text model](#sharing-the-device-with-a-text-model).
@@ -76,18 +76,28 @@ text model before the image is returned; text requests made meanwhile get a retr
 
 When the text model runs on the CPU or on another device, the image endpoint keeps the
 transformer and the VAE loaded on CUDA device 0 between generations (about 14.4 GiB,
-held while the server runs), and only the text encoder loads for each image; the
-server fails to start if that device cannot hold them. Prompt encoding and image
+held while the server runs), and the text encoder loads for each image; the server
+fails to start if that device cannot hold them. The text encoder's first layers stay
+loaded between images when there is room. The first image of a size that runs with the
+transformer loaded throughout keeps none, and the server records how much device memory
+that size's denoising and decoding need; later images of that size, with the transformer
+loaded and a prompt no longer than the measured one, keep as many layers as leave that
+much free plus 512 MiB, so each loads only the rest. A denoising or decoding step that
+still runs out of memory drops the kept layers and that size's record and runs again. On an RTX 5090,
+repeated 1024×1024 images settle with about 10 GiB of the 12.9 GiB kept, and the
+encoder's upload drops from 12.9 GiB to 2.9 GiB. Prompt encoding and image
 decoding run beside the resident transformer when they fit. When one runs out of device
 memory there — a 2048×2048 decode on a 32 GiB card, a prompt of thousands of tokens, or
 any prompt on a card much smaller than 32 GiB — the transformer is released and the step
-retried: after an encoding it is loaded again for the denoising steps of the same
-generation, after a decode by the next generation. Later work at least that large
+retried, along with any text-encoder layers kept beside it: after an encoding it is
+loaded again for the denoising steps of the same generation, after a decode by the next
+generation. Later work at least that large
 releases it up front. Images are identical either way. Any generation that runs out pays
 for its failed attempt; work at or above a remembered size costs what the evicting mode
 costs. A single
-out-of-memory event caused by another process on the device lowers that size threshold
-for the rest of the server's life.
+out-of-memory event caused by another process on the device, if dropping the kept text
+layers does not clear it and the transformer has to be released, lowers that size
+threshold for the rest of the server's life.
 
 On CUDA the server opens the three `.lbi` files once at startup and keeps them mapped, so
 their pages count toward its resident memory (page cache the system can reclaim).
@@ -97,7 +107,7 @@ it to load the new ones. Overwriting a file in place (for example with `cp`) whi
 server runs can crash it.
 
 `LUMEN_IMAGE_PIN_TEXT_ENCODER=1` (CUDA only) makes the server copy the text encoder's
-weights into page-locked host memory at startup (14.1 GiB) and keep them for its
+weights into page-locked host memory at startup (12.9 GiB) and keep them for its
 lifetime; the text encoder loads for every image, and loads from page-locked memory
 faster. Page-locked memory is not bounded by memlock or cgroup memory limits, so set it
 only on a host that can spare that memory beside everything else it runs; the server

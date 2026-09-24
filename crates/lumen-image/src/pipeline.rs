@@ -12,12 +12,16 @@
 //! 5. denormalise the final latent and decode it
 //!
 //! The three components are loaded one at a time and dropped between uses: the
-//! text encoder's language tower is 14.1 GiB of BF16 weights and the
-//! transformer 13.3 GiB, so they do not fit on the card together.
+//! text encoder's language tower puts 12.9 GiB of BF16 weights on the device and
+//! the transformer 13.3 GiB, so a generation never holds them together.
 
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cuda")]
+use crate::cuda::text_gpu::ResidentLayers;
 use crate::dit::{Dit, DitConfig, DitForwardArgs};
 use crate::lbi::LbiFile;
 use crate::png::Rgba;
@@ -411,8 +415,8 @@ pub const GPU_DEVICE: usize = 0;
 
 /// The most device memory a generation uses, in bytes: 21,491 MiB, measured
 /// as the device's used memory at the peak of a 2048x2048 generation (the
-/// VAE decode; a 1024x1024 generation peaks at 15,923 MiB in the text-encoder
-/// phase) on an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
+/// VAE decode; a 1024x1024 generation peaks at 15,663 MiB while denoising) on
+/// an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
 /// less total memory would fail a request at that size after the text model
 /// had been evicted for it, so the startup check refuses it instead.
 pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
@@ -435,9 +439,9 @@ pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
 ///
 /// Same sequence as [`generate_cpu`], with each component's device
 /// implementation. The three components still load and free one at a time: the
-/// text encoder's language tower is 14.1 GiB of BF16 weights and the transformer
-/// 13.3 GiB, so they do not fit on a 32 GiB card together and do not need to —
-/// the encoder's output is the only thing the transformer consumes.
+/// text encoder's language tower puts 12.9 GiB of BF16 weights on the device and
+/// the transformer 13.3 GiB, and the encoder's output is the only thing the
+/// transformer consumes, so neither needs the other on the device.
 #[cfg(feature = "cuda")]
 pub fn generate_gpu(
     sources: &GpuSources,
@@ -450,7 +454,7 @@ pub fn generate_gpu(
         .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
 
     let ids = sources.tokenizer.encode(&render_prompt(req.prompt))?;
-    let text = encode_prompt_gpu(sources, &dev, &ids)?;
+    let (text, _) = encode_prompt_gpu(sources, &dev, &ids, ResidentLayers::default(), None)?;
     let latents = {
         let dit = sources.load_dit(&dev)?;
         denoise_gpu(&dit, req, &text, progress)?
@@ -499,8 +503,8 @@ impl GpuSources {
         })
     }
 
-    /// Copy the text encoder's matrices into page-locked host memory (14.1 GiB
-    /// for Qwen-Image-2.1), from which every later load uploads them at the
+    /// Copy the text encoder's layer matrices into page-locked host memory
+    /// (12.9 GiB for Qwen-Image-2.1), from which every later load uploads them at the
     /// link's full rate. Page-locked memory is held for the sources' lifetime
     /// and is not bounded by the host's memlock or cgroup memory limits, so
     /// whether the host can spare it is the caller's decision.
@@ -528,10 +532,18 @@ impl GpuSources {
 /// device nothing else needs in between (the text model on the CPU or on
 /// another card).
 ///
-/// The text encoder still loads for each generation: the three do not fit on a
-/// 32 GiB card together with a decode's activations (1.45 GiB is left with all
-/// three resident, and a 1024x1024 decode needs more), and it is the component
-/// needed first and only briefly. Encoding and decoding each run beside the
+/// The text encoder loads for each generation, but its first layers can stay:
+/// the three do not fit on a 32 GiB card together with a decode's activations
+/// (3.1 GiB is left with all three resident, and a 1024x1024 decode needs
+/// more), and how much room a generation needs depends on its size. The first
+/// generation of a size keeps no text layers, and the device memory its
+/// denoising and decoding use above that point is recorded (the peak of the
+/// memory pool they allocate from). Later generations of that size, with a
+/// prompt no longer than the recorded one, keep as many layers from the first
+/// as leave that much free plus [`RESIDENT_TEXT_MARGIN`], and load only the
+/// rest. A denoising or decoding step that still runs out of memory drops the
+/// kept layers and that size's figure and runs again, before anything else is
+/// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
 /// there — a 2048x2048 decode, a prompt of thousands of tokens, any encode on
 /// a card much smaller than 32 GiB — is retried once with the transformer
@@ -550,6 +562,11 @@ pub struct GpuResident {
     /// Pixels of the smallest image whose decode ran out of memory beside the
     /// transformer.
     decode_needs_room: Option<usize>,
+    /// The text encoder's first layers, kept between generations.
+    text_layers: ResidentLayers,
+    /// Per image size, the longest prompt measured and the device bytes its
+    /// denoising and decoding took above what was allocated when they began.
+    room: HashMap<(usize, usize), (usize, usize)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -568,11 +585,14 @@ impl GpuResident {
             vae,
             encode_needs_room: None,
             decode_needs_room: None,
+            text_layers: ResidentLayers::default(),
+            room: HashMap::new(),
         })
     }
 
     /// Generate one image with the resident components; the same sequence and
-    /// arithmetic as [`generate_gpu`].
+    /// arithmetic as [`generate_gpu`]. A denoising pass retried after running
+    /// out of memory beside kept text layers reports its progress from 0 again.
     pub fn generate(
         &mut self,
         req: &GenerationRequest<'_>,
@@ -580,48 +600,122 @@ impl GpuResident {
     ) -> Result<Rgba, PipelineError> {
         let ids = self.sources.tokenizer.encode(&render_prompt(req.prompt))?;
         if self.encode_needs_room.is_some_and(|t| ids.len() >= t) {
-            self.dit = None;
+            self.release_transformer();
         }
-        let text = match encode_prompt_gpu(&self.sources, &self.dev, &ids) {
-            Ok(text) => text,
+        let size = (req.width, req.height);
+        // Layers are kept only beside a resident transformer: the room was
+        // measured with it loaded, and the free memory of a device without it
+        // would count the space its reload needs.
+        let room = self
+            .room
+            .get(&size)
+            .filter(|&&(tokens, _)| self.dit.is_some() && ids.len() <= tokens)
+            .map(|&(_, bytes)| bytes);
+        let resident = std::mem::take(&mut self.text_layers);
+        let (text, kept) = match encode_prompt_gpu(&self.sources, &self.dev, &ids, resident, room) {
+            Ok(encoded) => encoded,
             Err(e) if self.dit.is_some() && is_out_of_memory(&e) => {
-                self.dit = None;
+                self.release_transformer();
                 self.encode_needs_room = Some(smallest(self.encode_needs_room, ids.len()));
-                encode_prompt_gpu(&self.sources, &self.dev, &ids)?
+                encode_prompt_gpu(
+                    &self.sources,
+                    &self.dev,
+                    &ids,
+                    ResidentLayers::default(),
+                    None,
+                )?
             }
             Err(e) => return Err(e),
+        };
+        self.text_layers = kept;
+
+        // A size not yet measured runs with no text layers kept; its room is
+        // recorded only from a run with denoising steps that keeps the
+        // transformer throughout, so the figure is what the same run needs
+        // next time. The measurement starts once every free queued so far has
+        // taken effect.
+        // A device whose pool cannot be read is never measured, so it keeps
+        // no text layers.
+        let measure_from = match (room, &self.dit) {
+            (None, Some(_)) if req.steps > 0 => {
+                synchronize(&self.dev)?;
+                memory_pool_reset(&self.dev).ok()
+            }
+            _ => None,
         };
         let dit = match self.dit.take() {
             Some(dit) => dit,
             None => self.sources.load_dit(&self.dev)?,
         };
-        let latents = denoise_gpu(&dit, req, &text, progress);
+        let mut latents = denoise_gpu(&dit, req, &text, progress);
+        // Kept layers are only ever an estimate's worth: a step that runs out
+        // beside them drops them and the estimate, and runs again.
+        if matches!(&latents, Err(e) if is_out_of_memory(e)) && !self.text_layers.is_empty() {
+            if let Err(e) = self.forget_room(size) {
+                self.dit = Some(dit);
+                return Err(e);
+            }
+            latents = denoise_gpu(&dit, req, &text, progress);
+        }
         self.dit = Some(dit);
         let latents = latents?;
         let pixels = req.width * req.height;
         if self.decode_needs_room.is_some_and(|p| pixels >= p) {
-            self.dit = None;
+            self.release_transformer();
         }
-        match decode_gpu(&self.vae, req, &latents) {
-            Ok(image) => Ok(image),
-            Err(e) if self.dit.is_some() && e.contains(OUT_OF_MEMORY) => {
-                self.dit = None;
-                self.decode_needs_room = Some(smallest(self.decode_needs_room, pixels));
-                decode_gpu(&self.vae, req, &latents).map_err(PipelineError::Unsupported)
+        let image = loop {
+            match decode_gpu(&self.vae, req, &latents) {
+                Ok(image) => break image,
+                Err(e) if out_of_memory(&e) && !self.text_layers.is_empty() => {
+                    self.forget_room(size)?;
+                }
+                Err(e) if out_of_memory(&e) && self.dit.is_some() => {
+                    self.release_transformer();
+                    self.decode_needs_room = Some(smallest(self.decode_needs_room, pixels));
+                }
+                Err(e) => return Err(PipelineError::Unsupported(e)),
             }
-            Err(e) => Err(PipelineError::Unsupported(e)),
+        };
+        if let (Some(start), Some(_)) = (measure_from, &self.dit) {
+            // A peak that cannot be read leaves the size unmeasured; the image
+            // stands either way.
+            if let Ok(peak) = memory_pool_peak(&self.dev) {
+                self.room
+                    .insert(size, (ids.len(), peak.saturating_sub(start)));
+            }
         }
+        Ok(image)
+    }
+
+    /// Drop the kept text layers and the room figure that kept them, once
+    /// their frees have taken effect.
+    fn forget_room(&mut self, size: (usize, usize)) -> Result<(), PipelineError> {
+        self.text_layers = ResidentLayers::default();
+        self.room.remove(&size);
+        synchronize(&self.dev)
+    }
+
+    /// Free the transformer, and the text layers kept beside it, for work that
+    /// does not fit beside them.
+    fn release_transformer(&mut self) {
+        self.dit = None;
+        self.text_layers = ResidentLayers::default();
     }
 }
 
-/// How the device's driver reports an allocation it could not make; the errors
-/// reach here as text.
+/// How the driver and cuBLAS report a device allocation they could not make;
+/// the errors reach here as text.
 #[cfg(feature = "cuda")]
-const OUT_OF_MEMORY: &str = "CUDA_ERROR_OUT_OF_MEMORY";
+const OUT_OF_MEMORY: [&str; 2] = ["CUDA_ERROR_OUT_OF_MEMORY", "CUBLAS_STATUS_ALLOC_FAILED"];
+
+#[cfg(feature = "cuda")]
+fn out_of_memory(text: &str) -> bool {
+    OUT_OF_MEMORY.iter().any(|m| text.contains(m))
+}
 
 #[cfg(feature = "cuda")]
 fn is_out_of_memory(e: &PipelineError) -> bool {
-    format!("{e}").contains(OUT_OF_MEMORY)
+    out_of_memory(&format!("{e}"))
 }
 
 /// The smaller of a remembered threshold and a new one.
@@ -631,26 +725,54 @@ fn smallest(known: Option<usize>, new: usize) -> usize {
 }
 
 /// The rendered prompt's hidden states, with the template's system prefix
-/// stripped. The encoder is loaded for the call and freed when it returns.
+/// stripped. The encoder loads for the call on top of `resident`, its layers
+/// kept from an earlier call. Given `room`, the bytes the rest of the
+/// generation needs free, it keeps as many layers from the first as leave that
+/// much plus [`RESIDENT_TEXT_MARGIN`] and returns them; otherwise it frees them
+/// all.
 #[cfg(feature = "cuda")]
 fn encode_prompt_gpu(
     sources: &GpuSources,
     dev: &lumen_runtime::cuda::ffi::CudaDevice,
     ids: &[u32],
-) -> Result<Matrix, PipelineError> {
-    let hidden = {
-        let config =
-            crate::text_encoder::TextEncoderConfig::from_lbi_config(sources.text_encoder.config())?;
-        let encoder = crate::cuda::text_gpu::TextGpu::load_with(
-            &sources.text_encoder,
-            sources.text_pinned.as_ref(),
-            dev,
-            config,
-        )
-        .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
-        encoder
-            .forward(ids)
-            .map_err(|e| PipelineError::Unsupported(format!("{e}")))?
+    resident: ResidentLayers,
+    room: Option<usize>,
+) -> Result<(Matrix, ResidentLayers), PipelineError> {
+    let unsupported = |e: String| PipelineError::Unsupported(e);
+    let config =
+        crate::text_encoder::TextEncoderConfig::from_lbi_config(sources.text_encoder.config())?;
+    let encoder = crate::cuda::text_gpu::TextGpu::load_with(
+        &sources.text_encoder,
+        sources.text_pinned.as_ref(),
+        dev,
+        config,
+        resident,
+    )
+    .map_err(|e| unsupported(format!("{e}")))?;
+    let hidden = match encoder.forward(ids) {
+        Ok(hidden) => hidden,
+        Err(e) => {
+            // Layers kept from an earlier load are freed on the stream that
+            // uploaded them, which does not wait for this one: let its queued
+            // work finish before the encoder drops them.
+            synchronize(dev)?;
+            return Err(unsupported(format!("{e}")));
+        }
+    };
+    let kept = match room {
+        Some(room) => {
+            // Every transient of the forward is freed once the device is idle,
+            // so what is free then plus the layers is what keeping none leaves.
+            synchronize(dev)?;
+            let free = dev.free_memory().map_err(|e| unsupported(format!("{e}")))?;
+            let budget = (free + encoder.layer_bytes()).saturating_sub(room + RESIDENT_TEXT_MARGIN);
+            let kept = encoder.into_resident(budget);
+            // The layers not kept are freed on the encoder's stream; let those
+            // frees land before the denoising steps allocate.
+            synchronize(dev)?;
+            kept
+        }
+        None => ResidentLayers::default(),
     };
     if hidden.rows < SYSTEM_PREFIX_TOKENS {
         return Err(PipelineError::Unsupported(format!(
@@ -658,11 +780,90 @@ fn encode_prompt_gpu(
             hidden.rows, SYSTEM_PREFIX_TOKENS
         )));
     }
-    Ok(Matrix::new(
+    let text = Matrix::new(
         hidden.rows - SYSTEM_PREFIX_TOKENS,
         hidden.cols,
         hidden.data[SYSTEM_PREFIX_TOKENS * hidden.cols..].to_vec(),
-    ))
+    );
+    Ok((text, kept))
+}
+
+/// Device memory left unplanned beside the text layers a generation keeps: the
+/// pool's rounding and allocations made outside it.
+#[cfg(feature = "cuda")]
+pub const RESIDENT_TEXT_MARGIN: usize = 512 << 20;
+
+/// Wait for every stream on the device, so queued work and frees have taken
+/// effect.
+#[cfg(feature = "cuda")]
+fn synchronize(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Result<(), PipelineError> {
+    dev.ctx
+        .synchronize()
+        .map_err(|e| PipelineError::Unsupported(format!("synchronize: {e}")))
+}
+
+/// Reset the device memory pool's high-water mark to what is allocated now,
+/// and return that amount.
+#[cfg(feature = "cuda")]
+fn memory_pool_reset(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Result<usize, PipelineError> {
+    use cudarc::driver::sys::CUmemPool_attribute as Attr;
+    let pool = memory_pool(dev)?;
+    let zero: u64 = 0;
+    // Safety: the pool is the device's current pool, and the attribute takes a
+    // `cuuint64_t`.
+    unsafe {
+        cudarc::driver::sys::cuMemPoolSetAttribute(
+            pool,
+            Attr::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            &zero as *const u64 as *mut std::ffi::c_void,
+        )
+        .result()
+        .map_err(|e| PipelineError::Unsupported(format!("memory pool: {e}")))?;
+    }
+    memory_pool_attr(pool, Attr::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
+}
+
+/// The most the device memory pool has had allocated since its last reset.
+#[cfg(feature = "cuda")]
+fn memory_pool_peak(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Result<usize, PipelineError> {
+    let pool = memory_pool(dev)?;
+    memory_pool_attr(
+        pool,
+        cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+    )
+}
+
+/// The device's current memory pool, the one every stream-ordered allocation
+/// on it draws from.
+#[cfg(feature = "cuda")]
+fn memory_pool(
+    dev: &lumen_runtime::cuda::ffi::CudaDevice,
+) -> Result<cudarc::driver::sys::CUmemoryPool, PipelineError> {
+    let mut pool = std::ptr::null_mut();
+    // Safety: `pool` is written by the call.
+    unsafe { cudarc::driver::sys::cuDeviceGetMemPool(&mut pool, dev.ctx.cu_device()) }
+        .result()
+        .map_err(|e| PipelineError::Unsupported(format!("memory pool: {e}")))?;
+    Ok(pool)
+}
+
+#[cfg(feature = "cuda")]
+fn memory_pool_attr(
+    pool: cudarc::driver::sys::CUmemoryPool,
+    attr: cudarc::driver::sys::CUmemPool_attribute,
+) -> Result<usize, PipelineError> {
+    let mut value: u64 = 0;
+    // Safety: the attribute is a `cuuint64_t`, written by the call.
+    unsafe {
+        cudarc::driver::sys::cuMemPoolGetAttribute(
+            pool,
+            attr,
+            &mut value as *mut u64 as *mut std::ffi::c_void,
+        )
+    }
+    .result()
+    .map_err(|e| PipelineError::Unsupported(format!("memory pool: {e}")))?;
+    Ok(value as usize)
 }
 
 /// The denoising loop: the final latents for `req`, conditioned on `text`.

@@ -156,7 +156,7 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            text model for its duration.
     LUMEN_IMAGE_PIN_TEXT_ENCODER=1
                            Keep the text encoder's weights in page-locked host
-                           memory (14.1 GiB, held for the server's lifetime) so
+                           memory (12.9 GiB, held for the server's lifetime) so
                            each generation loads them faster. CUDA only.
 
 ENVIRONMENT VARIABLES (CUDA backend):

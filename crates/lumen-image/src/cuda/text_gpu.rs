@@ -25,18 +25,18 @@
 //!
 //! Every matrix and the embedding table must be stored bf16, the checkpoint's
 //! dtype and the only one the GEMMs take. The embedding table (151936 x 4096,
-//! ~1.16 GiB) stays resident and the prompt's rows are gathered from it.
+//! ~1.16 GiB) is not uploaded: the prompt's rows are read from the container
+//! and only they reach the device.
 //! `model.language_model.norm.weight` is not loaded: the forward stops before
 //! the final norm.
 //!
 //! # Memory
 //!
-//! 14.1 GiB of bf16 weights (the container also carries the vision tower, which
-//! is not loaded) plus bf16 activations; the largest transient is a projection's
+//! 12.9 GiB of bf16 layer weights (the container also carries the vision tower,
+//! which is not loaded) plus bf16 activations; the largest transient is a projection's
 //! f32 output before rounding, `[seq, 12288]` f32 (48 KiB per token).
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use std::sync::Arc;
 
@@ -62,9 +62,12 @@ use crate::text_encoder::{rope_tables, TextEncoderConfig, TextEncoderError};
 /// byte reaches the device.
 const PREFIX: &str = "model.language_model.";
 
-/// Threads per block for the elementwise and gather kernels, and the most the
-/// rotary kernel takes.
+/// Threads per block for the elementwise kernels, and the most the rotary
+/// kernel takes.
 const THREADS: u32 = 256;
+
+/// The embedding table's stem, read in place rather than uploaded.
+const EMBED_STEM: &str = "embed_tokens";
 
 /// `TEXT_NORM_THREADS` in `text_ops.cu`, which sizes its shared reduction.
 const NORM_THREADS: u32 = 256;
@@ -121,7 +124,6 @@ impl From<LbiError> for TextGpuError {
 struct Weight {
     bits: CudaSlice<u16>,
     n: usize,
-    k: usize,
 }
 
 /// One decoder layer, resident on the device. The norm weights are widened to
@@ -140,9 +142,69 @@ struct GpuLayer {
     down_proj: Weight,
 }
 
+impl GpuLayer {
+    /// Whether the layer has the shapes `c` gives a layer. The output widths
+    /// and norm lengths pin every dimension the layer's inputs have too.
+    fn fits(&self, c: &TextEncoderConfig) -> bool {
+        let q_width = c.num_attention_heads * c.head_dim;
+        let kv_width = c.num_key_value_heads * c.head_dim;
+        self.q_proj.n == q_width
+            && self.k_proj.n == kv_width
+            && self.v_proj.n == kv_width
+            && self.o_proj.n == c.hidden_size
+            && self.gate_proj.n == c.intermediate_size
+            && self.up_proj.n == c.intermediate_size
+            && self.down_proj.n == c.hidden_size
+            && self.input_norm.len == c.hidden_size
+            && self.post_norm.len == c.hidden_size
+            && self.q_norm.len == c.head_dim
+            && self.k_norm.len == c.head_dim
+    }
+
+    /// The device bytes of the layer's weights.
+    fn bytes(&self) -> usize {
+        let matrices = [
+            &self.q_proj,
+            &self.k_proj,
+            &self.v_proj,
+            &self.o_proj,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ];
+        let norms = [
+            &self.input_norm,
+            &self.q_norm,
+            &self.k_norm,
+            &self.post_norm,
+        ];
+        matrices.iter().map(|w| w.bits.len() * 2).sum::<usize>()
+            + norms.iter().map(|v| v.len * 4).sum::<usize>()
+    }
+}
+
+/// Decoder layers kept on the device between loads, the first ones in order:
+/// a load given them uploads only the layers after them.
+#[derive(Default)]
+pub struct ResidentLayers {
+    layers: Vec<GpuLayer>,
+    /// The device the layers live on.
+    ordinal: usize,
+}
+
+impl ResidentLayers {
+    /// How many layers are kept.
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+}
+
 /// The entry points `text_ops.cu` provides.
 struct TextOps {
-    embed_gather: CudaFunction,
     rms_norm: CudaFunction,
     rope: CudaFunction,
     repeat_kv: CudaFunction,
@@ -159,7 +221,6 @@ impl TextOps {
                 .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
         };
         Ok(Self {
-            embed_gather: get("embed_gather_bf16")?,
             rms_norm: get("rms_norm_bf16")?,
             rope: get("rope_bf16")?,
             repeat_kv: get("repeat_kv")?,
@@ -169,8 +230,9 @@ impl TextOps {
     }
 }
 
-/// The text tower, with every weight resident on the device.
-pub struct TextGpu {
+/// The text tower, with every layer weight resident on the device and the
+/// embedding table read in place from the container.
+pub struct TextGpu<'a> {
     /// The tower drives one stream from host inputs end to end, so it holds its
     /// own device handle rather than borrowing the caller's. `CudaDevice::new`
     /// retains the same primary context, so this is a second stream on the same
@@ -180,17 +242,17 @@ pub struct TextGpu {
     kernels: ImageKernels,
     text_ops: TextOps,
     config: TextEncoderConfig,
-    embed: Weight,
+    /// The `[vocab, hidden]` bf16 embedding table as stored.
+    embed: &'a [u8],
     layers: Vec<GpuLayer>,
 }
 
-impl TextGpu {
-    /// Load every text-tower weight from a converted `.lbi` onto the device,
-    /// assuming the shipped Qwen-Image-2.1 architecture.
-    pub fn load(lbi: &Path, dev: &CudaDevice) -> Result<Self, TextGpuError> {
-        let file = LbiFile::open(lbi)?;
+impl<'a> TextGpu<'a> {
+    /// Load every text-tower layer weight from a converted `.lbi` onto the
+    /// device, assuming the shipped Qwen-Image-2.1 architecture.
+    pub fn load(file: &'a LbiFile, dev: &CudaDevice) -> Result<Self, TextGpuError> {
         let config = TextEncoderConfig::from_lbi_config(file.config())?;
-        Self::load_with(&file, None, dev, config)
+        Self::load_with(file, None, dev, config, ResidentLayers::default())
     }
 
     /// Load against an explicit architecture.
@@ -200,14 +262,31 @@ impl TextGpu {
     /// dimensions here are bounded and the products below cannot overflow.
     ///
     /// A matrix with a copy in `pinned` is uploaded from that copy instead of
-    /// the file's mapping.
+    /// the file's mapping. The layers in `resident`, kept from an earlier load
+    /// of the same file (see [`Self::into_resident`]), are used as they are and
+    /// only the layers after them are uploaded.
     pub fn load_with(
-        file: &LbiFile,
+        file: &'a LbiFile,
         pinned: Option<&PinnedMatrices>,
         dev: &CudaDevice,
         config: TextEncoderConfig,
+        resident: ResidentLayers,
     ) -> Result<Self, TextGpuError> {
         Self::check(file, &config)?;
+        let elsewhere = !resident.layers.is_empty() && resident.ordinal != dev.ctx.ordinal();
+        if elsewhere
+            || resident.layers.len() > config.num_layers
+            || !resident.layers.iter().all(|l| l.fits(&config))
+        {
+            return Err(TextEncoderError::BadConfig(format!(
+                "{} resident layers on device {} do not fit this tower of {} layers on device {}",
+                resident.layers.len(),
+                resident.ordinal,
+                config.num_layers,
+                dev.ctx.ordinal()
+            ))
+            .into());
+        }
 
         let own = CudaDevice::new(dev.ctx.ordinal())?;
         let kernels = ImageKernels::load(&own)?;
@@ -217,10 +296,13 @@ impl TextGpu {
         let hidden = c.hidden_size;
         let q_width = c.num_attention_heads * c.head_dim;
         let kv_width = c.num_key_value_heads * c.head_dim;
-        let embed = matrix(&own, file, pinned, "embed_tokens", c.vocab_size, hidden)?;
+        let embed_name = bf16_entry(file, EMBED_STEM, c.vocab_size, hidden)?;
+        let embed = file
+            .tensor_bytes(&embed_name)
+            .expect("entry resolved above");
 
-        let mut layers = Vec::with_capacity(c.num_layers);
-        for i in 0..c.num_layers {
+        let mut layers = resident.layers;
+        for i in layers.len()..c.num_layers {
             let p = format!("layers.{i}");
             let w = |stem: &str, n, k| matrix(&own, file, pinned, &format!("{p}.{stem}"), n, k);
             let v = |stem: &str, len| vector(&own, file, &format!("{p}.{stem}"), len);
@@ -272,6 +354,27 @@ impl TextGpu {
         &self.config
     }
 
+    /// Keep the longest run of layers from the first whose weights fit in
+    /// `budget` bytes, for a later [`Self::load_with`], and free the rest.
+    pub fn into_resident(self, budget: usize) -> ResidentLayers {
+        let ordinal = self.dev.ctx.ordinal();
+        let mut used = 0usize;
+        let layers = self
+            .layers
+            .into_iter()
+            .take_while(|layer| {
+                used += layer.bytes();
+                used <= budget
+            })
+            .collect();
+        ResidentLayers { layers, ordinal }
+    }
+
+    /// The device bytes of every layer's weights, resident or uploaded.
+    pub fn layer_bytes(&self) -> usize {
+        self.layers.iter().map(GpuLayer::bytes).sum()
+    }
+
     /// Encode a prompt to `[seq, hidden]`, **without** the final RMS norm.
     ///
     /// All three M-RoPE rows are the plain `0..seq-1`, because a text-to-image
@@ -286,13 +389,11 @@ impl TextGpu {
         let seq = token_ids.len();
         let hidden = c.hidden_size;
 
-        // Range-checked here so the gather kernel can trust them: it reads at
-        // `id * hidden`.
         for &id in token_ids {
-            if id as usize >= self.embed.n {
+            if id as usize >= c.vocab_size {
                 return Err(TextEncoderError::TokenOutOfRange {
                     id,
-                    vocab: self.embed.n,
+                    vocab: c.vocab_size,
                 }
                 .into());
             }
@@ -306,9 +407,7 @@ impl TextGpu {
         let to_bits = |m: &Matrix| m.data.iter().map(|&v| bf16_bits(v)).collect::<Vec<u16>>();
         let g_cos = self.dev.htod_copy(&to_bits(&cos))?;
         let g_sin = self.dev.htod_copy(&to_bits(&sin))?;
-        let g_ids = self.dev.htod_copy(token_ids)?;
-
-        let mut x = self.gather_embed(&g_ids, seq)?;
+        let mut x = self.embed_rows(token_ids)?;
         for layer in &self.layers {
             x = self.decoder_layer(layer, &x, seq, &g_cos, &g_sin)?;
         }
@@ -323,33 +422,25 @@ impl TextGpu {
 
     // -- the pieces of the forward ------------------------------------------
 
-    fn gather_embed(
-        &self,
-        ids: &CudaSlice<u32>,
-        seq: usize,
-    ) -> Result<Bf16Activation, TextGpuError> {
-        let hidden = self.embed.k;
-        let out = self.alloc_bits(seq * hidden)?;
-        let (su, hu) = (seq as u32, hidden as u32);
-        // Safety: `out` is `seq * hidden`; `forward` checked every id below
-        // the vocabulary, so each gathered row lies inside the `[vocab, hidden]` table.
-        unsafe {
-            self.dev
-                .stream
-                .launch_builder(&self.text_ops.embed_gather)
-                .arg(&self.embed.bits)
-                .arg(ids)
-                .arg(&out)
-                .arg(&su)
-                .arg(&hu)
-                .launch(LaunchConfig {
-                    grid_dim: (su, 1, 1),
-                    block_dim: (THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| RuntimeError::Compute(format!("embed_gather_bf16: {e}")))?;
+    /// The prompt's rows of the embedding table, copied to the device as
+    /// stored. `forward` has checked every id against the vocabulary.
+    fn embed_rows(&self, token_ids: &[u32]) -> Result<Bf16Activation, TextGpuError> {
+        let hidden = self.config.hidden_size;
+        let row_bytes = hidden * 2;
+        let mut rows = Vec::with_capacity(token_ids.len() * hidden);
+        for &id in token_ids {
+            let start = id as usize * row_bytes;
+            rows.extend(
+                self.embed[start..start + row_bytes]
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]])),
+            );
         }
-        Ok(Bf16Activation::from_bits(out, seq, hidden)?)
+        Ok(Bf16Activation::from_bits(
+            self.dev.htod_copy(&rows)?,
+            token_ids.len(),
+            hidden,
+        )?)
     }
 
     /// One decoder layer: pre-norm attention and pre-norm MLP, each residual.
@@ -620,12 +711,12 @@ fn bf16_entry(file: &LbiFile, stem: &str, n: usize, k: usize) -> Result<String, 
     Ok(name)
 }
 
-/// Every matrix the tower uploads, `(stem, n, k)`: the embedding table and
-/// each layer's seven projections.
+/// Every matrix the tower reads, `(stem, n, k)`: the embedding table first,
+/// then each layer's seven projections.
 fn matrices(c: &TextEncoderConfig) -> Vec<(String, usize, usize)> {
     let q_width = c.num_attention_heads * c.head_dim;
     let kv_width = c.num_key_value_heads * c.head_dim;
-    let mut all = vec![("embed_tokens".to_string(), c.vocab_size, c.hidden_size)];
+    let mut all = vec![(EMBED_STEM.to_string(), c.vocab_size, c.hidden_size)];
     for i in 0..c.num_layers {
         for (stem, n, k) in [
             ("self_attn.q_proj", q_width, c.hidden_size),
@@ -642,7 +733,7 @@ fn matrices(c: &TextEncoderConfig) -> Vec<(String, usize, usize)> {
     all
 }
 
-/// The tower's matrices copied once into page-locked host memory. The driver
+/// The tower's layer matrices copied once into page-locked host memory. The driver
 /// transfers page-locked memory straight to the device, so a load from these
 /// copies runs at the link's full rate, for the matrices' size in host memory
 /// held while they live.
@@ -651,14 +742,18 @@ pub struct PinnedMatrices {
 }
 
 impl PinnedMatrices {
-    /// Copy every matrix [`TextGpu::load_with`] uploads.
+    /// Copy every matrix [`TextGpu::load_with`] uploads: all but the embedding
+    /// table, which stays in the container.
     pub fn copy(
         file: &LbiFile,
         config: &TextEncoderConfig,
         ctx: &Arc<CudaContext>,
     ) -> Result<Self, TextGpuError> {
         let mut copies = HashMap::new();
-        for (stem, n, k) in matrices(config) {
+        for (stem, n, k) in matrices(config)
+            .into_iter()
+            .filter(|(stem, _, _)| stem != EMBED_STEM)
+        {
             let name = bf16_entry(file, &stem, n, k)?;
             let bytes = file.tensor_bytes(&name).expect("entry resolved above");
             let page_locked = |e: cudarc::driver::DriverError| {
@@ -697,7 +792,6 @@ fn matrix(
     Ok(Weight {
         bits: super::dit_gpu::ops::upload_16bit(dev, bytes)?,
         n,
-        k,
     })
 }
 

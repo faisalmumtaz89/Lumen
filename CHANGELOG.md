@@ -55,9 +55,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   instead of 15.12 s with the transformer resident (medians of 8 interleaved runs each),
   with identical images.
 - **`LUMEN_IMAGE_PIN_TEXT_ENCODER=1`** keeps the image text encoder's weights in
-  page-locked host memory (14.1 GiB, copied at startup) and loads the encoder from there
-  for each generation: on an RTX 5090 host the load takes 0.45 s instead of 0.75 s
-  (medians of 4 interleaved runs each), with identical output. Off by default.
+  page-locked host memory (12.9 GiB, copied at startup) and loads the encoder from there
+  for each generation, at the host link's full rate instead of the mapped file's, with
+  identical output. Off by default.
 - **Image decoding in TF32.** The CUDA VAE runs its convolutions as TF32 tensor-core
   products, as the reference's convolutions run under torch's defaults: the decode lands
   closer to the reference's own output (rel-L2 5.7e-5 instead of 3.6e-4) and, on an RTX
@@ -68,6 +68,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   values per thread; the output is unchanged bit for bit. On an RTX 5090 these kernels
   take 8.8 ms per step instead of 15.4 ms, and a 1024×1024 generation 14.37 s instead of
   14.60 s (medians of 12, alternating builds).
+- **Smaller image text-encoder load.** The text encoder no longer uploads its 1.16 GiB
+  embedding table: the prompt's rows are read from the container and only they reach the
+  device. Each generation moves 12.9 GiB instead of 14.1 GiB and the page-locked copy
+  is as much smaller, with identical images.
+- **Image text-encoder layers kept between generations.** With the transformer and VAE
+  resident, the text encoder's first layers also stay on the device when there is room:
+  each image size's device-memory need is measured on a generation that keeps the
+  transformer loaded, and later generations of that size keep as many layers as leave
+  that room plus 512 MiB, loading only the rest; a denoising or decoding step that runs
+  out of memory anyway drops them and retries. On an RTX 5090, repeated 1024×1024 generations settle at a
+  2.9 GiB encoder upload instead of 12.9 GiB, and the time from the first upload to the
+  first denoising step falls from 538 ms to 133 ms, with identical images.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

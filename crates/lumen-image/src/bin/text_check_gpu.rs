@@ -109,7 +109,7 @@ fn run() -> Result<(), String> {
     };
 
     // The oracle's own inputs, read before the device is touched so a bad
-    // oracle directory fails without a 14 GiB upload in the way.
+    // oracle directory fails without a 13 GiB upload in the way.
     let ids = load("prompt_input_ids")?;
     let mask = load("prompt_attention_mask")?;
     let want = load("encoder_hidden_states")?;
@@ -154,7 +154,8 @@ fn run() -> Result<(), String> {
     println!("loading the text tower from {}", lbi.display());
     let free_before = dev.free_memory().map_err(|e| e.to_string())?;
     let t0 = Instant::now();
-    let gpu = TextGpu::load(&lbi, &dev).map_err(|e| format!("{e}"))?;
+    let file = lumen_image::lbi::LbiFile::open(&lbi).map_err(|e| format!("{e}"))?;
+    let gpu = TextGpu::load(&file, &dev).map_err(|e| format!("{e}"))?;
     let free_after = dev.free_memory().map_err(|e| e.to_string())?;
     println!(
         "resident weights: {:.2} GiB (free {:.2} GiB after load, {:.1?} to load)",
