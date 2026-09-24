@@ -2,17 +2,17 @@
 //
 // The CPU reference is `crate::vae`, and it is the specification. The
 // elementwise kernels here compute the same expression in the same order per
-// output element; the convolution and the attention products run on cuBLAS
-// (`vae_gpu.rs`), whose accumulation order is its own, and are checked
-// end-to-end against the reference decode. The four surprises in that file are
-// restated in `vae_gpu.rs`; the kernels need to know that the convolutions are
-// 2-D, that the norm is `F.normalize` rather than an epsilon RMS, and that the
-// DupUp3D shortcut is parameter-free.
+// output element; the attention products and most convolutions run on cuBLAS
+// (`vae_gpu.rs`) and the rest in `vae_conv.cu`, with accumulation orders of
+// their own, and are checked end-to-end against the reference decode. The four
+// surprises in that file are restated in `vae_gpu.rs`; the kernels need to know
+// that the convolutions are 2-D, that the norm is `F.normalize` rather than an
+// epsilon RMS, and that the DupUp3D shortcut is parameter-free.
 //
 // Written here:
-//   - im2col_band            the convolution's column matrix, one band of
-//                            output rows at a time
-//   - bias_add_channels      the convolution's bias, after the GEMM
+//   - im2col_band            a cuBLAS convolution's column matrix, one band
+//                            of output rows at a time
+//   - bias_add_channels      a cuBLAS convolution's bias, after the GEMM
 //   - nearest_2x             nearest-exact 2x upsampling
 //   - dup_up_first_chunk     the parameter-free DupUp3D shortcut, accumulated
 //   - rms_norm_channels      F.normalize over the channel axis, times sqrt(C)

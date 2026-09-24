@@ -96,6 +96,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   the transformer's matrix products one attention call takes 1.50 ms instead of 1.59 ms at
   1024×1024 and 93.6 ms instead of 99.7 ms at 3840×2176, and a 40-step 1024×1024 image
   takes 13.78 s instead of 13.90 s on average.
+- **Faster image decoding.** The VAE decoder's 3x3 convolutions over at most 288 input
+  channels — its first convolution and its highest-resolution layers — run on a TF32
+  tensor-core kernel that reads a channels-last copy of their input instead of an im2col
+  column matrix and a cuBLAS product; the other convolutions stay on cuBLAS. Each layer
+  runs on the path whose summation order lands closer to the reference's output for it,
+  so the decode is slightly closer to the reference (rel-L2 6.67e-5 instead of 6.72e-5,
+  averaged over 12 latents) and images differ from earlier builds in the last bits. On an
+  RTX 5090 a decode takes 315 ms instead of 384 ms at 1024×1024, 1.30 s instead of
+  1.56 s at 2048×2048 and 4.02 s instead of 4.86 s at 3840×2176; decodes in bands still
+  match one-pass decodes bit for bit.
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.
