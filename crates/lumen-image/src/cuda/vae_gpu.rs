@@ -2,10 +2,12 @@
 //!
 //! This mirrors [`crate::vae`] step for step: the same shapes and the same
 //! operand order. The elementwise kernels keep the CPU's accumulation order
-//! per output element. The convolutions run on cuBLAS as TF32 tensor-core
-//! products with f32 accumulation, as the reference's cuDNN convolutions do
-//! under torch's default `allow_tf32`; the attention products run in full f32,
-//! the accuracy of the reference's f32 attention kernel. `vae-check-gpu`
+//! per output element. The convolutions run as TF32 tensor-core products with
+//! f32 accumulation, as the reference's cuDNN convolutions do under torch's
+//! default `allow_tf32`: on cuBLAS after im2col, or in `vae_conv.cu` for the
+//! layers the reference sums tap by tap ([`DIRECT_MAX_IN_C`]). The attention
+//! products run in full f32, the accuracy of the reference's f32 attention
+//! kernel. `vae-check-gpu`
 //! checks the GPU decode against the reference's own output within 1.5e-4
 //! relative error and against [`crate::vae`], which convolves in full f32,
 //! within 1e-3.
@@ -33,10 +35,12 @@
 //! `[batch, channels, h * w]`, which is the reference's row-major `Tensor4`
 //! `[n, c, h, w]` flattened; the kernels split a flat index as
 //! `(outer, row, column)` with the column innermost, which is exactly that
-//! layout. There is one layout for the whole decoder and no transposes, so a
-//! silent transposition has nowhere to hide — the one place the reference does
+//! layout. There is one layout for the whole decoder, so a silent
+//! transposition has nowhere to hide — the one place the reference does
 //! transpose (its attention block) is handled by reading the channel-major
-//! activation directly.
+//! activation directly. The only other layout is internal to a `conv_tf32`
+//! convolution: the channels-last copy of its input, which lives for one
+//! band of the convolution.
 //!
 //! The two host round trips are the latents going up and the decoded f32 image
 //! coming back. The clamp to `[-1, 1]` runs on the host after the download, as
@@ -47,7 +51,9 @@
 //! container's own reader. That is not a lossy shortcut: the reference's loader
 //! goes through `LbiFile::read_f32` for *every* tensor, so a checkpoint stored as
 //! bf16 or f16 is already widened to f32 on the CPU side and the comparison is
-//! one of summation order rather than of precision.
+//! one of summation order rather than of precision. A `conv_tf32` convolution's
+//! weights are stored already rounded to TF32, which is the rounding every TF32
+//! product applies to them anyway.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -92,19 +98,45 @@ const ATTN_SCORE_BUDGET: usize = 1 << 30;
 /// config rather than a limit the shipped architecture ever approaches.
 const GRID_X_MAX: u64 = 0x7fff_ffff;
 
-/// Output rows per convolution product. Fixed rather than derived from the
-/// image height, so a decode in bands runs every row through products of the
-/// same shape as the whole-image decode does.
+/// Output rows per cuBLAS convolution product. Fixed rather than derived from
+/// the image height, so a decode in bands runs every row through products of
+/// the same shape as the whole-image decode does.
 const CONV_ROWS: usize = 16;
 
-/// Bytes the convolution's column matrix may occupy per band.
+/// Bytes a convolution's staged input — the column matrix of a cuBLAS
+/// convolution, the channels-last copy of a `conv_tf32` one — may occupy per
+/// band.
 ///
-/// 256 MiB keeps the largest layer's im2col to a few bands while leaving the
+/// 256 MiB keeps the largest layer's staging to a few bands while leaving the
 /// rest of the card for the activations, which reach 1.2 GB at 1024x1024.
 const CONV_COL_BUDGET: usize = 256 * 1024 * 1024;
 
-/// The kernel source this module compiles.
+/// The widest input, in channels, of a 3x3 convolution `conv_tf32` runs.
+///
+/// The two paths sum a convolution's terms in different orders: the cuBLAS
+/// path's column matrix goes channel by channel with the kernel taps
+/// innermost, `conv_tf32` goes tap by tap with the channels innermost, 8 terms
+/// to a tensor-core product. Run layer by layer on the reference's own inputs,
+/// the reference's outputs were measured closer to the cuBLAS path for every
+/// 1x1 convolution and every 3x3 one over 576 or more channels, and closer to
+/// `conv_tf32` for the 3x3 ones over at most 288 channels — `conv_in`, over the
+/// 64 latent channels, and the highest-resolution layers. Each layer runs on
+/// the path measured closer.
+const DIRECT_MAX_IN_C: usize = 288;
+
+/// Output channels and output pixels per `conv_tf32` block, and its threads.
+const CONV_TILE: usize = 128;
+const CONV_THREADS: u32 = 128;
+
+/// Input channels per k slice of `conv_tf32`: a convolution it runs has a
+/// multiple of this many input channels.
+const CONV_K_SLICE: usize = 16;
+
+/// The elementwise kernel source this module compiles.
 pub const VAE_OPS_SOURCE: &str = include_str!("vae_ops.cu");
+
+/// The convolution kernel source, compiled for sm_80 (tensor-core TF32).
+pub const VAE_CONV_SOURCE: &str = include_str!("vae_conv.cu");
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -181,8 +213,10 @@ fn cuda<E: std::fmt::Display>(what: &str, e: E) -> VaeGpuError {
 // ---------------------------------------------------------------------------
 
 /// A 2-D convolution with stride 1 and symmetric zero padding, resident on the
-/// device: `[out_c, in_c, k, k]` weights and an `[out_c]` bias, the `nn.Conv2d`
-/// layout `vae.rs` also stores.
+/// device, with an `[out_c]` bias. A cuBLAS convolution keeps the `nn.Conv2d`
+/// `[out_c, in_c, k, k]` weights `vae.rs` also stores; a `direct` one, which
+/// `conv_tf32` runs, keeps them reordered to `[out_c, k, k, in_c]` and rounded
+/// to TF32, the order and precision it multiplies in.
 struct GpuConv {
     out_c: usize,
     in_c: usize,
@@ -190,6 +224,7 @@ struct GpuConv {
     kw: usize,
     pad_h: usize,
     pad_w: usize,
+    direct: bool,
     weight: DevVec,
     bias: DevVec,
 }
@@ -220,8 +255,14 @@ impl GpuConv {
     ) -> Result<Self, VaeGpuError> {
         let wname = format!("{prefix}.weight");
         let bname = format!("{prefix}.bias");
-        let weight = weight_exact(dev, file, &wname, &[out_c, in_c, k, k])?;
-        let bias = weight_exact(dev, file, &bname, &[out_c])?;
+        let direct = k == 3 && in_c <= DIRECT_MAX_IN_C && in_c % CONV_K_SLICE == 0;
+        let weight = read_exact(file, &wname, &[out_c, in_c, k, k])?;
+        let weight = if direct {
+            conv_weight_tf32(&weight, out_c, in_c, k)
+        } else {
+            weight
+        };
+        let bias = launch::upload(dev, &read_exact(file, &bname, &[out_c])?)?;
         Ok(Self {
             out_c,
             in_c,
@@ -229,7 +270,8 @@ impl GpuConv {
             kw: k,
             pad_h: pad,
             pad_w: pad,
-            weight,
+            direct,
+            weight: launch::upload(dev, &weight)?,
             bias,
         })
     }
@@ -519,6 +561,8 @@ impl GpuUpBlock {
 struct VaeOps {
     im2col: CudaFunction,
     bias_add: CudaFunction,
+    to_channels_last: CudaFunction,
+    conv: CudaFunction,
     nearest_2x: CudaFunction,
     dup_up: CudaFunction,
     rms_norm: CudaFunction,
@@ -982,19 +1026,9 @@ impl VaeGpu {
 
     // -- op wrappers ---------------------------------------------------------
 
-    /// One 2-D convolution, `[batch, in_c, h, w]` to `[batch, out_c, h, w]`,
-    /// as im2col plus a GEMM.
-    ///
-    /// The output rows are processed in bands of a fixed row count so the
-    /// column matrix stays bounded: at 1024x1024 with 144 channels and a 3x3
-    /// kernel the full matrix would be 5.4 GB. Each band's GEMM writes a
-    /// staging buffer `[out_c, band_rows * w]` (`ldc = band_rows * w`), and the
-    /// band's rows are then copied into `out`, `[out_c, h * w]` per image.
-    ///
-    /// Column-major mapping for the row-major buffers: `col[K, P]` is
-    /// `col_cm[P, K]`, `W[out_c, K]` is `W_cm[K, out_c]`, and the wanted
-    /// `out[out_c, P] = W · col` is `out_cm[P, out_c] = col_cm · W_cm`, so both
-    /// operands are un-transposed with `(m, n, k) = (P, out_c, K)`.
+    /// One 2-D convolution, `[batch, in_c, h, w]` to `[batch, out_c, h, w]`, on
+    /// the path whose summation order is the reference's for this layer: see
+    /// [`DIRECT_MAX_IN_C`].
     fn conv(
         &self,
         w: &GpuConv,
@@ -1033,6 +1067,35 @@ impl VaeGpu {
                 )));
             }
         }
+        if w.direct {
+            self.conv_direct(w, x, batch, h, wd)
+        } else {
+            self.conv_gemm(w, x, batch, h, wd)
+        }
+    }
+
+    /// A convolution as im2col plus a cuBLAS TF32 GEMM.
+    ///
+    /// The output rows are processed in bands of a fixed row count so the
+    /// column matrix stays bounded: at 1024x1024 with 144 channels and a 3x3
+    /// kernel the full matrix would be 5.4 GB. Each band's GEMM writes a
+    /// staging buffer `[out_c, band_rows * w]` (`ldc = band_rows * w`), and the
+    /// band's rows are then copied into `out`, `[out_c, h * w]` per image.
+    ///
+    /// Column-major mapping for the row-major buffers: `col[K, P]` is
+    /// `col_cm[P, K]`, `W[out_c, K]` is `W_cm[K, out_c]`, and the wanted
+    /// `out[out_c, P] = W · col` is `out_cm[P, out_c] = col_cm · W_cm`, so both
+    /// operands are un-transposed with `(m, n, k) = (P, out_c, K)`.
+    fn conv_gemm(
+        &self,
+        w: &GpuConv,
+        x: &DevVec,
+        batch: usize,
+        h: usize,
+        wd: usize,
+    ) -> Result<DevVec, VaeGpuError> {
+        let hw = h * wd;
+        let k = w.in_c * w.kh * w.kw;
         // Uninitialized: every element is written by a band's GEMM.
         let mut out = DevVec {
             buf: unsafe { self.dev.alloc_uninit::<f32>(batch * w.out_c * hw) }
@@ -1134,6 +1197,105 @@ impl VaeGpu {
                     .arg(&(hw as u32))
                     .launch(cfg_1d((w.out_c * hw) as u64, THREADS))
                     .map_err(|e| cuda("bias_add_channels", e))?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A convolution on `conv_tf32`, fed a channels-last TF32 copy of the input
+    /// that `to_channels_last_tf32` makes in bands of rows.
+    ///
+    /// A band's copy holds its output rows plus the `pad_h` rows either side the
+    /// kernel window reaches, within `CONV_COL_BUDGET`; each output value is
+    /// computed the same way whichever band it falls in.
+    fn conv_direct(
+        &self,
+        w: &GpuConv,
+        x: &DevVec,
+        batch: usize,
+        h: usize,
+        wd: usize,
+    ) -> Result<DevVec, VaeGpuError> {
+        let hw = h * wd;
+        // Uninitialized: every element is written by a band's launch.
+        let mut out = DevVec {
+            buf: unsafe { self.dev.alloc_uninit::<f32>(batch * w.out_c * hw) }
+                .map_err(|e| cuda("conv out alloc", e))?,
+            len: batch * w.out_c * hw,
+        };
+        if batch * w.out_c * hw == 0 {
+            return Ok(out);
+        }
+        let row_values = w.in_c * wd;
+        let band = (CONV_COL_BUDGET / (row_values * 4))
+            .saturating_sub(2 * w.pad_h)
+            .clamp(1, h);
+        let xt = launch::alloc(&self.dev, row_values * (band + 2 * w.pad_h).min(h))?;
+
+        let (in_c, out_c, hu, wu, ku) = (
+            w.in_c as u32,
+            w.out_c as u32,
+            h as u32,
+            wd as u32,
+            w.kh as u32,
+        );
+        let out_tiles = w.out_c.div_ceil(CONV_TILE) as u32;
+        for b in 0..batch {
+            let x_img = x.buf.slice(b * w.in_c * hw..(b + 1) * w.in_c * hw);
+            let mut y_img = out.buf.slice_mut(b * w.out_c * hw..(b + 1) * w.out_c * hw);
+            let mut r0 = 0usize;
+            while r0 < h {
+                let r1 = (r0 + band).min(h);
+                let (a, e) = (r0.saturating_sub(w.pad_h), (r1 + w.pad_h).min(h));
+                let n = (e - a) * wd;
+                let src = x_img.slice(a * wd..);
+                // Safety: `src` holds `in_c` planes `hw` apart of which the
+                // first `n` values each are read, and `xt` holds `n * in_c`
+                // floats; the grid covers exactly `n x in_c`.
+                unsafe {
+                    self.dev
+                        .stream
+                        .launch_builder(&self.ops.to_channels_last)
+                        .arg(&src)
+                        .arg(&xt.buf)
+                        .arg(&in_c)
+                        .arg(&(n as u32))
+                        .arg(&(hw as u64))
+                        .launch(LaunchConfig {
+                            grid_dim: (n.div_ceil(32) as u32, w.in_c.div_ceil(32) as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| cuda("to_channels_last_tf32", e))?;
+                }
+                // Safety: `xt` holds input rows `a..e` channels-last, which is
+                // every row the window of output rows `r0..r1` reads inside the
+                // image; the weight is `[out_c, k * k * in_c]` and `y_img` one
+                // image's `[out_c, h * w]`.
+                unsafe {
+                    self.dev
+                        .stream
+                        .launch_builder(&self.ops.conv)
+                        .arg(&xt.buf)
+                        .arg(&w.weight.buf)
+                        .arg(&w.bias.buf)
+                        .arg(&mut y_img)
+                        .arg(&in_c)
+                        .arg(&out_c)
+                        .arg(&hu)
+                        .arg(&wu)
+                        .arg(&ku)
+                        .arg(&(a as u32))
+                        .arg(&((r0 * wd) as u32))
+                        .arg(&((r1 * wd) as u32))
+                        .launch(LaunchConfig {
+                            grid_dim: (((r1 - r0) * wd).div_ceil(CONV_TILE) as u32, out_tiles, 1),
+                            block_dim: (CONV_THREADS, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| cuda("conv_tf32", e))?;
+                }
+                r0 = r1;
             }
         }
         Ok(out)
@@ -1521,18 +1683,13 @@ impl VaeGpu {
 // Loading helpers
 // ---------------------------------------------------------------------------
 
-/// The tensor `name` at exactly `shape`, uploaded in f32.
+/// The tensor `name` at exactly `shape`, decoded to f32 on the host.
 ///
 /// The reference's default is f32: everything it reads goes through
 /// `LbiFile::read_f32`, so a 16-bit weight is widened before use. Widening it on
 /// the host and uploading f32 is the same value the reference computes with, and
 /// it keeps every kernel here on one dtype — see this module's doc comment.
-fn weight_exact(
-    dev: &CudaDevice,
-    file: &LbiFile,
-    name: &str,
-    shape: &[usize],
-) -> Result<DevVec, VaeGpuError> {
+fn read_exact(file: &LbiFile, name: &str, shape: &[usize]) -> Result<Vec<f32>, VaeGpuError> {
     let want: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
     let entry = file
         .get(name)
@@ -1540,23 +1697,50 @@ fn weight_exact(
     if entry.shape != want {
         return Err(mismatch(name, &want, &entry.shape));
     }
-    read_f32_tensor(dev, file, name)
+    read_f32(file, name)
 }
 
 /// A tensor decoded to f32 by the container's own reader, then uploaded.
 fn read_f32_tensor(dev: &CudaDevice, file: &LbiFile, name: &str) -> Result<DevVec, VaeGpuError> {
+    Ok(launch::upload(dev, &read_f32(file, name)?)?)
+}
+
+/// A tensor decoded to f32 by the container's own reader.
+fn read_f32(file: &LbiFile, name: &str) -> Result<Vec<f32>, VaeGpuError> {
     let entry = file
         .get(name)
         .ok_or_else(|| VaeGpuError::Vae(VaeError::MissingTensor(name.to_string())))?;
     match entry.quant {
-        QuantScheme::F32 | QuantScheme::F16 | QuantScheme::Bf16 => {
-            Ok(launch::upload(dev, &file.read_f32(name)?)?)
-        }
+        QuantScheme::F32 | QuantScheme::F16 | QuantScheme::Bf16 => Ok(file.read_f32(name)?),
         other => Err(VaeGpuError::UnsupportedStorage {
             tensor: name.to_string(),
             scheme: format!("{other:?}"),
         }),
     }
+}
+
+/// `nn.Conv2d` weights `[out_c, in_c, k, k]` as `conv_tf32` reads them:
+/// `[out_c, k, k, in_c]`, each value rounded to TF32.
+fn conv_weight_tf32(w: &[f32], out_c: usize, in_c: usize, k: usize) -> Vec<f32> {
+    let taps = k * k;
+    let mut out = vec![0.0f32; w.len()];
+    for o in 0..out_c {
+        for i in 0..in_c {
+            for t in 0..taps {
+                out[(o * taps + t) * in_c + i] = tf32_round(w[(o * in_c + i) * taps + t]);
+            }
+        }
+    }
+    out
+}
+
+/// `x` rounded to TF32 (10 mantissa bits) to nearest, ties away from zero: the
+/// `cvt.rna.tf32.f32` the input copy applies to activations.
+fn tf32_round(x: f32) -> f32 {
+    if !x.is_finite() {
+        return x;
+    }
+    f32::from_bits(x.to_bits().wrapping_add(0x1000) & !0x1fff)
 }
 
 /// A cuBLAS operand transpose.
@@ -1650,24 +1834,29 @@ unsafe fn sgemm(
     Ok(())
 }
 
-/// Compile `vae_ops.cu` and resolve its entry points.
+/// Compile `vae_ops.cu` and `vae_conv.cu` and resolve their entry points.
 fn load_ops(dev: &CudaDevice) -> Result<VaeOps, RuntimeError> {
     let module: Arc<_> = dev.compile_and_load(VAE_OPS_SOURCE)?;
-    let get = |name: &str| -> Result<CudaFunction, RuntimeError> {
+    let conv_module: Arc<_> = dev.compile_and_load_with_arch(VAE_CONV_SOURCE, "compute_80")?;
+    let get = |module: &Arc<cudarc::driver::CudaModule>,
+               name: &str|
+     -> Result<CudaFunction, RuntimeError> {
         module
             .load_function(name)
             .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
     };
     Ok(VaeOps {
-        im2col: get("im2col_band")?,
-        bias_add: get("bias_add_channels")?,
-        nearest_2x: get("nearest_2x")?,
-        dup_up: get("dup_up_first_chunk")?,
-        rms_norm: get("rms_norm_channels")?,
-        silu: get("silu_inplace")?,
-        add: get("add_inplace")?,
-        softmax: get("softmax_rows_f32")?,
-        copy_rows: get("copy_rows")?,
+        im2col: get(&module, "im2col_band")?,
+        bias_add: get(&module, "bias_add_channels")?,
+        to_channels_last: get(&conv_module, "to_channels_last_tf32")?,
+        conv: get(&conv_module, "conv_tf32")?,
+        nearest_2x: get(&module, "nearest_2x")?,
+        dup_up: get(&module, "dup_up_first_chunk")?,
+        rms_norm: get(&module, "rms_norm_channels")?,
+        silu: get(&module, "silu_inplace")?,
+        add: get(&module, "add_inplace")?,
+        softmax: get(&module, "softmax_rows_f32")?,
+        copy_rows: get(&module, "copy_rows")?,
     })
 }
 
@@ -1914,5 +2103,46 @@ mod tests {
         // The clamp is the grid-x limit, not a smaller number: one block per
         // 256 elements must cover all of it.
         assert!((c.grid_dim.0 as u64) * THREADS as u64 >= total);
+    }
+
+    /// TF32 keeps 10 mantissa bits, rounding to nearest with ties away from
+    /// zero, as `cvt.rna.tf32.f32` does on the device.
+    #[test]
+    fn tf32_round_keeps_ten_mantissa_bits_ties_away() {
+        let ulp = 2f32.powi(-10);
+        assert_eq!(tf32_round(1.0), 1.0);
+        assert_eq!(tf32_round(1.0 + ulp), 1.0 + ulp);
+        // Exactly half an ulp rounds away from zero, just under it rounds down.
+        assert_eq!(tf32_round(1.0 + ulp / 2.0), 1.0 + ulp);
+        assert_eq!(tf32_round(-(1.0 + ulp / 2.0)), -(1.0 + ulp));
+        assert_eq!(tf32_round(1.0 + ulp / 2.0 - 2f32.powi(-23)), 1.0);
+        assert_eq!(tf32_round(0.0).to_bits(), 0);
+        assert_eq!(tf32_round(-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(tf32_round(f32::INFINITY), f32::INFINITY);
+        assert!(tf32_round(f32::NAN).is_nan());
+        // Every result has its low 13 bits clear.
+        for x in [0.1f32, -3.7, 1e-30, 6.5e4, 123_456.79] {
+            assert_eq!(tf32_round(x).to_bits() & 0x1fff, 0, "{x}");
+        }
+    }
+
+    /// `[out_c, in_c, k, k]` becomes `[out_c, k, k, in_c]`: weight
+    /// (o, i, ky, kx) lands at k index `(ky * k + kx) * in_c + i` of row o.
+    #[test]
+    fn conv_weight_tf32_puts_taps_outside_channels() {
+        let (out_c, in_c, k) = (2, 3, 3);
+        let w: Vec<f32> = (0..out_c * in_c * k * k).map(|v| v as f32).collect();
+        let t = conv_weight_tf32(&w, out_c, in_c, k);
+        for o in 0..out_c {
+            for i in 0..in_c {
+                for ky in 0..k {
+                    for kx in 0..k {
+                        let src = ((o * in_c + i) * k + ky) * k + kx;
+                        let dst = o * k * k * in_c + (ky * k + kx) * in_c + i;
+                        assert_eq!(t[dst], w[src], "o={o} i={i} ky={ky} kx={kx}");
+                    }
+                }
+            }
+        }
     }
 }

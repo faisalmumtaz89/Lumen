@@ -10,7 +10,7 @@
 //! The reference runs its convolutions in TF32 (torch's default for cuDNN),
 //! as the GPU path does; `vae.rs` runs them in full f32. So the first
 //! comparison is the sharper one: on the `main` oracle case the GPU decode is
-//! rel-L2 5.7e-5 from the reference (the reference itself lands 5.6e-5 from its
+//! rel-L2 5.5e-5 from the reference (the reference itself lands 5.6e-5 from its
 //! own output when cuDNN picks another algorithm), where full-f32 convolutions
 //! land 3.6e-4 away, and its 1.5e-4 bar tells the two apart. The GPU decode is
 //! 3.6e-4 from the CPU decoder, the TF32 rounding, and that bar of 1e-3 catches
