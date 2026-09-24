@@ -461,7 +461,16 @@ pub fn generate_gpu(
     };
     let vae = crate::cuda::vae_gpu::VaeGpu::load_with(&sources.vae, &dev, None)
         .map_err(|e| PipelineError::Unsupported(format!("{e}")))?;
-    decode_gpu(&vae, req, &latents).map_err(PipelineError::Unsupported)
+    // A decode that does not fit is retried in twice as many bands.
+    let most = decode_band_limit(req);
+    let mut bands = 1;
+    loop {
+        match decode_gpu(&vae, req, &latents, bands) {
+            Ok(image) => return Ok(image),
+            Err(e) if out_of_memory(&e) && bands < most => bands = (bands * 2).min(most),
+            Err(e) => return Err(PipelineError::Unsupported(e)),
+        }
+    }
 }
 
 /// The CUDA pipeline's host side, opened once and kept for every generation:
@@ -567,6 +576,8 @@ pub struct GpuResident {
     /// Per image size, the longest prompt measured and the device bytes its
     /// denoising and decoding took above what was allocated when they began.
     room: HashMap<(usize, usize), (usize, usize)>,
+    /// Per image size, the bands its decode last needed to fit.
+    decode_bands: HashMap<(usize, usize), usize>,
 }
 
 #[cfg(feature = "cuda")]
@@ -587,6 +598,7 @@ impl GpuResident {
             decode_needs_room: None,
             text_layers: ResidentLayers::default(),
             room: HashMap::new(),
+            decode_bands: HashMap::new(),
         })
     }
 
@@ -663,8 +675,15 @@ impl GpuResident {
         if self.decode_needs_room.is_some_and(|p| pixels >= p) {
             self.release_transformer();
         }
+        // A decode that does not fit drops the kept text layers first, then
+        // releases the transformer, and only then runs in twice as many bands:
+        // a whole-image decode plus reloading the transformer for the next
+        // generation takes less time than a banded decode beside it, so bands
+        // are for images that do not fit even on their own.
+        let most = decode_band_limit(req);
+        let mut bands = self.decode_bands.get(&size).copied().unwrap_or(1);
         let image = loop {
-            match decode_gpu(&self.vae, req, &latents) {
+            match decode_gpu(&self.vae, req, &latents, bands) {
                 Ok(image) => break image,
                 Err(e) if out_of_memory(&e) && !self.text_layers.is_empty() => {
                     self.forget_room(size)?;
@@ -672,6 +691,10 @@ impl GpuResident {
                 Err(e) if out_of_memory(&e) && self.dit.is_some() => {
                     self.release_transformer();
                     self.decode_needs_room = Some(smallest(self.decode_needs_room, pixels));
+                }
+                Err(e) if out_of_memory(&e) && bands < most => {
+                    bands = (bands * 2).min(most);
+                    self.decode_bands.insert(size, bands);
                 }
                 Err(e) => return Err(PipelineError::Unsupported(e)),
             }
@@ -919,12 +942,24 @@ fn denoise_gpu(
     Ok(latents)
 }
 
+/// The most bands a decode is split into: bands of at least 32 latent rows
+/// (512 image rows), which the shipped decoder's context rows on either side
+/// ([`crate::cuda::vae_gpu::VaeGpu::halo_rows`]) at most double.
+#[cfg(feature = "cuda")]
+fn decode_band_limit(req: &GenerationRequest<'_>) -> usize {
+    (latent_side(req.height) / 32).max(1)
+}
+
 /// The image the final latents decode to.
+///
+/// The decoder runs in `bands` horizontal bands, with the same result as one
+/// ([`crate::cuda::vae_gpu::VaeGpu::decode_in_bands`]).
 #[cfg(feature = "cuda")]
 fn decode_gpu(
     vae: &crate::cuda::vae_gpu::VaeGpu,
     req: &GenerationRequest<'_>,
     latents: &[f32],
+    bands: usize,
 ) -> Result<Rgba, String> {
     let lat_h = latent_side(req.height);
     let lat_w = latent_side(req.width);
@@ -938,7 +973,7 @@ fn decode_gpu(
     )
     .map_err(|e| format!("{e}"))?;
     let decoded = vae
-        .decode(&denorm, 1, lat_h, lat_w)
+        .decode_in_bands(&denorm, 1, lat_h, lat_w, bands)
         .map_err(|e| format!("{e}"))?;
     Ok(Rgba::from_planar_rgba(lat_w * 16, lat_h * 16, &decoded))
 }

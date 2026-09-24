@@ -15,7 +15,8 @@
 //! land 3.6e-4 away, and its 1.5e-4 bar tells the two apart. The GPU decode is
 //! 3.6e-4 from the CPU decoder, the TF32 rounding, and that bar of 1e-3 catches
 //! a decoder that computes something else. The run fails when either distance is above its
-//! bar.
+//! bar, or when a decode split into bands differs from the one-pass decode in any bit —
+//! on the oracle latents and on wide, tall and large pseudo-random ones.
 //!
 //! Usage: `vae-check-gpu <lbi-dir> <oracle-dir> [tag]`
 
@@ -67,6 +68,33 @@ fn max_abs(got: &[f32], want: &[f32]) -> f32 {
 
 fn gib(bytes: usize) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Fail unless `got` and `want` hold the same bits in every position.
+fn same_bits(label: &str, got: &[f32], want: &[f32]) -> Result<(), String> {
+    let differ = got
+        .iter()
+        .zip(want)
+        .filter(|(g, w)| g.to_bits() != w.to_bits())
+        .count();
+    println!("  {label:<44} {differ} of {} values differ", want.len());
+    if got.len() != want.len() || differ > 0 {
+        return Err(format!("{label}: not the same bits"));
+    }
+    Ok(())
+}
+
+/// Deterministic latents in [-2, 2), so a run is reproducible without a dump.
+fn pseudo(n: usize) -> Vec<f32> {
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+        })
+        .collect()
 }
 
 /// Print the three distances and fail when the relative L2 is above `bar`.
@@ -158,7 +186,7 @@ fn run() -> Result<(), String> {
     );
 
     let free_before = dev.free_memory().map_err(|e| e.to_string())?;
-    let gpu_decoder = VaeGpu::load(&lbi, &dev).map_err(|e| format!("{e}"))?;
+    let mut gpu_decoder = VaeGpu::load(&lbi, &dev).map_err(|e| format!("{e}"))?;
     let free_after = dev.free_memory().map_err(|e| e.to_string())?;
     println!(
         "resident weights: {:.3} GiB (free {:.2} GiB after load)",
@@ -187,6 +215,73 @@ fn run() -> Result<(), String> {
     // a bad oracle dump indistinguishable from a bad GPU path only if this line
     // is also wrong, which is the point of printing it.
     report("cpu vs oracle", &cpu, &want.data, 1e-3)?;
+
+    // A banded decode keeps only values computed from the whole-image inputs,
+    // so it must reproduce the one-pass decode bit for bit: two bands, an
+    // uneven split, and one latent row per band, where every band leans on its
+    // context rows. Then latents too wide and too tall for the oracle cases,
+    // whose convolutions run at the shapes large images use.
+    println!(
+        "banded decodes ({} context rows per side):",
+        gpu_decoder.halo_rows()
+    );
+    for bands in [2, 5, h] {
+        let banded = gpu_decoder
+            .decode_in_bands(&z.data, batch, h, w, bands)
+            .map_err(|e| format!("gpu, {bands} bands: {e}"))?;
+        same_bits(&format!("{bands} bands vs one pass"), &banded, &got)?;
+    }
+    let channels = z.data.len() / (batch * h * w);
+    // Widths of an even number of latent columns that are not a multiple of
+    // four (4064 pixels is 254), where a band's rows are not 16-byte aligned
+    // the way the whole image's are, with band heights odd and even.
+    for (lh, lw, splits) in [
+        (32usize, 256usize, [2, 5, 17]),
+        (256, 32, [2, 5, 17]),
+        (128, 128, [2, 5, 17]),
+        (16, 254, [3, 5, 8]),
+        (254, 66, [3, 5, 8]),
+        (66, 66, [3, 5, 8]),
+    ] {
+        let latents = pseudo(batch * channels * lh * lw);
+        let one = gpu_decoder
+            .decode_in_bands(&latents, batch, lh, lw, 1)
+            .map_err(|e| format!("gpu, {lh}x{lw} latent: {e}"))?;
+        for bands in splits {
+            let banded = gpu_decoder
+                .decode_in_bands(&latents, batch, lh, lw, bands)
+                .map_err(|e| format!("gpu, {lh}x{lw} latent, {bands} bands: {e}"))?;
+            same_bits(
+                &format!("{lh}x{lw} latent, {bands} bands vs one pass"),
+                &banded,
+                &one,
+            )?;
+        }
+    }
+
+    // The mid block's attention in chunks of query rows, 23 of them with a
+    // short last one, against the one chunk these latents take by default.
+    // The chunks' products have another shape, so their sums round
+    // differently, and the decoder's TF32 convolutions carry that to the
+    // output at the scale of the reference's own algorithm-to-algorithm
+    // spread (5.3e-5 here); a chunk that read or wrote the wrong rows moves
+    // the output by order one, so the oracle bar separates the two.
+    gpu_decoder.set_attention_score_budget(3_000_000);
+    let chunked = gpu_decoder
+        .decode(&z.data, batch, h, w)
+        .map_err(|e| format!("gpu, chunked attention: {e}"))?;
+    gpu_decoder.set_attention_score_budget(usize::MAX);
+    let differ = chunked
+        .iter()
+        .zip(&got)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "attention in chunks: {differ} of {} values differ",
+        got.len()
+    );
+    report("chunked vs whole", &chunked, &got, 1.5e-4)?;
+    report("chunked vs oracle", &chunked, &want.data, 1.5e-4)?;
 
     if got.len() != want.data.len() {
         return Err(format!(
