@@ -61,10 +61,11 @@ fn default_output_format() -> String {
 /// This is a memory bound, not an aesthetic one: the pipeline allocates a
 /// `latents * channels` tensor per denoising step and a `latents * hidden`
 /// activation inside the transformer, so the cost is quadratic in the side. At
-/// 2048 the transformer activation is already well past a gigabyte. Without a
-/// cap, one request can ask for a tensor in the hundreds of gigabytes and the
-/// process dies rather than answering.
-pub const MAX_SIDE: usize = 2048;
+/// 4096 the transformer's largest activation is 1.5 GiB and the decode runs in
+/// bands when the whole image does not fit. Without a cap, one request can ask
+/// for a tensor in the hundreds of gigabytes and the process dies rather than
+/// answering.
+pub const MAX_SIDE: usize = 4096;
 
 /// The most denoising steps a request may ask for.
 ///
@@ -184,10 +185,10 @@ mod tests {
             "no upper bound"
         );
         assert!(
-            mk("2049x2048", 8).dimensions().is_err(),
+            mk("4097x4096", 8).dimensions().is_err(),
             "just past the cap"
         );
-        assert!(mk("2048x2048", 8).dimensions().is_ok(), "at the cap");
+        assert!(mk("4096x4096", 8).dimensions().is_ok(), "at the cap");
         assert!(
             mk("31x1024", 8).dimensions().is_err(),
             "below one latent tile"

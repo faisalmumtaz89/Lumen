@@ -80,6 +80,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   out of memory anyway drops them and retries. On an RTX 5090, repeated 1024×1024 generations settle at a
   2.9 GiB encoder upload instead of 12.9 GiB, and the time from the first upload to the
   first denoising step falls from 538 ms to 133 ms, with identical images.
+- **Images up to 4096×4096.** The image endpoint accepts sides up to 4096 (was 2048). A
+  decode that does not fit on the device even without the transformer runs in horizontal
+  bands, each with the neighbouring rows its convolutions reach, and gives the same image
+  as a one-pass decode bit for bit; the VAE's attention takes its queries in chunks of at
+  most 1 GiB of scores. On an RTX 5090 a 3840×2176 generation takes 216 s and a
+  4096×4096 one 718 s. The VAE's convolution products now have a
+  fixed number of rows and write the same buffer, which is what makes banded and one-pass
+  decodes identical: images differ from earlier builds in the last bits, with the same
+  distance to the reference (PSNR 46.02 dB against 46.01).
 - **`fault-injection` build feature** for `lumen-server`: `LUMEN_FAULT_PANIC_AT` panics
   the worker at a chosen prefill or decode point once, and `LUMEN_FAULT_PERTURB_US` adds
   random delays at the worker's synchronisation points; see `docs/server.md`.

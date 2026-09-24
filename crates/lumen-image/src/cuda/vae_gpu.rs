@@ -81,11 +81,21 @@ const THREADS: u32 = 256;
 /// guarantees by never returning before its last one.
 const ATTN_THREADS: u32 = 256;
 
+/// The most bytes of attention scores held at once: 1 GiB, which takes the
+/// mid block's scores whole up to 2048x2048 (16,384 positions) and in chunks
+/// of query rows beyond.
+const ATTN_SCORE_BUDGET: usize = 1 << 30;
+
 /// The grid-x limit CUDA allows (2^31 - 1). The decoder's largest activation —
 /// 288 channels at 1024x1024 — needs 1.2 million blocks at 256 threads, four
 /// orders of magnitude below this, so the clamp is a guard against a malformed
 /// config rather than a limit the shipped architecture ever approaches.
 const GRID_X_MAX: u64 = 0x7fff_ffff;
+
+/// Output rows per convolution product. Fixed rather than derived from the
+/// image height, so a decode in bands runs every row through products of the
+/// same shape as the whole-image decode does.
+const CONV_ROWS: usize = 16;
 
 /// Bytes the convolution's column matrix may occupy per band.
 ///
@@ -515,6 +525,7 @@ struct VaeOps {
     silu: CudaFunction,
     add: CudaFunction,
     softmax: CudaFunction,
+    copy_rows: CudaFunction,
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +547,9 @@ pub struct VaeGpu {
     up_blocks: Vec<GpuUpBlock>,
     norm_out: GpuNorm,
     conv_out: GpuConv,
+    /// The most bytes of attention scores held at once; see
+    /// [`Self::set_attention_score_budget`].
+    attention_score_budget: usize,
 }
 
 impl VaeGpu {
@@ -678,11 +692,22 @@ impl VaeGpu {
             up_blocks,
             norm_out,
             conv_out,
+            attention_score_budget: ATTN_SCORE_BUDGET,
         })
     }
 
     pub fn config(&self) -> &VaeConfig {
         &self.config
+    }
+
+    /// Hold at most `bytes` of attention scores at once (at least one row's):
+    /// the mid block's queries run in chunks of rows whose scores fit. Each
+    /// row's softmax and product with V stand alone, so any budget gives the
+    /// same values up to the order the products' terms are summed in;
+    /// `vae-check-gpu` sets a small one to exercise the chunking on latents
+    /// whose scores would otherwise fit whole.
+    pub fn set_attention_score_budget(&mut self, bytes: usize) {
+        self.attention_score_budget = bytes;
     }
 
     /// Decode latents `[batch, z_dim, 1, h, w]` to `[batch, out_channels, 1,
@@ -726,21 +751,144 @@ impl VaeGpu {
             ));
         }
 
-        // The spatial extent is carried through the stack because four of the
-        // five up blocks double it. Each layer checks the activation it is
-        // handed against the extent it is about to use, so a size that went out
-        // of step with the data is a reported shape mismatch rather than a read
-        // past the end of a plane.
-        let mut hh = h;
-        let mut ww = w;
+        self.decode_in_bands(latents, batch, h, w, 1)
+    }
+
+    /// [`Self::decode`] with the upsampling half run over `bands` horizontal
+    /// bands of the latent rows instead of the whole image at once, so the
+    /// largest activations are a band's size.
+    ///
+    /// Everything up to and including the mid block — the only operation that
+    /// mixes distant positions, its attention — runs over the whole latent
+    /// once. After it every operation is local: 3x3 and 1x1 convolutions with
+    /// zero padding, the per-position channel norm, SiLU, nearest upsampling
+    /// and the `DupUp3D` shortcut. So each band is decoded with
+    /// [`Self::halo_rows`] extra latent rows on either side, which covers every
+    /// convolution's reach, and only its own rows are kept: each kept value is
+    /// computed from exactly the inputs the whole-image decode uses, with the
+    /// image border where the image's is. `bands` is clamped to the latent's
+    /// row count.
+    pub fn decode_in_bands(
+        &self,
+        latents: &[f32],
+        batch: usize,
+        h: usize,
+        w: usize,
+        bands: usize,
+    ) -> Result<Vec<f32>, VaeGpuError> {
+        if batch == 0 || h == 0 || w == 0 {
+            return Err(mismatch(
+                "latents",
+                &[1, self.config.z_dim as u64, 1, 1, 1],
+                &[
+                    batch as u64,
+                    self.config.z_dim as u64,
+                    1,
+                    h as u64,
+                    w as u64,
+                ],
+            ));
+        }
+        let expected = batch * self.config.z_dim * h * w;
+        if latents.len() != expected {
+            return Err(mismatch(
+                "latents",
+                &[
+                    batch as u64,
+                    self.config.z_dim as u64,
+                    1,
+                    h as u64,
+                    w as u64,
+                ],
+                &[latents.len() as u64],
+            ));
+        }
 
         // `_decode` runs `post_quant_conv` over the whole latent, then feeds the
         // decoder one frame at a time with `first_chunk=True` on frame 0. There
         // is exactly one frame here, so that loop runs once.
         let z = launch::upload(&self.dev, latents)?;
-        let x = self.post_quant_conv.apply(self, &z, batch, hh, ww)?;
-        let x = self.conv_in.apply(self, &x, batch, hh, ww)?;
-        let mut x = self.mid_block.apply(self, &x, batch, hh, ww)?;
+        let x = self.post_quant_conv.apply(self, &z, batch, h, w)?;
+        drop(z);
+        let x = self.conv_in.apply(self, &x, batch, h, w)?;
+        let x = self.mid_block.apply(self, &x, batch, h, w)?;
+
+        // The elementwise kernels index an activation with 32 bits, so a band,
+        // context rows included, never holds more than `i32::MAX` values in any
+        // one activation.
+        let row_limit = i32::MAX as usize / (batch * self.widest_row(w));
+        let halo = self.halo_rows();
+        let fewest = if h <= row_limit {
+            1
+        } else if row_limit > 2 * halo {
+            h.div_ceil(row_limit - 2 * halo)
+        } else {
+            return Err(VaeGpuError::KernelLimit(format!(
+                "a {w}-wide latent in batches of {batch} leaves {row_limit} rows per band, \
+                 not above the {} of context a band carries",
+                2 * halo
+            )));
+        };
+        let bands = bands.max(fewest).clamp(1, h);
+        let out = if bands == 1 {
+            self.upsample_half(x, batch, h, w)?
+        } else {
+            let scale = self.scale();
+            let c_mid = x.len / (batch * h * w);
+            let c_out = self.conv_out.out_c;
+            let mut out = launch::alloc(&self.dev, batch * c_out * h * scale * w * scale)?;
+            let per_band = h.div_ceil(bands);
+            for r0 in (0..h).step_by(per_band) {
+                let r1 = (r0 + per_band).min(h);
+                let (a, b) = (r0.saturating_sub(halo), (r1 + halo).min(h));
+                let mut band = launch::alloc(&self.dev, batch * c_mid * (b - a) * w)?;
+                self.copy_rows(
+                    &x.buf.slice(..),
+                    &mut band.buf.slice_mut(..),
+                    batch * c_mid,
+                    w,
+                    (h, a),
+                    (b - a, 0),
+                    b - a,
+                )?;
+                let decoded = self.upsample_half(band, batch, b - a, w)?;
+                self.copy_rows(
+                    &decoded.buf.slice(..),
+                    &mut out.buf.slice_mut(..),
+                    batch * c_out,
+                    w * scale,
+                    ((b - a) * scale, (r0 - a) * scale),
+                    (h * scale, r0 * scale),
+                    (r1 - r0) * scale,
+                )?;
+            }
+            out
+        };
+
+        // The clamp is the reference's `v.max(-1.0).min(1.0)` on the finished
+        // tensor; `download` synchronizes first, so the copy is complete.
+        let mut data = launch::download(&self.dev, &out)?;
+        for v in data.iter_mut() {
+            *v = v.max(-1.0).min(1.0);
+        }
+        Ok(data)
+    }
+
+    /// The decoder after the mid block, over `[batch, c, h, w]`: the up blocks,
+    /// `norm_out`, SiLU and `conv_out`, to `[batch, 3, h * scale, w * scale]`.
+    fn upsample_half(
+        &self,
+        mut x: DevVec,
+        batch: usize,
+        h: usize,
+        w: usize,
+    ) -> Result<DevVec, VaeGpuError> {
+        // The spatial extent is carried through the stack because the
+        // upsamplers double it. Each layer checks the activation it is handed
+        // against the extent it is about to use, so a size that went out of
+        // step with the data is a reported shape mismatch rather than a read
+        // past the end of a plane.
+        let (mut hh, mut ww) = (h, w);
         for block in &self.up_blocks {
             x = block.apply(self, &x, batch, hh, ww)?;
             if block.upsampler.is_some() {
@@ -754,15 +902,61 @@ impl VaeGpu {
             .apply(self, &x, batch * self.norm_out.dim, hh * ww)?;
         self.silu_inplace(&mut x)?;
         self.check_extent(&x, batch, self.norm_out.dim, hh, ww, "decoder.conv_out")?;
-        let out = self.conv_out.apply(self, &x, batch, hh, ww)?;
+        self.conv_out.apply(self, &x, batch, hh, ww)
+    }
 
-        // The clamp is the reference's `v.max(-1.0).min(1.0)` on the finished
-        // tensor; `download` synchronizes first, so the copy is complete.
-        let mut data = launch::download(&self.dev, &out)?;
-        for v in data.iter_mut() {
-            *v = v.max(-1.0).min(1.0);
+    /// Values per latent row in the largest activation after the mid block, for
+    /// a latent `w` wide: each activation's channels times the rows and columns
+    /// one latent row becomes at its resolution.
+    fn widest_row(&self, w: usize) -> usize {
+        let mut scale = 1usize;
+        let mut widest = 0usize;
+        for block in &self.up_blocks {
+            for resnet in &block.resnets {
+                let channels = resnet.conv1.in_c.max(resnet.conv2.out_c);
+                widest = widest.max(channels * scale * scale * w);
+            }
+            if let Some(conv) = &block.upsampler {
+                scale *= 2;
+                widest = widest.max(conv.in_c.max(conv.out_c) * scale * scale * w);
+            }
         }
-        Ok(data)
+        widest.max(self.norm_out.dim * scale * scale * w)
+    }
+
+    /// How many times the up blocks double the latent's extent.
+    fn scale(&self) -> usize {
+        1 << self
+            .up_blocks
+            .iter()
+            .filter(|b| b.upsampler.is_some())
+            .count()
+    }
+
+    /// Latent rows of context a band needs on either side: the reach of every
+    /// convolution after the mid block, each padding row counted at the
+    /// resolution its convolution runs at and converted to latent rows.
+    pub fn halo_rows(&self) -> usize {
+        let scale = self.scale();
+        // Reach in rows of the finished image, summed over the convolutions.
+        let mut reach = 0usize;
+        let mut level = 1usize;
+        for block in &self.up_blocks {
+            for resnet in &block.resnets {
+                let convs = [
+                    Some(&resnet.conv1),
+                    Some(&resnet.conv2),
+                    resnet.shortcut.as_ref(),
+                ];
+                reach += convs.iter().flatten().map(|c| c.pad_h).sum::<usize>() * (scale / level);
+            }
+            if let Some(conv) = &block.upsampler {
+                level *= 2;
+                reach += conv.pad_h * (scale / level);
+            }
+        }
+        reach += self.conv_out.pad_h;
+        reach.div_ceil(scale)
     }
 
     /// Assert that `x` holds `batch * c * h * w` values, naming the layer.
@@ -791,11 +985,11 @@ impl VaeGpu {
     /// One 2-D convolution, `[batch, in_c, h, w]` to `[batch, out_c, h, w]`,
     /// as im2col plus a GEMM.
     ///
-    /// The output rows are processed in bands so the column matrix stays
-    /// bounded: at 1024x1024 with 144 channels and a 3x3 kernel the full matrix
-    /// would be 5.4 GB. Each band's GEMM writes straight into `out` — the
-    /// output is `[out_c, h * w]` per image, so a band of rows is a contiguous
-    /// run within every channel and `ldc = h * w` addresses it directly.
+    /// The output rows are processed in bands of a fixed row count so the
+    /// column matrix stays bounded: at 1024x1024 with 144 channels and a 3x3
+    /// kernel the full matrix would be 5.4 GB. Each band's GEMM writes a
+    /// staging buffer `[out_c, band_rows * w]` (`ldc = band_rows * w`), and the
+    /// band's rows are then copied into `out`, `[out_c, h * w]` per image.
     ///
     /// Column-major mapping for the row-major buffers: `col[K, P]` is
     /// `col_cm[P, K]`, `W[out_c, K]` is `W_cm[K, out_c]`, and the wanted
@@ -848,13 +1042,21 @@ impl VaeGpu {
         if batch * w.out_c * hw == 0 {
             return Ok(out);
         }
-        // Rows per band, sized so the column matrix stays under the budget.
-        let band_rows = (CONV_COL_BUDGET / (k * wd * 4)).clamp(1, h);
+        // Rows per product: CONV_ROWS, or fewer when a row is so wide the
+        // column matrix would pass its budget. The count depends only on the
+        // width, and every product writes the same `staging` buffer with the
+        // same stride before its rows are copied into place, so the same row
+        // of an image goes through the same cuBLAS call — shape, operands'
+        // alignment and strides — whether the image is decoded whole or in
+        // bands, and is summed in the same order. The last band of rows is
+        // padded to the full shape.
+        let band_rows = (CONV_COL_BUDGET / (k * wd * 4)).clamp(1, CONV_ROWS);
         let col = DevVec {
             buf: unsafe { self.dev.alloc_uninit::<f32>(k * band_rows * wd) }
                 .map_err(|e| cuda("conv col alloc", e))?,
             len: k * band_rows * wd,
         };
+        let mut staging = launch::alloc(&self.dev, w.out_c * band_rows * wd)?;
 
         let (icu, ihu, iwu) = (w.in_c as u32, h as u32, wd as u32);
         let (khu, kwu, phu, pwu) = (w.kh as u32, w.kw as u32, w.pad_h as u32, w.pad_w as u32);
@@ -863,7 +1065,9 @@ impl VaeGpu {
             let mut row0 = 0usize;
             while row0 < h {
                 let rows = band_rows.min(h - row0);
-                let p = rows * wd;
+                // Always a full product; rows past the image are computed
+                // from whatever the kernel window reads and dropped.
+                let p = band_rows * wd;
                 let total = (k * p) as u64;
                 // Safety: `col` holds `k * band_rows * wd` floats and `x_img` is
                 // one image's `[in_c, h, w]`; the grid covers exactly `k * p`.
@@ -881,13 +1085,12 @@ impl VaeGpu {
                         .arg(&phu)
                         .arg(&pwu)
                         .arg(&(row0 as u32))
-                        .arg(&(rows as u32))
+                        .arg(&(band_rows as u32))
                         .launch(cfg_1d(total, THREADS))
                         .map_err(|e| cuda("im2col_band", e))?;
                 }
-                // out[b, :, row0*wd ..] — offset into the image, then the band.
-                let out_off = b * w.out_c * hw + row0 * wd;
-                let mut out_band = out.buf.slice_mut(out_off..out.len);
+                // Safety: `col` holds the band's `k * p` columns, the weight is
+                // `[out_c, k]` and `staging` holds `out_c * p`.
                 unsafe {
                     sgemm(
                         &self.dev,
@@ -899,14 +1102,24 @@ impl VaeGpu {
                         p,
                         &w.weight.buf.slice(..),
                         k,
-                        &mut out_band,
-                        hw,
+                        &mut staging.buf.slice_mut(..),
+                        p,
                         p,
                         w.out_c,
                         k,
                     )
                     .map_err(VaeGpuError::Cuda)?;
                 }
+                let mut image = out.buf.slice_mut(b * w.out_c * hw..(b + 1) * w.out_c * hw);
+                self.copy_rows(
+                    &staging.buf.slice(..),
+                    &mut image,
+                    w.out_c,
+                    wd,
+                    (band_rows, 0),
+                    (h, row0),
+                    rows,
+                )?;
                 row0 += rows;
             }
             // Safety: the plane is `out_c * hw` floats and `bias` holds `out_c`.
@@ -1170,18 +1383,23 @@ impl VaeGpu {
             )));
         }
         let mut ctx = launch::alloc(&self.dev, batch * c * seq)?;
-        // One row per (batch, position). Owing its size to `seq^2` rather than
-        // to the activation, this is the largest allocation the decoder makes
-        // per attention block — 64 MiB at the mid block's 4096 positions, against
-        // the 1.2 GiB the widest activation takes at 1024x1024.
-        let mut row = launch::alloc(&self.dev, batch * seq * seq)?;
+        // The scores are `seq` rows of `seq`, one per query position, and each
+        // row's softmax and product with V stand alone, so the queries run in
+        // chunks of rows whose scores fit the budget, by default
+        // [`ATTN_SCORE_BUDGET`]: the whole of
+        // them up to 2048x2048 (64 MiB at 1024x1024's 4096 positions), and 1 GiB
+        // at a time beyond, where all of them would take 16 GiB at 4096x4096.
+        let chunk = (self.attention_score_budget / (seq * 4)).clamp(1, seq);
+        let mut row = launch::alloc(&self.dev, chunk * seq)?;
         let scale = 1.0 / (c as f32).sqrt();
         let su = seq as u32;
-        for n in 0..batch {
-            let q = qkv.buf.slice(n * 3 * c * seq..);
+        for (n, q0) in (0..batch).flat_map(|n| (0..seq).step_by(chunk).map(move |q0| (n, q0))) {
+            let rows = chunk.min(seq - q0);
+            let ru = rows as u32;
+            let q = qkv.buf.slice(n * 3 * c * seq + q0..);
             let k = qkv.buf.slice((n * 3 + 1) * c * seq..);
             let v = qkv.buf.slice((n * 3 + 2) * c * seq..);
-            let mut scores = row.buf.slice_mut(n * seq * seq..(n + 1) * seq * seq);
+            let mut scores = row.buf.slice_mut(..rows * seq);
             // Safety: every operand is a device view of at least the size the
             // product reads or writes, checked against `qkv.len` above.
             unsafe {
@@ -1198,13 +1416,13 @@ impl VaeGpu {
                     &mut scores,
                     seq,
                     seq,
-                    seq,
+                    rows,
                     c,
                 )
                 .map_err(VaeGpuError::Cuda)?;
             }
-            // Safety: the grid is one block per row of the `[seq, seq]` scores
-            // of this batch item, and every block runs to the end.
+            // Safety: the grid is one block per row of this chunk's `[rows,
+            // seq]` scores, and every block runs to the end.
             unsafe {
                 self.dev
                     .stream
@@ -1212,14 +1430,14 @@ impl VaeGpu {
                     .arg(&mut scores)
                     .arg(&su)
                     .launch(LaunchConfig {
-                        grid_dim: (su, 1, 1),
+                        grid_dim: (ru, 1, 1),
                         block_dim: (ATTN_THREADS, 1, 1),
                         shared_mem_bytes: 0,
                     })
                     .map_err(|e| cuda("softmax_rows_f32", e))?;
             }
-            let probs = row.buf.slice(n * seq * seq..(n + 1) * seq * seq);
-            let mut out = ctx.buf.slice_mut(n * c * seq..(n + 1) * c * seq);
+            let probs = row.buf.slice(..rows * seq);
+            let mut out = ctx.buf.slice_mut(n * c * seq + q0..(n + 1) * c * seq);
             // Safety: as for the first product.
             unsafe {
                 sgemm(
@@ -1234,7 +1452,7 @@ impl VaeGpu {
                     seq,
                     &mut out,
                     seq,
-                    seq,
+                    rows,
                     c,
                     seq,
                 )
@@ -1242,6 +1460,50 @@ impl VaeGpu {
             }
         }
         Ok(ctx)
+    }
+
+    /// `rows` rows of every one of `planes` planes `w` wide, from `src`
+    /// (`(height, first row)`) to `dst` (`(height, first row)`).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows(
+        &self,
+        src: &cudarc::driver::CudaView<f32>,
+        dst: &mut cudarc::driver::CudaViewMut<f32>,
+        planes: usize,
+        w: usize,
+        (src_h, src_row0): (usize, usize),
+        (dst_h, dst_row0): (usize, usize),
+        rows: usize,
+    ) -> Result<(), VaeGpuError> {
+        if src_row0 + rows > src_h
+            || dst_row0 + rows > dst_h
+            || src.len() != planes * src_h * w
+            || dst.len() != planes * dst_h * w
+        {
+            return Err(mismatch(
+                "band rows",
+                &[(planes * src_h * w) as u64, (planes * dst_h * w) as u64],
+                &[src.len() as u64, dst.len() as u64],
+            ));
+        }
+        let total = (planes as u64) * (rows as u64) * (w as u64);
+        if total == 0 {
+            return Ok(());
+        }
+        let args = [planes, w, src_h, src_row0, dst_h, dst_row0, rows].map(|v| v as u32);
+        // Safety: both views hold `planes` planes of the heights checked
+        // above, and the grid covers exactly the copied element count.
+        unsafe {
+            let mut launch = self.dev.stream.launch_builder(&self.ops.copy_rows);
+            launch.arg(src).arg(dst);
+            for v in &args {
+                launch.arg(v);
+            }
+            launch
+                .launch(cfg_1d(total, THREADS))
+                .map_err(|e| cuda("copy_rows", e))?;
+        }
+        Ok(())
     }
 
     /// A device-to-device copy, for a residual path that keeps its operand.
@@ -1405,6 +1667,7 @@ fn load_ops(dev: &CudaDevice) -> Result<VaeOps, RuntimeError> {
         silu: get("silu_inplace")?,
         add: get("add_inplace")?,
         softmax: get("softmax_rows_f32")?,
+        copy_rows: get("copy_rows")?,
     })
 }
 

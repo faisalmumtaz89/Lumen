@@ -28,6 +28,36 @@
 // what the per-element index splits below assume.
 
 // ---------------------------------------------------------------------------
+// A run of rows copied between two planes of the same width:
+//
+//     dst[o, dst_row0 + r, :] = src[o, src_row0 + r, :]    for r < rows
+//
+// for every plane `o` of `NC`. A banded decode uses it to cut a band of rows
+// out of the decoder's input and to place a band's finished rows into the
+// image. Each element is a copy, so no arithmetic is involved.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void copy_rows(
+    const float* __restrict__ src,   // [NC, src_h, W]
+    float* __restrict__ dst,         // [NC, dst_h, W]
+    unsigned int NC,
+    unsigned int W,
+    unsigned int src_h,
+    unsigned int src_row0,
+    unsigned int dst_h,
+    unsigned int dst_row0,
+    unsigned int rows)
+{
+    unsigned long long total = (unsigned long long)NC * rows * W;
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    unsigned int col = (unsigned int)(i % W);
+    unsigned long long rem = i / W;
+    unsigned int r = (unsigned int)(rem % rows);
+    unsigned long long o = rem / rows;
+    dst[(o * dst_h + dst_row0 + r) * W + col] = src[(o * src_h + src_row0 + r) * W + col];
+}
+
+// ---------------------------------------------------------------------------
 // `QwenImage21Upsample(scale_factor=(2, 2), mode="nearest-exact")`.
 //
 // For an exact integer scale of 2, nearest-exact maps output index `i` to

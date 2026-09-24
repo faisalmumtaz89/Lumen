@@ -55,7 +55,7 @@ curl http://localhost:8000/v1/images/generations \
 |---|---|---|
 | `model` | the served image model id | must match `LUMEN_IMAGE_MODEL_ID` when given |
 | `prompt` | required | up to 8 KiB |
-| `size` | `1024x1024` | `WxH`, each side 32–2048; sides round down to a multiple of 32 |
+| `size` | `1024x1024` | `WxH`, each side 32–4096; sides round down to a multiple of 32 |
 | `num_inference_steps` | `40` | 1–200 |
 | `seed` | `42` | any `u64` |
 | `true_cfg_scale` | `1.0` | must be `1.0`: one conditional pass per step, no negative prompt |
@@ -89,7 +89,11 @@ encoder's upload drops from 12.9 GiB to 2.9 GiB. Prompt encoding and image
 decoding run beside the resident transformer when they fit. When one runs out of device
 memory there — a 2048×2048 decode on a 32 GiB card, a prompt of thousands of tokens, or
 any prompt on a card much smaller than 32 GiB — the transformer is released and the step
-retried, along with any text-encoder layers kept beside it: after an encoding it is
+retried, along with any text-encoder layers kept beside it. A decode that still does not
+fit on its own, as at 3840×2176 on a 32 GiB card, is split into horizontal bands, twice
+as many at each retry down to bands of 512 image rows, and the count is remembered for
+the size; every band is decoded with enough neighbouring rows that the image is the same
+as a one-pass decode, bit for bit. After an encoding the transformer is
 loaded again for the denoising steps of the same generation, after a decode by the next
 generation. Later work at least that large
 releases it up front. Images are identical either way. Any generation that runs out pays
