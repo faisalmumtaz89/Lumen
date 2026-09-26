@@ -26,6 +26,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   with dedicated decode and prefill kernels; the other backends refuse such an artifact
   at load and name the scheme. With `LUMEN_CUDA_NVFP4=0`, `lumen` and `lumen-server` refuse
   them on CUDA as well.
+- **Native NVFP4/FP8 prefill on CUDA.** An NVFP4/FP8 artifact of the supported 27B
+  hybrid structure, converted with its activation scales, is prefilled with FP4 and FP8
+  activations on cuBLASLt's tensor-core GEMMs (block-scaled FP4, per-tensor-scaled FP8) and dedicated kernels, on a GPU
+  of compute capability 12.0 with NVRTC and cuBLASLt 12.8 or newer and an F32 KV store,
+  when its kernels pass a self-check at load and every GEMM has a verified plan (measured
+  and verified once, then cached per library, device model and driver). The GDN and
+  attention kernels' reference outputs were recorded with NVRTC 13.3 and driver 610;
+  another toolchain whose build changes their outputs fails the check.
+  Decode is unchanged and continues from the state the prefill leaves. The native prefill
+  rounds differently from the F32 one, and its output is reproducible while the measured
+  plan table stays the same and a request does not continue the one the server ran before
+  it, prompt and reply (see `docs/troubleshooting.md`). The route is chosen
+  once at load and the load log names it (`[CUDA] prefill route: ...`), with the libraries
+  and their versions, or, when the F32 prefill is used instead, the first condition that
+  was not met. Artifacts converted before activation scales were kept are prefilled by the
+  F32 route; re-convert them to use the native one. `LUMEN_CUDA_NATIVE_PREFILL=0` selects
+  the F32 prefill, as does `LUMEN_CUDA_PREFILL_F32`.
 - **Token-id prompts on `/v1/completions`.** `prompt` may be an array of token ids, which
   reach the model unchanged, as in the OpenAI completions API. An id outside the model's
   vocabulary is refused with a 400, as is an array mixing strings with ids or holding any

@@ -575,10 +575,12 @@ fn qualifying_launches_match_the_oracle() {
             ),
             EMBED_GATHER_BF16 => {
                 let table = smoke::table();
-                smoke::IDS
+                let mut rows: Vec<u8> = smoke::IDS
                     .iter()
                     .flat_map(|&id| bytes16(&table[id as usize * h..(id as usize + 1) * h]))
-                    .collect()
+                    .collect();
+                rows.resize(rows.len() + 2 * smoke::GUARD, 0xA5);
+                rows
             }
             _ => unreachable!(),
         };

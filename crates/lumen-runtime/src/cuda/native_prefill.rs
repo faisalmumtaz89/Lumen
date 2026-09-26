@@ -1,10 +1,15 @@
-//! The native NVFP4/FP8 prefill route: its exact structural admission.
+//! The native NVFP4/FP8 prefill route: its exact structural admission and the conditions of its
+//! publication.
 //!
 //! The route's kernels and GEMM plans are specialised to one verified model structure, so a model is
-//! admitted only when every condition below holds; the first that fails is named, and the model is
-//! served by the F32 prefill. Each check is a pure host function of the hyperparameters, the layer
-//! descriptors, the slice schemes and lengths, and the few values read through [`SliceSource`] (the
-//! activation scales and the `in_proj_a` / `in_proj_b` values).
+//! prefilled by it only when every condition below holds; otherwise the model is prefilled by the
+//! F32 route, and for an artifact with NVFP4 or FP8 planes the load log names the first condition
+//! that failed. The route is chosen once, when the weights are
+//! loaded (`CudaBackend::preload_weights`); nothing falls back during a request.
+//!
+//! The structural conditions are pure host functions of the hyperparameters, the layer descriptors,
+//! the slice schemes and lengths, and the few values read through [`SliceSource`] (the activation
+//! scales and the `in_proj_a` / `in_proj_b` values):
 //!
 //! | Condition | Requirement |
 //! |---|---|
@@ -12,12 +17,21 @@
 //! | Q0.a | Hidden size 5120, MLP size 17408 |
 //! | Q0.b | 24 query heads, 4 KV heads, head size 256; query and gate fused with per-head q/k norms; no q/k/v bias; RoPE over 64 dimensions, NeoX pairing, theta 1e7, no scaling |
 //! | Q0.c | GDN: 48 value heads, 16 key heads, head size 128, conv kernel 4; its F32 tensors present at exact lengths |
-//! | Q0.d | BF16 embedding; every layer norm F32 at its exact length |
-//! | Q5 | Every MLP projection NVFP4, every attention and GDN projection FP8, each carrying an activation scale that is finite and positive; so every scale group (GDN qkv and z, attention q, k and v, MLP gate and up) is well formed, its scale being its members' maximum |
+//! | Q0.d | BF16 embedding, resident on the device; every layer norm F32 at its exact length |
+//! | Q5 | Every MLP projection NVFP4, every attention and GDN projection FP8, each carrying an activation scale that is finite and positive, and each resident on the device as its stored planes; so every scale group (GDN qkv and z, attention q, k and v, MLP gate and up) is well formed, its scale being its members' maximum |
 //! | Q6 | `in_proj_a` / `in_proj_b` hold only BF16 values, so their BF16 copy is exact |
 //!
-//! The runtime conditions (device, libraries, plans, KV store, memory, the switch) are checked when
-//! the route is published.
+//! The runtime conditions are checked when the route is published:
+//!
+//! | Condition | Requirement |
+//! |---|---|
+//! | Q1 | The device has compute capability 12.0 |
+//! | Q2 | NVRTC 12.8 or newer, listing target 120 (`compute_120a`) |
+//! | Q3 | Every native kernel group compiles and reproduces its qualifying outputs, and the embedding gather of the vocabulary's highest id and of id 65537 (when the vocabulary has one) returns the resident embedding's stored rows |
+//! | Q4 | cuBLASLt 12.8 or newer loads, and every GEMM plan has a measured, verified algorithm |
+//! | Q7 | The KV store is F32 |
+//! | Q8 | The weight views, the scratch, the KV staging, the RoPE table and the shared GDN state allocate |
+//! | Q9 | `LUMEN_CUDA_NATIVE_PREFILL` is not `0` and `LUMEN_CUDA_PREFILL_F32` is unset |
 
 use crate::error::RuntimeError;
 use crate::weight::cache::{LayerView, WeightProvider};
@@ -60,8 +74,9 @@ pub trait SliceSource {
     ) -> Result<Vec<u8>, RuntimeError>;
 }
 
-/// A [`SliceSource`] over a weight provider. It keeps the last layer it fetched, because a provider
-/// fetch reads the whole layer and admission and the views read each layer's slices together.
+/// A [`SliceSource`] over a weight provider. It keeps the last layer it fetched, and only that one,
+/// because a provider fetch reads the whole layer and admission and the views read each layer's
+/// slices together.
 pub struct ProviderSlices<'a> {
     provider: &'a dyn WeightProvider,
     layer: std::cell::RefCell<Option<LayerView>>,
@@ -76,6 +91,28 @@ impl<'a> ProviderSlices<'a> {
     }
 }
 
+impl ProviderSlices<'_> {
+    /// Run `f` on layer `layer`'s view, fetching it unless it is the one held.
+    fn with_layer<R>(
+        &self,
+        layer: usize,
+        f: impl FnOnce(&LayerView) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let mut held = self.layer.borrow_mut();
+        if held.as_ref().map_or(true, |v| v.layer_idx != layer) {
+            // Release the held layer before fetching the next: one layer is held at a time.
+            *held = None;
+            *held = Some(self.provider.get_layer_raw(layer)?);
+        }
+        f(held.as_ref().expect("fetched above"))
+    }
+
+    /// Layer `layer`'s descriptor, from the fetch its slices are then read from.
+    pub fn subtensors(&self, layer: usize) -> Result<SubtensorOffsets, RuntimeError> {
+        self.with_layer(layer, |v| Ok(v.subtensors.clone()))
+    }
+}
+
 impl SliceSource for ProviderSlices<'_> {
     fn read(
         &self,
@@ -84,22 +121,19 @@ impl SliceSource for ProviderSlices<'_> {
         start: u64,
         len: u64,
     ) -> Result<Vec<u8>, RuntimeError> {
-        let mut held = self.layer.borrow_mut();
-        let view = match held.take() {
-            Some(v) if v.layer_idx == layer => held.insert(v),
-            _ => held.insert(self.provider.get_layer_raw(layer)?),
-        };
-        let bytes = view.subtensor_bytes(slice)?;
-        let end = start
-            .checked_add(len)
-            .filter(|&e| e <= bytes.len() as u64)
-            .ok_or_else(|| {
-                RuntimeError::Compute(format!(
-                    "layer {layer}: bytes {start}+{len} lie outside a slice of {}",
-                    bytes.len()
-                ))
-            })?;
-        Ok(bytes[start as usize..end as usize].to_vec())
+        self.with_layer(layer, |view| {
+            let bytes = view.subtensor_bytes(slice)?;
+            let end = start
+                .checked_add(len)
+                .filter(|&e| e <= bytes.len() as u64)
+                .ok_or_else(|| {
+                    RuntimeError::Compute(format!(
+                        "layer {layer}: bytes {start}+{len} lie outside a slice of {}",
+                        bytes.len()
+                    ))
+                })?;
+            Ok(bytes[start as usize..end as usize].to_vec())
+        })
     }
 }
 
@@ -168,21 +202,13 @@ fn expected(field: &str, attention: bool) -> (Expect, &'static str) {
     }
 }
 
-/// Admit the model to the native route, or name the first condition it fails.
-pub fn admit(
-    hp: &ModelHyperparams,
-    embedding: QuantScheme,
-    layers: &[SubtensorOffsets],
-    src: &dyn SliceSource,
-) -> Result<(), Refusal> {
-    if hp.num_layers != LAYERS || layers.len() != LAYERS as usize {
+/// The conditions of [`admit`] on the hyperparameters and the embedding's scheme alone, which read no
+/// layer: a model that fails them is refused before any layer is read.
+pub fn admit_structure(hp: &ModelHyperparams, embedding: QuantScheme) -> Result<(), Refusal> {
+    if hp.num_layers != LAYERS {
         return refuse(
             "Q0",
-            format!(
-                "{} layers ({} described); the signature has {LAYERS}",
-                hp.num_layers,
-                layers.len()
-            ),
+            format!("{} layers; the signature has {LAYERS}", hp.num_layers),
         );
     }
     if hp.num_experts.is_some() || hp.num_active_experts.is_some() {
@@ -232,11 +258,48 @@ pub fn admit(
             format!("the embedding is {embedding:?}; the signature has Bf16"),
         );
     }
-    for (l, layer) in layers.iter().enumerate() {
-        admit_layer(l, layer, src)?;
+    Ok(())
+}
+
+/// Admit the model to the native route, or name the first condition it fails.
+pub fn admit(
+    hp: &ModelHyperparams,
+    embedding: QuantScheme,
+    layers: &[SubtensorOffsets],
+    src: &dyn SliceSource,
+) -> Result<(), Refusal> {
+    if layers.len() != hp.num_layers as usize {
+        return refuse(
+            "Q0",
+            format!(
+                "{} layers ({} described); the signature has {LAYERS}",
+                hp.num_layers,
+                layers.len()
+            ),
+        );
+    }
+    admit_each(hp, embedding, |l| Ok(layers[l].clone()), src).map(|_| ())
+}
+
+/// [`admit`] with each layer's descriptor taken from `layer` as its turn comes, so a model refused
+/// at a layer is read no further; returns every layer's descriptor.
+pub fn admit_each(
+    hp: &ModelHyperparams,
+    embedding: QuantScheme,
+    mut layer: impl FnMut(usize) -> Result<SubtensorOffsets, RuntimeError>,
+    src: &dyn SliceSource,
+) -> Result<Vec<SubtensorOffsets>, Refusal> {
+    admit_structure(hp, embedding)?;
+    let mut layers = Vec::with_capacity(LAYERS as usize);
+    for l in 0..LAYERS as usize {
+        let offsets = layer(l).map_err(|e| Refusal {
+            condition: "Q0",
+            reason: format!("layer {l}: {e}"),
+        })?;
+        admit_layer(l, &offsets, src)?;
         for (name, slice) in [
-            ("ssm_alpha", &layer.ssm_alpha),
-            ("ssm_beta", &layer.ssm_beta),
+            ("ssm_alpha", &offsets.ssm_alpha),
+            ("ssm_beta", &offsets.ssm_beta),
         ] {
             let Some(slice) = slice else { continue };
             let bytes = src.read(l, slice, 0, slice.length).map_err(|e| Refusal {
@@ -244,14 +307,77 @@ pub fn admit(
                 reason: format!("layer {l} {name}: {e}"),
             })?;
             if let Some(i) = first_non_bf16(&bytes) {
-                return refuse(
-                    "Q6",
-                    format!("layer {l} {name} value {i} is not a BF16 value"),
-                );
+                return Err(Refusal {
+                    condition: "Q6",
+                    reason: format!("layer {l} {name} value {i} is not a BF16 value"),
+                });
             }
         }
+        layers.push(offsets);
+    }
+    Ok(layers)
+}
+
+/// The switches (Q9), checked before every other condition: `LUMEN_CUDA_NATIVE_PREFILL=0` selects the
+/// F32 prefill, and so does `LUMEN_CUDA_PREFILL_F32`, which forces every model's F32 prefill path.
+pub fn switches(native_prefill: bool, prefill_f32: bool) -> Result<(), Refusal> {
+    if !native_prefill {
+        return refuse("Q9", "LUMEN_CUDA_NATIVE_PREFILL=0".into());
+    }
+    if prefill_f32 {
+        return refuse("Q9", "LUMEN_CUDA_PREFILL_F32 is set".into());
     }
     Ok(())
+}
+
+/// Whether a model whose planes are stored in `schemes` carries NVFP4 or FP8 planes: the models the
+/// load log names the prefill route for, since the native route and its F32 alternative are theirs.
+/// Any other model keeps its own prefill (by default the F16 GEMM), which a route line would misname.
+pub fn carries_planar_planes(schemes: impl IntoIterator<Item = QuantScheme>) -> bool {
+    schemes
+        .into_iter()
+        .any(|q| matches!(q, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3))
+}
+
+/// Refuse at a publication check point when a test injected a refusal of one of its `conditions`
+/// (feature `test-fault-injection`); otherwise nothing.
+pub(crate) fn injected(conditions: &[&'static str]) -> Result<(), Refusal> {
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    if let Some(condition) = fault::refused(conditions) {
+        return refuse(condition, "injected".into());
+    }
+    let _ = conditions;
+    Ok(())
+}
+
+/// Test-only refusal and forward-failure injection for the route's publication and forward.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub mod fault {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static REFUSE: Mutex<Option<&'static str>> = Mutex::new(None);
+    static FAIL_LAYER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Make every later publication refuse `condition` at its check point, until `None` is set.
+    pub fn refuse(condition: Option<&'static str>) {
+        *REFUSE.lock().unwrap() = condition;
+    }
+
+    /// Make the next native forward that reaches layer `layer` fail there, once.
+    pub fn fail_forward_at_layer(layer: usize) {
+        FAIL_LAYER.store(layer, Ordering::SeqCst);
+    }
+
+    pub(crate) fn refused(conditions: &[&'static str]) -> Option<&'static str> {
+        REFUSE.lock().unwrap().filter(|c| conditions.contains(c))
+    }
+
+    pub(crate) fn fails_at(layer: usize) -> bool {
+        FAIL_LAYER
+            .compare_exchange(layer, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 /// Index of the first F32 in `bytes` whose low 16 bits are not zero, i.e. that BF16 cannot hold.
@@ -698,6 +824,159 @@ mod tests {
                 v.scales.insert((11, l[11].w_up.offset), 0.0);
             },
         );
+    }
+
+    #[test]
+    fn the_structure_alone_is_checked_before_any_layer_is_read() {
+        let hp = signature_hyperparams();
+        assert_eq!(admit_structure(&hp, QuantScheme::Bf16), Ok(()));
+        let short = ModelHyperparams {
+            num_layers: 32,
+            ..hp
+        };
+        let r = admit_structure(&short, QuantScheme::Bf16).unwrap_err();
+        assert_eq!(
+            (r.condition, r.reason.as_str()),
+            ("Q0", "32 layers; the signature has 64")
+        );
+        let r = admit_structure(&hp, QuantScheme::Q8_0).unwrap_err();
+        assert_eq!(r.condition, "Q0.d");
+        // The layer count must match the layers described.
+        let r = admit(
+            &hp,
+            QuantScheme::Bf16,
+            &signature_layers()[1..],
+            &Values::default(),
+        )
+        .unwrap_err();
+        assert_eq!(r.condition, "Q0");
+        assert!(r.reason.contains("(63 described)"), "{}", r.reason);
+    }
+
+    #[test]
+    fn admission_reads_no_layer_past_the_one_it_refuses() {
+        let (hp, values) = (signature_hyperparams(), Values::default());
+        let mut asked = Vec::new();
+        let layers = admit_each(
+            &hp,
+            QuantScheme::Bf16,
+            |l| {
+                asked.push(l);
+                Ok(signature_layer(l))
+            },
+            &values,
+        )
+        .unwrap();
+        assert_eq!(
+            asked,
+            (0..64).collect::<Vec<_>>(),
+            "each layer asked for once"
+        );
+        assert_eq!(layers.len(), 64);
+        assert_eq!(layers[63].w_down.length, signature_layer(63).w_down.length);
+
+        // An artifact without activation scales is refused at its first layer, which is all it reads.
+        let mut asked = Vec::new();
+        let r = admit_each(
+            &hp,
+            QuantScheme::Bf16,
+            |l| {
+                asked.push(l);
+                let mut st = signature_layer(l);
+                st.w_down.length -= 4;
+                Ok(st)
+            },
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(r.condition, "Q5");
+        assert_eq!(asked, [0]);
+    }
+
+    /// A provider of `layers` tiny layers, counting its fetches.
+    struct Counting {
+        fetches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl WeightProvider for Counting {
+        fn prefetch_layer(
+            &self,
+            layer: usize,
+            priority: crate::weight::cache::PrefetchPriority,
+        ) -> Result<crate::weight::cache::PrefetchHandle, RuntimeError> {
+            Ok(crate::weight::cache::PrefetchHandle::new(layer, priority))
+        }
+        fn get_layer_blocking(&self, layer: usize) -> Result<LayerView, RuntimeError> {
+            self.fetches.lock().unwrap().push(layer);
+            let mut st = signature_layer(3);
+            st.attn_norm = TensorSlice {
+                offset: 0,
+                length: 8,
+                quant: QuantScheme::F32,
+            };
+            Ok(LayerView::from_owned(layer, (0..16).collect(), st))
+        }
+        fn try_get_layer(&self, _: usize) -> Option<LayerView> {
+            None
+        }
+        fn release_layer_hint(&self, _: usize) {}
+        fn stats(&self) -> crate::weight::cache::CacheStats {
+            Default::default()
+        }
+        fn num_layers(&self) -> usize {
+            4
+        }
+    }
+
+    #[test]
+    fn provider_slices_fetch_a_layer_once_per_visit() {
+        let provider = Counting {
+            fetches: Default::default(),
+        };
+        let src = ProviderSlices::new(&provider);
+        for l in [0, 0, 1, 1, 1, 0] {
+            let norm = src.subtensors(l).unwrap().attn_norm;
+            assert_eq!(src.read(l, &norm, 4, 4).unwrap(), [4, 5, 6, 7]);
+        }
+        assert_eq!(*provider.fetches.lock().unwrap(), [0, 1, 0]);
+    }
+
+    #[test]
+    fn an_injected_refusal_stops_publication_at_its_own_check_point() {
+        fault::refuse(Some("Q4"));
+        assert_eq!(injected(&["Q1", "Q2", "Q3"]), Ok(()));
+        let r = injected(&["Q4"]).unwrap_err();
+        assert_eq!((r.condition, r.reason.as_str()), ("Q4", "injected"));
+        fault::refuse(None);
+        assert_eq!(injected(&["Q4"]), Ok(()));
+        fault::fail_forward_at_layer(30);
+        assert!(!fault::fails_at(29));
+        assert!(fault::fails_at(30));
+        assert!(!fault::fails_at(30), "one shot");
+    }
+
+    #[test]
+    fn either_switch_selects_the_f32_route_by_name() {
+        assert_eq!(switches(true, false), Ok(()));
+        for (native_prefill, prefill_f32, reason) in [
+            (false, false, "LUMEN_CUDA_NATIVE_PREFILL=0"),
+            (false, true, "LUMEN_CUDA_NATIVE_PREFILL=0"),
+            (true, true, "LUMEN_CUDA_PREFILL_F32 is set"),
+        ] {
+            let r = switches(native_prefill, prefill_f32).unwrap_err();
+            assert_eq!((r.condition, r.reason.as_str()), ("Q9", reason));
+        }
+    }
+
+    #[test]
+    fn only_nvfp4_or_fp8_planes_name_the_prefill_route() {
+        use QuantScheme::*;
+        assert!(!carries_planar_planes([]));
+        assert!(!carries_planar_planes([
+            Q8_0, Q4_0, Q4_1, Q4_K, Q5_0, Q5_K, Q6_K, Q2_K, Q3_K, CtInt4G32, F16, Bf16, F32
+        ]));
+        assert!(carries_planar_planes([Bf16, F32, Nvfp4]));
+        assert!(carries_planar_planes([Q4_0, Fp8E4M3]));
     }
 
     #[test]

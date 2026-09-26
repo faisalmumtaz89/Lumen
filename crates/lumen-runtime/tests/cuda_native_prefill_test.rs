@@ -1,8 +1,8 @@
-//! The native prefill's layer oracle (`native_oracle::layer`), qualified before the route is
-//! assembled: one layer at a time is run through the native components (the producer kernels, the
-//! cuBLASLt plans, the GDN and attention kernels, the prefill weight views) as the route will chain
-//! them, its tensors recorded by the dump hook (`native_prefill_dump`), and the oracle must pass the
-//! layer as run and catch it changed at one point. The runner reads its weights and scales as the route does
+//! The native prefill's layer oracle (`native_oracle::layer`), qualified on its own: one layer at a
+//! time is run through the native components (the producer kernels, the cuBLASLt plans, the GDN and
+//! attention kernels, the prefill weight views) as the route chains them, its tensors recorded by the
+//! dump hook (`native_prefill_dump`), and the oracle must pass the layer as run and catch it changed
+//! at one point. The runner reads its weights and scales as the route does
 //! (`PrefillWeightViews`), not through the oracle's loader.
 //!
 //! Layers 0 to 2 (GDN) and 3 (attention) of the real model, on the first tokens of a real prompt: its
@@ -27,8 +27,40 @@
 //! (`LUMEN_NATIVE_MODEL`), a file of the prompt's token ids separated by white space
 //! (`LUMEN_NATIVE_IDS`, at least 128), and a `LUMEN_CACHE_DIR`:
 //!
-//!   cargo test --release -p lumen-runtime --features test-prefill-dump \
+//!   cargo test --release -p lumen-runtime \
+//!     --features test-prefill-dump,test-state-snapshot,test-fault-injection \
 //!     --test cuda_native_prefill_test -- --ignored --test-threads=1 --nocapture
+//!
+//! The route as the backend publishes and runs it (a backend built as `lumen-server` builds it: F32
+//! KV, the raw global planes, the context capped at 4096), on the real artifact (`LUMEN_NATIVE_MODEL`)
+//! and prompts from a JSON file of token-id arrays under the keys P128, P512 and P2048
+//! (`LUMEN_NATIVE_IDS_JSON`):
+//!
+//! - `route_is_announced_and_counted`: the route is published and runs one forward per slice of at most
+//!   2048 tokens; with `LUMEN_CUDA_NATIVE_PREFILL=0` or `LUMEN_CUDA_PREFILL_F32` set it is refused as
+//!   Q9, naming the switch, and prompts take the F32 route. With `test-fault-injection`, a refusal injected at each condition's check point leaves the
+//!   F32 route, naming that condition, and a prompt still prefills.
+//! - `native_prefill_is_the_first_operation_after_load` (`test-state-snapshot`): a native prefill right
+//!   after load works, and the same prompt after a reset leaves the same state and row, bit for bit,
+//!   twice.
+//! - `layer_oracle_on_the_assembled_route`: the layer oracle on the route's own dumps: every layer at
+//!   16 and 128 tokens with every handoff between layers, sampled layers at 2048 tokens, the second
+//!   slice of a 2049-token prompt, a prompt in 64-token calls with the handoffs between calls, and 131
+//!   tokens. `LUMEN_NATIVE_ORACLE_SCOPE` (a comma list of t16, t128, t2048, t2049, slices, t131)
+//!   selects parts.
+//! - `continuation_across_routes` (`test-state-snapshot`): prefill, four teacher-forced decode steps and
+//!   a second prefill and two more decode steps, for every order of the native (N) and F32 (F) routes
+//!   and a set of lengths; the state the routes leave after each prefill agrees in layout, and their
+//!   logits agree; a native prefill after decode passes the layer oracle
+//!   and reads the state decode left; an artifact without activation scales
+//!   (`LUMEN_NATIVE_OLD_MODEL`) is refused the native route as Q5, and its F32 prefill matches the F32
+//!   route on the extended artifact bit for bit.
+//! - `reset_and_reuse` (`test-state-snapshot`): prompts that are not prefixes of each other; a prompt
+//!   after another prompt and a reset, a shorter one after a longer one, and (with
+//!   `test-fault-injection`) one after a failed native forward and a reset, each leave the state and
+//!   logits of their first run; the same prompt without a reset differs.
+//! - `vram_and_load_time`: load time and device memory; no device memory left allocated after a native
+//!   forward; with `test-fault-injection`, an injected Q8 leaves the F32 route.
 #![cfg(feature = "test-prefill-dump")]
 
 mod native_oracle;
@@ -69,7 +101,7 @@ use std::time::Instant;
 const LAYERS: usize = 4;
 
 // ---------------------------------------------------------------------------------------------
-// The layer as the route will run it.
+// The layer as the route runs it.
 
 /// A change at one point, for the negative controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1248,6 +1280,995 @@ fn layer_oracle_runtime() {
             l.check(v.ok(), &format!("layer {layer}, {t} tokens"), &v.report());
             (x, resid) = (out.mlp_out, Some(out.resid));
         }
+    }
+    l.finish();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The route as the backend publishes and runs it.
+
+use lumen_format::quantization::QuantScheme;
+use lumen_runtime::compute::ComputeBackend;
+#[cfg(feature = "test-state-snapshot")]
+use lumen_runtime::compute::{ActivationBuffer, ComputeDtype};
+use lumen_runtime::cuda::CudaBackend;
+use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
+
+/// The KV capacity of the route's backend, as `lumen-server --context-len 4096`.
+const CONTEXT: usize = 4096;
+/// Layers of the admitted model.
+const MODEL_LAYERS: usize = 64;
+
+fn model(var: &str) -> SyncWeightProvider {
+    SyncWeightProvider::open(std::path::Path::new(&env(var))).unwrap()
+}
+
+/// The backend as `lumen-server` builds it for CUDA: F32 KV, the raw global planes, the context
+/// capped at [`CONTEXT`], every weight preloaded (which publishes the prefill route).
+fn route_backend(provider: &SyncWeightProvider) -> CudaBackend {
+    let mut hp = provider.lbc().header.hyperparams;
+    hp.max_seq_len = hp.max_seq_len.min(CONTEXT as u32);
+    let mut cuda = CudaBackend::new(0).expect("CUDA device 0");
+    cuda.set_kv_precision(KvPrecision::F32).expect("F32 KV");
+    cuda.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    if matches!(provider.embedding_quant, QuantScheme::Bf16) && !provider.embedding_raw.is_empty() {
+        cuda.set_embedding_raw(provider.embedding_raw.clone(), provider.embedding_quant);
+    }
+    if matches!(
+        provider.output_proj_quant,
+        QuantScheme::Nvfp4 | QuantScheme::Bf16 | QuantScheme::Q8_0
+    ) && !provider.output_proj_raw.is_empty()
+    {
+        cuda.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
+    }
+    if provider.weight_tying {
+        cuda.set_weight_tying(true);
+    }
+    cuda.init(&hp).expect("init");
+    cuda.preload_weights(provider).expect("preload");
+    cuda
+}
+
+fn route_kv(provider: &SyncWeightProvider) -> KvCache {
+    let hp = provider.lbc().header.hyperparams;
+    KvCache::new(KvCacheConfig {
+        max_seq_len: CONTEXT,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision: KvPrecision::F32,
+    })
+    .unwrap()
+}
+
+/// The token ids of prompt `case` of `LUMEN_NATIVE_IDS_JSON`.
+fn case_ids(case: &str) -> Vec<u32> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(env("LUMEN_NATIVE_IDS_JSON")).unwrap())
+            .unwrap();
+    v[case]
+        .as_array()
+        .unwrap_or_else(|| panic!("{case} is not in LUMEN_NATIVE_IDS_JSON"))
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect()
+}
+
+/// P2048's ids followed by P512's: prompts up to 2560 tokens.
+fn long_ids() -> Vec<u32> {
+    let mut ids = case_ids("P2048");
+    ids.extend(case_ids("P512"));
+    ids
+}
+
+#[cfg(feature = "test-state-snapshot")]
+fn logits_of(cuda: &CudaBackend, row: &[f32]) -> Vec<f32> {
+    let mut buf = ActivationBuffer::zeros(row.len(), ComputeDtype::F32);
+    buf.write_f32_from(row);
+    cuda.compute_final(&buf).expect("compute_final").data
+}
+
+#[cfg(feature = "test-state-snapshot")]
+fn argmax(v: &[f32]) -> usize {
+    (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b })
+}
+
+#[cfg(feature = "test-state-snapshot")]
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+#[cfg(feature = "test-state-snapshot")]
+/// Relative L2 distance of `got` from `want`; infinite for different lengths or a non-finite sum.
+fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
+    if got.len() != want.len() {
+        return f64::INFINITY;
+    }
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (&g, &w) in got.iter().zip(want) {
+        num += (g as f64 - w as f64).powi(2);
+        den += (w as f64).powi(2);
+    }
+    if !num.is_finite() {
+        return f64::INFINITY;
+    }
+    if den > 0.0 {
+        (num / den).sqrt()
+    } else {
+        num.sqrt()
+    }
+}
+
+/// Reset the backend and prefill `prompts` one after another into a fresh cache, recording `layers`
+/// during each call in `record`. Returns the last call's row, one dump per recorded call in order,
+/// and the cache.
+fn run_calls(
+    cuda: &CudaBackend,
+    provider: &SyncWeightProvider,
+    prompts: &[&[u32]],
+    record: &[usize],
+    layers: &[usize],
+) -> (Vec<f32>, Vec<PrefillDump>, KvCache) {
+    cuda.reset_recurrent_state();
+    let mut kv = route_kv(provider);
+    let mut row = Vec::new();
+    let mut dumps = Vec::new();
+    for (i, ids) in prompts.iter().enumerate() {
+        let recording = record.contains(&i);
+        if recording {
+            cuda.set_native_prefill_dump(Some(layers.to_vec()));
+        }
+        row = cuda.prefill(ids, provider, &mut kv).expect("prefill");
+        if recording {
+            dumps.push(cuda.take_native_prefill_dump().expect("a dump"));
+        }
+    }
+    (row, dumps, kv)
+}
+
+/// The oracle's inputs for the real model's layers.
+struct RouteOracle<'a> {
+    offsets: Vec<SubtensorOffsets>,
+    src: ProviderSlices<'a>,
+}
+
+impl<'a> RouteOracle<'a> {
+    fn new(provider: &'a SyncWeightProvider) -> Self {
+        Self {
+            offsets: provider
+                .lbc()
+                .layer_indices
+                .iter()
+                .map(|l| l.subtensors.clone())
+                .collect(),
+            src: ProviderSlices::new(provider),
+        }
+    }
+
+    fn weights(&self, l: usize) -> LayerWeights {
+        LayerWeights::load(&self.src, l, &self.offsets[l])
+    }
+}
+
+/// Check each of `layers` of `dump` (a call of `t` tokens) with the layer oracle, and every handoff
+/// between two consecutive layers of the list.
+#[allow(clippy::too_many_arguments)]
+fn check_layers(
+    l: &mut Checks,
+    o: &Oracle,
+    core: &Attention,
+    ro: &RouteOracle,
+    dump: &PrefillDump,
+    layers: &[usize],
+    t: usize,
+    what: &str,
+) {
+    for (i, &layer) in layers.iter().enumerate() {
+        let w = ro.weights(layer);
+        let c: Option<&dyn AttentionCore> = if w.attention { Some(core) } else { None };
+        let (v, secs) = verdict(o, &w, dump, t, c);
+        l.check(
+            v.ok(),
+            &format!("{what}: layer {layer} ({secs:.1} s)"),
+            &v.report(),
+        );
+        if i > 0 && layers[i - 1] + 1 == layer {
+            let v = handoff(&at(dump, layer - 1, t), &at(dump, layer, t));
+            l.check(
+                v.ok(),
+                &format!("{what}: layer {} -> {layer} handoff", layer - 1),
+                &v.report(),
+            );
+        }
+    }
+}
+
+fn oracle_scope(part: &str) -> bool {
+    std::env::var("LUMEN_NATIVE_ORACLE_SCOPE")
+        .map(|s| s.split(',').any(|p| p.trim() == part))
+        .unwrap_or(true)
+}
+
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn route_is_announced_and_counted() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let ids = long_ids();
+    let mut l = Checks::default();
+    let cuda = route_backend(&provider);
+    // Either switch selects the F32 route, refused as Q9 naming it.
+    let switch = if std::env::var("LUMEN_CUDA_NATIVE_PREFILL").as_deref() == Ok("0") {
+        Some("LUMEN_CUDA_NATIVE_PREFILL=0")
+    } else if std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok() {
+        Some("LUMEN_CUDA_PREFILL_F32 is set")
+    } else {
+        None
+    };
+    let switched_off = switch.is_some();
+    let refusal = cuda.native_prefill_refusal();
+    if let Some(reason) = switch {
+        l.check(
+            refusal.as_ref().map(|r| (r.condition, r.reason.as_str())) == Some(("Q9", reason))
+                && cuda.native_prefill_forwards().is_none(),
+            &format!("{reason}: the F32 route, refused as Q9"),
+            &format!("{refusal:?}"),
+        );
+    } else {
+        l.check(
+            refusal.is_none() && cuda.native_prefill_forwards() == Some(0),
+            "the native route is published",
+            &format!("{refusal:?}"),
+        );
+    }
+    let before = cuda.native_prefill_forwards();
+    let (row, _, _) = run_calls(&cuda, &provider, &[&ids[..128]], &[], &[]);
+    let after_128 = cuda.native_prefill_forwards();
+    let (row2049, _, _) = run_calls(&cuda, &provider, &[&ids[..2049]], &[], &[]);
+    let after_2049 = cuda.native_prefill_forwards();
+    let finite = row.iter().chain(&row2049).all(|v| v.is_finite());
+    let counted = if switched_off {
+        [before, after_128, after_2049] == [None, None, None]
+    } else {
+        [before, after_128, after_2049] == [Some(0), Some(1), Some(3)]
+    };
+    l.check(
+        counted && finite,
+        "forwards: one per slice of at most 2048 tokens (128 tokens, then 2049), rows finite",
+        &format!("{before:?} {after_128:?} {after_2049:?}, finite {finite}"),
+    );
+    drop(cuda);
+
+    #[cfg(feature = "test-fault-injection")]
+    if !switched_off {
+        use lumen_runtime::cuda::native_prefill::fault;
+        for condition in ["Q0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9"] {
+            fault::refuse(Some(condition));
+            let cuda = route_backend(&provider);
+            fault::refuse(None);
+            let refusal = cuda.native_prefill_refusal();
+            let (row, _, _) = run_calls(&cuda, &provider, &[&ids[..16]], &[], &[]);
+            l.check(
+                refusal.as_ref().map(|r| (r.condition, r.reason.as_str()))
+                    == Some((condition, "injected"))
+                    && cuda.native_prefill_forwards().is_none()
+                    && row.iter().all(|v| v.is_finite()),
+                &format!("{condition} injected: the F32 route, naming {condition}, prefills"),
+                &format!("{refusal:?}"),
+            );
+        }
+    }
+    l.finish();
+}
+
+/// FNV-1a over the bits of `v`: equal hashes stand for bit-equal values.
+#[cfg(feature = "test-state-snapshot")]
+fn fnv(v: &[f32]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in v.iter().flat_map(|x| x.to_bits().to_le_bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Every value of two snapshots bit for bit.
+#[cfg(feature = "test-state-snapshot")]
+fn same_state(
+    a: &lumen_runtime::cuda::StateSnapshot,
+    b: &lumen_runtime::cuda::StateSnapshot,
+) -> bool {
+    a.seq_len == b.seq_len
+        && a.conv_positions == b.conv_positions
+        && a.decode_token_count == b.decode_token_count
+        && a.kv.len() == b.kv.len()
+        && a.kv
+            .iter()
+            .zip(&b.kv)
+            .all(|(x, y)| same_bits(&x.0, &y.0) && same_bits(&x.1, &y.1))
+        && a.h_states.len() == b.h_states.len()
+        && a.h_states
+            .iter()
+            .zip(&b.h_states)
+            .all(|(x, y)| same_bits(x, y))
+        && a.conv_states.len() == b.conv_states.len()
+        && a.conv_states
+            .iter()
+            .zip(&b.conv_states)
+            .all(|(x, y)| same_bits(x, y))
+        && same_bits(&a.x, &b.x)
+}
+
+#[cfg(feature = "test-state-snapshot")]
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn native_prefill_is_the_first_operation_after_load() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let ids = case_ids("P128");
+    let mut l = Checks::default();
+    let cuda = route_backend(&provider);
+    // No reset, decode or other prefill before this one; its layers 0, 3 and 63 are recorded.
+    let dumped = [0usize, 3, 63];
+    cuda.set_native_prefill_dump(Some(dumped.to_vec()));
+    let mut kv = route_kv(&provider);
+    let row = cuda
+        .prefill(&ids, &provider, &mut kv)
+        .expect("first prefill");
+    let dump = cuda.take_native_prefill_dump().expect("a dump");
+    let first = cuda.snapshot_state(&kv).unwrap();
+    let logits = logits_of(&cuda, &row);
+    let state_bits: Vec<f32> = first
+        .kv
+        .iter()
+        .flat_map(|(k, v)| k.iter().chain(v))
+        .chain(first.h_states.iter().flatten())
+        .chain(first.conv_states.iter().flatten())
+        .chain(&first.x)
+        .copied()
+        .chain(first.conv_positions.iter().map(|&p| p as f32))
+        .collect();
+    println!(
+        "HASH row={} logits={} state={}",
+        fnv(&row),
+        fnv(&logits),
+        fnv(&state_bits)
+    );
+    let dev = CudaDevice::new(0).unwrap();
+    let hw = p::Hw::new(&dev);
+    let tab = p::Tables::new(&hw);
+    let o = Oracle {
+        hw: &hw,
+        tab: &tab,
+        sm_count: sm_count(&dev),
+    };
+    let core = Attention {
+        hw: attn::Hw::new(&dev),
+    };
+    let ro = RouteOracle::new(&provider);
+    check_layers(
+        &mut l,
+        &o,
+        &core,
+        &ro,
+        &dump,
+        &dumped,
+        ids.len(),
+        "the first prefill after load",
+    );
+    // Controls on the same dump: layer 3's KV cache and layer 0's GDN state each changed.
+    let scale = |b: &mut Vec<u8>| {
+        for c in b.chunks_exact_mut(4) {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            c.copy_from_slice(&(v * 1.25 + 0.01).to_le_bytes());
+        }
+    };
+    let t = ids.len();
+    for (layer, name, check) in [(3, "kv", "attention_core.kv"), (0, "state", "gdn.")] {
+        let bad = changed(&dump, layer, name, &scale);
+        let w = ro.weights(layer);
+        let c: Option<&dyn AttentionCore> = if w.attention { Some(&core) } else { None };
+        let (v, _) = verdict(&o, &w, &bad, t, c);
+        let failed = v.failed();
+        l.check(
+            failed.iter().any(|f| f.starts_with(check)),
+            &format!("control: layer {layer}'s {name} changed, rejected by {check}*"),
+            &format!("failed {failed:?}"),
+        );
+    }
+    l.check(
+        cuda.native_prefill_forwards() == Some(1) && row.iter().all(|v| v.is_finite()),
+        "the first operation after load is a native prefill",
+        &format!(
+            "forwards {:?}, first token {}",
+            cuda.native_prefill_forwards(),
+            argmax(&logits)
+        ),
+    );
+    for again in 1..=2 {
+        let (r, _, kv) = run_calls(&cuda, &provider, &[&ids], &[], &[]);
+        let snap = cuda.snapshot_state(&kv).unwrap();
+        let lg = logits_of(&cuda, &r);
+        l.check(
+            same_bits(&r, &row) && same_state(&snap, &first) && same_bits(&lg, &logits),
+            &format!("after a reset, run {again}: row, state and logits bit-identical"),
+            &format!("row rel L2 {:.3e}", rel_l2(&r, &row)),
+        );
+    }
+    l.finish();
+}
+
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn layer_oracle_on_the_assembled_route() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let cuda = route_backend(&provider);
+    let dev = CudaDevice::new(0).unwrap();
+    let hw = p::Hw::new(&dev);
+    let tab = p::Tables::new(&hw);
+    let o = Oracle {
+        hw: &hw,
+        tab: &tab,
+        sm_count: sm_count(&dev),
+    };
+    let core = Attention {
+        hw: attn::Hw::new(&dev),
+    };
+    let ro = RouteOracle::new(&provider);
+    let ids = long_ids();
+    let mut l = Checks::default();
+    assert_eq!(cuda.native_prefill_refusal(), None, "the native route");
+
+    // Every layer, in batches that overlap by one layer so every handoff is checked.
+    for t in [16usize, 128] {
+        if !oracle_scope(&format!("t{t}")) {
+            continue;
+        }
+        for start in (0..MODEL_LAYERS).step_by(16) {
+            let layers: Vec<usize> = (start.saturating_sub(1)..(start + 16)).collect();
+            let (_, mut dump, _) = run_calls(&cuda, &provider, &[&ids[..t]], &[0], &layers);
+            let dump = dump.remove(0);
+            check_layers(
+                &mut l,
+                &o,
+                &core,
+                &ro,
+                &dump,
+                &layers,
+                t,
+                &format!("{t} tokens"),
+            );
+        }
+    }
+    if oracle_scope("t2048") {
+        let layers = vec![0, 1, 2, 3, 31, 62, 63];
+        let (_, mut dump, _) = run_calls(&cuda, &provider, &[&ids[..2048]], &[0], &layers);
+        check_layers(
+            &mut l,
+            &o,
+            &core,
+            &ro,
+            &dump.remove(0),
+            &layers,
+            2048,
+            "2048 tokens",
+        );
+    }
+    if oracle_scope("t2049") {
+        // The recorder keeps the later slice: 1 token at position 2048.
+        let layers = vec![0, 1, 2, 3, 62, 63];
+        let (_, mut dump, _) = run_calls(&cuda, &provider, &[&ids[..2049]], &[0], &layers);
+        let dump = dump.remove(0);
+        let p0 = at(&dump, 3, 1).state_pos("p0");
+        l.check(
+            p0 == Some(2048),
+            "2049 tokens: the recorded slice is the second, at position 2048",
+            &format!("p0 {p0:?}"),
+        );
+        check_layers(
+            &mut l,
+            &o,
+            &core,
+            &ro,
+            &dump,
+            &layers,
+            1,
+            "2049 tokens, second slice",
+        );
+    }
+    if oracle_scope("slices") {
+        // 256 tokens in four calls of 64: the third call checked, and its inputs are the second's
+        // outputs.
+        let layers = vec![0, 1, 2, 3, 4, 63];
+        let calls: Vec<&[u32]> = ids[..256].chunks(64).collect();
+        // Both calls' dumps from one run: a reset keeps each cache's rows past its length, so another
+        // run's rows there would differ.
+        let (_, mut dumps, _) = run_calls(&cuda, &provider, &calls, &[1, 2], &layers);
+        let (third, second) = (dumps.pop().unwrap(), dumps.pop().unwrap());
+        check_layers(
+            &mut l,
+            &o,
+            &core,
+            &ro,
+            &third,
+            &layers,
+            64,
+            "64-token calls, the third",
+        );
+        for &layer in &layers {
+            let v = handoff(&at(&second, layer, 64), &at(&third, layer, 64));
+            l.check(
+                v.ok(),
+                &format!("64-token calls: layer {layer}, second -> third call handoff"),
+                &v.report(),
+            );
+        }
+    }
+    if oracle_scope("t131") {
+        let layers = vec![0, 1, 2, 3, 4, 63];
+        let (_, mut dump, _) = run_calls(&cuda, &provider, &[&ids[..131]], &[0], &layers);
+        check_layers(
+            &mut l,
+            &o,
+            &core,
+            &ro,
+            &dump.remove(0),
+            &layers,
+            131,
+            "131 tokens",
+        );
+    }
+    l.finish();
+}
+
+/// One order of routes: a prefill of `l1` tokens, `STEPS` teacher-forced decode steps, a prefill of
+/// `l2` tokens; the second prefill's layers `dump` recorded when it is native.
+#[cfg(feature = "test-state-snapshot")]
+struct Continuation {
+    /// State after the first prefill, after the decode steps, and after the second prefill.
+    after_first: lumen_runtime::cuda::StateSnapshot,
+    after_decode: lumen_runtime::cuda::StateSnapshot,
+    after_second: lumen_runtime::cuda::StateSnapshot,
+    /// Logits of each decode step, of the second prefill's last position, then of [`AFTER`]
+    /// teacher-forced decode steps after it.
+    logits: Vec<Vec<f32>>,
+    dump: Option<PrefillDump>,
+}
+
+#[cfg(feature = "test-state-snapshot")]
+const STEPS: usize = 4;
+/// Teacher-forced decode steps after the second prefill.
+#[cfg(feature = "test-state-snapshot")]
+const AFTER: usize = 2;
+
+#[cfg(feature = "test-state-snapshot")]
+fn continuation(
+    cuda: &CudaBackend,
+    provider: &SyncWeightProvider,
+    ids: &[u32],
+    (l1, l2): (usize, usize),
+    native: (bool, bool),
+    dump: &[usize],
+) -> Continuation {
+    cuda.reset_recurrent_state();
+    let mut kv = route_kv(provider);
+    cuda.set_native_prefill_suspended(!native.0);
+    cuda.prefill(&ids[..l1], provider, &mut kv)
+        .expect("first prefill");
+    let after_first = cuda.snapshot_state(&kv).unwrap();
+    let mut logits = Vec::new();
+    for &id in &ids[l1..l1 + STEPS] {
+        logits.push(
+            cuda.decode_token(id, provider, &mut kv)
+                .expect("decode")
+                .data,
+        );
+    }
+    let after_decode = cuda.snapshot_state(&kv).unwrap();
+    cuda.set_native_prefill_suspended(!native.1);
+    if native.1 {
+        cuda.set_native_prefill_dump(Some(dump.to_vec()));
+    }
+    let from = l1 + STEPS;
+    let row = cuda
+        .prefill(&ids[from..from + l2], provider, &mut kv)
+        .expect("second prefill");
+    let dump = if native.1 {
+        cuda.take_native_prefill_dump()
+    } else {
+        None
+    };
+    cuda.set_native_prefill_suspended(false);
+    logits.push(logits_of(cuda, &row));
+    let after_second = cuda.snapshot_state(&kv).unwrap();
+    for &id in &ids[from + l2..from + l2 + AFTER] {
+        logits.push(
+            cuda.decode_token(id, provider, &mut kv)
+                .expect("decode after the second prefill")
+                .data,
+        );
+    }
+    Continuation {
+        after_first,
+        after_decode,
+        after_second,
+        logits,
+        dump,
+    }
+}
+
+/// The largest relative L2 distance between two routes' state after the same prompt, per kind of
+/// tensor, with the exact parts (lengths and ring positions) compared exactly.
+#[cfg(feature = "test-state-snapshot")]
+fn state_distance(
+    a: &lumen_runtime::cuda::StateSnapshot,
+    b: &lumen_runtime::cuda::StateSnapshot,
+) -> (bool, [f64; 4]) {
+    let worst = |pairs: Vec<f64>| pairs.into_iter().fold(0.0f64, f64::max);
+    let exact = a.seq_len == b.seq_len
+        && a.conv_positions == b.conv_positions
+        && a.kv.len() == b.kv.len()
+        && a.h_states.len() == b.h_states.len();
+    (
+        exact,
+        [
+            worst(
+                a.kv.iter()
+                    .zip(&b.kv)
+                    .flat_map(|(x, y)| [rel_l2(&x.0, &y.0), rel_l2(&x.1, &y.1)])
+                    .collect(),
+            ),
+            worst(
+                a.h_states
+                    .iter()
+                    .zip(&b.h_states)
+                    .map(|(x, y)| rel_l2(x, y))
+                    .collect(),
+            ),
+            worst(
+                a.conv_states
+                    .iter()
+                    .zip(&b.conv_states)
+                    .map(|(x, y)| rel_l2(x, y))
+                    .collect(),
+            ),
+            rel_l2(&a.x, &b.x),
+        ],
+    )
+}
+
+/// `snap` with one GDN state transposed, and with one KV cache's rows moved a position.
+#[cfg(feature = "test-state-snapshot")]
+fn state_controls(
+    snap: &lumen_runtime::cuda::StateSnapshot,
+) -> [lumen_runtime::cuda::StateSnapshot; 2] {
+    let mut transposed = snap.clone();
+    let h = &mut transposed.h_states[0];
+    let orig = h.clone();
+    for head in 0..48 {
+        for i in 0..128 {
+            for j in 0..128 {
+                h[(head * 128 + i) * 128 + j] = orig[(head * 128 + j) * 128 + i];
+            }
+        }
+    }
+    let mut moved = snap.clone();
+    moved.kv[0].0.rotate_left(256);
+    [transposed, moved]
+}
+
+/// The limit on the relative L2 distance between the two routes' state and logits.
+#[cfg(feature = "test-state-snapshot")]
+const ROUTE_DISTANCE: f64 = 0.25;
+
+#[cfg(feature = "test-state-snapshot")]
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and both real artifacts"]
+fn continuation_across_routes() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let cuda = route_backend(&provider);
+    assert_eq!(cuda.native_prefill_refusal(), None, "the native route");
+    let dev = CudaDevice::new(0).unwrap();
+    let hw = p::Hw::new(&dev);
+    let tab = p::Tables::new(&hw);
+    let o = Oracle {
+        hw: &hw,
+        tab: &tab,
+        sm_count: sm_count(&dev),
+    };
+    let core = Attention {
+        hw: attn::Hw::new(&dev),
+    };
+    let ro = RouteOracle::new(&provider);
+    let ids = long_ids();
+    let mut l = Checks::default();
+    let lengths = [
+        (63, 64),
+        (64, 65),
+        (65, 63),
+        (127, 128),
+        (128, 131),
+        (131, 127),
+        (2047, 2),
+        (2048, 1),
+        (2049, 64),
+        (63, 2049),
+    ];
+    let dumped = [0usize, 3, 63];
+    let mut f32_runs = Vec::new();
+    for &(l1, l2) in &lengths {
+        let what = format!("{l1} + {STEPS} decode + {l2}");
+        let run = |native| continuation(&cuda, &provider, &ids, (l1, l2), native, &dumped);
+        let (ndn, fdn, ndf, fdf) = (
+            run((true, true)),
+            run((false, true)),
+            run((true, false)),
+            run((false, false)),
+        );
+        // The routes leave the same state, up to their arithmetic, after the first prefill and after
+        // the second; the controls (a transposed GDN state, KV moved a position) exceed the limit.
+        let after_first = [("N-d-N", &ndn)];
+        let after_second = [("N-d-N", &ndn), ("F-d-N", &fdn), ("N-d-F", &ndf)];
+        for (when, runs) in [("first", &after_first[..]), ("second", &after_second[..])] {
+            let snap = |c: &Continuation| {
+                if when == "first" {
+                    c.after_first.clone()
+                } else {
+                    c.after_second.clone()
+                }
+            };
+            let base = snap(&fdf);
+            for (name, run) in runs {
+                let got = snap(run);
+                let (exact, d) = state_distance(&got, &base);
+                l.check(
+                    exact && d.iter().all(|&x| x <= ROUTE_DISTANCE),
+                    &format!("{what}: state after the {when} prefill, {name} vs F-d-F, within {ROUTE_DISTANCE}"),
+                    &format!("lengths and ring positions equal {exact}; KV {:.3e}, GDN state {:.3e}, ring {:.3e}, row {:.3e}", d[0], d[1], d[2], d[3]),
+                );
+                let [transposed, moved] = state_controls(&base);
+                let (_, dt) = state_distance(&got, &transposed);
+                let (_, dm) = state_distance(&got, &moved);
+                l.check(
+                    dt[1] > ROUTE_DISTANCE && dm[0] > ROUTE_DISTANCE,
+                    &format!("{what}: after the {when} prefill, {name}: controls exceed the limit (a transposed GDN state, KV moved a position)"),
+                    &format!("GDN state {:.3e}, KV {:.3e}", dt[1], dm[0]),
+                );
+            }
+        }
+        // Decode continues either route's state alike; the second prefill reads decode's state.
+        for (name, run, base) in [
+            ("N-d-N", &ndn, &fdf),
+            ("F-d-N", &fdn, &fdf),
+            ("N-d-F", &ndf, &fdf),
+        ] {
+            let dists: Vec<f64> = run
+                .logits
+                .iter()
+                .zip(&base.logits)
+                .map(|(a, b)| rel_l2(a, b))
+                .collect();
+            let agree = run
+                .logits
+                .iter()
+                .zip(&base.logits)
+                .filter(|(a, b)| argmax(a) == argmax(b))
+                .count();
+            l.check(
+                dists.iter().all(|&x| x <= ROUTE_DISTANCE),
+                &format!("{what}: {name} logits ({STEPS} decode steps, the second prefill, {AFTER} decode steps) vs F-d-F within {ROUTE_DISTANCE}"),
+                &format!(
+                    "rel L2 {}; argmax agrees at {agree} of {}",
+                    dists.iter().map(|d| format!("{d:.3e}")).collect::<Vec<_>>().join(" "),
+                    dists.len()
+                ),
+            );
+            // Control: the logits of another position.
+            let n = run.logits.len();
+            let other = rel_l2(&run.logits[n - 2], &base.logits[n - 1]);
+            l.check(
+                other > ROUTE_DISTANCE,
+                &format!("{what}: {name}: control, the logits one position apart exceed the limit"),
+                &format!("rel L2 {other:.3e}"),
+            );
+        }
+        for (name, run) in [("N-d-N", &ndn), ("F-d-N", &fdn)] {
+            let dump = run.dump.as_ref().expect("the native second prefill's dump");
+            let snap = &run.after_decode;
+            // A second prefill past 2048 tokens is recorded in its last slice, which starts 2048
+            // positions later from the state its first slice left; its KV rows before that slice are
+            // still the ones decode left.
+            let whole = l2 <= 2048;
+            let td = if whole { l2 } else { l2 - 2048 };
+            let first_pos = snap.seq_len + l2 - td;
+            // The second prefill read the state decode left.
+            let g_state = |layer: usize| {
+                let f = |n: &str| {
+                    at(dump, layer, td)
+                        .f32(n)
+                        .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                };
+                // The GDN layers before it: the layer less the attention layers before it.
+                let g = layer - (layer + 1) / 4;
+                f("state_in") == Some(snap.h_states[g].iter().map(|x| x.to_bits()).collect())
+                    && f("ring_in")
+                        == Some(snap.conv_states[g].iter().map(|x| x.to_bits()).collect())
+                    && at(dump, layer, td).state_pos("state_pos_in")
+                        == Some(snap.conv_positions[g] as usize)
+            };
+            let kv_in = at(dump, 3, td).f32("kv_in").unwrap_or_default();
+            let max_seq = kv_in.len() / (2 * 4 * 256);
+            let seq = snap.seq_len;
+            let live = |half: usize| -> Vec<u32> {
+                (0..4)
+                    .flat_map(|hk| {
+                        let at = (half * 4 + hk) * max_seq * 256;
+                        kv_in[at..at + seq * 256].iter().map(|x| x.to_bits())
+                    })
+                    .collect()
+            };
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let kv_ok = max_seq >= seq
+                && live(0) == bits(&snap.kv[0].0)
+                && live(1) == bits(&snap.kv[0].1)
+                && at(dump, 3, td).state_pos("p0") == Some(first_pos);
+            let gdn_ok = !whole || g_state(0);
+            l.check(
+                gdn_ok && kv_ok,
+                &format!("{what}: {name}'s second prefill reads the state decode left (layer 0 state, ring and position; layer 3 KV and position)"),
+                &format!("GDN {gdn_ok} (checked: {whole}) KV {kv_ok}"),
+            );
+            check_layers(
+                &mut l,
+                &o,
+                &core,
+                &ro,
+                dump,
+                &dumped,
+                td,
+                &format!("{what}: {name}, second prefill ({td} tokens from {first_pos})"),
+            );
+        }
+        f32_runs.push(fdf.logits);
+    }
+    drop(cuda);
+
+    // An artifact without activation scales: the F32 route, the same weights, the same logits.
+    let old = model("LUMEN_NATIVE_OLD_MODEL");
+    let cuda = route_backend(&old);
+    let refusal = cuda.native_prefill_refusal();
+    l.check(
+        refusal.as_ref().map(|r| r.condition) == Some("Q5"),
+        "the artifact without activation scales: the F32 route, refused as Q5",
+        &format!("{refusal:?}"),
+    );
+    for (&(l1, l2), want) in lengths.iter().zip(&f32_runs) {
+        let run = continuation(&cuda, &old, &ids, (l1, l2), (false, false), &[]);
+        let same = run.logits.len() == want.len()
+            && run.logits.iter().zip(want).all(|(a, b)| same_bits(a, b));
+        l.check(
+            same,
+            &format!("{l1} + {STEPS} decode + {l2}: F-d-F on the artifact without scales equals it on the extended one, bit for bit"),
+            "",
+        );
+    }
+    l.finish();
+}
+
+#[cfg(feature = "test-state-snapshot")]
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn reset_and_reuse() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let cuda = route_backend(&provider);
+    assert_eq!(cuda.native_prefill_refusal(), None, "the native route");
+    let mut l = Checks::default();
+    let state_of = |ids: &[u32]| {
+        let (row, _, kv) = run_calls(&cuda, &provider, &[ids], &[], &[]);
+        (cuda.snapshot_state(&kv).unwrap(), logits_of(&cuda, &row))
+    };
+    // No prompt is a prefix of another, so the KV rows and state a reset leaves behind are not the
+    // ones the next prompt writes.
+    let long = case_ids("P2048");
+    let a = &long[1500..1628];
+    let b = &long[300..812];
+    // 131 tokens run at 144 rows: rows 131 to 143 of every GEMM input are padding, which a longer
+    // prompt before them leaves written.
+    let short = &long[1000..1131];
+    let (short_first, short_logits) = state_of(short);
+    let (first, first_logits) = state_of(b);
+    run_calls(&cuda, &provider, &[a], &[], &[]);
+    let (again, again_logits) = state_of(b);
+    l.check(
+        same_state(&again, &first) && same_bits(&again_logits, &first_logits),
+        "512 tokens after another prompt and a reset: state and logits bit-identical to their first run",
+        &format!("first token {}", argmax(&first_logits)),
+    );
+    run_calls(&cuda, &provider, &[&long], &[], &[]);
+    let (short_again, short_again_logits) = state_of(short);
+    l.check(
+        same_state(&short_again, &short_first) && same_bits(&short_again_logits, &short_logits),
+        "131 tokens after 2048 and a reset: state and logits bit-identical to the first prompt after load",
+        &format!("first token {}", argmax(&short_logits)),
+    );
+    // Control: the same 131 tokens again without a reset run at positions 131 to 261, after the
+    // first copy, and must differ.
+    let (carried_row, _, _) = run_calls(&cuda, &provider, &[short, short], &[], &[]);
+    let carried = logits_of(&cuda, &carried_row);
+    l.check(
+        !same_bits(&carried, &short_logits),
+        "control: the 131 tokens again without a reset (continuing at position 131) differ",
+        &format!("logits rel L2 {:.3e}", rel_l2(&carried, &short_logits)),
+    );
+    #[cfg(feature = "test-fault-injection")]
+    {
+        use lumen_runtime::cuda::native_prefill::fault;
+        cuda.reset_recurrent_state();
+        let mut kv = route_kv(&provider);
+        fault::fail_forward_at_layer(30);
+        let failed = cuda.prefill(a, &provider, &mut kv);
+        let (after, after_logits) = state_of(b);
+        l.check(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("layer 30: injected"))
+                && same_state(&after, &first)
+                && same_bits(&after_logits, &first_logits),
+            "512 tokens after a native forward failed at layer 30 and a reset: bit-identical to their first run",
+            &format!("{:?}", failed.err()),
+        );
+    }
+    l.finish();
+}
+
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn vram_and_load_time() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let dev = CudaDevice::new(0).unwrap();
+    let mut l = Checks::default();
+    let free0 = dev.free_memory().unwrap();
+    let start = Instant::now();
+    let cuda = route_backend(&provider);
+    let load = start.elapsed().as_secs_f64();
+    let free1 = dev.free_memory().unwrap();
+    let ids = case_ids("P2048");
+    run_calls(&cuda, &provider, &[&ids[..16]], &[], &[]);
+    let free2 = dev.free_memory().unwrap();
+    let (row, _, _) = run_calls(&cuda, &provider, &[&ids], &[], &[]);
+    let free3 = dev.free_memory().unwrap();
+    let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+    println!(
+        "LOAD {load:.1} s; device memory: {:.2} GiB free before, {:.2} GiB after load ({:.2} GiB taken), {:.2} GiB after a 16-token and {:.2} GiB after a 2048-token native prefill",
+        gib(free0),
+        gib(free1),
+        gib(free0.saturating_sub(free1)),
+        gib(free2),
+        gib(free3)
+    );
+    l.check(
+        cuda.native_prefill_refusal().is_none()
+            && free3 == free2
+            && row.iter().all(|v| v.is_finite()),
+        "no device memory is left allocated after a forward (free memory after the 16- and 2048-token prefills equal; a peak inside the forward is not visible here)",
+        &format!("{free2} vs {free3} bytes free"),
+    );
+    drop(cuda);
+    #[cfg(feature = "test-fault-injection")]
+    {
+        use lumen_runtime::cuda::native_prefill::fault;
+        fault::refuse(Some("Q8"));
+        let cuda = route_backend(&provider);
+        fault::refuse(None);
+        let refusal = cuda.native_prefill_refusal();
+        let (row, _, _) = run_calls(&cuda, &provider, &[&ids[..16]], &[], &[]);
+        l.check(
+            refusal.as_ref().map(|r| r.condition) == Some("Q8")
+                && row.iter().all(|v| v.is_finite()),
+            "an allocation refused (Q8): the F32 route, named",
+            &format!("{refusal:?}"),
+        );
     }
     l.finish();
 }

@@ -31,9 +31,9 @@ pub(crate) mod gpu_buffers;
 pub(crate) mod kv_cache;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
-/// The native NVFP4/FP8 prefill route's structural admission. It and the other `native_prefill_*`
-/// modules are components the forward pass does not reach yet; they are public for the GPU suites
-/// (`tests/cuda_native_*_test.rs`).
+/// The native NVFP4/FP8 prefill route's admission and publication conditions. The route itself is
+/// published and run by the backend (`backend_impl::native_prefill_forward`); it and the other
+/// `native_prefill_*` modules are public for the GPU suites (`tests/cuda_native_*_test.rs`).
 pub mod native_prefill;
 /// The native prefill's attention kernels (`tests/cuda_native_attention_test.rs`): the RoPE table,
 /// the query/key norms with RoPE and the new KV rows, the BF16 KV staging and causal GQA attention.

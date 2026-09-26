@@ -9,6 +9,8 @@
 //! - **Activation scales.** Projections that share an input share one activation scale, the maximum
 //!   of their members' `input_scale`: GDN qkv and z, attention q, k and v, MLP gate and up. The FP8
 //!   ones are also kept on the device, where the GEMMs read them by pointer.
+//! - **NVFP4 global scales.** Each MLP plane's F32 global scale, read with the layer's other views,
+//!   for the GEMMs' `alpha`.
 
 use super::ffi::CudaDevice;
 use super::native_prefill::{input_scale, is_attention_layer, SliceSource};
@@ -73,6 +75,9 @@ pub struct PrefillWeightViews {
     /// Per layer: the BF16 `a` then `b` rows of a GDN layer; `None` on attention layers.
     pub ab: Vec<Option<CudaSlice<u16>>>,
     pub scales: Vec<LayerScales>,
+    /// Per layer: the NVFP4 global scales of gate, up and down, stored after each plane's codes and
+    /// block scales.
+    pub globals: Vec<[f32; 3]>,
     /// `[layer][proj_in, proj_out]`, read by the FP8 GEMMs as their activation-scale pointers.
     pub fp8_scales: CudaSlice<f32>,
 }
@@ -89,7 +94,19 @@ impl PrefillWeightViews {
         let mut mlp_scales = Vec::with_capacity(layers.len());
         let mut ab = Vec::with_capacity(layers.len());
         let mut scales = Vec::with_capacity(layers.len());
+        let mut globals = Vec::with_capacity(layers.len());
         for (l, layer) in layers.iter().enumerate() {
+            let global = |slice: &TensorSlice, n: usize, k: usize| {
+                let planes = Nvfp4Planes::for_shape(n as u64, k as u64)?;
+                let at = planes.weight_bytes + planes.block_scale_bytes;
+                src.read(l, slice, at, 4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            globals.push([
+                global(&layer.w_gate, inter, hidden)?,
+                global(&layer.w_up, inter, hidden)?,
+                global(&layer.w_down, hidden, inter)?,
+            ]);
             let swizzled = |slice: &TensorSlice, n: usize, k: usize| {
                 let planes = Nvfp4Planes::for_shape(n as u64, k as u64)?;
                 let linear = src.read(l, slice, planes.weight_bytes, planes.block_scale_bytes)?;
@@ -153,6 +170,7 @@ impl PrefillWeightViews {
             mlp_scales,
             ab,
             scales,
+            globals,
             fp8_scales: device.htod_copy(&table)?,
         })
     }

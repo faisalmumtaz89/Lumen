@@ -195,7 +195,23 @@ ENVIRONMENT VARIABLES (CUDA backend):
                           Refuse an NVFP4/FP8 artifact (an imported ModelOpt
                           checkpoint) at load, naming the scheme. By default the
                           CUDA NVFP4/FP8 kernels serve it; no other backend
-                          serves those planes."
+                          serves those planes.
+    LUMEN_CUDA_NATIVE_PREFILL=0
+                          Prefill an NVFP4/FP8 artifact with the F32 route (other
+                          models keep their own prefill). By default an
+                          NVFP4/FP8 artifact of the admitted 64-layer GDN +
+                          attention hybrid (the Qwen3.8-27B structure), converted
+                          with its activation scales, is prefilled natively
+                          (FP4/FP8 tensor cores) on a compute capability 12.0 GPU
+                          with NVRTC and cuBLASLt 12.8+ and an F32 KV cache, when
+                          its kernels pass a self-check at load (the GDN and
+                          attention kernels' reference outputs were recorded
+                          with NVRTC 13.3 and driver 610; a toolchain whose
+                          build changes those outputs fails it) and every GEMM has
+                          a plan verified once and cached (measuring the plans
+                          adds about half a minute to the first load); the load log
+                          names the route chosen and, for the F32 route, the
+                          first condition that failed."
     );
 }
 

@@ -1563,6 +1563,19 @@ pub fn cuda_nvfp4_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_NATIVE_PREFILL=0`: prefill an NVFP4/FP8 artifact with the F32 route; other models keep their
+/// own prefill whatever the switch. Default ON: an artifact the
+/// native NVFP4/FP8 prefill route admits (`cuda::native_prefill`) is prefilled by it, chosen once at load;
+/// the switch is that route's admission condition Q9, and for an artifact with NVFP4 or FP8 planes the
+/// load log names the route either way.
+pub fn native_prefill_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_NATIVE_PREFILL") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
 /// Mirror the switch into the admission predicate, once per process.
 ///
 /// `lumen-format` sits BELOW `lumen-runtime` in the dependency graph, so it cannot read this env var
@@ -1986,6 +1999,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_Q4_V3B",
     "LUMEN_CUDA_MOE_RESIDUAL_Q8",
     "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
+    "LUMEN_CUDA_NATIVE_PREFILL",
     "LUMEN_CUDA_NORM_CTA5_DUAL",
     "LUMEN_CUDA_NVFP4",
     "LUMEN_CUDA_OUTPUT_PROJ_NR",
@@ -2080,7 +2094,10 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_METAL_UNRETAINED_CMDBUFS",
     "LUMEN_MOE_PROBE",
     "LUMEN_NATIVE_IDS",
+    "LUMEN_NATIVE_IDS_JSON",
     "LUMEN_NATIVE_MODEL",
+    "LUMEN_NATIVE_OLD_MODEL",
+    "LUMEN_NATIVE_ORACLE_SCOPE",
     "LUMEN_PREFILL_TIMING",
     "LUMEN_QWEN35_9B_BF16",
     "LUMEN_QWEN35_9B_PATH",
@@ -4284,6 +4301,7 @@ mod tests {
         "LUMEN_CUDA_MOE_Q4_V3B",
         "LUMEN_CUDA_MOE_RESIDUAL_Q8",
         "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
+        "LUMEN_CUDA_NATIVE_PREFILL",
         "LUMEN_CUDA_NORM_CTA5_DUAL",
         "LUMEN_CUDA_NVFP4",
         "LUMEN_CUDA_OUTPUT_PROJ_NR",
@@ -4374,7 +4392,10 @@ mod tests {
         "LUMEN_METAL_UNRETAINED_CMDBUFS",
         "LUMEN_MOE_PROBE",
         "LUMEN_NATIVE_IDS",
+        "LUMEN_NATIVE_IDS_JSON",
         "LUMEN_NATIVE_MODEL",
+        "LUMEN_NATIVE_OLD_MODEL",
+        "LUMEN_NATIVE_ORACLE_SCOPE",
         "LUMEN_PREFILL_TIMING",
         "LUMEN_QWEN35_9B_BF16",
         "LUMEN_QWEN35_9B_PATH",

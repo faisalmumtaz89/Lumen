@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+mod native_prefill_forward;
 #[cfg(feature = "test-state-snapshot")]
 mod state_snapshot;
 #[cfg(feature = "test-state-snapshot")]
@@ -949,6 +950,12 @@ struct MutableState {
     decode_token_count: usize,
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
+    /// The native NVFP4/FP8 prefill route, published by `preload_weights` when the model and the
+    /// runtime meet its conditions (`native_prefill`); `None` selects the F32 prefill.
+    native_prefill: Option<native_prefill_forward::NativePrefill>,
+    /// Why the native route was not published, as the load log names it.
+    #[cfg_attr(not(feature = "test-prefill-dump"), allow(dead_code))]
+    native_prefill_refusal: Option<super::native_prefill::Refusal>,
     /// Pre-allocated cuBLAS workspace for CUDA graph capture compatibility.
     ///
     /// cuBLAS must not allocate memory internally during graph capture (cudaMalloc
@@ -19666,6 +19673,8 @@ impl ComputeBackend for CudaBackend {
             has_moe_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
+            native_prefill: None,
+            native_prefill_refusal: None,
             _cublas_workspace: cublas_workspace,
             precomputed_ptrs: None,
             algo_cache: AlgoCache::new(),
@@ -21203,107 +21212,131 @@ impl ComputeBackend for CudaBackend {
             )));
         }
 
-        // Resolve GDN dims up-front so the shared dequant scratch is
-        // sized correctly for models whose `qkv_dim` exceeds `inter_dim`
-        // (e.g. Qwen3.5-35B-A3B: qkv_dim=8192, hidden_dim=2048, inter_dim=6144
-        // -> gdn_qkv needs 16.8M scratch elements, attn/FFN max is 12.6M).
-        let gdn_dims: Option<(usize, usize)> = if has_gdn {
-            let p = super::gdn::GdnParams::from_hyperparams(hp);
-            Some((p.qkv_dim, p.value_dim))
+        // The route was chosen at load; nothing falls back during a request.
+        if let Some(native) = st.native_prefill.as_mut().filter(|n| n.serves()) {
+            let (Some(gdn), Some(embedding)) = (
+                st.gdn_scratch_gpu.as_mut(),
+                st.globals.embedding_bf16.as_ref(),
+            ) else {
+                return Err(RuntimeError::Compute(
+                    "the native prefill route lacks its GDN state or BF16 embedding".into(),
+                ));
+            };
+            native.run(
+                &self.device,
+                native_prefill_forward::DecodeState {
+                    layers: &st.layer_weights_cache,
+                    gdn,
+                    kv: &mut st.kv_caches,
+                    embedding,
+                    x_gpu: &mut st.scratch.x_gpu,
+                },
+                tokens,
+                pos_start,
+            )?;
         } else {
-            None
-        };
+            // Resolve GDN dims up-front so the shared dequant scratch is
+            // sized correctly for models whose `qkv_dim` exceeds `inter_dim`
+            // (e.g. Qwen3.5-35B-A3B: qkv_dim=8192, hidden_dim=2048, inter_dim=6144
+            // -> gdn_qkv needs 16.8M scratch elements, attn/FFN max is 12.6M).
+            let gdn_dims: Option<(usize, usize)> = if has_gdn {
+                let p = super::gdn::GdnParams::from_hyperparams(hp);
+                Some((p.qkv_dim, p.value_dim))
+            } else {
+                None
+            };
 
-        // Allocate slice-sized scratch buffers. Q+gate fusion (attn_q_norm
-        // present) projects wq at out = q_dim * 2, so the shared dequant
-        // scratch must budget the doubled matrix on those models.
-        let qgate_fused = st
-            .layer_weights_cache
-            .iter()
-            .any(|lw| lw.attn_q_norm.is_some());
-        let mut pf = super::prefill::alloc_prefill_scratch(
-            &self.device,
-            slice_len,
-            hidden_dim,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            gdn_dims.map(|(q, _)| q),
-            gdn_dims.map(|(_, v)| v),
-            qgate_fused,
-        )?;
-
-        // Allocate GDN prefill scratch if the model has GDN layers.
-        let mut gdn_pf = if has_gdn {
-            let gdn_params = super::gdn::GdnParams::from_hyperparams(hp);
-            // Ensure GDN persistent state (h_states, conv_states) is allocated.
-            self.ensure_gdn_scratch(st)?;
-            Some(super::prefill::alloc_gdn_prefill_scratch(
+            // Allocate slice-sized scratch buffers. Q+gate fusion (attn_q_norm
+            // present) projects wq at out = q_dim * 2, so the shared dequant
+            // scratch must budget the doubled matrix on those models.
+            let qgate_fused = st
+                .layer_weights_cache
+                .iter()
+                .any(|lw| lw.attn_q_norm.is_some());
+            let mut pf = super::prefill::alloc_prefill_scratch(
                 &self.device,
                 slice_len,
-                gdn_params.qkv_dim,
-                gdn_params.num_heads,
-                gdn_params.value_dim,
-            )?)
-        } else {
-            None
-        };
-
-        // The tiled SGEMM prefill attention's score block, last of the
-        // pre-loop buffers so a tight device does not lose one of those to
-        // it, and
-        // before the layer loop, because the loop writes each layer's KV and
-        // advances that cache's length before it reaches the attention
-        // dispatch while the host-side length only advances after the last
-        // layer. It exists exactly when the dispatch will take that route:
-        // the switch on, the softmax kernel built, a fused Q+gate attention
-        // layer present, 16 tokens or more, and no forced scalar attention. A
-        // refused allocation leaves it `None`, and the attention then runs on
-        // the scalar kernel, which needs no scratch.
-        pf.attn_scores = None;
-        if !crate::runtime_defaults::force_scalar_attn_enabled()
-            && slice_len >= 16
-            && crate::runtime_defaults::attn_prefill_sgemm_enabled()
-            && st.kernels.attn_softmax_causal.is_some()
-            && st.layer_weights_cache.iter().any(|lw| {
-                lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
-            })
-        {
-            pf.attn_scores = super::prefill::alloc_attn_score_block(
-                &self.device,
-                // The block serves every slice; the last slice attends over the
-                // longest key range, so it is sized for that one.
-                super::prefill::attn_score_block_elems(
-                    slice_len,
-                    num_heads,
-                    num_kv_heads,
-                    pos_start + total - slice_len,
-                ),
-            );
-        }
-
-        let mut last_len = 0;
-        for (i, slice) in tokens.chunks(slice_len).enumerate() {
-            self.prefill_slice(
-                st,
-                &mut pf,
-                gdn_pf.as_mut(),
-                slice,
-                pos_start + i * slice_len,
-            )?;
-            last_len = slice.len();
-        }
-
-        // Step 3: Extract last token's hidden state into decode scratch.
-        unsafe {
-            super::prefill::launch_extract_row(
-                &self.device,
-                &st.kernels,
-                &pf.x,
-                &mut st.scratch.x_gpu,
-                last_len - 1,
                 hidden_dim,
+                q_dim,
+                kv_dim,
+                inter_dim,
+                gdn_dims.map(|(q, _)| q),
+                gdn_dims.map(|(_, v)| v),
+                qgate_fused,
             )?;
+
+            // Allocate GDN prefill scratch if the model has GDN layers.
+            let mut gdn_pf = if has_gdn {
+                let gdn_params = super::gdn::GdnParams::from_hyperparams(hp);
+                // Ensure GDN persistent state (h_states, conv_states) is allocated.
+                self.ensure_gdn_scratch(st)?;
+                Some(super::prefill::alloc_gdn_prefill_scratch(
+                    &self.device,
+                    slice_len,
+                    gdn_params.qkv_dim,
+                    gdn_params.num_heads,
+                    gdn_params.value_dim,
+                )?)
+            } else {
+                None
+            };
+
+            // The tiled SGEMM prefill attention's score block, last of the
+            // pre-loop buffers so a tight device does not lose one of those to
+            // it, and
+            // before the layer loop, because the loop writes each layer's KV and
+            // advances that cache's length before it reaches the attention
+            // dispatch while the host-side length only advances after the last
+            // layer. It exists exactly when the dispatch will take that route:
+            // the switch on, the softmax kernel built, a fused Q+gate attention
+            // layer present, 16 tokens or more, and no forced scalar attention. A
+            // refused allocation leaves it `None`, and the attention then runs on
+            // the scalar kernel, which needs no scratch.
+            pf.attn_scores = None;
+            if !crate::runtime_defaults::force_scalar_attn_enabled()
+                && slice_len >= 16
+                && crate::runtime_defaults::attn_prefill_sgemm_enabled()
+                && st.kernels.attn_softmax_causal.is_some()
+                && st.layer_weights_cache.iter().any(|lw| {
+                    lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
+                })
+            {
+                pf.attn_scores = super::prefill::alloc_attn_score_block(
+                    &self.device,
+                    // The block serves every slice; the last slice attends over the
+                    // longest key range, so it is sized for that one.
+                    super::prefill::attn_score_block_elems(
+                        slice_len,
+                        num_heads,
+                        num_kv_heads,
+                        pos_start + total - slice_len,
+                    ),
+                );
+            }
+
+            let mut last_len = 0;
+            for (i, slice) in tokens.chunks(slice_len).enumerate() {
+                self.prefill_slice(
+                    st,
+                    &mut pf,
+                    gdn_pf.as_mut(),
+                    slice,
+                    pos_start + i * slice_len,
+                )?;
+                last_len = slice.len();
+            }
+
+            // Step 3: Extract last token's hidden state into decode scratch.
+            unsafe {
+                super::prefill::launch_extract_row(
+                    &self.device,
+                    &st.kernels,
+                    &pf.x,
+                    &mut st.scratch.x_gpu,
+                    last_len - 1,
+                    hidden_dim,
+                )?;
+            }
         }
 
         // Step 4: Single sync + readback.
@@ -21341,6 +21374,11 @@ impl ComputeBackend for CudaBackend {
         // below, which a K-quant HEADER alone must not turn on (see
         // `runtime_defaults::kquant_planes_present`).
         let mut any_kquant_layer_plane = false;
+        // Does it carry an NVFP4 or FP8 plane? Taken the same way; scopes the prefill route line.
+        let mut carries_planar = super::native_prefill::carries_planar_planes([
+            self.embedding_quant,
+            self.output_proj_quant,
+        ]);
 
         // A K-quant artifact needs the kernel group of every K-quant scheme its planes
         // carry, and the Q8_1 activation quantizer every K-quant plane's decode matvec
@@ -21466,6 +21504,14 @@ impl ComputeBackend for CudaBackend {
                 .named_slices()
                 .iter()
                 .any(|(_, s)| s.length > 0 && s.quant.is_kquant_superblock());
+            carries_planar |= super::native_prefill::carries_planar_planes(
+                layer_view
+                    .subtensors
+                    .named_slices()
+                    .iter()
+                    .filter(|(_, s)| s.length > 0)
+                    .map(|(_, s)| s.quant),
+            );
             // Fail fast on the FIRST layer that will keep a raw Ct4 tensor,
             // before the multi-GB upload: Ct4 decode needs its kernel trio +
             // Q8_1 scratch, and those load failures (e.g. no SM80 dp4a) are
@@ -22392,6 +22438,28 @@ impl ComputeBackend for CudaBackend {
                 self.embedding_quant,
                 self.output_proj_quant
             );
+        }
+
+        // The prefill route, chosen once for this model and named in the log for a model with NVFP4
+        // or FP8 planes, the only one the native route can admit.
+        st.native_prefill = None;
+        let publishing = std::time::Instant::now();
+        let published = native_prefill_forward::publish(self, st, weights);
+        let secs = publishing.elapsed().as_secs_f64();
+        match published {
+            Ok((route, line)) => {
+                eprintln!(
+                    "[CUDA] prefill route: native NVFP4/FP8 (published in {secs:.1} s; {line})"
+                );
+                st.native_prefill = Some(route);
+                st.native_prefill_refusal = None;
+            }
+            Err(refusal) => {
+                if carries_planar {
+                    eprintln!("[CUDA] prefill route: F32 ({refusal}; refused after {secs:.1} s)");
+                }
+                st.native_prefill_refusal = Some(refusal);
+            }
         }
         Ok(())
     }

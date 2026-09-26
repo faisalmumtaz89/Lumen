@@ -500,7 +500,7 @@ pub mod smoke {
 
     /// Expected digests, in [`KERNELS`] order. The GDN gated norm's covers both reduction shapes,
     /// 32 lanes then 16. The embedding gather's is that of its expected output, [`gathered`], which
-    /// a copy reproduces exactly.
+    /// a copy reproduces exactly (and a write past the last row does not).
     pub const DIGESTS: [&str; 9] = [
         "da95171dda3f128d992037eece54a49b53d64966e20b0285adfe743ca90f9c8a",
         "a494b6904958bbb89a5037565629fddde4a184f5233ddc7928d5f35e3120e5dd",
@@ -510,26 +510,34 @@ pub mod smoke {
         "5f500ca7b94561748f040598f580b6fb7dfe0d8737dd92b0a80c3b8d1a3f88d0",
         "d00c4d33fa2845a5e8fe1e05613ee22e9cfbef3199b9538de17f7b1a78ab2b41",
         "d30a70b3dbb40792247158b69fb4f9f80a92121ead7a1bdbf02942b5cb5cfbc9",
-        "f84553182564ad57cc7054c6b828db0ddb334677b83799e299314ba60b5b1200",
+        "90a328c8e491c6b8f80d4933e95a92d014d85f912aa2ba6aaf1b53c70517756f",
     ];
 
     /// Rows of the gather's table.
     pub const TABLE_ROWS: usize = 5;
-    /// Token ids of the gather: a later row first, then row 0.
-    pub const IDS: [u32; ROWS] = [3, 0];
+    /// Token ids of the gather: an odd count, so its last block of 256 threads is half past the last
+    /// row (3 x 640 threads = 7.5 blocks) and a missing bound writes into the guard band. The high
+    /// bits of wide ids are checked on the real embedding when the route is published.
+    pub const IDS: [u32; 3] = [3, 0, 4];
+    /// Sentinel values after the gather's last row, part of its digest.
+    pub const GUARD: usize = 256;
 
     /// The gather's table [TABLE_ROWS][5120].
     pub fn table() -> Vec<u16> {
         bf16(TABLE_ROWS * HIDDEN as usize, 12)
     }
 
-    /// The bytes the gather must write: the rows of [`table`] named by [`IDS`], in order.
+    /// The bytes the gather's output must hold: the rows of [`table`] named by [`IDS`], in order,
+    /// then the [`GUARD`] sentinel values it must leave.
     pub fn gathered() -> Vec<u8> {
         let h = HIDDEN as usize;
         let table = table();
-        IDS.iter()
+        let mut out: Vec<u8> = IDS
+            .iter()
             .flat_map(|&id| bytes_u16(&table[id as usize * h..(id as usize + 1) * h]))
-            .collect()
+            .collect();
+        out.resize(out.len() + 2 * GUARD, 0xA5);
+        out
     }
 
     /// `n` BF16 values in [-4, 4) from a linear congruential sequence seeded with `seed`.
@@ -709,12 +717,12 @@ pub mod smoke {
                 EMBED_GATHER_BF16 => {
                     let table = up(device, &table())?;
                     let ids = up(device, &IDS)?;
-                    let o = sentinel(device, 2 * m * h)?;
+                    let o = sentinel(device, 2 * (IDS.len() * h + GUARD))?;
                     k.embed_gather_bf16(
                         device,
                         ptr(device, &table),
                         ptr(device, &ids),
-                        mu,
+                        IDS.len() as u32,
                         ptr(device, &o),
                     )?;
                     out.extend(device.dtoh_copy(&o)?);
@@ -733,7 +741,23 @@ mod tests {
     #[test]
     fn the_gather_digest_is_that_of_its_expected_rows() {
         let want = smoke::gathered();
-        assert_eq!(want.len(), 2 * smoke::ROWS * HIDDEN as usize);
+        assert_eq!(
+            want.len(),
+            2 * (smoke::IDS.len() * HIDDEN as usize + smoke::GUARD)
+        );
         assert_eq!(checksum(&want), smoke::DIGESTS[EMBED_GATHER_BF16]);
+    }
+
+    #[test]
+    fn the_gather_problem_tells_a_write_past_the_last_row_apart() {
+        let want = smoke::gathered();
+        assert_eq!(
+            (smoke::IDS.len() * HIDDEN as usize / 8) % 256,
+            128,
+            "the last block is half past the last row"
+        );
+        let mut stray = want.clone();
+        stray[2 * smoke::IDS.len() * HIDDEN as usize] = 0;
+        assert_ne!(checksum(&stray), smoke::DIGESTS[EMBED_GATHER_BF16]);
     }
 }
