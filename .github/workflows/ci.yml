@@ -70,7 +70,7 @@ jobs:
       # The workspace clippy gate above runs without the cuda feature, so the
       # CUDA backend's lints are checked here, in the job that already compiles it.
       - name: clippy (cuda feature)
-        run: cargo clippy --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-server/cuda --release
+        run: cargo clippy --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-server/cuda --release
       # The cuda::prefill_attention lib tests and the cuda integration test
       # binaries need a physical GPU (cudarc dlopen of libcuda), so this
       # runner executes the host-side lib suite only — but compiles every
@@ -91,7 +91,7 @@ jobs:
       - name: cuda server admission tests
         run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/cuda --release --test planar_scheme_admission --bin lumen-server
       - name: compile all cuda test targets (no GPU run)
-        run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-server/cuda --release --no-run
+        run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lumen-linux-x86_64-cuda

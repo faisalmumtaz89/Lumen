@@ -41,6 +41,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(feature = "test-state-snapshot")]
+mod state_snapshot;
+#[cfg(feature = "test-state-snapshot")]
+pub use state_snapshot::StateSnapshot;
+
 /// Cached cuBLAS algorithm selection for HGEMV (M, N=1, K) shapes.
 ///
 /// During `preload_weights()`, benchmarks all 16 tensor-core cuBLAS algorithms

@@ -19,6 +19,11 @@ cuda = ["dep:cudarc"]
 # being enabled at the workspace level; production builds without the
 # feature have zero overhead from the inject path.
 test-fault-injection = []
+# Test-only feature: `CudaBackend::snapshot_state` / `restore_state` copy the
+# state a decode continues from (KV rows, GDN state, conv rings and positions,
+# the last hidden row, the step counter) out and back in, so two builds can be
+# decoded from one frozen state. Used by `cuda_state_snapshot_test`.
+test-state-snapshot = ["cuda"]
 
 [dependencies]
 lumen-format.workspace = true

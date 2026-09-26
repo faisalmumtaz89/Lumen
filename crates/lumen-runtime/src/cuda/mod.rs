@@ -37,6 +37,9 @@ pub mod shaders;
 pub(crate) mod types;
 
 pub use backend_impl::CudaBackend;
+/// Decode-state snapshots, for tests that decode two builds from one state.
+#[cfg(feature = "test-state-snapshot")]
+pub use backend_impl::StateSnapshot;
 /// The kernel-source `#define` reader, for the out-of-crate K-quant correctness suite
 /// (`tests/cuda_kquant_test.rs`), which pins the launcher's geometry to the kernels' own macros.
 pub use decode::kernel_define;
