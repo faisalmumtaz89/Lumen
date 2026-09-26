@@ -65,9 +65,12 @@ fn run(
     // The kernel takes ONE plane: weight | global_scale(F32 LE), the converter's order
     // (`convert_hf.rs::lower_fp8`). Building it here exercises the real layout rather than a simplified
     // one, and it is what the production dispatch passes.
-    let mut plane = Vec::with_capacity(weights.len() + 4);
+    let mut plane = Vec::with_capacity(weights.len() + 8);
     plane.extend_from_slice(weights);
     plane.extend_from_slice(&scale.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     let d_w = dev.htod_copy(&plane).expect("htod plane");
     let d_x = dev.htod_copy(x).expect("htod x");
     let mut d_out = dev.alloc_zeros::<f32>(out_dim as usize).expect("alloc out");

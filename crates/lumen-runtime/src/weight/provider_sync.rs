@@ -422,19 +422,23 @@ pub fn read_output_proj_global(
     let expected_f16_bytes = n_elements * 2;
     // Header-tag-first for the planar schemes, because their plane lengths collide with schemes the
     // length cascade below claims. An NVFP4 plane's packed weights and block scales, `n/2 + n/16` bytes,
-    // are exactly Q4_0's `(n/32) * 18`, and the trailing 4-byte F32 global scale makes the stored plane
+    // are exactly Q4_0's `(n/32) * 18`, and the 4-byte F32 global scale after them makes the stored plane
     // miss the Q4_0 arm and pass the F32 fallback's `% 4 == 0` check, which would read the head as a
     // quarter of its length in f32 values. The header decides. An FP8 head has no serving kernel, so it is
     // refused by name rather than left to the cascade.
     match header_quant {
         QuantScheme::Nvfp4 => {
-            // Packed weights, block scales and the trailing F32 global scale.
-            let need = n_elements / 2 + n_elements / 16 + 4;
-            if raw_bytes.len() != need {
+            // Packed weights, block scales and the F32 global scale, optionally followed by the head's
+            // activation scale.
+            let planes = lumen_format::Nvfp4Planes::for_shape(vocab_size as u64, hidden_dim as u64)
+                .map_err(|e| RuntimeError::Compute(format!("output head: {e}")))?
+                .total_bytes();
+            if lumen_format::planar_input_scale(planes, raw_bytes.len() as u64).is_none() {
                 return Err(RuntimeError::Compute(format!(
                     "output head plane is {} bytes but a {vocab_size} x {hidden_dim} head in Nvfp4 needs \
-                     exactly {need}",
-                    raw_bytes.len()
+                     exactly {planes}, or {} with its input scale",
+                    raw_bytes.len(),
+                    planes + lumen_format::PLANAR_INPUT_SCALE_BYTES
                 )));
             }
             // No F32 form for this scheme: the CPU paths do not serve it and the CUDA backend reads the

@@ -58,19 +58,25 @@ fn nvfp4_plane(o: usize, i: usize, global: f32, rng: &mut Lcg) -> (Vec<u8>, Vec<
     let scales: Vec<u8> = (0..o * i / 16)
         .map(|_| finite_e4m3(rng.next_u8()))
         .collect();
-    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 4);
+    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 8);
     plane.extend_from_slice(&packed);
     plane.extend_from_slice(&scales);
     plane.extend_from_slice(&global.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     (plane, packed, scales)
 }
 
 /// Build a whole FP8 plane: weight | global_scale(4B LE).
 fn fp8_plane(o: usize, i: usize, scale: f32, rng: &mut Lcg) -> (Vec<u8>, Vec<u8>) {
     let weights: Vec<u8> = (0..o * i).map(|_| finite_e4m3(rng.next_u8())).collect();
-    let mut plane = Vec::with_capacity(weights.len() + 4);
+    let mut plane = Vec::with_capacity(weights.len() + 8);
     plane.extend_from_slice(&weights);
     plane.extend_from_slice(&scale.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     (plane, weights)
 }
 
@@ -263,6 +269,9 @@ fn prefill_hand_computed_cell_pins_the_layout() {
     let mut plane = packed.clone();
     plane.push(scales[0]);
     plane.extend_from_slice(&global.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     // Token 0 is all 1.0 -> row dot = 1.0+1.5+2+3+4+6-0.5-1 = 16.
     // Token 1 is all 2.0 -> exactly twice that. Built as row-major [batch, in_dim], the layout cuBLAS is
     // handed; a transposed x puts token 1's first element where token 0's second belongs and the two

@@ -12,7 +12,7 @@
 //!     a wide global scale that drives the decoded magnitude towards the F16 bound;
 //!   * all-zero planes and alternating nibbles (0x0F/0xF0 patterns, which catch a nibble-order swap);
 //!   * multi-group NVFP4 planes (65 and 1000 groups), so each thread's group index, the block-scale offset
-//!     and the trailing global scale are checked past the first group.
+//!     and the global scale after the block scales are checked past the first group.
 //!
 //! Requires a CUDA GPU:
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_planar_decode_exact_test
@@ -77,11 +77,14 @@ fn run_nvfp4(
 ) -> Vec<f32> {
     // The kernel takes ONE plane: weight | block_scale | global_scale(F32 LE), the converter's order
     // (`convert_hf.rs::lower_nvfp4`). Building it here makes the test exercise the real layout, including
-    // the scale at the tail, rather than a simplified one.
-    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 4);
+    // the scale after the block scales, rather than a simplified one.
+    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 8);
     plane.extend_from_slice(packed);
     plane.extend_from_slice(scales);
     plane.extend_from_slice(&global.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     let d_plane = dev.htod_copy(&plane).expect("htod plane");
     let mut d_out = dev
         .alloc_zeros::<f32>((n_blocks as usize) * NVFP4_GROUP)
@@ -110,11 +113,14 @@ fn run_nvfp4(
 
 fn run_fp8(dev: &CudaDevice, weights: &[u8], scale: f32) -> Vec<f32> {
     let n = weights.len() as u32;
-    // FP8's plane is weight[n] | global_scale(F32 LE), the same trailing-scalar rule
+    // FP8's plane is weight[n] | global_scale(F32 LE), the same rule
     // (`convert_hf.rs::lower_fp8`).
-    let mut plane = Vec::with_capacity(weights.len() + 4);
+    let mut plane = Vec::with_capacity(weights.len() + 8);
     plane.extend_from_slice(weights);
     plane.extend_from_slice(&scale.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     let d_w = dev.htod_copy(&plane).expect("htod plane");
     let mut d_out = dev.alloc_zeros::<f32>(n as usize).expect("alloc out");
     let m = dev
@@ -222,7 +228,7 @@ fn nvfp4_decode_edge_block_and_global_scales_bit_exact() {
 }
 
 /// Planes of many 16-weight groups, each with its own block scale: every group is decoded with its own
-/// scale and the global scale read from the plane's tail, as in a real matrix.
+/// scale and the global scale read after the block scales, as in a real matrix.
 #[test]
 fn nvfp4_decode_many_groups_bit_exact() {
     let dev = device();

@@ -605,8 +605,10 @@ pub fn no_serving_kernels_message(quant: QuantScheme, backend: ServingBackend) -
 }
 
 /// How one matrix's planes are sized for a planar scheme, or `None` for a
-/// scheme with a fixed per-row layout. The returned function gives the exact
-/// slice length of an `[out_dim, in_dim]` matrix, and `None` for a width with
+/// scheme with a fixed per-row layout. The returned function gives the bytes
+/// of an `[out_dim, in_dim]` matrix's weight planes, which a slice holds
+/// alone or followed by its activation scale
+/// ([`crate::quantization::planar_input_scale`]), and `None` for a width with
 /// no valid geometry (NVFP4: `in_dim` not a multiple of its 16-element group;
 /// FP8: `in_dim` not a multiple of 4).
 ///
@@ -665,7 +667,7 @@ pub fn validate_projection_geometry(
     // would leave `row_bytes` None, skipping the length check entirely.
     // Both halves of the rule still apply: the width must be one the planes
     // support, and the length must be exactly what one allowed out_dim
-    // plans.
+    // plans, with or without the activation scale after the planes.
     if let Some(slice_len) = planar_slice_len_fn(slice.quant) {
         if in_dim == 0 {
             return Err(format!("{name} role has in_dim 0 (malformed hyperparams)."));
@@ -683,14 +685,19 @@ pub fn validate_projection_geometry(
                 .iter()
                 .filter_map(|&out| slice_len(out as u64, in_dim as u64))
                 .collect();
-            if !expected.contains(&slice.length) {
+            if !expected.iter().any(|&planes| {
+                crate::quantization::planar_input_scale(planes, slice.length).is_some()
+            }) {
                 return Err(format!(
                     "{name} is {} bytes ({:?}, in_dim {in_dim}) but this role \
                      requires out_dim in {allowed_out:?}, whose planes are \
-                     {expected:?} bytes. The kernels derive dimensions from \
+                     {expected:?} bytes, each optionally followed by a \
+                     {}-byte input scale. The kernels derive dimensions from \
                      hyperparams, so this tensor would be read at the wrong \
                      geometry. Re-convert with `lumen convert`.",
-                    slice.length, slice.quant
+                    slice.length,
+                    slice.quant,
+                    crate::quantization::PLANAR_INPUT_SCALE_BYTES
                 ));
             }
         }
@@ -1519,6 +1526,30 @@ mod tests {
                 validate_projection_geometry("wq", &sl(bytes, quant), in_dim, &[7, out_dim])
                     .is_ok()
             );
+        }
+    }
+
+    #[test]
+    fn planar_projection_geometry_takes_an_input_scale_after_the_planes_and_nothing_else() {
+        // A slice may carry the module's F32 activation scale after its
+        // planes: exactly four bytes more. Any other length around the planes
+        // is refused, naming the tensor, its length and the planes' length.
+        for (quant, in_dim, out_dim, planes) in PLANAR_SHAPES {
+            for allowed in [&[out_dim][..], &[7, out_dim]] {
+                validate_projection_geometry("wq", &sl(planes + 4, quant), in_dim, allowed)
+                    .unwrap_or_else(|e| panic!("{quant:?} [{out_dim}, {in_dim}] + scale: {e}"));
+            }
+            for bad in [planes - 4, planes + 1, planes + 3, planes + 5, planes + 8] {
+                let err =
+                    validate_projection_geometry("w_down", &sl(bad, quant), in_dim, &[out_dim])
+                        .unwrap_err();
+                assert!(
+                    err.starts_with(&format!("w_down is {bad} bytes"))
+                        && err.contains(&format!("[{planes}]"))
+                        && err.contains("4-byte input scale"),
+                    "{quant:?} {bad} bytes: {err}"
+                );
+            }
         }
     }
 

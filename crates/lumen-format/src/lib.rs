@@ -37,7 +37,8 @@ pub use index::{ExpertSlice, LayerIndex, SliceFields, SubtensorOffsets, TensorSl
 pub use large_model::{generate_large_model, generate_large_model_f16, LargeModelConfig};
 pub use planar_dequant::{dequantize_fp8, dequantize_nvfp4, e2m1_to_f32, e4m3_to_f32, NVFP4_GROUP};
 pub use quantization::{
-    CtInt4G32Planes, Fp8Planes, Nvfp4Planes, QuantGroupSize, QuantScheme, QuantizationDescriptor,
+    planar_input_scale, CtInt4G32Planes, Fp8Planes, Nvfp4Planes, QuantGroupSize, QuantScheme,
+    QuantizationDescriptor, PLANAR_INPUT_SCALE_BYTES,
 };
 pub use reader::LbcFile;
 pub use streaming_writer::{LayerShape, StreamingLbcWriter};

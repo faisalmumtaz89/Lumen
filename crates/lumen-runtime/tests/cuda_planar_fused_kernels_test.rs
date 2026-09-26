@@ -66,10 +66,13 @@ fn nvfp4_plane(
     global: f32,
 ) -> CudaSlice<u8> {
     let n = out_dim as usize * in_dim as usize;
-    let mut p = Vec::with_capacity(n / 2 + n / 16 + 4);
+    let mut p = Vec::with_capacity(n / 2 + n / 16 + 8);
     p.extend((0..n / 2).map(|_| rng.next_u8()));
     p.extend((0..n / 16).map(|_| rng.next_e4m3()));
     p.extend_from_slice(&global.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    p.extend_from_slice(&f32::NAN.to_le_bytes());
     dev.htod_copy(&p).expect("htod nvfp4 plane")
 }
 
@@ -82,9 +85,12 @@ fn fp8_plane(
     scale: f32,
 ) -> CudaSlice<u8> {
     let n = out_dim as usize * in_dim as usize;
-    let mut p = Vec::with_capacity(n + 4);
+    let mut p = Vec::with_capacity(n + 8);
     p.extend((0..n).map(|_| rng.next_e4m3()));
     p.extend_from_slice(&scale.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    p.extend_from_slice(&f32::NAN.to_le_bytes());
     dev.htod_copy(&p).expect("htod fp8 plane")
 }
 
@@ -467,6 +473,9 @@ fn fp8_residual_rounded_is_bit_identical_to_matvec_then_add() {
         }
     }
     plane.extend_from_slice(&0.0137f32.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     let x: Vec<f32> = (0..IN)
         .map(|_| (next() % 2001) as f32 * 1.0e-3 - 1.0)
         .collect();

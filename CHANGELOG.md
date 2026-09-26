@@ -19,7 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   or BF16, and the output head NVFP4 or BF16; the embedding must be BF16 and the GDN
   `in_proj_a` / `in_proj_b` unquantized. A NaN E4M3 block scale or FP8 weight, a
   `pre_quant_scale`, and a declared module outside the text model (a
-  multi-token-prediction layer, say) are refused by name. The CUDA backend serves them
+  multi-token-prediction layer, say) are refused by name. Each module's activation scale
+  (`input_scale`) is kept after its planes when the checkpoint carries one, and one that
+  is malformed or belongs to no converted NVFP4 or FP8 module is refused by name; an
+  artifact converted without them loads and serves as before. The CUDA backend serves them
   with dedicated decode and prefill kernels; the other backends refuse such an artifact
   at load and name the scheme. With `LUMEN_CUDA_NVFP4=0`, `lumen` and `lumen-server` refuse
   them on CUDA as well.

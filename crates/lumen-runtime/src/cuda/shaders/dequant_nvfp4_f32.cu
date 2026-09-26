@@ -87,7 +87,7 @@ extern "C" __global__ void dequant_nvfp4_to_f32(
     }
 
     // The plane's layout is the converter's (`convert_hf.rs::lower_nvfp4`), so both sub-planes and the
-    // trailing scale are derived from n — the same rule the matvec kernels follow.
+    // global scale after them are derived from n — the same rule the matvec kernels follow.
     const unsigned int weight_bytes = n / 2u;
     const unsigned char* block_scales = plane + weight_bytes;
     const unsigned char* gs = plane + weight_bytes + n / 16u;

@@ -2,14 +2,14 @@
 // an f32 activation.
 //
 // Layout served: ONE plane, exactly as the converter writes it (`convert_hf.rs::lower_fp8` concatenates
-// weight | global_scale):
-//   plane = weight F8 [out_dim, in_dim] | weight_scale F32 LE (4 bytes at the tail)
+// weight | global_scale, then the activation scale when the checkpoint has one):
+//   plane = weight F8 [out_dim, in_dim] | weight_scale F32 LE (4 bytes) [| input_scale F32 LE, not read here]
 //   value = e4m3(code) * weight_scale
 //
 // The scale is a PER-TENSOR scalar, unlike NVFP4's per-16 block scale, so it factors out of the whole dot
 // product: `out[i] = weight_scale * sum_j e4m3(w[i,j]) * x[j]`. It is applied once per row after the
-// reduction, one multiply per row rather than one per weight. Reading it from the plane's
-// tail keeps FP8 on the same single-argument contract NVFP4 uses, so one launch helper serves both.
+// reduction, one multiply per row rather than one per weight. Reading it from the plane, right after the
+// weights, keeps FP8 on the same single-argument contract NVFP4 uses, so one launch helper serves both.
 //
 // The residual twin exists for the attention `wo` sites: the caller needs `y = W*x + residual`
 // accumulated, so the second entry point takes a residual vector and adds it on the lane-0 write. It is a
@@ -122,7 +122,8 @@ extern "C" __device__ __forceinline__ float fp8_warp_reduce(float v)
     return v;
 }
 
-// The per-tensor scale: the plane's LAST 4 BYTES, so it needs no separate buffer.
+// The per-tensor scale: the 4 bytes right after the weights, found from the dimensions, so it needs no
+// separate buffer.
 extern "C" __device__ __forceinline__ float fp8_plane_scale(
     const unsigned char* plane, unsigned int out_dim, unsigned int in_dim)
 {

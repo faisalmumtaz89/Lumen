@@ -12368,7 +12368,7 @@ impl CudaBackend {
 }
 
 /// Launch the planar matvec (NVFP4 or FP8). One plane, one warp per row; the kernel derives
-/// every offset from `out_dim`/`in_dim`, including the F32 scale at the plane's tail, which both
+/// every offset from `out_dim`/`in_dim`, including the F32 scale after the weight planes, which both
 /// schemes carry.
 ///
 /// # Safety
@@ -18562,7 +18562,9 @@ unsafe fn launch_fused_norm_dual_matvec_f32(
 /// by its length (`weight::provider_sync::read_embedding_global`); this
 /// path length-checks a scheme the header already named.
 /// `Ok(Some(len))` = the scheme has a fixed block layout and `len` is the
-/// only valid raw size. `Ok(None)` = the layout is not length-checkable
+/// only valid raw size, or for a planar scheme the size of its weight planes,
+/// which [`check_raw_global_len`] also accepts with the activation scale
+/// after them. `Ok(None)` = the layout is not length-checkable
 /// here (e.g. CtInt4G32's composite planes). `Err` = the dimensions are
 /// malformed for the scheme (non-block-multiple element count or overflow).
 fn raw_global_expected_len(
@@ -18602,6 +18604,11 @@ fn raw_global_expected_len(
             ))),
         }
     };
+    let planes_len = |planes: Result<u64, lumen_format::FormatError>| {
+        planes.map(|len| Some(len as usize)).map_err(|e| {
+            RuntimeError::Compute(format!("{quant:?} global: {e} (malformed hyperparams)"))
+        })
+    };
     match quant {
         QuantScheme::Q8_0 => block(32, 34),
         QuantScheme::Q4_0 => block(32, 18),
@@ -18616,18 +18623,60 @@ fn raw_global_expected_len(
                 .map(Some)
                 .map_err(RuntimeError::Compute)
         }
-        // The planar schemes.
-        //
-        // NVFP4's stored plane is `weight[n/2] + block_scale[n/16] + global_scale[4]`, concatenated in that
-        // order by the converter (`convert_hf.rs::lower_nvfp4`). The global scale is a FIXED 4 bytes, not
-        // proportional to n, so it is added after the block check rather than folded into a per-block size:
-        // `block(16, 9)` alone is 4 bytes short of the stored plane.
-        QuantScheme::Nvfp4 => block(16, 9).map(|o| o.map(|len| len + 4)),
-        // FP8's plane is `weight[n] + global_scale[4]`, the same trailing-scalar rule as NVFP4
-        // (`convert_hf.rs::lower_fp8` appends `scale.to_le_bytes()`), so it too needs the +4.
-        QuantScheme::Fp8E4M3 => block(1, 1).map(|o| o.map(|len| len + 4)),
+        // The planar schemes: `block` checks the element count against the 32-bit bounds, and the length is
+        // that of the weight planes (`Nvfp4Planes`, `Fp8Planes`), global scale included. Their sizes depend on
+        // the element count alone, so they are those of one n-element row. A stored global may carry its
+        // activation scale after the planes, which `check_raw_global_len` accepts.
+        QuantScheme::Nvfp4 => {
+            block(16, 9)?;
+            planes_len(
+                lumen_format::Nvfp4Planes::for_shape(1, n_elements as u64).map(|p| p.total_bytes()),
+            )
+        }
+        QuantScheme::Fp8E4M3 => {
+            block(1, 1)?;
+            planes_len(
+                lumen_format::Fp8Planes::for_shape(1, n_elements as u64).map(|p| p.total_bytes()),
+            )
+        }
         _ => Ok(None),
     }
+}
+
+/// Refuse a raw `[vocab, hidden]` global, named `what`, whose length is not the one its scheme's layout fixes
+/// ([`raw_global_expected_len`]). A planar global may also carry its activation scale after its planes
+/// ([`lumen_format::planar_input_scale`]).
+fn check_raw_global_len(
+    what: &str,
+    quant: QuantScheme,
+    hyperparams: &ModelHyperparams,
+    len: usize,
+) -> Result<(), RuntimeError> {
+    let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
+    let Some(expected) = raw_global_expected_len(quant, n)? else {
+        return Ok(());
+    };
+    let planar = matches!(quant, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3);
+    let matches = if planar {
+        lumen_format::planar_input_scale(expected as u64, len as u64).is_some()
+    } else {
+        len == expected
+    };
+    if matches {
+        return Ok(());
+    }
+    let with_scale = if planar {
+        format!(
+            ", or {} with its input scale",
+            expected as u64 + lumen_format::PLANAR_INPUT_SCALE_BYTES
+        )
+    } else {
+        String::new()
+    };
+    Err(RuntimeError::Compute(format!(
+        "{what} raw is {len} bytes but {quant:?} [{} x {}] requires {expected}{with_scale}",
+        hyperparams.vocab_size, hyperparams.hidden_dim
+    )))
 }
 
 #[cfg(test)]
@@ -18673,6 +18722,49 @@ mod raw_global_len_tests {
         assert!(n <= u32::MAX as usize);
         let err = raw_global_expected_len(QuantScheme::Q8_0, n).unwrap_err();
         assert!(err.to_string().contains("32-bit byte indexing"), "{err}");
+    }
+
+    #[test]
+    fn a_planar_global_takes_its_input_scale_and_no_other_length() {
+        let hp = ModelHyperparams {
+            num_layers: 1,
+            num_heads: 4,
+            num_kv_heads: 1,
+            head_dim: 128,
+            hidden_dim: 5120,
+            intermediate_dim: 17408,
+            vocab_size: 248_320,
+            max_seq_len: 512,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-6,
+            rotary_dim: None,
+            rope_neox: true,
+            gdn: None,
+        };
+        // The real head: its planes, and its planes followed by the 4-byte activation scale.
+        for len in [715_161_604, 715_161_608] {
+            check_raw_global_len("output_proj", QuantScheme::Nvfp4, &hp, len)
+                .unwrap_or_else(|e| panic!("{len}: {e}"));
+        }
+        for len in [715_161_600, 715_161_603, 715_161_605, 715_161_612] {
+            let err = check_raw_global_len("output_proj", QuantScheme::Nvfp4, &hp, len)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("output_proj raw is {len} bytes"))
+                    && err.contains("requires 715161604, or 715161608 with its input scale"),
+                "{err}"
+            );
+        }
+        // A scheme with a fixed block layout takes its exact length only.
+        let q8 = 248_320 * 5120 / 32 * 34;
+        assert!(check_raw_global_len("output_proj", QuantScheme::Q8_0, &hp, q8).is_ok());
+        let err = check_raw_global_len("output_proj", QuantScheme::Q8_0, &hp, q8 + 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with(&format!("requires {q8}")), "{err}");
     }
 }
 
@@ -19030,18 +19122,7 @@ impl ComputeBackend for CudaBackend {
         let (embedding_f32, embedding_q8, embedding_f16_raw, embedding_q4_raw, embedding_bf16_raw) =
             if has_raw_embedding {
                 let raw = self.embedding_raw.as_ref().unwrap();
-                let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
-                if let Some(expected) = raw_global_expected_len(self.embedding_quant, n)? {
-                    if raw.len() != expected {
-                        return Err(RuntimeError::Compute(format!(
-                            "embedding raw is {} bytes but {:?} [{} x {}] requires {expected}",
-                            raw.len(),
-                            self.embedding_quant,
-                            hyperparams.vocab_size,
-                            hyperparams.hidden_dim
-                        )));
-                    }
-                }
+                check_raw_global_len("embedding", self.embedding_quant, hyperparams, raw.len())?;
                 let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
                 super::gpu_buffers::validate_kquant_embedding(self.embedding_quant)?;
                 match self.embedding_quant {
@@ -19111,23 +19192,17 @@ impl ComputeBackend for CudaBackend {
             output_proj_nvfp4_raw,
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
-            let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
             lumen_format::serving_rules::validate_output_head_row_alignment(
                 self.output_proj_quant,
                 hyperparams.hidden_dim as usize,
             )
             .map_err(RuntimeError::Compute)?;
-            if let Some(expected) = raw_global_expected_len(self.output_proj_quant, n)? {
-                if raw.len() != expected {
-                    return Err(RuntimeError::Compute(format!(
-                        "output_proj raw is {} bytes but {:?} [{} x {}] requires {expected}",
-                        raw.len(),
-                        self.output_proj_quant,
-                        hyperparams.vocab_size,
-                        hyperparams.hidden_dim
-                    )));
-                }
-            }
+            check_raw_global_len(
+                "output_proj",
+                self.output_proj_quant,
+                hyperparams,
+                raw.len(),
+            )?;
             let placeholder: CudaSlice<f32> = self.device.alloc_zeros(1)?;
             match self.output_proj_quant {
                 QuantScheme::Q8_0 => {

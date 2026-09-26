@@ -294,7 +294,7 @@ pub(crate) fn attn_score_block_elems(
 /// Decode a planar plane into the f32 dequant scratch (`dequant_nvfp4_to_f32` / `dequant_fp8_to_f32`).
 ///
 /// The kernels take the plane and the element count, deriving every internal offset from n — including the
-/// F32 scale at the plane's tail — so nothing else is passed. The NVFP4 kernel writes four elements per
+/// F32 scale after the weight planes — so nothing else is passed. The NVFP4 kernel writes four elements per
 /// thread and the FP8 kernel one, so the grid covers `n / 4` or `n` threads accordingly.
 ///
 /// # Safety

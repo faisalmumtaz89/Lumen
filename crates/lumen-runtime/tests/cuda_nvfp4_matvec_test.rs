@@ -102,11 +102,14 @@ fn run_kernel(
 ) -> Vec<f32> {
     // The kernel takes ONE plane: weight | block_scale | global_scale(F32 LE), the converter's order
     // (`convert_hf.rs::lower_nvfp4`). Building it here means the test exercises the real layout rather
-    // than a simplified one, including the 4-byte scale at the tail.
-    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 4);
+    // than a simplified one, including the 4-byte scale after the block scales.
+    let mut plane = Vec::with_capacity(packed.len() + scales.len() + 8);
     plane.extend_from_slice(packed);
     plane.extend_from_slice(scales);
     plane.extend_from_slice(&global.to_le_bytes());
+    // The activation scale a converted slice may carry after its planes: NaN, so a kernel that read it
+    // would fail every comparison here.
+    plane.extend_from_slice(&f32::NAN.to_le_bytes());
     let d_w = dev.htod_copy(&plane).expect("htod plane");
     let d_x = dev.htod_copy(x).expect("htod x");
     let mut d_out = dev.alloc_zeros::<f32>(out_dim as usize).expect("alloc out");

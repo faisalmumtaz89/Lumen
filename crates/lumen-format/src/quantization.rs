@@ -59,7 +59,9 @@ pub enum QuantScheme {
     ///
     /// A tensor slice with this scheme holds the three source planes
     /// byte-for-byte, concatenated in fixed order for logical shape `[n, k]`
-    /// (`k % 16 == 0`, two nibbles per byte along k).
+    /// (`k % 16 == 0`, two nibbles per byte along k), then, when the
+    /// checkpoint carries one, the module's F32 activation scale
+    /// (`input_scale`) as a fourth plane ([`planar_input_scale`]).
     ///
     /// Dequantization: `w = E2M1(nibble) * f32(E4M3(block_scale) * scale)`,
     /// the two scales folded first.
@@ -69,7 +71,9 @@ pub enum QuantScheme {
     ///
     /// A tensor slice with this scheme holds both source planes
     /// byte-for-byte, the weight bytes then the scale, for logical shape
-    /// `[n, k]` (`k % 4 == 0`).
+    /// `[n, k]` (`k % 4 == 0`), then, when the checkpoint carries one, the
+    /// module's F32 activation scale (`input_scale`) as a third plane
+    /// ([`planar_input_scale`]).
     ///
     /// Dequantization: `w = E4M3(byte) * scale`.
     Fp8E4M3,
@@ -225,11 +229,35 @@ impl CtInt4G32Planes {
     }
 }
 
+/// Bytes of the F32 activation scale (`input_scale`) that may follow a planar
+/// slice's weight planes.
+pub const PLANAR_INPUT_SCALE_BYTES: u64 = 4;
+
+/// Whether a planar ([`QuantScheme::Nvfp4`] or [`QuantScheme::Fp8E4M3`])
+/// slice of `len` bytes, whose weight planes take `planes_bytes`
+/// ([`Nvfp4Planes::total_bytes`], [`Fp8Planes::total_bytes`]), carries the
+/// module's activation scale after them: `Some(false)` when `len` is exactly
+/// the planes, `Some(true)` when it is the planes and the scale, which then
+/// starts at byte `planes_bytes`, and `None` for any other length. The one
+/// length rule for every planar slice, a layer's or the head's. The planes
+/// are laid out from the logical shape alone, so the scale changes no offset
+/// the weights are read from.
+pub fn planar_input_scale(planes_bytes: u64, len: u64) -> Option<bool> {
+    if len == planes_bytes {
+        Some(false)
+    } else if planes_bytes.checked_add(PLANAR_INPUT_SCALE_BYTES) == Some(len) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Byte sizes of the three planes of a [`QuantScheme::Nvfp4`] tensor slice
 /// for logical shape `[n, k]`, in their fixed slice order. The single source
 /// of truth for the plane derivation — the converter sizes writes with it and
 /// the CUDA upload checks each slice's length against it
-/// ([`crate::serving_rules::validate_projection_geometry`]).
+/// ([`crate::serving_rules::validate_projection_geometry`]), which may be
+/// longer by an activation scale ([`planar_input_scale`]).
 ///
 /// Requires `k % 16 == 0` (the group size); `n` may be any positive value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,8 +302,8 @@ impl Nvfp4Planes {
 
 /// Byte sizes of the two planes of a [`QuantScheme::Fp8E4M3`] tensor slice
 /// for logical shape `[n, k]`, in their fixed slice order. The single source
-/// of truth for the plane derivation and the slice-length check, as
-/// [`Nvfp4Planes`] is for NVFP4.
+/// of truth for the plane derivation, as [`Nvfp4Planes`] is for NVFP4; the
+/// slice-length check adds [`planar_input_scale`].
 ///
 /// The scale is per tensor, so there is no group-size constraint on `k`; `k`
 /// must be a multiple of 4 because the kernels read each row four bytes at a
@@ -407,6 +435,28 @@ mod tests {
         assert_eq!(head.weight_bytes, 635_699_200);
         assert_eq!(head.block_scale_bytes, 79_462_400);
         assert_eq!(head.total_bytes(), 715_161_604);
+    }
+
+    #[test]
+    fn a_planar_slice_is_its_planes_with_or_without_one_input_scale() {
+        // The real shapes' planes (see the two tests above and below): the
+        // exact length and one F32 more are the only two a slice may have.
+        for planes in [50_135_044u64, 715_161_604, 52_428_804, 5_242_884] {
+            assert_eq!(planar_input_scale(planes, planes), Some(false));
+            assert_eq!(planar_input_scale(planes, planes + 4), Some(true));
+            for bad in [
+                planes - 4,
+                planes - 1,
+                planes + 1,
+                planes + 3,
+                planes + 5,
+                planes + 8,
+            ] {
+                assert_eq!(planar_input_scale(planes, bad), None, "{planes} / {bad}");
+            }
+        }
+        assert_eq!(planar_input_scale(u64::MAX, u64::MAX), Some(false));
+        assert_eq!(planar_input_scale(u64::MAX - 3, 3), None);
     }
 
     #[test]

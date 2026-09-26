@@ -511,6 +511,14 @@ fn validate_projection_geometry(
         .map_err(RuntimeError::Compute)
 }
 
+/// Name the layer in a refusal from a check that knows only the tensor's role.
+fn in_layer(layer: usize, e: RuntimeError) -> RuntimeError {
+    match e {
+        RuntimeError::Compute(m) => RuntimeError::Compute(format!("layer {layer}: {m}")),
+        other => other,
+    }
+}
+
 fn validate_mandatory_presence(
     subs: &lumen_format::index::SubtensorOffsets,
 ) -> Result<(), RuntimeError> {
@@ -535,7 +543,8 @@ fn upload_projection_tensor(
         }
         upload_ct4_tensor(device, weights, name, slice, out_dim, in_dim)
     } else {
-        validate_projection_geometry(name, slice, in_dim, allowed_out)?;
+        validate_projection_geometry(name, slice, in_dim, allowed_out)
+            .map_err(|e| in_layer(weights.layer_idx, e))?;
         upload_tensor(device, weights, name, slice)
     }
 }
@@ -553,7 +562,8 @@ fn upload_gdn_gate_tensor(
     num_v_heads: usize,
 ) -> Result<GpuWeightBuf, RuntimeError> {
     if matches!(slice.quant, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3) {
-        validate_projection_geometry(name, slice, hidden, &[num_v_heads])?;
+        validate_projection_geometry(name, slice, hidden, &[num_v_heads])
+            .map_err(|e| in_layer(weights.layer_idx, e))?;
     }
     upload_tensor(device, weights, name, slice)
 }
@@ -710,8 +720,9 @@ fn upload_tensor(
         // silently taking a different numerical path and defeating the whole point of the format.
         //
         // The upload is a straight htod of the packed planes: NVFP4's E2M1 nibbles and per-16 E4M3 block
-        // scales, FP8's E4M3 bytes. No repack and no shadow copy; the per-tensor global scale stays in
-        // the plane's last 4 bytes, where the kernels read it.
+        // scales, FP8's E4M3 bytes. No repack and no shadow copy; the per-tensor global scale stays right
+        // after the weight planes, where the kernels find it from the matrix dimensions, and an activation
+        // scale after it, if the slice carries one, goes up with them and is not read by these kernels.
         QuantScheme::Nvfp4 => {
             kquant_plane_counters().count_native(QuantScheme::Nvfp4);
             Ok(GpuWeightBuf::Nvfp4Raw(device.htod_copy(raw)?))
@@ -2432,7 +2443,8 @@ mod layer_slice_tests {
     }
 
     /// A planar GDN `ssm_out` gets the same load-time geometry check as the other projections: a slice
-    /// exactly one `[hidden, value_dim]` plane set long uploads, one a byte short is refused before upload.
+    /// exactly one `[hidden, value_dim]` plane set long uploads, alone or followed by its 4-byte activation
+    /// scale, and any other length around it is refused before upload.
     /// The Q8_0 GDN test model's `ssm_out` is retagged in place; its bytes are longer than either plane
     /// set, so only the slice length differs between the cases. Needs a CUDA device; run with
     /// `cargo test --release -p lumen-runtime --features cuda planar_ssm_out_geometry -- --ignored`.
@@ -2452,12 +2464,26 @@ mod layer_slice_tests {
             .header
             .hyperparams;
         let gd = hp.gdn_dims();
-        let n = hp.hidden_dim as u64 * gd.num_v_heads as u64 * gd.head_dim as u64;
+        let (out, width) = (
+            hp.hidden_dim as u64,
+            gd.num_v_heads as u64 * gd.head_dim as u64,
+        );
         for (quant, exact) in [
-            (QuantScheme::Fp8E4M3, n + 4),
-            (QuantScheme::Nvfp4, n / 2 + n / 16 + 4),
+            (
+                QuantScheme::Fp8E4M3,
+                lumen_format::Fp8Planes::for_shape(out, width)
+                    .unwrap()
+                    .total_bytes(),
+            ),
+            (
+                QuantScheme::Nvfp4,
+                lumen_format::Nvfp4Planes::for_shape(out, width)
+                    .unwrap()
+                    .total_bytes(),
+            ),
         ] {
-            for length in [exact, exact - 1] {
+            let accepted = [exact, exact + 4];
+            for length in [exact, exact + 4, exact - 4, exact - 1, exact + 1, exact + 8] {
                 let bytes = rewrite(&source, Tokenizer::Absent, |index| {
                     let s = index[0].subtensors.ssm_out.as_mut().unwrap();
                     assert!(
@@ -2473,7 +2499,7 @@ mod layer_slice_tests {
                 let provider = SyncWeightProvider::open(&path).unwrap();
                 let view = provider.get_layer_raw(0).unwrap();
                 let result = upload_layer_weights(&device, &view, &hp);
-                match (length == exact, result) {
+                match (accepted.contains(&length), result) {
                     (true, Ok(_)) => {}
                     (true, Err(e)) => panic!("{quant:?} ssm_out of {length} bytes refused: {e}"),
                     (false, Ok(_)) => {
@@ -2492,7 +2518,8 @@ mod layer_slice_tests {
     }
 
     /// A planar `ssm_alpha` / `ssm_beta` is held to its geometry, `[num_v_heads, hidden]`, at upload: the
-    /// exact plane length uploads and one byte short is refused by the geometry rules. The Q8_0 GDN test
+    /// exact plane length uploads, alone or followed by its 4-byte activation scale, and any other length
+    /// around it is refused by the geometry rules. The Q8_0 GDN test
     /// model's gate slices are too short for either plane set, so the retagged slice points at `ssm_out`'s
     /// bytes, which are longer than both. Needs a CUDA device; run with
     /// `cargo test --release -p lumen-runtime --features cuda planar_gdn_gate_geometry -- --ignored`.
@@ -2511,13 +2538,24 @@ mod layer_slice_tests {
             .unwrap()
             .header
             .hyperparams;
-        let n = hp.hidden_dim as u64 * hp.gdn_dims().num_v_heads as u64;
+        let (out, width) = (hp.gdn_dims().num_v_heads as u64, hp.hidden_dim as u64);
         for name in ["ssm_alpha", "ssm_beta"] {
             for (quant, exact) in [
-                (QuantScheme::Fp8E4M3, n + 4),
-                (QuantScheme::Nvfp4, n / 2 + n / 16 + 4),
+                (
+                    QuantScheme::Fp8E4M3,
+                    lumen_format::Fp8Planes::for_shape(out, width)
+                        .unwrap()
+                        .total_bytes(),
+                ),
+                (
+                    QuantScheme::Nvfp4,
+                    lumen_format::Nvfp4Planes::for_shape(out, width)
+                        .unwrap()
+                        .total_bytes(),
+                ),
             ] {
-                for length in [exact, exact - 1] {
+                let accepted = [exact, exact + 4];
+                for length in [exact, exact + 4, exact - 4, exact - 1, exact + 1, exact + 8] {
                     let bytes = rewrite(&source, Tokenizer::Absent, |index| {
                         let subs = &mut index[0].subtensors;
                         let host = subs.ssm_out.unwrap();
@@ -2541,7 +2579,7 @@ mod layer_slice_tests {
                     let provider = SyncWeightProvider::open(&path).unwrap();
                     let view = provider.get_layer_raw(0).unwrap();
                     let result = upload_layer_weights(&device, &view, &hp);
-                    match (length == exact, result) {
+                    match (accepted.contains(&length), result) {
                         (true, Ok(_)) => {}
                         (true, Err(e)) => {
                             panic!("{quant:?} {name} of {length} bytes refused: {e}")

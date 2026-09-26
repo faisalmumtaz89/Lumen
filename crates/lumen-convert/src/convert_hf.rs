@@ -28,7 +28,7 @@
 //! [`QuantScheme::Fp8E4M3`]: lumen_format::QuantScheme::Fp8E4M3
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufWriter;
 use std::path::Path;
 
@@ -78,6 +78,10 @@ struct Importer<'a> {
     /// Every module name [`Importer::check_declared`] has been handed. The
     /// whole declaration is held against this set once the model is lowered.
     checked_modules: RefCell<BTreeSet<String>>,
+    /// Every module lowered as NVFP4 or FP8 planes, and whether its
+    /// activation scale was carried after them
+    /// ([`Importer::fetch_input_scale`]).
+    planar_modules: RefCell<BTreeMap<String, bool>>,
 }
 
 /// One lowered tensor: final LBC bytes + quant tag.
@@ -303,6 +307,52 @@ impl<'a> Importer<'a> {
         Ok(value)
     }
 
+    /// The activation scale of planar module `{base}`, `{base}.input_scale`,
+    /// when the checkpoint carries one, held to the rule of every other
+    /// scale ([`Self::fetch_scalar`]). A module without one converts as it
+    /// is: the scale is never invented. Records the module and whether it
+    /// carries the scale.
+    fn fetch_input_scale(&self, base: &str) -> Result<Option<f32>, ConvertError> {
+        let name = format!("{base}.input_scale");
+        let scale = match self.ckpt.tensor_info(&name) {
+            Some(_) => Some(self.fetch_scalar(&name)?),
+            None => None,
+        };
+        self.planar_modules
+            .borrow_mut()
+            .insert(base.to_owned(), scale.is_some());
+        Ok(scale)
+    }
+
+    /// Close the activation scales once every module is lowered: each
+    /// `.input_scale` the checkpoint carries must belong to a module lowered
+    /// as planes, which carried it. One on any other module (unquantized,
+    /// INT4, or not part of this import) would be left behind, so the first
+    /// such is refused by name. Returns how many planar modules carry their
+    /// scale, and how many planar modules there are.
+    fn check_every_input_scale_was_carried(&self) -> Result<(usize, usize), ConvertError> {
+        let planar = self.planar_modules.borrow();
+        let orphan = self
+            .ckpt
+            .tensor_names()
+            .filter_map(|name| name.strip_suffix(".input_scale").map(|base| (name, base)))
+            .filter(|(_, base)| planar.get(*base) != Some(&true))
+            .map(|(name, _)| name)
+            .min();
+        if let Some(name) = orphan {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.clone(),
+                ggml_type: "activation scale of a module this import does not lower as NVFP4 or \
+                            FP8 planes, so the artifact has no place for it"
+                    .into(),
+            });
+        }
+        Ok((
+            planar.values().filter(|&&carried| carried).count(),
+            planar.len(),
+        ))
+    }
+
     /// Refuse an E4M3 plane holding a NaN code, `S.1111.111` (0x7F or 0xFF),
     /// by name: E4M3 has no infinities, so NaN is its one non-finite value,
     /// and every weight such a code reaches would be NaN at serve time.
@@ -320,7 +370,8 @@ impl<'a> Importer<'a> {
     }
 
     /// Fetch the three NVFP4 planes of `{base}`, validated against the
-    /// logical shape `[n, k]`, every block scale finite. `None` when the
+    /// logical shape `[n, k]`, every block scale finite, and the module's
+    /// activation scale when it has one. `None` when the
     /// module is not NVFP4 — `weight_scale_2` is what distinguishes it: the
     /// FP8 modules carry a `weight_scale` too, but no second scale. A module
     /// the checkpoint declares NVFP4 whose weight is the packed U8 plane is
@@ -332,7 +383,7 @@ impl<'a> Importer<'a> {
         base: &str,
         n: usize,
         k: usize,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>, f32)>, ConvertError> {
+    ) -> Result<Option<(Vec<u8>, Vec<u8>, f32, Option<f32>)>, ConvertError> {
         let global_name = format!("{base}.weight_scale_2");
         if self.ckpt.tensor_info(&global_name).is_none() {
             let packed = self
@@ -388,13 +439,14 @@ impl<'a> Importer<'a> {
             planes.block_scale_bytes,
         )?;
         Self::check_e4m3_finite(&format!("{base}.weight_scale"), &block_scale)?;
-        Ok(Some((weight, block_scale, global)))
+        let input_scale = self.fetch_input_scale(base)?;
+        Ok(Some((weight, block_scale, global, input_scale)))
     }
 
     /// Lower an NVFP4 module: the packed nibbles, the block scales and the
-    /// global scale, concatenated in that fixed order. `row_perm` moves
-    /// whole logical rows of both planes; the global scale is per tensor and
-    /// is unaffected.
+    /// global scale, concatenated in that fixed order, then the activation
+    /// scale when the module has one. `row_perm` moves whole logical rows of
+    /// both planes; the two scales are per tensor and are unaffected.
     fn lower_nvfp4(
         &self,
         base: &str,
@@ -402,7 +454,9 @@ impl<'a> Importer<'a> {
         k: usize,
         row_perm: Option<&[usize]>,
     ) -> Result<Option<Lowered>, ConvertError> {
-        let Some((weight, block_scale, global)) = self.fetch_nvfp4_planes(base, n, k)? else {
+        let Some((weight, block_scale, global, input_scale)) =
+            self.fetch_nvfp4_planes(base, n, k)?
+        else {
             return Ok(None);
         };
         let (weight, block_scale) = match row_perm {
@@ -415,6 +469,9 @@ impl<'a> Importer<'a> {
         let mut bytes = weight;
         bytes.extend_from_slice(&block_scale);
         bytes.extend_from_slice(&global.to_le_bytes());
+        if let Some(scale) = input_scale {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
         Ok(Some(Lowered {
             bytes,
             quant: QuantScheme::Nvfp4,
@@ -422,14 +479,14 @@ impl<'a> Importer<'a> {
     }
 
     /// Fetch the two FP8 planes of `{base}`, validated against the logical
-    /// shape `[n, k]`, every weight finite. `None` when the module's weight
-    /// is not E4M3 bytes.
+    /// shape `[n, k]`, every weight finite, and the module's activation scale
+    /// when it has one. `None` when the module's weight is not E4M3 bytes.
     fn fetch_fp8_planes(
         &self,
         base: &str,
         n: usize,
         k: usize,
-    ) -> Result<Option<(Vec<u8>, f32)>, ConvertError> {
+    ) -> Result<Option<(Vec<u8>, f32, Option<f32>)>, ConvertError> {
         let wname = format!("{base}.weight");
         let Some(info) = self.ckpt.tensor_info(&wname) else {
             return Ok(None);
@@ -455,11 +512,13 @@ impl<'a> Importer<'a> {
         }
         Self::check_e4m3_finite(&wname, &weight)?;
         let scale = self.fetch_scalar(&format!("{base}.weight_scale"))?;
-        Ok(Some((weight, scale)))
+        let input_scale = self.fetch_input_scale(base)?;
+        Ok(Some((weight, scale, input_scale)))
     }
 
-    /// Lower an FP8 module: the E4M3 weight bytes then the per-tensor scale.
-    /// `row_perm` moves whole logical rows; the scale is per tensor.
+    /// Lower an FP8 module: the E4M3 weight bytes, the per-tensor scale, then
+    /// the activation scale when the module has one. `row_perm` moves whole
+    /// logical rows; the scales are per tensor.
     fn lower_fp8(
         &self,
         base: &str,
@@ -467,7 +526,7 @@ impl<'a> Importer<'a> {
         k: usize,
         row_perm: Option<&[usize]>,
     ) -> Result<Option<Lowered>, ConvertError> {
-        let Some((weight, scale)) = self.fetch_fp8_planes(base, n, k)? else {
+        let Some((weight, scale, input_scale)) = self.fetch_fp8_planes(base, n, k)? else {
             return Ok(None);
         };
         let mut bytes = match row_perm {
@@ -475,6 +534,9 @@ impl<'a> Importer<'a> {
             None => weight,
         };
         bytes.extend_from_slice(&scale.to_le_bytes());
+        if let Some(scale) = input_scale {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
         Ok(Some(Lowered {
             bytes,
             quant: QuantScheme::Fp8E4M3,
@@ -857,12 +919,17 @@ impl<'a> Importer<'a> {
             let out_base = self.name(layer, "linear_attn.out_proj");
             let lowered = {
                 let base = out_base.clone();
-                if let Some((weight, scale)) = self.fetch_fp8_planes(&base, hidden, v_rows)? {
+                if let Some((weight, scale, input_scale)) =
+                    self.fetch_fp8_planes(&base, hidden, v_rows)?
+                {
                     // The v-head reorder permutes this tensor's INPUT
                     // columns, in head-sized blocks of one byte per weight.
                     let mut bytes =
                         permute_col_blocks(&weight, v_rows, self.gdn_head_dim, &self.head_perm);
                     bytes.extend_from_slice(&scale.to_le_bytes());
+                    if let Some(scale) = input_scale {
+                        bytes.extend_from_slice(&scale.to_le_bytes());
+                    }
                     Lowered {
                         bytes,
                         quant: QuantScheme::Fp8E4M3,
@@ -1021,16 +1088,6 @@ impl<'a> Importer<'a> {
             },
         })
     }
-}
-
-/// How many activation scales the checkpoint carries. A ModelOpt export
-/// stores one `input_scale` per quantized module for a runtime that also
-/// quantizes activations; this import reads weights only, so they are
-/// counted and left behind rather than dropped in silence.
-fn activation_scale_count(ckpt: &HfCtCheckpoint) -> usize {
-    ckpt.tensor_names()
-        .filter(|name| name.ends_with(".input_scale"))
-        .count()
 }
 
 /// The first activation-smoothing vector the checkpoint carries, by name.
@@ -1196,13 +1253,6 @@ pub fn convert_hf_ct_to_lbc(
             ckpt.quant.ignore.join(", ")
         );
     }
-    let activation_scales = activation_scale_count(&ckpt);
-    if activation_scales > 0 {
-        eprintln!(
-            "  Checkpoint drops {activation_scales} input_scale tensors: \
-             activation scales the artifact does not carry"
-        );
-    }
     if let Some(name) = activation_smoothing_tensor(&ckpt) {
         return Err(ConvertError::UnsupportedTensorType {
             tensor: name.clone(),
@@ -1219,6 +1269,7 @@ pub fn convert_hf_ct_to_lbc(
         num_k_heads,
         gdn_head_dim: gdn.head_dim as usize,
         checked_modules: RefCell::new(BTreeSet::new()),
+        planar_modules: RefCell::new(BTreeMap::new()),
     };
 
     let hidden = hp.hidden_dim as usize;
@@ -1263,8 +1314,13 @@ pub fn convert_hf_ct_to_lbc(
     let final_norm = Importer::f32_le(&final_norm_vals.iter().map(|v| v + 1.0).collect::<Vec<_>>());
     let head = importer.lower_linear("lm_head", hp.vocab_size as usize, hidden, None)?;
     // The head is the last module lowered, so every module the checkpoint
-    // declares has had its chance to carry the planes it is declared with.
+    // declares has had its chance to carry the planes it is declared with,
+    // and every activation scale its chance to be carried.
     importer.check_every_declared_module_was_checked()?;
+    let (carried, planar) = importer.check_every_input_scale_was_carried()?;
+    if planar > 0 {
+        eprintln!("  Carried {carried} of {planar} input scales (one per NVFP4 or FP8 module)");
+    }
     match head.quant {
         // The schemes the format carries a global head in. Every other one
         // has no head representation, and converting it would produce an
@@ -2493,6 +2549,8 @@ mod tests {
         n: usize,
         k: usize,
         planes: PlaneSet,
+        /// The module's activation scale, when the checkpoint carries one.
+        input_scale: Option<f32>,
     }
 
     impl Module {
@@ -2507,6 +2565,7 @@ mod tests {
                     block_scale: e4m3_bytes(p.block_scale_bytes as usize, seed),
                     global: 1.5e-4 + (rng(seed) % 97) as f32 * 1e-6,
                 },
+                input_scale: None,
             }
         }
 
@@ -2520,7 +2579,13 @@ mod tests {
                     weight: e4m3_bytes(p.weight_bytes as usize, seed),
                     scale: 9.7e-4 + (rng(seed) % 89) as f32 * 1e-6,
                 },
+                input_scale: None,
             }
+        }
+
+        fn with_input_scale(mut self, scale: f32) -> Self {
+            self.input_scale = Some(scale);
+            self
         }
 
         fn source_weight(&self) -> &[u8] {
@@ -2532,7 +2597,7 @@ mod tests {
         /// The tensors this module contributes to a checkpoint shard.
         fn entries(&self) -> Vec<(String, String, Vec<u64>, Vec<u8>)> {
             let (n, k) = (self.n as u64, self.k as u64);
-            match &self.planes {
+            let mut entries = match &self.planes {
                 PlaneSet::Nvfp4 {
                     weight,
                     block_scale,
@@ -2571,13 +2636,23 @@ mod tests {
                         scale.to_le_bytes().to_vec(),
                     ),
                 ],
+            };
+            if let Some(scale) = self.input_scale {
+                entries.push((
+                    format!("{}.input_scale", self.base),
+                    "F32".into(),
+                    vec![],
+                    scale.to_le_bytes().to_vec(),
+                ));
             }
+            entries
         }
 
         /// The lowered bytes this module must produce: its planes verbatim,
-        /// in their fixed order, after `row_perm` if the role has one.
+        /// in their fixed order, after `row_perm` if the role has one, then
+        /// its activation scale if it has one.
         fn expected_bytes(&self, row_perm: Option<&[usize]>) -> Vec<u8> {
-            match &self.planes {
+            let mut out = match &self.planes {
                 PlaneSet::Nvfp4 {
                     weight,
                     block_scale,
@@ -2603,7 +2678,11 @@ mod tests {
                     out.extend_from_slice(&scale.to_le_bytes());
                     out
                 }
+            };
+            if let Some(scale) = self.input_scale {
+                out.extend_from_slice(&scale.to_le_bytes());
             }
+            out
         }
     }
 
@@ -2672,6 +2751,7 @@ mod tests {
             num_k_heads: KH,
             gdn_head_dim: GHD,
             checked_modules: RefCell::new(BTreeSet::new()),
+            planar_modules: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -2764,30 +2844,84 @@ mod tests {
     }
 
     #[test]
-    fn activation_scales_are_counted_and_left_behind() {
+    fn an_input_scale_is_carried_after_the_planes_and_an_orphan_is_refused() {
         let mut seed = 9u64;
-        let base = "model.layers.0.linear_attn.in_proj_z";
-        let modules = vec![Module::fp8(base, V_ROWS, HID, &mut seed)];
-        let extra: Vec<(String, String, Vec<u64>, Vec<u8>)> = [base, "model.layers.0.mlp.up_proj"]
-            .iter()
-            .map(|m| {
-                (
-                    format!("{m}.input_scale"),
-                    "F32".to_owned(),
-                    vec![],
-                    1.0f32.to_le_bytes().to_vec(),
-                )
-            })
-            .collect();
-        let dir = write_modelopt_checkpoint("input-scale", &modules, &extra, &[], None);
+        let z = "model.layers.0.linear_attn.in_proj_z";
+        let gate = "model.layers.0.mlp.gate_proj";
+        let modules = vec![
+            Module::fp8(z, V_ROWS, HID, &mut seed).with_input_scale(0.11),
+            Module::nvfp4(gate, INTER, HID, &mut seed).with_input_scale(1.4e-3),
+            Module::fp8("model.layers.3.self_attn.v_proj", 2 * 8, HID, &mut seed),
+        ];
+        // Activation scales for two modules that are not lowered as planes
+        // here: the GDN a projection, which is always unquantized, and an MLP
+        // projection this checkpoint does not carry.
+        let orphans: Vec<(String, String, Vec<u64>, Vec<u8>)> = [
+            "model.layers.0.linear_attn.in_proj_a",
+            "model.layers.0.mlp.up_proj",
+        ]
+        .iter()
+        .map(|m| {
+            (
+                format!("{m}.input_scale"),
+                "F32".to_owned(),
+                vec![],
+                1.0f32.to_le_bytes().to_vec(),
+            )
+        })
+        .collect();
+
+        let dir = write_modelopt_checkpoint("input-scale", &modules, &[], &[], None);
         let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
-        assert_eq!(activation_scale_count(&ckpt), 2);
-        // Counting them changes nothing about what the module lowers to.
-        let lowered = modelopt_importer(&ckpt)
-            .lower_linear(base, V_ROWS, HID, None)
-            .unwrap();
-        assert_eq!(lowered.quant, QuantScheme::Fp8E4M3);
-        assert_eq!(lowered.bytes, modules[0].expected_bytes(None));
+        let importer = modelopt_importer(&ckpt);
+        // Before the modules are lowered, their scales are not yet carried.
+        let err = importer.check_every_input_scale_was_carried().unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("{z}.input_scale")),
+            "{err}"
+        );
+        for m in &modules {
+            let lowered = importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
+            assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
+            let planes = match m.planes {
+                PlaneSet::Nvfp4 { .. } => Nvfp4Planes::for_shape(m.n as u64, m.k as u64)
+                    .unwrap()
+                    .total_bytes(),
+                PlaneSet::Fp8 { .. } => Fp8Planes::for_shape(m.n as u64, m.k as u64)
+                    .unwrap()
+                    .total_bytes(),
+            };
+            match m.input_scale {
+                Some(scale) => assert_eq!(
+                    lowered.bytes[planes as usize..],
+                    scale.to_le_bytes(),
+                    "{}: the scale follows the planes verbatim",
+                    m.base
+                ),
+                None => assert_eq!(lowered.bytes.len() as u64, planes, "{}", m.base),
+            }
+        }
+        assert_eq!(
+            importer.check_every_input_scale_was_carried().unwrap(),
+            (2, 3)
+        );
+
+        for orphan in &orphans {
+            let dir = write_modelopt_checkpoint(
+                "input-scale-orphan",
+                &modules,
+                std::slice::from_ref(orphan),
+                &[],
+                None,
+            );
+            let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+            let importer = modelopt_importer(&ckpt);
+            for m in &modules {
+                importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
+            }
+            let err = importer.check_every_input_scale_was_carried().unwrap_err();
+            assert!(err.to_string().contains(&orphan.0), "{err}");
+        }
     }
 
     #[test]
@@ -3035,6 +3169,37 @@ mod tests {
 
     #[test]
     fn modelopt_checkpoint_converts_end_to_end() {
+        convert_end_to_end(|_| false, None);
+    }
+
+    #[test]
+    fn modelopt_checkpoint_converts_end_to_end_with_every_input_scale() {
+        convert_end_to_end(|_| true, None);
+    }
+
+    #[test]
+    fn modelopt_checkpoint_converts_end_to_end_with_half_the_input_scales() {
+        // Six modules per GDN layer (layers 0-2) in the fixture's order: whole
+        // layers alternate, so each module kind that occurs in more than one
+        // layer does so both with and without its scale.
+        convert_end_to_end(|i| (i / 6) % 2 == 0, None);
+    }
+
+    #[test]
+    fn modelopt_checkpoint_with_an_orphan_input_scale_is_refused() {
+        // The GDN a projection is converted unquantized, so an activation
+        // scale for it has no place in the artifact.
+        convert_end_to_end(|_| true, Some("model.layers.1.linear_attn.in_proj_a"));
+    }
+
+    /// Convert a four-layer ModelOpt checkpoint and check every module's
+    /// slice byte for byte. Module `i` (in the fixture's order, the head last)
+    /// carries an activation scale when `with_scale(i)`; its slice must end
+    /// with that scale verbatim, and a module without one must have exactly
+    /// its planes' length. With `orphan`, the checkpoint also carries an
+    /// activation scale for that module, and the conversion must be refused
+    /// by that name, leaving no artifact.
+    fn convert_end_to_end(with_scale: fn(usize) -> bool, orphan: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let donor_path = dir.path().join("donor.gguf");
         synthetic_donor(&donor_path);
@@ -3126,6 +3291,17 @@ mod tests {
             }
         }
         modules.push(Module::nvfp4("lm_head", VOCAB, HID, &mut seed));
+        let modules: Vec<Module> = modules
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if with_scale(i) {
+                    m.with_input_scale(2.5e-2 + i as f32 * 1e-4)
+                } else {
+                    m
+                }
+            })
+            .collect();
 
         let mut cfg = crate::hf_ct::test_fixture::modelopt_config();
         cfg["text_config"] = serde_json::json!({
@@ -3133,9 +3309,29 @@ mod tests {
             "intermediate_size": INTER, "vocab_size": VOCAB,
             "rope_parameters": { "rope_theta": 10000.0 },
         });
+        if let Some(base) = orphan {
+            extra.push((
+                format!("{base}.input_scale"),
+                "F32".into(),
+                vec![],
+                0.5f32.to_le_bytes().to_vec(),
+            ));
+        }
         let hf_dir = write_modelopt_checkpoint("e2e", &modules, &extra, &[], Some(cfg));
 
         let lbc_path = dir.path().join("out.lbc");
+        if let Some(base) = orphan {
+            let err = convert_hf_ct_to_lbc(hf_dir.path(), &donor_path, &lbc_path).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("{base}.input_scale")),
+                "{err}"
+            );
+            assert!(
+                !lbc_path.exists(),
+                "a refused conversion leaves no artifact"
+            );
+            return;
+        }
         let stats = convert_hf_ct_to_lbc(hf_dir.path(), &donor_path, &lbc_path).unwrap();
         assert_eq!(stats.quant_scheme, QuantScheme::Nvfp4);
 
@@ -3231,6 +3427,13 @@ mod tests {
                     "out_proj column blocks"
                 );
                 assert_ne!(&bytes[..HID * V_ROWS], out.source_weight());
+                // After the weights: the weight scale, then the activation
+                // scale when the module has one.
+                assert_eq!(
+                    &bytes[HID * V_ROWS..],
+                    &out.expected_bytes(None)[HID * V_ROWS..],
+                    "out_proj scales"
+                );
                 fp8_slices += 3;
             }
         }
@@ -3239,9 +3442,10 @@ mod tests {
         assert_eq!(modules.len(), 12 + 13 + 1, "with the head");
     }
 
-    /// The scalar policy, exercised on both scalar kinds: a scale is refused
-    /// by name for every way it can be wrong, never clamped. The last two
-    /// cases are the declaration's own fields, refused at open time.
+    /// The scalar policy, exercised on both schemes' weight scales and on
+    /// their activation scales: a scale is refused by name for every way it
+    /// can be wrong, never clamped. The last two cases are the declaration's
+    /// own fields, refused at open time.
     #[test]
     fn scalar_rejection_matrix() {
         let bad_f32 = |v: f32| ("F32".to_owned(), vec![], v.to_le_bytes().to_vec());
@@ -3260,6 +3464,20 @@ mod tests {
                 V_ROWS,
                 HID,
                 "weight_scale",
+            ),
+            (
+                "NVFP4",
+                "model.layers.0.mlp.gate_proj",
+                INTER,
+                HID,
+                "input_scale",
+            ),
+            (
+                "FP8",
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                "input_scale",
             ),
         ] {
             let name = format!("{base}.{scalar}");
