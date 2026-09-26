@@ -688,6 +688,31 @@ pub const DEQUANT_FP8_KERNEL_SOURCE: &str = include_str!("dequant_fp8_f32.cu");
 /// (`cublaslt_check.cu`).
 pub const CUBLASLT_CHECK_KERNEL_SOURCE: &str = include_str!("cublaslt_check.cu");
 
+/// The native prefill's producer kernels, one NVRTC module built for `compute_120a` with no header:
+/// the shared conversions and quantizer cores, the norms, and the activations
+/// (`native_prefill_{common,norm,act}.cu`; see `native_prefill_kernels`).
+pub const NATIVE_PREFILL_KERNEL_SOURCE: &str = concat!(
+    include_str!("native_prefill_common.cu"),
+    include_str!("native_prefill_norm.cu"),
+    include_str!("native_prefill_act.cu")
+);
+
+/// The native prefill's GDN kernels, their own NVRTC module built for `compute_120a` with no header:
+/// the shared conversions, then the conv1d and the chunked delta rule (`native_prefill_gdn.cu`; see
+/// `native_prefill_gdn`).
+pub const NATIVE_PREFILL_GDN_KERNEL_SOURCE: &str = concat!(
+    include_str!("native_prefill_common.cu"),
+    include_str!("native_prefill_gdn.cu")
+);
+
+/// The native prefill's attention kernels, one NVRTC module built for `compute_120a` with no header:
+/// the shared conversions, then the RoPE table, query/key norm and RoPE, KV staging and causal
+/// attention (`native_prefill_{common,attn}.cu`; see `native_prefill_attn`).
+pub const NATIVE_PREFILL_ATTN_KERNEL_SOURCE: &str = concat!(
+    include_str!("native_prefill_common.cu"),
+    include_str!("native_prefill_attn.cu")
+);
+
 /// NVFP4 decode matvec, its residual-on-store form and the fused FFN gate+up+SwiGLU, one warp per row: lane
 /// `l` owns groups l, l+32, ... in ascending order, each 16-weight group is fetched with two `uchar4` and four
 /// `float4` loads, and its E2M1 values are built from the code bits. All three walk a row identically, so the

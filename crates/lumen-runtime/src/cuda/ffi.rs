@@ -135,6 +135,16 @@ impl CudaDevice {
         Ok(dp4a_arch_for(major * 10 + minor, &supported))
     }
 
+    /// The NVRTC target of the native prefill's kernel group on this device
+    /// ([`fp4_native_arch_for`]), `Ok(None)` when the device or the loaded
+    /// NVRTC cannot build it, `Err` when a query fails.
+    pub fn fp4_native_arch(&self) -> Result<Option<&'static str>, RuntimeError> {
+        let cc = self.compute_capability()?;
+        let nvrtc = nvrtc_version()?;
+        let supported = nvrtc_supported_archs()?;
+        Ok(fp4_native_arch_for(cc, nvrtc, &supported))
+    }
+
     /// Compile CUDA source targeting a specific SM architecture.
     ///
     /// Used for kernels requiring specific hardware features (e.g., tensor cores
@@ -597,6 +607,19 @@ pub(crate) fn dp4a_arch_for(cc: i32, supported: &[i32]) -> Option<&'static str> 
     candidates.into_iter().find_map(arch_name)
 }
 
+/// The native prefill group's NVRTC target: `compute_120a` on a compute
+/// capability 12.0 device when NVRTC is 12.8 or newer and lists target 120,
+/// otherwise none. The FP4 conversion the group uses exists only on the
+/// architecture-specific target, which the generic `compute_120` PTX cannot
+/// express.
+pub(crate) fn fp4_native_arch_for(
+    cc: (i32, i32),
+    nvrtc: (i32, i32),
+    supported: &[i32],
+) -> Option<&'static str> {
+    (cc == (12, 0) && nvrtc >= (12, 8) && supported.contains(&120)).then_some("compute_120a")
+}
+
 fn arch_name(arch: i32) -> Option<&'static str> {
     Some(match arch {
         61 => "compute_61",
@@ -874,5 +897,47 @@ mod dp4a_arch_tests {
         assert_eq!(dp4a_arch_for(52, &[50, 52, 53, 60]), None);
         assert_eq!(dp4a_arch_for(60, NVRTC_12_2), None);
         assert_eq!(dp4a_arch_for(120, &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod fp4_native_arch_tests {
+    use super::fp4_native_arch_for;
+
+    const NVRTC_12_2: &[i32] = &[50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90];
+    const NVRTC_12_8: &[i32] = &[
+        50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90, 100, 101, 120,
+    ];
+    const NVRTC_13_1: &[i32] = &[75, 80, 86, 87, 88, 89, 90, 100, 103, 110, 120, 121];
+
+    #[test]
+    fn only_a_12_0_device_with_nvrtc_12_8_or_newer_gets_compute_120a() {
+        let toolkits = [
+            ((12, 2), NVRTC_12_2),
+            ((12, 8), NVRTC_12_8),
+            ((13, 1), NVRTC_13_1),
+        ];
+        let devices = [(8, 9), (10, 0), (12, 0), (12, 1)];
+        // Rows: NVRTC 12.2, 12.8, 13.1; columns: cc 8.9, 10.0, 12.0, 12.1.
+        let want = [
+            [None, None, None, None],
+            [None, None, Some("compute_120a"), None],
+            [None, None, Some("compute_120a"), None],
+        ];
+        for (row, (nvrtc, supported)) in toolkits.into_iter().enumerate() {
+            for (col, cc) in devices.into_iter().enumerate() {
+                assert_eq!(
+                    fp4_native_arch_for(cc, nvrtc, supported),
+                    want[row][col],
+                    "NVRTC {nvrtc:?}, cc {cc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_enough_nvrtc_that_does_not_list_target_120_gets_nothing() {
+        assert_eq!(fp4_native_arch_for((12, 0), (12, 8), &[80, 90, 100]), None);
+        assert_eq!(fp4_native_arch_for((12, 0), (12, 7), NVRTC_13_1), None);
     }
 }

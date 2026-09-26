@@ -28,6 +28,10 @@ test-fault-injection = []
 # the last hidden row, the step counter) out and back in, so two builds can be
 # decoded from one frozen state. Used by `cuda_state_snapshot_test`.
 test-state-snapshot = ["cuda"]
+# Test-only feature: `cuda::native_prefill_dump`, named tensors of the native
+# prefill copied to the host at layer boundaries, for the layer oracle of
+# `cuda_native_prefill_test`.
+test-prefill-dump = ["cuda"]
 
 [dependencies]
 lumen-format.workspace = true
