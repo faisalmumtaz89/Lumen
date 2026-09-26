@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **An empty `/v1/completions` prompt is refused** with a 400. After an earlier request it
   was served, continuing from what that request had left loaded; on a fresh server it
   failed with an error.
+- The CUDA RMSNorm, used by every model, keeps each thread's first eight values in
+  registers between its two passes instead of reading them again for the store; its
+  output is bit-identical.
 
 ## [0.33.0] — 2026-09-25
 
