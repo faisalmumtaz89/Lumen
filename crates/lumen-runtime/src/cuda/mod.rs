@@ -19,6 +19,10 @@
 
 pub(crate) mod attention_decode;
 mod backend_impl;
+/// Runtime-loaded cuBLASLt for the native NVFP4/FP8 prefill's GEMMs.
+pub mod cublaslt;
+/// Measured, verified cuBLASLt algorithm selection, cached per library identity.
+pub mod cublaslt_algo_cache;
 pub(crate) mod decode;
 /// CUDA device wrapper (context, stream, buffer management).
 pub mod ffi;
@@ -27,6 +31,14 @@ pub(crate) mod gpu_buffers;
 pub(crate) mod kv_cache;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
+/// The native NVFP4/FP8 prefill route's structural admission. This module and the next two are
+/// components the forward pass does not reach yet; they are public for the GPU suites
+/// (`tests/cuda_native_gemm_test.rs`).
+pub mod native_prefill;
+/// The native prefill's GEMM plan table.
+pub mod native_prefill_gemm;
+/// The native prefill's weight views.
+pub mod native_prefill_weights;
 pub(crate) mod prefill;
 pub(crate) mod prefill_attention;
 pub(crate) mod profiler;

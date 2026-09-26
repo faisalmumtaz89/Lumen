@@ -683,6 +683,11 @@ pub const DEQUANT_NVFP4_KERNEL_SOURCE: &str = include_str!("dequant_nvfp4_f32.cu
 /// FP8 E4M3 plane -> f32 decode with a per-tensor F32 scale, for the prefill dequant scratch.
 pub const DEQUANT_FP8_KERNEL_SOURCE: &str = include_str!("dequant_fp8_f32.cu");
 
+/// Verification and timing helpers for the native prefill's cuBLASLt plans: an element-wise bound
+/// check of a BF16 GEMM output against F32 references, an absolute-value pass, and a spin kernel
+/// (`cublaslt_check.cu`).
+pub const CUBLASLT_CHECK_KERNEL_SOURCE: &str = include_str!("cublaslt_check.cu");
+
 /// NVFP4 decode matvec, its residual-on-store form and the fused FFN gate+up+SwiGLU, one warp per row: lane
 /// `l` owns groups l, l+32, ... in ascending order, each 16-weight group is fetched with two `uchar4` and four
 /// `float4` loads, and its E2M1 values are built from the code bits. All three walk a row identically, so the

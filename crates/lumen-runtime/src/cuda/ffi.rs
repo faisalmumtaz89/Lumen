@@ -525,7 +525,7 @@ struct PtxCacheKeyEnv {
 /// Part of the PTX cache key: a toolkit upgrade that changes the NVRTC version
 /// must invalidate cached PTX (the new NVRTC may emit different PTX for the
 /// same source). Returns an error if the call fails.
-fn nvrtc_version() -> Result<(i32, i32), RuntimeError> {
+pub(crate) fn nvrtc_version() -> Result<(i32, i32), RuntimeError> {
     let mut major: std::ffi::c_int = 0;
     let mut minor: std::ffi::c_int = 0;
     // SAFETY: out-pointers are valid for the duration of the call; cudarc's
@@ -537,6 +537,15 @@ fn nvrtc_version() -> Result<(i32, i32), RuntimeError> {
         )));
     }
     Ok((major as i32, minor as i32))
+}
+
+/// Path of the NVRTC library cudarc loaded, found from the address of its resolved `nvrtcVersion`.
+/// `None` when the loader cannot name the object.
+pub(crate) fn nvrtc_library_path() -> Option<String> {
+    // SAFETY: `culib` resolves libnvrtc as every NVRTC call here does; only the function's address
+    // is taken, it is not called.
+    let version_fn = unsafe { cudarc::nvrtc::sys::culib() }.nvrtcVersion;
+    super::cublaslt::object_path(version_fn as *const std::ffi::c_void)
 }
 
 /// The compute capabilities the loaded NVRTC can target (`nvrtcGetSupportedArchs`,
@@ -615,7 +624,7 @@ fn arch_name(arch: i32) -> Option<&'static str> {
 /// Part of the PTX cache key: a driver upgrade changes how PTX JITs to SASS,
 /// mirroring the driver compute cache's own invalidation. Returns an error if
 /// the call fails.
-fn driver_version() -> Result<i32, RuntimeError> {
+pub(crate) fn driver_version() -> Result<i32, RuntimeError> {
     let mut version: std::ffi::c_int = 0;
     // SAFETY: out-pointer is valid for the duration of the call.
     let res = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) };

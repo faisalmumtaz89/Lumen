@@ -315,6 +315,7 @@ startup allowlist (so they never false-warn) but have **no effect on the
 | Variable | Default | Effect (test harness) |
 |---|---|---|
 | `LUMEN_KQUANT_LBC` | unset → an `--ignored` run fails, naming the variable | Path to a K-quant `.lbc` (a generic-target `Q4_K_M` / `Q5_K_M` conversion) for the `#[ignore]`d `kquant_cuda_serve` smoke. |
+| `LUMEN_NATIVE_MODEL` | unset → an `--ignored` run fails, naming the variable | Path to an NVFP4/FP8 `.lbc` converted with its activation scales, for the `#[ignore]`d native prefill tests that read the real artifact. |
 | `LUMEN_STATE_MODEL` / `LUMEN_STATE_CASES` / `LUMEN_STATE_DIR` / `LUMEN_STATE_OUT` / `LUMEN_STATE_REPS` | unset → each tool fails, naming a variable it needs (`LUMEN_STATE_REPS` defaults to 5) | The model, the cases file (`capture_state_fixtures`), the state directory, the results file (`decode_state_fixtures`) and the repetition count of `cuda_state_snapshot_test`'s `#[ignore]`d `capture_state_fixtures` / `decode_state_fixtures` tools (see the file's real-model fixtures comment). |
 | `LUMEN_QWEN35_9B_PATH` | unset → test skips | Path to a Qwen3.5-9B `.lbc` for KV-resume + CLI matrix tests. |
 | `LUMEN_QWEN35_9B_Q8` | unset → test skips | Q8_0 9B `.lbc` fixture for CLI + soak tests. |

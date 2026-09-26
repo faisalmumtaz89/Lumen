@@ -18,6 +18,10 @@ cuda = ["dep:cudarc"]
 # also reachable from in-tree `#[test]` functions without the feature
 # being enabled at the workspace level; production builds without the
 # feature have zero overhead from the inject path.
+# The same feature exposes `cuda::cublaslt::fault`: a numbered construction
+# step of the native prefill's cuBLASLt plans made to fail once, and a count
+# of live cuBLASLt objects, used by `cuda_native_gemm_test` to show that a
+# failure at any step leaves nothing behind.
 test-fault-injection = []
 # Test-only feature: `CudaBackend::snapshot_state` / `restore_state` copy the
 # state a decode continues from (KV rows, GDN state, conv rings and positions,

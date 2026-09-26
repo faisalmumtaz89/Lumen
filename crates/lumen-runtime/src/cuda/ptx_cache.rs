@@ -87,9 +87,8 @@ pub(crate) fn cache_enabled() -> bool {
     }
 }
 
-/// Resolve the PTX cache directory: `$LUMEN_CACHE_DIR/ptx` (or, absent that
-/// override, `$XDG_CACHE_HOME`/`~/.cache/lumen/ptx`). Mirrors the cli
-/// `cache_dir()` priority without taking a dependency on the cli crate.
+/// Resolve the PTX cache directory: `$LUMEN_CUDA_PTX_CACHE_DIR`, else
+/// [`lumen_cache_dir`]`("ptx")`.
 fn ptx_cache_dir() -> Option<PathBuf> {
     // Explicit per-process override for the whole cache path (debugging).
     if let Ok(v) = std::env::var("LUMEN_CUDA_PTX_CACHE_DIR") {
@@ -97,18 +96,25 @@ fn ptx_cache_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(v));
         }
     }
+    lumen_cache_dir("ptx")
+}
+
+/// Resolve a subdirectory of Lumen's cache: `$LUMEN_CACHE_DIR/<sub>` (or, absent
+/// that override, `$XDG_CACHE_HOME`/`~/.cache/lumen/<sub>`). Mirrors the cli
+/// `cache_dir()` priority without taking a dependency on the cli crate.
+pub(crate) fn lumen_cache_dir(sub: &str) -> Option<PathBuf> {
     if let Ok(v) = std::env::var("LUMEN_CACHE_DIR") {
         if !v.is_empty() {
-            return Some(PathBuf::from(v).join("ptx"));
+            return Some(PathBuf::from(v).join(sub));
         }
     }
     if let Ok(v) = std::env::var("XDG_CACHE_HOME") {
         if !v.is_empty() {
-            return Some(PathBuf::from(v).join("lumen").join("ptx"));
+            return Some(PathBuf::from(v).join("lumen").join(sub));
         }
     }
     if let Ok(home) = std::env::var("HOME") {
-        return Some(PathBuf::from(home).join(".cache").join("lumen").join("ptx"));
+        return Some(PathBuf::from(home).join(".cache").join("lumen").join(sub));
     }
     None
 }
@@ -204,29 +210,40 @@ pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
     if let Some(reject) = key.reject_path() {
         let _ = std::fs::remove_file(reject);
     }
-    // Unique temp name per (pid, key) so two concurrent first-launches writing
-    // the *same* kernel don't clobber each other's temp file mid-write; the
+    write_atomically(&path, &serialize_entry(ptx));
+}
+
+/// Write `bytes` to `path` through a temp file and a rename, so a reader sees
+/// either the old file or the complete new one. Best-effort: `false` (and no
+/// temp file left behind) when any step fails.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    // Unique temp name per (pid, file) so two concurrent first-launches writing
+    // the *same* entry don't clobber each other's temp file mid-write; the
     // final rename is atomic so whichever lands last wins with a complete file.
-    let tmp = dir.join(format!(".{}.{}.tmp", key.digest_hex(), std::process::id()));
-    let entry = serialize_entry(ptx);
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     {
         let Ok(mut f) = std::fs::File::create(&tmp) else {
-            return;
+            return false;
         };
-        if f.write_all(&entry).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
         // Flush to the OS so the rename publishes a complete file.
-        if f.flush().is_err() {
+        if f.write_all(bytes).is_err() || f.flush().is_err() {
             let _ = std::fs::remove_file(&tmp);
-            return;
+            return false;
         }
     }
     // Atomic publish. If rename fails (e.g. cross-device), drop the temp.
-    if std::fs::rename(&tmp, &path).is_err() {
+    if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    true
 }
 
 /// Record that the host driver *rejected* this key's PTX at `cuModuleLoadData`
@@ -262,21 +279,9 @@ pub(crate) fn mark_driver_reject(key: &CacheKey) {
     if let Some(ptx_path) = key.cache_path() {
         let _ = std::fs::remove_file(&ptx_path);
     }
-    let tmp = dir.join(format!(".{}.{}.rtmp", key.digest_hex(), std::process::id()));
-    {
-        let Ok(mut f) = std::fs::File::create(&tmp) else {
-            return;
-        };
-        // Content is irrelevant -- existence is the signal -- but a magic byte
-        // makes the file self-describing if a human inspects the cache dir.
-        if f.write_all(CACHE_MAGIC).is_err() || f.flush().is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // Content is irrelevant -- existence is the signal -- but a magic byte
+    // makes the file self-describing if a human inspects the cache dir.
+    write_atomically(&path, CACHE_MAGIC);
 }
 
 /// Whether this key was previously recorded as driver-rejected (see
@@ -521,6 +526,13 @@ impl Sha256 {
         self.state[6] = self.state[6].wrapping_add(g);
         self.state[7] = self.state[7].wrapping_add(h);
     }
+}
+
+/// Hex SHA-256 of `data`.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    hex(&h.finalize())
 }
 
 fn hex(bytes: &[u8]) -> String {
