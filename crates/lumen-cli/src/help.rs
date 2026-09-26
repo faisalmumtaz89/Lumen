@@ -11,7 +11,8 @@ COMMANDS:
     pull                  Download and convert a model from the registry
     models                List cached and available models
     convert               Convert a GGUF model (or import an HF compressed-tensors
-                          checkpoint via --from-hf) to LBC format
+                          INT4 or ModelOpt NVFP4/FP8 checkpoint via --from-hf)
+                          to LBC format
     generate-test-model   Generate a synthetic model (LBC file)
     bench                 Run benchmarks (I/O, throughput, cold/warm)
     purge                 Evict a model file from the OS page cache
@@ -189,7 +190,12 @@ ENVIRONMENT VARIABLES (CUDA backend):
                           `0` (OFF) is bit-exact. Set `=50` as an empirical
                           mitigation for decode non-determinism observed under
                           heavy MoE Q4 server concurrency (not a root-caused
-                          fix). Cost <=1% TPOT."
+                          fix). Cost <=1% TPOT.
+    LUMEN_CUDA_NVFP4=0
+                          Refuse an NVFP4/FP8 artifact (an imported ModelOpt
+                          checkpoint) at load, naming the scheme. By default the
+                          CUDA NVFP4/FP8 kernels serve it; no other backend
+                          serves those planes."
     );
 }
 
@@ -253,9 +259,16 @@ OPTIONS:
                                   ssm_out needs this target's own header, so
                                   --requant / --dequantize drop it).
                          Default: metal on macOS, generic elsewhere.
-    --from-hf <dir>      Import a Hugging Face compressed-tensors checkpoint
-                         directory (pack-quantized INT4 group-32, indexed
-                         sharded safetensors; dense qwen35-family models).
+    --from-hf <dir>      Import a Hugging Face checkpoint directory: a
+                         compressed-tensors pack-quantized INT4 group-32
+                         checkpoint, or an NVIDIA ModelOpt mixed-precision
+                         checkpoint whose attention and MLP projections and
+                         GDN in_proj_qkv/in_proj_z are each NVFP4, FP8 or
+                         BF16, with the GDN output projection FP8 or BF16
+                         and the output head NVFP4 or BF16; the embedding
+                         must be BF16 and the GDN in_proj_a/in_proj_b
+                         unquantized (indexed sharded safetensors; dense
+                         qwen35-family models).
                          --input then names a donor GGUF of the same model,
                          used only for tokenizer and hyperparameter metadata;
                          all tensor data comes from the checkpoint. CUDA

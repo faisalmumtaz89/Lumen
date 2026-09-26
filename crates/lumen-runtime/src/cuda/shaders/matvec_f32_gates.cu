@@ -22,6 +22,32 @@ __device__ __forceinline__ float gates_warp_reduce(float v) {
     return v;
 }
 
+// One row's dot product by one CTA of GATES_THREADS threads; the total is valid in thread 0. Every thread of
+// the block must call it (it synchronizes the block). Shared by the banked kernel and the fused GDN
+// input-projection kernel, so both compute a gate row with the same reduction tree.
+__device__ __forceinline__ float gates_row_dot(
+    const float* __restrict__ w,   // [in_dim], one row
+    const float* __restrict__ x,   // [in_dim]
+    unsigned int in_dim,
+    float* warp_partial)           // [GATES_THREADS / 32], shared
+{
+    float acc = 0.0f;
+    for (unsigned int i = threadIdx.x; i < in_dim; i += GATES_THREADS) {
+        acc = fmaf(w[i], x[i], acc);
+    }
+    acc = gates_warp_reduce(acc);
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    if (lane == 0) warp_partial[warp] = acc;
+    __syncthreads();
+    float total = 0.0f;
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int w2 = 0; w2 < GATES_THREADS / 32; w2++) total += warp_partial[w2];
+    }
+    return total;
+}
+
 extern "C" __global__ __launch_bounds__(GATES_THREADS, 4)
 void matvec_f32_gates_banked(
     const float* __restrict__ w_alpha, // [out_dim, in_dim] row-major F32
@@ -38,20 +64,8 @@ void matvec_f32_gates_banked(
     if (row >= out_dim) return;
 
     const float* w = (is_beta ? w_beta : w_alpha) + (unsigned long long)row * in_dim;
-
-    float acc = 0.0f;
-    for (unsigned int i = threadIdx.x; i < in_dim; i += GATES_THREADS) {
-        acc = fmaf(w[i], x[i], acc);
-    }
-    acc = gates_warp_reduce(acc);
-    const unsigned int lane = threadIdx.x & 31u;
-    const unsigned int warp = threadIdx.x >> 5;
-    if (lane == 0) warp_partial[warp] = acc;
-    __syncthreads();
+    const float total = gates_row_dot(w, x, in_dim, warp_partial);
     if (threadIdx.x == 0) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int w2 = 0; w2 < GATES_THREADS / 32; w2++) total += warp_partial[w2];
         (is_beta ? out_beta : out_alpha)[row] = total;
     }
 }

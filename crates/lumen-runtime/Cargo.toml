@@ -63,5 +63,8 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = "1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

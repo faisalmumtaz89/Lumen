@@ -532,6 +532,114 @@ pub fn validate_layer_quants(
     Ok(())
 }
 
+/// Which backend is about to serve, as far as admission is concerned.
+///
+/// The caller states the backend it will use rather than the predicate guessing: the CLI resolves it from
+/// its flags and automatic default, the server from `--backend`, and the bench runs on the CPU only. `Cpu`
+/// covers every non-GPU path (SIMD and naive), which is what a no-CUDA build falls back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingBackend {
+    /// The CUDA backend, with its kernels compiled in and enabled by the kill switch.
+    Cuda,
+    /// Metal, which has no kernel for these schemes.
+    Metal,
+    /// SIMD or naive CPU, which read f32 and have no kernel for these schemes.
+    Cpu,
+}
+
+/// Whether a scheme has no serving kernels ON `backend`: the artifact can carry it and the reader can
+/// parse it, but `backend` cannot compute with it. The binaries refuse such an artifact at admission,
+/// before a weight provider opens, so the failure names the scheme instead of surfacing as a missing
+/// kernel or a misread plane much later.
+///
+/// NVFP4 and FP8 E4M3 are the only such schemes: their matvecs exist on CUDA only, and are used only
+/// while the kill switch leaves them on. Every other scheme passes this rule on every backend; CtInt4G32,
+/// whose kernels are also CUDA-only, is refused by the binaries' own check after admission.
+pub fn scheme_has_no_serving_kernels(quant: QuantScheme, backend: ServingBackend) -> bool {
+    // The kill switch is read from the process-wide flag, not from the environment: each binary that
+    // admits for CUDA (the CLI and the server) publishes `LUMEN_CUDA_NVFP4` into it first. The server's
+    // `planar_scheme_admission` test fails if it stops doing so; the CLI's needs a CUDA device and runs
+    // with `--ignored`. Tests here set it directly with
+    // `set_cuda_planar_kernels_enabled` to exercise the kill-switch refusal.
+    matches!(quant, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3)
+        && (backend != ServingBackend::Cuda || !cuda_planar_kernels_enabled())
+}
+
+/// Whether the CUDA planar kernels are on for admission purposes.
+///
+/// `lumen-format` is a dependency OF `lumen-runtime`, so it cannot read the runtime's env cache; the
+/// switch is mirrored here as a process-wide flag that the CLI and the server set from `LUMEN_CUDA_NVFP4`
+/// (through `runtime_defaults::publish_cuda_nvfp4_admission`) before admission, and that tests set directly. Default ON, matching the runtime's polarity (`LUMEN_CUDA_NVFP4=0` = off).
+pub fn cuda_planar_kernels_enabled() -> bool {
+    CUDA_PLANAR_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the admission-time view of the CUDA planar kill switch.
+pub fn set_cuda_planar_kernels_enabled(on: bool) {
+    CUDA_PLANAR_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static CUDA_PLANAR_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// The first unservable scheme an artifact carries, from its header and
+/// index alone — the primary descriptor, the three globals and every layer
+/// slice ([`LbcFile::uses_quant`](crate::reader::LbcFile::uses_quant)).
+pub fn unservable_scheme(
+    lbc: &crate::reader::LbcFile,
+    backend: ServingBackend,
+) -> Option<QuantScheme> {
+    [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3]
+        .into_iter()
+        .find(|&quant| lbc.uses_quant(quant) && scheme_has_no_serving_kernels(quant, backend))
+}
+
+/// The refusal the binaries print for a scheme `backend` cannot serve, written once so they cannot
+/// diverge. On CUDA the only reason is the kill switch, so the message names it.
+pub fn no_serving_kernels_message(quant: QuantScheme, backend: ServingBackend) -> String {
+    if backend == ServingBackend::Cuda && !cuda_planar_kernels_enabled() {
+        format!("this model ({quant:?}) needs the CUDA kernels for this scheme, which LUMEN_CUDA_NVFP4=0 disables")
+    } else {
+        format!("this model ({quant:?}) is served on CUDA only; the {backend:?} backend has no kernels for this scheme")
+    }
+}
+
+/// How one matrix's planes are sized for a planar scheme, or `None` for a
+/// scheme with a fixed per-row layout. The returned function gives the exact
+/// slice length of an `[out_dim, in_dim]` matrix, and `None` for a width with
+/// no valid geometry (NVFP4: `in_dim` not a multiple of its 16-element group;
+/// FP8: `in_dim` not a multiple of 4).
+///
+/// Exhaustive on the scheme: a new one must say which kind it is here, or it
+/// silently gets neither rule.
+fn planar_slice_len_fn(quant: QuantScheme) -> Option<fn(u64, u64) -> Option<u64>> {
+    match quant {
+        QuantScheme::Nvfp4 => Some(|n, k| {
+            crate::Nvfp4Planes::for_shape(n, k)
+                .ok()
+                .map(|p| p.total_bytes())
+        }),
+        QuantScheme::Fp8E4M3 => Some(|n, k| {
+            crate::Fp8Planes::for_shape(n, k)
+                .ok()
+                .map(|p| p.total_bytes())
+        }),
+        QuantScheme::F32
+        | QuantScheme::F16
+        | QuantScheme::Bf16
+        | QuantScheme::Q8_0
+        | QuantScheme::Q4_0
+        | QuantScheme::Q4_1
+        | QuantScheme::Q4_K
+        | QuantScheme::Q5_0
+        | QuantScheme::Q5_K
+        | QuantScheme::Q6_K
+        | QuantScheme::Q2_K
+        | QuantScheme::Q3_K
+        | QuantScheme::CtInt4G32 => None,
+    }
+}
+
 /// Enforce projection geometry for every fixed-layout scheme: the launchers
 /// derive row counts from hyperparams, so a slice whose byte length decodes
 /// to any other row count is read at the wrong geometry — in-bounds, silent
@@ -543,12 +651,51 @@ pub fn validate_layer_quants(
 /// this path verbatim under `--target cuda`/generic — the Q8_0 upcast is
 /// Metal-target-only) are covered here; CtInt4G32 is enforced in
 /// `upload_projection_tensor`'s ct4 branch.
+///
+/// The planar branch below is reached from the CUDA upload path, the only
+/// backend that admits the planar schemes.
 pub fn validate_projection_geometry(
     name: &str,
     slice: &crate::index::TensorSlice,
     in_dim: usize,
     allowed_out: &[usize],
 ) -> Result<(), String> {
+    // A planar scheme has no per-row layout — the slice holds one matrix's
+    // concatenated planes — so the block table below cannot describe it and
+    // would leave `row_bytes` None, skipping the length check entirely.
+    // Both halves of the rule still apply: the width must be one the planes
+    // support, and the length must be exactly what one allowed out_dim
+    // plans.
+    if let Some(slice_len) = planar_slice_len_fn(slice.quant) {
+        if in_dim == 0 {
+            return Err(format!("{name} role has in_dim 0 (malformed hyperparams)."));
+        }
+        if slice_len(1, in_dim as u64).is_none() {
+            return Err(format!(
+                "{name} is {:?} but in_dim {in_dim} is not a row width its \
+                 planes support (Nvfp4: a multiple of 16; Fp8E4M3: a \
+                 multiple of 4) (malformed hyperparams).",
+                slice.quant
+            ));
+        }
+        if slice.length > 0 {
+            let expected: Vec<u64> = allowed_out
+                .iter()
+                .filter_map(|&out| slice_len(out as u64, in_dim as u64))
+                .collect();
+            if !expected.contains(&slice.length) {
+                return Err(format!(
+                    "{name} is {} bytes ({:?}, in_dim {in_dim}) but this role \
+                     requires out_dim in {allowed_out:?}, whose planes are \
+                     {expected:?} bytes. The kernels derive dimensions from \
+                     hyperparams, so this tensor would be read at the wrong \
+                     geometry. Re-convert with `lumen convert`.",
+                    slice.length, slice.quant
+                ));
+            }
+        }
+        return Ok(());
+    }
     // (block elements, block bytes) per fixed-layout scheme. A width that
     // does not divide into whole blocks is malformed row geometry — the
     // kernels truncate to in_dim/block blocks per row — so it must FAIL,
@@ -566,7 +713,11 @@ pub fn validate_projection_geometry(
         QuantScheme::Q4_K => Some((256, 144)),
         QuantScheme::Q5_K => Some((256, 176)),
         QuantScheme::Q6_K => Some((256, 210)),
-        _ => None,
+        // No fixed row layout: CtInt4G32's geometry is enforced in
+        // `upload_projection_tensor`'s ct4 branch, and the planar schemes
+        // returned above. Exhaustive so a new scheme must be classified
+        // here rather than skipping the length check below.
+        QuantScheme::CtInt4G32 | QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3 => None,
     };
     let row_bytes = match block {
         Some((elems, bytes)) => {
@@ -651,6 +802,7 @@ pub fn validate_output_head_row_alignment(
     let row_block_elems = match quant {
         QuantScheme::Q8_0 | QuantScheme::Q4_0 => Some(32usize),
         QuantScheme::Q6_K => Some(256usize),
+        QuantScheme::Nvfp4 => Some(16usize),
         _ => None,
     };
     if let Some(elems) = row_block_elems {
@@ -1096,6 +1248,85 @@ mod tests {
         }
     }
 
+    /// A one-layer file built by hand: a primary that serves, one layer
+    /// slice and a head whose schemes the caller picks. `lumen convert`
+    /// writes no such artifact — a planar module anywhere makes the primary
+    /// planar — so this is where the scan past the header is exercised.
+    fn hand_built_lbc(
+        primary: QuantScheme,
+        w_gate: QuantScheme,
+        head: QuantScheme,
+    ) -> crate::reader::LbcFile {
+        let hyperparams = crate::hyperparams::ModelHyperparams {
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            hidden_dim: 8,
+            intermediate_dim: 16,
+            vocab_size: 32,
+            max_seq_len: 64,
+            rope_params: None,
+            num_experts: None,
+            num_active_experts: None,
+            norm_eps: 1e-5,
+            rotary_dim: None,
+            rope_neox: false,
+            gdn: None,
+        };
+        let mut header = crate::header::LbcHeader::new(
+            hyperparams,
+            crate::quantization::QuantizationDescriptor {
+                scheme: primary,
+                group_size: crate::quantization::QuantGroupSize::Group(32),
+                block_byte_size: 18,
+                scale_offset_in_block: None,
+            },
+        );
+        header.output_proj.quant = head;
+        let mut subtensors = layer(Some(0));
+        subtensors.w_gate = sl(18, w_gate);
+        crate::reader::LbcFile {
+            header,
+            layer_indices: vec![crate::index::LayerIndex {
+                layer_offset_bytes: 0,
+                layer_length_bytes: 18,
+                subtensors,
+            }],
+            path: std::path::PathBuf::from("hand-built.lbc"),
+            tokenizer: None,
+        }
+    }
+
+    #[test]
+    fn a_planar_slice_or_head_under_a_servable_primary_is_named() {
+        // The header alone says nothing: Q4_0 and CtInt4G32 both serve, and
+        // a reader that stopped there would read the planar bytes as the
+        // scheme the header named.
+        for primary in [QuantScheme::Q4_0, QuantScheme::CtInt4G32] {
+            let servable = hand_built_lbc(primary, primary, QuantScheme::F16);
+            assert_eq!(
+                unservable_scheme(&servable, ServingBackend::Cpu),
+                None,
+                "{primary:?}: control"
+            );
+
+            let slice = hand_built_lbc(primary, QuantScheme::Fp8E4M3, QuantScheme::F16);
+            assert_eq!(
+                unservable_scheme(&slice, ServingBackend::Cpu),
+                Some(QuantScheme::Fp8E4M3),
+                "{primary:?}: one layer slice"
+            );
+
+            let head = hand_built_lbc(primary, primary, QuantScheme::Nvfp4);
+            assert_eq!(
+                unservable_scheme(&head, ServingBackend::Cpu),
+                Some(QuantScheme::Nvfp4),
+                "{primary:?}: the head"
+            );
+        }
+    }
+
     #[test]
     fn attn_vector_extents_pin_every_field_and_exempt_gdn() {
         let (head_dim, q_dim, kv_dim) = (4usize, 8usize, 2usize);
@@ -1197,6 +1428,15 @@ mod tests {
     }
 
     #[test]
+    fn output_head_rejects_an_nvfp4_row_that_splits_a_scale_group() {
+        // Each NVFP4 row carries one E4M3 scale per 16 elements, so a width
+        // of 24 leaves the second group of every row half filled.
+        let err = validate_output_head_row_alignment(QuantScheme::Nvfp4, 24).unwrap_err();
+        assert!(err.contains("16-element"), "{err}");
+        assert!(validate_output_head_row_alignment(QuantScheme::Nvfp4, 32).is_ok());
+    }
+
+    #[test]
     fn kquant_global_rejects_a_partial_final_superblock() {
         // 257 rows of 128: 32,896 elements — 128 whole superblocks plus a
         // 128-element tail, which GGUF stores in `div_ceil` = 129 superblocks
@@ -1253,5 +1493,132 @@ mod tests {
             err.starts_with("expert 1: down is Q4_0 but expert 0's is Q8_0"),
             "{err}"
         );
+    }
+
+    /// Representative planar shapes by role: FFN matrices and a
+    /// vocabulary-sized head (NVFP4), GDN in/out projections and attention
+    /// projections (FP8). `(quant, in_dim, out_dim, bytes)`.
+    const PLANAR_SHAPES: [(QuantScheme, usize, usize, u64); 8] = [
+        (QuantScheme::Nvfp4, 5120, 17408, 50_135_044),
+        (QuantScheme::Nvfp4, 17408, 5120, 50_135_044),
+        (QuantScheme::Nvfp4, 5120, 248_320, 715_161_604),
+        (QuantScheme::Fp8E4M3, 5120, 10240, 52_428_804),
+        (QuantScheme::Fp8E4M3, 5120, 6144, 31_457_284),
+        (QuantScheme::Fp8E4M3, 6144, 5120, 31_457_284),
+        (QuantScheme::Fp8E4M3, 5120, 12288, 62_914_564),
+        (QuantScheme::Fp8E4M3, 5120, 1024, 5_242_884),
+    ];
+
+    #[test]
+    fn planar_projection_geometry_accepts_every_source_shape() {
+        for (quant, in_dim, out_dim, bytes) in PLANAR_SHAPES {
+            validate_projection_geometry("wq", &sl(bytes, quant), in_dim, &[out_dim])
+                .unwrap_or_else(|e| panic!("{quant:?} [{out_dim}, {in_dim}] rejected: {e}"));
+            // Also accepted when the role allows several out_dims.
+            assert!(
+                validate_projection_geometry("wq", &sl(bytes, quant), in_dim, &[7, out_dim])
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn planar_projection_geometry_rejects_corrupted_slices() {
+        // The four ways a planar slice can be the wrong geometry: one byte
+        // short, one byte long, a length that decodes to a DIFFERENT
+        // out_dim, and a truncated plane set.
+        let (nvfp4, fp8) = (QuantScheme::Nvfp4, QuantScheme::Fp8E4M3);
+        for (quant, in_dim, out_dim, bad) in [
+            (nvfp4, 5120usize, 248_320usize, 715_161_603u64),
+            (nvfp4, 5120, 248_320, 715_161_605),
+            (nvfp4, 5120, 248_320, 50_135_044),
+            (fp8, 5120, 10240, 52_428_804 / 2),
+        ] {
+            let err =
+                validate_projection_geometry("output_proj", &sl(bad, quant), in_dim, &[out_dim])
+                    .unwrap_err();
+            assert!(
+                err.contains(&bad.to_string()) && err.contains("out_dim"),
+                "{quant:?} {bad} bytes not refused by size: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_projection_geometry_checks_the_slice_length() {
+        // The fixed-row block table has no entry for a planar scheme, and its
+        // length check runs only when a row width was derived, so without the
+        // planar rule every length would pass. A byte count that is no valid
+        // geometry must fail for both schemes.
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            assert!(
+                validate_projection_geometry("w_gate", &sl(1, quant), 5120, &[17408]).is_err(),
+                "{quant:?}: a 1-byte projection slice still passes"
+            );
+        }
+        // The absence sentinel still passes, as it does for every scheme.
+        assert!(
+            validate_projection_geometry("wo", &sl(0, QuantScheme::Nvfp4), 5120, &[5120]).is_ok()
+        );
+    }
+
+    #[test]
+    fn planar_projection_row_width_rejects_a_misaligned_in_dim() {
+        // NVFP4 groups 16 weights along k, so a width that is not a whole
+        // number of groups has no valid geometry at all — the converter
+        // must not plan one. FP8 has no group, but its kernels read a row
+        // four bytes at a time, so its width must be a multiple of 4.
+        let err = validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 24).unwrap_err();
+        assert!(err.contains("24"), "{err}");
+        assert!(validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 128).is_ok());
+        assert!(validate_projection_row_width("ssm_out", QuantScheme::Fp8E4M3, 24).is_ok());
+        let err = validate_projection_row_width("ssm_out", QuantScheme::Fp8E4M3, 7).unwrap_err();
+        assert!(err.contains("in_dim 7"), "{err}");
+        let err = validate_projection_row_width("ssm_out", QuantScheme::Nvfp4, 0).unwrap_err();
+        assert!(err.contains("in_dim 0"), "{err}");
+    }
+
+    #[test]
+    fn no_serving_kernels_is_exactly_the_two_planar_schemes() {
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            // On the CPU (and on Metal) they need a kernel that does not exist; the CUDA view is checked
+            // in `tests/planar_serving_admission.rs`, which owns the backend matrix.
+            assert!(
+                scheme_has_no_serving_kernels(quant, ServingBackend::Cpu),
+                "{quant:?}"
+            );
+        }
+        // Every other scheme passes this rule: it must not refuse anything
+        // that already serves. (CtInt4G32 is CUDA-only too, but the binaries
+        // refuse it by their own check after admission.)
+        for quant in [
+            QuantScheme::F32,
+            QuantScheme::F16,
+            QuantScheme::Bf16,
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+            QuantScheme::Q4_1,
+            QuantScheme::Q4_K,
+            QuantScheme::Q5_0,
+            QuantScheme::Q5_K,
+            QuantScheme::Q6_K,
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+            QuantScheme::CtInt4G32,
+        ] {
+            assert!(
+                !scheme_has_no_serving_kernels(quant, ServingBackend::Cpu),
+                "{quant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_scheme() {
+        for quant in [QuantScheme::Nvfp4, QuantScheme::Fp8E4M3] {
+            let message = no_serving_kernels_message(quant, ServingBackend::Cpu);
+            assert!(message.contains(&format!("{quant:?}")), "{message}");
+            assert!(message.contains("is served on CUDA only"), "{message}");
+        }
     }
 }

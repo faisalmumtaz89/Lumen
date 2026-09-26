@@ -21,7 +21,7 @@
 //! A(cublas)=W, lda=in_dim, B(cublas)=A, ldb=in_dim, C(cublas)=C, ldc=out_dim
 
 use cudarc::cublas::{sys as cublas_sys, Gemm, GemmConfig};
-use cudarc::driver::{CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 
 use crate::error::RuntimeError;
 
@@ -289,6 +289,94 @@ pub(crate) fn attn_score_block_elems(
     let rows_max = batch.min(ATTN_PREFILL_SGEMM_ROWS);
     let kv_total = pos_start.checked_add(batch)?;
     group.checked_mul(rows_max)?.checked_mul(kv_total)
+}
+
+/// Decode a planar plane into the f32 dequant scratch (`dequant_nvfp4_to_f32` / `dequant_fp8_to_f32`).
+///
+/// The kernels take the plane and the element count, deriving every internal offset from n — including the
+/// F32 scale at the plane's tail — so nothing else is passed. The NVFP4 kernel writes four elements per
+/// thread and the FP8 kernel one, so the grid covers `n / 4` or `n` threads accordingly.
+///
+/// # Safety
+///
+/// `plane` must hold `n_elements` values of `quant`'s scheme (its planes, then the F32 scale), decoded
+/// by `func`, and `out` must have `n_elements` elements.
+unsafe fn launch_dequant_plane_to_f32(
+    device: &CudaDevice,
+    func: &CudaFunction,
+    quant: QuantScheme,
+    plane: &CudaSlice<u8>,
+    out: &mut CudaSlice<f32>,
+    n_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let block = 256u32;
+    let n_u32 = n_elements as u32;
+    let threads = match quant {
+        QuantScheme::Nvfp4 => n_u32 / 4,
+        _ => n_u32,
+    };
+    let grid = threads.div_ceil(block);
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = device.stream.launch_builder(func);
+    b.arg(plane).arg(out).arg(&n_u32);
+    b.launch(cfg)
+        .map_err(|e| RuntimeError::Compute(format!("{label} planar prefill dequant: {e}")))?;
+    Ok(())
+}
+
+/// Decode a planar (NVFP4 or FP8) weight of `num_elements` into the f32 dequant scratch, the operand the
+/// prefill SGEMM reads in place of a resident F16 image. Refuses by name when the scheme's decode kernel
+/// is not loaded or the scratch is too small.
+///
+/// # Safety
+///
+/// A planar `weight` must hold `num_elements` values of its scheme.
+unsafe fn dequant_planar_into_scratch(
+    device: &CudaDevice,
+    kernels: &KernelSet,
+    weight: &GpuWeightBuf,
+    dequant_scratch: &mut CudaSlice<f32>,
+    num_elements: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    let (quant, plane, decode) = match weight {
+        GpuWeightBuf::Nvfp4Raw(plane) => (
+            QuantScheme::Nvfp4,
+            plane,
+            kernels.planar.nvfp4_prefill.as_ref(),
+        ),
+        GpuWeightBuf::Fp8Raw(plane) => (
+            QuantScheme::Fp8E4M3,
+            plane,
+            kernels.planar.fp8_prefill.as_ref(),
+        ),
+        _ => unreachable!("only a planar weight is decoded into the dequant scratch"),
+    };
+    let decode = decode.ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "{quant:?} {label}: prefill decode kernel is not loaded, so prefill cannot serve it"
+        ))
+    })?;
+    if dequant_scratch.len() < num_elements {
+        return Err(RuntimeError::Compute(format!(
+            "sgemm {label}: dequant scratch too small: have {} elements, need {num_elements}",
+            dequant_scratch.len(),
+        )));
+    }
+    launch_dequant_plane_to_f32(
+        device,
+        decode,
+        quant,
+        plane,
+        dequant_scratch,
+        num_elements,
+        label,
+    )
 }
 
 /// One line, once per process, when the score block cannot be allocated. The
@@ -648,6 +736,39 @@ pub(crate) unsafe fn launch_gemm_projection(
     }
 
     match weight {
+        // The planar schemes prefill through the shared F32 SGEMM: decode the plane into the dequant
+        // scratch, run the GEMM, discard the scratch. No resident F16 image, because an F16 copy takes
+        // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
+        // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
+        GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            dequant_planar_into_scratch(
+                device,
+                kernels,
+                weight,
+                dequant_scratch,
+                out_dim * in_dim,
+                label,
+            )?;
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: out_dim as i32,
+                n: batch as i32,
+                k: in_dim as i32,
+                alpha: 1.0f32,
+                lda: in_dim as i32,
+                ldb: in_dim as i32,
+                beta: 0.0f32,
+                ldc: out_dim as i32,
+            };
+            device
+                .blas
+                .gemm(cfg, &*dequant_scratch, input, output)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("cuBLAS SGEMM (planar dequant) {label}: {e}"))
+                })?;
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -1336,6 +1457,45 @@ pub(crate) unsafe fn launch_gemm_residual(
     }
 
     match weight {
+        // The planar schemes prefill through the shared F32 SGEMM: decode the plane into the dequant
+        // scratch, run the GEMM, discard the scratch. No resident F16 image, because an F16 copy takes
+        // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
+        // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
+        GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            dequant_planar_into_scratch(
+                device,
+                kernels,
+                weight,
+                dequant_scratch,
+                out_dim * in_dim,
+                label,
+            )?;
+            // Copy residual -> output so SGEMM can accumulate with beta=1.0. Without this the caller
+            // gets `W*x` where it asked for `W*x + y`: this function's contract, and every other arm
+            // here, adds the residual.
+            device.stream.memcpy_dtod(residual, output).map_err(|e| {
+                RuntimeError::Compute(format!("dtod residual copy (planar dequant) {label}: {e}"))
+            })?;
+            let cfg = GemmConfig {
+                transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: out_dim as i32,
+                n: batch as i32,
+                k: in_dim as i32,
+                alpha: 1.0f32,
+                lda: in_dim as i32,
+                ldb: in_dim as i32,
+                beta: 1.0f32,
+                ldc: out_dim as i32,
+            };
+            device
+                .blas
+                .gemm(cfg, &*dequant_scratch, input, output)
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("cuBLAS SGEMM (planar dequant) {label}: {e}"))
+                })?;
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let weight_needed = out_dim * in_dim;
             if w_f32.len() < weight_needed {
@@ -2610,10 +2770,12 @@ unsafe fn launch_matvec_slice(
         GpuWeightBuf::Ct4Raw(_)
         | GpuWeightBuf::Q4KRaw(_)
         | GpuWeightBuf::Q5KRaw(_)
-        | GpuWeightBuf::Q6KRaw(_) => {
+        | GpuWeightBuf::Q6KRaw(_)
+        | GpuWeightBuf::Nvfp4Raw(_)
+        | GpuWeightBuf::Fp8Raw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec_slice {label}: CtInt4G32 and K-quant planes are served by the prefill \
-                 HGEMM path, not the per-row fallback"
+                "matvec_slice {label}: CtInt4G32, K-quant, NVFP4 and FP8 planes are served by the \
+                 prefill GEMM paths, not the per-row fallback"
             )));
         }
         GpuWeightBuf::F16Raw(w_f16) => {
@@ -3203,10 +3365,12 @@ unsafe fn launch_matvec_residual_slice(
         GpuWeightBuf::Ct4Raw(_)
         | GpuWeightBuf::Q4KRaw(_)
         | GpuWeightBuf::Q5KRaw(_)
-        | GpuWeightBuf::Q6KRaw(_) => {
+        | GpuWeightBuf::Q6KRaw(_)
+        | GpuWeightBuf::Nvfp4Raw(_)
+        | GpuWeightBuf::Fp8Raw(_) => {
             return Err(RuntimeError::Compute(format!(
-                "matvec_res {label}: CtInt4G32 and K-quant planes are served by the prefill \
-                 HGEMM path, not the per-row fallback"
+                "matvec_res {label}: CtInt4G32, K-quant, NVFP4 and FP8 planes are served by the \
+                 prefill GEMM paths, not the per-row fallback"
             )));
         }
         GpuWeightBuf::Q8Aligned(w_q8a) => {
@@ -3673,4 +3837,143 @@ pub(crate) unsafe fn launch_kv_widen_f16<'a>(
         v: &out.1,
         seq_stride: count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumen_format::planar_dequant::{dequantize_fp8, dequantize_nvfp4};
+
+    /// The production planar prefill launchers on NVFP4 and FP8 planes of many groups:
+    /// `dequant_planar_into_scratch` (through `launch_dequant_plane_to_f32`) decodes each plane bit for bit
+    /// as the host decoder does, and the planar branch of `launch_gemm_residual` returns `W*x + residual`
+    /// within the prefill accuracy bound (`rel_l2 <= 1e-4`) of an f64 host reference. The shape leaves a
+    /// partial last thread block. Needs a CUDA device; run with
+    /// `cargo test --release -p lumen-runtime --features cuda planar_prefill_launchers -- --ignored`.
+    #[test]
+    #[ignore = "needs a CUDA device; run with --ignored"]
+    fn planar_prefill_launchers_match_the_host_reference() {
+        let device = CudaDevice::new(0).expect("this test needs a CUDA device");
+        let spec = super::super::attention_decode::DecodeAttentionSpec::for_shape(2, 2, 128)
+            .expect("a test shape inside the kernel's domain");
+        let kernels =
+            super::super::decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32, spec)
+                .expect("kernels compile");
+        // 1632 NVFP4 groups; 6528 decode threads for NVFP4, not a multiple of the 256-thread block.
+        let (out_dim, in_dim) = (96usize, 272usize);
+        let n = out_dim * in_dim;
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        // Any E4M3 code but the two NaNs.
+        let finite_e4m3 = |b: u8| if b == 0x7F || b == 0xFF { 0x38 } else { b };
+
+        let packed: Vec<u8> = (0..n / 2).map(|_| next()).collect();
+        let block_scales: Vec<u8> = (0..n / 16).map(|_| finite_e4m3(next())).collect();
+        let nvfp4_global = 3.5e-4f32;
+        let mut nvfp4_plane = packed.clone();
+        nvfp4_plane.extend_from_slice(&block_scales);
+        nvfp4_plane.extend_from_slice(&nvfp4_global.to_le_bytes());
+
+        let fp8_weights: Vec<u8> = (0..n).map(|_| finite_e4m3(next())).collect();
+        let fp8_scale = 3.3e-3f32;
+        let mut fp8_plane = fp8_weights.clone();
+        fp8_plane.extend_from_slice(&fp8_scale.to_le_bytes());
+
+        let cases = [
+            (
+                "nvfp4",
+                GpuWeightBuf::Nvfp4Raw(device.htod_copy(&nvfp4_plane).unwrap()),
+                dequantize_nvfp4(&packed, &block_scales, nvfp4_global).expect("host decode"),
+            ),
+            (
+                "fp8",
+                GpuWeightBuf::Fp8Raw(device.htod_copy(&fp8_plane).unwrap()),
+                dequantize_fp8(&fp8_weights, fp8_scale),
+            ),
+        ];
+        for (tag, weight, w) in &cases {
+            let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
+            unsafe {
+                dequant_planar_into_scratch(&device, &kernels, weight, &mut scratch, n, tag)
+                    .unwrap();
+            }
+            let decoded = device.dtoh_copy(&scratch).unwrap();
+            if let Some(i) = (0..n).find(|&i| decoded[i].to_bits() != w[i].to_bits()) {
+                panic!(
+                    "{tag}: element {i}: device {:#010x} vs host {:#010x}",
+                    decoded[i].to_bits(),
+                    w[i].to_bits()
+                );
+            }
+
+            for batch in [1usize, 33] {
+                let x: Vec<f32> = (0..batch * in_dim)
+                    .map(|k| (k % 211) as f32 * 0.004 - 0.42)
+                    .collect();
+                let residual: Vec<f32> = (0..batch * out_dim)
+                    .map(|k| (k % 13) as f32 * 0.5 - 3.0)
+                    .collect();
+                let x_gpu = device.htod_copy(&x).unwrap();
+                let residual_gpu = device.htod_copy(&residual).unwrap();
+                let mut out = device.alloc_zeros::<f32>(batch * out_dim).unwrap();
+                let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
+                // The F16 operands belong to the other arms; the planar arm does not touch them.
+                let mut activation_f16 = device.alloc_zeros::<u8>(1).unwrap();
+                let mut dequant_f16 = device.alloc_zeros::<u8>(1).unwrap();
+                unsafe {
+                    launch_gemm_residual(
+                        &device,
+                        &kernels,
+                        weight,
+                        None,
+                        &x_gpu,
+                        &residual_gpu,
+                        &mut out,
+                        &mut scratch,
+                        &mut activation_f16,
+                        &mut dequant_f16,
+                        batch,
+                        out_dim,
+                        in_dim,
+                        tag,
+                    )
+                    .unwrap();
+                }
+                let got = device.dtoh_copy(&out).unwrap();
+
+                // out[b, r] = residual[b, r] + sum_k W[r, k] * x[b, k], in f64.
+                let mut want = vec![0.0f64; batch * out_dim];
+                let mut wx_sq = 0.0f64;
+                for b in 0..batch {
+                    for r in 0..out_dim {
+                        let dot: f64 = (0..in_dim)
+                            .map(|k| w[r * in_dim + k] as f64 * x[b * in_dim + k] as f64)
+                            .sum();
+                        wx_sq += dot * dot;
+                        want[b * out_dim + r] = residual[b * out_dim + r] as f64 + dot;
+                    }
+                }
+                let want_sq: f64 = want.iter().map(|v| v * v).sum();
+                let err_sq: f64 = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, v)| (*g as f64 - v).powi(2))
+                    .sum();
+                let rel_l2 = (err_sq / want_sq).sqrt();
+                // The residual is O(1) by construction; W*x must be large enough too, so that dropping
+                // either term moves the result far past the bound.
+                assert!(
+                    (wx_sq / want_sq).sqrt() > 1e-2,
+                    "{tag} batch {batch}: W*x is too small against the residual to be checked"
+                );
+                assert!(
+                    rel_l2 <= 1e-4,
+                    "{tag} batch {batch}: rel_l2 {rel_l2:e} > 1e-4"
+                );
+            }
+        }
+    }
 }

@@ -1,6 +1,7 @@
 //! HF checkpoint import: compressed-tensors pack-quantized INT4 g32 (the
-//! [`QuantScheme::CtInt4G32`] dialect) → LBC, for dense Qwen3.5-family GDN
-//! models.
+//! [`QuantScheme::CtInt4G32`] dialect) and NVIDIA ModelOpt NVFP4 / FP8
+//! ([`QuantScheme::Nvfp4`], [`QuantScheme::Fp8E4M3`]) → LBC, for dense
+//! Qwen3.5-family GDN models.
 //!
 //! The HF checkpoint supplies ALL tensor data. A donor GGUF of the same
 //! model supplies only tokenizer + hyperparameter metadata (the checkpoint
@@ -23,13 +24,19 @@
 //! conventions (norms/SSM scalars/alpha/beta as F32, projections as Bf16).
 //!
 //! [`QuantScheme::CtInt4G32`]: lumen_format::QuantScheme::CtInt4G32
+//! [`QuantScheme::Nvfp4`]: lumen_format::QuantScheme::Nvfp4
+//! [`QuantScheme::Fp8E4M3`]: lumen_format::QuantScheme::Fp8E4M3
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::io::BufWriter;
 use std::path::Path;
 
 use crate::arch::qwen35_moe::is_qwen35moe_full_attention_layer;
 use crate::convert::{tmp_artifact_path, ConvertError, ConvertStats, TmpGuard};
-use crate::ct_planes::{permute_k_blocks, permute_rows, permute_zero_point_rows};
+use crate::ct_planes::{
+    permute_col_blocks, permute_k_blocks, permute_rows, permute_zero_point_rows,
+};
 use crate::dequant::convert_bf16_bytes_to_f32;
 use crate::gguf::GgufFile;
 use crate::hf_ct::{HfCtCheckpoint, HfDtype};
@@ -39,7 +46,7 @@ use lumen_format::index::{LayerIndex, SubtensorOffsets, TensorSlice};
 use lumen_format::streaming_writer::{LayerShape, StreamingLbcWriter};
 use lumen_format::tokenizer::TokenizerSection;
 use lumen_format::writer::GlobalTensors;
-use lumen_format::{CtInt4G32Planes, LbcHeader, QuantScheme};
+use lumen_format::{CtInt4G32Planes, Fp8Planes, LbcHeader, Nvfp4Planes, QuantScheme};
 
 /// GDN v-head reorder: output head `i` takes HF head `ratio*(i % groups) + i/groups`.
 fn v_head_perm(num_v_heads: usize, num_k_heads: usize) -> Vec<usize> {
@@ -68,6 +75,9 @@ struct Importer<'a> {
     num_v_heads: usize,
     num_k_heads: usize,
     gdn_head_dim: usize,
+    /// Every module name [`Importer::check_declared`] has been handed. The
+    /// whole declaration is held against this set once the model is lowered.
+    checked_modules: RefCell<BTreeSet<String>>,
 }
 
 /// One lowered tensor: final LBC bytes + quant tag.
@@ -116,6 +126,38 @@ impl<'a> Importer<'a> {
             .collect())
     }
 
+    /// The refusal for a module that carries NVFP4 planes — the packed U8
+    /// weight beside its block scale — but was not lowered as NVFP4, naming
+    /// what the checkpoint declares for it and what it carries. `None` when
+    /// the module carries no NVFP4 planes.
+    fn unlowered_nvfp4_refusal(&self, base: &str) -> Option<ConvertError> {
+        let packed = self
+            .ckpt
+            .tensor_info(&format!("{base}.weight"))
+            .is_some_and(|info| info.dtype == HfDtype::U8);
+        if !packed
+            || self
+                .ckpt
+                .tensor_info(&format!("{base}.weight_scale"))
+                .is_none()
+        {
+            return None;
+        }
+        let declared = match self.ckpt.quant.declared.get(base) {
+            Some(scheme) => format!("{scheme:?}"),
+            None => "no algorithm for this module".to_owned(),
+        };
+        let global_name = format!("{base}.weight_scale_2");
+        let missing_global = if self.ckpt.tensor_info(&global_name).is_some() {
+            String::new()
+        } else {
+            format!(" without {global_name}")
+        };
+        Some(ConvertError::UnsupportedArchitecture(format!(
+            "{base}: the checkpoint declares {declared} but carries Nvfp4 tensors{missing_global}"
+        )))
+    }
+
     /// Fetch the three CtInt4G32 planes of `{base}.weight_packed/…`,
     /// validated against the logical shape.
     fn fetch_planes(
@@ -124,6 +166,9 @@ impl<'a> Importer<'a> {
     ) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, usize, usize)>, ConvertError> {
         let packed_name = format!("{base}.weight_packed");
         if self.ckpt.tensor_info(&packed_name).is_none() {
+            if let Some(refusal) = self.unlowered_nvfp4_refusal(base) {
+                return Err(refusal);
+            }
             // No packed representation: the sibling planes must be absent
             // too, or the checkpoint is inconsistent (orphan planes would be
             // silently ignored otherwise).
@@ -222,9 +267,305 @@ impl<'a> Importer<'a> {
         Ok(Some((qweight, scale, zero, n, k)))
     }
 
-    /// Lower a Linear-module weight: CtInt4G32 planes when quantized, Bf16
-    /// bytes otherwise. `row_perm` (logical output rows) is applied to
-    /// either representation.
+    /// Read a per-tensor F32 scalar plane: exactly one value, four bytes,
+    /// whatever shape the producer gave it (`[]` and `[1]` both occur), and
+    /// finite and strictly positive.
+    fn fetch_scalar(&self, name: &str) -> Result<f32, ConvertError> {
+        let info = self
+            .ckpt
+            .tensor_info(name)
+            .ok_or_else(|| ConvertError::MissingTensor(name.to_owned()))?;
+        let elements: u64 = info.shape.iter().product();
+        if info.dtype != HfDtype::F32 || elements != 1 {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_owned(),
+                ggml_type: format!("{:?} {:?} (expected one F32 value)", info.dtype, info.shape),
+            });
+        }
+        let bytes = self.ckpt.tensor_bytes(name)?;
+        if bytes.len() != 4 {
+            return Err(ConvertError::TensorShapeMismatch {
+                tensor: name.to_owned(),
+                expected: "4 bytes".into(),
+                got: format!("{} bytes", bytes.len()),
+            });
+        }
+        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // Refused by name, never clamped: a scale is what every weight of the
+        // tensor is multiplied by, so a non-finite or non-positive one makes
+        // the whole tensor meaningless.
+        if !value.is_finite() || value <= 0.0 {
+            return Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_owned(),
+                ggml_type: format!("scale {value:e} (need finite and > 0)"),
+            });
+        }
+        Ok(value)
+    }
+
+    /// Refuse an E4M3 plane holding a NaN code, `S.1111.111` (0x7F or 0xFF),
+    /// by name: E4M3 has no infinities, so NaN is its one non-finite value,
+    /// and every weight such a code reaches would be NaN at serve time.
+    fn check_e4m3_finite(name: &str, codes: &[u8]) -> Result<(), ConvertError> {
+        match codes.iter().position(|&c| c & 0x7F == 0x7F) {
+            Some(at) => Err(ConvertError::UnsupportedTensorType {
+                tensor: name.to_owned(),
+                ggml_type: format!(
+                    "E4M3 NaN code {:#04x} at element {at} (need finite values)",
+                    codes[at]
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Fetch the three NVFP4 planes of `{base}`, validated against the
+    /// logical shape `[n, k]`, every block scale finite. `None` when the
+    /// module is not NVFP4 — `weight_scale_2` is what distinguishes it: the
+    /// FP8 modules carry a `weight_scale` too, but no second scale. A module
+    /// the checkpoint declares NVFP4 whose weight is the packed U8 plane is
+    /// NVFP4 by both accounts, so there the missing global scale is refused
+    /// by name; any other weight is left to the declaration check, which
+    /// names both schemes.
+    fn fetch_nvfp4_planes(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>, f32)>, ConvertError> {
+        let global_name = format!("{base}.weight_scale_2");
+        if self.ckpt.tensor_info(&global_name).is_none() {
+            let packed = self
+                .ckpt
+                .tensor_info(&format!("{base}.weight"))
+                .is_some_and(|info| info.dtype == HfDtype::U8);
+            if packed && self.ckpt.quant.declared.get(base) == Some(&QuantScheme::Nvfp4) {
+                return Err(ConvertError::MissingTensor(global_name));
+            }
+            return Ok(None);
+        }
+        let global = self.fetch_scalar(&global_name)?;
+        let planes = Nvfp4Planes::for_shape(n as u64, k as u64).map_err(ConvertError::Format)?;
+        let expect_plane = |suffix: &str,
+                            dtype: HfDtype,
+                            shape: [u64; 2],
+                            want: u64|
+         -> Result<Vec<u8>, ConvertError> {
+            let pname = format!("{base}.{suffix}");
+            let info = self
+                .ckpt
+                .tensor_info(&pname)
+                .ok_or_else(|| ConvertError::MissingTensor(pname.clone()))?;
+            if info.dtype != dtype || info.shape != shape {
+                return Err(ConvertError::UnsupportedTensorType {
+                    tensor: pname,
+                    ggml_type: format!(
+                        "{:?} {:?} (expected {dtype:?} {shape:?})",
+                        info.dtype, info.shape
+                    ),
+                });
+            }
+            let bytes = self.ckpt.tensor_bytes(&pname)?;
+            if bytes.len() as u64 != want {
+                return Err(ConvertError::TensorShapeMismatch {
+                    tensor: pname,
+                    expected: format!("{want} bytes for [{n}, {k}]"),
+                    got: format!("{} bytes", bytes.len()),
+                });
+            }
+            Ok(bytes)
+        };
+        let weight = expect_plane(
+            "weight",
+            HfDtype::U8,
+            [n as u64, k as u64 / 2],
+            planes.weight_bytes,
+        )?;
+        let block_scale = expect_plane(
+            "weight_scale",
+            HfDtype::F8E4M3,
+            [n as u64, k as u64 / 16],
+            planes.block_scale_bytes,
+        )?;
+        Self::check_e4m3_finite(&format!("{base}.weight_scale"), &block_scale)?;
+        Ok(Some((weight, block_scale, global)))
+    }
+
+    /// Lower an NVFP4 module: the packed nibbles, the block scales and the
+    /// global scale, concatenated in that fixed order. `row_perm` moves
+    /// whole logical rows of both planes; the global scale is per tensor and
+    /// is unaffected.
+    fn lower_nvfp4(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Option<Lowered>, ConvertError> {
+        let Some((weight, block_scale, global)) = self.fetch_nvfp4_planes(base, n, k)? else {
+            return Ok(None);
+        };
+        let (weight, block_scale) = match row_perm {
+            Some(perm) => (
+                permute_rows(&weight, k / 2, perm),
+                permute_rows(&block_scale, k / 16, perm),
+            ),
+            None => (weight, block_scale),
+        };
+        let mut bytes = weight;
+        bytes.extend_from_slice(&block_scale);
+        bytes.extend_from_slice(&global.to_le_bytes());
+        Ok(Some(Lowered {
+            bytes,
+            quant: QuantScheme::Nvfp4,
+        }))
+    }
+
+    /// Fetch the two FP8 planes of `{base}`, validated against the logical
+    /// shape `[n, k]`, every weight finite. `None` when the module's weight
+    /// is not E4M3 bytes.
+    fn fetch_fp8_planes(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<Option<(Vec<u8>, f32)>, ConvertError> {
+        let wname = format!("{base}.weight");
+        let Some(info) = self.ckpt.tensor_info(&wname) else {
+            return Ok(None);
+        };
+        if info.dtype != HfDtype::F8E4M3 {
+            return Ok(None);
+        }
+        if info.shape != [n as u64, k as u64] {
+            return Err(ConvertError::TensorShapeMismatch {
+                tensor: wname,
+                expected: format!("[{n}, {k}]"),
+                got: format!("{:?}", info.shape),
+            });
+        }
+        let planes = Fp8Planes::for_shape(n as u64, k as u64).map_err(ConvertError::Format)?;
+        let weight = self.ckpt.tensor_bytes(&wname)?;
+        if weight.len() as u64 != planes.weight_bytes {
+            return Err(ConvertError::TensorShapeMismatch {
+                tensor: wname,
+                expected: format!("{} bytes for [{n}, {k}]", planes.weight_bytes),
+                got: format!("{} bytes", weight.len()),
+            });
+        }
+        Self::check_e4m3_finite(&wname, &weight)?;
+        let scale = self.fetch_scalar(&format!("{base}.weight_scale"))?;
+        Ok(Some((weight, scale)))
+    }
+
+    /// Lower an FP8 module: the E4M3 weight bytes then the per-tensor scale.
+    /// `row_perm` moves whole logical rows; the scale is per tensor.
+    fn lower_fp8(
+        &self,
+        base: &str,
+        n: usize,
+        k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Option<Lowered>, ConvertError> {
+        let Some((weight, scale)) = self.fetch_fp8_planes(base, n, k)? else {
+            return Ok(None);
+        };
+        let mut bytes = match row_perm {
+            Some(perm) => permute_rows(&weight, k, perm),
+            None => weight,
+        };
+        bytes.extend_from_slice(&scale.to_le_bytes());
+        Ok(Some(Lowered {
+            bytes,
+            quant: QuantScheme::Fp8E4M3,
+        }))
+    }
+
+    /// Hold a lowered module to what the checkpoint declares for it, in the
+    /// dialect that declares each module by name: a module exported as one
+    /// scheme but declared as another is refused by name, and so is one that
+    /// carries planes the declaration does not mention — which one is the
+    /// truth decides how every weight of the module is read. The
+    /// compressed-tensors dialect declares one config group for every
+    /// `Linear` outside its `ignore` list instead of a scheme per module, so
+    /// its per-module declaration is empty, neither half has anything to
+    /// compare against there, and every module passes.
+    ///
+    /// Every module whose weight is fetched as planes passes here, the ones
+    /// [`Self::lower_linear`] fetches and the one lowered in place. The name
+    /// is recorded so [`Self::check_every_declared_module_was_checked`] can
+    /// hold the other half of the declaration — the modules it names that
+    /// never carried planes at all — to the same rule.
+    fn check_declared(&self, base: &str, lowered: Lowered) -> Result<Lowered, ConvertError> {
+        self.checked_modules.borrow_mut().insert(base.to_owned());
+        match self.ckpt.quant.declared.get(base) {
+            Some(&declared) if lowered.quant != declared => {
+                Err(ConvertError::UnsupportedArchitecture(format!(
+                    "{base}: the checkpoint declares {declared:?} but carries {:?} tensors",
+                    lowered.quant
+                )))
+            }
+            // Bf16 is the one unquantized form a module lowers to, and an
+            // unquantized module is not one the declaration covers.
+            None if self.ckpt.quant.declares_every_module && lowered.quant != QuantScheme::Bf16 => {
+                Err(ConvertError::UnsupportedArchitecture(format!(
+                    "{base}: the checkpoint declares no algorithm for this module \
+                     but carries {:?} tensors",
+                    lowered.quant
+                )))
+            }
+            _ => Ok(lowered),
+        }
+    }
+
+    /// Close the declaration once every module is lowered: the set of
+    /// declared modules must be exactly the set that carried planes. A
+    /// module the declaration names but that no plane fetch ever saw was
+    /// either lowered somewhere else — unquantized, as an embedding or as
+    /// one of the F32 GDN projections — so the declaration and the shard
+    /// disagree about it, or is not part of the model this import builds
+    /// (a multi-token-prediction layer, say), so whatever it carries would
+    /// be left behind. The refusal says whether the module carries the planes it is
+    /// declared with.
+    fn check_every_declared_module_was_checked(&self) -> Result<(), ConvertError> {
+        let checked = self.checked_modules.borrow();
+        let mut declared: Vec<_> = self
+            .ckpt
+            .quant
+            .declared
+            .iter()
+            .filter(|(base, _)| !checked.contains(base.as_str()))
+            .collect();
+        declared.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let Some(&(base, &scheme)) = declared.first() else {
+            return Ok(());
+        };
+        // The weight plane's dtype names the scheme: packed U8 nibbles or
+        // E4M3 bytes.
+        let planar_weight = if scheme == QuantScheme::Nvfp4 {
+            HfDtype::U8
+        } else {
+            HfDtype::F8E4M3
+        };
+        let weight_matches = self
+            .ckpt
+            .tensor_info(&format!("{base}.weight"))
+            .is_some_and(|info| info.dtype == planar_weight);
+        Err(ConvertError::UnsupportedArchitecture(if weight_matches {
+            format!(
+                "{base}: the checkpoint declares {scheme:?} and the module's weight is \
+                 {scheme:?}, but this import does not convert that module"
+            )
+        } else {
+            format!(
+                "{base}: the checkpoint declares {scheme:?} but the module carries \
+                 no {scheme:?} tensors"
+            )
+        }))
+    }
+
+    /// Lower a Linear-module weight and hold it to the checkpoint's
+    /// declaration for that module.
     fn lower_linear(
         &self,
         base: &str,
@@ -232,6 +573,26 @@ impl<'a> Importer<'a> {
         expect_k: usize,
         row_perm: Option<&[usize]>,
     ) -> Result<Lowered, ConvertError> {
+        let lowered = self.lower_weight(base, expect_n, expect_k, row_perm)?;
+        self.check_declared(base, lowered)
+    }
+
+    /// Lower whatever representation the module's tensors carry: planar
+    /// NVFP4 or FP8 planes, CtInt4G32 planes, or Bf16 bytes. `row_perm`
+    /// (logical output rows) is applied to every representation.
+    fn lower_weight(
+        &self,
+        base: &str,
+        expect_n: usize,
+        expect_k: usize,
+        row_perm: Option<&[usize]>,
+    ) -> Result<Lowered, ConvertError> {
+        if let Some(lowered) = self.lower_nvfp4(base, expect_n, expect_k, row_perm)? {
+            return Ok(lowered);
+        }
+        if let Some(lowered) = self.lower_fp8(base, expect_n, expect_k, row_perm)? {
+            return Ok(lowered);
+        }
         if let Some((qweight, scale, zero, n, k)) = self.fetch_planes(base)? {
             if (n, k) != (expect_n, expect_k) {
                 return Err(ConvertError::TensorShapeMismatch {
@@ -493,73 +854,90 @@ impl<'a> Importer<'a> {
             ));
             // out_proj: [hidden, v_rows]; the v-head reorder permutes its
             // INPUT columns in head-sized blocks.
+            let out_base = self.name(layer, "linear_attn.out_proj");
             let lowered = {
-                let base = self.name(layer, "linear_attn.out_proj");
-                match self.fetch_planes(&base)? {
-                    Some((qweight, scale, zp, n, k)) => {
-                        if (n, k) != (hidden, v_rows) {
-                            return Err(ConvertError::TensorShapeMismatch {
-                                tensor: base,
-                                expected: format!("[{hidden}, {v_rows}]"),
-                                got: format!("[{n}, {k}]"),
-                            });
-                        }
-                        let (q, s, z) = permute_k_blocks(
-                            &qweight,
-                            &scale,
-                            &zp,
-                            n,
-                            k,
-                            self.gdn_head_dim,
-                            &self.head_perm,
-                        );
-                        let mut bytes = q;
-                        bytes.extend_from_slice(&s);
-                        bytes.extend_from_slice(&z);
-                        Lowered {
-                            bytes,
-                            quant: QuantScheme::CtInt4G32,
-                        }
+                let base = out_base.clone();
+                if let Some((weight, scale)) = self.fetch_fp8_planes(&base, hidden, v_rows)? {
+                    // The v-head reorder permutes this tensor's INPUT
+                    // columns, in head-sized blocks of one byte per weight.
+                    let mut bytes =
+                        permute_col_blocks(&weight, v_rows, self.gdn_head_dim, &self.head_perm);
+                    bytes.extend_from_slice(&scale.to_le_bytes());
+                    Lowered {
+                        bytes,
+                        quant: QuantScheme::Fp8E4M3,
                     }
-                    None => {
-                        // Unquantized out_proj (e.g. layer 0): Bf16 with the
-                        // column-block permutation applied per row.
-                        let name = format!("{base}.weight");
-                        let info = self
-                            .ckpt
-                            .tensor_info(&name)
-                            .ok_or_else(|| ConvertError::MissingTensor(name.clone()))?;
-                        if info.dtype != HfDtype::Bf16
-                            || info.shape != [hidden as u64, v_rows as u64]
-                        {
-                            return Err(ConvertError::UnsupportedTensorType {
-                                tensor: name,
-                                ggml_type: format!(
-                                    "{:?} {:?} (expected BF16 [{hidden}, {v_rows}])",
-                                    info.dtype, info.shape
-                                ),
-                            });
-                        }
-                        let bytes = self.ckpt.tensor_bytes(&name)?;
-                        let block = self.gdn_head_dim * 2;
-                        let row = v_rows * 2;
-                        let mut out = vec![0u8; bytes.len()];
-                        for r in 0..hidden {
-                            for (i, &src) in self.head_perm.iter().enumerate() {
-                                out[r * row + i * block..r * row + (i + 1) * block]
-                                    .copy_from_slice(
-                                        &bytes[r * row + src * block..r * row + (src + 1) * block],
-                                    );
+                } else if self.ckpt.quant.declared.get(&base) == Some(&QuantScheme::Nvfp4)
+                    && self
+                        .ckpt
+                        .tensor_info(&format!("{base}.weight"))
+                        .is_some_and(|info| info.dtype == HfDtype::U8)
+                {
+                    return Err(ConvertError::UnsupportedArchitecture(format!(
+                        "{base}: the checkpoint declares Nvfp4, which is not supported for a GDN \
+                         output projection (FP8 and BF16 are)"
+                    )));
+                } else {
+                    match self.fetch_planes(&base)? {
+                        Some((qweight, scale, zp, n, k)) => {
+                            if (n, k) != (hidden, v_rows) {
+                                return Err(ConvertError::TensorShapeMismatch {
+                                    tensor: base,
+                                    expected: format!("[{hidden}, {v_rows}]"),
+                                    got: format!("[{n}, {k}]"),
+                                });
+                            }
+                            let (q, s, z) = permute_k_blocks(
+                                &qweight,
+                                &scale,
+                                &zp,
+                                n,
+                                k,
+                                self.gdn_head_dim,
+                                &self.head_perm,
+                            );
+                            let mut bytes = q;
+                            bytes.extend_from_slice(&s);
+                            bytes.extend_from_slice(&z);
+                            Lowered {
+                                bytes,
+                                quant: QuantScheme::CtInt4G32,
                             }
                         }
-                        Lowered {
-                            bytes: out,
-                            quant: QuantScheme::Bf16,
+                        None => {
+                            // Unquantized out_proj (e.g. layer 0): Bf16 with the
+                            // column-block permutation applied per row.
+                            let name = format!("{base}.weight");
+                            let info = self
+                                .ckpt
+                                .tensor_info(&name)
+                                .ok_or_else(|| ConvertError::MissingTensor(name.clone()))?;
+                            if info.dtype != HfDtype::Bf16
+                                || info.shape != [hidden as u64, v_rows as u64]
+                            {
+                                return Err(ConvertError::UnsupportedTensorType {
+                                    tensor: name,
+                                    ggml_type: format!(
+                                        "{:?} {:?} (expected BF16 [{hidden}, {v_rows}])",
+                                        info.dtype, info.shape
+                                    ),
+                                });
+                            }
+                            let bytes = self.ckpt.tensor_bytes(&name)?;
+                            Lowered {
+                                bytes: permute_col_blocks(
+                                    &bytes,
+                                    v_rows * 2,
+                                    self.gdn_head_dim * 2,
+                                    &self.head_perm,
+                                ),
+                                quant: QuantScheme::Bf16,
+                            }
                         }
                     }
                 }
             };
-            ssm_out = Some(push(lowered, &mut blob));
+            ssm_out = Some(push(self.check_declared(&out_base, lowered)?, &mut blob));
         }
 
         // -- FFN --
@@ -645,7 +1023,51 @@ impl<'a> Importer<'a> {
     }
 }
 
-/// Convert an HF pack-quantized checkpoint directory to LBC, taking
+/// How many activation scales the checkpoint carries. A ModelOpt export
+/// stores one `input_scale` per quantized module for a runtime that also
+/// quantizes activations; this import reads weights only, so they are
+/// counted and left behind rather than dropped in silence.
+fn activation_scale_count(ckpt: &HfCtCheckpoint) -> usize {
+    ckpt.tensor_names()
+        .filter(|name| name.ends_with(".input_scale"))
+        .count()
+}
+
+/// The first activation-smoothing vector the checkpoint carries, by name.
+/// A module exported with a `pre_quant_scale` had its weights quantized for
+/// inputs multiplied by that vector first; the artifact has no place for
+/// it, so leaving it behind would change what every such module computes.
+fn activation_smoothing_tensor(ckpt: &HfCtCheckpoint) -> Option<&String> {
+    ckpt.tensor_names()
+        .filter(|name| name.ends_with(".pre_quant_scale"))
+        .min()
+}
+
+/// Read a numeric scalar from a checkpoint config, looking inside
+/// `rope_parameters` as well: configs that nest the RoPE scalars there
+/// declare no `rope_theta` at the level above, so a top-level-only lookup
+/// compares nothing at all and a donor with the wrong theta passes.
+///
+/// Absent (or null) is `None`: the comparison is skipped. Present but not a
+/// number is an error — reading it as absent would fail open, the same way
+/// it would for the integer keys.
+fn config_scalar(tc: &serde_json::Value, key: &str) -> Result<Option<f64>, ConvertError> {
+    let value = match tc.get(key) {
+        None | Some(serde_json::Value::Null) => {
+            match tc.get("rope_parameters").and_then(|rp| rp.get(key)) {
+                None | Some(serde_json::Value::Null) => return Ok(None),
+                Some(v) => v,
+            }
+        }
+        Some(v) => v,
+    };
+    value.as_f64().map(Some).ok_or_else(|| {
+        ConvertError::UnsupportedArchitecture(format!("checkpoint {key} = {value} is not a number"))
+    })
+}
+
+/// Convert an HF compressed-tensors INT4 or ModelOpt NVFP4 / FP8
+/// checkpoint directory to LBC, taking
 /// tokenizer + hyperparameter metadata from `donor_gguf` (a GGUF of the
 /// same model).
 pub fn convert_hf_ct_to_lbc(
@@ -756,7 +1178,7 @@ pub fn convert_hf_ct_to_lbc(
         ("rope_theta", donor_theta),
         ("rms_norm_eps", f64::from(hp.norm_eps)),
     ] {
-        if let Some(got) = tc.get(key).and_then(|v| v.as_f64()) {
+        if let Some(got) = config_scalar(&tc, key)? {
             let tol = want.abs().max(1e-12) * 1e-6;
             if (got - want).abs() > tol {
                 return Err(ConvertError::UnsupportedArchitecture(format!(
@@ -770,9 +1192,24 @@ pub fn convert_hf_ct_to_lbc(
     let num_k_heads = gdn.num_k_heads as usize;
     if !ckpt.quant.ignore.is_empty() {
         eprintln!(
-            "  Checkpoint keeps unquantized (compressed-tensors ignore): {}",
+            "  Checkpoint keeps unquantized: {}",
             ckpt.quant.ignore.join(", ")
         );
+    }
+    let activation_scales = activation_scale_count(&ckpt);
+    if activation_scales > 0 {
+        eprintln!(
+            "  Checkpoint drops {activation_scales} input_scale tensors: \
+             activation scales the artifact does not carry"
+        );
+    }
+    if let Some(name) = activation_smoothing_tensor(&ckpt) {
+        return Err(ConvertError::UnsupportedTensorType {
+            tensor: name.clone(),
+            ggml_type: "activation smoothing vector (the weights were quantized for \
+                        inputs multiplied by it, which the artifact does not carry)"
+                .into(),
+        });
     }
     let importer = Importer {
         ckpt: &ckpt,
@@ -781,6 +1218,7 @@ pub fn convert_hf_ct_to_lbc(
         num_v_heads,
         num_k_heads,
         gdn_head_dim: gdn.head_dim as usize,
+        checked_modules: RefCell::new(BTreeSet::new()),
     };
 
     let hidden = hp.hidden_dim as usize;
@@ -824,44 +1262,67 @@ pub fn convert_hf_ct_to_lbc(
     let final_norm_vals = importer.fetch_f32(&format!("{prefix}norm.weight"), &[hidden as u64])?;
     let final_norm = Importer::f32_le(&final_norm_vals.iter().map(|v| v + 1.0).collect::<Vec<_>>());
     let head = importer.lower_linear("lm_head", hp.vocab_size as usize, hidden, None)?;
-    if head.quant != QuantScheme::Bf16 {
-        // No runtime path serves a quantized global head; converting one
-        // would produce an artifact that fails (or worse) at load time.
-        return Err(ConvertError::UnsupportedArchitecture(
-            "quantized lm_head is not supported — the checkpoint must keep \
-             lm_head in BF16 (compressed-tensors `ignore` list)"
-                .into(),
-        ));
+    // The head is the last module lowered, so every module the checkpoint
+    // declares has had its chance to carry the planes it is declared with.
+    importer.check_every_declared_module_was_checked()?;
+    match head.quant {
+        // The schemes the format carries a global head in. Every other one
+        // has no head representation, and converting it would produce an
+        // artifact that fails (or worse) at load time.
+        QuantScheme::Bf16 | QuantScheme::Nvfp4 => {}
+        other => {
+            return Err(ConvertError::UnsupportedArchitecture(format!(
+                "lm_head is {other:?}: the checkpoint must keep lm_head in BF16 \
+                 (the source's unquantized list) or export it as NVFP4"
+            )))
+        }
     }
     let (output_proj, output_proj_quant) = (head.bytes, head.quant);
 
-    // The header's primary scheme advertises CtInt4G32; require that at
-    // least one tensor actually carries it — an all-BF16 checkpoint that
-    // merely retains a pack-quantized config must not be mislabeled.
-    let has_ct4 = layer_shapes.iter().any(|ls| {
-        let s = &ls.index.subtensors;
-        [
-            Some(&s.wq),
-            Some(&s.wk),
-            Some(&s.wv),
-            Some(&s.wo),
-            Some(&s.w_gate),
-            Some(&s.w_up),
-            Some(&s.w_down),
-            s.attn_gate.as_ref(),
-            s.ssm_out.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|t| t.quant == QuantScheme::CtInt4G32)
-    });
-    if !has_ct4 {
-        return Err(ConvertError::UnsupportedArchitecture(
-            "checkpoint contains no pack-quantized tensors (nothing to import as CtInt4G32)".into(),
-        ));
-    }
+    // The header's primary scheme names what the weights actually carry — a
+    // checkpoint that merely retains a quantization config while storing
+    // everything unquantized must not be mislabeled. A planar scheme carried
+    // by ANY module, a body slice or the head, becomes the primary, the
+    // narrower of the two first; INT4 group-32 becomes it only when no
+    // module carries a planar scheme at all. That order is what makes a
+    // reader which does not know the planar tags refuse the file at its
+    // header: an unknown primary is an error there, while an unknown head
+    // tag reads as a float, so a planar head under a servable primary would
+    // be read as one.
+    let carries = |scheme: QuantScheme| {
+        output_proj_quant == scheme
+            || layer_shapes.iter().any(|ls| {
+                let s = &ls.index.subtensors;
+                [
+                    Some(&s.wq),
+                    Some(&s.wk),
+                    Some(&s.wv),
+                    Some(&s.wo),
+                    Some(&s.w_gate),
+                    Some(&s.w_up),
+                    Some(&s.w_down),
+                    s.attn_gate.as_ref(),
+                    s.ssm_out.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|t| t.quant == scheme)
+            })
+    };
+    let primary = [
+        QuantScheme::Nvfp4,
+        QuantScheme::Fp8E4M3,
+        QuantScheme::CtInt4G32,
+    ]
+    .into_iter()
+    .find(|&scheme| carries(scheme))
+    .ok_or_else(|| {
+        ConvertError::UnsupportedArchitecture(
+            "checkpoint contains no quantized tensors (nothing to import)".into(),
+        )
+    })?;
 
-    let qd = quant_descriptor_for(QuantScheme::CtInt4G32);
+    let qd = quant_descriptor_for(primary);
     let mut header = LbcHeader::new(hp, qd);
     header.embedding.quant = QuantScheme::Bf16;
     header.final_norm.quant = QuantScheme::F32;
@@ -969,7 +1430,7 @@ pub fn convert_hf_ct_to_lbc(
         num_layers: hp.num_layers,
         architecture: arch,
         tensor_count,
-        quant_scheme: QuantScheme::CtInt4G32,
+        quant_scheme: primary,
     })
 }
 
@@ -979,6 +1440,7 @@ mod tests {
     use crate::ct_planes::{pack_nibbles, unpack_nibbles};
     use crate::gguf::GgufBuilder;
     use crate::hf_ct::test_fixture::{dialect_config, shard_bytes, write_checkpoint};
+    use crate::test_checkpoint::e4m3_bytes;
     use lumen_format::LbcFile;
 
     // Synthetic model: hidden 64, inter 96, vocab 48, 4 layers (layer 3 is
@@ -999,6 +1461,494 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         *seed >> 33
+    }
+
+    #[test]
+    fn config_scalar_reads_flat_and_nested_rope_theta() {
+        let flat = serde_json::json!({ "rope_theta": 1.0e7, "rms_norm_eps": 1.0e-6 });
+        assert_eq!(config_scalar(&flat, "rope_theta").unwrap(), Some(1.0e7));
+        assert_eq!(config_scalar(&flat, "rms_norm_eps").unwrap(), Some(1.0e-6));
+        // The nested shape, where a top-level-only lookup compares nothing.
+        let nested = serde_json::json!({
+            "rope_parameters": { "rope_type": "default", "rope_theta": 1.0e7 },
+            "rms_norm_eps": 1.0e-6
+        });
+        assert_eq!(config_scalar(&nested, "rope_theta").unwrap(), Some(1.0e7));
+        assert_eq!(
+            config_scalar(&nested, "rms_norm_eps").unwrap(),
+            Some(1.0e-6)
+        );
+        // Absent everywhere stays absent: the comparison is skipped, not failed.
+        assert_eq!(
+            config_scalar(&serde_json::json!({}), "rope_theta").unwrap(),
+            None
+        );
+        // A present value that is not a number is refused by key name, so a
+        // donor mismatch cannot hide behind it.
+        let textual = serde_json::json!({ "rope_parameters": { "rope_theta": "1e7" } });
+        let err = config_scalar(&textual, "rope_theta")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rope_theta"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_rope_theta_that_disagrees_with_the_donor_is_refused() {
+        use crate::test_checkpoint::{write_checkpoint as write_synthetic, Modules};
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = write_synthetic(dir.path(), Modules::Nvfp4AndFp8);
+
+        // The donor GGUF declares 10000; the checkpoint nests another theta
+        // one level down, where the comparison has to reach for it.
+        let path = ckpt.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["text_config"]["rope_parameters"] = serde_json::json!({ "rope_theta": 500000.0 });
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let err = convert_hf_ct_to_lbc(&ckpt.dir, &ckpt.donor, &dir.path().join("out.lbc"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rope_theta") && err.contains("500000"),
+            "the refusal does not name the scalar and its value: {err}"
+        );
+    }
+
+    /// Convert a synthetic one-layer ModelOpt checkpoint whose
+    /// `quantized_layers` declaration `edit` has rewritten. The modules
+    /// carry NVFP4 MLP and head planes and FP8 GDN projections.
+    fn convert_with_declaration(
+        tag: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<ConvertStats, ConvertError> {
+        use crate::test_checkpoint::{write_checkpoint as write_synthetic, Modules};
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("lumen-decl-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let ckpt = write_synthetic(dir.path(), Modules::Nvfp4AndFp8);
+        let path = ckpt.dir.join("hf_quant_config.json");
+        let mut qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        edit(
+            qc["quantization"]["quantized_layers"]
+                .as_object_mut()
+                .unwrap(),
+        );
+        std::fs::write(&path, serde_json::to_vec(&qc).unwrap()).unwrap();
+        convert_hf_ct_to_lbc(&ckpt.dir, &ckpt.donor, &dir.path().join("out.lbc"))
+    }
+
+    #[test]
+    fn the_gdn_output_projection_must_carry_the_algorithm_it_is_declared_with() {
+        // This module is lowered where the column-block permutation is
+        // applied, off the path the other projections take.
+        let base = "model.layers.0.linear_attn.out_proj";
+        let err = convert_with_declaration("outproj", |layers| {
+            layers.insert(
+                base.to_owned(),
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            );
+        })
+        .expect_err("FP8 out_proj planes declared NVFP4 were converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4") && err.contains("Fp8E4M3"),
+            "the refusal does not name the module and both schemes: {err}"
+        );
+    }
+
+    #[test]
+    fn a_modelopt_module_that_carries_planes_must_be_declared() {
+        // Dropped from the declaration, the module still holds its NVFP4
+        // planes: nothing in the checkpoint says which reading is right.
+        let base = "model.layers.0.mlp.up_proj";
+        let err = convert_with_declaration("undeclared", |layers| {
+            assert!(layers.remove(base).is_some(), "{base} was not declared");
+        })
+        .expect_err("an undeclared NVFP4 module converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4"),
+            "the refusal does not name the module and what it carries: {err}"
+        );
+    }
+
+    #[test]
+    fn a_declared_module_that_carries_no_planes_is_refused() {
+        // `in_proj_a` is lowered as F32 — the path that fetches no planes at
+        // all — so its BF16 tensor can satisfy no declaration, and the
+        // declaration is the only place the checkpoint says otherwise.
+        let base = "model.layers.0.linear_attn.in_proj_a";
+        let err = convert_with_declaration("inproj-a", |layers| {
+            layers.insert(base.to_owned(), serde_json::json!({ "quant_algo": "FP8" }));
+        })
+        .expect_err("a BF16 module declared FP8 converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("carries no Fp8E4M3 tensors"),
+            "the refusal does not name the module and its declared algorithm: {err}"
+        );
+    }
+
+    #[test]
+    fn a_declared_embedding_is_refused() {
+        // The embedding is lowered as BF16 bytes straight from the shard,
+        // nowhere near a plane fetch.
+        let base = "model.embed_tokens";
+        let err = convert_with_declaration("embedding", |layers| {
+            layers.insert(
+                base.to_owned(),
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            );
+        })
+        .expect_err("a BF16 embedding declared NVFP4 converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("carries no Nvfp4 tensors"),
+            "the refusal does not name the module and its declared algorithm: {err}"
+        );
+    }
+
+    #[test]
+    fn a_declared_nvfp4_module_without_its_global_scale_is_refused_by_name() {
+        let missing = "model.layers.0.mlp.up_proj.weight_scale_2";
+        let err = convert_edited(
+            |entries| {
+                let before = entries.len();
+                entries.retain(|(name, ..)| name != missing);
+                assert_eq!(
+                    entries.len(),
+                    before - 1,
+                    "{missing} was not in the checkpoint"
+                );
+            },
+            |_| {},
+        )
+        .expect_err("a declared NVFP4 module without its global scale converted");
+        assert!(
+            matches!(&err, ConvertError::MissingTensor(name) if name == missing),
+            "the refusal does not name the missing global scale: {err}"
+        );
+    }
+
+    #[test]
+    fn an_nvfp4_gdn_output_projection_is_refused_by_name() {
+        // The fixture's FP8 out_proj [64, 64] is replaced by a well-formed
+        // NVFP4 plane set.
+        let base = "model.layers.0.linear_attn.out_proj";
+        let err = convert_edited(
+            |entries| {
+                entries.retain(|(name, ..)| !name.starts_with(&format!("{base}.")));
+                entries.extend(nvfp4_plane_entries(base, 64, 64));
+            },
+            |layers| {
+                layers.insert(
+                    base.to_owned(),
+                    serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+                );
+            },
+        )
+        .expect_err("an NVFP4 GDN output projection converted")
+        .to_string();
+        assert!(
+            err.contains(base) && err.contains("Nvfp4") && !err.contains("weight_packed"),
+            "the refusal does not name the module and its NVFP4 declaration: {err}"
+        );
+    }
+
+    /// Convert with `base`'s tensors replaced by `planes` and its
+    /// declaration replaced by `declared` (removed when `None`); return the
+    /// refusal.
+    fn refusal_for(
+        base: &str,
+        planes: Vec<ShardEntry>,
+        declared: Option<serde_json::Value>,
+    ) -> String {
+        convert_edited(
+            |entries| {
+                entries.retain(|(name, ..)| !name.starts_with(&format!("{base}.")));
+                entries.extend(planes);
+            },
+            |layers| match declared {
+                Some(declaration) => {
+                    layers.insert(base.to_owned(), declaration);
+                }
+                None => {
+                    layers.remove(base);
+                }
+            },
+        )
+        .expect_err("a module whose declaration disagrees with its tensors converted")
+        .to_string()
+    }
+
+    fn assert_names_declaration_and_carried(err: &str, base: &str, declared: &str, carried: &str) {
+        assert!(
+            err.contains(base)
+                && err.contains(declared)
+                && err.contains(carried)
+                && !err.contains("weight_packed"),
+            "the refusal does not name `{declared}` and `{carried}`: {err}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_planes_on_a_gdn_output_projection_declared_fp8_are_refused_as_such() {
+        let base = "model.layers.0.linear_attn.out_proj";
+        let err = refusal_for(
+            base,
+            nvfp4_plane_entries(base, 64, 64),
+            Some(serde_json::json!({ "quant_algo": "FP8" })),
+        );
+        assert_names_declaration_and_carried(&err, base, "declares Fp8", "carries Nvfp4");
+    }
+
+    #[test]
+    fn nvfp4_planes_on_an_undeclared_gdn_output_projection_are_refused_as_such() {
+        let base = "model.layers.0.linear_attn.out_proj";
+        let err = refusal_for(base, nvfp4_plane_entries(base, 64, 64), None);
+        assert_names_declaration_and_carried(&err, base, "declares no algorithm", "carries Nvfp4");
+    }
+
+    #[test]
+    fn nvfp4_planes_without_a_global_scale_declared_fp8_are_refused_as_such() {
+        let base = "model.layers.0.mlp.gate_proj";
+        let mut planes = nvfp4_plane_entries(base, 64, 64);
+        planes.retain(|(name, ..)| !name.ends_with(".weight_scale_2"));
+        let err = refusal_for(
+            base,
+            planes,
+            Some(serde_json::json!({ "quant_algo": "FP8" })),
+        );
+        assert_names_declaration_and_carried(&err, base, "declares Fp8", "carries Nvfp4");
+        assert!(
+            err.contains("weight_scale_2"),
+            "the refusal does not name the missing global scale: {err}"
+        );
+    }
+
+    #[test]
+    fn a_bf16_gdn_output_projection_declared_nvfp4_is_refused_as_such() {
+        let base = "model.layers.0.linear_attn.out_proj";
+        let bf16 = vec![(
+            format!("{base}.weight"),
+            serde_json::json!({ "dtype": "BF16", "shape": [64, 64] }),
+            vec![0u8; 64 * 64 * 2],
+        )];
+        let err = refusal_for(
+            base,
+            bf16,
+            Some(serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 })),
+        );
+        assert_names_declaration_and_carried(&err, base, "declares Nvfp4", "carries Bf16");
+        assert!(
+            !err.contains("FP8 and BF16 are"),
+            "the refusal calls BF16 supported: {err}"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_whose_declared_modules_all_carry_planes_converts() {
+        // The control for the two refusals above: with the declaration left
+        // as the fixture writes it, every declared module carries the planes
+        // it names, and nothing is refused.
+        convert_with_declaration("declared-intact", |_| {})
+            .expect("the fixture's own declaration was refused");
+    }
+
+    /// One tensor of a checkpoint shard: name, header entry, bytes.
+    type ShardEntry = (String, serde_json::Value, Vec<u8>);
+
+    /// Convert the synthetic mixed-precision checkpoint after `edit` has
+    /// rewritten its shard's tensors and `declare` its `quantized_layers`.
+    /// The shard and its index are laid out again from the edited list.
+    fn convert_edited(
+        edit: impl FnOnce(&mut Vec<ShardEntry>),
+        declare: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<ConvertStats, ConvertError> {
+        use crate::test_checkpoint::{write_checkpoint as write_synthetic, Modules};
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = write_synthetic(dir.path(), Modules::Nvfp4AndFp8);
+        let shard = ckpt.dir.join("model-00001.safetensors");
+        let raw = std::fs::read(&shard).unwrap();
+        let header_len = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&raw[8..8 + header_len]).unwrap();
+        let data = &raw[8 + header_len..];
+        let mut entries: Vec<ShardEntry> = header
+            .into_iter()
+            .map(|(name, info)| {
+                let begin = info["data_offsets"][0].as_u64().unwrap() as usize;
+                let end = info["data_offsets"][1].as_u64().unwrap() as usize;
+                let bytes = data[begin..end].to_vec();
+                (name, info, bytes)
+            })
+            .collect();
+        entries.sort_by_key(|(_, info, _)| info["data_offsets"][0].as_u64().unwrap());
+        edit(&mut entries);
+
+        let mut new_header = serde_json::Map::new();
+        let mut new_data = Vec::new();
+        let mut weight_map = serde_json::Map::new();
+        for (name, mut info, bytes) in entries {
+            let at = new_data.len();
+            new_data.extend_from_slice(&bytes);
+            info["data_offsets"] = serde_json::json!([at, new_data.len()]);
+            weight_map.insert(name.clone(), "model-00001.safetensors".into());
+            new_header.insert(name, info);
+        }
+        let new_header = serde_json::to_vec(&new_header).unwrap();
+        let mut out = (new_header.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&new_header);
+        out.extend_from_slice(&new_data);
+        std::fs::write(&shard, out).unwrap();
+        let index = ckpt.dir.join("model.safetensors.index.json");
+        let mut map: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        map["weight_map"] = serde_json::Value::Object(weight_map);
+        std::fs::write(&index, serde_json::to_vec(&map).unwrap()).unwrap();
+
+        let path = ckpt.dir.join("hf_quant_config.json");
+        let mut qc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        declare(
+            qc["quantization"]["quantized_layers"]
+                .as_object_mut()
+                .unwrap(),
+        );
+        std::fs::write(&path, serde_json::to_vec(&qc).unwrap()).unwrap();
+        convert_hf_ct_to_lbc(&ckpt.dir, &ckpt.donor, &dir.path().join("out.lbc"))
+    }
+
+    /// A well-formed NVFP4 plane set for `base` of logical shape `[n, k]`:
+    /// packed nibbles, finite E4M3 block scales, an F32 global scale.
+    fn nvfp4_plane_entries(base: &str, n: u64, k: u64) -> Vec<ShardEntry> {
+        [
+            (
+                "weight",
+                "U8",
+                vec![n, k / 2],
+                vec![0x21u8; (n * k / 2) as usize],
+            ),
+            (
+                "weight_scale",
+                "F8_E4M3",
+                vec![n, k / 16],
+                vec![0x38u8; (n * k / 16) as usize],
+            ),
+            (
+                "weight_scale_2",
+                "F32",
+                vec![],
+                1.5e-4f32.to_le_bytes().to_vec(),
+            ),
+        ]
+        .into_iter()
+        .map(|(suffix, dtype, shape, bytes)| {
+            (
+                format!("{base}.{suffix}"),
+                serde_json::json!({ "dtype": dtype, "shape": shape }),
+                bytes,
+            )
+        })
+        .collect()
+    }
+
+    /// Set byte `at` of the named tensor.
+    fn set_byte(entries: &mut [ShardEntry], name: &str, at: usize, value: u8) {
+        let (.., bytes) = entries
+            .iter_mut()
+            .find(|(n, ..)| n == name)
+            .unwrap_or_else(|| panic!("{name} is not in the checkpoint"));
+        bytes[at] = value;
+    }
+
+    #[test]
+    fn a_declared_module_this_import_does_not_convert_is_refused_as_such() {
+        // A multi-token-prediction layer: declared, carrying well-formed
+        // NVFP4 planes, and outside the model this import builds.
+        let base = "mtp.layers.0.mlp.gate_proj";
+        let err = convert_edited(
+            |entries| entries.extend(nvfp4_plane_entries(base, 64, 64)),
+            |layers| {
+                layers.insert(
+                    base.to_owned(),
+                    serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+                );
+            },
+        )
+        .expect_err("a declared module outside the converted model was accepted")
+        .to_string();
+        assert!(
+            err.contains(base)
+                && err.contains("weight is Nvfp4")
+                && err.contains("does not convert"),
+            "the refusal does not say the module's weight is NVFP4 but is not converted: {err}"
+        );
+    }
+
+    #[test]
+    fn a_nan_nvfp4_block_scale_is_refused_by_name() {
+        let name = "model.layers.0.mlp.gate_proj.weight_scale";
+        for nan in [0x7Fu8, 0xFF] {
+            let err = convert_edited(|entries| set_byte(entries, name, 5, nan), |_| {})
+                .expect_err("a NaN block scale was converted")
+                .to_string();
+            assert!(
+                err.contains(name) && err.contains("NaN"),
+                "the refusal does not name the plane and the NaN code {nan:#04x}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nan_fp8_weight_is_refused_by_name() {
+        // One projection lowered through the plain path, and the GDN output
+        // projection, lowered in place with its column blocks reordered.
+        for name in [
+            "model.layers.0.linear_attn.in_proj_z.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+        ] {
+            for nan in [0x7Fu8, 0xFF] {
+                let err = convert_edited(|entries| set_byte(entries, name, 3, nan), |_| {})
+                    .expect_err("a NaN FP8 weight was converted")
+                    .to_string();
+                assert!(
+                    err.contains(name) && err.contains("NaN"),
+                    "the refusal does not name the plane and the NaN code {nan:#04x}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_activation_smoothing_vector_is_refused_by_name() {
+        let name = "model.layers.0.mlp.gate_proj.pre_quant_scale";
+        let err = convert_edited(
+            |entries| {
+                entries.push((
+                    name.to_owned(),
+                    serde_json::json!({ "dtype": "BF16", "shape": [64] }),
+                    vec![0x40u8; 128],
+                ));
+            },
+            |_| {},
+        )
+        .expect_err("a module with a pre_quant_scale was converted")
+        .to_string();
+        assert!(
+            err.contains(name),
+            "the refusal does not name the tensor: {err}"
+        );
+    }
+
+    #[test]
+    fn the_synthetic_checkpoint_converts_after_a_rewrite() {
+        // The control for the refusals above: the same rewrite with nothing
+        // edited converts.
+        convert_edited(|_| {}, |_| {}).expect("the unedited checkpoint was refused");
     }
 
     fn rand_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
@@ -1520,6 +2470,902 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ---- ModelOpt import: NVFP4 and FP8 ----
+
+    /// One ModelOpt module's source planes.
+    enum PlaneSet {
+        Nvfp4 {
+            weight: Vec<u8>,
+            block_scale: Vec<u8>,
+            global: f32,
+        },
+        Fp8 {
+            weight: Vec<u8>,
+            scale: f32,
+        },
+    }
+
+    struct Module {
+        base: String,
+        n: usize,
+        k: usize,
+        planes: PlaneSet,
+    }
+
+    impl Module {
+        fn nvfp4(base: &str, n: usize, k: usize, seed: &mut u64) -> Self {
+            let p = Nvfp4Planes::for_shape(n as u64, k as u64).unwrap();
+            Module {
+                base: base.to_owned(),
+                n,
+                k,
+                planes: PlaneSet::Nvfp4 {
+                    weight: rand_bytes(p.weight_bytes as usize, seed),
+                    block_scale: e4m3_bytes(p.block_scale_bytes as usize, seed),
+                    global: 1.5e-4 + (rng(seed) % 97) as f32 * 1e-6,
+                },
+            }
+        }
+
+        fn fp8(base: &str, n: usize, k: usize, seed: &mut u64) -> Self {
+            let p = Fp8Planes::for_shape(n as u64, k as u64).unwrap();
+            Module {
+                base: base.to_owned(),
+                n,
+                k,
+                planes: PlaneSet::Fp8 {
+                    weight: e4m3_bytes(p.weight_bytes as usize, seed),
+                    scale: 9.7e-4 + (rng(seed) % 89) as f32 * 1e-6,
+                },
+            }
+        }
+
+        fn source_weight(&self) -> &[u8] {
+            match &self.planes {
+                PlaneSet::Nvfp4 { weight, .. } | PlaneSet::Fp8 { weight, .. } => weight,
+            }
+        }
+
+        /// The tensors this module contributes to a checkpoint shard.
+        fn entries(&self) -> Vec<(String, String, Vec<u64>, Vec<u8>)> {
+            let (n, k) = (self.n as u64, self.k as u64);
+            match &self.planes {
+                PlaneSet::Nvfp4 {
+                    weight,
+                    block_scale,
+                    global,
+                } => vec![
+                    (
+                        format!("{}.weight", self.base),
+                        "U8".into(),
+                        vec![n, k / 2],
+                        weight.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale", self.base),
+                        "F8_E4M3".into(),
+                        vec![n, k / 16],
+                        block_scale.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale_2", self.base),
+                        "F32".into(),
+                        vec![],
+                        global.to_le_bytes().to_vec(),
+                    ),
+                ],
+                PlaneSet::Fp8 { weight, scale } => vec![
+                    (
+                        format!("{}.weight", self.base),
+                        "F8_E4M3".into(),
+                        vec![n, k],
+                        weight.clone(),
+                    ),
+                    (
+                        format!("{}.weight_scale", self.base),
+                        "F32".into(),
+                        vec![],
+                        scale.to_le_bytes().to_vec(),
+                    ),
+                ],
+            }
+        }
+
+        /// The lowered bytes this module must produce: its planes verbatim,
+        /// in their fixed order, after `row_perm` if the role has one.
+        fn expected_bytes(&self, row_perm: Option<&[usize]>) -> Vec<u8> {
+            match &self.planes {
+                PlaneSet::Nvfp4 {
+                    weight,
+                    block_scale,
+                    global,
+                } => {
+                    let (w, s) = match row_perm {
+                        Some(p) => (
+                            permute_rows(weight, self.k / 2, p),
+                            permute_rows(block_scale, self.k / 16, p),
+                        ),
+                        None => (weight.clone(), block_scale.clone()),
+                    };
+                    let mut out = w;
+                    out.extend_from_slice(&s);
+                    out.extend_from_slice(&global.to_le_bytes());
+                    out
+                }
+                PlaneSet::Fp8 { weight, scale } => {
+                    let mut out = match row_perm {
+                        Some(p) => permute_rows(weight, self.k, p),
+                        None => weight.clone(),
+                    };
+                    out.extend_from_slice(&scale.to_le_bytes());
+                    out
+                }
+            }
+        }
+    }
+
+    /// Serialize modules into a one-shard ModelOpt checkpoint, plus any
+    /// extra tensors. `patch` replaces a named tensor to build corruptions.
+    fn write_modelopt_checkpoint(
+        tag: &str,
+        modules: &[Module],
+        extra: &[(String, String, Vec<u64>, Vec<u8>)],
+        patch: &[(String, String, Vec<u64>, Vec<u8>)],
+        config: Option<serde_json::Value>,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("lumen-modelopt-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let mut planned: Vec<(String, String, Vec<u64>, Vec<u8>)> = Vec::new();
+        let mut quantized_layers = serde_json::Map::new();
+        for m in modules {
+            planned.extend(m.entries());
+            let algo = match m.planes {
+                PlaneSet::Nvfp4 { .. } => {
+                    serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 })
+                }
+                PlaneSet::Fp8 { .. } => serde_json::json!({ "quant_algo": "FP8" }),
+            };
+            quantized_layers.insert(m.base.clone(), algo);
+        }
+        planned.extend(extra.iter().cloned());
+        for entry in patch {
+            match planned.iter_mut().find(|(n, ..)| *n == entry.0) {
+                Some(slot) => *slot = entry.clone(),
+                None => planned.push(entry.clone()),
+            }
+        }
+        let entries: Vec<(&str, &str, &[u64], &[u8])> = planned
+            .iter()
+            .map(|(n, d, s, b)| (n.as_str(), d.as_str(), s.as_slice(), b.as_slice()))
+            .collect();
+        let weight_map: Vec<(&str, &str)> = planned
+            .iter()
+            .map(|(n, ..)| (n.as_str(), "model-00001.safetensors"))
+            .collect();
+        write_checkpoint(
+            dir.path(),
+            &config.unwrap_or_else(crate::hf_ct::test_fixture::modelopt_config),
+            &[("model-00001.safetensors", shard_bytes(&entries))],
+            &weight_map,
+        );
+        let mut qc = crate::hf_ct::test_fixture::modelopt_quant_config();
+        qc["quantization"]["quantized_layers"] = serde_json::Value::Object(quantized_layers);
+        std::fs::write(
+            dir.path().join("hf_quant_config.json"),
+            serde_json::to_vec(&qc).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn modelopt_importer(ckpt: &HfCtCheckpoint) -> Importer<'_> {
+        Importer {
+            ckpt,
+            prefix: "model.".to_owned(),
+            head_perm: v_head_perm(VH, KH),
+            num_v_heads: VH,
+            num_k_heads: KH,
+            gdn_head_dim: GHD,
+            checked_modules: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// Two layers of NVFP4 MLP modules plus an NVFP4 head.
+    fn nvfp4_modules(seed: &mut u64) -> Vec<Module> {
+        let mut modules = Vec::new();
+        for layer in 0..2usize {
+            for (suffix, n, k) in [
+                ("mlp.gate_proj", INTER, HID),
+                ("mlp.up_proj", INTER, HID),
+                ("mlp.down_proj", HID, INTER),
+            ] {
+                modules.push(Module::nvfp4(
+                    &format!("model.layers.{layer}.{suffix}"),
+                    n,
+                    k,
+                    seed,
+                ));
+            }
+        }
+        modules.push(Module::nvfp4("lm_head", VOCAB, HID, seed));
+        modules
+    }
+
+    /// One GDN layer's three FP8 modules and one full-attention layer's four.
+    fn fp8_modules(seed: &mut u64) -> Vec<Module> {
+        let o_cols = 4 * 8;
+        vec![
+            Module::fp8(
+                "model.layers.0.linear_attn.in_proj_qkv",
+                QKV_ROWS,
+                HID,
+                seed,
+            ),
+            Module::fp8("model.layers.0.linear_attn.in_proj_z", V_ROWS, HID, seed),
+            Module::fp8("model.layers.0.linear_attn.out_proj", HID, V_ROWS, seed),
+            Module::fp8("model.layers.3.self_attn.q_proj", 4 * 8 * 2, HID, seed),
+            Module::fp8("model.layers.3.self_attn.k_proj", 2 * 8, HID, seed),
+            Module::fp8("model.layers.3.self_attn.v_proj", 2 * 8, HID, seed),
+            Module::fp8("model.layers.3.self_attn.o_proj", HID, o_cols, seed),
+        ]
+    }
+
+    #[test]
+    fn nvfp4_modules_lower_to_their_planes_verbatim() {
+        let mut seed = 21u64;
+        let modules = nvfp4_modules(&mut seed);
+        assert_eq!(modules.len(), 7, "2 layers x 3 + the head");
+        let dir = write_modelopt_checkpoint("nvfp4", &modules, &[], &[], None);
+        let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+        let importer = modelopt_importer(&ckpt);
+        for m in &modules {
+            let lowered = importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
+            assert_eq!(lowered.quant, QuantScheme::Nvfp4, "{}", m.base);
+            let planes = Nvfp4Planes::for_shape(m.n as u64, m.k as u64).unwrap();
+            assert_eq!(
+                lowered.bytes.len() as u64,
+                planes.total_bytes(),
+                "{}",
+                m.base
+            );
+            assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
+        }
+    }
+
+    #[test]
+    fn fp8_modules_lower_to_their_planes_verbatim() {
+        let mut seed = 33u64;
+        let modules = fp8_modules(&mut seed);
+        assert_eq!(
+            modules.len(),
+            7,
+            "one GDN layer's 3 and one attention layer's 4"
+        );
+        let dir = write_modelopt_checkpoint("fp8", &modules, &[], &[], None);
+        let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+        let importer = modelopt_importer(&ckpt);
+        for m in &modules {
+            let lowered = importer.lower_linear(&m.base, m.n, m.k, None).unwrap();
+            assert_eq!(lowered.quant, QuantScheme::Fp8E4M3, "{}", m.base);
+            let planes = Fp8Planes::for_shape(m.n as u64, m.k as u64).unwrap();
+            assert_eq!(
+                lowered.bytes.len() as u64,
+                planes.total_bytes(),
+                "{}",
+                m.base
+            );
+            assert_eq!(lowered.bytes, m.expected_bytes(None), "{}", m.base);
+        }
+    }
+
+    #[test]
+    fn activation_scales_are_counted_and_left_behind() {
+        let mut seed = 9u64;
+        let base = "model.layers.0.linear_attn.in_proj_z";
+        let modules = vec![Module::fp8(base, V_ROWS, HID, &mut seed)];
+        let extra: Vec<(String, String, Vec<u64>, Vec<u8>)> = [base, "model.layers.0.mlp.up_proj"]
+            .iter()
+            .map(|m| {
+                (
+                    format!("{m}.input_scale"),
+                    "F32".to_owned(),
+                    vec![],
+                    1.0f32.to_le_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let dir = write_modelopt_checkpoint("input-scale", &modules, &extra, &[], None);
+        let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+        assert_eq!(activation_scale_count(&ckpt), 2);
+        // Counting them changes nothing about what the module lowers to.
+        let lowered = modelopt_importer(&ckpt)
+            .lower_linear(base, V_ROWS, HID, None)
+            .unwrap();
+        assert_eq!(lowered.quant, QuantScheme::Fp8E4M3);
+        assert_eq!(lowered.bytes, modules[0].expected_bytes(None));
+    }
+
+    #[test]
+    fn modelopt_modules_must_carry_the_algorithm_they_are_declared_with() {
+        // Each module, declared as the other kind than the planes it holds.
+        for (base, n, k, planes, declared) in [
+            (
+                "model.layers.0.mlp.up_proj",
+                INTER,
+                HID,
+                "NVFP4",
+                serde_json::json!({ "quant_algo": "FP8" }),
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                "FP8",
+                serde_json::json!({ "quant_algo": "NVFP4", "group_size": 16 }),
+            ),
+        ] {
+            let mut seed = 11u64;
+            let modules = vec![if planes == "NVFP4" {
+                Module::nvfp4(base, n, k, &mut seed)
+            } else {
+                Module::fp8(base, n, k, &mut seed)
+            }];
+            let dir =
+                write_modelopt_checkpoint(&format!("declared-{planes}"), &modules, &[], &[], None);
+            let path = dir.path().join("hf_quant_config.json");
+            let mut qc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            qc["quantization"]["quantized_layers"][base] = declared;
+            std::fs::write(&path, serde_json::to_vec(&qc).unwrap()).unwrap();
+
+            let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+            let err = match modelopt_importer(&ckpt).lower_linear(base, n, k, None) {
+                Ok(l) => panic!("{planes} planes declared otherwise: accepted {:?}", l.quant),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(base) && err.contains("Nvfp4") && err.contains("Fp8E4M3"),
+                "{planes}: the refusal does not name the module and both schemes: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn modelopt_planes_must_carry_the_declared_dtype_and_shape() {
+        let mut seed = 5u64;
+        let nvfp4 = Module::nvfp4("model.layers.0.mlp.gate_proj", INTER, HID, &mut seed);
+        let fp8 = Module::fp8(
+            "model.layers.0.linear_attn.in_proj_z",
+            V_ROWS,
+            HID,
+            &mut seed,
+        );
+        let np = Nvfp4Planes::for_shape(INTER as u64, HID as u64).unwrap();
+        let fq = Fp8Planes::for_shape(V_ROWS as u64, HID as u64).unwrap();
+        let cases: Vec<(&str, usize, String, String, Vec<u64>, Vec<u8>, &str)> = vec![
+            // NVFP4: weight dtype, weight shape, scale shape, scale dtype.
+            (
+                "n-dtype",
+                0,
+                format!("{}.weight", nvfp4.base),
+                "I32".into(),
+                vec![INTER as u64, HID as u64 / 8],
+                vec![0u8; np.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "n-wshape",
+                0,
+                format!("{}.weight", nvfp4.base),
+                "U8".into(),
+                vec![INTER as u64 / 2, HID as u64],
+                vec![0u8; np.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "n-sshape",
+                0,
+                format!("{}.weight_scale", nvfp4.base),
+                "F8_E4M3".into(),
+                vec![INTER as u64, HID as u64 / 32],
+                vec![0u8; np.block_scale_bytes as usize / 2],
+                "weight_scale",
+            ),
+            (
+                "n-sdtype",
+                0,
+                format!("{}.weight_scale", nvfp4.base),
+                "BF16".into(),
+                vec![INTER as u64, HID as u64 / 16],
+                vec![0u8; np.block_scale_bytes as usize * 2],
+                "weight_scale",
+            ),
+            // FP8: a transposed weight of the same byte count, and a scale
+            // that is a vector rather than one value.
+            (
+                "f-wshape",
+                1,
+                format!("{}.weight", fp8.base),
+                "F8_E4M3".into(),
+                vec![HID as u64, V_ROWS as u64],
+                vec![0u8; fq.weight_bytes as usize],
+                "weight",
+            ),
+            (
+                "f-scount",
+                1,
+                format!("{}.weight_scale", fp8.base),
+                "F32".into(),
+                vec![2],
+                vec![0u8; 8],
+                "weight_scale",
+            ),
+        ];
+        for (tag, which, name, dtype, shape, bytes, needle) in cases {
+            let modules = vec![
+                Module::nvfp4("model.layers.0.mlp.gate_proj", INTER, HID, &mut 7),
+                Module::fp8("model.layers.0.linear_attn.in_proj_z", V_ROWS, HID, &mut 9),
+            ];
+            let (n, k) = (modules[which].n, modules[which].k);
+            let base = modules[which].base.clone();
+            let dir =
+                write_modelopt_checkpoint(tag, &modules, &[], &[(name, dtype, shape, bytes)], None);
+            let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+            let err = match modelopt_importer(&ckpt).lower_linear(&base, n, k, None) {
+                Ok(l) => panic!("{tag}: accepted, {} bytes as {:?}", l.bytes.len(), l.quant),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(needle), "{tag}: not refused by name: {err}");
+        }
+    }
+
+    #[test]
+    fn modelopt_row_permutations_invert_to_the_source() {
+        let mut seed = 77u64;
+        let mut modules = nvfp4_modules(&mut seed);
+        modules.extend(fp8_modules(&mut seed));
+        let dir = write_modelopt_checkpoint("perm", &modules, &[], &[], None);
+        let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+        let importer = modelopt_importer(&ckpt);
+        let perm = v_head_perm(VH, KH);
+        let qkv_row_perm = expand_head_perm(&perm, GHD, 2 * QK_ROWS);
+        let v_row_perm = expand_head_perm(&perm, GHD, 0);
+        let inverse = |p: &[usize]| {
+            let mut inv = vec![0usize; p.len()];
+            for (i, &src) in p.iter().enumerate() {
+                inv[src] = i;
+            }
+            inv
+        };
+
+        // The two row-permuted FP8 roles: every permuted plane equals its
+        // source after the inverse permutation.
+        for (base, n, k, row_perm) in [
+            (
+                "model.layers.0.linear_attn.in_proj_qkv",
+                QKV_ROWS,
+                HID,
+                &qkv_row_perm,
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                &v_row_perm,
+            ),
+        ] {
+            let m = modules.iter().find(|m| m.base == base).unwrap();
+            let lowered = importer.lower_linear(base, n, k, Some(row_perm)).unwrap();
+            assert_eq!(lowered.quant, QuantScheme::Fp8E4M3);
+            assert_eq!(
+                lowered.bytes,
+                m.expected_bytes(Some(row_perm)),
+                "{base} forward"
+            );
+            let weight = &lowered.bytes[..n * k];
+            assert_eq!(
+                permute_rows(weight, k, &inverse(row_perm)),
+                m.source_weight(),
+                "{base} inverse"
+            );
+            // The permutation really moved something.
+            assert_ne!(weight, m.source_weight(), "{base} is a no-op permutation");
+        }
+
+        // This fixture's NVFP4 modules (the MLP and the head) carry no
+        // permutation, but the transform is exercised the same way when one is
+        // asked for.
+        let m = modules.iter().find(|m| m.base == "lm_head").unwrap();
+        let rev: Vec<usize> = (0..m.n).rev().collect();
+        let lowered = importer
+            .lower_linear(&m.base, m.n, m.k, Some(&rev))
+            .unwrap();
+        let planes = Nvfp4Planes::for_shape(m.n as u64, m.k as u64).unwrap();
+        let w = &lowered.bytes[..planes.weight_bytes as usize];
+        let s = &lowered.bytes[planes.weight_bytes as usize
+            ..(planes.weight_bytes + planes.block_scale_bytes) as usize];
+        let PlaneSet::Nvfp4 {
+            weight,
+            block_scale,
+            global,
+        } = &m.planes
+        else {
+            unreachable!()
+        };
+        assert_eq!(permute_rows(w, m.k / 2, &inverse(&rev)), *weight);
+        assert_eq!(permute_rows(s, m.k / 16, &inverse(&rev)), *block_scale);
+        assert_eq!(
+            &lowered.bytes[(planes.weight_bytes + planes.block_scale_bytes) as usize..],
+            &global.to_le_bytes()
+        );
+    }
+
+    /// The donor GGUF the synthetic conversions take their metadata from.
+    fn synthetic_donor(path: &std::path::Path) {
+        let mut b = GgufBuilder::new();
+        b.add_string("general.architecture", "qwen35");
+        b.add_u32("qwen35.block_count", 4);
+        b.add_u32("qwen35.attention.head_count", 4);
+        b.add_u32("qwen35.attention.head_count_kv", 2);
+        b.add_u32("qwen35.attention.key_length", 8);
+        b.add_u32("qwen35.embedding_length", HID as u32);
+        b.add_u32("qwen35.feed_forward_length", INTER as u32);
+        b.add_u32("qwen35.context_length", 64);
+        b.add_f32("qwen35.rope.freq_base", 10000.0);
+        b.add_f32("qwen35.attention.layer_norm_rms_epsilon", 1e-5);
+        b.add_u32("qwen35.ssm.time_step_rank", VH as u32);
+        b.add_u32("qwen35.ssm.group_count", KH as u32);
+        b.add_u32("qwen35.ssm.state_size", GHD as u32);
+        b.add_u32("qwen35.ssm.conv_kernel", 4);
+        let token_names: Vec<String> = (0..VOCAB).map(|i| format!("t{i}")).collect();
+        let token_refs: Vec<&str> = token_names.iter().map(String::as_str).collect();
+        b.add_string_array("tokenizer.ggml.tokens", &token_refs);
+        b.add_f32_tensor(
+            "token_embd.weight",
+            &[VOCAB as u64, HID as u64],
+            &vec![0.0; VOCAB * HID],
+        );
+        std::fs::write(path, b.build()).unwrap();
+    }
+
+    #[test]
+    fn modelopt_checkpoint_converts_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let donor_path = dir.path().join("donor.gguf");
+        synthetic_donor(&donor_path);
+
+        // Layers 0-2 are GDN, layer 3 is full attention (the qwen35 schedule).
+        let mut seed = 101u64;
+        let mut modules = Vec::new();
+        let mut extra: Vec<(String, String, Vec<u64>, Vec<u8>)> = Vec::new();
+        let mut bf16 = |name: String, shape: Vec<u64>, seed: &mut u64| {
+            let n: usize = shape.iter().product::<u64>() as usize;
+            let vals = rand_f32(n, seed);
+            extra.push((name, "BF16".into(), shape, bf16_bytes(&vals)));
+            vals
+        };
+        let mut fp32_vals: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let emb = bf16(
+            "model.embed_tokens.weight".into(),
+            vec![VOCAB as u64, HID as u64],
+            &mut seed,
+        );
+        fp32_vals.insert("model.embed_tokens.weight".into(), emb);
+        let fnorm = bf16("model.norm.weight".into(), vec![HID as u64], &mut seed);
+        fp32_vals.insert("model.norm.weight".into(), fnorm);
+        for layer in 0..4usize {
+            let l = |s: &str| format!("model.layers.{layer}.{s}");
+            bf16(l("input_layernorm.weight"), vec![HID as u64], &mut seed);
+            bf16(
+                l("post_attention_layernorm.weight"),
+                vec![HID as u64],
+                &mut seed,
+            );
+            for (suffix, n, k) in [
+                ("mlp.gate_proj", INTER, HID),
+                ("mlp.up_proj", INTER, HID),
+                ("mlp.down_proj", HID, INTER),
+            ] {
+                modules.push(Module::nvfp4(&l(suffix), n, k, &mut seed));
+            }
+            if layer == 3 {
+                modules.push(Module::fp8(
+                    &l("self_attn.q_proj"),
+                    4 * 8 * 2,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(&l("self_attn.k_proj"), 2 * 8, HID, &mut seed));
+                modules.push(Module::fp8(&l("self_attn.v_proj"), 2 * 8, HID, &mut seed));
+                modules.push(Module::fp8(&l("self_attn.o_proj"), HID, 4 * 8, &mut seed));
+                bf16(l("self_attn.q_norm.weight"), vec![8], &mut seed);
+                bf16(l("self_attn.k_norm.weight"), vec![8], &mut seed);
+            } else {
+                modules.push(Module::fp8(
+                    &l("linear_attn.in_proj_qkv"),
+                    QKV_ROWS,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(
+                    &l("linear_attn.in_proj_z"),
+                    V_ROWS,
+                    HID,
+                    &mut seed,
+                ));
+                modules.push(Module::fp8(
+                    &l("linear_attn.out_proj"),
+                    HID,
+                    V_ROWS,
+                    &mut seed,
+                ));
+                bf16(l("linear_attn.A_log"), vec![VH as u64], &mut seed);
+                bf16(
+                    l("linear_attn.conv1d.weight"),
+                    vec![QKV_ROWS as u64, 1, 4],
+                    &mut seed,
+                );
+                bf16(l("linear_attn.dt_bias"), vec![VH as u64], &mut seed);
+                bf16(
+                    l("linear_attn.in_proj_b.weight"),
+                    vec![VH as u64, HID as u64],
+                    &mut seed,
+                );
+                bf16(
+                    l("linear_attn.in_proj_a.weight"),
+                    vec![VH as u64, HID as u64],
+                    &mut seed,
+                );
+                bf16(l("linear_attn.norm.weight"), vec![GHD as u64], &mut seed);
+            }
+        }
+        modules.push(Module::nvfp4("lm_head", VOCAB, HID, &mut seed));
+
+        let mut cfg = crate::hf_ct::test_fixture::modelopt_config();
+        cfg["text_config"] = serde_json::json!({
+            "hidden_size": HID, "num_hidden_layers": 4,
+            "intermediate_size": INTER, "vocab_size": VOCAB,
+            "rope_parameters": { "rope_theta": 10000.0 },
+        });
+        let hf_dir = write_modelopt_checkpoint("e2e", &modules, &extra, &[], Some(cfg));
+
+        let lbc_path = dir.path().join("out.lbc");
+        let stats = convert_hf_ct_to_lbc(hf_dir.path(), &donor_path, &lbc_path).unwrap();
+        assert_eq!(stats.quant_scheme, QuantScheme::Nvfp4);
+
+        let lbc = LbcFile::open(&lbc_path).unwrap();
+        let file = std::fs::read(&lbc_path).unwrap();
+        // The header names what the body and the head carry.
+        assert_eq!(lbc.header.quantization.scheme, QuantScheme::Nvfp4);
+        assert_eq!(lbc.header.output_proj.quant, QuantScheme::Nvfp4);
+        assert_eq!(lbc.header.embedding.quant, QuantScheme::Bf16);
+        assert_eq!(lbc.header.final_norm.quant, QuantScheme::F32);
+
+        let by_base: std::collections::HashMap<&str, &Module> =
+            modules.iter().map(|m| (m.base.as_str(), m)).collect();
+        let at = |s: &lumen_format::index::TensorSlice, base: u64| -> &[u8] {
+            &file[(base + s.offset) as usize..(base + s.offset + s.length) as usize]
+        };
+        // The head: its three planes, verbatim.
+        let head = &lbc.header.output_proj;
+        assert_eq!(
+            &file[head.offset as usize..(head.offset + head.length) as usize],
+            by_base["lm_head"].expected_bytes(None).as_slice()
+        );
+
+        let perm = v_head_perm(VH, KH);
+        let qkv_row_perm = expand_head_perm(&perm, GHD, 2 * QK_ROWS);
+        let v_row_perm = expand_head_perm(&perm, GHD, 0);
+        let (mut nvfp4_slices, mut fp8_slices) = (0usize, 0usize);
+        for layer in 0..4usize {
+            let idx = &lbc.layer_indices[layer];
+            let base = idx.layer_offset_bytes;
+            let st = &idx.subtensors;
+            let l = |s: &str| format!("model.layers.{layer}.{s}");
+            for (suffix, slice) in [
+                ("mlp.gate_proj", &st.w_gate),
+                ("mlp.up_proj", &st.w_up),
+                ("mlp.down_proj", &st.w_down),
+            ] {
+                let m = by_base[l(suffix).as_str()];
+                assert_eq!(slice.quant, QuantScheme::Nvfp4, "{}", m.base);
+                assert_eq!(
+                    at(slice, base),
+                    m.expected_bytes(None).as_slice(),
+                    "{}",
+                    m.base
+                );
+                nvfp4_slices += 1;
+            }
+            if layer == 3 {
+                for (suffix, slice) in [
+                    ("self_attn.q_proj", &st.wq),
+                    ("self_attn.k_proj", &st.wk),
+                    ("self_attn.v_proj", &st.wv),
+                    ("self_attn.o_proj", &st.wo),
+                ] {
+                    let m = by_base[l(suffix).as_str()];
+                    assert_eq!(slice.quant, QuantScheme::Fp8E4M3, "{}", m.base);
+                    assert_eq!(
+                        at(slice, base),
+                        m.expected_bytes(None).as_slice(),
+                        "{}",
+                        m.base
+                    );
+                    fp8_slices += 1;
+                }
+            } else {
+                // The two row-permuted GDN projections.
+                let qkv = by_base[l("linear_attn.in_proj_qkv").as_str()];
+                assert_eq!(st.wq.quant, QuantScheme::Fp8E4M3);
+                assert_eq!(
+                    at(&st.wq, base),
+                    qkv.expected_bytes(Some(&qkv_row_perm)).as_slice()
+                );
+                let z = by_base[l("linear_attn.in_proj_z").as_str()];
+                let gate = st.attn_gate.as_ref().unwrap();
+                assert_eq!(gate.quant, QuantScheme::Fp8E4M3);
+                assert_eq!(
+                    at(gate, base),
+                    z.expected_bytes(Some(&v_row_perm)).as_slice()
+                );
+                // out_proj: the v-head reorder moves INPUT column blocks, so
+                // the inverse permutation returns the source bytes.
+                let out = by_base[l("linear_attn.out_proj").as_str()];
+                let slice = st.ssm_out.as_ref().unwrap();
+                assert_eq!(slice.quant, QuantScheme::Fp8E4M3);
+                let bytes = at(slice, base);
+                let mut inverse = vec![0usize; perm.len()];
+                for (i, &src) in perm.iter().enumerate() {
+                    inverse[src] = i;
+                }
+                assert_eq!(
+                    permute_col_blocks(&bytes[..HID * V_ROWS], V_ROWS, GHD, &inverse),
+                    out.source_weight(),
+                    "out_proj column blocks"
+                );
+                assert_ne!(&bytes[..HID * V_ROWS], out.source_weight());
+                fp8_slices += 3;
+            }
+        }
+        // Every quantized module of the checkpoint reached the artifact.
+        assert_eq!((nvfp4_slices, fp8_slices), (12, 13));
+        assert_eq!(modules.len(), 12 + 13 + 1, "with the head");
+    }
+
+    /// The scalar policy, exercised on both scalar kinds: a scale is refused
+    /// by name for every way it can be wrong, never clamped. The last two
+    /// cases are the declaration's own fields, refused at open time.
+    #[test]
+    fn scalar_rejection_matrix() {
+        let bad_f32 = |v: f32| ("F32".to_owned(), vec![], v.to_le_bytes().to_vec());
+
+        for (scheme, base, n, k, scalar) in [
+            (
+                "NVFP4",
+                "model.layers.0.mlp.gate_proj",
+                INTER,
+                HID,
+                "weight_scale_2",
+            ),
+            (
+                "FP8",
+                "model.layers.0.linear_attn.in_proj_z",
+                V_ROWS,
+                HID,
+                "weight_scale",
+            ),
+        ] {
+            let name = format!("{base}.{scalar}");
+            let cases: Vec<(&str, (String, Vec<u64>, Vec<u8>))> = vec![
+                ("zero", bad_f32(0.0)),
+                ("negative", bad_f32(-1.0e-4)),
+                ("nan", bad_f32(f32::NAN)),
+                ("positive_infinity", bad_f32(f32::INFINITY)),
+                ("wrong_dtype", ("BF16".to_owned(), vec![], vec![0x80, 0x3f])),
+                ("wrong_count", ("F32".to_owned(), vec![2], vec![0u8; 8])),
+            ];
+            for (case, (dtype, shape, bytes)) in cases {
+                let mut seed = 3u64;
+                let modules = vec![if scheme == "NVFP4" {
+                    Module::nvfp4(base, n, k, &mut seed)
+                } else {
+                    Module::fp8(base, n, k, &mut seed)
+                }];
+                let dir = write_modelopt_checkpoint(
+                    &format!("scalar-{scheme}-{case}"),
+                    &modules,
+                    &[],
+                    &[(name.clone(), dtype, shape, bytes)],
+                    None,
+                );
+                let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+                let err = match modelopt_importer(&ckpt).lower_linear(base, n, k, None) {
+                    Ok(l) => panic!("{scheme}/{case}: accepted, {} bytes", l.bytes.len()),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    err.contains(&name),
+                    "{scheme}/{case}: refusal does not name {name}: {err}"
+                );
+            }
+
+            // A valid scale is accepted and carried verbatim: the policy
+            // refuses what is wrong, not what is real.
+            let valid_scale: f32 = if scheme == "NVFP4" { 4.4e-4 } else { 3.3e-3 };
+            let mut seed = 3u64;
+            let modules = vec![if scheme == "NVFP4" {
+                Module::nvfp4(base, n, k, &mut seed)
+            } else {
+                Module::fp8(base, n, k, &mut seed)
+            }];
+            let dir = write_modelopt_checkpoint(
+                &format!("scalar-{scheme}-valid"),
+                &modules,
+                &[],
+                &[(
+                    name.clone(),
+                    "F32".to_owned(),
+                    vec![],
+                    valid_scale.to_le_bytes().to_vec(),
+                )],
+                None,
+            );
+            let ckpt = HfCtCheckpoint::open(dir.path()).unwrap();
+            let lowered = modelopt_importer(&ckpt)
+                .lower_linear(base, n, k, None)
+                .unwrap_or_else(|e| panic!("{scheme}: a valid scale was refused: {e}"));
+            assert_eq!(
+                &lowered.bytes[lowered.bytes.len() - 4..],
+                &valid_scale.to_le_bytes(),
+                "{scheme}: the scale is carried verbatim"
+            );
+        }
+
+        // The declaration's own two refusals, at open time.
+        let mut seed = 3u64;
+        let modules = vec![Module::nvfp4(
+            "model.layers.0.mlp.gate_proj",
+            INTER,
+            HID,
+            &mut seed,
+        )];
+        for (case, mutate, needle) in [
+            (
+                "unsupported_group_size",
+                Box::new(|qc: &mut serde_json::Value| {
+                    qc["quantization"]["quantized_layers"]["model.layers.0.mlp.gate_proj"] =
+                        serde_json::json!({ "quant_algo": "NVFP4", "group_size": 32 });
+                }) as Box<dyn Fn(&mut serde_json::Value)>,
+                "group_size",
+            ),
+            (
+                "unknown_dialect",
+                Box::new(|qc: &mut serde_json::Value| {
+                    qc["quantization"]["quant_algo"] = serde_json::json!("W4A16_AWQ");
+                }),
+                "quant_algo",
+            ),
+        ] {
+            let dir = write_modelopt_checkpoint(&format!("decl-{case}"), &modules, &[], &[], None);
+            let mut qc: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.path().join("hf_quant_config.json")).unwrap(),
+            )
+            .unwrap();
+            mutate(&mut qc);
+            std::fs::write(
+                dir.path().join("hf_quant_config.json"),
+                serde_json::to_vec(&qc).unwrap(),
+            )
+            .unwrap();
+            let err = HfCtCheckpoint::open(dir.path()).unwrap_err().to_string();
+            assert!(err.contains(needle), "{case}: {err}");
         }
     }
 }

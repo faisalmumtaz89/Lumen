@@ -777,6 +777,9 @@ struct GpuGlobals {
     /// full F32 dynamic range. Avoids the ~4 GB F32 inflation that previously
     /// caused OOM during preload on Qwen3.5-9B BF16.
     output_proj_bf16: Option<CudaSlice<u8>>,
+    /// Output projection as raw NVFP4 bytes (None if not NVFP4): E2M1 nibbles with per-16 E4M3 block
+    /// scales, served by `matvec_nvfp4_wide_f32`.
+    output_proj_nvfp4: Option<CudaSlice<u8>>,
     /// Embedding table (F32 path): [vocab_size * hidden_dim]
     /// Empty if embedding uses a quantized raw path instead.
     embedding: CudaSlice<f32>,
@@ -3144,63 +3147,123 @@ impl CudaBackend {
                             );
                         }
                     }
-                    unsafe {
-                        // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
-                        if has_qgate_fusion {
+                    // FP8 q (or q+gate), k and v in ONE launch: each row runs `matvec_fp8_f32`'s row code, so
+                    // the three outputs are bit-identical to the separate launches below. Launched separately,
+                    // the narrow k and v projections have too few rows to fill the device.
+                    let qkv_fused =
+                        match (st.kernels.planar.fp8_qkv.as_ref(), &lw.wq, &lw.wk, &lw.wv) {
+                            (
+                                Some(qkv_fn),
+                                GpuWeightBuf::Fp8Raw(wq),
+                                GpuWeightBuf::Fp8Raw(wk),
+                                GpuWeightBuf::Fp8Raw(wv),
+                            ) => {
+                                let (q_out, q_rows) = if has_qgate_fusion {
+                                    (st.scratch.q_gate.as_mut().unwrap(), wq_out_dim as u32)
+                                } else {
+                                    (&mut st.scratch.q, q_dim as u32)
+                                };
+                                let kv_rows = kv_dim as u32;
+                                let in_dim = hidden_dim as u32;
+                                let grid = q_rows.div_ceil(4) + 2 * kv_rows.div_ceil(4);
+                                let cfg = CudarcLaunchConfig {
+                                    grid_dim: (grid, 1, 1),
+                                    block_dim: (128, 1, 1),
+                                    shared_mem_bytes: 0,
+                                };
+                                unsafe {
+                                    self.device
+                                        .stream
+                                        .launch_builder(qkv_fn)
+                                        .arg(wq)
+                                        .arg(wk)
+                                        .arg(wv)
+                                        .arg(&st.scratch.normed)
+                                        .arg(q_out)
+                                        .arg(&mut st.scratch.k)
+                                        .arg(&mut st.scratch.v)
+                                        .arg(&q_rows)
+                                        .arg(&kv_rows)
+                                        .arg(&kv_rows)
+                                        .arg(&in_dim)
+                                        .launch(cfg)
+                                }
+                                .map_err(|e| {
+                                    RuntimeError::Compute(format!("fp8 q/k/v launch: {e}"))
+                                })?;
+                                {
+                                    static SEEN: std::sync::OnceLock<()> =
+                                        std::sync::OnceLock::new();
+                                    announce_matvec_route_dims(
+                                        &SEEN,
+                                        || "matvec_fp8_three_f32",
+                                        "wq_wk_wv",
+                                        || (q_rows as usize + 2 * kv_dim, hidden_dim),
+                                    );
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                    if !qkv_fused {
+                        unsafe {
+                            // Q+gate fusion: project wq to q_gate buffer with doubled output dim.
+                            if has_qgate_fusion {
+                                launch_matvec(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.wq,
+                                    &st.scratch.normed,
+                                    st.scratch.q_gate.as_mut().unwrap(),
+                                    wq_out_dim,
+                                    hidden_dim,
+                                    "wq",
+                                    lw.wq_f16.as_ref(),
+                                    Some(&mut st.scratch.input_f16),
+                                    st.scratch.input_q8_1.as_mut(),
+                                )?;
+                            } else {
+                                launch_matvec(
+                                    &self.device,
+                                    &st.kernels,
+                                    &lw.wq,
+                                    &st.scratch.normed,
+                                    &mut st.scratch.q,
+                                    q_dim,
+                                    hidden_dim,
+                                    "wq",
+                                    lw.wq_f16.as_ref(),
+                                    Some(&mut st.scratch.input_f16),
+                                    st.scratch.input_q8_1.as_mut(),
+                                )?;
+                            }
                             launch_matvec(
                                 &self.device,
                                 &st.kernels,
-                                &lw.wq,
+                                &lw.wk,
                                 &st.scratch.normed,
-                                st.scratch.q_gate.as_mut().unwrap(),
-                                wq_out_dim,
+                                &mut st.scratch.k,
+                                kv_dim,
                                 hidden_dim,
-                                "wq",
-                                lw.wq_f16.as_ref(),
+                                "wk",
+                                lw.wk_f16.as_ref(),
                                 Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
                             )?;
-                        } else {
                             launch_matvec(
                                 &self.device,
                                 &st.kernels,
-                                &lw.wq,
+                                &lw.wv,
                                 &st.scratch.normed,
-                                &mut st.scratch.q,
-                                q_dim,
+                                &mut st.scratch.v,
+                                kv_dim,
                                 hidden_dim,
-                                "wq",
-                                lw.wq_f16.as_ref(),
+                                "wv",
+                                lw.wv_f16.as_ref(),
                                 Some(&mut st.scratch.input_f16),
                                 st.scratch.input_q8_1.as_mut(),
                             )?;
                         }
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wk,
-                            &st.scratch.normed,
-                            &mut st.scratch.k,
-                            kv_dim,
-                            hidden_dim,
-                            "wk",
-                            lw.wk_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
-                        launch_matvec(
-                            &self.device,
-                            &st.kernels,
-                            &lw.wv,
-                            &st.scratch.normed,
-                            &mut st.scratch.v,
-                            kv_dim,
-                            hidden_dim,
-                            "wv",
-                            lw.wv_f16.as_ref(),
-                            Some(&mut st.scratch.input_f16),
-                            st.scratch.input_q8_1.as_mut(),
-                        )?;
                     }
                     if attn_leaf == Some("qkv") {
                         if let Some(p) = st.profiler.as_mut() {
@@ -4084,6 +4147,82 @@ impl CudaBackend {
         // The fused kernel writes silu(gate)*up directly to scratch.gate,
         // so the SwiGLU step is skipped entirely.
         let fused_glu_fired = 'fused_glu: {
+            // An explicit `LUMEN_CUDA_FFN_FUSED_GLU=0` selects the separate gate/up path for the NVFP4 and
+            // mmvq fusions below; the model-aware default further down applies to the dp4a fusions only.
+            let fused_glu_opt_out = matches!(
+                std::env::var("LUMEN_CUDA_FFN_FUSED_GLU").ok().as_deref(),
+                Some("0") | Some("false") | Some("no") | Some("off") | Some("OFF")
+            );
+            // NVFP4 gate + up: the same RMSNorm the separate path runs, then ONE kernel that computes gate
+            // row i and up row i in the same warp from one set of activation loads and writes their SwiGLU
+            // to scratch.gate. Bit-identical to gate matvec -> up matvec -> swiglu_inplace (each plane's row
+            // is walked in the same order and the SwiGLU expression is the same).
+            if let (
+                false,
+                GpuWeightBuf::Nvfp4Raw(ref wg),
+                GpuWeightBuf::Nvfp4Raw(ref wu),
+                Some(glu_fn),
+            ) = (
+                fused_glu_opt_out,
+                &lw.w_gate,
+                &lw.w_up,
+                st.kernels.planar.nvfp4_glu.as_ref(),
+            ) {
+                {
+                    let block_size = rmsnorm_block_size(hidden_dim);
+                    let shared_bytes = rmsnorm_shared_bytes(block_size);
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (block_size, 1, 1),
+                        shared_mem_bytes: shared_bytes,
+                    };
+                    let dim = hidden_dim as u32;
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(&st.kernels.rmsnorm)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&lw.ffn_norm)
+                            .arg(&mut st.scratch.normed)
+                            .arg(&eps)
+                            .arg(&dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| RuntimeError::Compute(format!("rmsnorm ffn launch: {e}")))?;
+                }
+                let out_dim = inter_dim as u32;
+                let in_dim = hidden_dim as u32;
+                let launch_cfg = CudarcLaunchConfig {
+                    grid_dim: (out_dim.div_ceil(128 / 32).max(1), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.device
+                        .stream
+                        .launch_builder(glu_fn)
+                        .arg(wg)
+                        .arg(wu)
+                        .arg(&st.scratch.normed)
+                        .arg(&mut st.scratch.gate)
+                        .arg(&out_dim)
+                        .arg(&in_dim)
+                        .launch(launch_cfg)
+                }
+                .map_err(|e| {
+                    RuntimeError::Compute(format!("nvfp4 fused gate/up/swiglu launch: {e}"))
+                })?;
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route_dims(
+                        &SEEN,
+                        || "matvec_nvfp4_wide_glu_f32",
+                        "ffn_gate_up",
+                        || (2 * inter_dim, hidden_dim),
+                    );
+                }
+                break 'fused_glu true;
+            }
             // LUMEN_CUDA_Q8_MMVQ: mmvq-dp4a fused gate+up+SwiGLU on the Q8 split
             // layout (consult §2.7). Preferred over BOTH the separate mmvq
             // gate/up + swiglu_inplace path AND the scalar fused_glu_gemv when
@@ -4102,12 +4241,8 @@ impl CudaBackend {
             // Fires by default under Q8_MMVQ=1; an explicit
             // `LUMEN_CUDA_FFN_FUSED_GLU=0` (which already means "use the separate
             // dp4a gate/up path") opts out of the fusion.
-            let mmvq_glu_opt_out = matches!(
-                std::env::var("LUMEN_CUDA_FFN_FUSED_GLU").ok().as_deref(),
-                Some("0") | Some("false") | Some("no") | Some("off") | Some("OFF")
-            );
             if st.kernels.use_mmvq
-                && !mmvq_glu_opt_out
+                && !fused_glu_opt_out
                 && st.kernels.fused_glu_gemv_q8_split_mmvq.is_some()
                 && st.kernels.rmsnorm_to_q8_1.is_some()
                 && st.scratch.input_q8_1.is_some()
@@ -5104,7 +5239,9 @@ impl CudaBackend {
                         GpuWeightBuf::Q4KRaw(_) => "Q4KRaw",
                         GpuWeightBuf::Q5KRaw(_) => "Q5KRaw",
                         GpuWeightBuf::Q6KRaw(_) => "Q6KRaw",
-                        _ => "other",
+                        GpuWeightBuf::Nvfp4Raw(_) => "Nvfp4Raw",
+                        GpuWeightBuf::Fp8Raw(_) => "Fp8Raw",
+                        GpuWeightBuf::Ct4Raw(_) => "Ct4Raw",
                     };
                     eprintln!(
                         "[CUDA route] ffn down: w_down={variant} fused_glu_fired={fused_glu_fired} q8_split_sib={} q4_split_sib={} f16_cache={}",
@@ -5514,6 +5651,47 @@ impl CudaBackend {
                             )?;
                         }
                     }
+                } else if let (true, GpuWeightBuf::Nvfp4Raw(wd), Some(res_fn)) = (
+                    crate::runtime_defaults::ffn_direct_residual(),
+                    &lw.w_down,
+                    st.kernels.planar.nvfp4_residual.as_ref(),
+                ) {
+                    // NVFP4 down with the residual on the store: x_gpu = attn_proj + W_down * gate, replacing
+                    // down -> residual_add -> the layer-output copy. Bit-identical (the row value is the
+                    // plain kernel's, and the add commutes).
+                    let out_dim = hidden_dim as u32;
+                    let in_dim = inter_dim as u32;
+                    let launch_cfg = CudarcLaunchConfig {
+                        grid_dim: (out_dim.div_ceil(128 / 32).max(1), 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        self.device
+                            .stream
+                            .launch_builder(res_fn)
+                            .arg(wd)
+                            .arg(&st.scratch.gate)
+                            .arg(&st.scratch.attn_proj)
+                            .arg(&mut st.scratch.x_gpu)
+                            .arg(&out_dim)
+                            .arg(&in_dim)
+                            .launch(launch_cfg)
+                    }
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("nvfp4 down+residual launch: {e}"))
+                    })?;
+                    {
+                        static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        announce_matvec_route(
+                            &SEEN,
+                            || "matvec_nvfp4_wide_residual_f32",
+                            "down",
+                            hidden_dim,
+                            inter_dim,
+                        );
+                    }
+                    ffn_in_place = true;
                 } else {
                     unsafe {
                         launch_matvec(
@@ -6724,10 +6902,80 @@ impl CudaBackend {
                 })?;
             }
 
+            // FP8 qkv + FP8 z + F32 alpha/beta gates in ONE launch when those are the weights: each row runs
+            // its own kernel's code (`fp8_row_dot` / `gates_row_dot`), so the four outputs are bit-identical
+            // to the separate qkv, banked-gates and z launches below, which it replaces, except where the
+            // fast-math banked gates kernel flushes a denormal to zero. Only when those
+            // launches would all run as written: not under the qkv parity reprojection, not on the F16 gate
+            // route.
+            let gdn_in_fused = !gdn_skip_dup_qkv
+                && !gdn_ab_f16
+                && match (
+                    st.kernels.planar.fp8_gdn_in.as_ref(),
+                    &lw.wq,
+                    attn_gate_w,
+                    ssm_alpha_w,
+                    ssm_beta_w,
+                ) {
+                    (
+                        Some(fused_fn),
+                        GpuWeightBuf::Fp8Raw(wqkv),
+                        GpuWeightBuf::Fp8Raw(wz),
+                        GpuWeightBuf::F32(w_a),
+                        GpuWeightBuf::F32(w_b),
+                    ) => {
+                        let qkv_dim = p.qkv_dim as u32;
+                        let z_dim = p.value_dim as u32;
+                        let n_heads = p.num_heads as u32;
+                        let in_dim = hidden_dim as u32;
+                        let grid = 2 * n_heads + qkv_dim.div_ceil(4) + z_dim.div_ceil(4);
+                        let cfg = CudarcLaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(fused_fn)
+                                .arg(wqkv)
+                                .arg(wz)
+                                .arg(w_a)
+                                .arg(w_b)
+                                .arg(&st.scratch.normed)
+                                .arg(&mut gdn.qkv_buf)
+                                .arg(&mut gdn.gate_buf)
+                                .arg(&mut gdn.alpha_raw_buf)
+                                .arg(&mut gdn.beta_raw_buf)
+                                .arg(&qkv_dim)
+                                .arg(&z_dim)
+                                .arg(&n_heads)
+                                .arg(&in_dim)
+                                .launch(cfg)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "gdn_input_projections L{layer_idx}: {e}"
+                            ))
+                        })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route_dims(
+                                &SEEN,
+                                || "gdn_input_projections_f32",
+                                "gdn_qkv_z_gates",
+                                || (p.qkv_dim + p.value_dim + 2 * p.num_heads, hidden_dim),
+                            );
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+
             // QKV matvec
             // Skipped when the parity reprojection below overwrites qkv_buf
             // (dead work: nothing consumes this result before the overwrite).
-            if !gdn_skip_dup_qkv {
+            if !gdn_skip_dup_qkv && !gdn_in_fused {
                 unsafe {
                     launch_matvec(
                         &self.device,
@@ -6762,7 +7010,9 @@ impl CudaBackend {
             // by the unfused RMSNorm above (same input as the matvec path);
             // `input_f16` is the F32->F16 conversion scratch. `gdn_ab_f16` is
             // resolved once above the fused/unfused split.
-            if gdn_ab_f16 {
+            if gdn_in_fused {
+                // Produced by the fused input-projection launch above.
+            } else if gdn_ab_f16 {
                 let alpha_f16 = lw.ssm_alpha_f16.as_ref().expect("gdn_ab_f16 guards Some");
                 unsafe {
                     launch_hgemv_f16(
@@ -6862,6 +7112,60 @@ impl CudaBackend {
                     }
                     ab_banked = true;
                 }
+                // Planar layers are off the preq route (a planar `wq` makes `gdn_use_preq` false), so
+                // their F32 gates are served here with the same banked kernel the preq route uses: one
+                // launch for both projections.
+                if !ab_banked
+                    && matches!(lw.wq, GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_))
+                {
+                    let f32_banked = match (
+                        st.kernels.matvec_f32_gates_banked.as_ref(),
+                        ssm_alpha_w,
+                        ssm_beta_w,
+                    ) {
+                        (Some(mv_fn), GpuWeightBuf::F32(w_a), GpuWeightBuf::F32(w_b)) => {
+                            Some((mv_fn, w_a, w_b))
+                        }
+                        _ => None,
+                    };
+                    if let Some((mv_fn, w_a, w_b)) = f32_banked {
+                        let out_dim_u32 = p.num_heads as u32;
+                        let in_dim_u32 = hidden_dim as u32;
+                        let mv_cfg = CudarcLaunchConfig {
+                            grid_dim: (2 * out_dim_u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(mv_fn)
+                                .arg(w_a)
+                                .arg(w_b)
+                                .arg(&st.scratch.normed)
+                                .arg(&mut gdn.alpha_raw_buf)
+                                .arg(&mut gdn.beta_raw_buf)
+                                .arg(&out_dim_u32)
+                                .arg(&in_dim_u32)
+                                .launch(mv_cfg)
+                        }
+                        .map_err(|e| {
+                            RuntimeError::Compute(format!(
+                                "matvec_f32_gates_banked (off-preq) L{layer_idx}: {e}"
+                            ))
+                        })?;
+                        {
+                            static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                            announce_matvec_route_dims(
+                                &SEEN,
+                                || "matvec_f32_gates_banked",
+                                "gdn_gates_f32",
+                                || (2 * p.num_heads, hidden_dim),
+                            );
+                        }
+                        ab_banked = true;
+                    }
+                }
                 if !ab_banked {
                     // Alpha matvec
                     unsafe {
@@ -6900,20 +7204,22 @@ impl CudaBackend {
             }
 
             // Gate matvec (moved here from step 9 to share quantized input)
-            unsafe {
-                launch_matvec(
-                    &self.device,
-                    &st.kernels,
-                    attn_gate_w,
-                    &st.scratch.normed,
-                    &mut gdn.gate_buf,
-                    p.value_dim,
-                    hidden_dim,
-                    "gdn_gate",
-                    lw.attn_gate_f16.as_ref(),
-                    Some(&mut st.scratch.input_f16),
-                    st.scratch.input_q8_1.as_mut(),
-                )?;
+            if !gdn_in_fused {
+                unsafe {
+                    launch_matvec(
+                        &self.device,
+                        &st.kernels,
+                        attn_gate_w,
+                        &st.scratch.normed,
+                        &mut gdn.gate_buf,
+                        p.value_dim,
+                        hidden_dim,
+                        "gdn_gate",
+                        lw.attn_gate_f16.as_ref(),
+                        Some(&mut st.scratch.input_f16),
+                        st.scratch.input_q8_1.as_mut(),
+                    )?;
+                }
             }
         }
 
@@ -8354,6 +8660,40 @@ impl CudaBackend {
                         )?;
                     }
                 }
+                ssm_split_done = true;
+            }
+            if let (false, true, GpuWeightBuf::Fp8Raw(plane), Some(func)) = (
+                ssm_split_done,
+                crate::runtime_defaults::ssmout_residual_fold_enabled(),
+                ssm_out,
+                st.kernels.planar.fp8_residual_rounded.as_ref(),
+            ) {
+                // FP8 plane: the residual rides on the projection's store, rounded exactly as the separate
+                // Step 12 add would round it, so attn_proj is written here and that launch is skipped.
+                unsafe {
+                    launch_matvec_planar_residual(
+                        &self.device,
+                        func,
+                        plane,
+                        ssm_input,
+                        &st.scratch.x_gpu,
+                        &mut st.scratch.attn_proj,
+                        hidden_dim,
+                        p.value_dim,
+                        "gdn_ssm_out",
+                    )?;
+                }
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_matvec_route(
+                        &SEEN,
+                        || "matvec_fp8_f32_residual_rounded",
+                        "gdn_ssm_out",
+                        hidden_dim,
+                        p.value_dim,
+                    );
+                }
+                ssm_residual_folded = true;
                 ssm_split_done = true;
             }
             if !ssm_split_done {
@@ -11674,6 +12014,31 @@ impl CudaBackend {
                     hidden_dim,
                 );
             }
+        } else if let Some(ref plane) = st.globals.output_proj_nvfp4 {
+            // Planar head. MUST come before the BF16/F32 arms: a raw-head upload
+            // leaves `globals.output_proj` as a ONE-ELEMENT placeholder, so any arm below
+            // reads garbage logits for the token this finalizer produces.
+            let mv_fn = st.kernels.planar.nvfp4_decode.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "nvfp4 output head present but its matvec kernel is not loaded".into(),
+                )
+            })?;
+            unsafe {
+                launch_matvec_planar(
+                    &self.device,
+                    mv_fn,
+                    plane,
+                    &st.scratch.normed,
+                    &mut st.logits_gpu,
+                    vocab_size,
+                    hidden_dim,
+                    "nvfp4 final",
+                )?;
+            }
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_head_route(&SEEN, || "matvec_nvfp4_wide_f32", vocab_size, hidden_dim);
+            }
         } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
             // Path -1: BF16 output_proj matvec dispatch.
             // Gated by `LUMEN_CUDA_MMV_BF16_OUTPUT_PROJ` (canonical default ON)
@@ -11995,6 +12360,93 @@ impl CudaBackend {
         st.decode_token_count += 1;
         Ok(token)
     }
+}
+
+/// Launch the planar matvec (NVFP4 or FP8). One plane, one warp per row; the kernel derives
+/// every offset from `out_dim`/`in_dim`, including the F32 scale at the plane's tail, which both
+/// schemes carry.
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - `plane` holds an `[out_dim, in_dim]` weight of `func`'s scheme (its planes, then the F32 scale)
+/// - `input` has `in_dim` elements
+/// - `output` has `out_dim` elements
+unsafe fn launch_matvec_planar(
+    device: &CudaDevice,
+    func: &CudaFunction,
+    plane: &CudaSlice<u8>,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    // Both planar kernels launch with 128 threads (`__launch_bounds__(128, 1)`) and no dynamic shared
+    // memory: the NVFP4 kernel reads x straight from global memory as coalesced `float4`s and the FP8
+    // kernel's decode table is static shared memory, so one geometry serves both.
+    let threads = 128u32;
+    let shared_mem_bytes = 0u32;
+    let warps = threads / 32;
+    let grid = (out_dim as u32).div_ceil(warps).max(1);
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let mut b = device.stream.launch_builder(func);
+    b.arg(plane)
+        .arg(input)
+        .arg(output)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32);
+    let cudarc_cfg = CudarcLaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes,
+    };
+    b.launch(cudarc_cfg)
+        .map_err(|e| RuntimeError::Compute(format!("{label} planar matvec launch: {e}")))?;
+    Ok(())
+}
+
+/// The residual twin of [`launch_matvec_planar`]: `out = W*x + residual`, for the planar residual kernels
+/// (`matvec_fp8_f32_residual`, `matvec_fp8_f32_residual_rounded` and `matvec_nvfp4_wide_residual_f32`).
+///
+/// # Safety
+///
+/// As [`launch_matvec_planar`], and `residual` has `out_dim` elements.
+unsafe fn launch_matvec_planar_residual(
+    device: &CudaDevice,
+    func: &CudaFunction,
+    plane: &CudaSlice<u8>,
+    input: &CudaSlice<f32>,
+    residual: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_dim: usize,
+    in_dim: usize,
+    label: &str,
+) -> Result<(), RuntimeError> {
+    // Same geometry as `launch_matvec_planar`: 128 threads, no dynamic shared memory (see there).
+    let threads = 128u32;
+    let shared_mem_bytes = 0u32;
+    let warps = threads / 32;
+    let grid = (out_dim as u32).div_ceil(warps).max(1);
+    let cfg = CudarcLaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes,
+    };
+    let out_dim_u32 = out_dim as u32;
+    let in_dim_u32 = in_dim as u32;
+    let mut b = device.stream.launch_builder(func);
+    b.arg(plane)
+        .arg(input)
+        .arg(residual)
+        .arg(output)
+        .arg(&out_dim_u32)
+        .arg(&in_dim_u32);
+    b.launch(cfg).map_err(|e| {
+        RuntimeError::Compute(format!("{label} planar matvec residual launch: {e}"))
+    })?;
+    Ok(())
 }
 
 /// Launch a matvec kernel for the given weight buffer (F32, F16, Q8_0, or Q4_0).
@@ -12867,6 +13319,35 @@ unsafe fn launch_matvec(
     }
 
     match weight {
+        // The planar schemes dispatch to their own matvecs. The slot is required, not
+        // optional: an artifact carrying these planes cannot be served without its kernel, so a missing
+        // slot is refused by name rather than falling through to a route that cannot read the plane.
+        GpuWeightBuf::Nvfp4Raw(plane) => {
+            let func = kernels.planar.nvfp4_decode.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "{label}: NVFP4 matvec kernel is not loaded, so this artifact cannot be served"
+                ))
+            })?;
+            launch_matvec_planar(device, func, plane, input, output, out_dim, in_dim, label)?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_nvfp4_wide_f32", label, out_dim, in_dim);
+            }
+            return Ok(());
+        }
+        GpuWeightBuf::Fp8Raw(plane) => {
+            let func = kernels.planar.fp8_decode.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "{label}: FP8 matvec kernel is not loaded, so this artifact cannot be served"
+                ))
+            })?;
+            launch_matvec_planar(device, func, plane, input, output, out_dim, in_dim, label)?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_fp8_f32", label, out_dim, in_dim);
+            }
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             let cfg = GemvConfig {
                 trans: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -13767,6 +14248,49 @@ unsafe fn launch_matvec_residual(
     }
 
     match weight {
+        // The planar schemes dispatch to their own matvecs. The slot is required, not
+        // optional: an artifact carrying these planes cannot be served without its kernel, so a missing
+        // slot is refused by name rather than falling through to a route that cannot read the plane.
+        GpuWeightBuf::Nvfp4Raw(plane) => {
+            // The residual entry point, as for FP8 below: this function's contract is
+            // `output = W*x + residual`.
+            let func = kernels.planar.nvfp4_residual.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "{label}: NVFP4 residual matvec kernel is not loaded, so this artifact cannot be served"
+                ))
+            })?;
+            launch_matvec_planar_residual(
+                device, func, plane, input, residual, output, out_dim, in_dim, label,
+            )?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(
+                    &SEEN,
+                    || "matvec_nvfp4_wide_residual_f32",
+                    label,
+                    out_dim,
+                    in_dim,
+                );
+            }
+            return Ok(());
+        }
+        GpuWeightBuf::Fp8Raw(plane) => {
+            // The residual entry point, not the plain one: this function's contract is
+            // `output = W*x + residual`, and the plain matvec would drop the residual silently.
+            let func = kernels.planar.fp8_residual.as_ref().ok_or_else(|| {
+                RuntimeError::Compute(format!(
+                    "{label}: FP8 residual matvec kernel is not loaded, so this artifact cannot be served"
+                ))
+            })?;
+            launch_matvec_planar_residual(
+                device, func, plane, input, residual, output, out_dim, in_dim, label,
+            )?;
+            {
+                static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                announce_matvec_route(&SEEN, || "matvec_fp8_f32_residual", label, out_dim, in_dim);
+            }
+            return Ok(());
+        }
         GpuWeightBuf::F32(w_f32) => {
             // Copy residual into output so cuBLAS can accumulate: y = W*x + y.
             device.stream.memcpy_dtod(residual, output).map_err(|e| {
@@ -14334,7 +14858,7 @@ unsafe fn launch_matvec_preq8_1(
                 device, kernels, scheme, w_kq, q8_1_buf, None, output, out_dim, in_dim, label,
             );
         }
-        _ => {} // F32, F16Raw: no dp4a path, caller should not use preq8_1
+        _ => {} // every other variant: no dp4a kernel in this dispatch
     }
 
     // Fallback: should not be reached if caller checks prerequisites.
@@ -18087,6 +18611,16 @@ fn raw_global_expected_len(
                 .map(Some)
                 .map_err(RuntimeError::Compute)
         }
+        // The planar schemes.
+        //
+        // NVFP4's stored plane is `weight[n/2] + block_scale[n/16] + global_scale[4]`, concatenated in that
+        // order by the converter (`convert_hf.rs::lower_nvfp4`). The global scale is a FIXED 4 bytes, not
+        // proportional to n, so it is added after the block check rather than folded into a per-block size:
+        // `block(16, 9)` alone is 4 bytes short of the stored plane.
+        QuantScheme::Nvfp4 => block(16, 9).map(|o| o.map(|len| len + 4)),
+        // FP8's plane is `weight[n] + global_scale[4]`, the same trailing-scalar rule as NVFP4
+        // (`convert_hf.rs::lower_fp8` appends `scale.to_le_bytes()`), so it too needs the +4.
+        QuantScheme::Fp8E4M3 => block(1, 1).map(|o| o.map(|len| len + 4)),
         _ => Ok(None),
     }
 }
@@ -18106,9 +18640,18 @@ mod raw_global_len_tests {
         assert_eq!(ok(QuantScheme::Q6_K, n), Some(13440));
         assert_eq!(ok(QuantScheme::CtInt4G32, n), None);
         assert_eq!(ok(QuantScheme::F32, n), None);
+        // The planar schemes. NVFP4 is 9 bytes per 16-element block PLUS the 4-byte global scale.
+        assert_eq!(ok(QuantScheme::Nvfp4, n), Some(n / 16 * 9 + 4));
+        assert_eq!(ok(QuantScheme::Fp8E4M3, n), Some(n + 4));
+        // A vocabulary-sized head, so the arm is checked at a realistic size and not only a round test size.
+        let real = 248_320usize * 5120;
+        assert_eq!(ok(QuantScheme::Nvfp4, real), Some(715_161_604));
+        assert_eq!(ok(QuantScheme::Fp8E4M3, real), Some(1_271_398_404));
         // element counts that do not fill whole blocks are malformed, not
         // skippable
         assert!(raw_global_expected_len(QuantScheme::Q8_0, 33).is_err());
+        // NVFP4's block is 16, so an element count that does not fill whole blocks is malformed.
+        assert!(raw_global_expected_len(QuantScheme::Nvfp4, 17).is_err());
         assert!(raw_global_expected_len(QuantScheme::Q6_K, 300).is_err());
         // overflow is an error, never a wrap
         assert!(raw_global_expected_len(QuantScheme::Bf16, usize::MAX).is_err());
@@ -18560,6 +19103,7 @@ impl ComputeBackend for CudaBackend {
             output_proj_q4,
             output_proj_f16_raw,
             output_proj_bf16_raw,
+            output_proj_nvfp4_raw,
         ) = if has_raw_output_proj {
             let raw = self.output_proj_raw.as_ref().unwrap();
             let n = hyperparams.vocab_size as usize * hyperparams.hidden_dim as usize;
@@ -18583,15 +19127,15 @@ impl ComputeBackend for CudaBackend {
             match self.output_proj_quant {
                 QuantScheme::Q8_0 => {
                     let gpu_q8 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, Some(gpu_q8), None, None, None)
+                    (placeholder, Some(gpu_q8), None, None, None, None)
                 }
                 QuantScheme::Q4_0 => {
                     let gpu_q4 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, Some(gpu_q4), None, None)
+                    (placeholder, None, Some(gpu_q4), None, None, None)
                 }
                 QuantScheme::F16 => {
                     let gpu_f16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, Some(gpu_f16), None)
+                    (placeholder, None, None, Some(gpu_f16), None, None)
                 }
                 QuantScheme::Bf16 => {
                     // BF16 output_proj: upload raw bytes (2 B/elem) and dispatch
@@ -18600,7 +19144,7 @@ impl ComputeBackend for CudaBackend {
                     let raw_mb = raw.len() as f64 / 1.0e6;
                     eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
-                    (placeholder, None, None, None, Some(gpu_bf16))
+                    (placeholder, None, None, None, Some(gpu_bf16), None)
                 }
                 QuantScheme::Q6_K if !crate::runtime_defaults::q6k_head_enabled() => {
                     // Kill-switch (LUMEN_CUDA_Q6K_HEAD=0, debug/bisect): serve
@@ -18618,7 +19162,7 @@ impl ComputeBackend for CudaBackend {
                     );
                     super::gpu_buffers::kquant_plane_counters().count_catch_all(QuantScheme::Q6_K);
                     let gpu_f32 = self.device.htod_copy(&f32_data)?;
-                    (gpu_f32, None, None, None, None)
+                    (gpu_f32, None, None, None, None, None)
                 }
                 QuantScheme::Q6_K => {
                     // Q6_K head: split the 210-byte superblocks (ql 128 / qh 64
@@ -18647,17 +19191,28 @@ impl ComputeBackend for CudaBackend {
                         self.device.htod_copy(sc.as_slice())?,
                         self.device.htod_copy(dd.as_slice())?,
                     ));
-                    (placeholder, None, None, None, None)
+                    (placeholder, None, None, None, None, None)
+                }
+                QuantScheme::Nvfp4 => {
+                    // The stored planes go up as they are: E2M1 nibbles with their per-16 E4M3 block scales. No
+                    // repack and no shadow F32 copy; the head is served by the planar matvec.
+                    eprintln!(
+                        "[CUDA mem] uploading NVFP4 output_proj raw: {:.1} MB",
+                        raw.len() as f64 / 1.0e6
+                    );
+                    super::gpu_buffers::kquant_plane_counters().count_native(QuantScheme::Nvfp4);
+                    let gpu_nvfp4 = self.device.htod_copy(raw.as_slice())?;
+                    (placeholder, None, None, None, None, Some(gpu_nvfp4))
                 }
                 other => {
                     return Err(RuntimeError::Compute(format!(
-                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, Q6_K, F16, Bf16)",
+                        "CUDA init: output_proj raw quant {other:?} not supported (only Q8_0, Q4_0, Q6_K, F16, Bf16, Nvfp4)",
                     )));
                 }
             }
         } else {
             let gpu_f32 = self.device.htod_copy(&self.output_proj)?;
-            (gpu_f32, None, None, None, None)
+            (gpu_f32, None, None, None, None, None)
         };
         let mem_after_output_proj = self.device.free_memory().unwrap_or(0);
         eprintln!(
@@ -18677,6 +19232,7 @@ impl ComputeBackend for CudaBackend {
             output_proj_q6k,
             output_proj_q4_aligned: None, // Populated during preload_weights
             output_proj_bf16: output_proj_bf16_raw,
+            output_proj_nvfp4: output_proj_nvfp4_raw,
             embedding: embedding_f32,
             embedding_q8,
             embedding_f16: embedding_f16_raw,
@@ -20231,6 +20787,31 @@ impl ComputeBackend for CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("matvec output_proj Q8_0 launch: {e}"))
                 })?;
+            } else if let Some(ref plane) = st.globals.output_proj_nvfp4 {
+                // Planar head. MUST come before the BF16/F32 arms: a raw-head upload
+                // leaves `globals.output_proj` as a ONE-ELEMENT placeholder, so any arm below
+                // reads garbage logits for the token this finalizer produces.
+                let mv_fn = st.kernels.planar.nvfp4_decode.as_ref().ok_or_else(|| {
+                    RuntimeError::Compute(
+                        "nvfp4 output head present but its matvec kernel is not loaded".into(),
+                    )
+                })?;
+                unsafe {
+                    launch_matvec_planar(
+                        &self.device,
+                        mv_fn,
+                        plane,
+                        &st.scratch.normed,
+                        &mut st.logits_gpu,
+                        vocab_size,
+                        hidden_dim,
+                        "nvfp4 final",
+                    )?;
+                }
+                {
+                    static SEEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    announce_head_route(&SEEN, || "matvec_nvfp4_wide_f32", vocab_size, hidden_dim);
+                }
             } else if let Some(ref proj_bf16) = st.globals.output_proj_bf16 {
                 // BF16 head: same launcher as the decode-path head dispatch.
                 // Without this arm the chain falls through to the F32 GEMV
@@ -20761,6 +21342,27 @@ impl ComputeBackend for CudaBackend {
                  dequant instead)"
                     .into(),
             ));
+        }
+        // A model with NVFP4 or FP8 weights needs every kernel its scheme has no fallback for:
+        // refused here, before a layer plane is uploaded, rather than at the first token. The
+        // census runs only when a planar kernel failed to load.
+        if !st.kernels.planar.load_errors.is_empty() {
+            let mut schemes = vec![self.embedding_quant, self.output_proj_quant];
+            for layer_idx in 0..num_layers {
+                let view = weights.get_layer_raw(layer_idx).map_err(|e| {
+                    RuntimeError::Compute(format!("Failed to read layer {layer_idx}: {e}"))
+                })?;
+                for (_, slice) in view.subtensors.named_slices() {
+                    if slice.length > 0 {
+                        schemes.push(slice.quant);
+                    }
+                }
+            }
+            if let Some(refusal) =
+                super::decode::planar_kernel_refusal(&schemes, &st.kernels.planar.load_errors)
+            {
+                return Err(RuntimeError::Compute(refusal));
+            }
         }
 
         let mem_before_layers = self.device.free_memory().unwrap_or(0);
@@ -21812,6 +22414,74 @@ fn f32_to_activation(values: &[f32]) -> ActivationBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `launch_matvec_residual` on an NVFP4 plane must add the residual: `output = W*x + residual`, equal
+    /// bit for bit to the plain NVFP4 matvec followed by an f32 add. Needs a CUDA device; run with
+    /// `cargo test --release -p lumen-runtime --features cuda nvfp4_residual_matvec -- --ignored`.
+    #[test]
+    #[ignore = "needs a CUDA device; run with --ignored"]
+    fn nvfp4_residual_matvec_adds_the_residual() {
+        let device = CudaDevice::new(0).expect("this test needs a CUDA device");
+        let spec = super::super::attention_decode::DecodeAttentionSpec::for_shape(2, 2, 128)
+            .expect("a test shape inside the kernel's domain");
+        let kernels = decode::compile_all_kernels(&device, crate::kv::KvPrecision::F32, spec)
+            .expect("kernels compile");
+        let (out_dim, in_dim) = (64usize, 256usize);
+        let n = out_dim * in_dim;
+        let mut plane: Vec<u8> = (0..n / 2)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        plane.extend((0..n / 16).map(|i| 0x30 + (i % 7) as u8));
+        plane.extend_from_slice(&0.01f32.to_le_bytes());
+        let x: Vec<f32> = (0..in_dim).map(|i| (i % 17) as f32 * 0.05 - 0.4).collect();
+        let residual: Vec<f32> = (0..out_dim).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let weight = GpuWeightBuf::Nvfp4Raw(device.htod_copy(&plane).unwrap());
+        let GpuWeightBuf::Nvfp4Raw(ref plane_gpu) = weight else {
+            unreachable!()
+        };
+        let x_gpu = device.htod_copy(&x).unwrap();
+        let residual_gpu = device.htod_copy(&residual).unwrap();
+        let mut wx = device.alloc_zeros::<f32>(out_dim).unwrap();
+        let mut out = device.alloc_zeros::<f32>(out_dim).unwrap();
+        unsafe {
+            let plain = kernels
+                .planar
+                .nvfp4_decode
+                .as_ref()
+                .expect("NVFP4 matvec loaded");
+            launch_matvec_planar(
+                &device, plain, plane_gpu, &x_gpu, &mut wx, out_dim, in_dim, "wx",
+            )
+            .unwrap();
+            launch_matvec_residual(
+                &device,
+                &kernels,
+                &weight,
+                &x_gpu,
+                &residual_gpu,
+                &mut out,
+                out_dim,
+                in_dim,
+                "wo",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let wx = device.dtoh_copy(&wx).unwrap();
+        let out = device.dtoh_copy(&out).unwrap();
+        assert!(wx.iter().any(|v| *v != 0.0), "degenerate matvec output");
+        for i in 0..out_dim {
+            assert_eq!(
+                out[i].to_bits(),
+                (residual[i] + wx[i]).to_bits(),
+                "row {i}: got {}, want W*x + residual = {}",
+                out[i],
+                residual[i] + wx[i]
+            );
+        }
+    }
 
     /// Verify that caps() advertises gpu_resident=true.
     /// This is a compile-time/structural test -- it validates the BackendCaps

@@ -675,3 +675,24 @@ pub const MOE_BATCHED_Q4_0_KERNEL_SOURCE: &str = include_str!("moe_batched_q4_0.
 /// the V2 path.: gated by `LUMEN_CUDA_TOPK_MOE_FUSED=1`, default ON for
 /// production (broad +6-8%, no regression, 4/4 multi-prompt MATCH).
 pub const TOPK_MOE_FUSED_KERNEL_SOURCE: &str = include_str!("topk_moe_fused.cu");
+
+/// NVFP4 (E2M1 + per-16 E4M3 block scales) plane -> f32 decode for the prefill dequant scratch, bit-identical
+/// to `lumen_format::planar_dequant::dequantize_nvfp4`; see the kernel's header for the arithmetic and its grid.
+pub const DEQUANT_NVFP4_KERNEL_SOURCE: &str = include_str!("dequant_nvfp4_f32.cu");
+
+/// FP8 E4M3 plane -> f32 decode with a per-tensor F32 scale, for the prefill dequant scratch.
+pub const DEQUANT_FP8_KERNEL_SOURCE: &str = include_str!("dequant_fp8_f32.cu");
+
+/// NVFP4 decode matvec, its residual-on-store form and the fused FFN gate+up+SwiGLU, one warp per row: lane
+/// `l` owns groups l, l+32, ... in ascending order, each 16-weight group is fetched with two `uchar4` and four
+/// `float4` loads, and its E2M1 values are built from the code bits. All three walk a row identically, so the
+/// fused kernels are bit-identical to the plain matvec followed by the unfused residual add or SwiGLU.
+pub const MATVEC_NVFP4_WIDE_KERNEL_SOURCE: &str = include_str!("matvec_nvfp4_wide.cu");
+
+/// FP8 E4M3 matvec with a per-tensor scale: plain, residual, residual-rounded, and the three-matrix
+/// q/k/v launch. Its E4M3 decode is the same arithmetic as `dequant_fp8_to_f32`.
+pub const MATVEC_FP8_KERNEL_SOURCE: &str = include_str!("matvec_fp8.cu");
+
+/// The GDN input projections (F32 alpha/beta gates, FP8 qkv, FP8 z) in one launch. Not self-contained: it is
+/// compiled after `MATVEC_FP8_KERNEL_SOURCE` and `MATVEC_F32_GATES_KERNEL_SOURCE`, whose row functions it runs.
+pub const GDN_INPUT_PROJECTIONS_KERNEL_SOURCE: &str = include_str!("gdn_input_projections.cu");

@@ -314,6 +314,16 @@ pub fn read_embedding_global(
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
 
+    // The planar schemes are decided by the header tag, never by the length cascade below: an NVFP4
+    // plane's length collides with Q4_0's and an FP8 plane's can pass the F32 fallback (see
+    // `read_output_proj_global`). No backend gathers an embedding from either scheme and the converter
+    // never writes one, so such a plane is refused by name.
+    if matches!(header_quant, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3) {
+        return Err(RuntimeError::Compute(format!(
+            "the embedding is {header_quant:?}, which no backend serves as an embedding"
+        )));
+    }
+
     // A K-quant plane is declared by the header and confirmed by its length:
     // Q4_K (144 B / 256) has exactly Q4_0's bytes per element (18 B / 32), so
     // the length alone cannot tell them apart.
@@ -410,6 +420,36 @@ pub fn read_output_proj_global(
     let expected_q8_bytes = (n_elements / 32) * 34;
     let expected_q4_bytes = (n_elements / 32) * 18;
     let expected_f16_bytes = n_elements * 2;
+    // Header-tag-first for the planar schemes, because their plane lengths collide with schemes the
+    // length cascade below claims. An NVFP4 plane's packed weights and block scales, `n/2 + n/16` bytes,
+    // are exactly Q4_0's `(n/32) * 18`, and the trailing 4-byte F32 global scale makes the stored plane
+    // miss the Q4_0 arm and pass the F32 fallback's `% 4 == 0` check, which would read the head as a
+    // quarter of its length in f32 values. The header decides. An FP8 head has no serving kernel, so it is
+    // refused by name rather than left to the cascade.
+    match header_quant {
+        QuantScheme::Nvfp4 => {
+            // Packed weights, block scales and the trailing F32 global scale.
+            let need = n_elements / 2 + n_elements / 16 + 4;
+            if raw_bytes.len() != need {
+                return Err(RuntimeError::Compute(format!(
+                    "output head plane is {} bytes but a {vocab_size} x {hidden_dim} head in Nvfp4 needs \
+                     exactly {need}",
+                    raw_bytes.len()
+                )));
+            }
+            // No F32 form for this scheme: the CPU paths do not serve it and the CUDA backend reads the
+            // raw head plane with its own kernel, so the F32 copy is empty: a consumer needing F32 finds
+            // nothing, not a wrong reading.
+            return Ok((Vec::new(), raw_bytes, QuantScheme::Nvfp4));
+        }
+        QuantScheme::Fp8E4M3 => {
+            return Err(RuntimeError::Compute(
+                "the output head is Fp8E4M3, which no backend serves as an output head".to_owned(),
+            ));
+        }
+        _ => {}
+    }
+
     // A K-quant head is declared by the header and confirmed by its length.
     let kquant = kquant_scheme_for_len(raw_bytes.len(), n_elements)
         .filter(|&q| header_quant.is_kquant_superblock() && q == header_quant);
@@ -509,7 +549,19 @@ fn dequant_subtensor_to_f32_bytes(raw_blob: &[u8], slice: &TensorSlice) -> Optio
             }
             Some(bytes)
         }
-        _ => None, // Unsupported quant scheme -- pass through as-is
+        // Named explicitly, so a NEW scheme is a compile error here rather than a silent pass-through.
+        // These all return `None`, and the caller copies the raw bytes. The test below pins each scheme's
+        // answer.
+        QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3 => None,
+        QuantScheme::CtInt4G32
+        | QuantScheme::Q4_K
+        | QuantScheme::Q5_K
+        | QuantScheme::Q6_K
+        | QuantScheme::Q4_1
+        | QuantScheme::Q5_0
+        | QuantScheme::Q2_K
+        | QuantScheme::Q3_K
+        | QuantScheme::Bf16 => None, // no f32 form on this path; the caller copies the raw bytes
     }
 }
 
@@ -1282,5 +1334,64 @@ mod tests {
             "resolved ssm_out must lie within the resolved (raw) blob — the \
              get_layer_blocking path would leave it overrunning",
         );
+    }
+    /// Every scheme's answer at the CPU dequantization pass-through.
+    ///
+    /// A scheme that passes through has its raw bytes copied and the slice re-labelled with the SAME
+    /// scheme, and `LayerView::from_owned` hands them to matmul_bytes/rmsnorm_bytes, which read raw bytes
+    /// as f32. A catch-all arm would send a newly added scheme down that branch silently; the set is
+    /// named instead, so a new scheme is a compile error, and each one's answer is pinned below.
+    #[test]
+    fn cpu_dequant_pass_through_is_named_per_scheme() {
+        let blob = vec![0u8; 64];
+
+        // Schemes this path CAN convert: the function returns bytes, so the caller takes the dequantized
+        // branch. Only the convertible ones are asserted non-None, and none of them is NVFP4/FP8.
+        for q in [
+            QuantScheme::F32,
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+            QuantScheme::F16,
+        ] {
+            let slice = TensorSlice {
+                offset: 0,
+                length: 64,
+                quant: q,
+            };
+            let got = dequant_subtensor_to_f32_bytes(&blob, &slice);
+            match q {
+                QuantScheme::F32 => assert!(
+                    got.is_none(),
+                    "F32 must pass through unchanged, got {got:?}"
+                ),
+                _ => assert!(got.is_some(), "{q:?} must convert to f32 bytes here"),
+            }
+        }
+
+        // Schemes with NO f32 form on this path: they pass through (None). The match arm names each one,
+        // so adding a scheme to QuantScheme without deciding there is a compile error.
+        for q in [
+            QuantScheme::Nvfp4,
+            QuantScheme::Fp8E4M3,
+            QuantScheme::CtInt4G32,
+            QuantScheme::Q4_K,
+            QuantScheme::Q5_K,
+            QuantScheme::Q6_K,
+            QuantScheme::Q4_1,
+            QuantScheme::Q5_0,
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+            QuantScheme::Bf16,
+        ] {
+            let slice = TensorSlice {
+                offset: 0,
+                length: 64,
+                quant: q,
+            };
+            assert!(
+                dequant_subtensor_to_f32_bytes(&blob, &slice).is_none(),
+                "{q:?} must pass through here (no f32 form on this path), and the arm must name it"
+            );
+        }
     }
 }

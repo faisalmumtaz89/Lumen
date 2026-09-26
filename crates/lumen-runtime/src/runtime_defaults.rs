@@ -156,7 +156,9 @@ pub fn set_model_dense_quant(scheme: QuantScheme) {
         | QuantScheme::Q6_K
         | QuantScheme::Q2_K
         | QuantScheme::Q3_K
-        | QuantScheme::CtInt4G32 => HINT_QUANTISED,
+        | QuantScheme::CtInt4G32
+        | QuantScheme::Nvfp4
+        | QuantScheme::Fp8E4M3 => HINT_QUANTISED,
         // F32/F16 → leave as legacy (HINT_UNSET == 0 means
         // "fall through to legacy default ON" in the resolvers).
         QuantScheme::F32 | QuantScheme::F16 => HINT_UNSET,
@@ -1544,6 +1546,32 @@ pub fn cuda_kquant_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_NVFP4=0`: kill-switch for BOTH planar weight formats — NVFP4 (E2M1 + per-16 E4M3 block
+/// scales) and FP8 E4M3. One switch covers both because they arrive together in one artifact class; an
+/// operator bisecting the planar path wants both out together, not one at a time.
+///
+/// Polarity follows the shipped convention (`LUMEN_CUDA_KQUANT=0` = off). When OFF, the CLI and the
+/// server refuse an artifact whose planes need these kernels at admission
+/// ([`publish_cuda_nvfp4_admission`]) rather than serving it some other way — there is no other route
+/// for those planes on this backend, so a silent fallback would be a different (and untested)
+/// numerical path. The CUDA backend itself does not read the switch. Default ON.
+pub fn cuda_nvfp4_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_NVFP4") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// Mirror the switch into the admission predicate, once per process.
+///
+/// `lumen-format` sits BELOW `lumen-runtime` in the dependency graph, so it cannot read this env var
+/// itself; the admission decision is made from its own flag, and this is the one place that sets it.
+/// The CLI and the server call it before admission; the CUDA backend does not read the switch itself.
+pub fn publish_cuda_nvfp4_admission() {
+    lumen_format::serving_rules::set_cuda_planar_kernels_enabled(cuda_nvfp4_enabled());
+}
+
 /// `LUMEN_CUDA_Q6K_HEAD=0`: kill-switch for the source-fidelity Q6_K output
 /// head planes. When OFF the CUDA init skips the plane build and serves the
 /// head from the provider's F32 dequant copy (SGEMV; ~5 GB extra VRAM —
@@ -1959,6 +1987,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_MOE_RESIDUAL_Q8",
     "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
     "LUMEN_CUDA_NORM_CTA5_DUAL",
+    "LUMEN_CUDA_NVFP4",
     "LUMEN_CUDA_OUTPUT_PROJ_NR",
     "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
     "LUMEN_CUDA_PREFILL_F32",
@@ -4249,6 +4278,7 @@ mod tests {
         "LUMEN_CUDA_MOE_RESIDUAL_Q8",
         "LUMEN_CUDA_MOE_ROUTER_PARALLEL",
         "LUMEN_CUDA_NORM_CTA5_DUAL",
+        "LUMEN_CUDA_NVFP4",
         "LUMEN_CUDA_OUTPUT_PROJ_NR",
         "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
         "LUMEN_CUDA_PREFILL_F32",

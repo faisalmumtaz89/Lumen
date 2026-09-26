@@ -9,6 +9,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Added
 
+- **NVFP4 and FP8 checkpoints on CUDA.** `lumen convert --from-hf` imports an NVIDIA
+  ModelOpt mixed-precision checkpoint whose quantized layers are each NVFP4 (4-bit E2M1
+  weights, an E4M3 scale per 16 weights and one F32 scale per tensor) or FP8 E4M3 (one
+  F32 scale per tensor), as the checkpoint declares per layer, and stores each tensor's
+  planes without re-quantizing them, with the GDN projections' rows or column blocks
+  reordered to the GGUF head order. The attention and MLP projections and the GDN
+  `in_proj_qkv` / `in_proj_z` may be either scheme or BF16, the GDN output projection FP8
+  or BF16, and the output head NVFP4 or BF16; the embedding must be BF16 and the GDN
+  `in_proj_a` / `in_proj_b` unquantized. A NaN E4M3 block scale or FP8 weight, a
+  `pre_quant_scale`, and a declared module outside the text model (a
+  multi-token-prediction layer, say) are refused by name. The CUDA backend serves them
+  with dedicated decode and prefill kernels; the other backends refuse such an artifact
+  at load and name the scheme. With `LUMEN_CUDA_NVFP4=0`, `lumen` and `lumen-server` refuse
+  them on CUDA as well.
 - **Token-id prompts on `/v1/completions`.** `prompt` may be an array of token ids, which
   reach the model unchanged, as in the OpenAI completions API. An id outside the model's
   vocabulary is refused with a 400, as is an array mixing strings with ids or holding any
@@ -22,6 +36,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - The CUDA RMSNorm, used by every model, keeps each thread's first eight values in
   registers between its two passes instead of reading them again for the store; its
   output is bit-identical.
+- The CUDA load-time line `[CUDA] K-quant planes: ...` is now
+  `[CUDA] quantized planes: ...` and also counts `Nvfp4` and `Fp8E4M3` planes.
+- The compressed-tensors import also reads a `rope_theta` nested under
+  `rope_parameters` when comparing the checkpoint with the donor GGUF, and refuses a
+  `rope_theta` or `rms_norm_eps` that is present but not a number instead of skipping
+  the comparison.
 
 ## [0.33.0] — 2026-09-25
 

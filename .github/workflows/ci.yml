@@ -85,6 +85,11 @@ jobs:
         env:
           LUMEN_CUDA_KQUANT: "0"
         run: "cargo test --locked -p lumen-runtime --lib --features cuda --release -- --exact cuda::gpu_buffers::tests::kquant_embedding_refusal_follows_the_switch_whatever_the_header"
+      # A CUDA-built server refuses a scheme it cannot serve before it opens a
+      # device, so these admission tests run here without a GPU, alongside the
+      # server binary's own unit tests.
+      - name: cuda server admission tests
+        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/cuda --release --test planar_scheme_admission --bin lumen-server
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
