@@ -703,6 +703,9 @@ pub struct EngineHandle {
     sender: mpsc::Sender<WorkerJob>,
     model_info: Arc<ModelInfo>,
     tokenizer: Arc<dyn Tokenize>,
+    /// Vocabulary size of the loaded model (its embedding has this many
+    /// rows): token ids a request names directly must be below it.
+    vocab_size: usize,
     /// shared per-component memory breakdown. The worker writes
     /// after each job; the `/debug/memory_breakdown` endpoint reads via
     /// [`EngineHandle::memory_breakdown_snapshot`].  Defaults to the
@@ -972,11 +975,18 @@ impl EngineHandle {
                 context_length,
             }),
             tokenizer: Arc::new(IdentityByteTokenizer::default()) as Arc<dyn Tokenize>,
+            vocab_size: 256,
             breakdown: Arc::new(Mutex::new(ServerMemoryBreakdown::default())),
             channel_pool: Arc::new(Mutex::new(VecDeque::new())),
             pool_cap: 2,
             lease: DeviceLease::unavailable(),
         }
+    }
+
+    /// Vocabulary size of the loaded model; a request's token ids must be
+    /// below it.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
     }
 
     /// Tokenize a rendered prompt string. Called by request handlers.
@@ -1383,11 +1393,13 @@ impl EngineWorker {
         ) {
             panic!("{e}");
         }
+        let vocab_size = worker.hyperparams.vocab_size as usize;
         tokio::task::spawn_blocking(move || worker.run());
         EngineHandle {
             sender: tx,
             model_info,
             tokenizer,
+            vocab_size,
             breakdown,
             channel_pool,
             pool_cap,
@@ -2859,6 +2871,7 @@ mod pool_tests {
                 context_length: 1,
             }),
             tokenizer: Arc::new(IdentityByteTokenizer::default()) as Arc<dyn Tokenize>,
+            vocab_size: 256,
             breakdown,
             channel_pool: Arc::clone(&channel_pool),
             pool_cap: 2,

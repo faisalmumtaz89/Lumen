@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **Token-id prompts on `/v1/completions`.** `prompt` may be an array of token ids, which
+  reach the model unchanged, as in the OpenAI completions API. An id outside the model's
+  vocabulary is refused with a 400, as is an array mixing strings with ids or holding any
+  other value; such elements were previously dropped without notice.
+
+### Changed
+
+- **An empty `/v1/completions` prompt is refused** with a 400. After an earlier request it
+  was served, continuing from what that request had left loaded; on a fresh server it
+  failed with an error.
+
 ## [0.33.0] — 2026-09-25
 
 ### Added

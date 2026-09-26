@@ -300,22 +300,16 @@ impl CompletionRequest {
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
         // ROBUST-007: same sampler-range guard as the chat endpoint.
         validate_sampler_ranges(self.temperature, self.top_p)?;
-        let text = match self.prompt {
-            Value::String(s) => s,
-            Value::Array(arr) => arr
-                .into_iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-                .join(""),
-            _ => {
-                return Err(ServerError::bad_request_field(
-                    "prompt must be string or array",
-                    "prompt",
-                    "invalid_type",
-                ))
-            }
-        };
-        let prompt_tokens = engine.tokenize_for_request(&text);
+        let prompt_tokens = completion_prompt_tokens(self.prompt, engine)?;
+        // The engine treats an empty prompt as "continue what is loaded", which
+        // here is the previous request's context.
+        if prompt_tokens.is_empty() {
+            return Err(ServerError::bad_request_field(
+                "prompt must not be empty",
+                "prompt",
+                "invalid_value",
+            ));
+        }
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
@@ -359,6 +353,50 @@ impl CompletionRequest {
             reasoning_budget: 0,
         })
     }
+}
+
+/// Resolve a legacy-completions `prompt` to token ids. A string, or an array
+/// of strings (concatenated), is tokenized; an array of integers is taken as
+/// token ids and reaches the engine unchanged, each checked against the
+/// model's vocabulary. An array mixing the two, or holding any other value
+/// (a nested array, a float, a negative number), is refused rather than
+/// partly ignored.
+fn completion_prompt_tokens(prompt: Value, engine: &EngineHandle) -> Result<Vec<u32>, ServerError> {
+    let invalid = || {
+        ServerError::bad_request_field(
+            "prompt must be a string, an array of strings, or an array of token ids",
+            "prompt",
+            "invalid_type",
+        )
+    };
+    let arr = match prompt {
+        Value::String(s) => return Ok(engine.tokenize_for_request(&s)),
+        Value::Array(arr) => arr,
+        _ => return Err(invalid()),
+    };
+    if arr.iter().all(Value::is_string) {
+        let text: String = arr.iter().filter_map(Value::as_str).collect();
+        return Ok(engine.tokenize_for_request(&text));
+    }
+    let vocab_size = engine.vocab_size();
+    arr.iter()
+        .map(|v| {
+            let id = v
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or_else(invalid)?;
+            if id as usize >= vocab_size {
+                return Err(ServerError::bad_request_field(
+                    format!(
+                        "prompt token id {id} is out of range for a vocabulary of {vocab_size}"
+                    ),
+                    "prompt",
+                    "invalid_value",
+                ));
+            }
+            Ok(id)
+        })
+        .collect()
 }
 
 /// ROBUST-007 (2026-06-11 production checklist): reject out-of-range sampler
@@ -2235,6 +2273,67 @@ mod tests {
                 );
             }
             other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn completion_job(prompt: Value) -> Result<JobRequest, ServerError> {
+        let engine = EngineHandle::new_for_test(4096);
+        serde_json::from_value::<CompletionRequest>(json!({"model": "m", "prompt": prompt}))
+            .unwrap()
+            .into_job(&engine)
+    }
+
+    fn assert_prompt_error(prompt: Value, want_code: &str) {
+        match completion_job(prompt.clone()) {
+            Err(ServerError::BadRequest { code, param, .. }) => {
+                assert_eq!(code.as_deref(), Some(want_code), "prompt {prompt}");
+                assert_eq!(param.as_deref(), Some("prompt"), "prompt {prompt}");
+            }
+            other => panic!("prompt {prompt}: expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_token_id_prompt_reaches_the_job_unchanged() {
+        // The test engine's vocabulary is 256 ids; 0 and 255 are its edges.
+        let ids = [0u32, 104, 105, 255, 7, 7];
+        let job = completion_job(json!(ids)).unwrap();
+        assert_eq!(job.prompt_tokens, ids);
+        // Ids are not re-tokenized: [104, 105] is the byte tokenizer's "hi".
+        assert_eq!(
+            completion_job(json!([104, 105])).unwrap().prompt_tokens,
+            completion_job(json!("hi")).unwrap().prompt_tokens
+        );
+    }
+
+    #[test]
+    fn completion_string_prompts_still_tokenize() {
+        assert_eq!(completion_job(json!("ab")).unwrap().prompt_tokens, [97, 98]);
+        assert_eq!(
+            completion_job(json!(["a", "b"])).unwrap().prompt_tokens,
+            [97, 98]
+        );
+    }
+
+    #[test]
+    fn completion_prompt_outside_the_accepted_forms_is_refused() {
+        assert_prompt_error(json!([256]), "invalid_value");
+        assert_prompt_error(json!(""), "invalid_value");
+        assert_prompt_error(json!([]), "invalid_value");
+        assert_prompt_error(json!([1, 2, 4_294_967_295u64]), "invalid_value");
+        for bad in [
+            json!([1, "a"]),
+            json!(["a", 1]),
+            json!([[1, 2]]),
+            json!([-1]),
+            json!([1.5]),
+            json!([4_294_967_296u64]),
+            json!([null]),
+            json!(5),
+            json!(null),
+            json!({"text": "a"}),
+        ] {
+            assert_prompt_error(bad, "invalid_type");
         }
     }
 
