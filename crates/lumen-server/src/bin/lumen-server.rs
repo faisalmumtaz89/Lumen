@@ -126,9 +126,10 @@ OPTIONS:
     --backend <B>          cuda | metal | cpu
                            Default: auto (Metal on macOS, CUDA if available, else CPU)
     --backend-device <N>   GPU device ordinal (CUDA only). Default: 0
-    --kv-precision <P>     KV cache storage: f16 | f32. Default: LUMEN_KV_PRECISION,
-                           else Metal f16, CUDA f32, CPU f32. On CUDA, f16 halves
-                           the cache's bytes and its attention reads.
+    --kv-precision <P>     KV cache storage: f16 | bf16 | f32. Default: LUMEN_KV_PRECISION,
+                           else Metal f16, CUDA f32, CPU f32. On CUDA, f16 and bf16
+                           halve the cache's bytes and its attention reads; bf16 is
+                           CUDA only.
     --inbox-size <N>       Engine inbox capacity (in-flight job queue depth).
                            Default: 16
     --log-level <LEVEL>    error | warn | info | debug. Default: info
@@ -990,7 +991,7 @@ async fn run(args: Args) -> Result<(), String> {
                 metal
                     .preload_weights(provider.as_dyn())
                     .map_err(|e| format!("Metal preload_weights: {e}"))?;
-                // Metal holds F16 only; a requested F32 is refused by
+                // Metal holds F16 only; a requested F32 or BF16 is refused by
                 // validate_kv_precision at the engine.
                 (
                     Box::new(metal),
@@ -1029,7 +1030,7 @@ async fn run(args: Args) -> Result<(), String> {
             wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
-            // The CPU cache stores whatever precision the session asks for.
+            // The CPU cache stores F32 or F16; the engine refuses any other precision.
             (
                 Box::new(cpu),
                 resolve_kv_precision(args.kv_precision, KvPrecision::F32),
@@ -1309,12 +1310,15 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
     }))
 }
 
-/// `--kv-precision` values: `f16` / `f32` (case-insensitive).
+/// `--kv-precision` values: `f16` / `bf16` / `f32` (case-insensitive).
 fn parse_kv_precision(value: &str) -> Result<KvPrecision, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "f16" | "fp16" | "half" => Ok(KvPrecision::F16),
+        "bf16" | "bfloat16" => Ok(KvPrecision::Bf16),
         "f32" | "fp32" | "float" => Ok(KvPrecision::F32),
-        other => Err(format!("--kv-precision must be f16 or f32 (got '{other}')")),
+        other => Err(format!(
+            "--kv-precision must be f16, bf16 or f32 (got '{other}')"
+        )),
     }
 }
 
@@ -1396,6 +1400,13 @@ mod tests {
     /// Build the `&[String]` `parse_args` expects from string literals.
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kv_precision_flag_accepts_bf16() {
+        let a = parse_args(&argv(&["m", "--kv-precision", "bf16"])).expect("parse");
+        assert_eq!(a.kv_precision, Some(lumen_runtime::kv::KvPrecision::Bf16));
+        assert!(parse_args(&argv(&["m", "--kv-precision", "int8"])).is_err());
     }
 
     #[test]

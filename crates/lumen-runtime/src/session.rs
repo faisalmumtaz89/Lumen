@@ -318,8 +318,8 @@ impl Session {
     /// Verify that the given backend supports this session's KV precision.
     ///
     /// Different backends pin the KV cache storage to a specific precision
-    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: the store the backend was built for, F32 or F16
-    /// `KvCacheGpu`); CPU backends accept any implemented precision. If the
+    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: the store the backend was built for, F32, F16 or BF16
+    /// `KvCacheGpu`); CPU backends accept F32 and F16. If the
     /// session's `RuntimeConfig.kv_precision` is incompatible with the
     /// backend, return `RuntimeError::Unsupported` with an actionable
     /// message. Callers should invoke this once before the first
@@ -1969,6 +1969,24 @@ mod tests {
         };
         let session = Session::new(cfg, hp, SamplingParams::default()).unwrap();
         assert!(session.validate_backend(&backend).is_ok());
+    }
+
+    #[test]
+    fn extend_refuses_bf16_on_cpu_naive() {
+        let (provider, backend, hp) = synthetic_setup();
+        let cfg = RuntimeConfig {
+            kv_precision: KvPrecision::Bf16,
+            ..baseline_config(64)
+        };
+        let mut session = Session::new(cfg, hp, SamplingParams::default()).unwrap();
+        match session.extend(&[1, 2, 3], &backend, &provider) {
+            Err(RuntimeError::Unsupported(msg)) => assert!(msg.contains("Bf16"), "{msg}"),
+            other => panic!(
+                "expected Unsupported, got {:?}",
+                other.map(|r| r.processed_tokens)
+            ),
+        }
+        assert!(session.tokens().is_empty());
     }
 
     // ---- prompt-length guard tests ------------------------

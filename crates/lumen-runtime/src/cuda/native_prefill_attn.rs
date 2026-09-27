@@ -6,8 +6,9 @@
 //! The group is its own NVRTC module, built like the producers' group
 //! ([`super::native_prefill_kernels`]) for `compute_120a` with no header, under the same admission
 //! conditions (Q1 to Q3). Its kernels have `native_` names and are reachable only through
-//! [`NativeAttnKernels`], never through the decode kernel set. The KV cache stays F32
-//! (`[4][max_seq][256]` per layer); attention reads a BF16 staging copy in the same layout.
+//! [`NativeAttnKernels`], never through the decode kernel set. Attention reads BF16 K and V in the
+//! cache layout (`[4][max_seq][256]` per layer): an F32 cache's BF16 staging copy, or a BF16 cache
+//! itself, which the prep writes alone.
 //!
 //! Loading launches every kernel once on a small fixed problem whose outputs must match recorded
 //! digests. The GPU suite (`tests/cuda_native_attention_test.rs`) checks T = 1 to 2049 tokens
@@ -168,14 +169,16 @@ impl NativeAttnKernels {
     /// The norms and RoPE of `t` tokens at positions [p0, p0 + t): `qg` [t][24][512] BF16 (per head
     /// the query, then its gate), `k` and `v` [t][4][256] BF16, `q_w1`/`k_w1` the stored F32 (w + 1)
     /// [256], `cs` the RoPE table. Writes `q_out` and `gate_out` [t][24][256] BF16, and for each KV
-    /// head the rows p0..p0 + t of `k_cache`/`v_cache` (F32) and `k_stage`/`v_stage` (BF16), all
-    /// [4][max_seq][256]; nothing else.
+    /// head the rows p0..p0 + t of `k_stage`/`v_stage` (BF16) and, unless both are 0 (a BF16
+    /// cache, which is then the staging), of `k_cache`/`v_cache` (F32), all [4][max_seq][256];
+    /// nothing else.
     ///
     /// # Safety
-    /// `t >= 1`, `p0 + t <= max_seq`, `cs` holds at least `p0 + t` rows; every pointer is 16-byte
-    /// aligned and addresses device memory of the stated size that stays allocated until the device
-    /// stream has run the launch, no buffer the launch writes overlaps another pointer argument, and
-    /// the launch is ordered after the work that writes the inputs (the device stream).
+    /// `t >= 1`, `p0 + t <= max_seq`, `cs` holds at least `p0 + t` rows; `k_cache` and `v_cache` are
+    /// both 0 or both not; every other pointer, and those two when not 0, is 16-byte aligned and
+    /// addresses device memory of the stated size that stays allocated until the device stream has
+    /// run the launch, no buffer the launch writes overlaps another pointer argument, and the launch
+    /// is ordered after the work that writes the inputs (the device stream).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn prep(
         &self,

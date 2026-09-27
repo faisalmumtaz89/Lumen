@@ -107,8 +107,8 @@ pub const MATVEC_F16_KERNEL_SOURCE: &str = include_str!("matvec_f16.cu");
 /// left-shift; on SM_80+ the compiler emits the dedicated CVT instruction.
 pub const MATVEC_BF16_KERNEL_SOURCE: &str = include_str!("matvec_bf16.cu");
 
-/// F16 KV cache kernels (f32->f16 write, f16->f32 read).
-pub const KV_CACHE_F16_KERNEL_SOURCE: &str = include_str!("kv_cache_f16.cu");
+/// The 16-bit KV cache kernels: F32 -> half or bfloat16 writes, the exact widening read.
+pub const KV_CACHE_16_KERNEL_SOURCE: &str = include_str!("kv_cache_16.cu");
 
 /// F32 <-> F16 bulk conversion kernels (f32_to_f16_vec, f16_to_f32_vec).
 pub const CONVERT_F16_KERNEL_SOURCE: &str = include_str!("convert_f16.cu");

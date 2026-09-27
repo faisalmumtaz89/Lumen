@@ -22,6 +22,10 @@ use crate::error::RuntimeError;
 pub enum KvPrecision {
     F32,
     F16,
+    /// bfloat16: the F32 range at 8 bits of significand. The host cache
+    /// allocates it but does not read or write it; each backend's
+    /// `validate_kv_precision` says whether it serves it.
+    Bf16,
     /// 8-bit integer quantized.
     Int8,
     /// 4-bit integer quantized (most compressed).
@@ -41,7 +45,7 @@ impl KvPrecision {
     pub fn bytes_per_element(&self) -> usize {
         match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::Bf16 => 2,
             // Reserved for future use -- see `is_implemented()`.
             Self::Int8 => 1,
             // Int4 stores two elements per byte; returns 1 as the minimum
@@ -50,16 +54,16 @@ impl KvPrecision {
         }
     }
 
-    /// Returns `true` if this precision is fully implemented in the KV cache
-    /// read/write paths.
+    /// Returns `true` if a KV cache of this precision can be allocated.
     ///
-    /// Currently F32 and F16 are supported. Int8 and Int4 are defined
-    /// for forward-compatible configuration but will be rejected at
-    /// [`KvCache::new`] time until the corresponding KV storage paths are
-    /// implemented.
+    /// F32, F16 and BF16 can. Int8 and Int4 are defined for
+    /// forward-compatible configuration but are rejected at [`KvCache::new`]
+    /// time until the corresponding KV storage paths are implemented. Which
+    /// precisions a backend reads and writes is the backend's own
+    /// `validate_kv_precision`.
     pub fn is_implemented(&self) -> bool {
         match self {
-            Self::F32 | Self::F16 => true,
+            Self::F32 | Self::F16 | Self::Bf16 => true,
             Self::Int8 | Self::Int4 => false,
         }
     }
@@ -866,6 +870,7 @@ mod tests {
     fn kv_precision_bytes_per_element() {
         assert_eq!(KvPrecision::F32.bytes_per_element(), 4);
         assert_eq!(KvPrecision::F16.bytes_per_element(), 2);
+        assert_eq!(KvPrecision::Bf16.bytes_per_element(), 2);
         assert_eq!(KvPrecision::Int8.bytes_per_element(), 1);
         assert_eq!(KvPrecision::Int4.bytes_per_element(), 1);
     }
@@ -1163,6 +1168,7 @@ mod tests {
     fn kv_precision_is_implemented() {
         assert!(KvPrecision::F32.is_implemented());
         assert!(KvPrecision::F16.is_implemented());
+        assert!(KvPrecision::Bf16.is_implemented());
         assert!(!KvPrecision::Int8.is_implemented());
         assert!(!KvPrecision::Int4.is_implemented());
     }

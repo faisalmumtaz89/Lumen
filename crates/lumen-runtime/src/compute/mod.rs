@@ -277,25 +277,26 @@ pub trait ComputeBackend: Send + Sync {
     /// CPU-resident KV cache; if the runtime config asks for a different
     /// precision the backend silently ignored it before, producing memory-
     /// layout mismatches that would later corrupt KV writes (Metal: F16-only
-    /// `gpu_k_cache`/`gpu_v_cache`; CUDA: the F32 or F16 store it was built for). Reject the
+    /// `gpu_k_cache`/`gpu_v_cache`; CUDA: the F32, F16 or BF16 store it was built for). Reject the
     /// mismatch up front so the caller sees an explicit error instead of
     /// downstream silent data corruption.
     ///
-    /// Default impl (CPU naive / SIMD) accepts both `F32` and `F16` because
-    /// the CPU `KvCache` byte buffers are sized by `config.precision` and the
-    /// `KvCacheView` append/read helpers dispatch on precision at runtime.
+    /// Default impl (CPU naive / SIMD) accepts `F32` and `F16`: the CPU
+    /// `KvCache` byte buffers are sized by `config.precision`, and the
+    /// `KvCacheView` append/read helpers and the CPU attention read those two.
     ///
     /// Backends with a hardcoded precision MUST override this and return
     /// `RuntimeError::Unsupported` for mismatched configs.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        // CPU backends store KV in `Vec<u8>` sized by precision and dispatch
-        // append/read at runtime, so any implemented precision works.
-        if !precision.is_implemented() {
-            return Err(RuntimeError::Unsupported(format!(
-                "KV cache precision {precision:?} is not yet implemented"
-            )));
+        match precision {
+            KvPrecision::F32 | KvPrecision::F16 => Ok(()),
+            other if !other.is_implemented() => Err(RuntimeError::Unsupported(format!(
+                "KV cache precision {other:?} is not yet implemented"
+            ))),
+            other => Err(RuntimeError::Unsupported(format!(
+                "the CPU backends store the KV cache as F32 or F16 (requested {other:?})"
+            ))),
         }
-        Ok(())
     }
 
     // ====================================================================

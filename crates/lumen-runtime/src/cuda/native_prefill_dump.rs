@@ -14,7 +14,7 @@
 //! | `cv`, `ring`, `core`, `state` | GDN conv output BF16 `[t][10240]`, ring after, output BF16 `[t][6144]`, state after |
 //! | `y8` | FP8 codes `[t][6144]` of the GDN gated norm |
 //! | `qg`, `k`, `v` | Attention input projections: BF16 `[t][12288]`, `[t][1024]`, `[t][1024]` |
-//! | `p0`, `cs`, `kv_in` | An attention layer's first position (`u32`), its RoPE table rows `[p0, p0 + t)` F32 `[t][64]`, and its F32 KV cache `[2][4][max_seq][256]` (K, then V) before it |
+//! | `p0`, `cs`, `kv_in` | An attention layer's first position (`u32`), its RoPE table rows `[p0, p0 + t)` F32 `[t][64]`, and its KV cache `[2][4][max_seq][256]` (K, then V) before it, in the store's type (F32, or BF16 on a BF16 store) |
 //! | `q`, `gate`, `kv` | The prep: normed and rotated queries and the gate, BF16 `[t][24][256]`, and the KV cache after it |
 //! | `o`, `o8` | The attention output BF16 `[t][6144]` and the gated output's FP8 codes |
 //! | `attn_out` | The output projection, BF16 `[t][5120]` |

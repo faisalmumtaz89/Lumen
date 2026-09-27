@@ -5,6 +5,18 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Added
+
+- **A BF16 KV cache on CUDA.** `--kv-precision bf16` (or `LUMEN_KV_PRECISION=bf16`) stores
+  keys and values as bfloat16: half the F32 cache's memory at F32's range. The native
+  NVFP4/FP8 prefill writes the cache directly and attends to it in place, with no staging
+  copy and no widening buffers, and its output is bit for bit the F32 cache's. On a 32 GB
+  RTX 5090, Qwen3.8-27B NVFP4 keeps the native prefill with a 140,000-position BF16 cache
+  (31.2 GB in use) and served a 95,000-token request with it; an F32 cache of 65,536
+  positions already takes 30.9 GB. The CPU backends and Metal refuse `bf16`.
+
 ## [0.34.0] — 2026-09-27
 
 ### Added

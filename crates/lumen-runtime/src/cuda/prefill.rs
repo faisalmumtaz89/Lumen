@@ -3733,18 +3733,19 @@ pub(crate) unsafe fn launch_cublas_gemm_bf16(
 }
 
 // ---------------------------------------------------------------------------
-// The half store's readers and writers. Every function here takes `u16`
-// buffers and the kernels in `KernelSet::kv_f16`, which exist only when the
-// backend was built for a half store; nothing here can be reached with F32
-// bytes.
+// The 16-bit store's readers and writers. Every function here takes `u16`
+// buffers and the kernels in `KernelSet::kv16`, which exist only when the
+// backend was built for a 16-bit store and are of that store's format; nothing
+// here can be reached with F32 bytes.
 // ---------------------------------------------------------------------------
 
-/// `kv_cache_write_batch_f16`: `batch` tokens of F32 K or V into a half
-/// store, rounding on the way in and counting what does not fit.
+/// `kv_cache_write_batch_{f16,bf16}`: `batch` tokens of F32 K or V into a
+/// 16-bit store, rounding on the way in and counting what is stored as ±Inf or
+/// NaN.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn launch_kv_cache_write_batch_f16(
+pub(crate) unsafe fn launch_kv_cache_write_batch_16(
     device: &CudaDevice,
-    f16: &super::decode::KvF16Kernels,
+    kv16: &super::decode::Kv16Kernels,
     cache: &mut CudaSlice<u16>,
     data: &CudaSlice<f32>,
     overflow: &mut CudaSlice<u32>,
@@ -3769,7 +3770,7 @@ pub(crate) unsafe fn launch_kv_cache_write_batch_f16(
     let hd = head_dim as u32;
     device
         .stream
-        .launch_builder(&f16.write_batch)
+        .launch_builder(&kv16.write_batch)
         .arg(cache)
         .arg(data)
         .arg(overflow)
@@ -3779,18 +3780,18 @@ pub(crate) unsafe fn launch_kv_cache_write_batch_f16(
         .arg(&msl)
         .arg(&hd)
         .launch(launch_cfg)
-        .map_err(|e| RuntimeError::Compute(format!("kv_cache_write_batch_f16 launch: {e}")))?;
+        .map_err(|e| RuntimeError::Compute(format!("16-bit kv_cache_write_batch launch: {e}")))?;
     Ok(())
 }
 
-/// `kv_cache_widen_f16` for K and V: positions `0..count` of every head,
+/// `kv_cache_widen_{f16,bf16}` for K and V: positions `0..count` of every head,
 /// widened into `[num_kv_heads, count, head_dim]` F32 buffers — the F32 cache
 /// layout with a position stride of `count`, which is what the returned view
 /// says.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn launch_kv_widen_f16<'a>(
+pub(crate) unsafe fn launch_kv_widen_16<'a>(
     device: &CudaDevice,
-    f16: &super::decode::KvF16Kernels,
+    kv16: &super::decode::Kv16Kernels,
     k_cache: &CudaSlice<u16>,
     v_cache: &CudaSlice<u16>,
     out: &'a mut (CudaSlice<f32>, CudaSlice<f32>),
@@ -3820,7 +3821,7 @@ pub(crate) unsafe fn launch_kv_widen_f16<'a>(
     for (cache, dst, which) in [(k_cache, &mut out.0, "K"), (v_cache, &mut out.1, "V")] {
         device
             .stream
-            .launch_builder(&f16.widen)
+            .launch_builder(&kv16.widen)
             .arg(cache)
             .arg(dst)
             .arg(&nkvh)
@@ -3829,7 +3830,7 @@ pub(crate) unsafe fn launch_kv_widen_f16<'a>(
             .arg(&hd)
             .launch(launch_cfg)
             .map_err(|e| {
-                RuntimeError::Compute(format!("kv_cache_widen_f16 {which} launch: {e}"))
+                RuntimeError::Compute(format!("16-bit kv_cache_widen {which} launch: {e}"))
             })?;
     }
     Ok(KvView {

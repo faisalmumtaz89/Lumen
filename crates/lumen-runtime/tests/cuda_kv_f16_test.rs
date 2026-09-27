@@ -19,7 +19,7 @@
 
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::{KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
+use lumen_runtime::cuda::shaders::{KV_CACHE_16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
 use lumen_runtime::cuda::{
     decode_attention_merge_shared_bytes, ATTN_DECODE_BLOCK_DIM as BLOCK_DIM,
     ATTN_DECODE_FIXTURE_SHAPE as SPEC, ATTN_DECODE_TILE,
@@ -302,7 +302,7 @@ fn special_values() -> Vec<(f32, bool)> {
 fn the_writers_round_to_nearest_even_and_count_what_does_not_fit() {
     let Some(dev) = try_device() else { return };
     let module = dev
-        .compile_and_load(KV_CACHE_F16_KERNEL_SOURCE)
+        .compile_and_load(KV_CACHE_16_KERNEL_SOURCE)
         .expect("compile half writers");
     let write = module.load_function("kv_cache_write_f16").expect("write");
     let write_batch = module
@@ -416,7 +416,7 @@ fn the_writers_round_to_nearest_even_and_count_what_does_not_fit() {
 fn the_widening_read_is_exact() {
     let Some(dev) = try_device() else { return };
     let module = dev
-        .compile_and_load(KV_CACHE_F16_KERNEL_SOURCE)
+        .compile_and_load(KV_CACHE_16_KERNEL_SOURCE)
         .expect("compile half kernels");
     let widen = module.load_function("kv_cache_widen_f16").expect("widen");
     let num_kv_heads: u32 = 4;
