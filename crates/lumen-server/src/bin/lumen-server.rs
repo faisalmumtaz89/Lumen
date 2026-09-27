@@ -636,7 +636,8 @@ impl ServerWeights {
         }
     }
 
-    /// Borrow as `&dyn WeightProvider` for `preload_weights`.
+    /// Borrow as `&dyn WeightProvider` for `preload_weights` (the CUDA and Metal backends).
+    #[cfg(any(feature = "cuda", target_os = "macos"))]
     fn as_dyn(&self) -> &dyn WeightProvider {
         match self {
             ServerWeights::Sync(p) => &**p,
