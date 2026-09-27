@@ -1065,10 +1065,11 @@ pub(crate) struct KernelSet {
     pub(crate) moe_shared_down_q4_0_residual_accum: Option<CudaFunction>,
 
     /// The 16-bit KV cache's kernels: present only when the backend was built
-    /// for `KvPrecision::F16`, and then every one of them loaded (`?`, never
-    /// `.ok()`), so a half-typed store always has a half-typed reader and
-    /// writer. `None` means the store is F32 and nothing here can be reached.
-    pub(crate) kv_f16: Option<KvF16Kernels>,
+    /// for `KvPrecision::F16` or `KvPrecision::Bf16`, and then every one of
+    /// them loaded (`?`, never `.ok()`) for that format, so a 16-bit store
+    /// always has a reader and writer of its own format. `None` means the
+    /// store is F32 and nothing here can be reached.
+    pub(crate) kv16: Option<Kv16Kernels>,
 
     // The planar schemes (NVFP4, FP8): decode, fused-decode and prefill kernels for each. Every slot is
     // `Option` because they are NVRTC-compiled at run time and a load can fail on a device or driver. A
@@ -1156,17 +1157,38 @@ pub(crate) fn planar_kernel_refusal(
         })
 }
 
-/// The kernels a half-typed KV store is read and written with. Loaded as a
-/// group or not at all.
-pub(crate) struct KvF16Kernels {
-    /// `attention_decode_partial_f16`; the F32 merge consumes its partials.
+/// The kernels a 16-bit KV store (half or bfloat16) is read and written with,
+/// all of one format. Loaded as a group or not at all.
+pub(crate) struct Kv16Kernels {
+    /// The format every kernel here reads or writes: `F16` or `Bf16`.
+    pub(crate) precision: crate::kv::KvPrecision,
+    /// `attention_decode_partial_{f16,bf16}`; the F32 merge consumes its partials.
     pub(crate) attention_decode_partial: CudaFunction,
-    /// `kv_cache_write_batch_f16` (prefill).
+    /// `kv_cache_write_batch_{f16,bf16}` (prefill).
     pub(crate) write_batch: CudaFunction,
-    /// `kv_cache_widen_f16`: the prefill readers work on a widened F32 copy.
+    /// `kv_cache_widen_{f16,bf16}`: the prefill readers work on a widened F32 copy.
     pub(crate) widen: CudaFunction,
-    /// `attn_prep_fused_kvf16`, the fused decode writer.
+    /// `attn_prep_fused_kv{f16,bf16}`, the fused decode writer.
     pub(crate) prep_fused: CudaFunction,
+}
+
+impl Kv16Kernels {
+    /// The kernels, when they are of the store's format `precision`.
+    pub(crate) fn of(
+        kernels: &KernelSet,
+        precision: crate::kv::KvPrecision,
+    ) -> Result<&Kv16Kernels, RuntimeError> {
+        match kernels.kv16.as_ref() {
+            Some(k) if k.precision == precision => Ok(k),
+            Some(k) => Err(RuntimeError::Compute(format!(
+                "{precision:?} KV cache reached with the {:?} kernels",
+                k.precision
+            ))),
+            None => Err(RuntimeError::Compute(format!(
+                "{precision:?} KV cache reached without its kernels"
+            ))),
+        }
+    }
 }
 
 /// The kernels that serve one K-quant scheme (Q4_K, Q5_K or Q6_K) natively:
@@ -1283,19 +1305,32 @@ pub(crate) fn compile_all_kernels(
         })
     };
 
-    // The half store's kernels load as a group, each with `?`: a store that
+    // The 16-bit store's kernels load as a group, each with `?`: a store that
     // cannot be read or written by every path that touches it is refused at
     // init, never discovered at a dispatch.
-    let kv_f16 = match kv_precision {
-        crate::kv::KvPrecision::F16 => Some(KvF16Kernels {
-            attention_decode_partial: load_attention("attention_decode_partial_f16")?,
+    let load_kv16 = |precision, suffix: &str| -> Result<Kv16Kernels, RuntimeError> {
+        Ok(Kv16Kernels {
+            precision,
+            attention_decode_partial: load_attention(&format!(
+                "attention_decode_partial_{suffix}"
+            ))?,
             write_batch: load_fn(
                 shaders::KV_CACHE_F16_KERNEL_SOURCE,
-                "kv_cache_write_batch_f16",
+                &format!("kv_cache_write_batch_{suffix}"),
             )?,
-            widen: load_fn(shaders::KV_CACHE_F16_KERNEL_SOURCE, "kv_cache_widen_f16")?,
-            prep_fused: load_fn(shaders::QGATE_FUSION_KERNEL_SOURCE, "attn_prep_fused_kvf16")?,
-        }),
+            widen: load_fn(
+                shaders::KV_CACHE_F16_KERNEL_SOURCE,
+                &format!("kv_cache_widen_{suffix}"),
+            )?,
+            prep_fused: load_fn(
+                shaders::QGATE_FUSION_KERNEL_SOURCE,
+                &format!("attn_prep_fused_kv{suffix}"),
+            )?,
+        })
+    };
+    let kv16 = match kv_precision {
+        crate::kv::KvPrecision::F16 => Some(load_kv16(kv_precision, "f16")?),
+        crate::kv::KvPrecision::Bf16 => Some(load_kv16(kv_precision, "bf16")?),
         crate::kv::KvPrecision::F32 => None,
         other => {
             return Err(RuntimeError::Unsupported(format!(
@@ -1304,8 +1339,8 @@ pub(crate) fn compile_all_kernels(
         }
     };
 
-    // Every entry point loads before the target is recorded (the half
-    // partial above, when a half store is configured; both F32 entries here):
+    // Every entry point loads before the target is recorded (the 16-bit
+    // partial above, when a 16-bit store is configured; both F32 entries here):
     // a refused target falls back inside `load_attention`, and the record, the
     // load line, the route line and the dump must all name what actually loaded.
     let attention_decode_partial = load_attention("attention_decode_partial_f32")?;
@@ -1380,7 +1415,7 @@ pub(crate) fn compile_all_kernels(
     );
     let kernels = KernelSet {
         planar,
-        kv_f16,
+        kv16,
         attn_spec,
         attn_codegen: attn_codegen.get(),
         attention_decode_partial,

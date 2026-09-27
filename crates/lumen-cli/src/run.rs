@@ -650,7 +650,7 @@ pub(crate) fn run_inference(args: &[String]) {
             }
             "--kv-precision" => {
                 // explicit KV cache precision. Metal stores KV in F16 only;
-                // CUDA stores F32 by default and F16 on request; CPU F32.
+                // CUDA stores F32 by default and F16 or BF16 on request; CPU F32.
                 // A precision a backend cannot hold is refused before any
                 // cache is allocated (backend.validate_kv_precision).
                 i += 1;
@@ -1411,7 +1411,7 @@ fn parse_kv_precision(value: &str) -> Result<KvPrecision, String> {
 ///
 /// Backend defaults match each backend's hardcoded storage:
 /// - Metal: F16 (gpu_k_cache/gpu_v_cache are F16 only)
-/// - CUDA: F32 (the half store is opt-in: `--kv-precision f16`)
+/// - CUDA: F32 (the 16-bit stores are opt-in: `--kv-precision f16` or `bf16`)
 /// - CPU (naive/SIMD): F32 (default of RuntimeConfig)
 ///
 /// Returns `None` to mean "use the existing config default" so callers do not

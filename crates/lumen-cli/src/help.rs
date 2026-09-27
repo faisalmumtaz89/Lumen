@@ -149,14 +149,15 @@ OPTIONS:
                           per deployment. The BF16 mmvf kernel produces different first-token
                           argmax at different KV-cache layout sizes; pinning eliminates
                           the cross-deployment non-determinism. Q8 / Q4 are unaffected.
-    --kv-precision <p>    KV cache storage precision: f16 | f32. Default: backend-appropriate
+    --kv-precision <p>    KV cache storage precision: f16 | bf16 | f32. Default: backend-appropriate
                           (Metal -> f16, CUDA -> f32, CPU -> f32). The Metal backend pins KV
                           to f16; passing --kv-precision f32 on Metal is rejected with an
-                          explicit error. CUDA takes either: f16 halves the cache and refuses a
-                          generation whose values do not fit the format (either store
-                          serves a head dimension of 128 or 256; any other is refused at
-                          start-up for the CUDA backend as a whole).
-                          Honors `LUMEN_KV_PRECISION=f16|f32` env override.
+                          explicit error. CUDA takes any of the three: f16 and bf16 halve the
+                          cache and refuse a generation whose values the format stores as
+                          Inf or NaN (every store serves a head dimension of 128 or 256; any
+                          other is refused at start-up for the CUDA backend as a whole).
+                          bf16 is CUDA only.
+                          Honors `LUMEN_KV_PRECISION=f16|bf16|f32` env override.
     --kv-disk-dir <dir>   Directory for the disk-persistent KV cache.
                           When set, the runtime purges stale .tmp.<pid> writes at
                           startup and (if --kv-disk-space-mb is also set) evicts

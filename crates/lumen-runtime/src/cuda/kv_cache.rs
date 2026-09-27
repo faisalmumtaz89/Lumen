@@ -1,14 +1,15 @@
 //! GPU-resident KV cache for CUDA.
 //!
 //! One cache per full-attention layer, `[num_kv_heads, max_seq_len, head_dim]`
-//! head-first, stored either as F32 or as IEEE half (`u16` bit patterns). The
-//! storage type is a variant of [`KvStore`], not a flag beside an untyped
-//! buffer: every reader and writer takes the variant it can consume, so no
-//! program can hand half bits to a kernel that reads floats, or the reverse.
+//! head-first, stored as F32, as IEEE half or as bfloat16 (`u16` bit patterns
+//! for both 16-bit formats). The storage type is a variant of [`KvStore`], not
+//! a flag beside an untyped buffer: every reader and writer takes the variant
+//! it can consume, so no program can hand 16-bit patterns to a kernel that
+//! reads floats, half to one that reads bfloat16, or the reverse.
 //!
-//! Writers round to half on the device (round to nearest even) and count every
-//! value that does not fit; the owner of the counter refuses to continue with
-//! a poisoned cache (see `backend_impl.rs`).
+//! The 16-bit writers round on the device (round to nearest even) and count
+//! every value stored as ±Inf or NaN; the owner of the counter refuses to
+//! continue with a poisoned cache (see `backend_impl.rs`).
 
 use std::sync::Arc;
 
@@ -34,6 +35,11 @@ pub enum KvStore {
         k: CudaSlice<u16>,
         v: CudaSlice<u16>,
     },
+    /// bfloat16 bit patterns, same layout.
+    Bf16 {
+        k: CudaSlice<u16>,
+        v: CudaSlice<u16>,
+    },
 }
 
 impl KvStore {
@@ -41,7 +47,7 @@ impl KvStore {
     pub fn bytes_per_element(&self) -> usize {
         match self {
             KvStore::F32 { .. } => 4,
-            KvStore::F16 { .. } => 2,
+            KvStore::F16 { .. } | KvStore::Bf16 { .. } => 2,
         }
     }
 
@@ -49,7 +55,7 @@ impl KvStore {
     pub fn elements(&self) -> usize {
         match self {
             KvStore::F32 { k, .. } => k.len(),
-            KvStore::F16 { k, .. } => k.len(),
+            KvStore::F16 { k, .. } | KvStore::Bf16 { k, .. } => k.len(),
         }
     }
 }
@@ -67,7 +73,7 @@ pub struct KvCacheGpu {
     /// Dimension per attention head.
     pub head_dim: usize,
     /// The single-token write kernel for this store's type: `kv_cache_write`
-    /// for F32, `kv_cache_write_f16` for half.
+    /// for F32, `kv_cache_write_f16` for half, `kv_cache_write_bf16` for bfloat16.
     write_func: CudaFunction,
 }
 
@@ -78,7 +84,7 @@ pub fn compile_kv_module(
 ) -> Result<Arc<CudaModule>, RuntimeError> {
     let source = match precision {
         KvPrecision::F32 => KV_CACHE_KERNEL_SOURCE,
-        KvPrecision::F16 => KV_CACHE_F16_KERNEL_SOURCE,
+        KvPrecision::F16 | KvPrecision::Bf16 => KV_CACHE_F16_KERNEL_SOURCE,
         other => {
             return Err(RuntimeError::Unsupported(format!(
                 "CUDA KV cache precision {other:?} is not implemented"
@@ -147,6 +153,13 @@ impl KvCacheGpu {
                 },
                 "kv_cache_write_f16",
             ),
+            KvPrecision::Bf16 => (
+                KvStore::Bf16 {
+                    k: device.alloc_zeros::<u16>(total_elements)?,
+                    v: device.alloc_zeros::<u16>(total_elements)?,
+                },
+                "kv_cache_write_bf16",
+            ),
             other => {
                 return Err(RuntimeError::Unsupported(format!(
                     "CUDA KV cache precision {other:?} is not implemented"
@@ -176,6 +189,7 @@ impl KvCacheGpu {
         match self.store {
             KvStore::F32 { .. } => KvPrecision::F32,
             KvStore::F16 { .. } => KvPrecision::F16,
+            KvStore::Bf16 { .. } => KvPrecision::Bf16,
         }
     }
 
@@ -187,8 +201,8 @@ impl KvCacheGpu {
     /// Append one token's K and V data to the cache at the current position.
     ///
     /// `k_data` and `v_data` are GPU buffers of shape `[num_kv_heads * head_dim]`
-    /// (F32 activations whatever the store is). For a half store the kernel
-    /// rounds on the way in and counts every value that does not fit in
+    /// (F32 activations whatever the store is). For a 16-bit store the kernel
+    /// rounds on the way in and counts every value stored as ±Inf or NaN in
     /// `overflow`, which the caller must supply for that store.
     ///
     /// Advances `seq_len` by 1 after writing.
@@ -239,10 +253,10 @@ impl KvCacheGpu {
                     })?;
                 }
             }
-            KvStore::F16 { k, v } => {
+            KvStore::F16 { k, v } | KvStore::Bf16 { k, v } => {
                 let overflow = overflow.ok_or_else(|| {
                     RuntimeError::Compute(
-                        "F16 KV cache write without an overflow counter".to_string(),
+                        "16-bit KV cache write without an overflow counter".to_string(),
                     )
                 })?;
                 for (cache, data, which) in [(k, k_data, "K"), (v, v_data, "V")] {
@@ -260,7 +274,7 @@ impl KvCacheGpu {
                             .launch(launch_cfg)
                     }
                     .map_err(|e| {
-                        RuntimeError::Compute(format!("kv_cache_write_f16 {which} launch: {e}"))
+                        RuntimeError::Compute(format!("16-bit kv_cache_write {which} launch: {e}"))
                     })?;
                 }
             }
@@ -280,7 +294,7 @@ impl KvCacheGpu {
 }
 
 /// F32 K/V buffers a reader takes: the cache's own F32 store, or a widened
-/// copy of a half store; `[num_kv_heads, seq_stride, head_dim]` either way.
+/// copy of a 16-bit store; `[num_kv_heads, seq_stride, head_dim]` either way.
 pub struct KvView<'a> {
     pub k: &'a CudaSlice<f32>,
     pub v: &'a CudaSlice<f32>,
@@ -300,6 +314,21 @@ pub enum KvRef<'a> {
         k: &'a CudaSlice<u16>,
         v: &'a CudaSlice<u16>,
     },
+    Bf16 {
+        k: &'a CudaSlice<u16>,
+        v: &'a CudaSlice<u16>,
+    },
+}
+
+impl KvRef<'_> {
+    /// The element type of the borrowed store.
+    pub fn precision(&self) -> KvPrecision {
+        match self {
+            KvRef::F32 { .. } => KvPrecision::F32,
+            KvRef::F16 { .. } => KvPrecision::F16,
+            KvRef::Bf16 { .. } => KvPrecision::Bf16,
+        }
+    }
 }
 
 impl KvCacheGpu {
@@ -307,6 +336,7 @@ impl KvCacheGpu {
         match &self.store {
             KvStore::F32 { k, v } => KvRef::F32 { k, v },
             KvStore::F16 { k, v } => KvRef::F16 { k, v },
+            KvStore::Bf16 { k, v } => KvRef::Bf16 { k, v },
         }
     }
 
@@ -318,7 +348,7 @@ impl KvCacheGpu {
                 v,
                 seq_stride: self.max_seq_len,
             }),
-            KvStore::F16 { .. } => None,
+            KvStore::F16 { .. } | KvStore::Bf16 { .. } => None,
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Decode attention on CUDA: one kernel family for every model and context.
 //!
-//! The kernels (`attention_decode_partial_f32` / `_f16` and
+//! The kernels (`attention_decode_partial_f32` / `_f16` / `_bf16` and
 //! `attention_decode_merge`, `shaders/attention_decode.cu`) are the split-K
 //! flash-decoding structure: one CTA per (KV head, chunk) walks 16-key tiles
 //! with a running-max recurrence and writes an unnormalised numerator with
@@ -17,6 +17,7 @@
 use cudarc::driver::{CudaSlice, DeviceRepr, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
 
 use crate::error::RuntimeError;
+use crate::kv::KvPrecision;
 
 use super::decode::{KernelSet, ATTN_DECODE_BLOCK_DIM};
 use super::ffi::CudaDevice;
@@ -100,10 +101,10 @@ impl DecodeAttentionSpec {
     }
 
     /// Dynamic shared bytes of the partial pass: Q for the group, one 16-key
-    /// V tile (halves on a half store), the tile's scores, and the running
-    /// max, sum and rescale per head.
-    pub const fn partial_shared_bytes(&self, half_store: bool) -> u32 {
-        let v = if half_store {
+    /// V tile (16-bit values on a 16-bit store), the tile's scores, and the
+    /// running max, sum and rescale per head.
+    pub const fn partial_shared_bytes(&self, store16: bool) -> u32 {
+        let v = if store16 {
             ATTN_DECODE_TILE * self.head_dim / 2
         } else {
             ATTN_DECODE_TILE * self.head_dim
@@ -321,14 +322,17 @@ pub(crate) struct DecodeAttentionLaunch {
 impl DecodeAttentionLaunch {
     /// The route name a census sees: the kernel, suffixed with the codegen
     /// target when it is not NVRTC's default (the CUDA symbol is the same).
-    pub fn route_name(&self, half_store: bool) -> &'static str {
-        match (half_store, self.codegen) {
-            (false, "ptx120") => "attention_decode_partial_f32_ptx120",
-            (false, "ptx80") => "attention_decode_partial_f32_ptx80",
-            (false, _) => "attention_decode_partial_f32",
-            (true, "ptx120") => "attention_decode_partial_f16_ptx120",
-            (true, "ptx80") => "attention_decode_partial_f16_ptx80",
-            (true, _) => "attention_decode_partial_f16",
+    pub fn route_name(&self, store: KvPrecision) -> &'static str {
+        match (store, self.codegen) {
+            (KvPrecision::F16, "ptx120") => "attention_decode_partial_f16_ptx120",
+            (KvPrecision::F16, "ptx80") => "attention_decode_partial_f16_ptx80",
+            (KvPrecision::F16, _) => "attention_decode_partial_f16",
+            (KvPrecision::Bf16, "ptx120") => "attention_decode_partial_bf16_ptx120",
+            (KvPrecision::Bf16, "ptx80") => "attention_decode_partial_bf16_ptx80",
+            (KvPrecision::Bf16, _) => "attention_decode_partial_bf16",
+            (_, "ptx120") => "attention_decode_partial_f32_ptx120",
+            (_, "ptx80") => "attention_decode_partial_f32_ptx80",
+            (_, _) => "attention_decode_partial_f32",
         }
     }
 }
@@ -380,7 +384,7 @@ unsafe fn launch_pair<K: DeviceRepr>(
     device: &CudaDevice,
     kernels: &KernelSet,
     partial_fn: &cudarc::driver::CudaFunction,
-    half_store: bool,
+    store: KvPrecision,
     q: &CudaSlice<f32>,
     k_cache: &CudaSlice<K>,
     v_cache: &CudaSlice<K>,
@@ -415,9 +419,9 @@ unsafe fn launch_pair<K: DeviceRepr>(
         .launch(CudarcLaunchConfig {
             grid_dim: (s, num_kv_heads, 1),
             block_dim: (ATTN_DECODE_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: spec.partial_shared_bytes(half_store),
+            shared_mem_bytes: spec.partial_shared_bytes(store != KvPrecision::F32),
         })
-        .map_err(|e| RuntimeError::Compute(format!("{}: {e}", launch.route_name(half_store))))?;
+        .map_err(|e| RuntimeError::Compute(format!("{}: {e}", launch.route_name(store))))?;
     device
         .stream
         .launch_builder(&kernels.attention_decode_merge)
@@ -435,10 +439,19 @@ unsafe fn launch_pair<K: DeviceRepr>(
     Ok(())
 }
 
+/// The store's element type as the route line and the dump name it.
+fn kv_dtype(store: KvPrecision) -> &'static str {
+    match store {
+        KvPrecision::F16 => "f16",
+        KvPrecision::Bf16 => "bf16",
+        _ => "f32",
+    }
+}
+
 /// Name the route on its first dispatch, with the geometry that dispatch
 /// took and the policy in force.
 fn announce_route(
-    half_store: bool,
+    store: KvPrecision,
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -447,14 +460,19 @@ fn announce_route(
 ) {
     static SEEN_F32: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     static SEEN_F16: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    let seen = if half_store { &SEEN_F16 } else { &SEEN_F32 };
+    static SEEN_BF16: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let seen = match store {
+        KvPrecision::F16 => &SEEN_F16,
+        KvPrecision::Bf16 => &SEEN_BF16,
+        _ => &SEEN_F32,
+    };
     super::decode::announce_route_once(seen, || {
         format!(
             "[CUDA] {}: ACTIVE (kv={}, q_heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, \
              seq_len={seq_len}, chunks={}, partition={}, tile={}, one_tile_max={}, target={}, \
              block={}, merge=attention_decode_merge)",
-            launch.route_name(half_store),
-            if half_store { "f16" } else { "f32" },
+            launch.route_name(store),
+            kv_dtype(store),
             launch.chunks,
             if launch.partition == 0 {
                 "one-tile"
@@ -488,13 +506,13 @@ pub(crate) unsafe fn launch_attention_decode(
     scale: f32,
 ) -> Result<DecodeAttentionLaunch, RuntimeError> {
     let launch = admit(kernels, scratch, num_heads, num_kv_heads, head_dim, seq_len)?;
-    let half_store = matches!(kv, KvRef::F16 { .. });
+    let store = kv.precision();
     match kv {
         KvRef::F32 { k, v } => launch_pair(
             device,
             kernels,
             &kernels.attention_decode_partial,
-            false,
+            store,
             q,
             k,
             v,
@@ -509,15 +527,13 @@ pub(crate) unsafe fn launch_attention_decode(
             scale,
             launch,
         )?,
-        KvRef::F16 { k, v } => {
-            let f16 = kernels.kv_f16.as_ref().ok_or_else(|| {
-                RuntimeError::Compute("16-bit KV cache dispatched without its kernels".into())
-            })?;
+        KvRef::F16 { k, v } | KvRef::Bf16 { k, v } => {
+            let kv16 = super::decode::Kv16Kernels::of(kernels, store)?;
             launch_pair(
                 device,
                 kernels,
-                &f16.attention_decode_partial,
-                true,
+                &kv16.attention_decode_partial,
+                store,
                 q,
                 k,
                 v,
@@ -534,14 +550,7 @@ pub(crate) unsafe fn launch_attention_decode(
             )?
         }
     }
-    announce_route(
-        half_store,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        seq_len,
-        launch,
-    );
+    announce_route(store, num_heads, num_kv_heads, head_dim, seq_len, launch);
     if let Some((dir, lengths)) = attention_dump_config() {
         if lengths.contains(&seq_len) {
             dump_attention_call(
@@ -594,7 +603,8 @@ fn attention_dump_config() -> Option<&'static (std::path::PathBuf, Vec<u32>)> {
 /// Write one decode-attention call to `dir`: `attn-<seq_len>-<call>.json`
 /// (shape, scale, the kernel and launch geometry that served) beside the raw little-endian F32
 /// files `.q.f32` (`[num_heads, head_dim]`), `.k.f32` and `.v.f32` — `.k.f16`
-/// and `.v.f16` on a half store, with `kv_dtype` in the header — (the live
+/// and `.v.f16` on a half store, `.k.bf16` and `.v.bf16` on a bfloat16 store,
+/// with `kv_dtype` in the header — (the live
 /// `[num_kv_heads, seq_len, head_dim]` region of the cache) and `.out.f32`
 /// (the route's output, `[num_heads, head_dim]`). The call counter runs over
 /// the process, so the attention layers of one token appear in order. A
@@ -637,10 +647,12 @@ fn dump_attention_call(
     };
     let q_host: Vec<f32> = device.dtoh_copy_view(&q.slice(0..nh * hd))?;
     write_f32("q.f32", &q_host)?;
-    // The cache region as stored: F32 words, or the half bit patterns the
-    // kernel read (`.k.f16` / `.v.f16`, 16-bit little-endian). A replay of a
-    // half dump must widen exactly; the storage rounding already happened.
-    let kv_dtype = match kv {
+    // The cache region as stored: F32 words, or the 16-bit patterns the
+    // kernel read (`.k.f16` / `.v.f16` or `.k.bf16` / `.v.bf16`, little-endian).
+    // A replay of a 16-bit dump must widen exactly; the storage rounding
+    // already happened.
+    let dtype = kv_dtype(kv.precision());
+    match kv {
         KvRef::F32 { k, v } => {
             for (name, cache) in [("k.f32", k), ("v.f32", v)] {
                 let mut host = Vec::with_capacity(nkv * sl * hd);
@@ -652,10 +664,9 @@ fn dump_attention_call(
                 }
                 write_f32(name, &host)?;
             }
-            "f32"
         }
-        KvRef::F16 { k, v } => {
-            for (name, cache) in [("k.f16", k), ("v.f16", v)] {
+        KvRef::F16 { k, v } | KvRef::Bf16 { k, v } => {
+            for (name, cache) in [(format!("k.{dtype}"), k), (format!("v.{dtype}"), v)] {
                 let mut bytes = Vec::with_capacity(nkv * sl * hd * 2);
                 for kv_h in 0..nkv {
                     let base = kv_h * msl * hd;
@@ -667,15 +678,14 @@ fn dump_attention_call(
                 }
                 std::fs::write(stem.with_extension(name), bytes).map_err(io)?;
             }
-            "f16"
         }
-    };
+    }
     let out_host: Vec<f32> = device.dtoh_copy_view(&attn_out.slice(0..nh * hd))?;
     write_f32("out.f32", &out_host)?;
     // The receipt is the launch's own, not a fresh reading of the policy:
     // the dump records what ran, with the geometry a replay needs to
     // reproduce the reduction order.
-    let route = launch.route_name(kv_dtype == "f16");
+    let route = launch.route_name(kv.precision());
     let geometry = format!(
         ",\n \"chunks\": {},\n \"partition\": \"{}\",\n \"one_tile_max\": {},\n \"target\": {},\n \"codegen\": \"{}\"",
         launch.chunks,
@@ -686,7 +696,7 @@ fn dump_attention_call(
     );
     let engine = crate::runtime_defaults::build_identity();
     let meta = format!(
-        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"kv_dtype\": \"{kv_dtype}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}{geometry}\n}}\n"
+        "{{\n \"format\": \"lumen-attn-dump@1\",\n \"engine\": \"{engine}\",\n \"kv_dtype\": \"{dtype}\",\n \"call\": {call},\n \"route\": \"{route}\",\n \"num_heads\": {num_heads},\n \"num_kv_heads\": {num_kv_heads},\n \"head_dim\": {head_dim},\n \"seq_len\": {seq_len},\n \"max_seq_len\": {max_seq_len},\n \"scale\": {scale:e}{geometry}\n}}\n"
     );
     std::fs::write(stem.with_extension("json"), meta).map_err(io)
 }
@@ -953,20 +963,28 @@ mod tests {
             codegen,
         };
         assert_eq!(
-            l("default").route_name(false),
+            l("default").route_name(KvPrecision::F32),
             "attention_decode_partial_f32"
         );
         assert_eq!(
-            l("ptx120").route_name(false),
+            l("ptx120").route_name(KvPrecision::F32),
             "attention_decode_partial_f32_ptx120"
         );
         assert_eq!(
-            l("default").route_name(true),
+            l("default").route_name(KvPrecision::F16),
             "attention_decode_partial_f16"
         );
         assert_eq!(
-            l("ptx80").route_name(true),
+            l("ptx80").route_name(KvPrecision::F16),
             "attention_decode_partial_f16_ptx80"
+        );
+        assert_eq!(
+            l("default").route_name(KvPrecision::Bf16),
+            "attention_decode_partial_bf16"
+        );
+        assert_eq!(
+            l("ptx120").route_name(KvPrecision::Bf16),
+            "attention_decode_partial_bf16_ptx120"
         );
     }
 }

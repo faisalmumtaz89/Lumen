@@ -7,7 +7,7 @@
 // (16 Q / 4 KV), Qwen3.8-27B G = 6 (24 / 4),
 // Qwen3.5-MoE-35B-A3B G = 8 (16 / 2).
 //
-// Two passes over split-K partials: `attention_decode_partial_{f32,f16}`
+// Two passes over split-K partials: `attention_decode_partial_{f32,f16,bf16}`
 // writes (m, l, o) per (query head, chunk), `attention_decode_merge` combines
 // them. One CTA per (KV head, chunk): each K row and V row is fetched ONCE
 // and serves all G query heads of the group, and every Q, K and V read is a
@@ -47,7 +47,7 @@
 // dynamic-shared cap, so no opt-in is needed.
 //
 // PRECISION: F32 accumulation throughout (K and V widened exactly from halves
-// on a half store), the same expf, no atomics and no fast-math. Deterministic
+// or bfloat16s on a 16-bit store; "half" below covers both), the same expf, no atomics and no fast-math. Deterministic
 // for a fixed (S, partition): every reduction is a fixed tree and every
 // accumulation walks ascending indices, so the output depends on the launch
 // geometry and on nothing else. The integration suites hold both partitions
@@ -70,7 +70,7 @@
 // Requires (enforced by the host, which compiled this module for the model's
 // shape): num_heads / num_kv_heads == DECODE_G, head_dim == DECODE_HD, and the
 // store the entry point is for (F32 words for _f32, half bit patterns for
-// _f16).
+// _f16, bfloat16 bit patterns for _bf16).
 // NVRTC-compatible: no system includes, extern "C" linkage.
 // ==========================================================================
 
@@ -144,6 +144,21 @@ __device__ __forceinline__ float4 decode_h4_to_f4(unsigned int lo, unsigned int 
     o.y = decode_h2f(lo >> 16);
     o.z = decode_h2f(hi);
     o.w = decode_h2f(hi >> 16);
+    return o;
+}
+
+// bfloat16 bits -> F32, exact: the bits are the float's upper half.
+__device__ __forceinline__ float decode_b2f(unsigned int h) {
+    return __uint_as_float((h & 0xffffu) << 16);
+}
+
+// Four packed bfloat16s (two 32-bit words, low half first) -> float4.
+__device__ __forceinline__ float4 decode_b4_to_f4(unsigned int lo, unsigned int hi) {
+    float4 o;
+    o.x = decode_b2f(lo);
+    o.y = decode_b2f(lo >> 16);
+    o.z = decode_b2f(hi);
+    o.w = decode_b2f(hi >> 16);
     return o;
 }
 
@@ -232,8 +247,9 @@ __device__ __forceinline__ void decode_loop_range(
         }                                                                                           \
     }
 
-// The body shared by the F32 and half variants. V_HALF selects the V staging.
-#define DECODE_LOOP_BODY(V_HALF, KLOAD)                                                               \
+// The body shared by the F32 and 16-bit variants. V_HALF selects the V staging and
+// V2F widens a staged 16-bit V value.
+#define DECODE_LOOP_BODY(V_HALF, KLOAD, V2F)                                                               \
     const unsigned int chunk = blockIdx.x;                                                          \
     const unsigned int kv_h  = blockIdx.y;                                                          \
     const unsigned int tid   = threadIdx.x;                                                         \
@@ -362,7 +378,7 @@ __device__ __forceinline__ void decode_loop_range(
         }                                                                                           \
         for (unsigned int j = 0; j < span; j++) {                                                   \
             float vv[DECODE_DPT];                                                                     \
-            DECODE_V_LOAD(V_HALF, j, vv);                                                             \
+            DECODE_V_LOAD(V_HALF, V2F, j, vv);                                                           \
             _Pragma("unroll")                                                                       \
             for (unsigned int g = 0; g < DECODE_G; g++) {                                             \
                 const float p = s_score[g * DECODE_TILE + j];                                         \
@@ -406,16 +422,18 @@ __device__ __forceinline__ void decode_loop_range(
         _Pragma("unroll")                                                                           \
         for (unsigned int c = 0; c < DECODE_LC; c++) kr[c] = k4[32u * c + lane];                      \
     }
-#define DECODE_KLOAD_F16(pos)                                                                         \
+#define DECODE_KLOAD_16(pos, CVT4)                                                                    \
     {                                                                                               \
         const uint2* k2 = reinterpret_cast<const uint2*>(                                           \
             k_cache + kv_base + (unsigned long long)(pos) * (unsigned long long)DECODE_HD);           \
         _Pragma("unroll")                                                                           \
         for (unsigned int c = 0; c < DECODE_LC; c++) {                                                \
             const uint2 r = k2[32u * c + lane];                                                     \
-            kr[c] = decode_h4_to_f4(r.x, r.y);                                                        \
+            kr[c] = CVT4(r.x, r.y);                                                                 \
         }                                                                                           \
     }
+#define DECODE_KLOAD_F16(pos) DECODE_KLOAD_16(pos, decode_h4_to_f4)
+#define DECODE_KLOAD_BF16(pos) DECODE_KLOAD_16(pos, decode_b4_to_f4)
 /* chunk 0 assigns, later chunks add: at HD 256 this is `dot = qa.ka; dot += qb.kb`. */
 #define DECODE_QK_DOT(g, dot)                                                                         \
     {                                                                                               \
@@ -427,11 +445,11 @@ __device__ __forceinline__ void decode_loop_range(
                 + qr[c][g].w * kr[c].w;                                                             \
         }                                                                                           \
     }
-#define DECODE_V_LOAD(V_HALF, j, vv)                                                                  \
+#define DECODE_V_LOAD(V_HALF, V2F, j, vv)                                                              \
     {                                                                                               \
         _Pragma("unroll")                                                                           \
         for (unsigned int i = 0; i < DECODE_DPT; i++) {                                               \
-            if (V_HALF) vv[i] = decode_h2f(s_vh[(j) * DECODE_HD + tid + DECODE_BLOCK * i]);               \
+            if (V_HALF) vv[i] = V2F(s_vh[(j) * DECODE_HD + tid + DECODE_BLOCK * i]);                      \
             else        vv[i] = s_v[(j) * DECODE_HD + tid + DECODE_BLOCK * i];                          \
         }                                                                                           \
     }
@@ -459,7 +477,7 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_partial_f3
     unsigned int num_chunks,
     unsigned int partition)
 {
-    DECODE_LOOP_BODY(false, DECODE_KLOAD_F32)
+    DECODE_LOOP_BODY(false, DECODE_KLOAD_F32, decode_h2f)
 }
 
 extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_partial_f16(
@@ -475,7 +493,23 @@ extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_partial_f1
     unsigned int num_chunks,
     unsigned int partition)
 {
-    DECODE_LOOP_BODY(true, DECODE_KLOAD_F16)
+    DECODE_LOOP_BODY(true, DECODE_KLOAD_F16, decode_h2f)
+}
+
+extern "C" __global__ void __launch_bounds__(128, 4) attention_decode_partial_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ m_part,
+    float* __restrict__ l_part,
+    float* __restrict__ o_part,
+    unsigned int seq_len,
+    unsigned int max_seq_len,
+    float scale,
+    unsigned int num_chunks,
+    unsigned int partition)
+{
+    DECODE_LOOP_BODY(true, DECODE_KLOAD_BF16, decode_b2f)
 }
 
 

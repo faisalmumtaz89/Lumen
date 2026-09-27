@@ -1260,9 +1260,7 @@ mod tests {
                 device.htod_copy_into(&k_host, k).unwrap();
                 device.htod_copy_into(&v_host, v).unwrap();
             }
-            crate::cuda::kv_cache::KvStore::F16 { .. } => {
-                unreachable!("KvCacheGpu::new allocates F32")
-            }
+            _ => unreachable!("KvCacheGpu::new allocates F32"),
         }
         kv_cache.advance_seq_len_by(kv_total);
 
@@ -1607,6 +1605,16 @@ mod tests {
         f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
     }
 
+    fn host_bf16_bits(x: f32) -> u16 {
+        // Round to nearest even (the inputs below are finite).
+        let b = x.to_bits();
+        ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+    }
+
+    fn host_bf16_to_f32(h: u16) -> f32 {
+        f32::from_bits(u32::from(h) << 16)
+    }
+
     /// The typed dispatch: the same Q over the same half-representable K/V
     /// held in an F32 store and in a half store produces bit-identical
     /// output at every context, on both partitions (one-tile to 2,816 keys,
@@ -1614,6 +1622,28 @@ mod tests {
     /// launcher the backend uses.
     #[test]
     fn half_store_dispatch_reproduces_the_f32_store_bit_for_bit() {
+        store16_dispatch_reproduces_the_f32_store(
+            crate::kv::KvPrecision::F16,
+            host_f16_bits,
+            host_f16_to_f32,
+        );
+    }
+
+    /// The same for a bfloat16 store over bfloat16-representable K/V.
+    #[test]
+    fn bf16_store_dispatch_reproduces_the_f32_store_bit_for_bit() {
+        store16_dispatch_reproduces_the_f32_store(
+            crate::kv::KvPrecision::Bf16,
+            host_bf16_bits,
+            host_bf16_to_f32,
+        );
+    }
+
+    fn store16_dispatch_reproduces_the_f32_store(
+        store: crate::kv::KvPrecision,
+        to_bits: fn(f32) -> u16,
+        to_f32: fn(u16) -> f32,
+    ) {
         use crate::cuda::kv_cache::{compile_kv_module, KvCacheGpu, KvStore};
         use crate::kv::KvPrecision;
         if super::super::ffi::device_count().unwrap_or(0) == 0 {
@@ -1639,14 +1669,8 @@ mod tests {
             head_dim as u32,
         )
         .unwrap();
-        let kernels =
-            match super::super::decode::compile_all_kernels(&device, KvPrecision::F16, spec) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Skipping test: failed to compile kernels: {e}");
-                    return;
-                }
-            };
+        let kernels = super::super::decode::compile_all_kernels(&device, store, spec)
+            .expect("a device is present, so the kernels must compile and load");
         let max_seq_len = 16_385usize;
         let cache = num_kv_heads * max_seq_len * head_dim;
         let mut seed = 0x0005_0910_F16D_0001u64;
@@ -1654,9 +1678,9 @@ mod tests {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            // A signed magnitude in [1/16, 1): every value is a normal half,
-            // so the storage rounding is exact and the two stores hold the
-            // same numbers.
+            // A signed magnitude in [1/16, 1): every value is a normal of both
+            // 16-bit formats, so the storage rounding is exact and the two
+            // stores hold the same numbers.
             let u = ((seed >> 33) & 0xff_ffff) as f32 / 8_388_608.0 - 1.0;
             let mag = 0.0625 + 0.9375 * u.abs();
             if u < 0.0 {
@@ -1666,12 +1690,12 @@ mod tests {
             }
         };
         let q: Vec<f32> = (0..num_heads * head_dim)
-            .map(|_| host_f16_to_f32(host_f16_bits(next() * 4.0)))
+            .map(|_| to_f32(to_bits(next() * 4.0)))
             .collect();
-        let k16: Vec<u16> = (0..cache).map(|_| host_f16_bits(next())).collect();
-        let v16: Vec<u16> = (0..cache).map(|_| host_f16_bits(next())).collect();
-        let k32: Vec<f32> = k16.iter().map(|&h| host_f16_to_f32(h)).collect();
-        let v32: Vec<f32> = v16.iter().map(|&h| host_f16_to_f32(h)).collect();
+        let k16: Vec<u16> = (0..cache).map(|_| to_bits(next())).collect();
+        let v16: Vec<u16> = (0..cache).map(|_| to_bits(next())).collect();
+        let k32: Vec<f32> = k16.iter().map(|&h| to_f32(h)).collect();
+        let v32: Vec<f32> = v16.iter().map(|&h| to_f32(h)).collect();
         let kv32_module = compile_kv_module(&device, KvPrecision::F32).unwrap();
         let mut kv32 = KvCacheGpu::with_module_at(
             &device,
@@ -1687,25 +1711,26 @@ mod tests {
                 device.htod_copy_into(&k32, k).unwrap();
                 device.htod_copy_into(&v32, v).unwrap();
             }
-            KvStore::F16 { .. } => unreachable!(),
+            _ => unreachable!(),
         }
-        let kv16_module = compile_kv_module(&device, KvPrecision::F16).unwrap();
+        let kv16_module = compile_kv_module(&device, store).unwrap();
         let mut kv16 = KvCacheGpu::with_module_at(
             &device,
             num_kv_heads,
             max_seq_len,
             head_dim,
             &kv16_module,
-            KvPrecision::F16,
+            store,
         )
         .unwrap();
         match &mut kv16.store {
-            KvStore::F16 { k, v } => {
+            KvStore::F16 { k, v } | KvStore::Bf16 { k, v } => {
                 device.htod_copy_into(&k16, k).unwrap();
                 device.htod_copy_into(&v16, v).unwrap();
             }
             KvStore::F32 { .. } => unreachable!(),
         }
+        assert_eq!(kv16.precision(), store);
         let q_gpu = device.htod_copy(&q).unwrap();
         let mut scratch = test_decode_scratch(&device, num_heads, num_kv_heads, head_dim);
         let mut out32 = device.alloc_zeros::<f32>(num_heads * head_dim).unwrap();

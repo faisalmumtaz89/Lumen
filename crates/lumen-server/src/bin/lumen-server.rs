@@ -126,9 +126,10 @@ OPTIONS:
     --backend <B>          cuda | metal | cpu
                            Default: auto (Metal on macOS, CUDA if available, else CPU)
     --backend-device <N>   GPU device ordinal (CUDA only). Default: 0
-    --kv-precision <P>     KV cache storage: f16 | f32. Default: LUMEN_KV_PRECISION,
-                           else Metal f16, CUDA f32, CPU f32. On CUDA, f16 halves
-                           the cache's bytes and its attention reads.
+    --kv-precision <P>     KV cache storage: f16 | bf16 | f32. Default: LUMEN_KV_PRECISION,
+                           else Metal f16, CUDA f32, CPU f32. On CUDA, f16 and bf16
+                           halve the cache's bytes and its attention reads; bf16 is
+                           CUDA only.
     --inbox-size <N>       Engine inbox capacity (in-flight job queue depth).
                            Default: 16
     --log-level <LEVEL>    error | warn | info | debug. Default: info

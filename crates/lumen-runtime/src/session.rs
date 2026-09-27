@@ -318,7 +318,7 @@ impl Session {
     /// Verify that the given backend supports this session's KV precision.
     ///
     /// Different backends pin the KV cache storage to a specific precision
-    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: the store the backend was built for, F32 or F16
+    /// (Metal: F16-only `gpu_k_cache`/`gpu_v_cache`; CUDA: the store the backend was built for, F32, F16 or BF16
     /// `KvCacheGpu`); CPU backends accept F32 and F16. If the
     /// session's `RuntimeConfig.kv_precision` is incompatible with the
     /// backend, return `RuntimeError::Unsupported` with an actionable
