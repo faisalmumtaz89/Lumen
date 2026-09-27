@@ -1315,11 +1315,11 @@ pub(crate) fn compile_all_kernels(
                 "attention_decode_partial_{suffix}"
             ))?,
             write_batch: load_fn(
-                shaders::KV_CACHE_F16_KERNEL_SOURCE,
+                shaders::KV_CACHE_16_KERNEL_SOURCE,
                 &format!("kv_cache_write_batch_{suffix}"),
             )?,
             widen: load_fn(
-                shaders::KV_CACHE_F16_KERNEL_SOURCE,
+                shaders::KV_CACHE_16_KERNEL_SOURCE,
                 &format!("kv_cache_widen_{suffix}"),
             )?,
             prep_fused: load_fn(

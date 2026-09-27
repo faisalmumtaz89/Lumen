@@ -295,7 +295,7 @@ extern "C" __global__ void attn_prep_fused(
 // ---------------------------------------------------------------------------
 // 16-bit KV twins of attn_prep_fused: identical Q/gate/K arithmetic; the K and
 // V cache stores round to half or to bfloat16 (round to nearest even) and count
-// every value stored as ±Inf or NaN (see kv_cache_f16.cu). Kept in this file,
+// every value stored as ±Inf or NaN (see kv_cache_16.cu). Kept in this file,
 // next to the F32 kernel, so they cannot drift apart unnoticed; SUF names the
 // format and STORE rounds, stores and counts one value.
 // ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ __device__ __forceinline__ void qgate_kvf16_store(
     *dst = h;
 }
 
-// bfloat16, round to nearest even in integer arithmetic (kv_cache_f16.cu
+// bfloat16, round to nearest even in integer arithmetic (kv_cache_16.cu
 // kvbf16_f32_to_bits); a NaN stays a NaN.
 __device__ __forceinline__ void qgate_kvbf16_store(
     unsigned short* __restrict__ dst,
@@ -443,4 +443,3 @@ extern "C" __global__ void attn_prep_fused_kv##SUF(                             
 
 ATTN_PREP_FUSED_16(f16, qgate_kvf16_store)
 ATTN_PREP_FUSED_16(bf16, qgate_kvbf16_store)
-

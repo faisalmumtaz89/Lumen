@@ -8,7 +8,7 @@
 // CPU reference tests (always run, no GPU required)
 // ============================================================================
 
-/// IEEE 754 f32 -> f16 conversion (CPU reference, matches kv_cache_f16.cu).
+/// IEEE 754 f32 -> f16 conversion (CPU reference, matches kv_cache_16.cu).
 fn f32_to_f16_bits(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 31) & 1;
@@ -552,8 +552,8 @@ mod gpu_tests {
     fn test_gpu_kv_cache_f16_write_read() {
         let (ctx, stream) = create_context();
 
-        let src = lumen_runtime::cuda::shaders::KV_CACHE_F16_KERNEL_SOURCE;
-        let ptx = compile_ptx(src).expect("NVRTC compile failed for kv_cache_f16.cu");
+        let src = lumen_runtime::cuda::shaders::KV_CACHE_16_KERNEL_SOURCE;
+        let ptx = compile_ptx(src).expect("NVRTC compile failed for kv_cache_16.cu");
         let module = ctx.load_module(ptx).unwrap();
         let write_func = module.load_function("kv_cache_write_f16").unwrap();
 

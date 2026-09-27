@@ -913,7 +913,7 @@ struct MutableState {
     /// The storage every cache is allocated in.
     kv_precision: KvPrecision,
     /// 16-bit store only: the count of values a writer stored as ±Inf or NaN
-    /// (see kv_cache_f16.cu). Read after every prefill, streaming and decode
+    /// (see kv_cache_16.cu). Read after every prefill, streaming and decode
     /// readback; a non-zero count refuses the generation.
     kv16_overflow: Option<CudaSlice<u32>>,
     /// 16-bit store on the F32 prefill route only: the F32 buffers the prefill

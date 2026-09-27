@@ -991,7 +991,7 @@ async fn run(args: Args) -> Result<(), String> {
                 metal
                     .preload_weights(provider.as_dyn())
                     .map_err(|e| format!("Metal preload_weights: {e}"))?;
-                // Metal holds F16 only; a requested F32 is refused by
+                // Metal holds F16 only; a requested F32 or BF16 is refused by
                 // validate_kv_precision at the engine.
                 (
                     Box::new(metal),

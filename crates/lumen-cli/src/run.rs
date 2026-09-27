@@ -1447,7 +1447,7 @@ fn resolve_kv_precision(
         }
     }
     // Backend-appropriate default. Metal pins KV to F16; CUDA defaults to
-    // F32 (F16 is the opt-in half store); CPU uses F32.
+    // F32 (F16 and BF16 are the opt-in 16-bit stores); CPU uses F32.
     let default = if use_metal {
         KvPrecision::F16
     } else {

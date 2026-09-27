@@ -1679,8 +1679,8 @@ mod tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             // A signed magnitude in [1/16, 1): every value is a normal of both
-            // 16-bit formats, so the storage rounding is exact and the two
-            // stores hold the same numbers.
+            // 16-bit formats. The host rounds each value to the store's format
+            // first, so both stores hold the same numbers.
             let u = ((seed >> 33) & 0xff_ffff) as f32 / 8_388_608.0 - 1.0;
             let mag = 0.0625 + 0.9375 * u.abs();
             if u < 0.0 {

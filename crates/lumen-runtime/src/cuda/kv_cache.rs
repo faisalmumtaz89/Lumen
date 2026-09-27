@@ -18,7 +18,7 @@ use cudarc::driver::{
 };
 
 use super::ffi::CudaDevice;
-use super::shaders::{KV_CACHE_F16_KERNEL_SOURCE, KV_CACHE_KERNEL_SOURCE};
+use super::shaders::{KV_CACHE_16_KERNEL_SOURCE, KV_CACHE_KERNEL_SOURCE};
 use super::types::LaunchConfig;
 use crate::error::RuntimeError;
 use crate::kv::KvPrecision;
@@ -84,7 +84,7 @@ pub fn compile_kv_module(
 ) -> Result<Arc<CudaModule>, RuntimeError> {
     let source = match precision {
         KvPrecision::F32 => KV_CACHE_KERNEL_SOURCE,
-        KvPrecision::F16 | KvPrecision::Bf16 => KV_CACHE_F16_KERNEL_SOURCE,
+        KvPrecision::F16 | KvPrecision::Bf16 => KV_CACHE_16_KERNEL_SOURCE,
         other => {
             return Err(RuntimeError::Unsupported(format!(
                 "CUDA KV cache precision {other:?} is not implemented"

@@ -21,7 +21,7 @@
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use lumen_runtime::cuda::ffi::CudaDevice;
-use lumen_runtime::cuda::shaders::{KV_CACHE_F16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
+use lumen_runtime::cuda::shaders::{KV_CACHE_16_KERNEL_SOURCE, QGATE_FUSION_KERNEL_SOURCE};
 
 fn try_device() -> Option<CudaDevice> {
     match CudaDevice::new(0) {
@@ -104,7 +104,7 @@ fn the_integer_rounding_is_the_device_conversion() {
         return;
     }
     let src = format!(
-        "{KV_CACHE_F16_KERNEL_SOURCE}\n\
+        "{KV_CACHE_16_KERNEL_SOURCE}\n\
          extern \"C\" __global__ void bf16_pair(const unsigned int* in, unsigned short* ours,\n\
              unsigned short* hw, unsigned int n) {{\n\
              unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -186,7 +186,7 @@ fn the_integer_rounding_is_the_device_conversion() {
 fn the_writers_round_to_nearest_even_and_count_what_is_not_finite() {
     let Some(dev) = try_device() else { return };
     let module = dev
-        .compile_and_load(KV_CACHE_F16_KERNEL_SOURCE)
+        .compile_and_load(KV_CACHE_16_KERNEL_SOURCE)
         .expect("compile 16-bit writers");
     let write = module.load_function("kv_cache_write_bf16").expect("write");
     let write_batch = module
@@ -289,7 +289,7 @@ fn the_writers_round_to_nearest_even_and_count_what_is_not_finite() {
 fn the_widening_read_is_exact() {
     let Some(dev) = try_device() else { return };
     let module = dev
-        .compile_and_load(KV_CACHE_F16_KERNEL_SOURCE)
+        .compile_and_load(KV_CACHE_16_KERNEL_SOURCE)
         .expect("compile 16-bit kernels");
     let widen = module.load_function("kv_cache_widen_bf16").expect("widen");
     let (num_kv_heads, max_seq_len, head_dim, count) = (4u32, 300u32, 256u32, 173u32);
