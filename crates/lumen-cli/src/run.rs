@@ -655,7 +655,7 @@ pub(crate) fn run_inference(args: &[String]) {
                 // cache is allocated (backend.validate_kv_precision).
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
-                    eprintln!("Error: --kv-precision requires a value (f16 | f32)");
+                    eprintln!("Error: --kv-precision requires a value (f16 | bf16 | f32)");
                     std::process::exit(1);
                 });
                 kv_precision_override = Some(parse_kv_precision(val).unwrap_or_else(|e| {
@@ -1393,14 +1393,15 @@ impl LiveModel {
 /// to max_seq_len. On GPU, this causes severe performance degradation due to memory
 /// Parse a `--kv-precision` value into a `KvPrecision` variant.
 ///
-/// Accepts `f16` / `f32` (case-insensitive). Other values return an error.
+/// Accepts `f16` / `bf16` / `f32` (case-insensitive). Other values return an error.
 /// Int8 / Int4 are reserved for future quantized KV; not exposed via the CLI.
 fn parse_kv_precision(value: &str) -> Result<KvPrecision, String> {
     match value.to_ascii_lowercase().as_str() {
         "f16" | "fp16" | "half" => Ok(KvPrecision::F16),
+        "bf16" | "bfloat16" => Ok(KvPrecision::Bf16),
         "f32" | "fp32" | "float" => Ok(KvPrecision::F32),
         other => Err(format!(
-            "--kv-precision must be one of: f16, f32 (got '{other}')"
+            "--kv-precision must be one of: f16, bf16, f32 (got '{other}')"
         )),
     }
 }
@@ -2985,6 +2986,13 @@ mod tests {
         assert_eq!(parse_kv_precision("F16").unwrap(), KvPrecision::F16);
         assert_eq!(parse_kv_precision("fp16").unwrap(), KvPrecision::F16);
         assert_eq!(parse_kv_precision("half").unwrap(), KvPrecision::F16);
+    }
+
+    #[test]
+    fn parse_kv_precision_accepts_bf16_variants() {
+        assert_eq!(parse_kv_precision("bf16").unwrap(), KvPrecision::Bf16);
+        assert_eq!(parse_kv_precision("BF16").unwrap(), KvPrecision::Bf16);
+        assert_eq!(parse_kv_precision("bfloat16").unwrap(), KvPrecision::Bf16);
     }
 
     #[test]

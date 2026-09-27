@@ -281,21 +281,22 @@ pub trait ComputeBackend: Send + Sync {
     /// mismatch up front so the caller sees an explicit error instead of
     /// downstream silent data corruption.
     ///
-    /// Default impl (CPU naive / SIMD) accepts both `F32` and `F16` because
-    /// the CPU `KvCache` byte buffers are sized by `config.precision` and the
-    /// `KvCacheView` append/read helpers dispatch on precision at runtime.
+    /// Default impl (CPU naive / SIMD) accepts `F32` and `F16`: the CPU
+    /// `KvCache` byte buffers are sized by `config.precision`, and the
+    /// `KvCacheView` append/read helpers and the CPU attention read those two.
     ///
     /// Backends with a hardcoded precision MUST override this and return
     /// `RuntimeError::Unsupported` for mismatched configs.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        // CPU backends store KV in `Vec<u8>` sized by precision and dispatch
-        // append/read at runtime, so any implemented precision works.
-        if !precision.is_implemented() {
-            return Err(RuntimeError::Unsupported(format!(
-                "KV cache precision {precision:?} is not yet implemented"
-            )));
+        match precision {
+            KvPrecision::F32 | KvPrecision::F16 => Ok(()),
+            other if !other.is_implemented() => Err(RuntimeError::Unsupported(format!(
+                "KV cache precision {other:?} is not yet implemented"
+            ))),
+            other => Err(RuntimeError::Unsupported(format!(
+                "the CPU backends store the KV cache as F32 or F16 (requested {other:?})"
+            ))),
         }
-        Ok(())
     }
 
     // ====================================================================
