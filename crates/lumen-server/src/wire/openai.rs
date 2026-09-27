@@ -576,13 +576,21 @@ fn render_chat_prompt_manual(
 ) -> Result<String, ServerError> {
     let mut system: Option<String> = None;
     let mut transcript = String::new();
-    for m in messages.iter() {
+    for (i, m) in messages.iter().enumerate() {
         // `flatten_content` enforces the ROBUST-007 numeric-type-guard (a bare
         // number/bool `content` 400s instead of being coerced) AND flattens
         // content-parts via the single shared key set — the SAME helper the
         // Anthropic surface uses, so the two cannot diverge.
         match m.role.as_str() {
-            "system" => system = Some(super::flatten_content(&m.content, "messages.content")?),
+            "system" if i == 0 => {
+                system = Some(super::flatten_content(&m.content, "messages.content")?)
+            }
+            // A later system message stays where it was sent.
+            "system" => {
+                transcript.push_str("<|im_start|>system\n");
+                transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
+                transcript.push_str("<|im_end|>\n");
+            }
             "user" => {
                 transcript.push_str("<|im_start|>user\n");
                 transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
@@ -2061,6 +2069,34 @@ mod tests {
         assert_eq!(
             out, expected,
             "render_chat_prompt system+user enabled != open think tail"
+        );
+    }
+
+    #[test]
+    fn render_chat_prompt_keeps_later_system_where_it_was_sent() {
+        let messages = vec![
+            system_msg("Sys"),
+            user_msg("Q1"),
+            system_msg("Be brief."),
+            assistant_msg("A1"),
+            user_msg("Q2"),
+        ];
+        let expected = "<|im_start|>system\nSys<|im_end|>\n\
+                        <|im_start|>user\nQ1<|im_end|>\n\
+                        <|im_start|>system\nBe brief.<|im_end|>\n\
+                        <|im_start|>assistant\nA1<|im_end|>\n\
+                        <|im_start|>user\nQ2<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n\n</think>\n\n";
+        assert_eq!(
+            render_chat_prompt(&messages, &[], false, None).unwrap(),
+            expected
+        );
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        // The Qwen3.8 template keeps (empty) reasoning on earlier assistant turns.
+        assert_eq!(
+            render_chat_prompt(&messages, &[], false, Some(template)).unwrap(),
+            expected.replace("assistant\nA1", "assistant\n<think>\n\n</think>\n\nA1")
         );
     }
 

@@ -273,6 +273,10 @@ fn render_prompt_templated(
                 }
                 msgs.push(Value::Object(obj));
             }
+            "system" => msgs.push(json!({
+                "role": "system",
+                "content": super::flatten_content(&m.content, "messages.content")?,
+            })),
             other => {
                 return Err(ServerError::bad_request_field(
                     format!("unknown anthropic role: {other}"),
@@ -320,6 +324,12 @@ fn render_prompt(
         match m.role.as_str() {
             "user" => render_user_turn(&mut prompt, &m.content)?,
             "assistant" => render_assistant_turn(&mut prompt, &m.content)?,
+            // A system message inside `messages` stays where it was sent.
+            "system" => {
+                prompt.push_str("<|im_start|>system\n");
+                prompt.push_str(&super::flatten_content(&m.content, "messages.content")?);
+                prompt.push_str("<|im_end|>\n");
+            }
             other => {
                 return Err(ServerError::bad_request_field(
                     format!("unknown anthropic role: {other}"),
@@ -1080,6 +1090,56 @@ mod tests {
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
         assert_eq!(out, expected);
+    }
+
+    fn system(text: &str) -> AnthropicMessage {
+        AnthropicMessage {
+            role: "system".into(),
+            content: Value::String(text.into()),
+        }
+    }
+
+    #[test]
+    fn system_message_renders_where_it_was_sent() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let messages = [
+            user("Hi"),
+            system("Answer in French."),
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "18C"},
+                    {"type": "text", "text": "And now?"}
+                ]),
+            },
+            AnthropicMessage {
+                role: "system".into(),
+                content: serde_json::json!([{"type": "text", "text": "Be brief."}]),
+            },
+        ];
+        let out = render_prompt_templated(Some("Sys"), &messages, &[], false, template).unwrap();
+        assert!(
+            out.starts_with("<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>system\nAnswer in French.<|im_end|>\n<|im_start|>assistant\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{out}"
+        );
+
+        let manual = render_prompt("Sys", &[user("Hi"), system("Be brief.")], false).unwrap();
+        assert_eq!(
+            manual,
+            "<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 
     #[test]
