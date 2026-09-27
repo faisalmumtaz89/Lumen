@@ -876,7 +876,7 @@ async fn drive_chat_stream(
                                 "delta": {
                                     "tool_calls": [{
                                         "index": tool_call_index - 1,
-                                        "id": format!("call_lumen_{}", tool_call_index),
+                                        "id": super::tool_call_id("call"),
                                         "type": "function",
                                         "function": {
                                             "name": tc.name,
@@ -1085,7 +1085,7 @@ pub async fn collect_chat(
                 content.push_str(&safe_text);
                 for tc in delta.tool_calls {
                     tool_calls.push(json!({
-                        "id": format!("call_lumen_{}", tool_calls.len() + 1),
+                        "id": super::tool_call_id("call"),
                         "type": "function",
                         "function": {
                             "name": tc.name,
@@ -1701,6 +1701,43 @@ mod tests {
         let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(content.contains("Sure."));
         assert!(content.contains("sunny"));
+    }
+
+    /// Tool-call ids are unique across responses as well as within one: a
+    /// client keeps every earlier turn's ids in its history.
+    #[tokio::test]
+    async fn tool_call_ids_are_unique_across_responses() {
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = || {
+            vec![
+                tok(&call),
+                tok(&call),
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 3,
+                    completion_tokens: 16,
+                },
+            ]
+        };
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let resp = collect_chat_from_events(events(), "m".into(), 1, false)
+                .await
+                .unwrap();
+            for tc in resp["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .unwrap()
+            {
+                ids.push(tc["id"].as_str().unwrap().to_string());
+            }
+            let sse = stream_openai_to_string(events(), true, false).await;
+            for part in sse.split("\"id\":\"call_").skip(1) {
+                ids.push(format!("call_{}", part.split('"').next().unwrap()));
+            }
+        }
+        assert_eq!(ids.len(), 8, "{ids:?}");
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
     }
 
     #[tokio::test]

@@ -706,7 +706,7 @@ responses; use stream=false" }});
                         "index": idx,
                         "content_block": {
                             "type": "tool_use",
-                            "id": format!("toolu_lumen_{}", idx),
+                            "id": super::tool_call_id("toolu"),
                             "name": tc.name,
                             "input": {},
                         }
@@ -910,7 +910,7 @@ pub async fn collect_messages(
                 for tc in delta.tool_calls {
                     tool_blocks.push(json!({
                         "type": "tool_use",
-                        "id": format!("toolu_lumen_{}", tool_blocks.len() + 1),
+                        "id": super::tool_call_id("toolu"),
                         "name": tc.name,
                         "input": serde_json::from_str::<Value>(&tc.arguments_json)
                             .unwrap_or(Value::String(tc.arguments_json)),
@@ -1308,6 +1308,42 @@ mod tests {
             "tool_use",
             "a streamed tool-call turn must report stop_reason:tool_use"
         );
+    }
+
+    /// Tool-use ids are unique across responses as well as within one: a
+    /// client keeps every earlier turn's ids in its history, and one that
+    /// meets an id twice drops a call.
+    #[tokio::test]
+    async fn tool_use_ids_are_unique_across_responses() {
+        use lumen_runtime::tooling::Qwen35Renderer;
+        let call = Qwen35Renderer::render_one_call("get_weather", "{\"city\": \"Paris\"}");
+        let events = || {
+            vec![
+                tok(&call),
+                tok(&call),
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 3,
+                    completion_tokens: 16,
+                },
+            ]
+        };
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let body = collect_messages_from_events(events(), false).await;
+            for b in body["content"].as_array().unwrap() {
+                if b["type"] == "tool_use" {
+                    ids.push(b["id"].as_str().unwrap().to_string());
+                }
+            }
+            let sse = stream_messages_to_string(events(), false, Vec::new()).await;
+            for part in sse.split("\"id\":\"toolu_").skip(1) {
+                ids.push(format!("toolu_{}", part.split('"').next().unwrap()));
+            }
+        }
+        assert_eq!(ids.len(), 8, "{ids:?}");
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
     }
 
     /// A plain (no-tool) streamed turn is unchanged: stop_reason `end_turn`.
