@@ -5,7 +5,7 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
-## [Unreleased]
+## [0.35.0] — 2026-09-28
 
 ### Added
 
@@ -16,6 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   RTX 5090, Qwen3.8-27B NVFP4 keeps the native prefill with a 140,000-position BF16 cache
   (31.2 GB in use) and served a 95,000-token request with it; an F32 cache of 65,536
   positions already takes 30.9 GB. The CPU backends and Metal refuse `bf16`.
+
+### Fixed
+
+- **Tool-call ids repeated across responses.** `/v1/messages` tool-use ids and
+  `/v1/chat/completions` tool-call ids were numbered within each response, so every turn
+  reused the ids of the turns before it, and a client that keeps its history treated the
+  later calls as ones it had already seen (an agent client looped). Each id is now a
+  64-bit namespace drawn at random once per server process followed by a per-call count.
 
 ## [0.34.0] — 2026-09-27
 
@@ -1729,6 +1737,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.35.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.31.0...v0.32.0
