@@ -57,7 +57,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
             return f32::from_bits(sign << 31);
         }
         // Subnormal
-        let v = (frac as f32) * 6.103515625e-05 / 1024.0;
+        let v = (frac as f32) * 6.103_515_6e-5 / 1024.0;
         return if sign != 0 { -v } else { v };
     }
     if exp == 31 {

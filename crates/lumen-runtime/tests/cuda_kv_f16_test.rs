@@ -270,6 +270,7 @@ fn the_half_partial_reproduces_the_f32_partial_bit_for_bit() {
 
 /// The values that separate round-to-nearest-even from truncation and from
 /// a saturating store, and the ones that must be counted.
+#[allow(clippy::approx_constant)] // -3.14159 is an ordinary sample value, not π
 fn special_values() -> Vec<(f32, bool)> {
     let two = |e: i32| 2f32.powi(e);
     vec![
@@ -499,7 +500,10 @@ fn the_fused_prep_half_twin_matches_the_f32_kernel_and_rounds_its_stores() {
             }
         })
         .collect();
-    let expected_count = v_in.iter().filter(|x| !(x.abs() < 65_520.0)).count() as u32;
+    let expected_count = v_in
+        .iter()
+        .filter(|x| x.is_nan() || x.abs() >= 65_520.0)
+        .count() as u32;
     assert!(expected_count > 0);
 
     let run = |half: bool| -> (

@@ -22672,7 +22672,7 @@ mod tests {
         let cache: Vec<LayerWeightsGpu> = Vec::new();
         // layer_idx 0 should not be in cache -- triggers streaming fallback
         assert!(
-            0 >= cache.len(),
+            cache.is_empty(),
             "empty cache means all layers use streaming upload",
         );
     }
@@ -22959,8 +22959,8 @@ mod tests {
         // any unparseable string (e.g. `"abc"`, negative integer, empty
         // string) falls back to the documented default of 0. We cannot
         // exercise this directly without a fork-and-set in the test
-        // process (env-var is cached); the assertion is a contract
-        // statement that the production resolver code uses `.ok()` and
+        // process (env-var is cached); the test only checks that the
+        // resolver returns a `u64`, and documents that it uses `.ok()` and
         // `.unwrap_or(0)` rather than `.unwrap()` or `.expect()`.
         //
         // The actual resolver implementation:
@@ -22980,6 +22980,5 @@ mod tests {
         // the resolver returns a valid `u64` always.
         let v = cuda_decode_delay_us();
         let _: u64 = v; // type-level confirmation; will not compile if regressed
-        assert!(v <= u64::MAX); // trivially true; documents the contract
     }
 }

@@ -125,7 +125,7 @@ fn f16_to_f32(bits: u16) -> f32 {
         }
         // Subnormal
         let f = frac as f32 / 1024.0;
-        let v = f * 6.103515625e-05;
+        let v = f * 6.103_515_6e-5;
         return if sign != 0 { -v } else { v };
     }
     if exp == 31 {

@@ -142,6 +142,7 @@ mod cuda_f16_tests {
 
     #[test]
     fn f16_roundtrip_conversion() {
+        #[allow(clippy::approx_constant)] // arbitrary sample values, not an approximation of π
         let test_values = [0.0f32, 1.0, -1.0, 0.5, -0.5, 3.14, 65504.0, -65504.0, 0.001];
         for &v in &test_values {
             let h = f32_to_f16_bits(v);

@@ -2112,7 +2112,7 @@ mod tests {
         assert_eq!(f32_to_f16_bits(65536.0), 0x7C00); // overflow -> inf
         assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7C00);
         assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xFC00);
-        assert_eq!(f32_to_f16_bits(6.103515625e-05), 0x0400); // smallest normal
+        assert_eq!(f32_to_f16_bits(6.103_515_6e-5), 0x0400); // smallest normal
         assert_eq!(f32_to_f16_bits(5.9604645e-08), 0x0001); // smallest subnormal
         assert!(f32_to_f16_bits(f32::NAN) & 0x7C00 == 0x7C00);
         assert!(f32_to_f16_bits(f32::NAN) & 0x03FF != 0);

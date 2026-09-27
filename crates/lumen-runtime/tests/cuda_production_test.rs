@@ -107,7 +107,7 @@ fn compute_capability_is_valid_on_gpu() {
     assert!(major >= 3, "SM major must be >= 3, got {major}");
     // Minor version is a small non-negative number.
     assert!(
-        minor >= 0 && minor <= 9,
+        (0..=9).contains(&minor),
         "SM minor must be 0..9, got {minor}"
     );
     eprintln!("[info] SM {major}.{minor}");
@@ -120,12 +120,10 @@ fn compute_capability_is_valid_on_gpu() {
 #[test]
 fn device_0_matches_default() {
     // Creating device 0 explicitly should succeed if any GPU is present.
-    match try_create_device(0) {
-        Some(d) => {
-            let name = d.name().unwrap_or_default();
-            eprintln!("[info] device 0: {name}");
-        }
-        None => {} // Gracefully skipped.
+    // Gracefully skipped when there is no device 0.
+    if let Some(d) = try_create_device(0) {
+        let name = d.name().unwrap_or_default();
+        eprintln!("[info] device 0: {name}");
     }
 }
 
