@@ -237,7 +237,7 @@ fn test_q8_aligned_q8_1_hw_matches_reference() {
         let row_f32 = deterministic_random_vec(in_dim, 0x9E37_79B9_u64.wrapping_add(row as u64));
         weight_bytes.extend_from_slice(&encode_q8_aligned(&row_f32));
     }
-    let x_f32 = deterministic_random_vec(in_dim, 0xC0FF_EE_u64);
+    let x_f32 = deterministic_random_vec(in_dim, 0x00C0_FFEE_u64);
     let x_q8_1 = encode_q8_1(&x_f32);
 
     let weight_i8: Vec<i8> = weight_bytes.iter().map(|&b| b as i8).collect();

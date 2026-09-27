@@ -1596,7 +1596,7 @@ mod tests {
         let half_m = mant >> 13;
         let rem = mant & 0x1fff;
         let round_up = rem > 0x1000 || (rem == 0x1000 && (half_m & 1) == 1);
-        sign | (((e as u32) << 10) | half_m) as u16 + u16::from(round_up)
+        sign | ((((e as u32) << 10) | half_m) as u16 + u16::from(round_up))
     }
 
     fn host_f16_to_f32(h: u16) -> f32 {

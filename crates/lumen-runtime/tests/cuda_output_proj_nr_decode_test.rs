@@ -256,7 +256,7 @@ fn run_nr_vs_nr2(out_dim: usize, in_dim: usize, seed: u64, rel_tol: f32) {
         };
         unsafe {
             stream
-                .launch_builder(*func)
+                .launch_builder(func)
                 .arg(&split_buf)
                 .arg(&q8_1_buf)
                 .arg(&mut out_candidate)

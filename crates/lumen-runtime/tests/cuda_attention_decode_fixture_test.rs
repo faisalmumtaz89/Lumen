@@ -400,9 +400,7 @@ fn read_manifest(text: &str) -> std::collections::HashMap<String, String> {
                 + key.len();
             let rest = &line[i..];
             let rest = rest.strip_prefix('"').unwrap_or(rest);
-            let end = rest
-                .find(|c: char| c == '"' || c == ',' || c == '}')
-                .unwrap_or(rest.len());
+            let end = rest.find(['"', ',', '}']).unwrap_or(rest.len());
             rest[..end].to_string()
         };
         let store = field("store");

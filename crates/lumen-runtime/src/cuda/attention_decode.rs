@@ -843,7 +843,10 @@ mod tests {
             {
                 let n = seq_len.div_ceil(ATTN_DECODE_TILE).max(1);
                 let (s, partition) = decode_attention_geometry_within(seq_len, one_tile, target);
-                assert!(s >= 1 && s <= ATTN_DECODE_S_MAX, "seq_len={seq_len}: S={s}");
+                assert!(
+                    (1..=ATTN_DECODE_S_MAX).contains(&s),
+                    "seq_len={seq_len}: S={s}"
+                );
                 if partition == 0 {
                     assert_eq!(s, n, "one-tile partition keeps S = N at seq_len={seq_len}");
                     assert!(n <= one_tile);

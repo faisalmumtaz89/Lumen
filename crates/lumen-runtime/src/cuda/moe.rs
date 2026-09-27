@@ -6633,7 +6633,7 @@ mod tests {
             // Spot-check element 0:
             let mut expected = residual[0];
             for k in 0..top_k {
-                expected += weights[k] * expert_outputs[k * hidden_dim + 0];
+                expected += weights[k] * expert_outputs[k * hidden_dim];
             }
             assert!(
                 (out[0] - expected).abs() < 1e-5,

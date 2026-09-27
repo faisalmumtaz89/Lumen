@@ -394,7 +394,7 @@ fn test_cuda_residual_add() {
     stream.synchronize().unwrap();
     let result = stream.clone_dtoh(&x_gpu).unwrap();
 
-    let expected = vec![11.0f32, 22.0, 33.0, 44.0];
+    let expected = [11.0f32, 22.0, 33.0, 44.0];
     for i in 0..4 {
         assert!(
             (result[i] - expected[i]).abs() < 1e-6,
