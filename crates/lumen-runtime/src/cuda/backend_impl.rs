@@ -2019,28 +2019,25 @@ impl CudaBackend {
     /// path is functional on this device. The probe uses the exact same
     /// data-type / accumulator / algo combination the hot path uses
     /// (`CUDA_R_16BF` operands, `CUBLAS_COMPUTE_32F`,
-    /// `CUBLAS_GEMM_DEFAULT_TENSOR_OP`) on a 4x4x4 GEMV shape (M=4, N=1,
-    /// K=4 — under 100 bytes of device memory total). The probe runs at
+    /// `CUBLAS_GEMM_DEFAULT_TENSOR_OP`) on a 4x1x4 GEMV shape (M=4, N=1,
+    /// K=4 — 56 bytes of device memory total). The probe runs at
     /// most once per process (gated by `BF16_GEMMEX_PROBED`); on failure
     /// it clears `BF16_GEMMEX_AVAILABLE` and emits a single warning
     /// eprintln. The backend is still constructed in either case — the
     /// legacy `matvec_bf16` path does not depend on cuBLAS BF16 GemmEx.
     ///
     /// Probe-time allocation failures (e.g. host -> device copy of the
-    /// 8 host bytes) are treated identically to a `cublasGemmEx`
+    /// operands) are treated identically to a `cublasGemmEx`
     /// non-success status.
     fn probe_bf16_gemmex_once(device: &CudaDevice) {
         if BF16_GEMMEX_PROBED.get().is_some() {
             return;
         }
-        // debugging hook: skip the probe when explicitly requested
-        // via `LUMEN_CUDA_SKIP_BF16_PROBE=1`. Useful when running under
-        // compute-sanitizer, which reports benign cuBLAS-internal OOB reads
-        // on the 4×1×4 probe input as hard CUDA errors that block test
-        // execution. The skip preserves the BF16_GEMMEX_AVAILABLE default
-        // (true) so the live path still attempts BF16 GemmEx; only the
-        // startup probe is bypassed. Production paths are unaffected
-        // unless the env-var is explicitly set.
+        // Skip the probe when explicitly requested via
+        // `LUMEN_CUDA_SKIP_BF16_PROBE=1`. The skip preserves the
+        // BF16_GEMMEX_AVAILABLE default (true) so the live path still
+        // attempts BF16 GemmEx; only the startup probe is bypassed.
+        // Production paths are unaffected unless the env-var is explicitly set.
         if std::env::var("LUMEN_CUDA_SKIP_BF16_PROBE")
             .ok()
             .as_deref()
@@ -2055,25 +2052,18 @@ impl CudaBackend {
         // synchronize), so the pointers are valid for the lifetime of
         // the cuBLAS dispatch. Errors propagate via the `Result` arms.
         let result = (|| -> Result<cublas_sys::cublasStatus_t, RuntimeError> {
-            // 4 BF16 values per operand. Two operands + one F32 output.
-            // 8 bytes weight + 8 bytes input + 16 bytes output = 32 bytes.
+            // A 4 x 4 BF16 weight (m x k), a 4 x 1 BF16 input (k x n) and a
+            // 4-value F32 output: 32 + 8 + 16 = 56 bytes.
             let m: i32 = 4;
             let n: i32 = 1;
             let k: i32 = 4;
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
             // BF16 bit pattern for 1.0 is 0x3f80.
-            let one_bf16_bits: u16 = 0x3f80;
-            let bf16_bytes: [u8; 8] = {
-                let mut out = [0u8; 8];
-                for chunk in out.chunks_exact_mut(2) {
-                    chunk.copy_from_slice(&one_bf16_bits.to_le_bytes());
-                }
-                out
-            };
+            let ones_bf16 = |values: usize| -> Vec<u8> { 0x3f80u16.to_le_bytes().repeat(values) };
 
-            let w_bf16 = device.htod_copy(&bf16_bytes)?;
-            let a_bf16 = device.htod_copy(&bf16_bytes)?;
+            let w_bf16 = device.htod_copy(&ones_bf16((m * k) as usize))?;
+            let a_bf16 = device.htod_copy(&ones_bf16((k * n) as usize))?;
             let c_f32: CudaSlice<f32> = device.alloc_zeros(m as usize)?;
 
             use cudarc::driver::DevicePtr;
@@ -2081,8 +2071,9 @@ impl CudaBackend {
             let (a_ptr, _) = a_bf16.device_ptr(&device.stream);
             let (c_ptr, _) = c_f32.device_ptr(&device.stream);
 
-            // SAFETY: pointers are valid device pointers for at least
-            // 8 / 8 / 16 bytes respectively; cuBLAS handle is owned
+            // SAFETY: pointers are valid device pointers for the m x k
+            // weight, the k x n input and the m x n output (32 / 8 / 16
+            // bytes) that the GEMM reads and writes; cuBLAS handle is owned
             // by `device.blas` and remains live for the call duration.
             let status = unsafe {
                 cublas_sys::cublasGemmEx(
