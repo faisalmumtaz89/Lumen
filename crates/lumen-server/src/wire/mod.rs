@@ -201,6 +201,45 @@ pub(crate) fn resolve_enable_thinking(per_request: Option<bool>) -> bool {
     lumen_runtime::runtime_defaults::resolve_enable_thinking(per_request)
 }
 
+/// Tool-call ids: a 64-bit namespace drawn at random when the generator is
+/// made, then a count. Clients keep every earlier turn's ids in their history
+/// and treat a repeated one as the same call, and a conversation outlives the
+/// server process that answered its earlier turns, so an id must not repeat
+/// within a process (the count, until it wraps after 2^64 ids) nor across
+/// processes: two independently started processes draw the same namespace
+/// with probability about 2^-64, given the OS's random source. No clock is
+/// read.
+pub(crate) struct ToolCallIds {
+    namespace: u64,
+    count: AtomicU64,
+}
+
+impl ToolCallIds {
+    pub(crate) fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        Self {
+            // The standard library's hasher keys are drawn from the OS's
+            // random source; an empty hash under them is a random 64-bit value.
+            namespace: std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish(),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// The next id under `prefix` (`toolu` for Anthropic, `call` for OpenAI).
+    pub(crate) fn next(&self, prefix: &str) -> String {
+        let n = self.count.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_lumen_{:016x}{n:x}", self.namespace)
+    }
+}
+
+/// The server's tool-call id: [`ToolCallIds`] made once per process.
+pub(crate) fn tool_call_id(prefix: &str) -> String {
+    static IDS: OnceLock<ToolCallIds> = OnceLock::new();
+    IDS.get_or_init(ToolCallIds::new).next(prefix)
+}
+
 /// Monotonic per-process sequence used to keep response `id`s unique even when
 /// several requests share the same `created`/clock value (sub-second burst).
 pub(crate) fn next_response_seq() -> u64 {
@@ -253,6 +292,33 @@ pub(crate) fn normalize_zero_penalty(v: Option<f32>) -> Option<f32> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn tool_call_ids_do_not_repeat_within_or_across_generators() {
+        // Two generators stand for two server processes; ids are drawn from
+        // both under contention and must all differ.
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+        let (a, b) = (Arc::new(ToolCallIds::new()), Arc::new(ToolCallIds::new()));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let g = if t % 2 == 0 { a.clone() } else { b.clone() };
+                thread::spawn(move || (0..5_000).map(|_| g.next("toolu")).collect::<Vec<_>>())
+            })
+            .collect();
+        let ids: Vec<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 40_000);
+        assert!(ids.iter().all(|id| id.starts_with("toolu_lumen_")
+            && id["toolu_lumen_".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())));
+        assert_ne!(a.namespace, b.namespace);
+    }
 
     #[test]
     fn next_random_seed_unique_across_threads() {
