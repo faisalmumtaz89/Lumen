@@ -5,7 +5,7 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
-## [Unreleased]
+## [0.34.0] — 2026-09-27
 
 ### Added
 
@@ -62,6 +62,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `rope_parameters` when comparing the checkpoint with the donor GGUF, and refuses a
   `rope_theta` or `rms_norm_eps` that is present but not a number instead of skipping
   the comparison.
+
+### Fixed
+
+- The CUDA backend's startup check of the BF16 cuBLAS path uploaded 4 weight values for
+  the 4 x 4 GEMM it runs, so cuBLAS read 12 values past the allocation; under
+  compute-sanitizer the backend could not start. The probe now uploads the whole weight.
+- Resetting a CUDA session zeroes the GDN recurrent state and conv rings in place.
+  The reset allocated a zeroed buffer for each and skipped the clear when that allocation
+  failed, which could leave the previous sequence's state behind without an error.
+- `docs/environment-variables.md` described `LUMEN_SUFFIX_THRESHOLD` as the shared-prefix
+  length before suffix reuse engages. It is the suffix length at which a resumed session
+  would switch from the decode loop to the batched prefill, and no current backend makes
+  that switch; the reference and the `--session-save` help now say so.
 
 ## [0.33.0] — 2026-09-25
 
@@ -1704,6 +1717,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[0.34.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.30.0...v0.31.0
