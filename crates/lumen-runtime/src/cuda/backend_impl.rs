@@ -916,8 +916,10 @@ struct MutableState {
     /// (see kv_cache_f16.cu). Read after every prefill, streaming and decode
     /// readback; a non-zero count refuses the generation.
     kv16_overflow: Option<CudaSlice<u32>>,
-    /// 16-bit store only: the F32 buffers the prefill readers work on, one pair
-    /// shared by every layer, allocated at init at the cache's capacity.
+    /// 16-bit store on the F32 prefill route only: the F32 buffers the prefill
+    /// readers work on, one pair shared by every layer, allocated at init at the
+    /// cache's capacity, released before the native prefill route is tried (it
+    /// reads a BF16 store in place) and made again if the route is refused.
     kv_widen: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     /// GPU-resident global tensors.
     globals: GpuGlobals,
@@ -1362,7 +1364,7 @@ fn write_kv_batch(
 
 /// The F32 view a prefill reader takes: the store itself when it is F32,
 /// otherwise the 16-bit store's positions `0..count` widened into the shared
-/// widening buffers `init()` allocated at the cache's full capacity (one pair
+/// widening buffers allocated for the F32 prefill route at the cache's full capacity (one pair
 /// for every layer; the readers see the F32 layout with a position stride of
 /// `count`).
 fn kv_view_for_prefill<'a>(
@@ -1379,7 +1381,7 @@ fn kv_view_for_prefill<'a>(
         KvStore::F32 { .. } => unreachable!("f32_view covers the F32 store"),
         KvStore::F16 { k, v } | KvStore::Bf16 { k, v } => {
             let kv16 = decode::Kv16Kernels::of(kernels, kv_cache.precision())?;
-            // Allocated at init with the 16-bit store; never here.
+            // Allocated before any prefill with the 16-bit store; never here.
             let out = widen.as_mut().ok_or_else(|| {
                 RuntimeError::Compute("16-bit KV cache without its widening buffers".into())
             })?;
@@ -22433,6 +22435,10 @@ impl ComputeBackend for CudaBackend {
         // The prefill route, chosen once for this model and named in the log for a model with NVFP4
         // or FP8 planes, the only one the native route can admit.
         st.native_prefill = None;
+        // A 16-bit store's widening pair, which every memory check of the first load since init
+        // has counted as taken, is released while the native route is tried, so the route sees the memory it would
+        // have; it is made again, at the cache's capacity, if the route is refused.
+        st.kv_widen = None;
         let publishing = std::time::Instant::now();
         let published = native_prefill_forward::publish(self, st, weights);
         let secs = publishing.elapsed().as_secs_f64();
@@ -22443,12 +22449,24 @@ impl ComputeBackend for CudaBackend {
                 );
                 st.native_prefill = Some(route);
                 st.native_prefill_refusal = None;
+                if matches!(st.kv_precision, KvPrecision::F16 | KvPrecision::Bf16) {
+                    eprintln!(
+                        "[CUDA mem] KV widening buffers released: the native route reads the cache in place"
+                    );
+                }
             }
             Err(refusal) => {
                 if carries_planar {
                     eprintln!("[CUDA] prefill route: F32 ({refusal}; refused after {secs:.1} s)");
                 }
                 st.native_prefill_refusal = Some(refusal);
+                if matches!(st.kv_precision, KvPrecision::F16 | KvPrecision::Bf16) {
+                    let floats = st.kv_num_kv_heads * st.kv_max_seq_len * st.kv_head_dim;
+                    st.kv_widen = Some((
+                        self.device.alloc_zeros::<f32>(floats)?,
+                        self.device.alloc_zeros::<f32>(floats)?,
+                    ));
+                }
             }
         }
         Ok(())

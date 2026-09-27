@@ -3,9 +3,10 @@
 // from any start position p0. Compiled after native_prefill_common.cu as one NVRTC module for
 // compute_120a, with no header.
 //
-// The KV cache stays F32, [4][max_seq][256] per layer. Attention reads a BF16 copy of it in the same
-// layout (the staging): the prep kernel writes both for the new positions [p0, p0 + T), and
-// native_kv_to_bf16 rounds the older positions [0, p0) to nearest even.
+// Attention reads BF16 K and V in the cache layout, [4][max_seq][256] per layer. An F32 cache is read
+// through a BF16 copy of it (the staging): the prep kernel writes both for the new positions
+// [p0, p0 + T), and native_kv_to_bf16 rounds the older positions [0, p0) to nearest even. A BF16
+// cache is the staging itself: the prep kernel writes it alone and nothing is restaged.
 //
 // Layouts: qg [T][24][512] BF16 (per head the query, then its gate), k and v [T][4][256] BF16, the RoPE
 // table [pos][64] F32 (cos of pairs 0..31, then their sin), q and the attention output [T][24][256] BF16.
@@ -45,7 +46,8 @@ extern "C" __global__ void native_rope_table(float* __restrict__ cs, unsigned in
 //   RoPE  of the pair (n1, n2) = (n[d], n[d + 32]), d < 32, at position p0 + t:
 //         bf16(fma(n1, cos, -(n2 * sin))), bf16(fma(n1, sin, n2 * cos)); columns 64..255 keep n.
 // The key's BF16 result goes to the staging and, widened exactly, to the F32 cache at row p0 + t; the
-// value's BF16 input likewise. Nothing else is written.
+// value's BF16 input likewise. With a BF16 KV store the staging is the store and `k_cache`/`v_cache`
+// are null, so only the BF16 rows are written. Nothing else is written.
 extern "C" __global__ void __launch_bounds__(128) native_attn_prep(
     const unsigned short* __restrict__ qg,
     const unsigned short* __restrict__ k,
@@ -125,9 +127,11 @@ extern "C" __global__ void __launch_bounds__(128) native_attn_prep(
     vf.x = native_lo(vp);
     vf.y = native_hi(vp);
     *reinterpret_cast<unsigned int*>(k_stage + o) = y;
-    *reinterpret_cast<float2*>(k_cache + o) = kf;
     *reinterpret_cast<unsigned int*>(v_stage + o) = vp;
-    *reinterpret_cast<float2*>(v_cache + o) = vf;
+    if (k_cache != nullptr) {
+        *reinterpret_cast<float2*>(k_cache + o) = kf;
+        *reinterpret_cast<float2*>(v_cache + o) = vf;
+    }
 }
 
 // Four F32 values rounded to nearest even as BF16, in order.

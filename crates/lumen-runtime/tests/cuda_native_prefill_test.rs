@@ -1306,10 +1306,15 @@ fn model(var: &str) -> SyncWeightProvider {
 /// The backend as `lumen-server` builds it for CUDA: F32 KV, the raw global planes, the context
 /// capped at [`CONTEXT`], every weight preloaded (which publishes the prefill route).
 fn route_backend(provider: &SyncWeightProvider) -> CudaBackend {
+    route_backend_at(provider, KvPrecision::F32)
+}
+
+/// [`route_backend`] with the KV cache stored at `kv`.
+fn route_backend_at(provider: &SyncWeightProvider, kv: KvPrecision) -> CudaBackend {
     let mut hp = provider.lbc().header.hyperparams;
     hp.max_seq_len = hp.max_seq_len.min(CONTEXT as u32);
     let mut cuda = CudaBackend::new(0).expect("CUDA device 0");
-    cuda.set_kv_precision(KvPrecision::F32).expect("F32 KV");
+    cuda.set_kv_precision(kv).expect("KV precision");
     cuda.set_global_tensors(
         provider.embedding.clone(),
         provider.final_norm.clone(),
@@ -1334,13 +1339,17 @@ fn route_backend(provider: &SyncWeightProvider) -> CudaBackend {
 }
 
 fn route_kv(provider: &SyncWeightProvider) -> KvCache {
+    route_kv_at(provider, KvPrecision::F32)
+}
+
+fn route_kv_at(provider: &SyncWeightProvider, precision: KvPrecision) -> KvCache {
     let hp = provider.lbc().header.hyperparams;
     KvCache::new(KvCacheConfig {
         max_seq_len: CONTEXT,
         num_layers: hp.num_layers as usize,
         num_kv_heads: hp.num_kv_heads as usize,
         head_dim: hp.head_dim as usize,
-        precision: KvPrecision::F32,
+        precision,
     })
     .unwrap()
 }
@@ -2271,4 +2280,132 @@ fn vram_and_load_time() {
         );
     }
     l.finish();
+}
+
+/// A BF16 KV store changes nothing the native prefill computes: the route attends to BF16 keys and
+/// values either way (an F32 store's rows restaged, or the BF16 store's own), so every prompt's last
+/// row is bit for bit the F32 store's. Prompts of 128, 512 and 2048 tokens, 2560 tokens in two
+/// slices, and 2560 tokens in two calls of 64 and 2496 (older rows read back from the store). The
+/// route is published at both stores and runs one forward per slice.
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn bf16_store_prefills_bit_for_bit_like_the_f32_store() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let ids = long_ids();
+    // Two slices whole, and a second call that crosses a slice boundary.
+    assert_eq!(ids.len(), 2560, "P2048 then P512");
+    let prompts: Vec<Vec<&[u32]>> = vec![
+        vec![&ids[..128]],
+        vec![&ids[..512]],
+        vec![&ids[..2048]],
+        vec![&ids[..]],
+        vec![&ids[..64], &ids[64..]],
+    ];
+    let rows = |kv: KvPrecision| -> Vec<Vec<f32>> {
+        let cuda = route_backend_at(&provider, kv);
+        assert!(
+            cuda.native_prefill_refusal().is_none() && cuda.native_prefill_forwards() == Some(0),
+            "{kv:?}: the native route is published: {:?}",
+            cuda.native_prefill_refusal()
+        );
+        let rows = prompts
+            .iter()
+            .map(|calls| {
+                cuda.reset_recurrent_state();
+                let mut cache = route_kv_at(&provider, kv);
+                let mut row = Vec::new();
+                for ids in calls {
+                    row = cuda.prefill(ids, &provider, &mut cache).expect("prefill");
+                }
+                row
+            })
+            .collect();
+        let slices: u64 = prompts
+            .iter()
+            .flatten()
+            .map(|ids| ids.len().div_ceil(2048) as u64)
+            .sum();
+        assert_eq!(
+            cuda.native_prefill_forwards(),
+            Some(slices),
+            "{kv:?}: forwards"
+        );
+        rows
+    };
+    let f32_rows = rows(KvPrecision::F32);
+    let bf16_rows = rows(KvPrecision::Bf16);
+    for (i, (a, b)) in f32_rows.iter().zip(&bf16_rows).enumerate() {
+        assert!(
+            !a.is_empty() && a.iter().all(|x| x.is_finite()),
+            "prompt {i}: row"
+        );
+        assert!(
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+            "prompt {i}: the BF16 store's row differs from the F32 store's"
+        );
+    }
+}
+
+/// A 16-bit KV store the native route refuses prefills on the F32 route, which reads the store
+/// through the widening pair released while the native route was tried and made again when it was
+/// refused: an F16 store (refused at Q7), and with `test-fault-injection` a BF16 store refused at
+/// Q4, after the route's own buffers allocated. With `test-state-snapshot` too, each store's logits
+/// on the F32 route are the F32 store's to within its rounding: the same argmax and a small
+/// relative L2 distance, which a key/value mix-up in the 16-bit writers or the widening would not
+/// keep.
+#[test]
+#[ignore = "needs a GPU, cuBLASLt >= 12.8 and the real artifact"]
+fn a_refused_16_bit_store_prefills_on_the_f32_route() {
+    let provider = model("LUMEN_NATIVE_MODEL");
+    let ids = long_ids();
+    let cuda = route_backend_at(&provider, KvPrecision::F16);
+    let refusal = cuda.native_prefill_refusal();
+    assert_eq!(
+        refusal.as_ref().map(|r| r.condition),
+        Some("Q7"),
+        "{refusal:?}"
+    );
+    cuda.reset_recurrent_state();
+    let mut cache = route_kv_at(&provider, KvPrecision::F16);
+    let row = cuda
+        .prefill(&ids[..512], &provider, &mut cache)
+        .expect("an F16 store prefills on the F32 route");
+    assert!(!row.is_empty() && row.iter().all(|x| x.is_finite()));
+    assert_eq!(cuda.native_prefill_forwards(), None);
+    drop(cuda);
+
+    #[cfg(all(feature = "test-fault-injection", feature = "test-state-snapshot"))]
+    {
+        use lumen_runtime::cuda::native_prefill::fault;
+        let f32_route_logits = |kv: KvPrecision, inject: Option<&'static str>, refused: &str| {
+            fault::refuse(inject);
+            let cuda = route_backend_at(&provider, kv);
+            fault::refuse(None);
+            let refusal = cuda.native_prefill_refusal();
+            assert_eq!(
+                refusal.as_ref().map(|r| r.condition),
+                Some(refused),
+                "{kv:?}: {refusal:?}"
+            );
+            cuda.reset_recurrent_state();
+            let mut cache = route_kv_at(&provider, kv);
+            let row = cuda
+                .prefill(&ids[..512], &provider, &mut cache)
+                .unwrap_or_else(|e| panic!("{kv:?} on the F32 route: {e}"));
+            assert!(!row.is_empty() && row.iter().all(|x| x.is_finite()));
+            assert_eq!(cuda.native_prefill_forwards(), None);
+            logits_of(&cuda, &row)
+        };
+        let want = f32_route_logits(KvPrecision::F32, Some("Q4"), "Q4");
+        for (kv, inject, refused) in [
+            (KvPrecision::F16, None, "Q7"),
+            (KvPrecision::Bf16, Some("Q4"), "Q4"),
+        ] {
+            let got = f32_route_logits(kv, inject, refused);
+            let d = rel_l2(&got, &want);
+            eprintln!("{kv:?} store, F32 route: logits relative L2 {d:.3e} from the F32 store's");
+            assert_eq!(argmax(&got), argmax(&want), "{kv:?}: argmax");
+            assert!(d < 0.05, "{kv:?}: relative L2 {d:.3e}");
+        }
+    }
 }

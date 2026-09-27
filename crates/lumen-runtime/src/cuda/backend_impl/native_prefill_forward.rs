@@ -10,7 +10,7 @@
 //! then every layer as its components define it (`native_prefill_kernels`, `native_prefill_gdn`,
 //! `native_prefill_attn`, the cuBLASLt plans of `native_prefill_gemm`), with BF16 activations and a
 //! BF16 residual. It writes the state decode reads, where and as decode keeps it: each attention
-//! layer's F32 KV rows and length, each GDN layer's recurrent state, conv ring and ring position, and
+//! layer's KV rows (F32 or BF16, the store's type) and length, each GDN layer's recurrent state, conv ring and ring position, and
 //! the last position's hidden row (`scratch.x_gpu`, F32).
 
 use super::{
@@ -251,9 +251,10 @@ pub(super) struct NativePrefill {
     views: PrefillWeightViews,
     /// RoPE table rows [0, max_seq).
     rope: CudaSlice<f32>,
-    /// BF16 staging of one attention layer's K and V, `[4][max_seq][256]` each.
-    k_stage: CudaSlice<u16>,
-    v_stage: CudaSlice<u16>,
+    /// BF16 staging of one attention layer's K and V, `[4][max_seq][256]` each, which the attention
+    /// reads: allocated for an F32 KV store only, since a BF16 store is already that layout and is
+    /// read in place.
+    stage: Option<(CudaSlice<u16>, CudaSlice<u16>)>,
     max_seq: usize,
     scratch: NativeScratch,
     eps: f32,
@@ -296,11 +297,11 @@ pub(super) fn publish(
         std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok(),
     )?;
     injected(&["Q7"])?;
-    if st.kv_precision != KvPrecision::F32 {
+    if !matches!(st.kv_precision, KvPrecision::F32 | KvPrecision::Bf16) {
         return Err(Refusal {
             condition: "Q7",
             reason: format!(
-                "the KV store is {:?}; the route writes F32",
+                "the KV store is {:?}; the route writes F32 or BF16",
                 st.kv_precision
             ),
         });
@@ -353,9 +354,15 @@ pub(super) fn publish(
     let mut a = Alloc { device, bytes: 0 };
     let scratch = NativeScratch::new(&mut a).map_err(refusal("Q8"))?;
     let scratch_bytes = a.bytes;
-    let n_stage = (route::KV_HEADS * route::HEAD_DIM) as usize * max_seq;
-    let k_stage = a.zeros::<u16>(n_stage).map_err(refusal("Q8"))?;
-    let v_stage = a.zeros::<u16>(n_stage).map_err(refusal("Q8"))?;
+    let stage = if st.kv_precision == KvPrecision::F32 {
+        let n_stage = (route::KV_HEADS * route::HEAD_DIM) as usize * max_seq;
+        Some((
+            a.zeros::<u16>(n_stage).map_err(refusal("Q8"))?,
+            a.zeros::<u16>(n_stage).map_err(refusal("Q8"))?,
+        ))
+    } else {
+        None
+    };
     let rope = a.zeros::<f32>(max_seq * ROT).map_err(refusal("Q8"))?;
     // SAFETY: `rope` holds `max_seq` rows of the table.
     unsafe { ak.rope_table(device, dp(device, &rope), max_seq as u32, ROPE.theta) }
@@ -418,8 +425,7 @@ pub(super) fn publish(
             gemm,
             views,
             rope,
-            k_stage,
-            v_stage,
+            stage,
             max_seq,
             scratch,
             eps: hp.norm_eps,
@@ -661,7 +667,8 @@ impl NativePrefill {
         }
     }
 
-    /// Record an attention layer's whole K cache followed by its whole V cache as `name`.
+    /// Record an attention layer's whole K cache followed by its whole V cache, `bytes` each, as
+    /// `name`.
     #[allow(unused_variables)]
     fn rec_kv(
         &mut self,
@@ -670,17 +677,17 @@ impl NativePrefill {
         name: &'static str,
         k: u64,
         v: u64,
-        n: usize,
+        bytes: usize,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-prefill-dump")]
         if self.dump.as_ref().is_some_and(|d| d.wants(l)) {
             device.synchronize()?;
-            let mut host = vec![0u8; 8 * n];
+            let mut host = vec![0u8; 2 * bytes];
             for (i, at) in [k, v].into_iter().enumerate() {
-                // SAFETY: each cache holds `n` F32 values.
+                // SAFETY: each cache holds `bytes` bytes.
                 unsafe {
                     cudarc::driver::result::memcpy_dtoh_sync(
-                        &mut host[i * 4 * n..(i + 1) * 4 * n],
+                        &mut host[i * bytes..(i + 1) * bytes],
                         at,
                     )
                 }
@@ -843,14 +850,26 @@ impl NativePrefill {
                     self.max_seq
                 )));
             }
-            let KvStore::F32 { k: kc, v: vc } = &cache.store else {
-                return Err(RuntimeError::KvCache(format!(
-                    "layer {l}: the native prefill writes an F32 KV store"
-                )));
+            // The rows the attention reads, BF16: the staging beside an F32 store (the prep writes
+            // both, and older rows are restaged from the store), or a BF16 store itself (the prep
+            // writes it alone, null F32 caches). `(kr, vr, bytes)` is the store as a dump records it.
+            let (kc, vc, ks, vs, (kr, vr, bytes)) = match (&cache.store, &self.stage) {
+                (KvStore::F32 { k, v }, Some((k_stage, v_stage))) => {
+                    let (kc, vc) = (dp(d, k), dp(d, v));
+                    (kc, vc, p(k_stage), p(v_stage), (kc, vc, 4))
+                }
+                (KvStore::Bf16 { k, v }, None) => {
+                    let (ks, vs) = (p(k), p(v));
+                    (0, 0, ks, vs, (ks, vs, 2))
+                }
+                _ => {
+                    return Err(RuntimeError::KvCache(format!(
+                        "layer {l}: the native prefill writes an F32 or BF16 KV store, the one it \
+                         was published for"
+                    )))
+                }
             };
-            let (kc, vc) = (dp(d, kc), dp(d, vc));
             let n = (route::KV_HEADS * route::HEAD_DIM) as usize * self.max_seq;
-            let (ks, vs) = (p(&self.k_stage), p(&self.v_stage));
             let cs = dp(d, &self.rope);
             let ms = self.max_seq as u32;
             let [q_w1, k_w1] = lp
@@ -858,7 +877,7 @@ impl NativePrefill {
                 .ok_or_else(|| RuntimeError::Compute(format!("layer {l} q/k norms")))?;
             self.rec_host(l, "p0", || (p0 as u32).to_le_bytes().to_vec());
             self.rec(d, l, "cs", cs + (p0 * ROT * 4) as u64, t * ROT * 4)?;
-            self.rec_kv(d, l, "kv_in", kc, vc, n)?;
+            self.rec_kv(d, l, "kv_in", kr, vr, n * bytes)?;
             let s = &self.scratch;
             let (q, gate, o) = (p(&s.q), p(&s.gate), p(&s.o));
             let p0u = p0 as u32;
@@ -866,12 +885,14 @@ impl NativePrefill {
                 self.ak.prep(
                     d, qg, kk, vv, q_w1, k_w1, cs, eps, tu, p0u, ms, q, gate, kc, vc, ks, vs,
                 )?;
-                self.ak.kv_to_bf16(d, kc, vc, ks, vs, p0u, ms)?;
+                if kc != 0 {
+                    self.ak.kv_to_bf16(d, kc, vc, ks, vs, p0u, ms)?;
+                }
                 self.ak.attention(d, q, ks, vs, o, tu, p0u, ms)?;
             }
             self.rec(d, l, "q", q, t * AO * 2)?;
             self.rec(d, l, "gate", gate, t * AO * 2)?;
-            self.rec_kv(d, l, "kv", kc, vc, n)?;
+            self.rec_kv(d, l, "kv", kr, vr, n * bytes)?;
             self.rec(d, l, "o", o, t * AO * 2)?;
             cache.advance_seq_len_by(t);
             unsafe {
@@ -1065,7 +1086,8 @@ impl CudaBackend {
     }
 
     /// Prefill with the F32 route (`true`) or the published native route (`false`) from the next
-    /// prompt on.
+    /// prompt on. The F32 route reads a 16-bit KV store through widening buffers, which exist only
+    /// when the native route was refused, so over a published route the KV store must be F32.
     pub fn set_native_prefill_suspended(&self, suspended: bool) {
         self.with_route(|st| {
             if let Some(np) = st.native_prefill.as_mut() {

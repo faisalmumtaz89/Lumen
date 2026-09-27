@@ -29,8 +29,8 @@
 //! | Q2 | NVRTC 12.8 or newer, listing target 120 (`compute_120a`) |
 //! | Q3 | Every native kernel group compiles and reproduces its qualifying outputs, and the embedding gather of the vocabulary's highest id and of id 65537 (when the vocabulary has one) returns the resident embedding's stored rows |
 //! | Q4 | cuBLASLt 12.8 or newer loads, and every GEMM plan has a measured, verified algorithm |
-//! | Q7 | The KV store is F32 |
-//! | Q8 | The weight views, the scratch, the KV staging, the RoPE table and the shared GDN state allocate |
+//! | Q7 | The KV store is F32 or BF16 |
+//! | Q8 | The weight views, the scratch, the KV staging (an F32 store's only), the RoPE table and the shared GDN state allocate |
 //! | Q9 | `LUMEN_CUDA_NATIVE_PREFILL` is not `0` and `LUMEN_CUDA_PREFILL_F32` is unset |
 
 use crate::error::RuntimeError;
