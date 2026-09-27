@@ -177,8 +177,9 @@ OPTIONS:
                           GDN recurrent state, the token history, and the pending logits
                           so a subsequent `--session-resume <p>` is argmax-identical to a
                           continuous session.
-                          The override `LUMEN_SUFFIX_THRESHOLD=<n>` (positive integer)
-                          tunes the per-call cached-prefix prefill/decode hand-off cutoff.
+                          `LUMEN_SUFFIX_THRESHOLD=<n>` (positive integer) is the suffix
+                          length at which a resumed session would switch from the decode
+                          loop to the batched prefill; no current backend makes that switch.
     --profile             Print per-operation timing breakdown after inference (implies --verbose)
     --verbose, -v         Show diagnostics, metrics, and banner (default: quiet, text only)
     --verbose-routing     Print per-layer MoE router diagnostics (entropy, expert selection)
