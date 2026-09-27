@@ -7,7 +7,11 @@
 //!
 //! Requires a CUDA-capable GPU (run on Modal).
 //!
-//!   cargo test --release -p lumen-runtime --features cuda --test cuda_gdn_integration_test
+//!   cargo test --release -p lumen-runtime --features cuda,test-state-snapshot \
+//!     --test cuda_gdn_integration_test
+//!
+//! `test_reset_recurrent_state_zeroes_the_gdn_state` reads the GDN state back, so it is built only
+//! with `test-state-snapshot`.
 
 #![cfg(feature = "cuda")]
 
@@ -499,6 +503,50 @@ fn test_reset_recurrent_state() {
     for (i, &val) in a0.iter().enumerate() {
         assert!(val.is_finite(), "a0 logit[{i}] should be finite, got {val}");
     }
+}
+
+/// `reset_recurrent_state` zeroes the GDN state: after two decodes leave state behind, the reset
+/// leaves every recurrent state and conv ring zero, read back from the device, and every ring
+/// position at 0.
+#[cfg(feature = "test-state-snapshot")]
+#[test]
+fn test_reset_recurrent_state_zeroes_the_gdn_state() {
+    let s = setup_gdn_backend();
+    // The nonzero state values and ring positions.
+    let gdn_state = |kv: &lumen_runtime::KvCache| -> (usize, Vec<u32>) {
+        let snap = s.backend.snapshot_state(kv).expect("snapshot_state");
+        let values = snap
+            .h_states
+            .iter()
+            .chain(&snap.conv_states)
+            .flatten()
+            .filter(|&&v| v != 0.0)
+            .count();
+        (values, snap.conv_positions)
+    };
+
+    s.backend.reset_recurrent_state();
+    let mut kv = new_gdn_kv(&s.hp);
+    for pos in 0..2 {
+        s.backend
+            .decode_token(1, &s.provider, &mut kv)
+            .unwrap_or_else(|e| panic!("decode at {pos}: {e}"));
+    }
+    let (values, positions) = gdn_state(&kv);
+    assert!(values > 0, "two decodes leave GDN state behind");
+    assert!(
+        positions.iter().any(|&p| p != 0),
+        "two decodes move a ring position: {positions:?}"
+    );
+
+    s.backend.reset_recurrent_state();
+
+    let (values, positions) = gdn_state(&new_gdn_kv(&s.hp));
+    assert_eq!(values, 0, "values of GDN state left behind by the reset");
+    assert!(
+        positions.iter().all(|&p| p == 0),
+        "ring positions left by the reset: {positions:?}"
+    );
 }
 
 /// Test hybrid model routing: layer 0 (GDN) and layer 1 (full attention) both
