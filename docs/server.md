@@ -44,6 +44,8 @@ POST /v1/images/generations # Text to image (`--features image` builds with
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
 
+`/v1/completions` takes `prompt` as a string, an array of strings (concatenated), or an array of token ids. Token ids reach the model unchanged, with no tokenization and no special tokens added, so a client can send the exact ids it measured elsewhere. An id at or above the model's vocabulary size, an array mixing strings with ids or holding anything else, or a prompt that resolves to no tokens, is refused with a 400.
+
 Both wire formats support SSE streaming. Tool-call parsing is template-driven: v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with a streaming parser that uses partial-marker hold-back; additional templates are registered as new model families ship. Reference embedder: [`crates/lumen-server/tests/server_integration.rs`](../crates/lumen-server/tests/server_integration.rs). Reference binary: [`crates/lumen-server/src/bin/lumen-server.rs`](../crates/lumen-server/src/bin/lumen-server.rs).
 
 ## Sampling & reproducibility
@@ -68,7 +70,7 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 
 - `temperature: 0` is greedy/deterministic **regardless of seed**.
 - The Anthropic `/v1/messages` schema has no `seed` field, so it always uses a fresh random seed (matching the upstream Anthropic API).
-- These are two independent properties: the **kernels** are byte-deterministic for fixed inputs (same seed + params ⇒ same tokens), while **sampling output varies by default** because the seed is randomized per request. Pin the `seed` to combine both into reproducible output.
+- These are two independent properties: the **kernels** are byte-deterministic for fixed inputs (same seed + params ⇒ same tokens; for an NVFP4/FP8 artifact on CUDA, while its measured GEMM plan table stays the same and the request does not continue the one the server ran before it, prompt and reply — see [troubleshooting.md](troubleshooting.md)), while **sampling output varies by default** because the seed is randomized per request. Pin the `seed` to combine both into reproducible output.
 
 ## Reasoning / extended thinking
 

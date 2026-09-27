@@ -7,6 +7,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **NVFP4 and FP8 checkpoints on CUDA.** `lumen convert --from-hf` imports an NVIDIA
+  ModelOpt mixed-precision checkpoint whose quantized layers are each NVFP4 (4-bit E2M1
+  weights, an E4M3 scale per 16 weights and one F32 scale per tensor) or FP8 E4M3 (one
+  F32 scale per tensor), as the checkpoint declares per layer, and stores each tensor's
+  planes without re-quantizing them, with the GDN projections' rows or column blocks
+  reordered to the GGUF head order. The attention and MLP projections and the GDN
+  `in_proj_qkv` / `in_proj_z` may be either scheme or BF16, the GDN output projection FP8
+  or BF16, and the output head NVFP4 or BF16; the embedding must be BF16 and the GDN
+  `in_proj_a` / `in_proj_b` unquantized. A NaN E4M3 block scale or FP8 weight, a
+  `pre_quant_scale`, and a declared module outside the text model (a
+  multi-token-prediction layer, say) are refused by name. Each module's activation scale
+  (`input_scale`) is kept after its planes when the checkpoint carries one, and one that
+  is malformed or belongs to no converted NVFP4 or FP8 module is refused by name; an
+  artifact converted without them loads and serves as before. The CUDA backend serves them
+  with dedicated decode and prefill kernels; the other backends refuse such an artifact
+  at load and name the scheme. With `LUMEN_CUDA_NVFP4=0`, `lumen` and `lumen-server` refuse
+  them on CUDA as well.
+- **Native NVFP4/FP8 prefill on CUDA.** An NVFP4/FP8 artifact of the supported 27B
+  hybrid structure, converted with its activation scales, is prefilled with FP4 and FP8
+  activations on cuBLASLt's tensor-core GEMMs (block-scaled FP4, per-tensor-scaled FP8) and dedicated kernels, on a GPU
+  of compute capability 12.0 with NVRTC and cuBLASLt 12.8 or newer and an F32 KV store,
+  when its kernels pass a self-check at load and every GEMM has a verified plan (measured
+  and verified once, then cached per library, device model and driver). The GDN and
+  attention kernels' reference outputs were recorded with NVRTC 13.3 and driver 610;
+  another toolchain whose build changes their outputs fails the check.
+  Decode is unchanged and continues from the state the prefill leaves. The native prefill
+  rounds differently from the F32 one, and its output is reproducible while the measured
+  plan table stays the same and a request does not continue the one the server ran before
+  it, prompt and reply (see `docs/troubleshooting.md`). The route is chosen
+  once at load and the load log names it (`[CUDA] prefill route: ...`), with the libraries
+  and their versions, or, when the F32 prefill is used instead, the first condition that
+  was not met. Artifacts converted before activation scales were kept are prefilled by the
+  F32 route; re-convert them to use the native one. `LUMEN_CUDA_NATIVE_PREFILL=0` selects
+  the F32 prefill, as does `LUMEN_CUDA_PREFILL_F32`.
+- **Token-id prompts on `/v1/completions`.** `prompt` may be an array of token ids, which
+  reach the model unchanged, as in the OpenAI completions API. An id outside the model's
+  vocabulary is refused with a 400, as is an array mixing strings with ids or holding any
+  other value; such elements were previously dropped without notice.
+
+### Changed
+
+- **An empty `/v1/completions` prompt is refused** with a 400. After an earlier request it
+  was served, continuing from what that request had left loaded; on a fresh server it
+  failed with an error.
+- The CUDA RMSNorm, used by every model, keeps each thread's first eight values in
+  registers between its two passes instead of reading them again for the store; its
+  output is bit-identical.
+- The CUDA load-time line `[CUDA] K-quant planes: ...` is now
+  `[CUDA] quantized planes: ...` and also counts `Nvfp4` and `Fp8E4M3` planes.
+- The compressed-tensors import also reads a `rope_theta` nested under
+  `rope_parameters` when comparing the checkpoint with the donor GGUF, and refuses a
+  `rope_theta` or `rms_norm_eps` that is present but not a number instead of skipping
+  the comparison.
+
 ## [0.33.0] — 2026-09-25
 
 ### Added

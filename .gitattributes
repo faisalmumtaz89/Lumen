@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Reference vectors are raw little-endian buffers; never normalize them.
+crates/lumen-format/tests/fixtures/planar_reference/* binary

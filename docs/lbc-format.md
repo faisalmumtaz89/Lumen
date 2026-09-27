@@ -38,6 +38,8 @@ Each tensor entry in the table includes name, dtype, dimensions, byte offset, an
 | Q8_0  | ~1.06 | 32-element groups, F16 scale per group |
 | Q4_0  | ~0.56 | 32-element groups, F16 scale per group |
 | CtInt4G32 | ~0.58 | Imported compressed-tensors "pack-quantized" INT4: 32-element groups, BF16 scale + 4-bit zero-point per group. Every quantized value is preserved exactly (no dequantization; rows/column-blocks are reindexed where the GGUF tensor conventions require it). CUDA runtime only. |
+| NVFP4 | 0.5625 | Imported NVIDIA ModelOpt NVFP4: 4-bit E2M1 weights (two per byte), an E4M3 scale per 16 weights, and one F32 scale per tensor, stored as three planes in that order. Each weight is `E2M1(code) × (E4M3(block scale) × tensor scale)`: the two scales are multiplied first, in F32. The row width must be a multiple of 16. The planes are stored as the checkpoint holds them, with GDN rows reordered where the GGUF tensor conventions require it. When the checkpoint carries the module's activation scale (`input_scale`), it follows the planes as one more F32, so a slice is either exactly its planes or its planes plus 4 bytes; each module decides for itself, and the loader refuses any other length. CUDA runtime only. |
+| FP8 | 1.0 | Imported NVIDIA ModelOpt FP8: E4M3 weights and one F32 scale per tensor, stored as two planes. Each weight is `E4M3(byte) × tensor scale`. The row width must be a multiple of 4; the converter and the loader refuse any other. The planes are stored as the checkpoint holds them, with GDN rows and column blocks reordered where the GGUF tensor conventions require it. The module's activation scale (`input_scale`) follows them as for NVFP4. CUDA runtime only. |
 | Q4_K / Q5_K / Q6_K | 0.5625 / 0.6875 / 0.8203 | GGML superblocks as stored: 256 elements in 144 / 176 / 210 bytes (Q4_K, Q5_K: f16 `d` and `dmin`, eight 6-bit scales and mins packed in 12 bytes, the nibbles, Q5_K's fifth bits; Q6_K: the low nibbles, the high 2-bit pairs, 16 int8 scales, f16 `d`). Carried by the generic target; served by the CUDA K-quant kernels. |
 
 Q4_K / Q5_K / Q6_K FFN planes of a K-quant source (`Q4_K_M`, `Q5_K_M`: a file with K-quant dense FFN projections; its Q4_K / Q5_K / Q6_K planes are the ones served natively, a Q2_K / Q3_K layer plane the generic target carries keeps the Q8_0 upcast on Metal and the host dequant at load on CUDA) are carried verbatim on the generic target and served natively by the CUDA K-quant kernels; so are a K-quant embedding stored as the plane the header's `vocab x hidden` needs, a kept `ssm_out` and a preserved Q6_K head, while a Q4_K / Q5_K head is re-quantised (Q8_0 by default). The header carries the source's scheme. The Metal target has no K-quant kernel, so it converts such a source exactly as it did before: every K-quant layer plane upcast to Q8_0, the head re-quantised, a K-quant embedding dequantised to F32 — and a Metal runtime refuses an as-stored K-quant layer plane and names the re-conversion (an as-stored K-quant embedding or a preserved Q6_K head it serves through its F32 dequant copy, the head exactly as it always has). On any other source whose artifact header scheme is not K-quant (a Q4_0 / Q8_0 / BF16 file with an occasional K-quant layer plane) the Metal target upcasts such a plane to Q8_0 and the generic target carries it for CUDA's host dequant at load (with dedicated CUDA kernels for a fidelity-preserved Q5_K `ssm_out` and Q6_K output head); under a K-quant header CUDA uploads the plane natively whatever the source — a MoE `Q4_K_M` / `Q5_K_M` file's attention planes are, before the MoE FFN refusal. Q2_K / Q3_K have no general kernels on either backend. MXFP4 has no LBC representation: required MXFP4 layer tensors are rejected at conversion; optional MXFP4 tensors are dequantized to F32 (MoE shared-expert gate/up planes to Q4_0).
@@ -51,9 +53,10 @@ lumen convert --input model.gguf --output model.lbc
 # Convert + re-quantize
 lumen convert --input model.gguf --output model.lbc --requant q4_0   # dense models only
 
-# Import a Hugging Face compressed-tensors checkpoint (pack-quantized INT4
-# group-32, indexed sharded safetensors, dense qwen35-family models only);
-# the GGUF supplies tokenizer + hyperparameters only
+# Import a Hugging Face checkpoint: compressed-tensors (pack-quantized INT4
+# group-32) or NVIDIA ModelOpt (NVFP4 / FP8), indexed sharded safetensors,
+# dense qwen35-family models only; the GGUF supplies tokenizer +
+# hyperparameters only
 lumen convert --input donor.gguf --from-hf /path/to/hf-checkpoint --output model.lbc
 ```
 

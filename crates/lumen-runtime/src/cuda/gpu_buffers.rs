@@ -87,6 +87,15 @@ pub enum GpuWeightBuf {
     Q5KRaw(CudaSlice<u8>),
     /// Raw GGML Q6_K superblocks (210 bytes per 256 elements); as `Q4KRaw`.
     Q6KRaw(CudaSlice<u8>),
+    /// Raw NVFP4 (E2M1 with per-16-element E4M3 block scales) as stored in the artifact.
+    ///
+    /// Served by the planar kernels (`PlanarKernels`). Not every dispatch site names it: some reach it
+    /// through a catch-all arm, as `weight_uses_dp4a_q8_1` (false) and `kquant_weight` (`None`) do.
+    Nvfp4Raw(CudaSlice<u8>),
+    /// Raw FP8 E4M3 with a per-tensor F32 scale, as stored in the artifact.
+    ///
+    /// As `Nvfp4Raw`, catch-all arms included.
+    Fp8Raw(CudaSlice<u8>),
 }
 
 /// Per-layer weight buffers resident on GPU.
@@ -502,6 +511,14 @@ fn validate_projection_geometry(
         .map_err(RuntimeError::Compute)
 }
 
+/// Name the layer in a refusal from a check that knows only the tensor's role.
+fn in_layer(layer: usize, e: RuntimeError) -> RuntimeError {
+    match e {
+        RuntimeError::Compute(m) => RuntimeError::Compute(format!("layer {layer}: {m}")),
+        other => other,
+    }
+}
+
 fn validate_mandatory_presence(
     subs: &lumen_format::index::SubtensorOffsets,
 ) -> Result<(), RuntimeError> {
@@ -526,9 +543,29 @@ fn upload_projection_tensor(
         }
         upload_ct4_tensor(device, weights, name, slice, out_dim, in_dim)
     } else {
-        validate_projection_geometry(name, slice, in_dim, allowed_out)?;
+        validate_projection_geometry(name, slice, in_dim, allowed_out)
+            .map_err(|e| in_layer(weights.layer_idx, e))?;
         upload_tensor(device, weights, name, slice)
     }
+}
+
+/// Upload a GDN gate projection (`ssm_alpha` / `ssm_beta`: one row per V head over the hidden width).
+/// A planar (NVFP4 or FP8) tensor is held to that geometry like every other projection, because its
+/// kernels read `out * in` weights from the plane with no bound of their own; the other schemes upload as
+/// stored.
+fn upload_gdn_gate_tensor(
+    device: &CudaDevice,
+    weights: &LayerView,
+    name: &str,
+    slice: &lumen_format::index::TensorSlice,
+    hidden: usize,
+    num_v_heads: usize,
+) -> Result<GpuWeightBuf, RuntimeError> {
+    if matches!(slice.quant, QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3) {
+        validate_projection_geometry(name, slice, hidden, &[num_v_heads])
+            .map_err(|e| in_layer(weights.layer_idx, e))?;
+    }
+    upload_tensor(device, weights, name, slice)
 }
 
 /// Upload a single tensor to GPU as the appropriate format based on its quantization.
@@ -678,6 +715,22 @@ fn upload_tensor(
             kquant_plane_counters().count_native(QuantScheme::Q6_K);
             Ok(GpuWeightBuf::Q6KRaw(device.htod_copy(raw)?))
         }
+        // The planar schemes. They run NATIVE kernels, so they must NOT reach
+        // the `other =>` catch-all below — that would host-dequantize them as if they were a K-quant plane,
+        // silently taking a different numerical path and defeating the whole point of the format.
+        //
+        // The upload is a straight htod of the packed planes: NVFP4's E2M1 nibbles and per-16 E4M3 block
+        // scales, FP8's E4M3 bytes. No repack and no shadow copy; the per-tensor global scale stays right
+        // after the weight planes, where the kernels find it from the matrix dimensions, and an activation
+        // scale after it, if the slice carries one, goes up with them and is not read by these kernels.
+        QuantScheme::Nvfp4 => {
+            kquant_plane_counters().count_native(QuantScheme::Nvfp4);
+            Ok(GpuWeightBuf::Nvfp4Raw(device.htod_copy(raw)?))
+        }
+        QuantScheme::Fp8E4M3 => {
+            kquant_plane_counters().count_native(QuantScheme::Fp8E4M3);
+            Ok(GpuWeightBuf::Fp8Raw(device.htod_copy(raw)?))
+        }
         other => {
             // Catch-all for K-quant planes outside a K-quant artifact (the
             // scoping rule: a Q4_0 artifact's Q6_K `attn_q` stays here) and
@@ -775,28 +828,42 @@ fn kquant_refusal(what: &str, quant: QuantScheme) -> RuntimeError {
     ))
 }
 
-/// Load-time counters behind the `[CUDA] K-quant planes:` line: planes (layer planes,
+/// Load-time counters behind the `[CUDA] quantized planes:` line: planes (layer planes,
 /// the embedding and the output head) uploaded natively per scheme, planes that went
 /// through the F32 host-dequant catch-all per scheme, and F16 caches built for
 /// F32-resident planes (a K-quant plane can only reach that cache through the catch-all).
 #[derive(Default)]
 pub(crate) struct KquantPlaneCounters {
-    native: [std::sync::atomic::AtomicUsize; 3],
-    catch_all: [std::sync::atomic::AtomicUsize; 3],
-    /// F16 images built from a K-quant plane, per scheme (the Q5_K `ssm_out`
+    native: [std::sync::atomic::AtomicUsize; PLANE_SLOTS],
+    catch_all: [std::sync::atomic::AtomicUsize; PLANE_SLOTS],
+    /// F16 images built from a quantized plane, per scheme (the Q5_K `ssm_out`
     /// special case builds one beside its planes).
-    f16_images: [std::sync::atomic::AtomicUsize; 3],
+    f16_images: [std::sync::atomic::AtomicUsize; PLANE_SLOTS],
     f32_f16_caches: std::sync::atomic::AtomicUsize,
+}
+
+/// The schemes counted per scheme, in report order.
+const PLANE_SCHEMES: [QuantScheme; 5] = [
+    QuantScheme::Q4_K,
+    QuantScheme::Q5_K,
+    QuantScheme::Q6_K,
+    QuantScheme::Nvfp4,
+    QuantScheme::Fp8E4M3,
+];
+const PLANE_SLOTS: usize = PLANE_SCHEMES.len();
+
+/// One scheme's counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaneCounter {
+    pub(crate) scheme: QuantScheme,
+    pub(crate) native: usize,
+    pub(crate) catch_all: usize,
+    pub(crate) f16_images: usize,
 }
 
 impl KquantPlaneCounters {
     fn slot(q: QuantScheme) -> Option<usize> {
-        match q {
-            QuantScheme::Q4_K => Some(0),
-            QuantScheme::Q5_K => Some(1),
-            QuantScheme::Q6_K => Some(2),
-            _ => None,
-        }
+        PLANE_SCHEMES.iter().position(|x| *x == q)
     }
     pub(crate) fn count_native(&self, q: QuantScheme) {
         if let Some(i) = Self::slot(q) {
@@ -830,32 +897,38 @@ impl KquantPlaneCounters {
             c.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    /// F16 images built from K-quant planes, per scheme (Q4_K, Q5_K, Q6_K).
-    pub(crate) fn f16_images(&self) -> [usize; 3] {
-        std::array::from_fn(|i| self.f16_images[i].load(std::sync::atomic::Ordering::Relaxed))
-    }
-    /// `(native, catch_all)` per scheme in the order Q4_K, Q5_K, Q6_K.
-    pub(crate) fn planes(&self) -> [(usize, usize); 3] {
-        std::array::from_fn(|i| {
-            (
-                self.native[i].load(std::sync::atomic::Ordering::Relaxed),
-                self.catch_all[i].load(std::sync::atomic::Ordering::Relaxed),
-            )
-        })
+    /// Every counted scheme's counters, in report order.
+    pub(crate) fn receipt(&self) -> Vec<PlaneCounter> {
+        PLANE_SCHEMES
+            .iter()
+            .enumerate()
+            .map(|(i, &scheme)| PlaneCounter {
+                scheme,
+                native: self.native[i].load(std::sync::atomic::Ordering::Relaxed),
+                catch_all: self.catch_all[i].load(std::sync::atomic::Ordering::Relaxed),
+                f16_images: self.f16_images[i].load(std::sync::atomic::Ordering::Relaxed),
+            })
+            .collect()
     }
     pub(crate) fn f32_f16_caches(&self) -> usize {
         self.f32_f16_caches
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-    /// The line the load prints once every layer is resident.
+    /// The line the load prints once every layer is resident, rendered from `receipt()`.
     pub(crate) fn report_line(&self) -> String {
-        let [(n4, c4), (n5, c5), (n6, c6)] = self.planes();
-        let [i4, i5, i6] = self.f16_images();
+        let rows = self.receipt();
+        let section = |count: fn(&PlaneCounter) -> usize| {
+            rows.iter()
+                .map(|p| format!("{:?}={}", p.scheme, count(p)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         format!(
-            "[CUDA] K-quant planes: native Q4_K={n4} Q5_K={n5} Q6_K={n6}; \
-             host-dequant catch-all Q4_K={c4} Q5_K={c5} Q6_K={c6}; \
-             F16 images from K-quant planes Q4_K={i4} Q5_K={i5} Q6_K={i6}; \
-             F16 caches built for F32-resident planes={}",
+            "[CUDA] quantized planes: native {}; host-dequant catch-all {}; \
+             F16 images from quantized planes {}; F16 caches built for F32-resident planes={}",
+            section(|p| p.native),
+            section(|p| p.catch_all),
+            section(|p| p.f16_images),
             self.f32_f16_caches()
         )
     }
@@ -998,7 +1071,12 @@ pub fn upload_layer_weights(
                 )),
             )
         }
-        Some(s) if s.quant == QuantScheme::CtInt4G32 => {
+        Some(s)
+            if matches!(
+                s.quant,
+                QuantScheme::CtInt4G32 | QuantScheme::Nvfp4 | QuantScheme::Fp8E4M3
+            ) =>
+        {
             let gd = hp.gdn_dims();
             let in_dim = gd.num_v_heads as usize * gd.head_dim as usize;
             (
@@ -1192,11 +1270,25 @@ pub fn upload_layer_weights(
             _ => None,
         },
         ssm_alpha: match &subs.ssm_alpha {
-            Some(s) => Some(upload_tensor(device, weights, "ssm_alpha", s)?),
+            Some(s) => Some(upload_gdn_gate_tensor(
+                device,
+                weights,
+                "ssm_alpha",
+                s,
+                hidden,
+                hp.gdn_dims().num_v_heads as usize,
+            )?),
             None => None,
         },
         ssm_beta: match &subs.ssm_beta {
-            Some(s) => Some(upload_tensor(device, weights, "ssm_beta", s)?),
+            Some(s) => Some(upload_gdn_gate_tensor(
+                device,
+                weights,
+                "ssm_beta",
+                s,
+                hidden,
+                hp.gdn_dims().num_v_heads as usize,
+            )?),
             None => None,
         },
         ssm_norm_tiled: match &subs.ssm_norm {
@@ -1401,6 +1493,11 @@ fn makes_f16_cache(w: &GpuWeightBuf, quantised_cached: bool) -> bool {
         | GpuWeightBuf::F16Raw(_)
         | GpuWeightBuf::Bf16Raw(_)
         | GpuWeightBuf::Q8Split(_) => false,
+        // The planar schemes allocate NO resident image. Decode reads the plane directly, and prefill
+        // decodes it ON DEMAND into the existing dequant scratch, one matrix at a time — the same route
+        // the Q8_0 fallback takes. A resident F16 image would take several times the planes' bytes, and
+        // a model sized for the planes cannot hold both.
+        GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => false,
     }
 }
 
@@ -2345,6 +2442,166 @@ mod layer_slice_tests {
         }
     }
 
+    /// A planar GDN `ssm_out` gets the same load-time geometry check as the other projections: a slice
+    /// exactly one `[hidden, value_dim]` plane set long uploads, alone or followed by its 4-byte activation
+    /// scale, and any other length around it is refused before upload.
+    /// The Q8_0 GDN test model's `ssm_out` is retagged in place; its bytes are longer than either plane
+    /// set, so only the slice length differs between the cases. Needs a CUDA device; run with
+    /// `cargo test --release -p lumen-runtime --features cuda planar_ssm_out_geometry -- --ignored`.
+    #[test]
+    #[ignore = "needs a CUDA device; run with --ignored"]
+    fn planar_ssm_out_geometry_checked_at_upload() {
+        use crate::weight::cache::WeightProvider;
+        use crate::weight::provider_sync::SyncWeightProvider;
+        use lumen_format::test_model::{
+            generate_test_model_q8_0_gdn, rewrite, TestModelQ8Config, Tokenizer,
+        };
+
+        let device = crate::cuda::ffi::CudaDevice::new(0).expect("this test needs a CUDA device");
+        let source = generate_test_model_q8_0_gdn(&TestModelQ8Config::default());
+        let hp = lumen_format::LbcFile::from_bytes(&source, "source.lbc".into())
+            .unwrap()
+            .header
+            .hyperparams;
+        let gd = hp.gdn_dims();
+        let (out, width) = (
+            hp.hidden_dim as u64,
+            gd.num_v_heads as u64 * gd.head_dim as u64,
+        );
+        for (quant, exact) in [
+            (
+                QuantScheme::Fp8E4M3,
+                lumen_format::Fp8Planes::for_shape(out, width)
+                    .unwrap()
+                    .total_bytes(),
+            ),
+            (
+                QuantScheme::Nvfp4,
+                lumen_format::Nvfp4Planes::for_shape(out, width)
+                    .unwrap()
+                    .total_bytes(),
+            ),
+        ] {
+            let accepted = [exact, exact + 4];
+            for length in [exact, exact + 4, exact - 4, exact - 1, exact + 1, exact + 8] {
+                let bytes = rewrite(&source, Tokenizer::Absent, |index| {
+                    let s = index[0].subtensors.ssm_out.as_mut().unwrap();
+                    assert!(
+                        length < s.length,
+                        "the retagged slice stays inside its bytes"
+                    );
+                    s.quant = quant;
+                    s.length = length;
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("model.lbc");
+                std::fs::write(&path, &bytes).unwrap();
+                let provider = SyncWeightProvider::open(&path).unwrap();
+                let view = provider.get_layer_raw(0).unwrap();
+                let result = upload_layer_weights(&device, &view, &hp);
+                match (accepted.contains(&length), result) {
+                    (true, Ok(_)) => {}
+                    (true, Err(e)) => panic!("{quant:?} ssm_out of {length} bytes refused: {e}"),
+                    (false, Ok(_)) => {
+                        panic!("{quant:?} ssm_out of {length} bytes must be refused before upload")
+                    }
+                    (false, Err(e)) => {
+                        let text = e.to_string();
+                        assert!(
+                            text.contains("ssm_out is") && text.contains("wrong geometry"),
+                            "{quant:?}: refusal must come from the geometry rules: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A planar `ssm_alpha` / `ssm_beta` is held to its geometry, `[num_v_heads, hidden]`, at upload: the
+    /// exact plane length uploads, alone or followed by its 4-byte activation scale, and any other length
+    /// around it is refused by the geometry rules. The Q8_0 GDN test
+    /// model's gate slices are too short for either plane set, so the retagged slice points at `ssm_out`'s
+    /// bytes, which are longer than both. Needs a CUDA device; run with
+    /// `cargo test --release -p lumen-runtime --features cuda planar_gdn_gate_geometry -- --ignored`.
+    #[test]
+    #[ignore = "needs a CUDA device; run with --ignored"]
+    fn planar_gdn_gate_geometry_checked_at_upload() {
+        use crate::weight::cache::WeightProvider;
+        use crate::weight::provider_sync::SyncWeightProvider;
+        use lumen_format::test_model::{
+            generate_test_model_q8_0_gdn, rewrite, TestModelQ8Config, Tokenizer,
+        };
+
+        let device = crate::cuda::ffi::CudaDevice::new(0).expect("this test needs a CUDA device");
+        let source = generate_test_model_q8_0_gdn(&TestModelQ8Config::default());
+        let hp = lumen_format::LbcFile::from_bytes(&source, "source.lbc".into())
+            .unwrap()
+            .header
+            .hyperparams;
+        let (out, width) = (hp.gdn_dims().num_v_heads as u64, hp.hidden_dim as u64);
+        for name in ["ssm_alpha", "ssm_beta"] {
+            for (quant, exact) in [
+                (
+                    QuantScheme::Fp8E4M3,
+                    lumen_format::Fp8Planes::for_shape(out, width)
+                        .unwrap()
+                        .total_bytes(),
+                ),
+                (
+                    QuantScheme::Nvfp4,
+                    lumen_format::Nvfp4Planes::for_shape(out, width)
+                        .unwrap()
+                        .total_bytes(),
+                ),
+            ] {
+                let accepted = [exact, exact + 4];
+                for length in [exact, exact + 4, exact - 4, exact - 1, exact + 1, exact + 8] {
+                    let bytes = rewrite(&source, Tokenizer::Absent, |index| {
+                        let subs = &mut index[0].subtensors;
+                        let host = subs.ssm_out.unwrap();
+                        assert!(
+                            length < host.length,
+                            "the retagged slice stays inside ssm_out's bytes"
+                        );
+                        let gate = if name == "ssm_alpha" {
+                            subs.ssm_alpha.as_mut()
+                        } else {
+                            subs.ssm_beta.as_mut()
+                        }
+                        .unwrap();
+                        gate.offset = host.offset;
+                        gate.quant = quant;
+                        gate.length = length;
+                    });
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("model.lbc");
+                    std::fs::write(&path, &bytes).unwrap();
+                    let provider = SyncWeightProvider::open(&path).unwrap();
+                    let view = provider.get_layer_raw(0).unwrap();
+                    let result = upload_layer_weights(&device, &view, &hp);
+                    match (accepted.contains(&length), result) {
+                        (true, Ok(_)) => {}
+                        (true, Err(e)) => {
+                            panic!("{quant:?} {name} of {length} bytes refused: {e}")
+                        }
+                        (false, Ok(_)) => {
+                            panic!(
+                                "{quant:?} {name} of {length} bytes must be refused before upload"
+                            )
+                        }
+                        (false, Err(e)) => {
+                            let text = e.to_string();
+                            assert!(
+                                text.contains(&format!("{name} is")) && text.contains("wrong geometry"),
+                                "{quant:?} {name}: refusal must come from the geometry rules: {text}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A dense layer's slices, all F32, the shape `validate_layer_slices` is driven with.
     fn base_layer_slices() -> SubtensorOffsets {
         let t = |offset: u64, length: u64| TensorSlice {
@@ -2626,5 +2883,39 @@ mod projection_geometry_tests {
     fn zero_length_is_absence_not_geometry() {
         // GDN wo / MoE dense-FFN sentinels: zero-length passes any role.
         assert!(validate_projection_geometry("wo", &sl(0, QuantScheme::Q8_0), 64, &[64]).is_ok());
+    }
+
+    /// A bumped counter lands in its own scheme's row and appears in the printed line.
+    #[test]
+    fn plane_receipt_matches_the_line() {
+        let c = KquantPlaneCounters::default();
+        // One of each kind, on a K-quant and a planar scheme.
+        c.count_native(QuantScheme::Q6_K);
+        c.count_catch_all(QuantScheme::Q4_K);
+        c.count_native(QuantScheme::Nvfp4);
+        c.count_f16_image(QuantScheme::Fp8E4M3);
+        c.count_f32_f16_cache();
+
+        let rows = c.receipt();
+        let row = |q: QuantScheme| rows.iter().find(|r| r.scheme == q).unwrap().clone();
+        let (q6, q4) = (row(QuantScheme::Q6_K), row(QuantScheme::Q4_K));
+        assert_eq!((q6.native, q6.catch_all), (1, 0));
+        assert_eq!((q4.native, q4.catch_all), (0, 1));
+        assert_eq!(row(QuantScheme::Nvfp4).native, 1);
+        assert_eq!(row(QuantScheme::Fp8E4M3).f16_images, 1);
+        assert_eq!(c.f32_f16_caches(), 1);
+
+        let line = c.report_line();
+        for expect in [
+            "native Q4_K=0 Q5_K=0 Q6_K=1 Nvfp4=1 Fp8E4M3=0;",
+            "host-dequant catch-all Q4_K=1 Q5_K=0 Q6_K=0 Nvfp4=0 Fp8E4M3=0;",
+            "F16 images from quantized planes Q4_K=0 Q5_K=0 Q6_K=0 Nvfp4=0 Fp8E4M3=1;",
+            "F16 caches built for F32-resident planes=1",
+        ] {
+            assert!(
+                line.contains(expect),
+                "report_line is missing {expect}: {line}"
+            );
+        }
     }
 }

@@ -68,5 +68,5 @@ The matrix below summarizes the validation state across operational dimensions a
 | Concurrency & multi-request | Validated (no 503 + Retry-After backpressure header) |
 | Stability & soak | Validated (CLI per-process); a 16-client burst against `lumen run` fails by design — use `lumen-server` |
 | Error handling & edge cases | Four protocol-completeness gaps remain; deploy behind a reverse proxy |
-| Determinism & reproducibility | Validated — kernels byte-deterministic at a fixed seed; server + CLI randomize the seed by default, so pin `seed` / `--seed` (or `temperature 0`) to reproduce |
+| Determinism & reproducibility | Validated — kernels byte-deterministic at a fixed seed (an NVFP4/FP8 artifact's CUDA prefill while its measured GEMM plan table stays the same and the request does not continue the one the server ran before it, prompt and reply; see troubleshooting.md); server + CLI randomize the seed by default, so pin `seed` / `--seed` (or `temperature 0`) to reproduce |
 | Perf vs llama.cpp | Retained record: Q8 0.567× / Q4 0.598× (A100, co-located); BF16 0.575× (H100, separate per-engine batteries) |

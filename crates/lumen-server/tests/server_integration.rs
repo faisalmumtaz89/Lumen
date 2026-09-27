@@ -321,6 +321,87 @@ async fn legacy_completion_non_streaming() {
     assert!(v["choices"][0]["text"].is_string());
 }
 
+/// A token-id prompt drives the engine exactly as the text those ids encode:
+/// the byte tokenizer maps "hi" to [104, 105], so both prompts must produce
+/// the same greedy completion over the same prompt length, streaming or not.
+/// An id outside the model's vocabulary is refused before any stream opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_completion_token_id_prompt() {
+    let (addr, client, _tmp, _handle) = boot_server().await;
+    let uri: Uri = format!("http://{addr}/v1/completions").parse().unwrap();
+    let body = |prompt: Value, stream: bool| {
+        serde_json::json!({
+            "model": MODEL_ID,
+            "prompt": prompt,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0.0,
+            "seed": 1,
+            "stream": stream
+        })
+    };
+    let text = post_json(&client, uri.clone(), body(Value::from("hi"), false)).await;
+    let ids = post_json(
+        &client,
+        uri.clone(),
+        body(serde_json::json!([104, 105]), false),
+    )
+    .await;
+    assert_eq!(ids["choices"][0]["text"], text["choices"][0]["text"]);
+    assert_eq!(ids["usage"]["prompt_tokens"], 2);
+    assert_eq!(text["usage"]["prompt_tokens"], 2);
+
+    let streamed = |sse: String| -> String {
+        sse.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .filter_map(|d| {
+                let v: Value = serde_json::from_str(d).unwrap();
+                v["choices"][0]["text"].as_str().map(str::to_string)
+            })
+            .collect()
+    };
+    let text_sse = post_sse(&client, uri.clone(), body(Value::from("hi"), true)).await;
+    let ids_sse = post_sse(
+        &client,
+        uri.clone(),
+        body(serde_json::json!([104, 105]), true),
+    )
+    .await;
+    assert_eq!(streamed(ids_sse), streamed(text_sse));
+
+    let (status, err) = post_status(&client, uri, body(serde_json::json!([104, 256]), true)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err["error"]["code"], "invalid_value");
+    assert_eq!(err["error"]["param"], "prompt");
+}
+
+/// An empty prompt is refused, whatever the previous request left in the
+/// engine: served, it would continue that request's context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_completion_empty_prompt_is_refused() {
+    let (addr, client, _tmp, _handle) = boot_server().await;
+    let uri: Uri = format!("http://{addr}/v1/completions").parse().unwrap();
+    let body = |prompt: Value| {
+        serde_json::json!({
+            "model": MODEL_ID,
+            "prompt": prompt,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0.0,
+            "seed": 1
+        })
+    };
+    post_json(&client, uri.clone(), body(Value::from("zq"))).await;
+    for empty in [
+        Value::from(""),
+        serde_json::json!([]),
+        serde_json::json!([""]),
+    ] {
+        let (status, err) = post_status(&client, uri.clone(), body(empty.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "prompt {empty}: {err}");
+        assert_eq!(err["error"]["param"], "prompt", "prompt {empty}");
+    }
+}
+
 /// (closing the envelope-shape finding).
 ///
 /// Schema-deserialization errors now return HTTP 400 with the OpenAI

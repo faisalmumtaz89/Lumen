@@ -85,6 +85,29 @@ impl From<lumen_runtime::RuntimeError> for BenchError {
 
 /// Resolve a `ModelSpec` to a path, generating the model if needed.
 pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf, BenchError> {
+    let path = resolve_model(spec)?;
+    // A scheme with no kernels is refused here, before any provider reads
+    // the file: the artifact parses, so without this it would surface much
+    // later as a missing kernel or a misread plane. A file the reader cannot
+    // open at all is left to the provider, which reports it in full.
+    // The bench runs on the CPU backends only (SIMD or naive), which have no kernel for the planar
+    // schemes, so it states Cpu and always refuses them.
+    let backend = lumen_format::serving_rules::ServingBackend::Cpu;
+    if let Some(scheme) = lumen_format::reader::LbcFile::open(&path)
+        .ok()
+        .as_ref()
+        .and_then(|lbc| lumen_format::serving_rules::unservable_scheme(lbc, backend))
+    {
+        return Err(BenchError::Config(
+            lumen_format::serving_rules::no_serving_kernels_message(scheme, backend),
+        ));
+    }
+    Ok(path)
+}
+
+/// The file a spec names, generating it first when the spec asks for a
+/// synthetic model.
+fn resolve_model(spec: &ModelSpec) -> Result<PathBuf, BenchError> {
     match spec {
         ModelSpec::Path(p) => {
             if !p.exists() {

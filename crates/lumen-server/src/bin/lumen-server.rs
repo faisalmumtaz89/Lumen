@@ -554,6 +554,22 @@ struct CudaFactory {
 }
 
 #[cfg(feature = "cuda")]
+impl CudaFactory {
+    /// The global planes CUDA takes as stored. The F32 dequant is kept
+    /// (skip=false) until the skip is validated on real CUDA hardware; the
+    /// CPU embed fallback is statically unreachable after init(), so this
+    /// holds unread host heap, not a live dependency.
+    const RAW_ACCEPTANCE: RawAcceptance = RawAcceptance {
+        skip_f32_when_raw: false,
+        q6k_head: true,
+        bf16_head: true,
+        nvfp4_head: true,
+        bf16_embedding: true,
+        kquant_embedding: true,
+    };
+}
+
+#[cfg(feature = "cuda")]
 impl lumen_server::BackendFactory for CudaFactory {
     fn device(&self) -> usize {
         self.device
@@ -566,20 +582,7 @@ impl lumen_server::BackendFactory for CudaFactory {
         // kernels as a group and allocates every cache in it.
         cuda.set_kv_precision(self.kv_precision)
             .map_err(|e| format!("CUDA KV precision: {e}"))?;
-        // Keep the F32 dequant (skip=false) until the skip is validated on
-        // real CUDA hardware; the CPU embed fallback is statically unreachable
-        // after init(), so this holds unread host heap, not a live dependency.
-        wire_global_tensors_and_raw(
-            &mut cuda,
-            &self.weights.globals(),
-            RawAcceptance {
-                q6k_head: true,
-                bf16_head: true,
-                bf16_embedding: true,
-                kquant_embedding: true,
-                ..RawAcceptance::default()
-            },
-        );
+        wire_global_tensors_and_raw(&mut cuda, &self.weights.globals(), Self::RAW_ACCEPTANCE);
         cuda.init(&self.hyperparams)
             .map_err(|e| format!("CUDA init: {e}"))?;
         cuda.preload_weights(self.weights.as_dyn())
@@ -658,6 +661,7 @@ struct RawAcceptance {
     skip_f32_when_raw: bool,
     q6k_head: bool,
     bf16_head: bool,
+    nvfp4_head: bool,
     bf16_embedding: bool,
     kquant_embedding: bool,
 }
@@ -671,6 +675,7 @@ fn wire_global_tensors_and_raw(
         skip_f32_when_raw,
         q6k_head: accept_q6k_head,
         bf16_head: accept_bf16_head,
+        nvfp4_head: accept_nvfp4_head,
         bf16_embedding: accept_bf16_embedding,
         kquant_embedding: accept_kquant_embedding,
     } = accept;
@@ -707,6 +712,8 @@ fn wire_global_tensors_and_raw(
         && !g.embedding_raw.is_empty();
     // Q6_K (source-fidelity head) is CUDA-only: the CUDA backend splits the
     // superblocks into dp4a planes; Metal/CPU have no Q6_K head kernel.
+    // NVFP4 is CUDA-only too: the provider holds no F32 head for it, so the
+    // raw plane is the backend's only copy of the head.
     // Bf16 matches the CLI allow-list (run.rs): Metal and CUDA serve a raw
     // BF16 head natively; leaving it out silently doubles the head's memory
     // via the F32 fallback and skips the native BF16 dispatch. The CPU
@@ -716,7 +723,8 @@ fn wire_global_tensors_and_raw(
         g.output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16
     ) || (accept_bf16_head && g.output_proj_quant == QuantScheme::Bf16)
-        || (accept_q6k_head && g.output_proj_quant == QuantScheme::Q6_K))
+        || (accept_q6k_head && g.output_proj_quant == QuantScheme::Q6_K)
+        || (accept_nvfp4_head && g.output_proj_quant == QuantScheme::Nvfp4))
         && !g.output_proj_raw.is_empty();
     backend.set_global_tensors(
         if skip_f32_when_raw && embedding_has_raw {
@@ -776,6 +784,39 @@ async fn run(args: Args) -> Result<(), String> {
     // section. Same pattern as `tests/server_soak.rs:289-317`.
     let lbc = lumen_format::reader::LbcFile::open(&lbc_path)
         .map_err(|e| format!("open LBC {lbc_path:?}: {e}"))?;
+
+    // A scheme with no kernels is refused first: the refusal is decided from
+    // what `LbcFile::open` parsed — the header, the index and the tokenizer
+    // section — before the tokenizer is built and before any weight provider opens. The artifact parses,
+    // so without this it would reach the provider and fail as a missing kernel or, worse, a misread plane.
+    // Admission is backend-dependent: the planar schemes are served by the CUDA kernels only, and only
+    // while the kill switch leaves them on; the switch is published the same way the CLI publishes it.
+    // The backend is resolved here, before admission and the weight-provider choice, which both depend on
+    // it. A backend this build cannot construct is refused for that reason first, with the message the
+    // backend construction below gives, before any weight provider opens and before admission could name
+    // the kill switch instead of the build.
+    lumen_runtime::runtime_defaults::publish_cuda_nvfp4_admission();
+    let backend_choice = select_backend(args.backend);
+    if matches!(backend_choice, BackendChoice::Cuda) && !cfg!(feature = "cuda") {
+        return Err("--backend cuda requires building with --features cuda".to_string());
+    }
+    if matches!(backend_choice, BackendChoice::Metal) && !cfg!(target_os = "macos") {
+        return Err("--backend metal is only supported on macOS".to_string());
+    }
+    let admission_backend = match backend_choice {
+        BackendChoice::Cuda => lumen_format::serving_rules::ServingBackend::Cuda,
+        BackendChoice::Metal => lumen_format::serving_rules::ServingBackend::Metal,
+        BackendChoice::Cpu | BackendChoice::Auto => {
+            lumen_format::serving_rules::ServingBackend::Cpu
+        }
+    };
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, admission_backend) {
+        return Err(lumen_format::serving_rules::no_serving_kernels_message(
+            scheme,
+            admission_backend,
+        ));
+    }
+
     let tok_section = lbc
         .tokenizer
         .as_ref()
@@ -803,8 +844,6 @@ async fn run(args: Args) -> Result<(), String> {
         eos_ids,
     });
 
-    // Resolve the backend first — the weight-provider choice depends on it.
-    let backend_choice = select_backend(args.backend);
     eprintln!("[lumen-server] backend: {backend_choice:?}");
 
     // CtInt4G32 has CUDA kernels only; no other backend can serve the packed
@@ -1466,5 +1505,81 @@ mod tests {
     fn no_model_is_error() {
         let e = parse_args(&argv(&[]));
         assert!(e.is_err(), "expected error, got {e:?}");
+    }
+
+    /// Records the output head the wiring hands over.
+    #[cfg(feature = "cuda")]
+    #[derive(Default)]
+    struct HeadRecorder {
+        output_proj_len: usize,
+        output_proj_raw: Option<(usize, lumen_format::QuantScheme)>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl lumen_runtime::compute::ComputeBackend for HeadRecorder {
+        fn init(
+            &mut self,
+            _: &lumen_format::ModelHyperparams,
+        ) -> Result<(), lumen_runtime::RuntimeError> {
+            unreachable!()
+        }
+        fn compute_layer(
+            &self,
+            _: usize,
+            _: &mut lumen_runtime::compute::ActivationBuffer,
+            _: &lumen_runtime::weight::cache::LayerView,
+            _: Option<&mut lumen_runtime::kv::KvCacheView>,
+            _: usize,
+        ) -> Result<(), lumen_runtime::RuntimeError> {
+            unreachable!()
+        }
+        fn compute_final(
+            &self,
+            _: &lumen_runtime::compute::ActivationBuffer,
+        ) -> Result<lumen_runtime::compute::Logits, lumen_runtime::RuntimeError> {
+            unreachable!()
+        }
+        fn embed_token(
+            &self,
+            _: u32,
+        ) -> Result<lumen_runtime::compute::ActivationBuffer, lumen_runtime::RuntimeError> {
+            unreachable!()
+        }
+        fn set_global_tensors(&mut self, _: Vec<f32>, _: Vec<f32>, output_proj: Vec<f32>) {
+            self.output_proj_len = output_proj.len();
+        }
+        fn set_output_proj_raw(&mut self, raw: Vec<u8>, quant: lumen_format::QuantScheme) {
+            self.output_proj_raw = Some((raw.len(), quant));
+        }
+    }
+
+    /// The provider holds no F32 copy of an NVFP4 head, so the raw plane must
+    /// reach CUDA or its init finds no output projection at all.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_takes_an_nvfp4_head_raw() {
+        use lumen_format::QuantScheme;
+        let raw = vec![0u8; 1156];
+        let globals = super::WeightGlobals {
+            embedding: &[0.0; 64],
+            final_norm: &[1.0; 8],
+            output_proj: &[],
+            embedding_raw: &[],
+            embedding_quant: QuantScheme::F32,
+            output_proj_raw: &raw,
+            output_proj_quant: QuantScheme::Nvfp4,
+            weight_tying: false,
+        };
+        let mut backend = HeadRecorder::default();
+        super::wire_global_tensors_and_raw(
+            &mut backend,
+            &globals,
+            super::CudaFactory::RAW_ACCEPTANCE,
+        );
+        assert_eq!(backend.output_proj_len, 0);
+        assert_eq!(
+            backend.output_proj_raw,
+            Some((raw.len(), QuantScheme::Nvfp4))
+        );
     }
 }

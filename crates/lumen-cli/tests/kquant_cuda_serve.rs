@@ -46,8 +46,8 @@ fn k_quant_artifact_serves_its_planes_natively() {
 
     let counters = stderr
         .lines()
-        .find(|l| l.starts_with("[CUDA] K-quant planes:"))
-        .unwrap_or_else(|| panic!("no K-quant plane counters line in:\n{stderr}"));
+        .find(|l| l.starts_with("[CUDA] quantized planes:"))
+        .unwrap_or_else(|| panic!("no plane counters line in:\n{stderr}"));
     assert!(
         counters.contains("host-dequant catch-all Q4_K=0 Q5_K=0 Q6_K=0"),
         "a K-quant plane went through the host-dequant catch-all: {counters}"

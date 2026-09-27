@@ -99,6 +99,28 @@ pub(crate) fn permute_zero_point_rows(
     out
 }
 
+/// Reorder K-dimension blocks of a plane with one byte-contiguous element
+/// per weight: every row of `row_bytes` is split into `perm.len()` blocks of
+/// `block_bytes`, and output block `i` = input block `perm[i]`.
+pub(crate) fn permute_col_blocks(
+    data: &[u8],
+    row_bytes: usize,
+    block_bytes: usize,
+    perm: &[usize],
+) -> Vec<u8> {
+    debug_assert_eq!(row_bytes, block_bytes * perm.len());
+    debug_assert_eq!(data.len() % row_bytes, 0);
+    let mut out = vec![0u8; data.len()];
+    for row in 0..data.len() / row_bytes {
+        let base = row * row_bytes;
+        for (i, &src) in perm.iter().enumerate() {
+            out[base + i * block_bytes..base + (i + 1) * block_bytes]
+                .copy_from_slice(&data[base + src * block_bytes..base + (src + 1) * block_bytes]);
+        }
+    }
+    out
+}
+
 /// Reorder K-dimension blocks of a CtInt4G32 tensor's planes: the K axis is
 /// split into `perm.len()` equal blocks of `block_cols` columns each
 /// (`block_cols % 32 == 0`, so scale/zero-point groups move whole), and

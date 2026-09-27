@@ -16,6 +16,12 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// A thread's first RMSNORM_REG values are held in registers between the two passes instead of being read
+// again for the store, so a dim up to RMSNORM_REG times the block size is read once. Elements past that
+// continue through the same ascending loop, summed in the same order and re-read for the store, so the
+// result is bit-identical to reading every value twice — for any dim.
+#define RMSNORM_REG 8
+
 // Single-block RMSNorm kernel.
 //
 // Each thread accumulates sum-of-squares for its strided elements, then a
@@ -41,8 +47,18 @@ extern "C" __global__ void rmsnorm(
     unsigned int num_warps = block_size >> 5;
 
     // Phase 1: Each thread accumulates sum-of-squares for its strided elements.
+    float held[RMSNORM_REG];
     float sum_sq = 0.0f;
-    for (unsigned int i = tid; i < dim; i += block_size) {
+#pragma unroll
+    for (unsigned int k = 0; k < RMSNORM_REG; ++k) {
+        const unsigned int i = tid + k * block_size;
+        if (i < dim) {
+            const float val = x[i];
+            held[k] = val;
+            sum_sq += val * val;
+        }
+    }
+    for (unsigned int i = tid + RMSNORM_REG * block_size; i < dim; i += block_size) {
         float val = x[i];
         sum_sq += val * val;
     }
@@ -73,7 +89,14 @@ extern "C" __global__ void rmsnorm(
     float rms = shared[0];
 
     // Phase 6: Apply normalization: out[i] = x[i] * rms * weight[i].
-    for (unsigned int i = tid; i < dim; i += block_size) {
+#pragma unroll
+    for (unsigned int k = 0; k < RMSNORM_REG; ++k) {
+        const unsigned int i = tid + k * block_size;
+        if (i < dim) {
+            out[i] = held[k] * rms * weight[i];
+        }
+    }
+    for (unsigned int i = tid + RMSNORM_REG * block_size; i < dim; i += block_size) {
         out[i] = x[i] * rms * weight[i];
     }
 }

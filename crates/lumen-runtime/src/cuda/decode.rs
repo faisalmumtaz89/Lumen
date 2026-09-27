@@ -1069,6 +1069,91 @@ pub(crate) struct KernelSet {
     /// `.ok()`), so a half-typed store always has a half-typed reader and
     /// writer. `None` means the store is F32 and nothing here can be reached.
     pub(crate) kv_f16: Option<KvF16Kernels>,
+
+    // The planar schemes (NVFP4, FP8): decode, fused-decode and prefill kernels for each. Every slot is
+    // `Option` because they are NVRTC-compiled at run time and a load can fail on a device or driver. A
+    // kernel that failed to load leaves its slot empty and its error in `load_errors`: a fused kernel's
+    // absence falls back to the separate launches, a model whose weights need any other missing kernel is
+    // refused before its layer weights are uploaded, and a dispatch that still meets one fails with an error
+    // naming the scheme, never silently routed elsewhere.
+    pub(crate) planar: PlanarKernels,
+}
+
+/// The planar kernel slots.
+#[derive(Debug, Default)]
+pub(crate) struct PlanarKernels {
+    pub(crate) nvfp4_decode: Option<CudaFunction>,
+    /// Plane -> f32 for the prefill dequant scratch (`dequant_nvfp4_to_f32`). Prefill decodes into the
+    /// shared scratch one matrix at a time rather than holding a resident F16 image, which would take
+    /// several times the planes' bytes.
+    pub(crate) nvfp4_prefill: Option<CudaFunction>,
+    pub(crate) fp8_decode: Option<CudaFunction>,
+    pub(crate) fp8_residual: Option<CudaFunction>,
+    /// The FP8 matvec with the residual added to the f32-rounded product (`matvec_fp8_f32_residual_rounded`),
+    /// for the GDN output projection: bit-identical to matvec -> `residual_add_copy`.
+    pub(crate) fp8_residual_rounded: Option<CudaFunction>,
+    /// Three FP8 matvecs over one activation in one launch (`matvec_fp8_three_f32`): the attention q (or
+    /// q+gate), k and v projections, bit-identical to three `matvec_fp8_f32` launches.
+    pub(crate) fp8_qkv: Option<CudaFunction>,
+    pub(crate) fp8_prefill: Option<CudaFunction>,
+    /// FFN gate + up + SwiGLU in one launch over two NVFP4 planes (`matvec_nvfp4_wide_glu_f32`); loaded
+    /// from the same source as `nvfp4_decode`, and bit-identical to gate matvec -> up matvec ->
+    /// `swiglu_inplace`.
+    pub(crate) nvfp4_glu: Option<CudaFunction>,
+    /// The NVFP4 matvec with the residual added on the store (`matvec_nvfp4_wide_residual_f32`), for the
+    /// FFN down projection: writes the layer output directly, bit-identical to matvec -> residual_add.
+    pub(crate) nvfp4_residual: Option<CudaFunction>,
+    /// The GDN input projections — FP8 qkv, FP8 z and the F32 alpha/beta gates — in one launch
+    /// (`gdn_input_projections_f32`), bit-identical to the three launches it replaces except where the
+    /// fast-math banked gates kernel flushes a denormal to zero.
+    pub(crate) fp8_gdn_in: Option<CudaFunction>,
+    /// Each kernel above that failed to load, by symbol, with its load error.
+    pub(crate) load_errors: Vec<(&'static str, String)>,
+}
+
+// The planar kernel symbols `compile_all_kernels` loads, one per `PlanarKernels` slot.
+const NVFP4_DECODE: &str = "matvec_nvfp4_wide_f32";
+const NVFP4_PREFILL: &str = "dequant_nvfp4_to_f32";
+const FP8_DECODE: &str = "matvec_fp8_f32";
+const FP8_RESIDUAL: &str = "matvec_fp8_f32_residual";
+const FP8_RESIDUAL_ROUNDED: &str = "matvec_fp8_f32_residual_rounded";
+const FP8_QKV: &str = "matvec_fp8_three_f32";
+const FP8_PREFILL: &str = "dequant_fp8_to_f32";
+const NVFP4_GLU: &str = "matvec_nvfp4_wide_glu_f32";
+const NVFP4_RESIDUAL: &str = "matvec_nvfp4_wide_residual_f32";
+const FP8_GDN_IN: &str = "gdn_input_projections_f32";
+
+/// The planar kernels the dispatch has no fallback for, by scheme and symbol: the decode matvec, its
+/// residual entry point and the prefill decode. The fused kernels fall back to these.
+const REQUIRED_PLANAR_KERNELS: [(QuantScheme, &str); 6] = [
+    (QuantScheme::Nvfp4, "matvec_nvfp4_wide_f32"),
+    (QuantScheme::Nvfp4, "matvec_nvfp4_wide_residual_f32"),
+    (QuantScheme::Nvfp4, "dequant_nvfp4_to_f32"),
+    (QuantScheme::Fp8E4M3, "matvec_fp8_f32"),
+    (QuantScheme::Fp8E4M3, "matvec_fp8_f32_residual"),
+    (QuantScheme::Fp8E4M3, "dequant_fp8_to_f32"),
+];
+
+/// The refusal for a model whose weights carry `schemes` when a kernel one of them requires failed to
+/// load, naming the kernel and its load error; `None` when every such kernel loaded.
+pub(crate) fn planar_kernel_refusal(
+    schemes: &[QuantScheme],
+    load_errors: &[(&'static str, String)],
+) -> Option<String> {
+    REQUIRED_PLANAR_KERNELS
+        .iter()
+        .filter(|(scheme, _)| schemes.contains(scheme))
+        .find_map(|(scheme, symbol)| {
+            load_errors
+                .iter()
+                .find(|(name, _)| name == symbol)
+                .map(|(_, e)| {
+                    format!(
+                        "CUDA: this model has {scheme:?} weights and their kernel `{symbol}` did not \
+                         load on this device ({e}); refused at load rather than at the first token"
+                    )
+                })
+        })
 }
 
 /// The kernels a half-typed KV store is read and written with. Loaded as a
@@ -1231,7 +1316,70 @@ pub(crate) fn compile_all_kernels(
         attn_spec.head_dim,
         attn_codegen.get()
     );
+    // The planar kernels load like every other NVRTC kernel, but their failure is NOT fatal here: an
+    // artifact that does not use them must still load on a device where they cannot compile. A kernel
+    // that failed to load leaves its slot empty and prints a verbose `FAILED` line with its error; a fused
+    // kernel's absence falls back to the separate launches, and a model that needs any other missing kernel
+    // is refused at `preload_weights` (`planar_kernel_refusal`).
+    // The NVFP4 matvec fetches each 16-weight group with two `uchar4` and four `float4` loads and builds the
+    // E2M1 values from the code bits; it launches at 128 threads with no shared memory. The fused FFN
+    // gate/up/SwiGLU and down+residual kernels share its row code.
+    let mut load_errors = Vec::new();
+    let mut load_planar = |source: &str, name: &'static str| match load_fn(source, name) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            cuda_log!("[CUDA] {name}: FAILED: {e}");
+            load_errors.push((name, e.to_string()));
+            None
+        }
+    };
+    let nvfp4_decode = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_DECODE);
+    let nvfp4_prefill = load_planar(shaders::DEQUANT_NVFP4_KERNEL_SOURCE, NVFP4_PREFILL);
+    let fp8_decode = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_DECODE);
+    let fp8_residual = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_RESIDUAL);
+    let fp8_residual_rounded = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_RESIDUAL_ROUNDED);
+    let fp8_qkv = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_QKV);
+    let fp8_prefill = load_planar(shaders::DEQUANT_FP8_KERNEL_SOURCE, FP8_PREFILL);
+    let nvfp4_glu = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_GLU);
+    let nvfp4_residual = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_RESIDUAL);
+    let fp8_gdn_in = load_planar(
+        &format!(
+            "{}\n{}\n{}",
+            shaders::MATVEC_FP8_KERNEL_SOURCE,
+            shaders::MATVEC_F32_GATES_KERNEL_SOURCE,
+            shaders::GDN_INPUT_PROJECTIONS_KERNEL_SOURCE
+        ),
+        FP8_GDN_IN,
+    );
+    let planar = PlanarKernels {
+        nvfp4_decode,
+        nvfp4_prefill,
+        fp8_decode,
+        fp8_residual,
+        fp8_residual_rounded,
+        fp8_qkv,
+        fp8_prefill,
+        nvfp4_glu,
+        nvfp4_residual,
+        fp8_gdn_in,
+        load_errors,
+    };
+    let status = |slot: &Option<CudaFunction>| if slot.is_some() { "loaded" } else { "absent" };
+    cuda_log!(
+        "[CUDA] planar kernels: NVFP4 decode {} glu {} residual {} prefill {} | FP8 decode {} residual {} residual-rounded {} qkv {} prefill {} gdn-in {}",
+        status(&planar.nvfp4_decode),
+        status(&planar.nvfp4_glu),
+        status(&planar.nvfp4_residual),
+        status(&planar.nvfp4_prefill),
+        status(&planar.fp8_decode),
+        status(&planar.fp8_residual),
+        status(&planar.fp8_residual_rounded),
+        status(&planar.fp8_qkv),
+        status(&planar.fp8_prefill),
+        status(&planar.fp8_gdn_in),
+    );
     let kernels = KernelSet {
+        planar,
         kv_f16,
         attn_spec,
         attn_codegen: attn_codegen.get(),
@@ -4309,5 +4457,102 @@ mod kquant_geometry_tests {
             kernel_define("  #  define   Q4K_NR   2  // rows\n", "Q4K_NR").unwrap(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod planar_kernel_refusal_tests {
+    //! A model is refused at load exactly when a kernel one of its planar schemes has no fallback
+    //! for failed to load; the refusal names that kernel and carries its load error.
+
+    use super::{
+        planar_kernel_refusal, FP8_DECODE, FP8_GDN_IN, FP8_PREFILL, FP8_QKV, FP8_RESIDUAL,
+        FP8_RESIDUAL_ROUNDED, NVFP4_DECODE, NVFP4_GLU, NVFP4_PREFILL, NVFP4_RESIDUAL,
+        REQUIRED_PLANAR_KERNELS,
+    };
+    use lumen_format::QuantScheme;
+
+    fn failed(names: &[&'static str]) -> Vec<(&'static str, String)> {
+        names
+            .iter()
+            .map(|&n| (n, format!("{n}: nvrtc error")))
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_required_kernel_refuses_only_the_scheme_that_needs_it() {
+        let errors = failed(&["dequant_fp8_to_f32"]);
+        let refusal = planar_kernel_refusal(&[QuantScheme::Bf16, QuantScheme::Fp8E4M3], &errors)
+            .expect("an FP8 model without its prefill kernel is refused");
+        assert!(
+            refusal.contains("Fp8E4M3")
+                && refusal.contains("`dequant_fp8_to_f32`")
+                && refusal.contains("dequant_fp8_to_f32: nvrtc error"),
+            "{refusal}"
+        );
+        assert_eq!(planar_kernel_refusal(&[QuantScheme::Nvfp4], &errors), None);
+        assert_eq!(planar_kernel_refusal(&[QuantScheme::Q8_0], &errors), None);
+    }
+
+    #[test]
+    fn a_missing_fused_kernel_does_not_refuse() {
+        let errors = failed(&[
+            "matvec_nvfp4_wide_glu_f32",
+            "matvec_fp8_three_f32",
+            "matvec_fp8_f32_residual_rounded",
+            "gdn_input_projections_f32",
+        ]);
+        assert_eq!(
+            planar_kernel_refusal(&[QuantScheme::Nvfp4, QuantScheme::Fp8E4M3], &errors),
+            None
+        );
+    }
+
+    #[test]
+    fn every_required_nvfp4_kernel_is_checked() {
+        for name in [
+            "matvec_nvfp4_wide_f32",
+            "matvec_nvfp4_wide_residual_f32",
+            "dequant_nvfp4_to_f32",
+        ] {
+            let refusal = planar_kernel_refusal(&[QuantScheme::Nvfp4], &failed(&[name]))
+                .unwrap_or_else(|| panic!("{name} missing is not refused"));
+            assert!(refusal.contains(name), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn every_required_fp8_kernel_is_checked() {
+        for name in [
+            "matvec_fp8_f32",
+            "matvec_fp8_f32_residual",
+            "dequant_fp8_to_f32",
+        ] {
+            let refusal = planar_kernel_refusal(&[QuantScheme::Fp8E4M3], &failed(&[name]))
+                .unwrap_or_else(|| panic!("{name} missing is not refused"));
+            assert!(refusal.contains(name), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn every_required_planar_kernel_is_one_the_loader_loads() {
+        let loaded = [
+            NVFP4_DECODE,
+            NVFP4_PREFILL,
+            FP8_DECODE,
+            FP8_RESIDUAL,
+            FP8_RESIDUAL_ROUNDED,
+            FP8_QKV,
+            FP8_PREFILL,
+            NVFP4_GLU,
+            NVFP4_RESIDUAL,
+            FP8_GDN_IN,
+        ];
+        for (scheme, symbol) in REQUIRED_PLANAR_KERNELS {
+            assert!(
+                loaded.contains(&symbol),
+                "{scheme:?} requires `{symbol}`, which the planar loader does not load"
+            );
+        }
     }
 }

@@ -19,6 +19,10 @@
 
 pub(crate) mod attention_decode;
 mod backend_impl;
+/// Runtime-loaded cuBLASLt for the native NVFP4/FP8 prefill's GEMMs.
+pub mod cublaslt;
+/// Measured, verified cuBLASLt algorithm selection, cached per library identity.
+pub mod cublaslt_algo_cache;
 pub(crate) mod decode;
 /// CUDA device wrapper (context, stream, buffer management).
 pub mod ffi;
@@ -27,6 +31,24 @@ pub(crate) mod gpu_buffers;
 pub(crate) mod kv_cache;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
+/// The native NVFP4/FP8 prefill route's admission and publication conditions. The route itself is
+/// published and run by the backend (`backend_impl::native_prefill_forward`); it and the other
+/// `native_prefill_*` modules are public for the GPU suites (`tests/cuda_native_*_test.rs`).
+pub mod native_prefill;
+/// The native prefill's attention kernels (`tests/cuda_native_attention_test.rs`): the RoPE table,
+/// the query/key norms with RoPE and the new KV rows, the BF16 KV staging and causal GQA attention.
+pub mod native_prefill_attn;
+/// Named tensors of the native prefill copied to the host, for its layer oracle.
+#[cfg(feature = "test-prefill-dump")]
+pub mod native_prefill_dump;
+/// The native prefill's GDN kernels: the conv1d and the chunked delta rule.
+pub mod native_prefill_gdn;
+/// The native prefill's GEMM plan table.
+pub mod native_prefill_gemm;
+/// The native prefill's NVRTC kernel group: its producers, their launches and their qualification.
+pub mod native_prefill_kernels;
+/// The native prefill's weight views.
+pub mod native_prefill_weights;
 pub(crate) mod prefill;
 pub(crate) mod prefill_attention;
 pub(crate) mod profiler;
@@ -37,6 +59,9 @@ pub mod shaders;
 pub(crate) mod types;
 
 pub use backend_impl::CudaBackend;
+/// Decode-state snapshots, for tests that decode two builds from one state.
+#[cfg(feature = "test-state-snapshot")]
+pub use backend_impl::StateSnapshot;
 /// The kernel-source `#define` reader, for the out-of-crate K-quant correctness suite
 /// (`tests/cuda_kquant_test.rs`), which pins the launcher's geometry to the kernels' own macros.
 pub use decode::kernel_define;

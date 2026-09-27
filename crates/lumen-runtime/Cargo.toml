@@ -18,7 +18,24 @@ cuda = ["dep:cudarc"]
 # also reachable from in-tree `#[test]` functions without the feature
 # being enabled at the workspace level; production builds without the
 # feature have zero overhead from the inject path.
+# The same feature exposes `cuda::cublaslt::fault`: a numbered construction
+# step of the native prefill's cuBLASLt plans made to fail once, and a count
+# of live cuBLASLt objects, used by `cuda_native_gemm_test` to show that a
+# failure at any step leaves nothing behind. It also exposes
+# `cuda::native_prefill::fault`: a refusal injected at one of the native prefill
+# route's publication conditions, and a native forward made to fail at a layer,
+# used by `cuda_native_prefill_test`.
 test-fault-injection = []
+# Test-only feature: `CudaBackend::snapshot_state` / `restore_state` copy the
+# state a decode continues from (KV rows, GDN state, conv rings and positions,
+# the last hidden row, the step counter) out and back in, so two builds can be
+# decoded from one frozen state. Used by `cuda_state_snapshot_test` and
+# `cuda_native_prefill_test`.
+test-state-snapshot = ["cuda"]
+# Test-only feature: `cuda::native_prefill_dump`, named tensors of the native
+# prefill copied to the host at layer boundaries, for the layer oracle of
+# `cuda_native_prefill_test`.
+test-prefill-dump = ["cuda"]
 
 [dependencies]
 lumen-format.workspace = true
@@ -62,6 +79,9 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 # the reference jinja2 (`json.dumps(sort_keys=False)`), not BTreeMap-sorted.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

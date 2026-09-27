@@ -925,6 +925,20 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
 
+    // This one `LbcFile` serves scheme admission, the prompt tokenizer and
+    // the CtInt4G32 check; the weight providers open the file again. A
+    // scheme with no kernels is refused from what `LbcFile::open` parsed —
+    // the header, the index and the tokenizer section — before any weight
+    // provider opens. The artifact parses, so without that refusal it would
+    // reach a provider and fail as a missing kernel or, worse, a misread
+    // plane. The refusal itself runs after the backend is resolved below,
+    // because whether a planar scheme is servable depends on the backend: the
+    // NVFP4 and FP8 matvecs exist on CUDA only.
+    let mut lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
+        eprintln!("Error parsing model file: {e}");
+        std::process::exit(1);
+    });
+
     // Resolve prompt tokens: either from --tokens (raw IDs) or --prompt (text -> tokenizer).
     let (prompt_tokens, tokenizer) = if let Some(ref tokens) = tokens_str {
         // --tokens mode: parse integer IDs (existing behavior, unchanged).
@@ -947,12 +961,9 @@ pub(crate) fn run_inference(args: &[String]) {
             eprintln!("Error: --prompt must not be empty");
             std::process::exit(1);
         }
-        // Load tokenizer from LBC file header (targeted seek, not full-file read).
-        let lbc = lumen_format::reader::LbcFile::open(path).unwrap_or_else(|e| {
-            eprintln!("Error parsing model file: {e}");
-            std::process::exit(1);
-        });
-        let tok_section = lbc.tokenizer.unwrap_or_else(|| {
+        // The tokenizer section the open above parsed, taken so the file
+        // stays usable for the checks after it.
+        let tok_section = lbc.tokenizer.take().unwrap_or_else(|| {
             eprintln!("Error: This model has no embedded tokenizer (LBC v2).");
             eprintln!("Re-convert with: lumen convert --input model.gguf --output model.lbc");
             std::process::exit(1);
@@ -1062,6 +1073,39 @@ pub(crate) fn run_inference(args: &[String]) {
         }
     }
 
+    // A backend this build cannot construct is refused for that reason first,
+    // with the message `create_backend` gives and in its order (CUDA is taken
+    // before Metal), before any weight provider opens and before the scheme
+    // rule below could name the kill switch instead of the build.
+    if use_cuda && !cfg!(feature = "cuda") {
+        eprintln!("Error: --cuda requires building with --features cuda");
+        std::process::exit(1);
+    }
+    if use_metal && !use_cuda && !cfg!(target_os = "macos") {
+        eprintln!("Error: --metal is only supported on macOS");
+        std::process::exit(1);
+    }
+
+    // Scheme admission, decided from the parsed header and index before any
+    // provider opens. The backend is resolved by now, and the kill switch is
+    // part of what makes CUDA unable to serve: it lives in the runtime's env
+    // cache, so it is published into the admission flag before asking.
+    lumen_runtime::runtime_defaults::publish_cuda_nvfp4_admission();
+    let admission_backend = if use_cuda {
+        lumen_format::serving_rules::ServingBackend::Cuda
+    } else if use_metal {
+        lumen_format::serving_rules::ServingBackend::Metal
+    } else {
+        lumen_format::serving_rules::ServingBackend::Cpu
+    };
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, admission_backend) {
+        eprintln!(
+            "Error: {}",
+            lumen_format::serving_rules::no_serving_kernels_message(scheme, admission_backend)
+        );
+        std::process::exit(1);
+    }
+
     // When the operator did NOT pass the flag, honour the shared env resolvers
     // so the CLI matches the server wire (`diag_frequency_penalty` /
     // `diag_repeat_last_n`, which delegate to the same resolvers). An explicit
@@ -1136,15 +1180,13 @@ pub(crate) fn run_inference(args: &[String]) {
         save_path: session_save_path.clone(),
     };
 
-    // CtInt4G32 has CUDA kernels only. Reject here — from the lightweight
-    // header/index, before any provider opens or multi-GB global expansion —
-    // so every run mode (async/sync/mmap, CPU/Metal) fails fast with the
-    // same message instead of misreading packed planes downstream. The scan
-    // covers per-tensor slices, not just the primary scheme.
+    // CtInt4G32 has CUDA kernels only. Reject here — from the index the
+    // open above parsed, before any provider opens or multi-GB global
+    // expansion — so every run mode (async/sync/mmap, CPU/Metal) fails fast
+    // with the same message instead of misreading packed planes downstream.
+    // The scan covers per-tensor slices, not just the primary scheme.
     {
-        let has_ct4 = lumen_format::reader::LbcFile::open(path)
-            .map(|lbc| lbc.uses_quant(QuantScheme::CtInt4G32))
-            .unwrap_or(false);
+        let has_ct4 = lbc.uses_quant(QuantScheme::CtInt4G32);
         if has_ct4 {
             if !cfg!(feature = "cuda") {
                 eprintln!(
@@ -1169,6 +1211,9 @@ pub(crate) fn run_inference(args: &[String]) {
             }
         }
     }
+    // The check above is the last use of the parsed file: in `--tokens` mode
+    // its tokenizer section is still held, and it is not kept through the run.
+    drop(lbc);
 
     if use_async {
         run_with_async(
@@ -1988,10 +2033,13 @@ fn create_backend(
     // Q6_K (source-fidelity head) is CUDA-only: the CUDA backend splits the
     // superblocks into dp4a planes; Metal/CPU have no Q6_K head kernel and
     // keep the F32 dequant copy instead.
+    // An NVFP4 head is forwarded on CUDA only: its head kernel exists there, and its F32 copy is
+    // deliberately empty, so without this the backend would see no head at all.
     if (matches!(
         output_proj_quant,
         QuantScheme::Q8_0 | QuantScheme::Q4_0 | QuantScheme::F16 | QuantScheme::Bf16
-    ) || (use_cuda && output_proj_quant == QuantScheme::Q6_K))
+    ) || (use_cuda && output_proj_quant == QuantScheme::Q6_K)
+        || (use_cuda && output_proj_quant == QuantScheme::Nvfp4))
         && !output_proj_raw.is_empty()
     {
         if verbose {

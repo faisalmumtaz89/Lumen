@@ -401,5 +401,17 @@ pub(crate) fn quant_descriptor_for(scheme: QuantScheme) -> QuantizationDescripto
             block_byte_size: 0,
             scale_offset_in_block: None,
         },
+        QuantScheme::Nvfp4 => QuantizationDescriptor {
+            scheme,
+            group_size: QuantGroupSize::Group(16),
+            block_byte_size: 0,
+            scale_offset_in_block: None,
+        },
+        QuantScheme::Fp8E4M3 => QuantizationDescriptor {
+            scheme,
+            group_size: QuantGroupSize::PerTensor,
+            block_byte_size: 0,
+            scale_offset_in_block: None,
+        },
     }
 }

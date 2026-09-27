@@ -1012,11 +1012,105 @@ pub fn generate_test_model_q4_0(config: &TestModelQ4Config) -> Vec<u8> {
     out
 }
 
+/// Whether a rewritten model carries a tokenizer section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tokenizer {
+    /// A placeholder vocabulary of `vocab_size` tokens `t0`, `t1`, …: enough
+    /// for a binary that reads the section before it can be driven at all.
+    Embedded,
+    /// No section at all: what a binary sees before it has one to build.
+    Absent,
+}
+
+/// Rewrite a generated model from its own parts, with `edit` applied to the
+/// layer index it was written with and a placeholder tokenizer section
+/// embedded when `tokenizer` says so — the generators embed none. The writer
+/// lays the file out again, so every offset, the tokenizer fields and the
+/// header checksum are its own.
+pub fn rewrite(
+    bytes: &[u8],
+    tokenizer: Tokenizer,
+    edit: impl FnOnce(&mut [LayerIndex]),
+) -> Vec<u8> {
+    let source =
+        crate::reader::LbcFile::from_bytes(bytes, std::path::PathBuf::from("source.lbc")).unwrap();
+    let at = |off: u64, len: u64| bytes[off as usize..(off + len) as usize].to_vec();
+
+    // The writer checksums the header bytes it serializes, so the field goes
+    // back to its pre-checksum value first.
+    let mut header = source.header.clone();
+    header.header_checksum = 0;
+    let mut indices = source.layer_indices.clone();
+    edit(&mut indices);
+    let blobs: Vec<Vec<u8>> = source
+        .layer_indices
+        .iter()
+        .map(|l| at(l.layer_offset_bytes, l.layer_length_bytes))
+        .collect();
+
+    let section = match tokenizer {
+        Tokenizer::Embedded => Some(crate::tokenizer::TokenizerSection {
+            model_type: "gpt2".into(),
+            pre_tokenizer: "default".into(),
+            tokens: (0..header.hyperparams.vocab_size)
+                .map(|i| format!("t{i}"))
+                .collect(),
+            token_types: Vec::new(),
+            scores: Vec::new(),
+            merges: Vec::new(),
+            bos_token_id: 0,
+            eos_token_id: 1,
+            pad_token_id: None,
+            add_bos_token: false,
+            add_eos_token: false,
+            add_space_prefix: false,
+            chat_template: None,
+        }),
+        Tokenizer::Absent => None,
+    };
+
+    let mut out = Vec::new();
+    write_lbc(
+        &mut out,
+        &header,
+        &indices,
+        &GlobalTensors {
+            embedding: at(header.embedding.offset, header.embedding.length),
+            final_norm: at(header.final_norm.offset, header.final_norm.length),
+            output_proj: at(header.output_proj.offset, header.output_proj.length),
+        },
+        &blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        section.as_ref(),
+    )
+    .expect("failed to rewrite the test model");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reader::LbcFile;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_rewrite_with_nothing_to_change_reproduces_the_model() {
+        let bytes = generate_test_model_q4_0(&TestModelQ4Config::default());
+        assert_eq!(rewrite(&bytes, Tokenizer::Absent, |_| {}), bytes);
+    }
+
+    #[test]
+    fn a_rewrite_embeds_a_placeholder_vocabulary_of_the_header_s_size() {
+        let config = TestModelQ4Config::default();
+        let bytes = rewrite(
+            &generate_test_model_q4_0(&config),
+            Tokenizer::Embedded,
+            |_| {},
+        );
+        let lbc = LbcFile::from_bytes(&bytes, PathBuf::from("test.lbc")).unwrap();
+        let tokens = &lbc.tokenizer.expect("a tokenizer section").tokens;
+        assert_eq!(tokens.len(), config.vocab_size as usize);
+        assert_eq!(tokens[0], "t0");
+    }
 
     // ---- F32 tests (original) ----
 

@@ -11,7 +11,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `lumen pull <model:quant>` | Download GGUF, convert to LBC, cache; do not run |
 | `lumen models` | List all registry entries and disk-cached LBCs |
 | `lumen convert --input <gguf> --output <lbc> [--requant <q>]` | Manually convert a GGUF to LBC (optionally re-quantize; `--requant` is refused for MoE models, whose expert tensors are carried in their source quantization) |
-| `lumen convert --input <donor-gguf> --from-hf <dir> --output <lbc>` | Import an HF compressed-tensors INT4 checkpoint (CUDA-only CtInt4G32; see `docs/lbc-format.md`) |
+| `lumen convert --input <donor-gguf> --from-hf <dir> --output <lbc>` | Import an HF compressed-tensors INT4 checkpoint (CtInt4G32) or an NVIDIA ModelOpt mixed-precision checkpoint whose attention and MLP projections and GDN `in_proj_qkv` / `in_proj_z` are each NVFP4, FP8 or BF16 (the GDN output projection FP8 or BF16, the output head NVFP4 or BF16; the embedding BF16, the GDN `in_proj_a` / `in_proj_b` unquantized); CUDA runtime only (see `docs/lbc-format.md`) |
 | `lumen --help` / `lumen run --help` / `lumen convert --help` | Full reference |
 
 ## Common flags (excerpt)
