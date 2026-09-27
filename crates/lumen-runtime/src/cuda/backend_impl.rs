@@ -21055,21 +21055,14 @@ impl ComputeBackend for CudaBackend {
                     let _ = self.device.stream.memset_zeros(counter);
                 }
 
-                // Reset GDN h_states and conv_states (zeroing GPU buffers).
+                // Reset GDN h_states and conv_states, zeroed in place: nothing is
+                // allocated, so a full device cannot leave the previous state behind.
                 if let Some(ref mut gdn) = st.gdn_scratch_gpu {
                     for h in &mut gdn.h_states {
-                        // Zero the h_state buffer. alloc_zeros produces zeroed memory,
-                        // but we need to re-zero between sequences.
-                        let len = h.len();
-                        if let Ok(zeros) = self.device.alloc_zeros::<f32>(len) {
-                            let _ = self.device.stream.memcpy_dtod(&zeros, h);
-                        }
+                        let _ = self.device.stream.memset_zeros(h);
                     }
                     for c in &mut gdn.conv_states {
-                        let len = c.len();
-                        if let Ok(zeros) = self.device.alloc_zeros::<f32>(len) {
-                            let _ = self.device.stream.memcpy_dtod(&zeros, c);
-                        }
+                        let _ = self.device.stream.memset_zeros(c);
                     }
                     gdn.conv_positions.fill(0);
                 }
