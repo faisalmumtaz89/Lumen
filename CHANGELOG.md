@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **`lumen run` and `lumen-server` ran on the CPU in a container given one GPU of a multi-GPU
   host.** CUDA was auto-selected only when `/dev/nvidia0` existed, and such a container sees
   only its own GPU's node (`/dev/nvidia1`, ...). Any `/dev/nvidiaN` now selects CUDA.
+- **The one-line installer hid `~/.bashrc` from bash login shells.** When it had to add
+  `~/.local/bin` to PATH it could create `~/.bash_profile`, which bash then reads instead of
+  `~/.profile`. It now writes to the login file bash already reads.
 - **The one-line installer reported installed CUDA libraries as missing.** When cuBLAS and
   NVRTC were found only through the system loader cache (CUDA 13 in `/opt/cuda`, for
   example), its check died of SIGPIPE under `pipefail` and it warned that inference would

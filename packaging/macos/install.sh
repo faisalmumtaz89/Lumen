@@ -349,12 +349,20 @@ else
     DEST="$HOME/.local/bin"
     install_to "$DEST" "" || die "could not install to $DEST."
     if ! on_path "$DEST"; then
-      # Pick the profile by login shell; cover bash's two files.
+      # Pick the profile by login shell. A bash login shell reads only the first
+      # of ~/.bash_profile, ~/.bash_login and ~/.profile, so write to that one:
+      # creating ~/.bash_profile would hide ~/.profile, which loads ~/.bashrc
+      # on Debian and Ubuntu.
       shell_name="$(basename -- "${SHELL:-}")"
       profiles=""
       case "$shell_name" in
         zsh)  profiles="$HOME/.zshrc" ;;
-        bash) profiles="$HOME/.bashrc $HOME/.bash_profile" ;;
+        bash)
+          login_profile="$HOME/.profile"
+          for f in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+            if [ -f "$f" ]; then login_profile="$f"; break; fi
+          done
+          profiles="$HOME/.bashrc $login_profile" ;;
         *)    profiles="$HOME/.profile" ;;
       esac
       export_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
