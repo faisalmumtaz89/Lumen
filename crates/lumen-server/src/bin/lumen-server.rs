@@ -365,10 +365,9 @@ fn cache_dir() -> PathBuf {
 ///
 /// File-path heuristic matches `lumen-cli/src/run.rs::resolve_model_path`:
 /// the value is treated as a path if it contains `/`, `\`, or ends with
-/// `.lbc`/`.gguf`. Otherwise it is taken as a registry-style name and a
+/// `.lbc`/`.gguf`. Otherwise it is taken as a registry name or alias and a
 /// cached LBC is looked up by `~/.cache/lumen/<key>-<QUANT>.lbc`, with the
-/// dot-to-dash key normalization the CLI's registry uses
-/// (e.g. `qwen3.5-9b` -> `qwen3-5-9b`).
+/// key [`registry_key`] gives.
 fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, String> {
     let looks_like_path = model.contains('/')
         || model.contains('\\')
@@ -391,17 +390,14 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, S
     // The quant fallback must match model_registry.toml's [meta]
     // default_quant. lumen-cli prefers that default for a bare name when its
     // LBC is cached (falling back to a sole cached quant); the server always
-    // uses it. (Key resolution also differs: the server only rewrites dots
-    // to dashes and does not resolve registry [aliases].)
+    // uses it.
     let quant = quant_arg
         .map(str::to_owned)
         .or_else(|| tag_quant.map(|s| s.to_owned()))
         .unwrap_or_else(|| "q8_0".to_owned())
         .to_uppercase();
 
-    // Registry uses `qwen3-5-9b` (dot-to-dash) as the canonical key; the
-    // README + lumen-cli accept `qwen3.5-9b` as an alias. Normalize.
-    let key = name.replace('.', "-");
+    let key = registry_key(name);
 
     // Lookup priority mirrors `lumen-cli/src/cache.rs::cached_lbc`:
     //   1. On macOS, prefer `<key>-<QUANT>-metal.lbc` (produced by
@@ -431,6 +427,15 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, S
         ));
     }
     Ok(path)
+}
+
+/// The cache key `lumen pull` stores a registry name or alias under
+/// (`qwen3.5-moe` -> `qwen3-5-moe-35b-a3b`). A name the registry does not know
+/// keeps the dot-to-dash normalization of its keys (`my.model` -> `my-model`).
+fn registry_key(name: &str) -> String {
+    lumen_cli::registry::load_registry()
+        .resolve(name)
+        .map_or_else(|| name.replace('.', "-"), |entry| entry.key.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1405,19 @@ mod tests {
     /// Build the `&[String]` `parse_args` expects from string literals.
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn registry_names_resolve_to_their_cache_keys() {
+        assert_eq!(super::registry_key("qwen3.5-moe"), "qwen3-5-moe-35b-a3b");
+        assert_eq!(
+            super::registry_key("qwen3.5-moe-35b-a3b"),
+            "qwen3-5-moe-35b-a3b"
+        );
+        assert_eq!(super::registry_key("qwen3.8-27b"), "qwen3-8-27b");
+        assert_eq!(super::registry_key("qwen3.5-9b"), "qwen3-5-9b");
+        assert_eq!(super::registry_key("qwen3-5-9b"), "qwen3-5-9b");
+        assert_eq!(super::registry_key("my.model"), "my-model");
     }
 
     #[test]
