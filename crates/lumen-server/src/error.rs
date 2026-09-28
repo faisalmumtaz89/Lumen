@@ -23,7 +23,7 @@ pub enum ServerError {
     /// `param` is the JSON pointer to the offending field (e.g. `"messages"`,
     /// `"messages[0].role"`), `None` when not localizable.
     /// `code` is a stable machine-readable tag (e.g. `"missing_field"`,
-    /// `"invalid_type"`, `"unknown_field"`), `None` when generic.
+    /// `"invalid_type"`), `None` when generic.
     #[error("{message}")]
     BadRequest {
         message: String,

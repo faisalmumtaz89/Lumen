@@ -1,22 +1,20 @@
-//! Part 4 (reasoning budget + forced-close) end-to-end engine tests.
+//! Token limit + reasoning budget (forced-close) end-to-end engine tests.
 //!
 //! Boots a `lumen-server` engine worker on the CPU-naive backend with a tiny
 //! synthetic model + the byte-identity tokenizer, then submits `JobRequest`s
-//! that exercise the Part-4 decode-loop control:
+//! that exercise the decode-loop control:
 //!
-//!   * thinking-OFF (the default) must produce a BYTE-IDENTICAL token stream
-//!     to the pre-Part-4 loop — proven by replaying the same greedy request
-//!     twice and (separately) by checking the answer budget still bounds total
-//!     tokens exactly at `max_tokens`.
-//!   * thinking-ON with a small `reasoning_budget` must FORCE-CLOSE the
-//!     `<think>` block at the budget (the synthetic model never emits
-//!     `</think>` on its own), inject `</think>\n\n`, and then apply the
-//!     SEPARATE answer budget — so the answer is never starved by reasoning.
+//!   * thinking-OFF (the default) is deterministic and stops at exactly
+//!     `max_tokens`.
+//!   * thinking-ON: `max_tokens` bounds reasoning and answer together, as both
+//!     APIs define it. A small `reasoning_budget` FORCE-CLOSES the `<think>`
+//!     block at the budget (the synthetic model never emits `</think>` on its
+//!     own) by injecting `</think>\n\n`, and the answer uses what remains; a
+//!     limit reached while reasoning ends the reply there.
 //!
 //! The synthetic model has random weights, so the exact token ids are
 //! arbitrary but DETERMINISTIC under temp 0 + fixed seed. The tests assert on
-//! counts, the injected close marker, and budget separation — not on specific
-//! token values.
+//! counts and the injected close marker, not on specific token values.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,6 +118,7 @@ fn job(max_tokens: usize, enable_thinking: bool, reasoning_budget: usize) -> Job
         suffix_threshold: 32,
         enable_thinking,
         reasoning_budget,
+        response_prefix: String::new(),
     }
 }
 
@@ -167,9 +166,8 @@ async fn drain(handle: &EngineHandle, req: JobRequest) -> Drained {
 // =========================================================================
 
 /// Two thinking-off greedy requests with the same seed must produce the
-/// EXACT same token sequence (determinism) AND respect the answer budget
-/// exactly. This is the byte-identity guard: Part-4 must not perturb the
-/// default path.
+/// EXACT same token sequence (determinism) AND stop at exactly
+/// `max_tokens`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thinking_off_is_deterministic_and_budget_exact() {
     let handle = boot_engine();
@@ -183,8 +181,7 @@ async fn thinking_off_is_deterministic_and_budget_exact() {
     );
     assert_eq!(a.full_text(), b.full_text());
 
-    // Answer budget: exactly max_tokens tokens (no reasoning phase, so every
-    // token is an answer token), finish_reason == Length.
+    // Exactly max_tokens tokens, finish_reason == Length.
     assert_eq!(
         a.completion_tokens, 12,
         "thinking-off must emit exactly max_tokens"
@@ -273,81 +270,95 @@ async fn max_tokens_zero_emits_nothing() {
 }
 
 // =========================================================================
-// Thinking-ON forced-close + separate budget
+// Thinking-ON: one token limit, reasoning included
 // =========================================================================
 
 /// With thinking ON and a small reasoning_budget, the synthetic model (which
-/// never emits `</think>` on its own) must be FORCE-CLOSED at the budget: the
-/// stream contains an injected `</think>` marker, and the SEPARATE answer
-/// budget then bounds the answer tokens. Total decoded tokens = reasoning
-/// budget + answer budget (the injected close is emitted but not counted in
-/// completion_tokens).
+/// never emits `</think>` on its own) is FORCE-CLOSED at the budget: the stream
+/// contains an injected `</think>` marker, and the answer then gets the rest of
+/// `max_tokens`. completion_tokens counts decode steps (the injected close is
+/// emitted as bytes but is not one), so it is exactly `max_tokens`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thinking_on_forced_close_at_reasoning_budget() {
     let handle = boot_engine();
-    let reasoning_budget = 6usize;
-    let answer_budget = 5usize;
-    let d = drain(&handle, job(answer_budget, true, reasoning_budget)).await;
-
-    // The forced-close injected `</think>` into the stream.
+    let d = drain(&handle, job(11, true, 6)).await;
     assert!(
         d.full_text().contains("</think>"),
         "forced-close must inject </think>; got: {:?}",
         d.full_text()
     );
-
-    // SEPARATE budgets: completion_tokens counts reasoning + answer decode
-    // steps (the injected close is emitted as bytes but is not a decode step),
-    // so it equals reasoning_budget + answer_budget. Critically, the answer
-    // was NOT starved: `answer_budget` answer tokens were produced AFTER the
-    // forced close even though reasoning already consumed its full budget.
-    assert_eq!(
-        d.completion_tokens,
-        reasoning_budget + answer_budget,
-        "answer budget must be applied SEPARATELY (reasoning {reasoning_budget} + answer {answer_budget})"
-    );
+    assert_eq!(d.completion_tokens, 11, "reasoning + answer = max_tokens");
     assert_eq!(d.finish, FinishReason::Length);
 }
 
-/// The answer budget is independent of the reasoning budget: doubling the
-/// reasoning budget leaves the same number of ANSWER tokens (answer is never
-/// starved). We compare completion_tokens deltas.
+/// The reasoning budget moves tokens between reasoning and answer, never past
+/// `max_tokens`: a longer trace leaves a shorter answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn answer_budget_is_independent_of_reasoning_budget() {
+async fn max_tokens_includes_reasoning() {
     let handle = boot_engine();
-    let answer = 5usize;
-    let small = drain(&handle, job(answer, true, 4)).await;
-    let large = drain(&handle, job(answer, true, 10)).await;
-    // completion = reasoning_budget + answer in each case.
-    assert_eq!(small.completion_tokens, 4 + answer);
-    assert_eq!(large.completion_tokens, 10 + answer);
-    // The ANSWER allotment (completion - reasoning_budget) is the SAME — the
-    // longer reasoning trace did not eat into the answer.
-    assert_eq!(small.completion_tokens - 4, large.completion_tokens - 10);
-    assert_eq!(small.completion_tokens - 4, answer);
+    let small = drain(&handle, job(15, true, 4)).await;
+    let large = drain(&handle, job(15, true, 10)).await;
+    assert_eq!(small.completion_tokens, 15);
+    assert_eq!(large.completion_tokens, 15);
+    // Answer tokens: the Token events after the injected close.
+    let answer = |d: &Drained| {
+        let close = d.fragments.iter().position(|f| f.contains("</think>"));
+        d.fragments.len() - 1 - close.expect("forced close")
+    };
+    assert_eq!(answer(&small), 15 - 4);
+    assert_eq!(answer(&large), 15 - 10);
 }
 
-/// A generous reasoning_budget that the (bounded) generation never reaches
-/// means no forced-close fires; with thinking on but the model never emitting
-/// `</think>`, the answer budget is never reached either (all tokens stay in
-/// the reasoning phase), so generation is bounded by the context window /
-/// reasoning budget — NOT a starved answer. This pins that an un-hit reasoning
-/// budget does not inject a marker.
+/// A limit reached while reasoning ends the reply there: no forced close, no
+/// answer, finish Length (Anthropic `max_tokens`, OpenAI `length`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_budget_not_reached_no_injection() {
+async fn limit_reached_while_reasoning_ends_the_reply() {
     let handle = boot_engine();
-    // reasoning_budget larger than what the answer budget would allow to be
-    // generated, but we stop via the context guard well before. Use a small
-    // answer budget; since the model never emits </think>, it stays in
-    // reasoning forever until the reasoning budget forces a close. To get the
-    // "not reached" case we set reasoning_budget huge and rely on the context
-    // guard (MAX_SEQ_LEN) to terminate.
     let d = drain(&handle, job(4, true, 100_000)).await;
-    // Never closed (budget never hit, context guard stopped it): no </think>.
     assert!(
         !d.full_text().contains("</think>"),
-        "an un-reached reasoning budget must not inject </think>"
+        "no forced close before the budget"
     );
-    // Terminated by the context window (Length), having stayed in reasoning.
+    assert_eq!(d.completion_tokens, 4);
     assert_eq!(d.finish, FinishReason::Length);
+}
+
+/// Sweeping the reasoning budget across the context edge: a close that fits
+/// with room to spare is injected and the answer carries on past the budget,
+/// and a close that no longer fits ends the reply with Length at the budget,
+/// like any reply that reaches the window. A close that fills the window
+/// exactly also ends at the budget, so it is not told apart here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_close_at_the_context_edge_ends_with_length() {
+    let handle = boot_engine();
+    let prompt = job(0, false, 0).prompt_tokens.len();
+    let close = "</think>\n\n".len();
+    for budget in MAX_SEQ_LEN - 20..MAX_SEQ_LEN {
+        let d = drain(&handle, job(usize::MAX, true, budget)).await;
+        assert_eq!(d.finish, FinishReason::Length, "budget {budget}");
+        let room = MAX_SEQ_LEN as isize - (prompt + budget + close) as isize;
+        if room > 0 {
+            assert!(
+                d.completion_tokens > budget,
+                "budget {budget}: the answer follows the close"
+            );
+        } else if room < 0 {
+            assert_eq!(d.completion_tokens, budget, "budget {budget}");
+        }
+    }
+}
+
+/// A response prefix (a forced tool call's opener, already at the end of the
+/// prompt) is the reply's first text, sent before any decoded token and not
+/// counted as generated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_prefix_opens_the_reply_uncounted() {
+    let handle = boot_engine();
+    let plain = drain(&handle, job(5, false, 0)).await;
+    let mut request = job(5, false, 0);
+    request.response_prefix = "<tool_call>\n<function=f>\n".into();
+    let prefixed = drain(&handle, request).await;
+    assert_eq!(prefixed.fragments[0], "<tool_call>\n<function=f>\n");
+    assert_eq!(prefixed.fragments[1..], plain.fragments[..]);
+    assert_eq!(prefixed.completion_tokens, plain.completion_tokens);
 }

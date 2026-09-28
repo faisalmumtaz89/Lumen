@@ -37,12 +37,30 @@ The bin is gated behind the `bin` Cargo feature so library embedders that wire t
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
+POST /v1/messages/count_tokens # Anthropic-compatible token count
 GET  /v1/models             # Model list
 POST /v1/images/generations # Text to image (`--features image` builds with
                             # LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT set)
 ```
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
+
+`/v1/messages/count_tokens` takes a `/v1/messages` request body (without `max_tokens`) and returns `{"input_tokens": N}`, the prompt tokens `/v1/messages` would run for it and report as `usage.input_tokens`. It refuses the same invalid or unsupported request content as `/v1/messages`, and still counts a prompt longer than the context window, which `/v1/messages` refuses.
+
+Every endpoint ignores a top-level request field it does not use, such as `metadata`, `user`, `store` or `service_tier`, so clients that attach them are served. A top-level field that asks for output the server cannot produce is refused with a 400 naming it, rather than silently dropped:
+
+| Endpoint | Refused unless left at its default |
+|---|---|
+| `/v1/chat/completions` and `/v1/completions` | `n` or `best_of` above 1, `echo`, `logit_bias` with a non-zero bias, `response_format` other than text, and the extensions other OpenAI-compatible servers honour: structured output (`guided_json`, `guided_choice`, `guided_regex`, `guided_grammar`, `structured_outputs`, `structural_tag`, `json_schema`, `regex`, `ebnf`, `grammar`), `prompt_logprobs`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `no_stop_trim`, `repetition_penalty`, `bad_words`, `allowed_token_ids`, `logits_processors`, `custom_logit_processor`, `use_beam_search`, `length_penalty`, `truncate_prompt_tokens`, `skip_special_tokens: false`, `spaces_between_special_tokens: false`, `return_tokens_as_token_ids`, `lora_path` and `reasoning` (use `reasoning_effort`) |
+| `/v1/chat/completions` | `logprobs`, `top_logprobs`, the legacy `functions` / `function_call`, `verbosity` other than `medium`, `modalities` other than text, `audio`, `web_search_options`, `moderation`, and the extensions `add_generation_prompt: false`, `continue_final_message`, `add_special_tokens`, `chat_template`, `documents`, `mm_processor_kwargs`, `separate_reasoning: false`, `stream_reasoning: false` and `return_hidden_states` |
+| `/v1/completions` | `suffix`, `logprobs` |
+| `/v1/messages` | `output_config.format` or `output_format` (structured output), `mcp_servers`, `container`, and tools whose `type` is not `custom` (Anthropic-defined tools such as web search or bash) |
+
+`tool_choice` works the same on both chat APIs. `auto` (the default) lets the model decide; `none` (Anthropic `{"type": "none"}`) leaves the tools out of the prompt and returns any tool-call markup the model still writes as text; `required` (Anthropic `{"type": "any"}`) and a named function (Anthropic `{"type": "tool", "name": ...}`) force a call by ending the prompt with the model's tool-call opener (with the function's name for a named choice), which the reply then starts with, and a named choice returns only calls to that function. OpenAI `parallel_tool_calls: false` and Anthropic `tool_choice.disable_parallel_tool_use: true` limit a reply to one tool call: calls after the first are dropped. A forced call is refused with a 400 when it names a tool not in `tools` or a name that is not 1 to 64 letters, digits, `_` or `-`, when there are no tools, while thinking is on, or for a model without an embedded chat template.
+
+`/v1/chat/completions` takes `max_completion_tokens` as the newer name for `max_tokens`; it wins when both are given. `stream_options.include_usage` adds the final usage chunk on both OpenAI endpoints.
+
+A system message after the start of the conversation (`role: "system"` inside `/v1/messages` `messages`, or any but the first message of `/v1/chat/completions`) stays where it was sent, so its instructions apply from that point on and the prompt before it is unchanged. It renders the way the model's chat template renders it; a template that only accepts a system message at the start (Qwen3.5, Qwen3.8) gets it as a system turn in that template's own framing. Lumen first renders a probe conversation with the template and refuses the request with a 400 when the probe shows the template moving such a message to the start, dropping it or rendering it as another role, or cannot isolate the template's system turn.
 
 `/v1/completions` takes `prompt` as a string, an array of strings (concatenated), or an array of token ids. Token ids reach the model unchanged, with no tokenization and no special tokens added, so a client can send the exact ids it measured elsewhere. An id at or above the model's vocabulary size, an array mixing strings with ids or holding anything else, or a prompt that resolves to no tokens, is refused with a 400.
 
@@ -76,21 +94,21 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 
 The Qwen3.5 family supports an optional `<think>...</think>` reasoning trace. Lumen exposes a per-request reasoning toggle across all surfaces. **Thinking is OFF by default** (the assistant prompt opens a closed empty-think block, `<think>\n\n</think>\n\n`, so the model answers directly). When enabled, the open `<think>\n` tail is emitted, the model produces a reasoning trace, and Lumen routes that trace to a separate field — it is never mixed into the answer text.
 
-The reasoning budget is **separate from `max_tokens`** (industry-convergent with Anthropic `thinking.budget_tokens` / Gemini `thinking_budget`), so a long reasoning trace never starves the answer. Default reasoning budget is `2048` tokens (`runtime_defaults::chat_reasoning_budget_default`).
+`max_tokens` (and `max_completion_tokens` on `/v1/chat/completions`) limits every generated token, reasoning included, as both APIs define it; a reply that reaches it while still reasoning ends there with `length` / `max_tokens`. Within that limit the reasoning budget caps the trace: when it runs out the server closes the reasoning block and the answer uses what remains. Default reasoning budget is `2048` tokens (`runtime_defaults::chat_reasoning_budget_default`). Without `max_tokens`, `/v1/chat/completions` is bounded only by the context window and `/v1/completions` stops at 256 tokens.
 
 **Precedence** (resolved by `runtime_defaults::resolve_enable_thinking`): explicit per-request field → `LUMEN_CHAT_ENABLE_THINKING` env override → process default (OFF).
 
-| Surface | Enable thinking | Separate budget | Reasoning output |
+| Surface | Enable thinking | Reasoning budget | Reasoning output |
 |---|---|---|---|
-| OpenAI `/v1/chat/completions` | top-level `enable_thinking: true`, or vLLM/SGLang-compatible `chat_template_kwargs: {"enable_thinking": true}` (top-level wins) | `reasoning_budget` | streamed as `delta.reasoning_content`; non-stream as `message.reasoning_content` (omitted when empty) |
-| Anthropic `/v1/messages` | `thinking: {"type": "enabled"}` (`"disabled"` / absent = off) | `thinking.budget_tokens` → `reasoning_budget` | a `{"type": "thinking", "thinking": ...}` content block; streamed via `thinking_delta` |
+| OpenAI `/v1/chat/completions` | top-level `enable_thinking: true`, or vLLM/SGLang-compatible `chat_template_kwargs: {"enable_thinking": true}` (top-level wins), or `reasoning_effort` other than `none` | `reasoning_budget` | streamed as `delta.reasoning_content`; non-stream as `message.reasoning_content` (omitted when empty) |
+| Anthropic `/v1/messages` | `thinking: {"type": "enabled"}` or `{"type": "adaptive"}` (`"disabled"` = off, absent = the default; any other type is refused with a 400) | `thinking.budget_tokens` → `reasoning_budget` | a `{"type": "thinking", "thinking": ...}` content block; streamed via `thinking_delta` |
 | CLI `lumen run` | `--think` (and `--no-think` forces off, overriding the env var) | — | reasoning printed to stderr, answer to stdout |
 
 ```bash
-# OpenAI: enable reasoning, cap the trace at 1024 tokens, answer budget separate
+# OpenAI: enable reasoning, cap the trace at 1024 of the 2048 tokens
 curl -fsS http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Plan a 3-day trip"}],"enable_thinking":true,"reasoning_budget":1024,"max_tokens":512}'
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Plan a 3-day trip"}],"enable_thinking":true,"reasoning_budget":1024,"max_tokens":2048}'
 
 # vLLM-compatible form (chat_template_kwargs)
 #   "chat_template_kwargs": {"enable_thinking": true}
@@ -98,8 +116,12 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 # Anthropic: enable extended thinking with a 1024-token budget
 curl -fsS http://localhost:8000/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5-9b","max_tokens":512,"messages":[{"role":"user","content":"Plan a 3-day trip"}],"thinking":{"type":"enabled","budget_tokens":1024}}'
+  -d '{"model":"qwen3.5-9b","max_tokens":2048,"messages":[{"role":"user","content":"Plan a 3-day trip"}],"thinking":{"type":"enabled","budget_tokens":1024}}'
 ```
+
+A reasoning effort sets how much the model reasons while thinking is on: `output_config.effort` on `/v1/messages` and `reasoning_effort` on `/v1/chat/completions`. The levels both APIs share map the same way: `low` and `medium` reach the chat template as its `reasoning_effort` (Qwen3.8 instructs brief reasoning at `low`), while `high`, `xhigh`, `max` and an absent effort keep the template's default (`xhigh` on Qwen3.8). OpenAI's `minimal` runs as `low`. On `/v1/chat/completions` an effort also asks for reasoning, and `none` turns it off, unless `enable_thinking` or `chat_template_kwargs.enable_thinking` is given. Any other value is refused with a 400.
+
+An earlier assistant turn's reasoning, sent back as `reasoning_content` on `/v1/chat/completions` or as a `thinking` block on `/v1/messages`, reaches the chat template, which renders it back into that turn (Qwen3.8 does for every earlier turn, Qwen3.5 for those after the last user message; both trim surrounding whitespace).
 
 `LUMEN_CHAT_ENABLE_THINKING=1` (accepts `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` for off) flips the default for requests that do not specify the toggle.
 

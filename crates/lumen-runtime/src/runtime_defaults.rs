@@ -498,13 +498,12 @@ pub fn resolve_enable_thinking(per_request: Option<bool>) -> bool {
 /// Process-wide default reasoning ("thinking") token budget used when a
 /// request enables thinking but supplies no explicit `reasoning_budget`.
 ///
-/// This is a SEPARATE budget from the answer `max_tokens` (industry-convergent
-/// with Anthropic `thinking.budget_tokens` / Gemini `thinking_budget`) so the
-/// answer is never starved by a long reasoning trace. **Part 4** (the decode
-/// loop) enforces it via a forced-close; Parts 1-3 only carry it on the
-/// request DTO / `JobRequest`. `2048` is a middle-of-the-road default that
-/// fits a multi-step reasoning trace without unbounded runaway. The
-/// budget is irrelevant (and unused) when thinking is disabled.
+/// It caps the reasoning trace within the request's `max_tokens`, which counts
+/// reasoning and answer together (like Anthropic `thinking.budget_tokens`); the
+/// decode loop closes the trace when the budget runs out. `2048` is a
+/// middle-of-the-road default that fits a multi-step reasoning trace without
+/// unbounded runaway. The budget is irrelevant (and unused) when thinking is
+/// disabled.
 pub fn chat_reasoning_budget_default() -> usize {
     2048
 }

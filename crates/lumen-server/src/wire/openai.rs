@@ -4,15 +4,10 @@
 //! - <https://platform.openai.com/docs/api-reference/chat>
 //! - <https://platform.openai.com/docs/api-reference/completions>
 //!
-//! the top-level request bodies (`ChatCompletionRequest`,
-//! `CompletionRequest`) carry `#[serde(deny_unknown_fields)]` to match
-//! the OpenAI schema's `additionalProperties: false` contract. Unknown
-//! top-level fields trigger HTTP 400 + OpenAI envelope with
-//! `code="unknown_field"` via the [`crate::router::OpenAiJson`] extractor.
-//! Inner DTOs (messages, tool defs, tool calls) keep the original
-//! permissive behavior so forward-compatible client extras still pass.
-
-use std::sync::Arc;
+//! A field a request body does not declare is ignored, as on `/v1/messages`,
+//! unless it asks for output this server cannot produce: those are listed in
+//! `OPENAI_UNSUPPORTED`, `CHAT_UNSUPPORTED` and `COMPLETION_UNSUPPORTED`
+//! and refused with a 400 (see `super::refuse_unsupported`).
 
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
@@ -22,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::engine::{EngineHandle, FinishReason, JobRequest, JobResponseChannel, TokenEvent};
 use crate::error::ServerError;
-use crate::sse::SseSafeEmitter;
+use crate::sse::{ReplyTools, SseSafeEmitter};
 use crate::tokenstop::StopMatcher;
 
 // ----------------------------- Request DTOs -----------------------------
@@ -36,6 +31,10 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<AssistantToolCall>,
+    /// An earlier assistant turn's reasoning, as this server returns it; the
+    /// chat template renders it back into the turn.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,9 +68,8 @@ pub struct ToolDefFunction {
 }
 
 /// vLLM-/SGLang-compatible `chat_template_kwargs`. The only field Lumen reads
-/// is `enable_thinking`; any other keys pass through and are ignored (the
-/// struct is permissive — NOT `deny_unknown_fields` — so forward-compatible
-/// extras don't 400). This mirrors the vLLM OpenAI server, which accepts
+/// is `enable_thinking`; any other keys are ignored. This mirrors the vLLM
+/// OpenAI server, which accepts
 /// `{"chat_template_kwargs": {"enable_thinking": false}}` to toggle the
 /// Qwen3.5 reasoning block.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,18 +79,19 @@ pub struct ChatTemplateKwargs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// The newer name for `max_tokens`; wins when both are given.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
-    /// Nucleus-sampling cutoff (OpenAI `top_p`). Honored on the CLI today but
-    /// previously HTTP-400-rejected here by `deny_unknown_fields`. `None`
+    /// Nucleus-sampling cutoff (OpenAI `top_p`), honored as on the CLI. `None`
     /// (omitted) leaves the sampler default untouched.
     #[serde(default)]
     pub top_p: Option<f32>,
@@ -138,21 +137,315 @@ pub struct ChatCompletionRequest {
     /// [`lumen_runtime::runtime_defaults::resolve_enable_thinking`].
     #[serde(default)]
     pub enable_thinking: Option<bool>,
-    /// Separate reasoning-token budget (industry-convergent with Anthropic
-    /// `thinking.budget_tokens` / Gemini `thinking_budget`). Carried on the
-    /// request DTO now; the decode-loop enforcement is Part 4 (separate work).
+    /// Reasoning-token cap within `max_tokens` (like Anthropic
+    /// `thinking.budget_tokens`); the shared default when absent.
     #[serde(default)]
     pub reasoning_budget: Option<usize>,
     /// vLLM-compatible `{"chat_template_kwargs": {"enable_thinking": ...}}`.
     /// The top-level `enable_thinking` field wins when both are present.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenAI reasoning effort: `none`, `minimal`, `low`, `medium`, `high`,
+    /// `xhigh` or `max`. See `Self::reasoning_effort` and
+    /// [`Self::resolve_thinking`].
+    #[serde(default)]
+    pub reasoning_effort: Option<Value>,
+    /// `none`, `auto`, `required` or `{"type": "function", "function":
+    /// {"name": ...}}`; see `Self::tool_choice`.
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    /// `false`: at most one tool call per reply. A boolean; see
+    /// [`Self::into_job`].
+    #[serde(default)]
+    pub parallel_tool_calls: Option<Value>,
+    /// Every field the request does not declare; see `CHAT_UNSUPPORTED`.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
-/// OpenAI `stream_options` object (streaming requests only). Strict like the
-/// parent request struct: unknown fields 400.
+/// Fields both OpenAI endpoints refuse unless left at their default: the ones
+/// the two share, then the extensions other OpenAI-compatible servers honour,
+/// since a client sending them expects them to apply.
+const OPENAI_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "n",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "more than one choice",
+    },
+    super::Unsupported {
+        field: "best_of",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "choosing among several completions",
+    },
+    super::Unsupported {
+        field: "use_beam_search",
+        accepts: |v| *v == false,
+        refused: "beam search",
+    },
+    super::Unsupported {
+        field: "length_penalty",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "a length penalty",
+    },
+    super::Unsupported {
+        field: "echo",
+        accepts: |v| *v == false,
+        refused: "echoing the prompt",
+    },
+    super::Unsupported {
+        field: "logit_bias",
+        accepts: super::is_zero_bias,
+        refused: "biasing token probabilities",
+    },
+    super::Unsupported {
+        field: "prompt_logprobs",
+        accepts: |_| false,
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "return_tokens_as_token_ids",
+        accepts: |v| *v == false,
+        refused: "returning token ids",
+    },
+    super::Unsupported {
+        field: "response_format",
+        accepts: |v| v["type"] == "text",
+        refused: "structured output",
+    },
+    super::Unsupported {
+        field: "structural_tag",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_json",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_choice",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_regex",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_grammar",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "structured_outputs",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "json_schema",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "regex",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "ebnf",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "grammar",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "min_tokens",
+        accepts: |v| super::is_number(v, 0.0),
+        refused: "a minimum length",
+    },
+    super::Unsupported {
+        field: "stop_token_ids",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "stop token ids",
+    },
+    super::Unsupported {
+        field: "include_stop_str_in_output",
+        accepts: |v| *v == false,
+        refused: "keeping the stop string",
+    },
+    super::Unsupported {
+        field: "no_stop_trim",
+        accepts: |v| *v == false,
+        refused: "keeping the stop string",
+    },
+    super::Unsupported {
+        field: "repetition_penalty",
+        accepts: |_| false,
+        refused: "a per-request repetition penalty",
+    },
+    super::Unsupported {
+        field: "bad_words",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "banned words",
+    },
+    super::Unsupported {
+        field: "allowed_token_ids",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "restricting the vocabulary",
+    },
+    super::Unsupported {
+        field: "logits_processors",
+        accepts: |_| false,
+        refused: "logits processors",
+    },
+    super::Unsupported {
+        field: "custom_logit_processor",
+        accepts: |_| false,
+        refused: "logits processors",
+    },
+    super::Unsupported {
+        field: "truncate_prompt_tokens",
+        accepts: |_| false,
+        refused: "truncating the prompt",
+    },
+    super::Unsupported {
+        field: "skip_special_tokens",
+        accepts: |v| *v == true,
+        refused: "keeping special tokens in the text",
+    },
+    super::Unsupported {
+        field: "spaces_between_special_tokens",
+        accepts: |v| *v == true,
+        refused: "changing special-token spacing",
+    },
+    super::Unsupported {
+        field: "lora_path",
+        accepts: |_| false,
+        refused: "LoRA adapters",
+    },
+    super::Unsupported {
+        field: "reasoning",
+        accepts: |_| false,
+        refused: "a `reasoning` object (use `reasoning_effort`)",
+    },
+];
+
+/// Chat fields that must stay at their default, besides [`OPENAI_UNSUPPORTED`].
+const CHAT_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "logprobs",
+        accepts: |v| *v == false,
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "top_logprobs",
+        accepts: |v| super::is_number(v, 0.0),
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "verbosity",
+        accepts: |v| v == "medium",
+        refused: "a verbosity other than `medium`",
+    },
+    super::Unsupported {
+        field: "moderation",
+        accepts: |_| false,
+        refused: "moderation",
+    },
+    super::Unsupported {
+        field: "functions",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "legacy function calling (use `tools`)",
+    },
+    super::Unsupported {
+        field: "function_call",
+        accepts: |v| v == "none" || v == "auto",
+        refused: "legacy function calling (use `tools`)",
+    },
+    super::Unsupported {
+        field: "modalities",
+        accepts: |v| v.as_array().is_some_and(|a| a.iter().all(|m| m == "text")),
+        refused: "output other than text",
+    },
+    super::Unsupported {
+        field: "audio",
+        accepts: |_| false,
+        refused: "audio output",
+    },
+    super::Unsupported {
+        field: "web_search_options",
+        accepts: |_| false,
+        refused: "web search",
+    },
+    super::Unsupported {
+        field: "add_generation_prompt",
+        accepts: |v| *v == true,
+        refused: "rendering without the assistant prompt",
+    },
+    super::Unsupported {
+        field: "continue_final_message",
+        accepts: |v| *v == false,
+        refused: "continuing the last message",
+    },
+    super::Unsupported {
+        field: "add_special_tokens",
+        accepts: |v| *v == false,
+        refused: "adding special tokens to the prompt",
+    },
+    super::Unsupported {
+        field: "chat_template",
+        accepts: |_| false,
+        refused: "a request chat template",
+    },
+    super::Unsupported {
+        field: "documents",
+        accepts: |_| false,
+        refused: "documents",
+    },
+    super::Unsupported {
+        field: "mm_processor_kwargs",
+        accepts: |_| false,
+        refused: "multimodal input",
+    },
+    super::Unsupported {
+        field: "separate_reasoning",
+        accepts: |v| *v == true,
+        refused: "reasoning mixed into the answer",
+    },
+    super::Unsupported {
+        field: "stream_reasoning",
+        accepts: |v| *v == true,
+        refused: "withholding streamed reasoning",
+    },
+    super::Unsupported {
+        field: "return_hidden_states",
+        accepts: |v| *v == false,
+        refused: "returning hidden states",
+    },
+];
+
+/// Completion fields that must stay at their default, besides
+/// [`OPENAI_UNSUPPORTED`].
+const COMPLETION_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "suffix",
+        accepts: |v| v == "",
+        refused: "a suffix after the completion",
+    },
+    super::Unsupported {
+        field: "logprobs",
+        accepts: |_| false,
+        refused: "returning log probabilities",
+    },
+];
+
+/// OpenAI `stream_options` object (streaming requests only). Other keys are
+/// ignored like unknown request fields.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StreamOptions {
     /// When true, emit the final usage chunk (empty `choices` + `usage`)
     /// before `data: [DONE]`.
@@ -173,22 +466,125 @@ impl ChatCompletionRequest {
 
     /// Resolve the per-request reasoning toggle using the single shared
     /// resolver. Precedence: top-level `enable_thinking` → vLLM
-    /// `chat_template_kwargs.enable_thinking` → env override → default. The
-    /// per-request `Option` is collapsed here, then handed to the one resolver
-    /// so the env/default fall-through is identical to every other surface.
+    /// `chat_template_kwargs.enable_thinking` → `reasoning_effort` (`none`
+    /// means no reasoning, any other level asks for it) → env override →
+    /// default. The per-request `Option` is collapsed here, then handed to the
+    /// one resolver so the env/default fall-through is identical to every
+    /// other surface.
     pub fn resolve_thinking(&self) -> bool {
-        let per_request = self.enable_thinking.or_else(|| {
-            self.chat_template_kwargs
-                .as_ref()
-                .and_then(|k| k.enable_thinking)
-        });
+        let per_request = self
+            .enable_thinking
+            .or_else(|| {
+                self.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|k| k.enable_thinking)
+            })
+            .or_else(|| {
+                self.reasoning_effort
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|e| e != "none")
+            });
         super::resolve_enable_thinking(per_request)
+    }
+
+    fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
+        use super::ToolChoice;
+        let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
+        match choice.as_str() {
+            _ if choice.is_null() => Ok(ToolChoice::Auto),
+            Some("auto") => Ok(ToolChoice::Auto),
+            Some("none") => Ok(ToolChoice::None),
+            Some("required") => Ok(ToolChoice::Required),
+            _ => match (&choice["type"], choice["function"]["name"].as_str()) {
+                (t, Some(name)) if t == "function" => Ok(ToolChoice::Named(name.into())),
+                _ => Err(ServerError::bad_request_field(
+                    "tool_choice must be `none`, `auto`, `required` or {\"type\": \"function\", \"function\": {\"name\": ...}}",
+                    "tool_choice",
+                    "invalid_value",
+                )),
+            },
+        }
+    }
+
+    /// The tool calls the reply may carry, for the collectors. Taken before
+    /// `into_job` consumes the request; a malformed `tool_choice` reads as
+    /// `auto` here because `into_job` refuses it.
+    pub fn reply_tools(&self) -> ReplyTools {
+        self.tool_choice()
+            .unwrap_or(super::ToolChoice::Auto)
+            .reply_tools(
+                tool_schemas(&self.tools),
+                self.parallel_tool_calls == Some(Value::Bool(false)),
+            )
+    }
+
+    /// The prompt for this request and the text the reply starts with, which
+    /// also ends the prompt (see [`super::ToolChoice::response_prefix`]).
+    fn prompt(&self, chat_template: Option<&str>) -> Result<(String, String), ServerError> {
+        let reasoning_effort = self.reasoning_effort()?;
+        let enable_thinking = self.resolve_thinking();
+        let tool_choice = self.tool_choice()?;
+        tool_choice.check(
+            self.tools.iter().map(|t| t.function.name.as_str()),
+            enable_thinking,
+            chat_template.is_some(),
+        )?;
+        let tools: &[ToolDef] = if tool_choice.offers_tools() {
+            &self.tools
+        } else {
+            &[]
+        };
+        let mut prompt = render_chat_prompt(
+            &self.messages,
+            tools,
+            enable_thinking,
+            chat_template,
+            reasoning_effort,
+        )?;
+        let response_prefix = tool_choice.response_prefix();
+        prompt.push_str(&response_prefix);
+        Ok((prompt, response_prefix))
+    }
+
+    /// `reasoning_effort` as the chat template's `reasoning_effort`: the
+    /// levels shared with `/v1/messages` map through
+    /// [`super::template_reasoning_effort`], `minimal` runs as `low` (the
+    /// closest level a template offers) and `none` needs none (thinking is off,
+    /// see [`Self::resolve_thinking`]). Any other value is refused.
+    fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
+        const PARAM: &str = "reasoning_effort";
+        const LEVELS: &str = "`none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`";
+        match super::effort_level(self.reasoning_effort.as_ref(), PARAM, LEVELS)? {
+            None | Some("none") => Ok(None),
+            Some("minimal") => Ok(Some("low")),
+            Some(level) => super::template_reasoning_effort(level).ok_or_else(|| {
+                ServerError::bad_request_field(
+                    format!("{PARAM} must be one of {LEVELS}"),
+                    PARAM,
+                    "invalid_value",
+                )
+            }),
+        }
     }
 
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
         // ROBUST-007 (2026-06-11 checklist): out-of-range sampler params and
         // empty `messages` must 400 like other malformed fields, not be
         // silently accepted/clamped.
+        super::refuse_unsupported(&self.other, CHAT_UNSUPPORTED)?;
+        super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
+        if self
+            .parallel_tool_calls
+            .as_ref()
+            .is_some_and(|p| !p.is_null() && !p.is_boolean())
+        {
+            return Err(ServerError::bad_request_field(
+                "parallel_tool_calls must be a boolean",
+                "parallel_tool_calls",
+                "invalid_type",
+            ));
+        }
         validate_sampler_ranges(self.temperature, self.top_p)?;
         if self.messages.is_empty() {
             return Err(ServerError::bad_request_field(
@@ -197,19 +593,18 @@ impl ChatCompletionRequest {
                 "invalid_value",
             ));
         }
+        let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
         let enable_thinking = self.resolve_thinking();
-        let prompt = render_chat_prompt(
-            &self.messages,
-            &self.tools,
-            enable_thinking,
-            engine.chat_template(),
-        )?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
         let eos = engine.eos_tokens_for_request();
-        let max_tokens = self.max_tokens.unwrap_or(256);
+        // Reasoning included; absent, only the context window bounds it.
+        let max_tokens = self
+            .max_completion_tokens
+            .or(self.max_tokens)
+            .unwrap_or(usize::MAX);
         // server-internal sampler defaults aligned with CLI's
         // production defaults (`--repeat-penalty 1.05`). The
         // OpenAI API surface is preserved: the `repetition_penalty` field
@@ -257,12 +652,12 @@ impl ChatCompletionRequest {
             reasoning_budget: self
                 .reasoning_budget
                 .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default),
+            response_prefix,
         })
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: Value,
@@ -273,9 +668,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub seed: Option<u64>,
     /// Mirror of the OpenAI-valid sampler set carried on chat completions
-    /// (see `ChatCompletionRequest`): honored on the CLI, previously
-    /// 400-rejected here by `deny_unknown_fields`. Same zero-normalization /
-    /// override semantics as the chat path.
+    /// (see `ChatCompletionRequest`), honored as on the CLI. Same
+    /// zero-normalization / override semantics as the chat path.
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -294,10 +688,26 @@ pub struct CompletionRequest {
     /// render nothing) until `max_tokens` or another stop. Off by default.
     #[serde(default)]
     pub ignore_eos: bool,
+    /// Streaming only: `include_usage` adds the final usage chunk, as on chat.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// Every field the request does not declare; see `COMPLETION_UNSUPPORTED`.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl CompletionRequest {
+    /// True when the streaming client asked for the final usage chunk.
+    pub fn include_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        super::refuse_unsupported(&self.other, COMPLETION_UNSUPPORTED)?;
+        super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
         // ROBUST-007: same sampler-range guard as the chat endpoint.
         validate_sampler_ranges(self.temperature, self.top_p)?;
         let prompt_tokens = completion_prompt_tokens(self.prompt, engine)?;
@@ -351,6 +761,7 @@ impl CompletionRequest {
             // so reasoning is never enabled on this path.
             enable_thinking: false,
             reasoning_budget: 0,
+            response_prefix: String::new(),
         })
     }
 }
@@ -444,10 +855,8 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
 
 /// Build the runtime [`ToolSchemas`] (function -> parameter -> JSON-Schema type)
 /// the native tool-call parser needs, from the OpenAI tool definitions on a
-/// request. The router hands this to the streaming / non-streaming collectors so
-/// native `<parameter>` values are typed by the advertised schema. Mirrors the
-/// `ToolSchema` conversion the manual render uses.
-pub fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
+/// request. Mirrors the `ToolSchema` conversion the manual render uses.
+fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
     let schemas: Vec<ToolSchema> = tools
         .iter()
         .map(|t| ToolSchema {
@@ -488,6 +897,7 @@ fn render_chat_prompt(
     tools: &[ToolDef],
     enable_thinking: bool,
     chat_template: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> Result<String, ServerError> {
     // Prefer the model's EMBEDDED chat template (Qwen3.5's native tool-calling
     // protocol) rendered via the shared Jinja engine — the SAME renderer the CLI
@@ -495,7 +905,13 @@ fn render_chat_prompt(
     // transcript below when no template is embedded (older LBCs / synthetic test
     // tokenizers), keeping those paths byte-identical to today.
     if let Some(template) = chat_template {
-        return render_chat_prompt_templated(messages, tools, enable_thinking, template);
+        return render_chat_prompt_templated(
+            messages,
+            tools,
+            enable_thinking,
+            reasoning_effort,
+            template,
+        );
     }
     render_chat_prompt_manual(messages, tools, enable_thinking)
 }
@@ -514,6 +930,7 @@ fn render_chat_prompt_templated(
     messages: &[ChatMessage],
     tools: &[ToolDef],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     template: &str,
 ) -> Result<String, ServerError> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len());
@@ -522,6 +939,15 @@ fn render_chat_prompt_templated(
         let mut obj = serde_json::Map::new();
         obj.insert("role".into(), Value::String(m.role.clone()));
         obj.insert("content".into(), Value::String(content));
+        // Passed even when empty: a template that finds none looks for
+        // reasoning inside the content instead (Qwen3.5 splits it at `</think>`).
+        if let Some(reasoning) = m
+            .reasoning_content
+            .as_ref()
+            .filter(|_| m.role == "assistant")
+        {
+            obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
+        }
         if !m.tool_calls.is_empty() {
             let calls: Vec<Value> = m
                 .tool_calls
@@ -563,6 +989,7 @@ fn render_chat_prompt_templated(
         &Value::Array(tools_json),
         true,
         enable_thinking,
+        reasoning_effort,
     )
     .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
@@ -576,13 +1003,21 @@ fn render_chat_prompt_manual(
 ) -> Result<String, ServerError> {
     let mut system: Option<String> = None;
     let mut transcript = String::new();
-    for m in messages.iter() {
+    for (i, m) in messages.iter().enumerate() {
         // `flatten_content` enforces the ROBUST-007 numeric-type-guard (a bare
         // number/bool `content` 400s instead of being coerced) AND flattens
         // content-parts via the single shared key set — the SAME helper the
         // Anthropic surface uses, so the two cannot diverge.
         match m.role.as_str() {
-            "system" => system = Some(super::flatten_content(&m.content, "messages.content")?),
+            "system" if i == 0 => {
+                system = Some(super::flatten_content(&m.content, "messages.content")?)
+            }
+            // A later system message stays where it was sent.
+            "system" => {
+                transcript.push_str("<|im_start|>system\n");
+                transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
+                transcript.push_str("<|im_end|>\n");
+            }
             "user" => {
                 transcript.push_str("<|im_start|>user\n");
                 transcript.push_str(&super::flatten_content(&m.content, "messages.content")?);
@@ -685,7 +1120,7 @@ pub fn stream_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
     include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -697,7 +1132,7 @@ pub fn stream_chat(
         true,
         thinking,
         stop,
-        tool_schemas,
+        tools,
         include_usage,
     ));
     body_from_byte_stream(body_rx)
@@ -708,6 +1143,7 @@ pub fn stream_completion(
     model: String,
     created: u64,
     stop: Vec<String>,
+    include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Legacy completions have no chat template / `<think>` block: thinking is
@@ -721,9 +1157,8 @@ pub fn stream_completion(
         false,
         false,
         stop,
-        Arc::new(ToolSchemas::default()),
-        // The legacy surface has no `stream_options`; never emit a usage chunk.
-        false,
+        ReplyTools::default(),
+        include_usage,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -736,14 +1171,14 @@ async fn drive_chat_stream(
     chat: bool,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
     include_usage: bool,
 ) {
     let id = format!(
         "chatcmpl-lumen-{created:x}-{:x}",
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed the streaming stop matcher from the request stop list. The
     // worker already truncates generation at the stop string (and reports
     // `FinishReason::StopSequence`, which it forwards via `TokenEvent::Done`);
@@ -1018,15 +1453,15 @@ async fn drive_chat_stream(
         })
     };
     let _ = tx.send(sse_frame(&tail.to_string())).await;
-    // OpenAI `stream_options.include_usage` contract (chat only): when the
-    // client requested it, ONE extra chunk with empty `choices` and the usage
-    // totals goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When
-    // not requested, nothing is emitted here — the stream stays byte-identical
-    // to the historical shape.
-    if chat && include_usage {
+    // OpenAI `stream_options.include_usage` contract: when the client
+    // requested it, ONE extra chunk with empty `choices` and the usage totals
+    // goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When not
+    // requested, nothing is emitted here — the stream stays byte-identical to
+    // the historical shape.
+    if include_usage {
         let usage = json!({
             "id": id,
-            "object": "chat.completion.chunk",
+            "object": if chat { "chat.completion.chunk" } else { "text_completion" },
             "created": created,
             "model": model,
             "choices": [],
@@ -1051,9 +1486,9 @@ pub async fn collect_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed from the request stop list (see `drive_chat_stream`). Empty =>
     // verbatim passthrough, byte-identical to the pre-F4 response.
     let mut stop_matcher = StopMatcher::new(stop);
@@ -1284,7 +1719,7 @@ pub async fn collect_chat_from_events_with_stop(
         created,
         thinking,
         stop,
-        Arc::new(ToolSchemas::default()),
+        ReplyTools::default(),
     )
     .await
 }
@@ -1544,7 +1979,7 @@ mod tests {
             chat,
             false,
             Vec::new(),
-            Arc::new(ToolSchemas::default()),
+            ReplyTools::default(),
             include_usage,
         ));
         let mut out = String::new();
@@ -1558,16 +1993,21 @@ mod tests {
     /// empty `choices` + the usage totals, positioned as the LAST data frame
     /// before `data: [DONE]` (the OpenAI streaming contract).
     #[tokio::test]
-    async fn stream_chat_usage_chunk_present_when_requested() {
-        let events = vec![
-            tok("hi"),
-            TokenEvent::Done {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: 7,
-                completion_tokens: 3,
-            },
-        ];
-        let sse = stream_openai_to_string(events, true, true).await;
+    async fn stream_usage_chunk_present_when_requested() {
+        for (chat, object) in [(true, "chat.completion.chunk"), (false, "text_completion")] {
+            let events = vec![
+                tok("hi"),
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                },
+            ];
+            assert_usage_chunk(&stream_openai_to_string(events, chat, true).await, object);
+        }
+    }
+
+    fn assert_usage_chunk(sse: &str, object: &str) {
         let frames: Vec<&str> = sse
             .split("\n\n")
             .filter_map(|b| b.trim().strip_prefix("data: "))
@@ -1580,6 +2020,7 @@ mod tests {
             0,
             "usage chunk must carry empty choices: {usage_frame}"
         );
+        assert_eq!(v["object"], object);
         assert_eq!(v["usage"]["prompt_tokens"], 7);
         assert_eq!(v["usage"]["completion_tokens"], 3);
         assert_eq!(v["usage"]["total_tokens"], 10);
@@ -1909,6 +2350,7 @@ mod tests {
 
     fn user_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "user".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -1918,6 +2360,7 @@ mod tests {
 
     fn system_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "system".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -1927,6 +2370,7 @@ mod tests {
 
     fn assistant_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "assistant".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -1936,6 +2380,7 @@ mod tests {
 
     fn assistant_tool_call_msg(name: &str, arguments: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "assistant".into(),
             content: Value::String(String::new()),
             tool_call_id: None,
@@ -1952,6 +2397,7 @@ mod tests {
 
     fn tool_msg(content: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "tool".into(),
             content: Value::String(content.into()),
             tool_call_id: Some("call_1".into()),
@@ -1980,7 +2426,7 @@ mod tests {
             "get_weather",
             r#"{"city": "Riyadh", "unit": "celsius"}"#,
         )];
-        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "fn=get_weather city=Riyadh unit=celsius");
     }
 
@@ -1997,7 +2443,7 @@ mod tests {
             tool_msg("B"),
             assistant_msg("done"),
         ];
-        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "<user>hi<user>[A][B]</user><assistant>done");
     }
 
@@ -2007,7 +2453,8 @@ mod tests {
         // and the flattened user content to the template.
         let tmpl = "{%- if tools %}TOOLS={{ tools[0].function.name }}{%- endif %} U={{ messages[-1].content }}";
         let messages = vec![user_msg("weather?")];
-        let out = render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl)).unwrap();
+        let out =
+            render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "TOOLS=get_weather U=weather?");
     }
 
@@ -2016,7 +2463,7 @@ mod tests {
         // enable_thinking=false (the default) MUST emit the closed empty-think
         // tail, byte-identical to the pre-reasoning-control behaviour.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         // CLI's `apply_chat_template_with_system("Hello", None)` for qwen35
         // post- produces exactly this string (see crates/lumen-cli
         // /src/tokenize.rs:273-292).
@@ -2030,7 +2477,7 @@ mod tests {
         // enable_thinking=true MUST emit the OPEN `<think>\n` tail so the
         // model produces a reasoning trace.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None, None).unwrap();
         let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
         assert_eq!(
             out, expected,
@@ -2041,7 +2488,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_closed_think_when_disabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -2054,7 +2501,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_open_think_when_enabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n";
@@ -2065,12 +2512,284 @@ mod tests {
     }
 
     #[test]
+    fn earlier_reasoning_renders_back_on_both_endpoints() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1", "reasoning_content": "R1"},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(template))
+        .unwrap()
+        .0;
+        let messages = serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "R1", "signature": "s"},
+                    {"type": "text", "text": "A1"},
+                ]},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(template))
+        .unwrap()
+        .0;
+        assert_eq!(chat, messages);
+        assert!(
+            chat.contains("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>"),
+            "{chat}"
+        );
+        // Explicitly empty reasoning still reaches the template, so Qwen3.5
+        // does not go looking for reasoning inside the answer.
+        let qwen35 =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen35_chat_template.jinja");
+        let answer = "X</think>M</think>Y";
+        let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": answer, "reasoning_content": ""},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(qwen35))
+        .unwrap()
+        .0;
+        let messages = serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "s"},
+                    {"type": "text", "text": answer},
+                ]},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(qwen35))
+        .unwrap()
+        .0;
+        assert_eq!(chat, messages);
+        assert!(
+            chat.contains(&format!("<|im_start|>assistant\n{answer}<|im_end|>")),
+            "{chat}"
+        );
+    }
+
+    #[test]
+    fn tool_choice_matches_the_messages_endpoint() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let with = |mut body: Value, extra: Value| {
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let chat = |choice: Value, extra: Value| {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "Weather", "parameters": schema}}],
+                "tool_choice": choice,
+            });
+            serde_json::from_value::<ChatCompletionRequest>(with(body, extra))
+                .unwrap()
+                .prompt(Some(template))
+        };
+        let messages = |choice: Value, extra: Value| {
+            let body = json!({
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"name": "get_weather", "description": "Weather", "input_schema": schema}],
+                "tool_choice": choice,
+            });
+            serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(with(body, extra))
+                .unwrap()
+                .prompt(Some(template))
+        };
+        let named = json!({"type": "function", "function": {"name": "get_weather"}});
+        for (openai, anthropic, prefix) in [
+            (json!("auto"), json!({"type": "auto"}), ""),
+            (json!("none"), json!({"type": "none"}), ""),
+            (json!("required"), json!({"type": "any"}), "<tool_call>\n"),
+            (
+                named.clone(),
+                json!({"type": "tool", "name": "get_weather"}),
+                "<tool_call>\n<function=get_weather>\n",
+            ),
+        ] {
+            let (prompt, response_prefix) = chat(openai.clone(), json!({})).unwrap();
+            assert_eq!(
+                (prompt.clone(), response_prefix.clone()),
+                messages(anthropic, json!({})).unwrap(),
+                "{openai}"
+            );
+            assert_eq!(response_prefix, prefix);
+            assert!(prompt.ends_with(&format!("<think>\n\n</think>\n\n{prefix}")));
+        }
+        // `none` offers no tools; a forced choice keeps every tool offered.
+        let (none, _) = chat(json!("none"), json!({})).unwrap();
+        assert!(!none.contains("<tools>"));
+        assert!(chat(named.clone(), json!({}))
+            .unwrap()
+            .0
+            .contains("<tools>"));
+        // Refused on both: a tool not offered, and a forced call while thinking.
+        let unknown = json!({"type": "function", "function": {"name": "nope"}});
+        let refusals = [
+            chat(unknown, json!({})).map(|_| ()),
+            messages(json!({"type": "tool", "name": "nope"}), json!({})).map(|_| ()),
+            chat(json!("required"), json!({"enable_thinking": true})).map(|_| ()),
+            messages(
+                json!({"type": "any"}),
+                json!({"thinking": {"type": "enabled"}}),
+            )
+            .map(|_| ()),
+            chat(json!("required"), json!({"tools": []})).map(|_| ()),
+            chat(json!("sometimes"), json!({})).map(|_| ()),
+            chat(
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"tools": [{"type": "function", "function": {"name": "", "parameters": {}}}]}),
+            )
+            .map(|_| ()),
+            chat(
+                json!({"type": "function", "function": {"name": "get weather"}}),
+                json!({"tools": [{"type": "function", "function": {"name": "get weather", "parameters": {}}}]}),
+            )
+            .map(|_| ()),
+        ];
+        for refusal in refusals {
+            match refusal {
+                Err(ServerError::BadRequest { param, .. }) => {
+                    assert_eq!(param.as_deref(), Some("tool_choice"))
+                }
+                other => panic!("expected a 400 naming tool_choice, got {other:?}"),
+            }
+        }
+        // Without the model's template the opener's protocol is unknown.
+        let body = json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+            "tool_choice": named,
+        });
+        assert!(serde_json::from_value::<ChatCompletionRequest>(body)
+            .unwrap()
+            .prompt(None)
+            .is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_matches_the_messages_endpoint() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let request = |extra: Value| -> ChatCompletionRequest {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let prompt = |extra: Value| request(extra).prompt(Some(template)).unwrap().0;
+        let anthropic = |output_config: Value| {
+            let req: crate::wire::anthropic::MessagesRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled"}, "output_config": output_config,
+            }))
+            .unwrap();
+            req.prompt(Some(template)).unwrap().0
+        };
+        // Each level shared with /v1/messages renders the same prompt there.
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                prompt(json!({"reasoning_effort": level})),
+                anthropic(json!({"effort": level})),
+                "{level}"
+            );
+        }
+        // Any level but `none` asks for reasoning; `minimal` runs as `low`.
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "minimal"})),
+            prompt(json!({"reasoning_effort": "low"}))
+        );
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "none"})),
+            prompt(json!({"enable_thinking": false}))
+        );
+        // An explicit toggle wins over the effort.
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "low", "enable_thinking": false})),
+            prompt(json!({"enable_thinking": false}))
+        );
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "none", "enable_thinking": true})),
+            prompt(json!({"enable_thinking": true}))
+        );
+        for (bad, code) in [
+            (json!("extreme"), "invalid_value"),
+            (json!(3), "invalid_type"),
+            (json!(["low"]), "invalid_type"),
+        ] {
+            match request(json!({"reasoning_effort": bad})).reasoning_effort() {
+                Err(ServerError::BadRequest {
+                    param, code: got, ..
+                }) => {
+                    assert_eq!(param.as_deref(), Some("reasoning_effort"));
+                    assert_eq!(got.as_deref(), Some(code), "{bad}");
+                }
+                other => panic!("{bad}: expected a 400, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn render_chat_prompt_keeps_later_system_where_it_was_sent() {
+        let messages = vec![
+            system_msg("Sys"),
+            user_msg("Q1"),
+            system_msg("Be brief."),
+            assistant_msg("A1"),
+            user_msg("Q2"),
+        ];
+        let expected = "<|im_start|>system\nSys<|im_end|>\n\
+                        <|im_start|>user\nQ1<|im_end|>\n\
+                        <|im_start|>system\nBe brief.<|im_end|>\n\
+                        <|im_start|>assistant\nA1<|im_end|>\n\
+                        <|im_start|>user\nQ2<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n\n</think>\n\n";
+        assert_eq!(
+            render_chat_prompt(&messages, &[], false, None, None).unwrap(),
+            expected
+        );
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        // The Qwen3.8 template keeps (empty) reasoning on earlier assistant turns.
+        assert_eq!(
+            render_chat_prompt(&messages, &[], false, Some(template), None).unwrap(),
+            expected.replace("assistant\nA1", "assistant\n<think>\n\n</think>\n\nA1")
+        );
+    }
+
+    #[test]
     fn render_chat_prompt_multi_turn_emits_closed_think_only_at_tail() {
         // Three-turn: user, assistant, user. The empty-think tail must
         // appear ONLY at the final assistant prefix, NOT at the previous
         // assistant turn (which carries real content).
         let messages = vec![user_msg("Q1"), assistant_msg("A1"), user_msg("Q2")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
                         <|im_start|>user\nQ2<|im_end|>\n\
@@ -2089,7 +2808,7 @@ mod tests {
         // (The unit test in tokenize.rs guards the CLI side; this guards
         // the server side; they must produce byte-identical strings.)
         let messages = vec![user_msg("Hello")];
-        let server_out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let server_out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let cli_out = format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"
@@ -2148,8 +2867,7 @@ mod tests {
 
     #[test]
     fn chat_request_with_sampler_params_deserializes_not_400() {
-        // Previously these fields tripped `deny_unknown_fields` -> HTTP 400.
-        // They must now deserialize cleanly onto the DTO.
+        // These fields must deserialize cleanly onto the DTO.
         let body = serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2232,16 +2950,149 @@ mod tests {
         assert_eq!(req.frequency_penalty, Some(0.4));
     }
 
+    /// Build a job from `base` plus `extra`, or the 400's param and code.
+    fn job_or_param<R: serde::de::DeserializeOwned>(
+        base: Value,
+        extra: Value,
+        into_job: impl Fn(R, &EngineHandle) -> Result<JobRequest, ServerError>,
+    ) -> Result<JobRequest, (Option<String>, Option<String>)> {
+        let engine = EngineHandle::new_for_test(4096);
+        let mut body = base;
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let req: R = serde_json::from_value(body).expect("the request parses");
+        into_job(req, &engine).map_err(|e| match e {
+            ServerError::BadRequest { param, code, .. } => (param, code),
+            other => panic!("expected a 400, got {other:?}"),
+        })
+    }
+
     #[test]
-    fn unknown_field_still_400s_deny_unknown_fields_intact() {
-        // Guard: adding the sampler fields must NOT loosen deny_unknown_fields.
-        let body = serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "definitely_not_a_field": 1
-        });
-        let r: Result<ChatCompletionRequest, _> = serde_json::from_value(body);
-        assert!(r.is_err(), "unknown top-level field must still be rejected");
+    fn chat_ignores_unused_fields_and_refuses_unproducible_ones() {
+        let base = || json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let job = |extra: Value| job_or_param(base(), extra, ChatCompletionRequest::into_job);
+        let plain = job(json!({})).unwrap();
+        // Fields this server does not use, and unproducible ones at their
+        // defaults, leave the job as it was.
+        let ignored = job(json!({
+            "store": true, "metadata": {"k": "v"}, "user": "u", "safety_identifier": "s",
+            "service_tier": "auto", "prompt_cache_key": "k", "parallel_tool_calls": true,
+            "prediction": {"type": "content", "content": "x"}, "verbosity": "medium",
+            "definitely_not_a_field": 1, "n": 1.0, "logprobs": false, "top_logprobs": 0,
+            "logit_bias": {"42": 0}, "response_format": {"type": "text", "strict": false},
+            "tool_choice": "none", "function_call": "none", "functions": [], "modalities": [],
+            "audio": null, "echo": false, "best_of": 1, "use_beam_search": false,
+            "skip_special_tokens": true, "add_generation_prompt": true, "min_tokens": 0,
+            "stop_token_ids": [], "separate_reasoning": true, "priority": 0, "request_id": "r",
+            "stream_options": {"include_usage": false, "include_obfuscation": false},
+        }))
+        .unwrap();
+        assert_eq!(ignored.prompt_tokens, plain.prompt_tokens);
+        assert_eq!(ignored.max_tokens, plain.max_tokens);
+        // Without a limit only the context window bounds the reply.
+        assert_eq!(plain.max_tokens, usize::MAX);
+        // The newer name for max_tokens is honoured, and wins.
+        assert_eq!(
+            job(json!({"max_completion_tokens": 7})).unwrap().max_tokens,
+            7
+        );
+        assert_eq!(
+            job(json!({"max_tokens": 9, "max_completion_tokens": 7}))
+                .unwrap()
+                .max_tokens,
+            7
+        );
+        for (field, value) in [
+            ("n", json!(2)),
+            ("response_format", json!({"type": "json_object"})),
+            ("logprobs", json!(true)),
+            ("top_logprobs", json!(3)),
+            ("logit_bias", json!({"42": 5})),
+            ("functions", json!([{"name": "f", "parameters": {}}])),
+            ("function_call", json!({"name": "f"})),
+            ("tool_choice", json!("required")),
+            ("modalities", json!(["text", "audio"])),
+            ("audio", json!({"voice": "alloy", "format": "wav"})),
+            ("web_search_options", json!({})),
+            ("verbosity", json!("low")),
+            ("moderation", json!({"model": "omni-moderation-latest"})),
+            ("guided_json", json!({"type": "object"})),
+            ("guided_choice", json!(["yes", "no"])),
+            ("structured_outputs", json!({"regex": "a+"})),
+            ("grammar", json!("root ::= \"a\"")),
+            ("structural_tag", json!("{}")),
+            ("echo", json!(true)),
+            ("prompt_logprobs", json!(1)),
+            ("min_tokens", json!(5)),
+            ("stop_token_ids", json!([1])),
+            ("repetition_penalty", json!(1.1)),
+            ("bad_words", json!(["x"])),
+            ("add_generation_prompt", json!(false)),
+            ("chat_template", json!("{{ messages }}")),
+            ("lora_path", json!("adapter")),
+            ("reasoning", json!({"effort": "high"})),
+            ("skip_special_tokens", json!(false)),
+        ] {
+            let (param, code) = job(json!({ field: value })).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field));
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
+        }
+        // `parallel_tool_calls: false` limits the reply to one call.
+        let single = |extra: Value| {
+            let mut body = base();
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ChatCompletionRequest>(body)
+                .unwrap()
+                .reply_tools()
+                .single
+        };
+        for bad in [json!("false"), json!(0), json!({})] {
+            let (param, code) = job(json!({"parallel_tool_calls": bad})).unwrap_err();
+            assert_eq!(
+                (param.as_deref(), code.as_deref()),
+                (Some("parallel_tool_calls"), Some("invalid_type"))
+            );
+        }
+        assert!(single(json!({"parallel_tool_calls": false})));
+        assert!(!single(json!({"parallel_tool_calls": true})));
+        assert!(!single(json!({})));
+        // `none` with tools offers none of them (see
+        // `tool_choice_matches_the_messages_endpoint`).
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);
+        let none = job(json!({"tool_choice": "none", "tools": tools})).unwrap();
+        assert_eq!(none.prompt_tokens, plain.prompt_tokens);
+    }
+
+    #[test]
+    fn completions_ignore_unused_fields_and_refuse_unproducible_ones() {
+        let base = || json!({"model": "m", "prompt": "hi"});
+        let job = |extra: Value| job_or_param(base(), extra, CompletionRequest::into_job);
+        let plain = job(json!({})).unwrap();
+        let ignored = job(json!({
+            "user": "u", "definitely_not_a_field": 1, "n": 1, "best_of": 1.0, "echo": false,
+            "suffix": "", "logit_bias": {}, "logprobs": null,
+        }))
+        .unwrap();
+        assert_eq!(ignored.prompt_tokens, plain.prompt_tokens);
+        assert_eq!(ignored.max_tokens, plain.max_tokens);
+        for (field, value) in [
+            ("n", json!(2)),
+            ("best_of", json!(3)),
+            ("echo", json!(true)),
+            ("suffix", json!("tail")),
+            ("logit_bias", json!({"42": 5})),
+            ("logprobs", json!(2)),
+            ("guided_regex", json!("a+")),
+            ("response_format", json!({"type": "json_object"})),
+            ("min_tokens", json!(5)),
+        ] {
+            let (param, code) = job(json!({ field: value })).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field));
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
+        }
     }
 
     /// `ignore_eos` reaches the job on both endpoints, off by default, and

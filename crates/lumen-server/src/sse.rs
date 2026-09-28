@@ -39,6 +39,57 @@ pub struct EmitDelta {
     pub tool_calls: Vec<ParsedToolCall>,
 }
 
+/// The tool calls a reply may carry. `schemas` types native `<parameter>`
+/// values by the request's tools; the request's tool choice decides which
+/// calls count.
+#[derive(Debug, Clone)]
+pub struct ReplyTools {
+    pub schemas: Arc<ToolSchemas>,
+    /// Whether tool calls are parsed out of the reply at all. Not under
+    /// `tool_choice: none`, where tool-call markup stays plain text.
+    pub parsed: bool,
+    /// Under a named tool choice, the only tool a call may name; calls to any
+    /// other tool are dropped.
+    pub only: Option<String>,
+    /// At most one tool call (OpenAI `parallel_tool_calls: false`, Anthropic
+    /// `disable_parallel_tool_use: true`); calls after the first are dropped.
+    pub single: bool,
+}
+
+impl Default for ReplyTools {
+    fn default() -> Self {
+        Self {
+            schemas: Arc::default(),
+            parsed: true,
+            only: None,
+            single: false,
+        }
+    }
+}
+
+/// Parse tool calls out of answer text, keeping the calls the reply may carry;
+/// with parsing off the text passes through unchanged.
+fn parse_answer(
+    parser: &mut StreamingParser,
+    tools: &ReplyTools,
+    calls: &mut usize,
+    answer: &str,
+) -> (String, Vec<ParsedToolCall>) {
+    if !tools.parsed {
+        return (answer.to_string(), Vec::new());
+    }
+    let mut parsed = parser.feed(answer);
+    if let Some(only) = &tools.only {
+        parsed.tool_calls.retain(|c| c.name == *only);
+    }
+    if tools.single {
+        // Room for one call over the whole reply.
+        parsed.tool_calls.truncate(1usize.saturating_sub(*calls));
+    }
+    *calls += parsed.tool_calls.len();
+    (parsed.text, parsed.tool_calls)
+}
+
 /// Buffers decoded token fragments until they are safe to emit on the wire.
 pub struct SseSafeEmitter {
     /// Bytes that arrived but didn't terminate on a UTF-8 boundary.
@@ -50,6 +101,10 @@ pub struct SseSafeEmitter {
     reasoning: ReasoningExtractor,
     /// Tool-call streaming parser. Sees only post-reasoning answer text.
     parser: StreamingParser,
+    /// Which parsed tool calls the reply keeps.
+    tools: ReplyTools,
+    /// Tool calls kept so far.
+    calls: usize,
 }
 
 impl Default for SseSafeEmitter {
@@ -61,6 +116,8 @@ impl Default for SseSafeEmitter {
             pending_bytes: Vec::new(),
             reasoning: ReasoningExtractor::new(false),
             parser: StreamingParser::new(),
+            tools: ReplyTools::default(),
+            calls: 0,
         }
     }
 }
@@ -75,20 +132,25 @@ impl SseSafeEmitter {
             pending_bytes: Vec::new(),
             reasoning: ReasoningExtractor::new(thinking),
             parser: StreamingParser::new(),
+            tools: ReplyTools::default(),
+            calls: 0,
         }
     }
 
-    /// Construct an emitter whose tool-call parser types native-protocol
-    /// `<parameter>` values by the request's advertised tool `schemas`. The chat
+    /// Construct an emitter for a request's [`ReplyTools`]: its tool-call
+    /// parser types native-protocol `<parameter>` values by the request's
+    /// schemas, and only the calls its tool choice allows are kept. The chat
     /// and Anthropic surfaces use this so the streaming reconstruction is
     /// schema-aware (and byte-identical to the aggregated non-streaming result,
     /// which flows through the same emitter). Legacy `/v1/completions` and the
     /// unit tests keep the schemaless [`new`](Self::new).
-    pub fn with_schemas(thinking: bool, schemas: Arc<ToolSchemas>) -> Self {
+    pub fn with_tools(thinking: bool, tools: ReplyTools) -> Self {
         Self {
             pending_bytes: Vec::new(),
             reasoning: ReasoningExtractor::new(thinking),
-            parser: StreamingParser::with_schemas(schemas),
+            parser: StreamingParser::with_schemas(tools.schemas.clone()),
+            tools,
+            calls: 0,
         }
     }
 
@@ -98,11 +160,16 @@ impl SseSafeEmitter {
     /// (reasoning never contains tool calls); only answer content is parsed.
     fn process_safe_text(&mut self, safe_text: &str) -> EmitDelta {
         let split = self.reasoning.feed(safe_text);
-        let parsed = self.parser.feed(&split.content);
+        let (text, tool_calls) = parse_answer(
+            &mut self.parser,
+            &self.tools,
+            &mut self.calls,
+            &split.content,
+        );
         EmitDelta {
             reasoning: split.reasoning,
-            text: parsed.text,
-            tool_calls: parsed.tool_calls,
+            text,
+            tool_calls,
         }
     }
 
@@ -144,15 +211,20 @@ impl SseSafeEmitter {
         let mut answer_tail = String::new();
         answer_tail.push_str(&split.content);
         answer_tail.push_str(&reasoning_fin.content);
-        let parsed = self.parser.feed(&answer_tail);
-        let fin: StreamingFinish = self.parser.finish();
+        let (text, tool_calls) =
+            parse_answer(&mut self.parser, &self.tools, &mut self.calls, &answer_tail);
+        let fin: StreamingFinish = if self.tools.parsed {
+            self.parser.finish()
+        } else {
+            StreamingFinish::default()
+        };
 
         let mut delta = EmitDelta::default();
         delta.reasoning.push_str(&split.reasoning);
         delta.reasoning.push_str(&reasoning_fin.reasoning);
-        delta.text.push_str(&parsed.text);
+        delta.text.push_str(&text);
         delta.text.push_str(&fin.flushed_text);
-        delta.tool_calls.extend(parsed.tool_calls);
+        delta.tool_calls.extend(tool_calls);
 
         (delta, fin.incomplete_tool_call)
     }
@@ -319,5 +391,57 @@ mod tests {
         assert_eq!(fin.reasoning, "</thi");
         assert_eq!(fin.text, "");
         assert!(incomplete.is_none());
+    }
+
+    fn tools_with(parsed: bool, only: Option<&str>) -> ReplyTools {
+        ReplyTools {
+            parsed,
+            only: only.map(str::to_owned),
+            ..ReplyTools::default()
+        }
+    }
+
+    const TWO_CALLS: &str = "<tool_call>\n<function=f>\n</function>\n</tool_call>\
+                             <tool_call>\n<function=g>\n</function>\n</tool_call>";
+
+    #[test]
+    fn a_reply_that_may_call_no_tool_keeps_tool_markup_as_text() {
+        let mut e = SseSafeEmitter::with_tools(false, tools_with(false, None));
+        let d = e.push(TWO_CALLS);
+        let (fin, incomplete) = e.finish();
+        assert!(d.tool_calls.is_empty() && fin.tool_calls.is_empty());
+        assert_eq!(format!("{}{}", d.text, fin.text), TWO_CALLS);
+        assert_eq!(incomplete, None);
+    }
+
+    #[test]
+    fn a_named_tool_choice_keeps_only_calls_to_that_tool() {
+        let mut e = SseSafeEmitter::with_tools(false, tools_with(true, Some("f")));
+        let d = e.push(TWO_CALLS);
+        let (fin, _) = e.finish();
+        let names: Vec<_> = d
+            .tool_calls
+            .iter()
+            .chain(&fin.tool_calls)
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, ["f"]);
+    }
+
+    #[test]
+    fn a_single_call_reply_keeps_only_its_first_call_across_pushes() {
+        let tools = ReplyTools {
+            single: true,
+            ..ReplyTools::default()
+        };
+        let mut e = SseSafeEmitter::with_tools(false, tools);
+        let first = e.push(TWO_CALLS);
+        let later = e.push("<tool_call>\n<function=h>\n</function>\n</tool_call>");
+        let (fin, _) = e.finish();
+        let names: Vec<_> = [first, later, fin]
+            .iter()
+            .flat_map(|d| d.tool_calls.iter().map(|c| c.name.clone()))
+            .collect();
+        assert_eq!(names, ["f"]);
     }
 }

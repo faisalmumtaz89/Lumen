@@ -14,7 +14,7 @@
 //!
 //! All request handlers use the [`OpenAiJson`] extractor instead of axum's
 //! built-in `Json<T>`. Schema-deserialization errors (missing fields, wrong
-//! types, unknown fields when `deny_unknown_fields` applies) are converted
+//! types) are converted
 //! to [`ServerError::BadRequest`] with `param` populated from
 //! `serde_json::Error::path()` and a stable `code` derived from
 //! `Error::classify()`. The response is HTTP 400 with the OpenAI envelope
@@ -57,6 +57,7 @@ pub fn build_router(engine: EngineHandle) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/debug/memory_breakdown", get(memory_breakdown))
         .with_state(state)
 }
@@ -85,6 +86,7 @@ pub fn build_router_with_images(
                 .route("/v1/chat/completions", post(chat_completions))
                 .route("/v1/completions", post(completions))
                 .route("/v1/messages", post(messages))
+                .route("/v1/messages/count_tokens", post(count_tokens))
                 .route("/debug/memory_breakdown", get(memory_breakdown))
                 .with_state(state),
         )
@@ -101,7 +103,6 @@ pub fn build_router_with_images(
 // Mapping rules from `serde_json::Error`:
 //   - `missing field "X"`             → code=`missing_field`,    param=X
 //   - `invalid type ... at line/col`  → code=`invalid_type`,     param=path
-//   - `unknown field "X"`             → code=`unknown_field`,    param=X
 //   - other Data errors               → code=`invalid_value`,    param=path
 //   - Syntax errors (truncated JSON)  → code=`invalid_json`,     param=None
 //   - Io / Eof                        → code=`invalid_json`,     param=None
@@ -136,7 +137,6 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
     // serde_json messages have stable shapes we can parse:
     //   "missing field `messages` at line 1 column 18"
     //   "invalid type: integer `5`, expected a sequence at line 1 column 30"
-    //   "unknown field `garbage`, expected one of `model`, ... at line 1 column 30"
     //   "EOF while parsing a value at line 1 column 0"
     //   "expected `:` at line 1 column 8"
     if let Some(field) = extract_quoted_after(&msg, "missing field") {
@@ -144,13 +144,6 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
             format!("missing required field: `{field}`"),
             field,
             "missing_field",
-        );
-    }
-    if let Some(field) = extract_quoted_after(&msg, "unknown field") {
-        return ServerError::bad_request_field(
-            format!("unknown field: `{field}`"),
-            field,
-            "unknown_field",
         );
     }
     if msg.starts_with("invalid type") {
@@ -230,9 +223,9 @@ async fn chat_completions(
     // it, so the wire emitter and the prompt tail agree (both call the single
     // shared resolver with the same inputs → same result).
     let thinking = req.resolve_thinking();
-    // Build the tool schemas BEFORE `into_job` consumes the request; the
-    // collectors type native `<parameter>` values by them.
-    let tool_schemas = std::sync::Arc::new(wire::openai::tool_schemas(&req.tools));
+    // The tool calls the reply may carry, taken BEFORE `into_job` consumes the
+    // request: the collectors type native `<parameter>` values by its schemas.
+    let tools = req.reply_tools();
     // OpenAI `stream_options.include_usage` — resolved before `into_job`
     // consumes the request; only the streaming path consults it.
     let include_usage = req.include_usage();
@@ -251,20 +244,14 @@ async fn chat_completions(
             current_unix_time(),
             thinking,
             stop,
-            tool_schemas,
+            tools,
             include_usage,
         );
         Ok(sse_response(body))
     } else {
-        let resp = wire::openai::collect_chat(
-            rx,
-            model_id,
-            current_unix_time(),
-            thinking,
-            stop,
-            tool_schemas,
-        )
-        .await?;
+        let resp =
+            wire::openai::collect_chat(rx, model_id, current_unix_time(), thinking, stop, tools)
+                .await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }
@@ -277,12 +264,14 @@ async fn completions(
 ) -> Result<Response, ServerError> {
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
+    let include_usage = req.include_usage();
     let job = req.into_job(&state.engine)?;
     wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::openai::stream_completion(rx, model_id, current_unix_time(), stop);
+        let body =
+            wire::openai::stream_completion(rx, model_id, current_unix_time(), stop, include_usage);
         Ok(sse_response(body))
     } else {
         let resp =
@@ -302,21 +291,34 @@ async fn messages(
     // Resolve reasoning before `into_job` consumes the request (same shared
     // resolver as the prompt tail -> consistent result).
     let thinking = req.resolve_thinking();
-    // Tool schemas built before `into_job` consumes the request (type native
-    // `<parameter>` values in the collectors).
-    let tool_schemas = std::sync::Arc::new(wire::anthropic::tool_schemas(&req.tools));
+    // The tool calls the reply may carry, taken before `into_job` consumes the
+    // request (the collectors type native `<parameter>` values by them).
+    let tools = req.reply_tools();
     let job = req.into_job(&state.engine)?;
     wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::anthropic::stream_messages(rx, model_id, thinking, stop, tool_schemas);
+        let body = wire::anthropic::stream_messages(rx, model_id, thinking, stop, tools);
         Ok(sse_response(body))
     } else {
-        let resp =
-            wire::anthropic::collect_messages(rx, model_id, thinking, stop, tool_schemas).await?;
+        let resp = wire::anthropic::collect_messages(rx, model_id, thinking, stop, tools).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
+}
+
+/// `POST /v1/messages/count_tokens`: the input tokens `/v1/messages` would run
+/// for the same request.
+async fn count_tokens(
+    State(state): State<AppState>,
+    OpenAiJson(req): OpenAiJson<wire::anthropic::MessagesRequest>,
+) -> Result<Response, ServerError> {
+    let input_tokens = req.count_tokens(&state.engine)?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"input_tokens": input_tokens})),
+    )
+        .into_response())
 }
 
 // ----------------------------- shared utilities -------------------------

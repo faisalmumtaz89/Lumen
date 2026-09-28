@@ -24,8 +24,6 @@
 //! data: {...}
 //! ```
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
 use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
@@ -35,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::{EngineHandle, FinishReason, JobRequest, JobResponseChannel, TokenEvent};
 use crate::error::ServerError;
-use crate::sse::SseSafeEmitter;
+use crate::sse::{ReplyTools, SseSafeEmitter};
 use crate::tokenstop::StopMatcher;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +44,12 @@ pub struct AnthropicMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicTool {
+    /// `custom` (the default) is a tool the client defines and runs. Other
+    /// types are Anthropic-defined tools (web search, code execution, bash,
+    /// text editor, ...), whose schemas this server does not know; they are
+    /// refused.
+    #[serde(default, rename = "type")]
+    pub tool_type: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -53,32 +57,59 @@ pub struct AnthropicTool {
     pub input_schema: Value,
 }
 
-/// Anthropic extended-thinking config: `{"type": "enabled"|"disabled",
-/// "budget_tokens": N}`. Permissive (not `deny_unknown_fields`) so future
-/// Anthropic keys pass through. `type == "enabled"` turns reasoning on;
-/// anything else (including `"disabled"`) turns it off.
+/// Anthropic extended-thinking config: `{"type": "enabled"|"adaptive"|"disabled",
+/// "budget_tokens": N}`. Other keys, such as `display`, are ignored. An unknown
+/// `type` is refused rather than read as off.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
-    pub thinking_type: String,
+    pub thinking_type: ThinkingType,
     #[serde(default)]
     pub budget_tokens: Option<usize>,
 }
 
+/// `thinking.type`. `Adaptive` leaves the decision to think to the model; the
+/// model always opens a reasoning block, so it is served as `Enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum ThinkingType {
+    Enabled,
+    Adaptive,
+    Disabled,
+}
+
+impl TryFrom<String> for ThinkingType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, String> {
+        match value.as_str() {
+            "enabled" => Ok(Self::Enabled),
+            "adaptive" => Ok(Self::Adaptive),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err("unknown thinking type, expected `enabled`, `adaptive` or `disabled`".into()),
+        }
+    }
+}
+
+/// A `/v1/messages` request. Fields this server does not use (`metadata`,
+/// `context_management`, and the others Anthropic clients attach) are ignored,
+/// not rejected; a structured-output request (`output_config.format`) is
+/// refused.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
-    pub max_tokens: usize,
+    /// Required by `/v1/messages` (see [`Self::into_job`]); not by
+    /// `/v1/messages/count_tokens`.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
     #[serde(default)]
     pub system: Option<Value>,
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Anthropic-valid sampler subset. The Messages API exposes `top_p` and
-    /// `top_k` (NOT presence/frequency penalties); both are honored on the
-    /// CLI and were previously HTTP-400-rejected here by `deny_unknown_fields`.
-    /// `None` (omitted) leaves the sampler default untouched.
+    /// `top_k` (NOT presence/frequency penalties); both are honored as on the
+    /// CLI. `None` (omitted) leaves the sampler default untouched.
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -89,33 +120,126 @@ pub struct MessagesRequest {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub tools: Vec<AnthropicTool>,
-    /// Anthropic extended-thinking control. `Some({type:"enabled"})` opens the
-    /// `<think>` block (reasoning surfaced as a `thinking` content block);
+    /// Anthropic extended-thinking control. `Some({type:"enabled"})` or
+    /// `Some({type:"adaptive"})` opens the `<think>` block (reasoning surfaced
+    /// as a `thinking` content block);
     /// `Some({type:"disabled"})` forces it closed; `None` defers to the
     /// `LUMEN_CHAT_ENABLE_THINKING` env override then the process default.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    /// Read for `effort` (see `Self::reasoning_effort`) and `format`:
+    /// decoding cannot be constrained to a schema, so a non-null `format` is
+    /// refused rather than answered in free text. Other keys are ignored like
+    /// unknown top-level fields; anything but an object is refused.
+    #[serde(default)]
+    pub output_config: Option<serde_json::Map<String, Value>>,
+    /// `{"type": "auto" | "any" | "none"}` or `{"type": "tool", "name": ...}`;
+    /// see `Self::tool_choice`.
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    /// Every field the request does not declare; see `MESSAGES_UNSUPPORTED`.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
+
+/// `/v1/messages` fields that must stay at their default. `tool_choice` and
+/// tool types are checked separately (see [`MessagesRequest::into_job`]).
+const MESSAGES_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "output_format",
+        accepts: |_| false,
+        refused: "structured output",
+    },
+    super::Unsupported {
+        field: "mcp_servers",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "MCP servers",
+    },
+    super::Unsupported {
+        field: "container",
+        accepts: |_| false,
+        refused: "a code execution container",
+    },
+];
 
 impl MessagesRequest {
     /// Resolve the per-request reasoning toggle via the single shared resolver.
-    /// The Anthropic `thinking.type == "enabled"` maps to `Some(true)`, any
-    /// other explicit value to `Some(false)`, and an absent `thinking` field to
-    /// `None` (defer to env/default).
+    /// `thinking.type` `enabled` or `adaptive` maps to `Some(true)`, `disabled`
+    /// to `Some(false)`, and an absent `thinking` field to `None` (defer to
+    /// env/default).
     pub fn resolve_thinking(&self) -> bool {
-        let per_request = self.thinking.as_ref().map(|t| t.thinking_type == "enabled");
+        let per_request = self
+            .thinking
+            .as_ref()
+            .map(|t| t.thinking_type != ThinkingType::Disabled);
         super::resolve_enable_thinking(per_request)
     }
 
-    pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
-        let enable_thinking = self.resolve_thinking();
-        // Per-request reasoning budget (Anthropic `thinking.budget_tokens`);
-        // falls back to the shared default. Carried for Part 4 (decode loop).
-        let reasoning_budget = self
-            .thinking
+    /// `tool_choice.disable_parallel_tool_use`: at most one tool call.
+    fn single_tool_call(&self) -> bool {
+        self.tool_choice
             .as_ref()
-            .and_then(|t| t.budget_tokens)
-            .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default);
+            .and_then(|c| c.get("disable_parallel_tool_use"))
+            == Some(&Value::Bool(true))
+    }
+
+    fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
+        use super::ToolChoice;
+        let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
+        if choice.is_null() {
+            return Ok(ToolChoice::Auto);
+        }
+        if choice
+            .get("disable_parallel_tool_use")
+            .is_some_and(|d| !d.is_null() && !d.is_boolean())
+        {
+            return Err(ServerError::bad_request_field(
+                "tool_choice.disable_parallel_tool_use must be a boolean",
+                "tool_choice.disable_parallel_tool_use",
+                "invalid_type",
+            ));
+        }
+        match (choice["type"].as_str(), choice["name"].as_str()) {
+            (Some("auto"), _) => Ok(ToolChoice::Auto),
+            (Some("none"), _) => Ok(ToolChoice::None),
+            (Some("any"), _) => Ok(ToolChoice::Required),
+            (Some("tool"), Some(name)) => Ok(ToolChoice::Named(name.into())),
+            _ => Err(ServerError::bad_request_field(
+                "tool_choice must be {\"type\": \"auto\" | \"any\" | \"none\"} or {\"type\": \"tool\", \"name\": ...}",
+                "tool_choice",
+                "invalid_value",
+            )),
+        }
+    }
+
+    /// The tool calls the reply may carry, for the collectors. Taken before
+    /// `into_job` consumes the request; a malformed `tool_choice` reads as
+    /// `auto` here because `into_job` refuses it.
+    pub fn reply_tools(&self) -> ReplyTools {
+        self.tool_choice()
+            .unwrap_or(super::ToolChoice::Auto)
+            .reply_tools(tool_schemas(&self.tools), self.single_tool_call())
+    }
+
+    /// The prompt for this request and the text the reply starts with, which
+    /// also ends the prompt (see [`super::ToolChoice::response_prefix`]).
+    pub(crate) fn prompt(
+        &self,
+        chat_template: Option<&str>,
+    ) -> Result<(String, String), ServerError> {
+        let reasoning_effort = self.reasoning_effort()?;
+        let enable_thinking = self.resolve_thinking();
+        let tool_choice = self.tool_choice()?;
+        tool_choice.check(
+            self.tools.iter().map(|t| t.name.as_str()),
+            enable_thinking,
+            chat_template.is_some(),
+        )?;
+        let tools: &[AnthropicTool] = if tool_choice.offers_tools() {
+            &self.tools
+        } else {
+            &[]
+        };
         // Flatten the system field through the SAME shared helper as message
         // content (ROBUST-007 guard + single recognized key set), so a number
         // `system` 400s identically to a number `content`.
@@ -123,33 +247,113 @@ impl MessagesRequest {
             Some(v) => Some(super::flatten_content(v, "system")?),
             None => None,
         };
-        let tool_schemas: Vec<ToolSchema> = self
-            .tools
-            .iter()
-            .map(|t| ToolSchema {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters_json_schema: serde_json::to_string(&t.input_schema)
-                    .unwrap_or_else(|_| "{}".into()),
-            })
-            .collect();
         // Prefer the model's embedded template (native tool-calling protocol),
         // shared with the CLI and OpenAI surfaces so the three cannot drift.
         // Fall back to the hard-coded ChatML transcript (compose the tools into
         // the system message) when no template is embedded.
-        let prompt = match engine.chat_template() {
+        let mut prompt = match chat_template {
             Some(tmpl) => render_prompt_templated(
                 system_text.as_deref(),
                 &self.messages,
-                &self.tools,
+                tools,
                 enable_thinking,
+                reasoning_effort,
                 tmpl,
             )?,
             None => {
+                let tool_schemas: Vec<ToolSchema> = tools
+                    .iter()
+                    .map(|t| ToolSchema {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters_json_schema: serde_json::to_string(&t.input_schema)
+                            .unwrap_or_else(|_| "{}".into()),
+                    })
+                    .collect();
                 let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
                 render_prompt(&final_system, &self.messages, enable_thinking)?
             }
         };
+        let response_prefix = tool_choice.response_prefix();
+        prompt.push_str(&response_prefix);
+        Ok((prompt, response_prefix))
+    }
+
+    /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
+    /// the chat template's `reasoning_effort`, mapped by the shared
+    /// [`super::template_reasoning_effort`]. Any other value is refused.
+    fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
+        const PARAM: &str = "output_config.effort";
+        const LEVELS: &str = "`low`, `medium`, `high`, `xhigh` or `max`";
+        let effort = self.output_config.as_ref().and_then(|c| c.get("effort"));
+        match super::effort_level(effort, PARAM, LEVELS)? {
+            None => Ok(None),
+            Some(level) => super::template_reasoning_effort(level).ok_or_else(|| {
+                ServerError::bad_request_field(
+                    format!("{PARAM} must be one of {LEVELS}"),
+                    PARAM,
+                    "invalid_value",
+                )
+            }),
+        }
+    }
+
+    /// Refuse what this request asks for that the server cannot produce;
+    /// shared by `/v1/messages` and `/v1/messages/count_tokens`. The prompt's
+    /// length is `into_job`'s to check: a count of a prompt longer than the
+    /// context is still a count.
+    fn check(&self) -> Result<(), ServerError> {
+        super::refuse_unsupported(&self.other, MESSAGES_UNSUPPORTED)?;
+        if self
+            .tools
+            .iter()
+            .any(|t| t.tool_type.as_deref().is_some_and(|ty| ty != "custom"))
+        {
+            return Err(super::unsupported(
+                "tools[].type",
+                "a tool type other than `custom`",
+            ));
+        }
+        if self
+            .output_config
+            .as_ref()
+            .and_then(|c| c.get("format"))
+            .is_some_and(|f| !f.is_null())
+        {
+            return Err(super::unsupported(
+                "output_config.format",
+                "structured output",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The input tokens `/v1/messages` would run for this request: its prompt,
+    /// tokenized. Served as `/v1/messages/count_tokens`.
+    pub fn count_tokens(&self, engine: &EngineHandle) -> Result<usize, ServerError> {
+        self.check()?;
+        let (prompt, _) = self.prompt(engine.chat_template())?;
+        Ok(engine.tokenize_for_request(&prompt).len())
+    }
+
+    pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        let max_tokens = self.max_tokens.ok_or_else(|| {
+            ServerError::bad_request_field(
+                "missing required field: `max_tokens`",
+                "max_tokens",
+                "missing_field",
+            )
+        })?;
+        self.check()?;
+        let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
+        let enable_thinking = self.resolve_thinking();
+        // Reasoning-token cap within `max_tokens` (Anthropic
+        // `thinking.budget_tokens`); falls back to the shared default.
+        let reasoning_budget = self
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens)
+            .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default);
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -175,7 +379,7 @@ impl MessagesRequest {
         };
         Ok(JobRequest {
             prompt_tokens,
-            max_tokens: self.max_tokens,
+            max_tokens,
             stop_text: self.stop_sequences,
             eos_token_ids: eos,
             ignore_eos: false,
@@ -183,14 +387,14 @@ impl MessagesRequest {
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
             enable_thinking,
             reasoning_budget,
+            response_prefix,
         })
     }
 }
 
-/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (used by the
-/// router to type native `<parameter>` values in the collectors, mirroring the
-/// OpenAI surface).
-pub fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
+/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (typing native
+/// `<parameter>` values in the collectors, mirroring the OpenAI surface).
+fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
     let schemas: Vec<ToolSchema> = tools
         .iter()
         .map(|t| ToolSchema {
@@ -215,6 +419,7 @@ fn render_prompt_templated(
     messages: &[AnthropicMessage],
     tools: &[AnthropicTool],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     template: &str,
 ) -> Result<String, ServerError> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
@@ -236,10 +441,17 @@ fn render_prompt_templated(
                 }
             }
             "assistant" => {
-                let (text, tool_uses) = partition_tool_use_blocks(&m.content, "messages.content")?;
+                let (text, reasoning, tool_uses) =
+                    partition_tool_use_blocks(&m.content, "messages.content")?;
                 let mut obj = serde_json::Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 obj.insert("content".into(), json!(text));
+                // Passed even when empty: a template that finds none looks for
+                // reasoning inside the content instead (Qwen3.5 splits it at
+                // `</think>`).
+                if let Some(reasoning) = reasoning {
+                    obj.insert("reasoning_content".into(), json!(reasoning));
+                }
                 if !tool_uses.is_empty() {
                     let calls: Vec<Value> = tool_uses
                         .iter()
@@ -255,6 +467,10 @@ fn render_prompt_templated(
                 }
                 msgs.push(Value::Object(obj));
             }
+            "system" => msgs.push(json!({
+                "role": "system",
+                "content": super::flatten_content(&m.content, "messages.content")?,
+            })),
             other => {
                 return Err(ServerError::bad_request_field(
                     format!("unknown anthropic role: {other}"),
@@ -283,6 +499,7 @@ fn render_prompt_templated(
         &Value::Array(tools_json),
         true,
         enable_thinking,
+        reasoning_effort,
     )
     .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
@@ -302,6 +519,12 @@ fn render_prompt(
         match m.role.as_str() {
             "user" => render_user_turn(&mut prompt, &m.content)?,
             "assistant" => render_assistant_turn(&mut prompt, &m.content)?,
+            // A system message inside `messages` stays where it was sent.
+            "system" => {
+                prompt.push_str("<|im_start|>system\n");
+                prompt.push_str(&super::flatten_content(&m.content, "messages.content")?);
+                prompt.push_str("<|im_end|>\n");
+            }
             other => {
                 return Err(ServerError::bad_request_field(
                     format!("unknown anthropic role: {other}"),
@@ -361,7 +584,7 @@ fn render_user_turn(prompt: &mut String, content: &Value) -> Result<(), ServerEr
 /// surface. The Anthropic `input` *object* is serialized to the same on-wire
 /// `{name, arguments:<json>}` Qwen form the OpenAI string `arguments` produces.
 fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), ServerError> {
-    let (text, tool_uses) = partition_tool_use_blocks(content, "messages.content")?;
+    let (text, _, tool_uses) = partition_tool_use_blocks(content, "messages.content")?;
     prompt.push_str("<|im_start|>assistant\n");
     prompt.push_str(&text);
     for (name, arguments_json) in &tool_uses {
@@ -374,8 +597,10 @@ fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), Ser
     Ok(())
 }
 
-/// Walk an assistant content value, returning `(flattened_text, tool_uses)`
-/// where each tool_use is `(name, arguments_json)`. Recognizes
+/// Walk an assistant content value, returning `(flattened_text, reasoning,
+/// tool_uses)` where reasoning joins the `{type:"thinking", thinking}` blocks
+/// (`None` without one) and each tool_use is `(name, arguments_json)`.
+/// Recognizes
 /// `{type:"tool_use", name, input}` blocks; the `input` object is serialized
 /// to a JSON string (the on-wire `arguments` form). Bare-string and
 /// `{type:"text", text}` parts flatten into the text via the SAME key set as
@@ -384,13 +609,16 @@ fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), Ser
 fn partition_tool_use_blocks(
     content: &Value,
     param: &str,
-) -> Result<(String, Vec<(String, String)>), ServerError> {
+) -> Result<(String, Option<String>, Vec<(String, String)>), ServerError> {
     match content {
         // No typed blocks possible in a string/null: reuse the shared text
         // flattener verbatim (also enforces ROBUST-007 on scalars).
-        Value::String(_) | Value::Null => Ok((super::flatten_content(content, param)?, Vec::new())),
+        Value::String(_) | Value::Null => {
+            Ok((super::flatten_content(content, param)?, None, Vec::new()))
+        }
         Value::Array(arr) => {
             let mut text = String::new();
+            let mut reasoning: Option<String> = None;
             let mut tool_uses = Vec::new();
             for piece in arr {
                 if let Some(s) = piece.as_str() {
@@ -412,6 +640,12 @@ fn partition_tool_use_blocks(
                                 .unwrap_or_else(|| "{}".to_string());
                             tool_uses.push((name, arguments_json));
                         }
+                        // The turn's reasoning, which the chat template renders
+                        // back into the turn.
+                        Some("thinking") => {
+                            let t = obj.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                            reasoning.get_or_insert_with(String::new).push_str(t);
+                        }
                         // text part (or any other block that carries `text`).
                         _ => {
                             if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
@@ -421,7 +655,7 @@ fn partition_tool_use_blocks(
                     }
                 }
             }
-            Ok((text, tool_uses))
+            Ok((text, reasoning, tool_uses))
         }
         _ => Err(ServerError::bad_request_field(
             "message 'content' must be a string or a content-parts array",
@@ -508,17 +742,10 @@ pub fn stream_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Body {
     let (tx, body_rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_messages_stream(
-        rx,
-        tx,
-        model,
-        thinking,
-        stop,
-        tool_schemas,
-    ));
+    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop, tools));
     body_from_byte_stream(body_rx)
 }
 
@@ -528,7 +755,7 @@ async fn drive_messages_stream(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) {
     let msg_id = format!(
         "msg_lumen_{:x}-{:x}",
@@ -538,7 +765,7 @@ async fn drive_messages_stream(
             .unwrap_or(0),
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed the streaming stop matcher from `stop_sequences`. Empty =>
     // verbatim passthrough (byte-identical); see the OpenAI `drive_chat_stream`
     // note for the worker/wire division of labour.
@@ -876,9 +1103,9 @@ pub async fn collect_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed from `stop_sequences`. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -1019,15 +1246,9 @@ mod tests {
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
         // Test helper exercises the legacy JSON tool-call path (schemaless); the
         // schema-aware native path is covered by the runtime tests + Modal §2D.
-        collect_messages(
-            pooled,
-            "test".into(),
-            thinking,
-            stop,
-            Arc::new(ToolSchemas::default()),
-        )
-        .await
-        .unwrap()
+        collect_messages(pooled, "test".into(), thinking, stop, ReplyTools::default())
+            .await
+            .unwrap()
     }
 
     fn user(text: &str) -> AnthropicMessage {
@@ -1064,6 +1285,57 @@ mod tests {
         assert_eq!(out, expected);
     }
 
+    fn system(text: &str) -> AnthropicMessage {
+        AnthropicMessage {
+            role: "system".into(),
+            content: Value::String(text.into()),
+        }
+    }
+
+    #[test]
+    fn system_message_renders_where_it_was_sent() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let messages = [
+            user("Hi"),
+            system("Answer in French."),
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "18C"},
+                    {"type": "text", "text": "And now?"}
+                ]),
+            },
+            AnthropicMessage {
+                role: "system".into(),
+                content: serde_json::json!([{"type": "text", "text": "Be brief."}]),
+            },
+        ];
+        let out =
+            render_prompt_templated(Some("Sys"), &messages, &[], false, None, template).unwrap();
+        assert!(
+            out.starts_with("<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>system\nAnswer in French.<|im_end|>\n<|im_start|>assistant\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{out}"
+        );
+
+        let manual = render_prompt("Sys", &[user("Hi"), system("Be brief.")], false).unwrap();
+        assert_eq!(
+            manual,
+            "<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n\
+             <|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
     #[test]
     fn resolve_thinking_maps_anthropic_config() {
         // type=="enabled" -> true; type=="disabled" -> false. Absent -> env/
@@ -1071,7 +1343,7 @@ mod tests {
         let enabled = MessagesRequest {
             model: "m".into(),
             messages: vec![],
-            max_tokens: 1,
+            max_tokens: Some(1),
             system: None,
             temperature: None,
             top_p: None,
@@ -1080,19 +1352,55 @@ mod tests {
             stop_sequences: vec![],
             tools: vec![],
             thinking: Some(ThinkingConfig {
-                thinking_type: "enabled".into(),
+                thinking_type: ThinkingType::Enabled,
                 budget_tokens: None,
             }),
+            output_config: None,
+            tool_choice: None,
+            other: Default::default(),
         };
         assert!(enabled.resolve_thinking());
         let disabled = MessagesRequest {
             thinking: Some(ThinkingConfig {
-                thinking_type: "disabled".into(),
+                thinking_type: ThinkingType::Disabled,
                 budget_tokens: None,
             }),
             ..enabled.clone()
         };
         assert!(!disabled.resolve_thinking());
+    }
+
+    #[test]
+    fn adaptive_thinking_is_on_and_an_unknown_type_is_refused() {
+        let request = |thinking: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 1, "messages": [], "thinking": thinking,
+            }))
+        };
+        let adaptive = request(json!({"type": "adaptive", "display": "omitted"})).unwrap();
+        assert!(adaptive.resolve_thinking());
+        assert!(request(json!({"type": "enabled", "budget_tokens": 1024}))
+            .unwrap()
+            .resolve_thinking());
+        assert!(!request(json!({"type": "disabled"}))
+            .unwrap()
+            .resolve_thinking());
+        let unknown = request(json!({"type": "sometimes"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("unknown thinking type, expected") && !unknown.contains("sometimes"),
+            "{unknown}"
+        );
+        for not_a_string in [json!(1), json!(null), json!({"adaptive": null})] {
+            let err = request(json!({"type": not_a_string}))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("invalid type:") && err.contains("expected a string"),
+                "{err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1220,7 +1528,7 @@ mod tests {
             "test".into(),
             thinking,
             stop,
-            Arc::new(ToolSchemas::default()),
+            ReplyTools::default(),
         ));
         let mut out = String::new();
         while let Some(chunk) = body_rx.recv().await {
@@ -1424,16 +1732,254 @@ mod tests {
         assert_eq!(job.sampling.top_k, Some(50));
     }
 
-    #[test]
-    fn messages_unknown_field_still_400s_deny_unknown_fields_intact() {
-        let body = serde_json::json!({
+    #[tokio::test]
+    async fn messages_unknown_top_level_fields_are_ignored() {
+        let engine = EngineHandle::new_for_test(4096);
+        let plain = serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 16,
-            "definitely_not_a_field": 1
+            "max_tokens": 16
         });
-        let r: Result<MessagesRequest, _> = serde_json::from_value(body);
-        assert!(r.is_err(), "unknown top-level field must still be rejected");
+        let mut extended = plain.clone();
+        for (k, v) in [
+            ("metadata", json!({"user_id": "u"})),
+            ("output_config", json!({"effort": "low"})),
+            (
+                "context_management",
+                json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+            ),
+            ("safeguards", json!([{"type": "dangerous_tool_use"}])),
+            ("definitely_not_a_field", json!(1)),
+        ] {
+            extended[k] = v;
+        }
+        let plain: MessagesRequest = serde_json::from_value(plain).unwrap();
+        let extended: MessagesRequest = serde_json::from_value(extended)
+            .expect("unknown top-level fields must be ignored, not rejected");
+        let (plain, extended) = (
+            plain.into_job(&engine).unwrap(),
+            extended.into_job(&engine).unwrap(),
+        );
+        assert_eq!(plain.prompt_tokens, extended.prompt_tokens);
+        assert_eq!(plain.max_tokens, extended.max_tokens);
+    }
+
+    #[test]
+    fn effort_reaches_the_template_as_reasoning_effort() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let request = |output_config: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"}, "output_config": output_config,
+            }))
+            .unwrap()
+        };
+        let preamble = |output_config: Value| {
+            let req = request(output_config);
+            let effort = req.reasoning_effort().unwrap();
+            let prompt =
+                render_prompt_templated(None, &req.messages, &[], true, effort, template).unwrap();
+            prompt
+                .split("<|im_end|>")
+                .next()
+                .filter(|head| head.starts_with("<|im_start|>system\n"))
+                .map(str::to_owned)
+        };
+        let xhigh = preamble(json!(null));
+        assert!(xhigh
+            .as_deref()
+            .unwrap()
+            .contains("Reasoning effort is set to xhigh"));
+        for level in ["high", "xhigh", "max"] {
+            assert_eq!(preamble(json!({"effort": level})), xhigh, "{level}");
+        }
+        assert!(preamble(json!({"effort": "low"}))
+            .unwrap()
+            .contains("Reasoning effort is set to low"));
+        assert_eq!(preamble(json!({"effort": "medium"})), None);
+        for bad in [json!("minimal"), json!(1)] {
+            match request(json!({"effort": bad})).reasoning_effort() {
+                Err(ServerError::BadRequest { param, .. }) => {
+                    assert_eq!(param.as_deref(), Some("output_config.effort"))
+                }
+                other => panic!("{bad}: expected a 400, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn count_tokens_is_the_prompt_messages_would_run() {
+        let engine = EngineHandle::new_for_test(8192);
+        let body = json!({
+            "model": "m",
+            "system": "Be brief.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "R"},
+                    {"type": "text", "text": "hello"},
+                ]},
+                {"role": "user", "content": "weather?"},
+            ],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+            "thinking": {"type": "disabled"},
+        });
+        let counted = serde_json::from_value::<MessagesRequest>(body.clone())
+            .unwrap()
+            .count_tokens(&engine)
+            .unwrap();
+        let mut run = body;
+        run["max_tokens"] = json!(16);
+        let job = serde_json::from_value::<MessagesRequest>(run)
+            .unwrap()
+            .into_job(&engine)
+            .unwrap();
+        assert_eq!(counted, job.prompt_tokens.len());
+        // A request `/v1/messages` refuses is refused here too.
+        let refused = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "messages": [], "mcp_servers": [{"type": "url", "url": "https://x"}],
+        }))
+        .unwrap()
+        .count_tokens(&engine);
+        assert!(matches!(refused, Err(ServerError::BadRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn messages_refuse_what_they_cannot_produce() {
+        let engine = EngineHandle::new_for_test(4096);
+        let job = |extra: Value| {
+            let mut body = json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<MessagesRequest>(body)
+                .expect("the request parses")
+                .into_job(&engine)
+                .map_err(|e| match e {
+                    ServerError::BadRequest { param, code, .. } => (param, code),
+                    other => panic!("expected a 400, got {other:?}"),
+                })
+        };
+        let plain = job(json!({})).unwrap();
+        let tool = json!({"name": "f", "input_schema": {"type": "object"}});
+        let (param, code) =
+            job(json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": "true"}}))
+                .unwrap_err();
+        assert_eq!(
+            (param.as_deref(), code.as_deref()),
+            (
+                Some("tool_choice.disable_parallel_tool_use"),
+                Some("invalid_type")
+            )
+        );
+        let single = |choice: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "tool_choice": choice,
+            }))
+            .unwrap()
+            .reply_tools()
+            .single
+        };
+        assert!(single(
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        ));
+        assert!(!single(
+            json!({"type": "auto", "disable_parallel_tool_use": false})
+        ));
+        assert!(!single(json!({"type": "auto"})));
+        for accepted in [
+            json!({"tool_choice": {"type": "auto"}, "mcp_servers": [], "container": null}),
+            json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": false}}),
+            json!({"tool_choice": {"type": "none"}}),
+            json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}),
+        ] {
+            assert_eq!(job(accepted).unwrap().prompt_tokens, plain.prompt_tokens);
+        }
+        let custom = json!({"type": "custom", "name": "f", "input_schema": {"type": "object"}});
+        assert_eq!(
+            job(json!({"tools": [custom]})).unwrap().prompt_tokens,
+            job(json!({"tools": [tool]})).unwrap().prompt_tokens
+        );
+        // Forcing a call needs the model's chat template, which this engine
+        // lacks (see `tool_choice_matches_the_messages_endpoint`).
+        for (extra, field) in [
+            (
+                json!({"tool_choice": {"type": "any"}, "tools": [tool.clone()]}),
+                "tool_choice",
+            ),
+            (
+                json!({"tool_choice": {"type": "tool", "name": "f"}}),
+                "tool_choice",
+            ),
+            (
+                json!({"mcp_servers": [{"type": "url", "url": "https://x", "name": "x"}]}),
+                "mcp_servers",
+            ),
+            (json!({"container": "c"}), "container"),
+            (
+                json!({"output_format": {"type": "json_schema"}}),
+                "output_format",
+            ),
+            (
+                json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+                "tools[].type",
+            ),
+        ] {
+            let (param, code) = job(extra.clone()).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field), "{extra}");
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_output_format_is_refused_not_ignored() {
+        let engine = EngineHandle::new_for_test(4096);
+        let request = |output_config: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+                "output_config": output_config
+            }))
+            .unwrap()
+        };
+        for format in [
+            json!({"type": "json_schema", "schema": {"type": "object"}}),
+            json!("json"),
+            json!({}),
+        ] {
+            let err = request(json!({"effort": "low", "format": format}))
+                .into_job(&engine)
+                .unwrap_err();
+            let resp = axum::response::IntoResponse::into_response(err);
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "output_config.format");
+            assert_eq!(body["error"]["code"], "invalid_value");
+        }
+        for accepted in [
+            json!(null),
+            json!({"effort": "low"}),
+            json!({"format": null}),
+        ] {
+            assert!(request(accepted).into_job(&engine).is_ok());
+        }
+        for not_an_object in [json!("low"), json!([]), json!(["low", null])] {
+            let body = json!({
+                "model": "m", "max_tokens": 16, "messages": [], "output_config": not_an_object
+            });
+            let err = serde_json::from_value::<MessagesRequest>(body)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("expected a map"), "{err}");
+        }
     }
 
     // ---- F16(b): Anthropic synchronous oversize-prompt guard ----

@@ -240,7 +240,7 @@ pub enum TokenEvent {
 pub enum FinishReason {
     /// Natural end of turn: the model emitted an EOS / role-end token.
     Stop,
-    /// Hit the answer-token budget (`max_tokens`) or the KV context window.
+    /// Hit the token limit (`max_tokens`) or the KV context window.
     Length,
     /// A tool-call block was emitted (and not interrupted).
     ToolCalls,
@@ -283,7 +283,9 @@ pub struct JobRequest {
     /// from, or replaces the prior session.
     pub prompt_tokens: Vec<u32>,
 
-    /// Maximum tokens to generate.
+    /// Maximum tokens to generate, reasoning included, as both the OpenAI
+    /// and the Anthropic API define it. `usize::MAX` leaves generation bounded
+    /// only by the context window.
     pub max_tokens: usize,
 
     /// Stop sequences (decoded text); generation halts when the most
@@ -308,17 +310,19 @@ pub struct JobRequest {
     pub suffix_threshold: usize,
 
     /// Whether the prompt opened a `<think>` reasoning block (resolved via
-    /// `runtime_defaults::resolve_enable_thinking`). Carried for the Part-4
-    /// decode-loop reasoning-budget / forced-close work; the current decode
-    /// loop does not yet read it. Default `false` (no reasoning).
+    /// `runtime_defaults::resolve_enable_thinking`): the decode loop starts in
+    /// the reasoning phase and applies `reasoning_budget`. Default `false` (no
+    /// reasoning).
     pub enable_thinking: bool,
 
     /// Maximum reasoning ("thinking") tokens before the decode loop force-
-    /// closes the `<think>` block (Part 4). Separate from `max_tokens` (the
-    /// answer budget) so the answer is never starved. `0` = unbounded /
-    /// unused (Part-4-pending). Carried now so Part 4 can wire enforcement
-    /// without touching every constructor again.
+    /// closes the `<think>` block, within `max_tokens`. `0` = unbounded.
     pub reasoning_budget: usize,
+
+    /// Text the reply starts with that already ends the prompt (a forced tool
+    /// call's opener). Reported as the reply's first text, before decoding;
+    /// not a generated token. Empty for most requests.
+    pub response_prefix: String,
 }
 
 /// The reply channel the worker uses for token events.
@@ -1951,6 +1955,21 @@ impl EngineWorker {
             return; // client gave up or worker shutting down
         }
 
+        if !request.response_prefix.is_empty()
+            && self
+                .send_event_polling_cancel(
+                    &tokens_tx,
+                    &cancel,
+                    TokenEvent::Token {
+                        token_id: *request.prompt_tokens.last().unwrap_or(&0),
+                        delta_text: request.response_prefix.clone(),
+                    },
+                )
+                .is_err()
+        {
+            return;
+        }
+
         // Decode loop.
         let mut bytes_state: Vec<u8> = Vec::new();
         let mut generated = 0usize;
@@ -1973,9 +1992,9 @@ impl EngineWorker {
         // on the thinking-off default path the loop is always in the answer
         // phase so this is a no-op distinction.
         let mut stop_matcher = StopMatcher::new(request.stop_text.clone());
-        // `Stop` is the value only for the degenerate `max_tokens == 0` answer
-        // budget (the entry guard breaks emitting nothing — byte-identical to
-        // the pre-Part-4 `for _ in 0..0`). Every other exit reassigns it.
+        // `Stop` is the value only for the degenerate `max_tokens == 0` limit
+        // (the entry guard breaks emitting nothing). Every other exit
+        // reassigns it.
         let mut finish_reason = FinishReason::Stop;
         // Bench surface (LUMEN_BENCH_TOKEN_IDS): the engine's own sampled-token
         // record. Empty and never pushed to when the surface is off.
@@ -1988,26 +2007,22 @@ impl EngineWorker {
         //   * Reasoning  — inside the `<think>` block (only entered when the
         //                  request resolved `enable_thinking == true`).
         //   * Answer     — after `</think>` (natural OR forced).
-        // The ANSWER budget (`request.max_tokens`) bounds ONLY answer tokens,
-        // so a long reasoning trace can never starve the answer. The reasoning
-        // trace is bounded SEPARATELY by `request.reasoning_budget`; on
-        // overrun the loop FORCE-CLOSES by injecting `</think>\n\n` ids
-        // (advancing the KV via `session.extend`) and switches to the answer
-        // phase.
+        // `request.max_tokens` bounds every generated token, reasoning
+        // included, in either phase. Within it the reasoning trace is also
+        // bounded by `request.reasoning_budget`; on overrun the loop
+        // FORCE-CLOSES by injecting `</think>\n\n` ids (advancing the KV via
+        // `session.extend`) and switches to the answer phase. A limit reached
+        // while reasoning ends the reply there, with `Length`.
         //
-        // THINKING-OFF byte-identity: when `enable_thinking` is false the
-        // phase starts at `Answer`, the detector / forced-close are never
-        // consulted (both gated on the reasoning phase), and the answer budget
-        // is the SAME post-emission `>= max_tokens` bound the pre-Part-4 loop
-        // used. The emitted token stream, count, and finish reason are
-        // therefore identical. (Guarded by `tests/reasoning_budget_test.rs`.)
+        // When `enable_thinking` is false the phase starts at `Answer` and the
+        // detector / forced-close are never consulted (both gated on the
+        // reasoning phase). (Guarded by `tests/reasoning_budget_test.rs`.)
         let mut phase = if request.enable_thinking {
             ReasoningPhase::Reasoning
         } else {
             ReasoningPhase::Answer
         };
         let mut reasoning_generated = 0usize;
-        let mut answer_generated = 0usize;
         // Detects the model-emitted `</think>` close. Resolves the marker's
         // token id(s) from the tokenizer ONCE (lazily) and matches by id when
         // the tokenizer encodes `</think>` as a single special token (the
@@ -2038,13 +2053,10 @@ impl EngineWorker {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            // Degenerate-answer-budget entry guard: in the answer phase with
-            // the budget already met and nothing emitted (the `max_tokens == 0`
-            // case, firing on iteration 0 with `answer_generated == 0`), fall
-            // out emitting nothing — byte-identical to the pre-Part-4
-            // `for _ in 0..0` (`{stop, completion=0}`). For `max_tokens >= 1`
-            // this never fires at entry (post-emission bound enforces it).
-            if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
+            // `max_tokens == 0`: fall out emitting nothing (`{stop,
+            // completion=0}`). For `max_tokens >= 1` this never fires (the
+            // post-emission bound below stops first).
+            if generated >= request.max_tokens {
                 break;
             }
             // FORCED-CLOSE: reasoning budget exhausted while still reasoning.
@@ -2057,7 +2069,9 @@ impl EngineWorker {
             {
                 let ids = close_ids.get_or_insert_with(|| self.tokenizer.encode("</think>\n\n"));
                 if !ids.is_empty() {
-                    if session.kv().seq_len() + ids.len() > self.config.max_seq_len {
+                    // `extend` writes the pending sampled token too, so the
+                    // bound is on the session's token count, not the KV's.
+                    if session.token_count() + ids.len() > self.config.max_seq_len {
                         finish_reason = FinishReason::Length;
                         break;
                     }
@@ -2151,7 +2165,7 @@ impl EngineWorker {
                 break;
             }
             #[cfg(feature = "fault-injection")]
-            crate::fault::before_decode_step(reasoning_generated + answer_generated);
+            crate::fault::before_decode_step(generated);
             let res = session.next_token(self.backend(), self.weights.as_ref());
             let token_id = match res {
                 Ok(id) => id,
@@ -2190,12 +2204,10 @@ impl EngineWorker {
             if bench_ids_on {
                 bench_token_ids.push(token_id);
             }
-            // Charge the token to the active phase. A token that carries (or
-            // completes) `</think>` is the last reasoning token; the answer
-            // begins on the following token.
-            match phase {
-                ReasoningPhase::Reasoning => reasoning_generated += 1,
-                ReasoningPhase::Answer => answer_generated += 1,
+            // A token that carries (or completes) `</think>` is the last
+            // reasoning token; the answer begins on the following token.
+            if phase == ReasoningPhase::Reasoning {
+                reasoning_generated += 1;
             }
 
             // EOS check (token-id based).
@@ -2204,9 +2216,8 @@ impl EngineWorker {
                     // Ignored: the token never reaches the decoder (its text
                     // would sit in the byte buffer between the halves of a
                     // pending character) and emits nothing, but it still
-                    // counts toward the answer budget checked after every
-                    // emission below.
-                    if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
+                    // counts toward `max_tokens`.
+                    if generated >= request.max_tokens {
                         finish_reason = FinishReason::Length;
                         break;
                     }
@@ -2284,10 +2295,8 @@ impl EngineWorker {
                 return;
             }
 
-            // ANSWER budget: bounds ONLY answer-phase tokens. On the
-            // thinking-off path `answer_generated == generated`, so this is the
-            // SAME stop as the pre-Part-4 loop.
-            if phase == ReasoningPhase::Answer && answer_generated >= request.max_tokens {
+            // Token limit: every generated token counts, reasoning included.
+            if generated >= request.max_tokens {
                 finish_reason = FinishReason::Length;
                 break;
             }

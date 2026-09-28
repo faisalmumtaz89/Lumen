@@ -4,12 +4,14 @@
 //! non-streaming response shape for one external API.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lumen_runtime::tooling::ToolSchemas;
 use serde_json::Value;
 
 use crate::error::ServerError;
+use crate::sse::ReplyTools;
 
 pub mod anthropic;
 pub mod image;
@@ -199,6 +201,176 @@ pub(crate) fn diag_anti_restate() -> bool {
 /// resolved in one module).
 pub(crate) fn resolve_enable_thinking(per_request: Option<bool>) -> bool {
     lumen_runtime::runtime_defaults::resolve_enable_thinking(per_request)
+}
+
+/// A request's reasoning effort level, the one both APIs share (Anthropic
+/// `output_config.effort`, OpenAI `reasoning_effort`), as the chat template's
+/// `reasoning_effort`. `low` and `medium` pass through; `high`, `xhigh` and
+/// `max` keep the template's default, which is its highest level (`xhigh` on
+/// Qwen3.8), so the variable is left unset. `None` for any other level.
+pub(crate) fn template_reasoning_effort(level: &str) -> Option<Option<&'static str>> {
+    match level {
+        "low" => Some(Some("low")),
+        "medium" => Some(Some("medium")),
+        "high" | "xhigh" | "max" => Some(None),
+        _ => None,
+    }
+}
+
+/// A request's tool choice, as both chat APIs express it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolChoice {
+    /// The model decides.
+    Auto,
+    /// No tool call: the prompt offers no tools.
+    None,
+    /// A call to some offered tool.
+    Required,
+    /// A call to this tool.
+    Named(String),
+}
+
+impl ToolChoice {
+    /// Refuse a choice the request cannot honour: a named tool it does not
+    /// offer or whose name is not one both APIs allow (1 to 64 letters, digits,
+    /// `_`, `-`; the name goes into the prompt, see [`Self::response_prefix`]), a
+    /// required call with no tools, or a forced call while thinking is on (the
+    /// reply opens with the call) or without the model's chat template, whose
+    /// tool-call protocol the opener follows.
+    pub(crate) fn check<'a>(
+        &self,
+        mut tools: impl Iterator<Item = &'a str>,
+        thinking: bool,
+        templated: bool,
+    ) -> Result<(), ServerError> {
+        let refusal = match self {
+            Self::Auto | Self::None => return Ok(()),
+            Self::Required if tools.next().is_none() => {
+                "tool_choice requires a tool call but `tools` is empty"
+            }
+            Self::Named(name)
+                if name.is_empty()
+                    || name.len() > 64
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+            {
+                "tool_choice names a tool whose name is not 1 to 64 letters, digits, `_` or `-`"
+            }
+            Self::Named(name) if !tools.any(|t| t == name) => {
+                "tool_choice names no tool that `tools` offers"
+            }
+            _ if thinking => "tool_choice cannot force a tool call while thinking is on",
+            _ if !templated => {
+                "tool_choice cannot force a tool call without the model's chat template"
+            }
+            _ => return Ok(()),
+        };
+        Err(ServerError::bad_request_field(
+            refusal,
+            "tool_choice",
+            "invalid_value",
+        ))
+    }
+
+    /// Whether the prompt offers the tools: not for [`Self::None`].
+    pub(crate) fn offers_tools(&self) -> bool {
+        *self != Self::None
+    }
+
+    /// The tool calls a reply may carry: none under [`Self::None`] (tool-call
+    /// markup stays text), only calls to the named tool under
+    /// [`Self::Named`], and at most one when `single`.
+    pub(crate) fn reply_tools(&self, schemas: ToolSchemas, single: bool) -> ReplyTools {
+        ReplyTools {
+            schemas: Arc::new(schemas),
+            parsed: *self != Self::None,
+            only: match self {
+                Self::Named(name) => Some(name.clone()),
+                _ => None,
+            },
+            single,
+        }
+    }
+
+    /// The text a forced reply starts with: the model's tool-call opener, with
+    /// the tool's name when one is named. It ends the prompt, so the model
+    /// continues the call, and is reported as the start of the reply.
+    pub(crate) fn response_prefix(&self) -> String {
+        use lumen_runtime::tooling::forced_tool_call_prefix;
+        match self {
+            Self::Auto | Self::None => String::new(),
+            Self::Required => forced_tool_call_prefix(None),
+            Self::Named(name) => forced_tool_call_prefix(Some(name)),
+        }
+    }
+}
+
+/// A request field that must stay at its default, because any other value asks
+/// for output this server cannot produce. `accepts` says whether a value asks
+/// for nothing more than the default does; `refused` names what it asks for.
+pub(crate) struct Unsupported {
+    pub field: &'static str,
+    pub accepts: fn(&Value) -> bool,
+    pub refused: &'static str,
+}
+
+/// Whether `value` is the number `n`, however it is written (`1`, `1.0`).
+pub(crate) fn is_number(value: &Value, n: f64) -> bool {
+    value.as_f64() == Some(n)
+}
+
+/// Whether a `logit_bias` map biases nothing.
+pub(crate) fn is_zero_bias(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|m| m.values().all(|b| is_number(b, 0.0)))
+}
+
+/// The 400 for a field whose value asks for something this server cannot do.
+pub(crate) fn unsupported(field: &str, refused: &str) -> ServerError {
+    ServerError::bad_request_field(
+        format!("{field}: {refused} is not supported"),
+        field,
+        "invalid_value",
+    )
+}
+
+/// Every endpoint ignores a field it does not use, as long as ignoring it cannot
+/// change the answer. The fields in `table` could, so a value other than null or
+/// one they accept is refused rather than silently dropped. `other` holds the
+/// fields the request does not declare.
+pub(crate) fn refuse_unsupported(
+    other: &serde_json::Map<String, Value>,
+    table: &[Unsupported],
+) -> Result<(), ServerError> {
+    for u in table {
+        if let Some(value) = other.get(u.field) {
+            if !value.is_null() && !(u.accepts)(value) {
+                return Err(unsupported(u.field, u.refused));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A request's reasoning effort field as its level: `None` when absent or null,
+/// a 400 naming `param` when it is not a string. The level itself is checked by
+/// the caller, since each API lists its own.
+pub(crate) fn effort_level<'a>(
+    value: Option<&'a Value>,
+    param: &str,
+    levels: &str,
+) -> Result<Option<&'a str>, ServerError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(level)) => Ok(Some(level)),
+        Some(_) => Err(ServerError::bad_request_field(
+            format!("{param} must be one of {levels}"),
+            param,
+            "invalid_type",
+        )),
+    }
 }
 
 /// Tool-call ids: a 64-bit namespace drawn at random when the generator is

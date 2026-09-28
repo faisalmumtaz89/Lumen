@@ -217,6 +217,7 @@ fn job() -> JobRequest {
         suffix_threshold: 32,
         enable_thinking: false,
         reasoning_budget: 0,
+        response_prefix: String::new(),
     }
 }
 
