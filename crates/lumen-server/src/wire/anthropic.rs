@@ -53,16 +53,39 @@ pub struct AnthropicTool {
     pub input_schema: Value,
 }
 
-/// Anthropic extended-thinking config: `{"type": "enabled"|"disabled",
+/// Anthropic extended-thinking config: `{"type": "enabled"|"adaptive"|"disabled",
 /// "budget_tokens": N}`. Permissive (not `deny_unknown_fields`) so future
-/// Anthropic keys pass through. `type == "enabled"` turns reasoning on;
-/// anything else (including `"disabled"`) turns it off.
+/// Anthropic keys such as `display` pass through. An unknown `type` is refused
+/// rather than read as off.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
-    pub thinking_type: String,
+    pub thinking_type: ThinkingType,
     #[serde(default)]
     pub budget_tokens: Option<usize>,
+}
+
+/// `thinking.type`. `Adaptive` leaves the decision to think to the model; the
+/// model always opens a reasoning block, so it is served as `Enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum ThinkingType {
+    Enabled,
+    Adaptive,
+    Disabled,
+}
+
+impl TryFrom<String> for ThinkingType {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, String> {
+        match value.as_str() {
+            "enabled" => Ok(Self::Enabled),
+            "adaptive" => Ok(Self::Adaptive),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err("unknown thinking type, expected `enabled`, `adaptive` or `disabled`".into()),
+        }
+    }
 }
 
 /// A `/v1/messages` request. Fields this server does not use (`metadata`,
@@ -91,8 +114,9 @@ pub struct MessagesRequest {
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub tools: Vec<AnthropicTool>,
-    /// Anthropic extended-thinking control. `Some({type:"enabled"})` opens the
-    /// `<think>` block (reasoning surfaced as a `thinking` content block);
+    /// Anthropic extended-thinking control. `Some({type:"enabled"})` or
+    /// `Some({type:"adaptive"})` opens the `<think>` block (reasoning surfaced
+    /// as a `thinking` content block);
     /// `Some({type:"disabled"})` forces it closed; `None` defers to the
     /// `LUMEN_CHAT_ENABLE_THINKING` env override then the process default.
     #[serde(default)]
@@ -105,11 +129,14 @@ pub struct MessagesRequest {
 
 impl MessagesRequest {
     /// Resolve the per-request reasoning toggle via the single shared resolver.
-    /// The Anthropic `thinking.type == "enabled"` maps to `Some(true)`, any
-    /// other explicit value to `Some(false)`, and an absent `thinking` field to
-    /// `None` (defer to env/default).
+    /// `thinking.type` `enabled` or `adaptive` maps to `Some(true)`, `disabled`
+    /// to `Some(false)`, and an absent `thinking` field to `None` (defer to
+    /// env/default).
     pub fn resolve_thinking(&self) -> bool {
-        let per_request = self.thinking.as_ref().map(|t| t.thinking_type == "enabled");
+        let per_request = self
+            .thinking
+            .as_ref()
+            .map(|t| t.thinking_type != ThinkingType::Disabled);
         super::resolve_enable_thinking(per_request)
     }
 
@@ -1158,7 +1185,7 @@ mod tests {
             stop_sequences: vec![],
             tools: vec![],
             thinking: Some(ThinkingConfig {
-                thinking_type: "enabled".into(),
+                thinking_type: ThinkingType::Enabled,
                 budget_tokens: None,
             }),
             output_config: None,
@@ -1166,12 +1193,45 @@ mod tests {
         assert!(enabled.resolve_thinking());
         let disabled = MessagesRequest {
             thinking: Some(ThinkingConfig {
-                thinking_type: "disabled".into(),
+                thinking_type: ThinkingType::Disabled,
                 budget_tokens: None,
             }),
             ..enabled.clone()
         };
         assert!(!disabled.resolve_thinking());
+    }
+
+    #[test]
+    fn adaptive_thinking_is_on_and_an_unknown_type_is_refused() {
+        let request = |thinking: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 1, "messages": [], "thinking": thinking,
+            }))
+        };
+        let adaptive = request(json!({"type": "adaptive", "display": "omitted"})).unwrap();
+        assert!(adaptive.resolve_thinking());
+        assert!(request(json!({"type": "enabled", "budget_tokens": 1024}))
+            .unwrap()
+            .resolve_thinking());
+        assert!(!request(json!({"type": "disabled"}))
+            .unwrap()
+            .resolve_thinking());
+        let unknown = request(json!({"type": "sometimes"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("unknown thinking type, expected") && !unknown.contains("sometimes"),
+            "{unknown}"
+        );
+        for not_a_string in [json!(1), json!(null), json!({"adaptive": null})] {
+            let err = request(json!({"type": not_a_string}))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("invalid type:") && err.contains("expected a string"),
+                "{err}"
+            );
+        }
     }
 
     #[tokio::test]
