@@ -195,6 +195,9 @@ fn build_env(
 /// `add_generation_prompt` appends the assistant tail; `enable_thinking`
 /// selects the closed empty-`<think>` tail (`false`, the default) or the open
 /// `<think>` tail (`true`), matching the template's `enable_thinking` branch.
+/// `reasoning_effort`, when given, is passed to the template as
+/// `reasoning_effort` (Qwen3.8 reads `low`, `medium` or `xhigh` while thinking
+/// is on); `None` leaves the variable undefined, so the template's default holds.
 ///
 /// A `system` message after the first message stays where it was sent, so the
 /// prompt before it is unchanged and instructions apply from that point on. A
@@ -213,6 +216,7 @@ pub fn render_chat_prompt(
     tools: &serde_json::Value,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
 ) -> Result<String, ChatTemplateError> {
     let env = build_env(template_src, None)?;
     let rendered = render(
@@ -221,6 +225,7 @@ pub fn render_chat_prompt(
         tools,
         add_generation_prompt,
         enable_thinking,
+        reasoning_effort,
     );
     let later_systems = later_system_contents(messages);
     if later_systems.is_empty() {
@@ -230,7 +235,7 @@ pub fn render_chat_prompt(
     let no_tools = serde_json::Value::Array(Vec::new());
     match rendered {
         Ok(prompt) => {
-            let in_place = render(&env, &probe, &no_tools, false, enable_thinking)
+            let in_place = render(&env, &probe, &no_tools, false, enable_thinking, None)
                 .is_ok_and(|p| keeps_probe_systems_in_place(&env, &p, enable_thinking));
             if in_place {
                 Ok(prompt)
@@ -245,7 +250,7 @@ pub fn render_chat_prompt(
             // The probe's rejections must all carry one message, and the
             // request's rejections must all carry that same message.
             let framed = marking
-                .render(&env, &probe, &no_tools, false, enable_thinking)
+                .render(&env, &probe, &no_tools, false, enable_thinking, None)
                 .filter(|(p, raised)| {
                     raised.iter().all(|m| *m == raised[0])
                         && keeps_probe_systems_in_place(&env, p, enable_thinking)
@@ -258,6 +263,7 @@ pub fn render_chat_prompt(
                             tools,
                             add_generation_prompt,
                             enable_thinking,
+                            reasoning_effort,
                         )
                         .filter(|(_, raised)| raised.iter().all(|m| *m == probe_raised[0]))
                 });
@@ -272,15 +278,21 @@ fn render(
     tools: &serde_json::Value,
     add_generation_prompt: bool,
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
 ) -> Result<String, ChatTemplateError> {
     let tmpl = env
         .get_template("chat")
         .map_err(|e| ChatTemplateError::Compile(format!("{e:#}")))?;
+    let effort = match reasoning_effort {
+        Some(effort) => minijinja::context! { reasoning_effort => effort },
+        None => minijinja::context! {},
+    };
     let ctx = minijinja::context! {
         messages => Value::from_serialize(messages),
         tools => Value::from_serialize(tools),
         add_generation_prompt => add_generation_prompt,
         enable_thinking => enable_thinking,
+        ..effort
     };
     tmpl.render(ctx)
         .map_err(|e| ChatTemplateError::Render(format!("{e:#}")))
@@ -335,6 +347,7 @@ fn keeps_probe_systems_in_place(
             &no_tools,
             false,
             enable_thinking,
+            None,
         ),
         system_turn(env, &PROBE[3].1.into()),
         system_turn(env, &PROBE[5].1.into()),
@@ -393,6 +406,7 @@ impl<'s> Marking<'s> {
         tools: &serde_json::Value,
         add_generation_prompt: bool,
         enable_thinking: bool,
+        reasoning_effort: Option<&str>,
     ) -> Option<(String, Vec<String>)> {
         self.raised.lock().unwrap().clear();
         let marked = render(
@@ -401,6 +415,7 @@ impl<'s> Marking<'s> {
             tools,
             add_generation_prompt,
             enable_thinking,
+            reasoning_effort,
         )
         .ok()?;
         let raised = std::mem::take(&mut *self.raised.lock().unwrap());
@@ -431,9 +446,18 @@ fn system_turn(env: &Environment<'_>, content: &serde_json::Value) -> Option<Str
         &no_tools,
         false,
         false,
+        None,
     )
     .ok()?;
-    let without = render(env, &serde_json::json!([user]), &no_tools, false, false).ok()?;
+    let without = render(
+        env,
+        &serde_json::json!([user]),
+        &no_tools,
+        false,
+        false,
+        None,
+    )
+    .ok()?;
     with.strip_suffix(without.as_str()).map(str::to_owned)
 }
 
@@ -457,6 +481,7 @@ pub fn render_single_turn(
         &serde_json::Value::Array(Vec::new()),
         true,
         enable_thinking,
+        None,
     )
 }
 
@@ -528,6 +553,7 @@ mod tests {
             &serde_json::Value::Array(vec![]),
             false,
             false,
+            None,
         );
         match out {
             Err(ChatTemplateError::Render(m)) => assert!(m.contains("boom"), "got: {m}"),
@@ -542,8 +568,15 @@ mod tests {
         let tmpl = "{{- 'yes' if messages[0].content.startswith('<tool_response>') else 'no' }}";
         let msgs =
             serde_json::json!([{"role": "user", "content": "<tool_response>x</tool_response>"}]);
-        let out = render_chat_prompt(tmpl, &msgs, &serde_json::Value::Array(vec![]), false, false)
-            .unwrap();
+        let out = render_chat_prompt(
+            tmpl,
+            &msgs,
+            &serde_json::Value::Array(vec![]),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(out, "yes");
     }
 
@@ -646,9 +679,10 @@ mod tests {
         for messages in later_system_conversations() {
             for tools in [&no_tools, &weather_tool()] {
                 for thinking in [false, true] {
-                    let want = render_chat_prompt(&reference, &messages, tools, true, thinking)
-                        .expect("reference renders");
-                    let got = render_chat_prompt(template, &messages, tools, true, thinking)
+                    let want =
+                        render_chat_prompt(&reference, &messages, tools, true, thinking, None)
+                            .expect("reference renders");
+                    let got = render_chat_prompt(template, &messages, tools, true, thinking, None)
                         .unwrap_or_else(|e| panic!("{messages}: {e}"));
                     assert_eq!(got, want, "{messages} thinking={thinking}");
                 }
@@ -676,14 +710,22 @@ mod tests {
         ]);
         let mut with_notice = messages.as_array().unwrap().clone();
         with_notice.push(serde_json::json!({"role": "system", "content": "Be brief."}));
-        let before =
-            render_chat_prompt(QWEN38_TEMPLATE, &messages, &weather_tool(), false, true).unwrap();
+        let before = render_chat_prompt(
+            QWEN38_TEMPLATE,
+            &messages,
+            &weather_tool(),
+            false,
+            true,
+            None,
+        )
+        .unwrap();
         let after = render_chat_prompt(
             QWEN38_TEMPLATE,
             &serde_json::Value::Array(with_notice),
             &weather_tool(),
             true,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -707,6 +749,7 @@ mod tests {
             &serde_json::json!([]),
             true,
             false,
+            None,
         ) {
             Err(ChatTemplateError::Render(m)) => {
                 assert!(m.contains("No user query found"), "got: {m}")
@@ -722,8 +765,15 @@ mod tests {
             {"role": "user", "content": "u"},
             {"role": "system", "content": "B"},
         ]);
-        let out =
-            render_chat_prompt(MINI_TMPL, &messages, &serde_json::json!([]), false, false).unwrap();
+        let out = render_chat_prompt(
+            MINI_TMPL,
+            &messages,
+            &serde_json::json!([]),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             out,
             "<|im_start|>system\nA<|im_end|>\n<|im_start|>user\nu<|im_end|>\n<|im_start|>system\nB<|im_end|>\n"
@@ -743,10 +793,16 @@ mod tests {
         for tmpl in [hoists, drops] {
             // Without a later system message the template renders normally.
             let first_two = serde_json::Value::Array(messages.as_array().unwrap()[..2].to_vec());
-            assert!(
-                render_chat_prompt(tmpl, &first_two, &serde_json::json!([]), false, false).is_ok()
-            );
-            match render_chat_prompt(tmpl, &messages, &serde_json::json!([]), false, false) {
+            assert!(render_chat_prompt(
+                tmpl,
+                &first_two,
+                &serde_json::json!([]),
+                false,
+                false,
+                None
+            )
+            .is_ok());
+            match render_chat_prompt(tmpl, &messages, &serde_json::json!([]), false, false, None) {
                 Err(ChatTemplateError::Render(m)) => {
                     assert!(m.contains("where it was sent"), "got: {m}")
                 }
@@ -800,7 +856,8 @@ mod tests {
             ),
         ];
         for (tmpl, messages) in cases {
-            let out = render_chat_prompt(&tmpl, &messages, &serde_json::json!([]), false, false);
+            let out =
+                render_chat_prompt(&tmpl, &messages, &serde_json::json!([]), false, false, None);
             assert!(out.is_err(), "{tmpl}: expected refusal, got {out:?}");
         }
     }
@@ -815,8 +872,10 @@ mod tests {
             {"role": "system", "content": "N"},
         ]);
         // Without tools the later system renders in place.
-        assert!(render_chat_prompt(&tmpl, &messages, &serde_json::json!([]), true, false).is_ok());
-        match render_chat_prompt(&tmpl, &messages, &weather_tool(), true, false) {
+        assert!(
+            render_chat_prompt(&tmpl, &messages, &serde_json::json!([]), true, false, None).is_ok()
+        );
+        match render_chat_prompt(&tmpl, &messages, &weather_tool(), true, false, None) {
             Err(ChatTemplateError::Render(m)) => {
                 assert!(m.contains("Unsupported tools."), "got: {m}")
             }
@@ -840,6 +899,7 @@ mod tests {
                 tools,
                 add_generation_prompt,
                 enable_thinking,
+                None,
             ) {
                 Ok(got) if got == expected => {}
                 Ok(got) => {

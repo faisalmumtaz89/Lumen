@@ -44,7 +44,7 @@ POST /v1/images/generations # Text to image (`--features image` builds with
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
 
-`/v1/messages` ignores fields it does not use, such as `metadata` or `output_config.effort`, so Anthropic clients that attach them are served. A structured-output request (`output_config.format`) is refused with a 400, since decoding cannot be constrained to a schema. `/v1/chat/completions` and `/v1/completions` refuse an unknown field with a 400.
+`/v1/messages` ignores fields it does not use, such as `metadata`, so Anthropic clients that attach them are served. A structured-output request (`output_config.format`) is refused with a 400, since decoding cannot be constrained to a schema. `/v1/chat/completions` and `/v1/completions` refuse an unknown field with a 400.
 
 A system message after the start of the conversation (`role: "system"` inside `/v1/messages` `messages`, or any but the first message of `/v1/chat/completions`) stays where it was sent, so its instructions apply from that point on and the prompt before it is unchanged. It renders the way the model's chat template renders it; a template that only accepts a system message at the start (Qwen3.5, Qwen3.8) gets it as a system turn in that template's own framing. Lumen first renders a probe conversation with the template and refuses the request with a 400 when the probe shows the template moving such a message to the start, dropping it or rendering it as another role.
 
@@ -86,7 +86,7 @@ The reasoning budget is **separate from `max_tokens`** (industry-convergent with
 
 | Surface | Enable thinking | Separate budget | Reasoning output |
 |---|---|---|---|
-| OpenAI `/v1/chat/completions` | top-level `enable_thinking: true`, or vLLM/SGLang-compatible `chat_template_kwargs: {"enable_thinking": true}` (top-level wins) | `reasoning_budget` | streamed as `delta.reasoning_content`; non-stream as `message.reasoning_content` (omitted when empty) |
+| OpenAI `/v1/chat/completions` | top-level `enable_thinking: true`, or vLLM/SGLang-compatible `chat_template_kwargs: {"enable_thinking": true}` (top-level wins), or `reasoning_effort` other than `none` | `reasoning_budget` | streamed as `delta.reasoning_content`; non-stream as `message.reasoning_content` (omitted when empty) |
 | Anthropic `/v1/messages` | `thinking: {"type": "enabled"}` or `{"type": "adaptive"}` (`"disabled"` = off, absent = the default; any other type is refused with a 400) | `thinking.budget_tokens` → `reasoning_budget` | a `{"type": "thinking", "thinking": ...}` content block; streamed via `thinking_delta` |
 | CLI `lumen run` | `--think` (and `--no-think` forces off, overriding the env var) | — | reasoning printed to stderr, answer to stdout |
 
@@ -104,6 +104,8 @@ curl -fsS http://localhost:8000/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-9b","max_tokens":512,"messages":[{"role":"user","content":"Plan a 3-day trip"}],"thinking":{"type":"enabled","budget_tokens":1024}}'
 ```
+
+A reasoning effort sets how much the model reasons while thinking is on: `output_config.effort` on `/v1/messages` and `reasoning_effort` on `/v1/chat/completions`. The levels both APIs share map the same way: `low` and `medium` reach the chat template as its `reasoning_effort` (Qwen3.8 instructs brief reasoning at `low`), while `high`, `xhigh`, `max` and an absent effort keep the template's default (`xhigh` on Qwen3.8). OpenAI's `minimal` runs as `low`. On `/v1/chat/completions` an effort also asks for reasoning, and `none` turns it off, unless `enable_thinking` or `chat_template_kwargs.enable_thinking` is given. Any other value is refused with a 400.
 
 `LUMEN_CHAT_ENABLE_THINKING=1` (accepts `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` for off) flips the default for requests that do not specify the toggle.
 

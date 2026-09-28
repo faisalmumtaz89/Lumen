@@ -89,9 +89,9 @@ impl TryFrom<String> for ThinkingType {
 }
 
 /// A `/v1/messages` request. Fields this server does not use (`metadata`,
-/// `context_management`, `output_config.effort`, and the others Anthropic
-/// clients attach) are ignored, not rejected; a structured-output request
-/// (`output_config.format`) is refused.
+/// `context_management`, and the others Anthropic clients attach) are ignored,
+/// not rejected; a structured-output request (`output_config.format`) is
+/// refused.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
@@ -121,10 +121,12 @@ pub struct MessagesRequest {
     /// `LUMEN_CHAT_ENABLE_THINKING` env override then the process default.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
-    /// Read only for `format`: decoding cannot be constrained to a schema, so
-    /// a structured-output request is refused rather than answered in free text.
+    /// Read for `effort` (see [`Self::reasoning_effort`]) and `format`:
+    /// decoding cannot be constrained to a schema, so a non-null `format` is
+    /// refused rather than answered in free text. Other keys are ignored like
+    /// unknown top-level fields; anything but an object is refused.
     #[serde(default)]
-    pub output_config: Option<Value>,
+    pub output_config: Option<serde_json::Map<String, Value>>,
 }
 
 impl MessagesRequest {
@@ -140,6 +142,25 @@ impl MessagesRequest {
         super::resolve_enable_thinking(per_request)
     }
 
+    /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
+    /// the chat template's `reasoning_effort`, mapped by the shared
+    /// [`super::template_reasoning_effort`]. Any other value is refused.
+    fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
+        const PARAM: &str = "output_config.effort";
+        const LEVELS: &str = "`low`, `medium`, `high`, `xhigh` or `max`";
+        let effort = self.output_config.as_ref().and_then(|c| c.get("effort"));
+        match super::effort_level(effort, PARAM, LEVELS)? {
+            None => Ok(None),
+            Some(level) => super::template_reasoning_effort(level).ok_or_else(|| {
+                ServerError::bad_request_field(
+                    format!("{PARAM} must be one of {LEVELS}"),
+                    PARAM,
+                    "invalid_value",
+                )
+            }),
+        }
+    }
+
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
         if self
             .output_config
@@ -153,6 +174,7 @@ impl MessagesRequest {
                 "invalid_value",
             ));
         }
+        let reasoning_effort = self.reasoning_effort()?;
         let enable_thinking = self.resolve_thinking();
         // Per-request reasoning budget (Anthropic `thinking.budget_tokens`);
         // falls back to the shared default. Carried for Part 4 (decode loop).
@@ -188,6 +210,7 @@ impl MessagesRequest {
                 &self.messages,
                 &self.tools,
                 enable_thinking,
+                reasoning_effort,
                 tmpl,
             )?,
             None => {
@@ -232,6 +255,20 @@ impl MessagesRequest {
     }
 }
 
+/// The prompt `into_job` renders for `req` with `template`.
+#[cfg(test)]
+pub(crate) fn render_for_test(req: &MessagesRequest, template: &str) -> String {
+    render_prompt_templated(
+        None,
+        &req.messages,
+        &req.tools,
+        req.resolve_thinking(),
+        req.reasoning_effort().unwrap(),
+        template,
+    )
+    .unwrap()
+}
+
 /// Build the runtime [`ToolSchemas`] from Anthropic tool defs (used by the
 /// router to type native `<parameter>` values in the collectors, mirroring the
 /// OpenAI surface).
@@ -260,6 +297,7 @@ fn render_prompt_templated(
     messages: &[AnthropicMessage],
     tools: &[AnthropicTool],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     template: &str,
 ) -> Result<String, ServerError> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
@@ -332,6 +370,7 @@ fn render_prompt_templated(
         &Value::Array(tools_json),
         true,
         enable_thinking,
+        reasoning_effort,
     )
     .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
@@ -1151,7 +1190,8 @@ mod tests {
                 content: serde_json::json!([{"type": "text", "text": "Be brief."}]),
             },
         ];
-        let out = render_prompt_templated(Some("Sys"), &messages, &[], false, template).unwrap();
+        let out =
+            render_prompt_templated(Some("Sys"), &messages, &[], false, None, template).unwrap();
         assert!(
             out.starts_with("<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>system\nAnswer in French.<|im_end|>\n<|im_start|>assistant\n"),
             "{out}"
@@ -1595,6 +1635,50 @@ mod tests {
         assert_eq!(plain.max_tokens, extended.max_tokens);
     }
 
+    #[test]
+    fn effort_reaches_the_template_as_reasoning_effort() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let request = |output_config: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"}, "output_config": output_config,
+            }))
+            .unwrap()
+        };
+        let preamble = |output_config: Value| {
+            let req = request(output_config);
+            let effort = req.reasoning_effort().unwrap();
+            let prompt =
+                render_prompt_templated(None, &req.messages, &[], true, effort, template).unwrap();
+            prompt
+                .split("<|im_end|>")
+                .next()
+                .filter(|head| head.starts_with("<|im_start|>system\n"))
+                .map(str::to_owned)
+        };
+        let xhigh = preamble(json!(null));
+        assert!(xhigh
+            .as_deref()
+            .unwrap()
+            .contains("Reasoning effort is set to xhigh"));
+        for level in ["high", "xhigh", "max"] {
+            assert_eq!(preamble(json!({"effort": level})), xhigh, "{level}");
+        }
+        assert!(preamble(json!({"effort": "low"}))
+            .unwrap()
+            .contains("Reasoning effort is set to low"));
+        assert_eq!(preamble(json!({"effort": "medium"})), None);
+        for bad in [json!("minimal"), json!(1)] {
+            match request(json!({"effort": bad})).reasoning_effort() {
+                Err(ServerError::BadRequest { param, .. }) => {
+                    assert_eq!(param.as_deref(), Some("output_config.effort"))
+                }
+                other => panic!("{bad}: expected a 400, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn messages_output_format_is_refused_not_ignored() {
         let engine = EngineHandle::new_for_test(4096);
@@ -1630,6 +1714,15 @@ mod tests {
             json!({"format": null}),
         ] {
             assert!(request(accepted).into_job(&engine).is_ok());
+        }
+        for not_an_object in [json!("low"), json!([]), json!(["low", null])] {
+            let body = json!({
+                "model": "m", "max_tokens": 16, "messages": [], "output_config": not_an_object
+            });
+            let err = serde_json::from_value::<MessagesRequest>(body)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("expected a map"), "{err}");
         }
     }
 

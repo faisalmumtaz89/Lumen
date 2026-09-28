@@ -201,6 +201,39 @@ pub(crate) fn resolve_enable_thinking(per_request: Option<bool>) -> bool {
     lumen_runtime::runtime_defaults::resolve_enable_thinking(per_request)
 }
 
+/// A request's reasoning effort level, the one both APIs share (Anthropic
+/// `output_config.effort`, OpenAI `reasoning_effort`), as the chat template's
+/// `reasoning_effort`. `low` and `medium` pass through; `high`, `xhigh` and
+/// `max` keep the template's default, which is its highest level (`xhigh` on
+/// Qwen3.8), so the variable is left unset. `None` for any other level.
+pub(crate) fn template_reasoning_effort(level: &str) -> Option<Option<&'static str>> {
+    match level {
+        "low" => Some(Some("low")),
+        "medium" => Some(Some("medium")),
+        "high" | "xhigh" | "max" => Some(None),
+        _ => None,
+    }
+}
+
+/// A request's reasoning effort field as its level: `None` when absent or null,
+/// a 400 naming `param` when it is not a string. The level itself is checked by
+/// the caller, since each API lists its own.
+pub(crate) fn effort_level<'a>(
+    value: Option<&'a Value>,
+    param: &str,
+    levels: &str,
+) -> Result<Option<&'a str>, ServerError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(level)) => Ok(Some(level)),
+        Some(_) => Err(ServerError::bad_request_field(
+            format!("{param} must be one of {levels}"),
+            param,
+            "invalid_type",
+        )),
+    }
+}
+
 /// Tool-call ids: a 64-bit namespace drawn at random when the generator is
 /// made, then a count. Clients keep every earlier turn's ids in their history
 /// and treat a repeated one as the same call, and a conversation outlives the

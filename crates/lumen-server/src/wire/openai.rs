@@ -147,6 +147,11 @@ pub struct ChatCompletionRequest {
     /// The top-level `enable_thinking` field wins when both are present.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenAI reasoning effort: `none`, `minimal`, `low`, `medium`, `high`,
+    /// `xhigh` or `max`. See [`Self::reasoning_effort`] and
+    /// [`Self::resolve_thinking`].
+    #[serde(default)]
+    pub reasoning_effort: Option<Value>,
 }
 
 /// OpenAI `stream_options` object (streaming requests only). Strict like the
@@ -173,16 +178,47 @@ impl ChatCompletionRequest {
 
     /// Resolve the per-request reasoning toggle using the single shared
     /// resolver. Precedence: top-level `enable_thinking` → vLLM
-    /// `chat_template_kwargs.enable_thinking` → env override → default. The
-    /// per-request `Option` is collapsed here, then handed to the one resolver
-    /// so the env/default fall-through is identical to every other surface.
+    /// `chat_template_kwargs.enable_thinking` → `reasoning_effort` (`none`
+    /// means no reasoning, any other level asks for it) → env override →
+    /// default. The per-request `Option` is collapsed here, then handed to the
+    /// one resolver so the env/default fall-through is identical to every
+    /// other surface.
     pub fn resolve_thinking(&self) -> bool {
-        let per_request = self.enable_thinking.or_else(|| {
-            self.chat_template_kwargs
-                .as_ref()
-                .and_then(|k| k.enable_thinking)
-        });
+        let per_request = self
+            .enable_thinking
+            .or_else(|| {
+                self.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|k| k.enable_thinking)
+            })
+            .or_else(|| {
+                self.reasoning_effort
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(|e| e != "none")
+            });
         super::resolve_enable_thinking(per_request)
+    }
+
+    /// `reasoning_effort` as the chat template's `reasoning_effort`: the
+    /// levels shared with `/v1/messages` map through
+    /// [`super::template_reasoning_effort`], `minimal` runs as `low` (the
+    /// closest level a template offers) and `none` needs none (thinking is off,
+    /// see [`Self::resolve_thinking`]). Any other value is refused.
+    fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
+        const PARAM: &str = "reasoning_effort";
+        const LEVELS: &str = "`none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`";
+        match super::effort_level(self.reasoning_effort.as_ref(), PARAM, LEVELS)? {
+            None | Some("none") => Ok(None),
+            Some("minimal") => Ok(Some("low")),
+            Some(level) => super::template_reasoning_effort(level).ok_or_else(|| {
+                ServerError::bad_request_field(
+                    format!("{PARAM} must be one of {LEVELS}"),
+                    PARAM,
+                    "invalid_value",
+                )
+            }),
+        }
     }
 
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
@@ -197,12 +233,14 @@ impl ChatCompletionRequest {
                 "invalid_value",
             ));
         }
+        let reasoning_effort = self.reasoning_effort()?;
         let enable_thinking = self.resolve_thinking();
         let prompt = render_chat_prompt(
             &self.messages,
             &self.tools,
             enable_thinking,
             engine.chat_template(),
+            reasoning_effort,
         )?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
@@ -488,6 +526,7 @@ fn render_chat_prompt(
     tools: &[ToolDef],
     enable_thinking: bool,
     chat_template: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> Result<String, ServerError> {
     // Prefer the model's EMBEDDED chat template (Qwen3.5's native tool-calling
     // protocol) rendered via the shared Jinja engine — the SAME renderer the CLI
@@ -495,7 +534,13 @@ fn render_chat_prompt(
     // transcript below when no template is embedded (older LBCs / synthetic test
     // tokenizers), keeping those paths byte-identical to today.
     if let Some(template) = chat_template {
-        return render_chat_prompt_templated(messages, tools, enable_thinking, template);
+        return render_chat_prompt_templated(
+            messages,
+            tools,
+            enable_thinking,
+            reasoning_effort,
+            template,
+        );
     }
     render_chat_prompt_manual(messages, tools, enable_thinking)
 }
@@ -514,6 +559,7 @@ fn render_chat_prompt_templated(
     messages: &[ChatMessage],
     tools: &[ToolDef],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     template: &str,
 ) -> Result<String, ServerError> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len());
@@ -563,6 +609,7 @@ fn render_chat_prompt_templated(
         &Value::Array(tools_json),
         true,
         enable_thinking,
+        reasoning_effort,
     )
     .map_err(|e| ServerError::bad_request(format!("chat template render failed: {e}")))
 }
@@ -1988,7 +2035,7 @@ mod tests {
             "get_weather",
             r#"{"city": "Riyadh", "unit": "celsius"}"#,
         )];
-        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "fn=get_weather city=Riyadh unit=celsius");
     }
 
@@ -2005,7 +2052,7 @@ mod tests {
             tool_msg("B"),
             assistant_msg("done"),
         ];
-        let out = render_chat_prompt(&messages, &[], false, Some(tmpl)).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "<user>hi<user>[A][B]</user><assistant>done");
     }
 
@@ -2015,7 +2062,8 @@ mod tests {
         // and the flattened user content to the template.
         let tmpl = "{%- if tools %}TOOLS={{ tools[0].function.name }}{%- endif %} U={{ messages[-1].content }}";
         let messages = vec![user_msg("weather?")];
-        let out = render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl)).unwrap();
+        let out =
+            render_chat_prompt(&messages, &[weather_tool_def()], false, Some(tmpl), None).unwrap();
         assert_eq!(out, "TOOLS=get_weather U=weather?");
     }
 
@@ -2024,7 +2072,7 @@ mod tests {
         // enable_thinking=false (the default) MUST emit the closed empty-think
         // tail, byte-identical to the pre-reasoning-control behaviour.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         // CLI's `apply_chat_template_with_system("Hello", None)` for qwen35
         // post- produces exactly this string (see crates/lumen-cli
         // /src/tokenize.rs:273-292).
@@ -2038,7 +2086,7 @@ mod tests {
         // enable_thinking=true MUST emit the OPEN `<think>\n` tail so the
         // model produces a reasoning trace.
         let messages = vec![user_msg("Hello")];
-        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None, None).unwrap();
         let expected = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n";
         assert_eq!(
             out, expected,
@@ -2049,7 +2097,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_closed_think_when_disabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -2062,7 +2110,7 @@ mod tests {
     #[test]
     fn render_chat_prompt_system_plus_user_emits_open_think_when_enabled() {
         let messages = vec![system_msg("You are helpful."), user_msg("Hi")];
-        let out = render_chat_prompt(&messages, &[], true, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], true, None, None).unwrap();
         let expected = "<|im_start|>system\nYou are helpful.<|im_end|>\n\
                         <|im_start|>user\nHi<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n";
@@ -2070,6 +2118,80 @@ mod tests {
             out, expected,
             "render_chat_prompt system+user enabled != open think tail"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_matches_the_messages_endpoint() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let request = |extra: Value| -> ChatCompletionRequest {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let prompt = |extra: Value| {
+            let req = request(extra);
+            let effort = req.reasoning_effort().unwrap();
+            render_chat_prompt(
+                &req.messages,
+                &[],
+                req.resolve_thinking(),
+                Some(template),
+                effort,
+            )
+            .unwrap()
+        };
+        let anthropic = |output_config: Value| {
+            let req: crate::wire::anthropic::MessagesRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled"}, "output_config": output_config,
+            }))
+            .unwrap();
+            crate::wire::anthropic::render_for_test(&req, template)
+        };
+        // Each level shared with /v1/messages renders the same prompt there.
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                prompt(json!({"reasoning_effort": level})),
+                anthropic(json!({"effort": level})),
+                "{level}"
+            );
+        }
+        // Any level but `none` asks for reasoning; `minimal` runs as `low`.
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "minimal"})),
+            prompt(json!({"reasoning_effort": "low"}))
+        );
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "none"})),
+            prompt(json!({"enable_thinking": false}))
+        );
+        // An explicit toggle wins over the effort.
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "low", "enable_thinking": false})),
+            prompt(json!({"enable_thinking": false}))
+        );
+        assert_eq!(
+            prompt(json!({"reasoning_effort": "none", "enable_thinking": true})),
+            prompt(json!({"enable_thinking": true}))
+        );
+        for (bad, code) in [
+            (json!("extreme"), "invalid_value"),
+            (json!(3), "invalid_type"),
+            (json!(["low"]), "invalid_type"),
+        ] {
+            match request(json!({"reasoning_effort": bad})).reasoning_effort() {
+                Err(ServerError::BadRequest {
+                    param, code: got, ..
+                }) => {
+                    assert_eq!(param.as_deref(), Some("reasoning_effort"));
+                    assert_eq!(got.as_deref(), Some(code), "{bad}");
+                }
+                other => panic!("{bad}: expected a 400, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2088,14 +2210,14 @@ mod tests {
                         <|im_start|>user\nQ2<|im_end|>\n\
                         <|im_start|>assistant\n<think>\n\n</think>\n\n";
         assert_eq!(
-            render_chat_prompt(&messages, &[], false, None).unwrap(),
+            render_chat_prompt(&messages, &[], false, None, None).unwrap(),
             expected
         );
         let template =
             include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
         // The Qwen3.8 template keeps (empty) reasoning on earlier assistant turns.
         assert_eq!(
-            render_chat_prompt(&messages, &[], false, Some(template)).unwrap(),
+            render_chat_prompt(&messages, &[], false, Some(template), None).unwrap(),
             expected.replace("assistant\nA1", "assistant\n<think>\n\n</think>\n\nA1")
         );
     }
@@ -2106,7 +2228,7 @@ mod tests {
         // appear ONLY at the final assistant prefix, NOT at the previous
         // assistant turn (which carries real content).
         let messages = vec![user_msg("Q1"), assistant_msg("A1"), user_msg("Q2")];
-        let out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let expected = "<|im_start|>user\nQ1<|im_end|>\n\
                         <|im_start|>assistant\nA1<|im_end|>\n\
                         <|im_start|>user\nQ2<|im_end|>\n\
@@ -2125,7 +2247,7 @@ mod tests {
         // (The unit test in tokenize.rs guards the CLI side; this guards
         // the server side; they must produce byte-identical strings.)
         let messages = vec![user_msg("Hello")];
-        let server_out = render_chat_prompt(&messages, &[], false, None).unwrap();
+        let server_out = render_chat_prompt(&messages, &[], false, None, None).unwrap();
         let cli_out = format!(
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             prompt = "Hello"
