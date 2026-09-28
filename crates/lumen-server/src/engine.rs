@@ -310,9 +310,9 @@ pub struct JobRequest {
     pub suffix_threshold: usize,
 
     /// Whether the prompt opened a `<think>` reasoning block (resolved via
-    /// `runtime_defaults::resolve_enable_thinking`). Carried for the Part-4
-    /// decode-loop reasoning-budget / forced-close work; the current decode
-    /// loop does not yet read it. Default `false` (no reasoning).
+    /// `runtime_defaults::resolve_enable_thinking`): the decode loop starts in
+    /// the reasoning phase and applies `reasoning_budget`. Default `false` (no
+    /// reasoning).
     pub enable_thinking: bool,
 
     /// Maximum reasoning ("thinking") tokens before the decode loop force-

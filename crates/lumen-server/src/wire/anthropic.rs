@@ -127,17 +127,17 @@ pub struct MessagesRequest {
     /// `LUMEN_CHAT_ENABLE_THINKING` env override then the process default.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
-    /// Read for `effort` (see [`Self::reasoning_effort`]) and `format`:
+    /// Read for `effort` (see `Self::reasoning_effort`) and `format`:
     /// decoding cannot be constrained to a schema, so a non-null `format` is
     /// refused rather than answered in free text. Other keys are ignored like
     /// unknown top-level fields; anything but an object is refused.
     #[serde(default)]
     pub output_config: Option<serde_json::Map<String, Value>>,
     /// `{"type": "auto" | "any" | "none"}` or `{"type": "tool", "name": ...}`;
-    /// see [`Self::tool_choice`].
+    /// see `Self::tool_choice`.
     #[serde(default)]
     pub tool_choice: Option<Value>,
-    /// Every field the request does not declare; see [`MESSAGES_UNSUPPORTED`].
+    /// Every field the request does not declare; see `MESSAGES_UNSUPPORTED`.
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
 }
@@ -175,9 +175,6 @@ impl MessagesRequest {
         super::resolve_enable_thinking(per_request)
     }
 
-    /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
-    /// the chat template's `reasoning_effort`, mapped by the shared
-    /// [`super::template_reasoning_effort`]. Any other value is refused.
     /// `tool_choice.disable_parallel_tool_use`: at most one tool call.
     fn single_tool_call(&self) -> bool {
         self.tool_choice
@@ -198,7 +195,7 @@ impl MessagesRequest {
         {
             return Err(ServerError::bad_request_field(
                 "tool_choice.disable_parallel_tool_use must be a boolean",
-                "tool_choice",
+                "tool_choice.disable_parallel_tool_use",
                 "invalid_type",
             ));
         }
@@ -282,6 +279,9 @@ impl MessagesRequest {
         Ok((prompt, response_prefix))
     }
 
+    /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
+    /// the chat template's `reasoning_effort`, mapped by the shared
+    /// [`super::template_reasoning_effort`]. Any other value is refused.
     fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
         const PARAM: &str = "output_config.effort";
         const LEVELS: &str = "`low`, `medium`, `high`, `xhigh` or `max`";
@@ -320,10 +320,9 @@ impl MessagesRequest {
             .and_then(|c| c.get("format"))
             .is_some_and(|f| !f.is_null())
         {
-            return Err(ServerError::bad_request_field(
-                "output_config.format (structured output) is not supported",
+            return Err(super::unsupported(
                 "output_config.format",
-                "invalid_value",
+                "structured output",
             ));
         }
         Ok(())
@@ -1872,7 +1871,10 @@ mod tests {
                 .unwrap_err();
         assert_eq!(
             (param.as_deref(), code.as_deref()),
-            (Some("tool_choice"), Some("invalid_type"))
+            (
+                Some("tool_choice.disable_parallel_tool_use"),
+                Some("invalid_type")
+            )
         );
         let single = |choice: Value| {
             serde_json::from_value::<MessagesRequest>(json!({

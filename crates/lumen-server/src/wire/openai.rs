@@ -6,8 +6,8 @@
 //!
 //! A field a request body does not declare is ignored, as on `/v1/messages`,
 //! unless it asks for output this server cannot produce: those are listed in
-//! [`OPENAI_UNSUPPORTED`], [`CHAT_UNSUPPORTED`] and [`COMPLETION_UNSUPPORTED`]
-//! and refused with a 400 (see [`super::refuse_unsupported`]).
+//! `OPENAI_UNSUPPORTED`, `CHAT_UNSUPPORTED` and `COMPLETION_UNSUPPORTED`
+//! and refused with a 400 (see `super::refuse_unsupported`).
 
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
@@ -146,19 +146,19 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     /// OpenAI reasoning effort: `none`, `minimal`, `low`, `medium`, `high`,
-    /// `xhigh` or `max`. See [`Self::reasoning_effort`] and
+    /// `xhigh` or `max`. See `Self::reasoning_effort` and
     /// [`Self::resolve_thinking`].
     #[serde(default)]
     pub reasoning_effort: Option<Value>,
     /// `none`, `auto`, `required` or `{"type": "function", "function":
-    /// {"name": ...}}`; see [`Self::tool_choice`].
+    /// {"name": ...}}`; see `Self::tool_choice`.
     #[serde(default)]
     pub tool_choice: Option<Value>,
     /// `false`: at most one tool call per reply. A boolean; see
     /// [`Self::into_job`].
     #[serde(default)]
     pub parallel_tool_calls: Option<Value>,
-    /// Every field the request does not declare; see [`CHAT_UNSUPPORTED`].
+    /// Every field the request does not declare; see `CHAT_UNSUPPORTED`.
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
 }
@@ -330,7 +330,7 @@ const OPENAI_UNSUPPORTED: &[super::Unsupported] = &[
     super::Unsupported {
         field: "reasoning",
         accepts: |_| false,
-        refused: "`reasoning` (use `reasoning_effort`)",
+        refused: "a `reasoning` object (use `reasoning_effort`)",
     },
 ];
 
@@ -488,11 +488,6 @@ impl ChatCompletionRequest {
         super::resolve_enable_thinking(per_request)
     }
 
-    /// `reasoning_effort` as the chat template's `reasoning_effort`: the
-    /// levels shared with `/v1/messages` map through
-    /// [`super::template_reasoning_effort`], `minimal` runs as `low` (the
-    /// closest level a template offers) and `none` needs none (thinking is off,
-    /// see [`Self::resolve_thinking`]). Any other value is refused.
     fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
         use super::ToolChoice;
         let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
@@ -552,6 +547,11 @@ impl ChatCompletionRequest {
         Ok((prompt, response_prefix))
     }
 
+    /// `reasoning_effort` as the chat template's `reasoning_effort`: the
+    /// levels shared with `/v1/messages` map through
+    /// [`super::template_reasoning_effort`], `minimal` runs as `low` (the
+    /// closest level a template offers) and `none` needs none (thinking is off,
+    /// see [`Self::resolve_thinking`]). Any other value is refused.
     fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
         const PARAM: &str = "reasoning_effort";
         const LEVELS: &str = "`none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`";
@@ -691,7 +691,7 @@ pub struct CompletionRequest {
     /// Streaming only: `include_usage` adds the final usage chunk, as on chat.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    /// Every field the request does not declare; see [`COMPLETION_UNSUPPORTED`].
+    /// Every field the request does not declare; see `COMPLETION_UNSUPPORTED`.
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
 }

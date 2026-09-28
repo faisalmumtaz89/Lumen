@@ -21,7 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   pass through (Qwen3.8 instructs brief reasoning at `low`), and `high`, `xhigh` and `max`
   keep its default.
   On `/v1/chat/completions` an effort also asks for reasoning, `none` turns it off, and
-  `minimal` runs as `low`.
+  `minimal` runs as `low`, unless `enable_thinking` is given, which wins.
 - **`/v1/messages/count_tokens`.** It returns the prompt tokens `/v1/messages` would run for
   the same request, the number that endpoint reports as `usage.input_tokens`.
 - **A system message partway through a conversation.** It stays where it was sent, on both
@@ -40,14 +40,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   structured output, audio, and the like) is refused with a 400 naming it on all three
   endpoints. `/v1/chat/completions` accepts `max_completion_tokens`, and
   `/v1/completions` honours `stream_options.include_usage`.
+- **Library API.** `chat_template::render_chat_prompt` takes a reasoning effort,
+  `JobRequest` carries a `response_prefix`, the chat collectors and streams take a
+  `ReplyTools` (the tool calls a reply may carry) in place of the tool schemas, and
+  `SseSafeEmitter::with_schemas` is `with_tools`.
 
 ### Fixed
 
 - **`thinking.type: "adaptive"` was read as thinking off.** It now turns thinking on; an
   unknown type is refused instead of read as off.
 - **An earlier turn's reasoning was dropped from the prompt.** Reasoning sent back
-  (`reasoning_content`, or a `thinking` block) now reaches the chat template, which renders
-  it into that turn.
+  (`reasoning_content`, or a `thinking` block) now reaches the model's chat template, which
+  decides which turns keep it (Qwen3.8 every earlier turn, Qwen3.5 those after the last
+  user message).
 - **A reasoning close that no longer fit the context ended the reply with an error.** It
   now ends with `length`, like any reply that reaches the context window.
 
@@ -1782,7 +1787,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.23.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.35.0...HEAD
 [0.35.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.32.0...v0.33.0
