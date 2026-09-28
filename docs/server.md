@@ -118,6 +118,8 @@ curl -fsS http://localhost:8000/v1/messages \
 
 A reasoning effort sets how much the model reasons while thinking is on: `output_config.effort` on `/v1/messages` and `reasoning_effort` on `/v1/chat/completions`. The levels both APIs share map the same way: `low` and `medium` reach the chat template as its `reasoning_effort` (Qwen3.8 instructs brief reasoning at `low`), while `high`, `xhigh`, `max` and an absent effort keep the template's default (`xhigh` on Qwen3.8). OpenAI's `minimal` runs as `low`. On `/v1/chat/completions` an effort also asks for reasoning, and `none` turns it off, unless `enable_thinking` or `chat_template_kwargs.enable_thinking` is given. Any other value is refused with a 400.
 
+An earlier assistant turn's reasoning, sent back as `reasoning_content` on `/v1/chat/completions` or as a `thinking` block on `/v1/messages`, reaches the chat template, which renders it back into that turn (Qwen3.8 does for every earlier turn, Qwen3.5 for those after the last user message; both trim surrounding whitespace).
+
 `LUMEN_CHAT_ENABLE_THINKING=1` (accepts `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` for off) flips the default for requests that do not specify the toggle.
 
 ## Fault injection (test builds)

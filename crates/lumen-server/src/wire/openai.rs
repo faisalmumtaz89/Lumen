@@ -31,6 +31,10 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<AssistantToolCall>,
+    /// An earlier assistant turn's reasoning, as this server returns it; the
+    /// chat template renders it back into the turn.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -935,6 +939,15 @@ fn render_chat_prompt_templated(
         let mut obj = serde_json::Map::new();
         obj.insert("role".into(), Value::String(m.role.clone()));
         obj.insert("content".into(), Value::String(content));
+        // Passed even when empty: a template that finds none looks for
+        // reasoning inside the content instead (Qwen3.5 splits it at `</think>`).
+        if let Some(reasoning) = m
+            .reasoning_content
+            .as_ref()
+            .filter(|_| m.role == "assistant")
+        {
+            obj.insert("reasoning_content".into(), Value::String(reasoning.clone()));
+        }
         if !m.tool_calls.is_empty() {
             let calls: Vec<Value> = m
                 .tool_calls
@@ -2337,6 +2350,7 @@ mod tests {
 
     fn user_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "user".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -2346,6 +2360,7 @@ mod tests {
 
     fn system_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "system".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -2355,6 +2370,7 @@ mod tests {
 
     fn assistant_msg(text: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "assistant".into(),
             content: Value::String(text.into()),
             tool_call_id: None,
@@ -2364,6 +2380,7 @@ mod tests {
 
     fn assistant_tool_call_msg(name: &str, arguments: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "assistant".into(),
             content: Value::String(String::new()),
             tool_call_id: None,
@@ -2380,6 +2397,7 @@ mod tests {
 
     fn tool_msg(content: &str) -> ChatMessage {
         ChatMessage {
+            reasoning_content: None,
             role: "tool".into(),
             content: Value::String(content.into()),
             tool_call_id: Some("call_1".into()),
@@ -2490,6 +2508,83 @@ mod tests {
         assert_eq!(
             out, expected,
             "render_chat_prompt system+user enabled != open think tail"
+        );
+    }
+
+    #[test]
+    fn earlier_reasoning_renders_back_on_both_endpoints() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": "A1", "reasoning_content": "R1"},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(template))
+        .unwrap()
+        .0;
+        let messages = serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "R1", "signature": "s"},
+                    {"type": "text", "text": "A1"},
+                ]},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(template))
+        .unwrap()
+        .0;
+        assert_eq!(chat, messages);
+        assert!(
+            chat.contains("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>"),
+            "{chat}"
+        );
+        // Explicitly empty reasoning still reaches the template, so Qwen3.5
+        // does not go looking for reasoning inside the answer.
+        let qwen35 =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen35_chat_template.jinja");
+        let answer = "X</think>M</think>Y";
+        let chat = serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": answer, "reasoning_content": ""},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(qwen35))
+        .unwrap()
+        .0;
+        let messages = serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "s"},
+                    {"type": "text", "text": answer},
+                ]},
+                {"role": "user", "content": "Q2"},
+            ],
+        }))
+        .unwrap()
+        .prompt(Some(qwen35))
+        .unwrap()
+        .0;
+        assert_eq!(chat, messages);
+        assert!(
+            chat.contains(&format!("<|im_start|>assistant\n{answer}<|im_end|>")),
+            "{chat}"
         );
     }
 

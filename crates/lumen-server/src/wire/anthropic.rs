@@ -415,10 +415,17 @@ fn render_prompt_templated(
                 }
             }
             "assistant" => {
-                let (text, tool_uses) = partition_tool_use_blocks(&m.content, "messages.content")?;
+                let (text, reasoning, tool_uses) =
+                    partition_tool_use_blocks(&m.content, "messages.content")?;
                 let mut obj = serde_json::Map::new();
                 obj.insert("role".into(), json!("assistant"));
                 obj.insert("content".into(), json!(text));
+                // Passed even when empty: a template that finds none looks for
+                // reasoning inside the content instead (Qwen3.5 splits it at
+                // `</think>`).
+                if let Some(reasoning) = reasoning {
+                    obj.insert("reasoning_content".into(), json!(reasoning));
+                }
                 if !tool_uses.is_empty() {
                     let calls: Vec<Value> = tool_uses
                         .iter()
@@ -551,7 +558,7 @@ fn render_user_turn(prompt: &mut String, content: &Value) -> Result<(), ServerEr
 /// surface. The Anthropic `input` *object* is serialized to the same on-wire
 /// `{name, arguments:<json>}` Qwen form the OpenAI string `arguments` produces.
 fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), ServerError> {
-    let (text, tool_uses) = partition_tool_use_blocks(content, "messages.content")?;
+    let (text, _, tool_uses) = partition_tool_use_blocks(content, "messages.content")?;
     prompt.push_str("<|im_start|>assistant\n");
     prompt.push_str(&text);
     for (name, arguments_json) in &tool_uses {
@@ -564,8 +571,10 @@ fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), Ser
     Ok(())
 }
 
-/// Walk an assistant content value, returning `(flattened_text, tool_uses)`
-/// where each tool_use is `(name, arguments_json)`. Recognizes
+/// Walk an assistant content value, returning `(flattened_text, reasoning,
+/// tool_uses)` where reasoning joins the `{type:"thinking", thinking}` blocks
+/// (`None` without one) and each tool_use is `(name, arguments_json)`.
+/// Recognizes
 /// `{type:"tool_use", name, input}` blocks; the `input` object is serialized
 /// to a JSON string (the on-wire `arguments` form). Bare-string and
 /// `{type:"text", text}` parts flatten into the text via the SAME key set as
@@ -574,13 +583,16 @@ fn render_assistant_turn(prompt: &mut String, content: &Value) -> Result<(), Ser
 fn partition_tool_use_blocks(
     content: &Value,
     param: &str,
-) -> Result<(String, Vec<(String, String)>), ServerError> {
+) -> Result<(String, Option<String>, Vec<(String, String)>), ServerError> {
     match content {
         // No typed blocks possible in a string/null: reuse the shared text
         // flattener verbatim (also enforces ROBUST-007 on scalars).
-        Value::String(_) | Value::Null => Ok((super::flatten_content(content, param)?, Vec::new())),
+        Value::String(_) | Value::Null => {
+            Ok((super::flatten_content(content, param)?, None, Vec::new()))
+        }
         Value::Array(arr) => {
             let mut text = String::new();
+            let mut reasoning: Option<String> = None;
             let mut tool_uses = Vec::new();
             for piece in arr {
                 if let Some(s) = piece.as_str() {
@@ -602,6 +614,12 @@ fn partition_tool_use_blocks(
                                 .unwrap_or_else(|| "{}".to_string());
                             tool_uses.push((name, arguments_json));
                         }
+                        // The turn's reasoning, which the chat template renders
+                        // back into the turn.
+                        Some("thinking") => {
+                            let t = obj.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                            reasoning.get_or_insert_with(String::new).push_str(t);
+                        }
                         // text part (or any other block that carries `text`).
                         _ => {
                             if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
@@ -611,7 +629,7 @@ fn partition_tool_use_blocks(
                     }
                 }
             }
-            Ok((text, tool_uses))
+            Ok((text, reasoning, tool_uses))
         }
         _ => Err(ServerError::bad_request_field(
             "message 'content' must be a string or a content-parts array",
