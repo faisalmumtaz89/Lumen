@@ -24,8 +24,6 @@
 //! data: {...}
 //! ```
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
 use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
@@ -35,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::{EngineHandle, FinishReason, JobRequest, JobResponseChannel, TokenEvent};
 use crate::error::ServerError;
-use crate::sse::SseSafeEmitter;
+use crate::sse::{ReplyTools, SseSafeEmitter};
 use crate::tokenstop::StopMatcher;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +130,10 @@ pub struct MessagesRequest {
     /// unknown top-level fields; anything but an object is refused.
     #[serde(default)]
     pub output_config: Option<serde_json::Map<String, Value>>,
+    /// `{"type": "auto" | "any" | "none"}` or `{"type": "tool", "name": ...}`;
+    /// see [`Self::tool_choice`].
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
     /// Every field the request does not declare; see [`MESSAGES_UNSUPPORTED`].
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
@@ -173,6 +175,101 @@ impl MessagesRequest {
     /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
     /// the chat template's `reasoning_effort`, mapped by the shared
     /// [`super::template_reasoning_effort`]. Any other value is refused.
+    fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
+        use super::ToolChoice;
+        let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
+        if choice.is_null() {
+            return Ok(ToolChoice::Auto);
+        }
+        if choice
+            .get("disable_parallel_tool_use")
+            .is_some_and(|d| !d.is_null() && *d != false)
+        {
+            return Err(super::unsupported(
+                "tool_choice",
+                "limiting a reply to one tool call",
+            ));
+        }
+        match (choice["type"].as_str(), choice["name"].as_str()) {
+            (Some("auto"), _) => Ok(ToolChoice::Auto),
+            (Some("none"), _) => Ok(ToolChoice::None),
+            (Some("any"), _) => Ok(ToolChoice::Required),
+            (Some("tool"), Some(name)) => Ok(ToolChoice::Named(name.into())),
+            _ => Err(ServerError::bad_request_field(
+                "tool_choice must be {\"type\": \"auto\" | \"any\" | \"none\"} or {\"type\": \"tool\", \"name\": ...}",
+                "tool_choice",
+                "invalid_value",
+            )),
+        }
+    }
+
+    /// The tool calls the reply may carry, for the collectors. Taken before
+    /// `into_job` consumes the request; a malformed `tool_choice` reads as
+    /// `auto` here because `into_job` refuses it.
+    pub fn reply_tools(&self) -> ReplyTools {
+        self.tool_choice()
+            .unwrap_or(super::ToolChoice::Auto)
+            .reply_tools(tool_schemas(&self.tools))
+    }
+
+    /// The prompt for this request and the text the reply starts with, which
+    /// also ends the prompt (see [`super::ToolChoice::response_prefix`]).
+    pub(crate) fn prompt(
+        &self,
+        chat_template: Option<&str>,
+    ) -> Result<(String, String), ServerError> {
+        let reasoning_effort = self.reasoning_effort()?;
+        let enable_thinking = self.resolve_thinking();
+        let tool_choice = self.tool_choice()?;
+        tool_choice.check(
+            self.tools.iter().map(|t| t.name.as_str()),
+            enable_thinking,
+            chat_template.is_some(),
+        )?;
+        let tools: &[AnthropicTool] = if tool_choice.offers_tools() {
+            &self.tools
+        } else {
+            &[]
+        };
+        // Flatten the system field through the SAME shared helper as message
+        // content (ROBUST-007 guard + single recognized key set), so a number
+        // `system` 400s identically to a number `content`.
+        let system_text = match &self.system {
+            Some(v) => Some(super::flatten_content(v, "system")?),
+            None => None,
+        };
+        // Prefer the model's embedded template (native tool-calling protocol),
+        // shared with the CLI and OpenAI surfaces so the three cannot drift.
+        // Fall back to the hard-coded ChatML transcript (compose the tools into
+        // the system message) when no template is embedded.
+        let mut prompt = match chat_template {
+            Some(tmpl) => render_prompt_templated(
+                system_text.as_deref(),
+                &self.messages,
+                tools,
+                enable_thinking,
+                reasoning_effort,
+                tmpl,
+            )?,
+            None => {
+                let tool_schemas: Vec<ToolSchema> = tools
+                    .iter()
+                    .map(|t| ToolSchema {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters_json_schema: serde_json::to_string(&t.input_schema)
+                            .unwrap_or_else(|_| "{}".into()),
+                    })
+                    .collect();
+                let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
+                render_prompt(&final_system, &self.messages, enable_thinking)?
+            }
+        };
+        let response_prefix = tool_choice.response_prefix();
+        prompt.push_str(&response_prefix);
+        Ok((prompt, response_prefix))
+    }
+
     fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
         const PARAM: &str = "output_config.effort";
         const LEVELS: &str = "`low`, `medium`, `high`, `xhigh` or `max`";
@@ -191,20 +288,6 @@ impl MessagesRequest {
 
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
         super::refuse_unsupported(&self.other, MESSAGES_UNSUPPORTED)?;
-        // `auto`, or `none` with no tools to call, is what the server does.
-        let tool_choice = self.other.get("tool_choice").unwrap_or(&Value::Null);
-        let parallel_allowed = tool_choice
-            .get("disable_parallel_tool_use")
-            .map_or(true, |d| *d == false || d.is_null());
-        if !(tool_choice.is_null()
-            || (tool_choice["type"] == "auto" && parallel_allowed)
-            || (tool_choice["type"] == "none" && self.tools.is_empty()))
-        {
-            return Err(super::unsupported(
-                "tool_choice",
-                "a tool choice other than `auto`",
-            ));
-        }
         if self
             .tools
             .iter()
@@ -227,7 +310,7 @@ impl MessagesRequest {
                 "invalid_value",
             ));
         }
-        let reasoning_effort = self.reasoning_effort()?;
+        let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
         let enable_thinking = self.resolve_thinking();
         // Reasoning-token cap within `max_tokens` (Anthropic
         // `thinking.budget_tokens`); falls back to the shared default.
@@ -236,41 +319,6 @@ impl MessagesRequest {
             .as_ref()
             .and_then(|t| t.budget_tokens)
             .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default);
-        // Flatten the system field through the SAME shared helper as message
-        // content (ROBUST-007 guard + single recognized key set), so a number
-        // `system` 400s identically to a number `content`.
-        let system_text = match &self.system {
-            Some(v) => Some(super::flatten_content(v, "system")?),
-            None => None,
-        };
-        let tool_schemas: Vec<ToolSchema> = self
-            .tools
-            .iter()
-            .map(|t| ToolSchema {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters_json_schema: serde_json::to_string(&t.input_schema)
-                    .unwrap_or_else(|_| "{}".into()),
-            })
-            .collect();
-        // Prefer the model's embedded template (native tool-calling protocol),
-        // shared with the CLI and OpenAI surfaces so the three cannot drift.
-        // Fall back to the hard-coded ChatML transcript (compose the tools into
-        // the system message) when no template is embedded.
-        let prompt = match engine.chat_template() {
-            Some(tmpl) => render_prompt_templated(
-                system_text.as_deref(),
-                &self.messages,
-                &self.tools,
-                enable_thinking,
-                reasoning_effort,
-                tmpl,
-            )?,
-            None => {
-                let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
-                render_prompt(&final_system, &self.messages, enable_thinking)?
-            }
-        };
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -304,28 +352,14 @@ impl MessagesRequest {
             suffix_threshold: lumen_runtime::session::Session::DEFAULT_SUFFIX_THRESHOLD,
             enable_thinking,
             reasoning_budget,
+            response_prefix,
         })
     }
 }
 
-/// The prompt `into_job` renders for `req` with `template`.
-#[cfg(test)]
-pub(crate) fn render_for_test(req: &MessagesRequest, template: &str) -> String {
-    render_prompt_templated(
-        None,
-        &req.messages,
-        &req.tools,
-        req.resolve_thinking(),
-        req.reasoning_effort().unwrap(),
-        template,
-    )
-    .unwrap()
-}
-
-/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (used by the
-/// router to type native `<parameter>` values in the collectors, mirroring the
-/// OpenAI surface).
-pub fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
+/// Build the runtime [`ToolSchemas`] from Anthropic tool defs (typing native
+/// `<parameter>` values in the collectors, mirroring the OpenAI surface).
+fn tool_schemas(tools: &[AnthropicTool]) -> ToolSchemas {
     let schemas: Vec<ToolSchema> = tools
         .iter()
         .map(|t| ToolSchema {
@@ -655,17 +689,10 @@ pub fn stream_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Body {
     let (tx, body_rx) = mpsc::channel::<Vec<u8>>(64);
-    tokio::spawn(drive_messages_stream(
-        rx,
-        tx,
-        model,
-        thinking,
-        stop,
-        tool_schemas,
-    ));
+    tokio::spawn(drive_messages_stream(rx, tx, model, thinking, stop, tools));
     body_from_byte_stream(body_rx)
 }
 
@@ -675,7 +702,7 @@ async fn drive_messages_stream(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) {
     let msg_id = format!(
         "msg_lumen_{:x}-{:x}",
@@ -685,7 +712,7 @@ async fn drive_messages_stream(
             .unwrap_or(0),
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed the streaming stop matcher from `stop_sequences`. Empty =>
     // verbatim passthrough (byte-identical); see the OpenAI `drive_chat_stream`
     // note for the worker/wire division of labour.
@@ -1023,9 +1050,9 @@ pub async fn collect_messages(
     model: String,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed from `stop_sequences`. Empty => verbatim, byte-identical.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut text = String::new();
@@ -1166,15 +1193,9 @@ mod tests {
         let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
         // Test helper exercises the legacy JSON tool-call path (schemaless); the
         // schema-aware native path is covered by the runtime tests + Modal §2D.
-        collect_messages(
-            pooled,
-            "test".into(),
-            thinking,
-            stop,
-            Arc::new(ToolSchemas::default()),
-        )
-        .await
-        .unwrap()
+        collect_messages(pooled, "test".into(), thinking, stop, ReplyTools::default())
+            .await
+            .unwrap()
     }
 
     fn user(text: &str) -> AnthropicMessage {
@@ -1282,6 +1303,7 @@ mod tests {
                 budget_tokens: None,
             }),
             output_config: None,
+            tool_choice: None,
             other: Default::default(),
         };
         assert!(enabled.resolve_thinking());
@@ -1453,7 +1475,7 @@ mod tests {
             "test".into(),
             thinking,
             stop,
-            Arc::new(ToolSchemas::default()),
+            ReplyTools::default(),
         ));
         let mut out = String::new();
         while let Some(chunk) = body_rx.recv().await {
@@ -1765,8 +1787,13 @@ mod tests {
             job(json!({"tools": [custom]})).unwrap().prompt_tokens,
             job(json!({"tools": [tool]})).unwrap().prompt_tokens
         );
+        // Forcing a call needs the model's chat template, which this engine
+        // lacks (see `tool_choice_matches_the_messages_endpoint`).
         for (extra, field) in [
-            (json!({"tool_choice": {"type": "any"}}), "tool_choice"),
+            (
+                json!({"tool_choice": {"type": "any"}, "tools": [tool.clone()]}),
+                "tool_choice",
+            ),
             (
                 json!({"tool_choice": {"type": "tool", "name": "f"}}),
                 "tool_choice",
@@ -1783,10 +1810,6 @@ mod tests {
             (
                 json!({"output_format": {"type": "json_schema"}}),
                 "output_format",
-            ),
-            (
-                json!({"tool_choice": {"type": "none"}, "tools": [tool.clone()]}),
-                "tool_choice",
             ),
             (
                 json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),

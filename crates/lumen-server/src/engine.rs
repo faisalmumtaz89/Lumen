@@ -318,6 +318,11 @@ pub struct JobRequest {
     /// Maximum reasoning ("thinking") tokens before the decode loop force-
     /// closes the `<think>` block, within `max_tokens`. `0` = unbounded.
     pub reasoning_budget: usize,
+
+    /// Text the reply starts with that already ends the prompt (a forced tool
+    /// call's opener). Reported as the reply's first text, before decoding;
+    /// not a generated token. Empty for most requests.
+    pub response_prefix: String,
 }
 
 /// The reply channel the worker uses for token events.
@@ -1948,6 +1953,21 @@ impl EngineWorker {
             .is_err()
         {
             return; // client gave up or worker shutting down
+        }
+
+        if !request.response_prefix.is_empty()
+            && self
+                .send_event_polling_cancel(
+                    &tokens_tx,
+                    &cancel,
+                    TokenEvent::Token {
+                        token_id: *request.prompt_tokens.last().unwrap_or(&0),
+                        delta_text: request.response_prefix.clone(),
+                    },
+                )
+                .is_err()
+        {
+            return;
         }
 
         // Decode loop.

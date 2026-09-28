@@ -9,8 +9,6 @@
 //! [`OPENAI_UNSUPPORTED`], [`CHAT_UNSUPPORTED`] and [`COMPLETION_UNSUPPORTED`]
 //! and refused with a 400 (see [`super::refuse_unsupported`]).
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
 use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
@@ -19,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::engine::{EngineHandle, FinishReason, JobRequest, JobResponseChannel, TokenEvent};
 use crate::error::ServerError;
-use crate::sse::SseSafeEmitter;
+use crate::sse::{ReplyTools, SseSafeEmitter};
 use crate::tokenstop::StopMatcher;
 
 // ----------------------------- Request DTOs -----------------------------
@@ -148,6 +146,10 @@ pub struct ChatCompletionRequest {
     /// [`Self::resolve_thinking`].
     #[serde(default)]
     pub reasoning_effort: Option<Value>,
+    /// `none`, `auto`, `required` or `{"type": "function", "function":
+    /// {"name": ...}}`; see [`Self::tool_choice`].
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
     /// Every field the request does not declare; see [`CHAT_UNSUPPORTED`].
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
@@ -325,7 +327,6 @@ const OPENAI_UNSUPPORTED: &[super::Unsupported] = &[
 ];
 
 /// Chat fields that must stay at their default, besides [`OPENAI_UNSUPPORTED`].
-/// `tool_choice` is checked separately (see [`ChatCompletionRequest::into_job`]).
 const CHAT_UNSUPPORTED: &[super::Unsupported] = &[
     super::Unsupported {
         field: "logprobs",
@@ -489,6 +490,62 @@ impl ChatCompletionRequest {
     /// [`super::template_reasoning_effort`], `minimal` runs as `low` (the
     /// closest level a template offers) and `none` needs none (thinking is off,
     /// see [`Self::resolve_thinking`]). Any other value is refused.
+    fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
+        use super::ToolChoice;
+        let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
+        match choice.as_str() {
+            _ if choice.is_null() => Ok(ToolChoice::Auto),
+            Some("auto") => Ok(ToolChoice::Auto),
+            Some("none") => Ok(ToolChoice::None),
+            Some("required") => Ok(ToolChoice::Required),
+            _ => match (&choice["type"], choice["function"]["name"].as_str()) {
+                (t, Some(name)) if t == "function" => Ok(ToolChoice::Named(name.into())),
+                _ => Err(ServerError::bad_request_field(
+                    "tool_choice must be `none`, `auto`, `required` or {\"type\": \"function\", \"function\": {\"name\": ...}}",
+                    "tool_choice",
+                    "invalid_value",
+                )),
+            },
+        }
+    }
+
+    /// The tool calls the reply may carry, for the collectors. Taken before
+    /// `into_job` consumes the request; a malformed `tool_choice` reads as
+    /// `auto` here because `into_job` refuses it.
+    pub fn reply_tools(&self) -> ReplyTools {
+        self.tool_choice()
+            .unwrap_or(super::ToolChoice::Auto)
+            .reply_tools(tool_schemas(&self.tools))
+    }
+
+    /// The prompt for this request and the text the reply starts with, which
+    /// also ends the prompt (see [`super::ToolChoice::response_prefix`]).
+    fn prompt(&self, chat_template: Option<&str>) -> Result<(String, String), ServerError> {
+        let reasoning_effort = self.reasoning_effort()?;
+        let enable_thinking = self.resolve_thinking();
+        let tool_choice = self.tool_choice()?;
+        tool_choice.check(
+            self.tools.iter().map(|t| t.function.name.as_str()),
+            enable_thinking,
+            chat_template.is_some(),
+        )?;
+        let tools: &[ToolDef] = if tool_choice.offers_tools() {
+            &self.tools
+        } else {
+            &[]
+        };
+        let mut prompt = render_chat_prompt(
+            &self.messages,
+            tools,
+            enable_thinking,
+            chat_template,
+            reasoning_effort,
+        )?;
+        let response_prefix = tool_choice.response_prefix();
+        prompt.push_str(&response_prefix);
+        Ok((prompt, response_prefix))
+    }
+
     fn reasoning_effort(&self) -> Result<Option<&'static str>, ServerError> {
         const PARAM: &str = "reasoning_effort";
         const LEVELS: &str = "`none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`";
@@ -511,17 +568,6 @@ impl ChatCompletionRequest {
         // silently accepted/clamped.
         super::refuse_unsupported(&self.other, CHAT_UNSUPPORTED)?;
         super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
-        // `auto`, or `none` with no tools to call, is what the server does.
-        let tool_choice = self.other.get("tool_choice").unwrap_or(&Value::Null);
-        if !(tool_choice.is_null()
-            || tool_choice == "auto"
-            || (tool_choice == "none" && self.tools.is_empty()))
-        {
-            return Err(super::unsupported(
-                "tool_choice",
-                "a tool choice other than `auto`",
-            ));
-        }
         validate_sampler_ranges(self.temperature, self.top_p)?;
         if self.messages.is_empty() {
             return Err(ServerError::bad_request_field(
@@ -530,15 +576,8 @@ impl ChatCompletionRequest {
                 "invalid_value",
             ));
         }
-        let reasoning_effort = self.reasoning_effort()?;
+        let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
         let enable_thinking = self.resolve_thinking();
-        let prompt = render_chat_prompt(
-            &self.messages,
-            &self.tools,
-            enable_thinking,
-            engine.chat_template(),
-            reasoning_effort,
-        )?;
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
@@ -596,6 +635,7 @@ impl ChatCompletionRequest {
             reasoning_budget: self
                 .reasoning_budget
                 .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default),
+            response_prefix,
         })
     }
 }
@@ -704,6 +744,7 @@ impl CompletionRequest {
             // so reasoning is never enabled on this path.
             enable_thinking: false,
             reasoning_budget: 0,
+            response_prefix: String::new(),
         })
     }
 }
@@ -797,10 +838,8 @@ fn parse_stop_field(v: Option<Value>) -> Vec<String> {
 
 /// Build the runtime [`ToolSchemas`] (function -> parameter -> JSON-Schema type)
 /// the native tool-call parser needs, from the OpenAI tool definitions on a
-/// request. The router hands this to the streaming / non-streaming collectors so
-/// native `<parameter>` values are typed by the advertised schema. Mirrors the
-/// `ToolSchema` conversion the manual render uses.
-pub fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
+/// request. Mirrors the `ToolSchema` conversion the manual render uses.
+fn tool_schemas(tools: &[ToolDef]) -> ToolSchemas {
     let schemas: Vec<ToolSchema> = tools
         .iter()
         .map(|t| ToolSchema {
@@ -1055,7 +1094,7 @@ pub fn stream_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
     include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -1067,7 +1106,7 @@ pub fn stream_chat(
         true,
         thinking,
         stop,
-        tool_schemas,
+        tools,
         include_usage,
     ));
     body_from_byte_stream(body_rx)
@@ -1092,7 +1131,7 @@ pub fn stream_completion(
         false,
         false,
         stop,
-        Arc::new(ToolSchemas::default()),
+        ReplyTools::default(),
         include_usage,
     ));
     body_from_byte_stream(body_rx)
@@ -1106,14 +1145,14 @@ async fn drive_chat_stream(
     chat: bool,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
     include_usage: bool,
 ) {
     let id = format!(
         "chatcmpl-lumen-{created:x}-{:x}",
         super::next_response_seq()
     );
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed the streaming stop matcher from the request stop list. The
     // worker already truncates generation at the stop string (and reports
     // `FinishReason::StopSequence`, which it forwards via `TokenEvent::Done`);
@@ -1421,9 +1460,9 @@ pub async fn collect_chat(
     created: u64,
     thinking: bool,
     stop: Vec<String>,
-    tool_schemas: Arc<ToolSchemas>,
+    tools: ReplyTools,
 ) -> Result<Value, ServerError> {
-    let mut emitter = SseSafeEmitter::with_schemas(thinking, tool_schemas);
+    let mut emitter = SseSafeEmitter::with_tools(thinking, tools);
     // F4: seed from the request stop list (see `drive_chat_stream`). Empty =>
     // verbatim passthrough, byte-identical to the pre-F4 response.
     let mut stop_matcher = StopMatcher::new(stop);
@@ -1654,7 +1693,7 @@ pub async fn collect_chat_from_events_with_stop(
         created,
         thinking,
         stop,
-        Arc::new(ToolSchemas::default()),
+        ReplyTools::default(),
     )
     .await
 }
@@ -1914,7 +1953,7 @@ mod tests {
             chat,
             false,
             Vec::new(),
-            Arc::new(ToolSchemas::default()),
+            ReplyTools::default(),
             include_usage,
         ));
         let mut out = String::new();
@@ -2442,6 +2481,110 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_matches_the_messages_endpoint() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let with = |mut body: Value, extra: Value| {
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let chat = |choice: Value, extra: Value| {
+            let body = json!({
+                "model": "m", "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "Weather", "parameters": schema}}],
+                "tool_choice": choice,
+            });
+            serde_json::from_value::<ChatCompletionRequest>(with(body, extra))
+                .unwrap()
+                .prompt(Some(template))
+        };
+        let messages = |choice: Value, extra: Value| {
+            let body = json!({
+                "model": "m", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"name": "get_weather", "description": "Weather", "input_schema": schema}],
+                "tool_choice": choice,
+            });
+            serde_json::from_value::<crate::wire::anthropic::MessagesRequest>(with(body, extra))
+                .unwrap()
+                .prompt(Some(template))
+        };
+        let named = json!({"type": "function", "function": {"name": "get_weather"}});
+        for (openai, anthropic, prefix) in [
+            (json!("auto"), json!({"type": "auto"}), ""),
+            (json!("none"), json!({"type": "none"}), ""),
+            (json!("required"), json!({"type": "any"}), "<tool_call>\n"),
+            (
+                named.clone(),
+                json!({"type": "tool", "name": "get_weather"}),
+                "<tool_call>\n<function=get_weather>\n",
+            ),
+        ] {
+            let (prompt, response_prefix) = chat(openai.clone(), json!({})).unwrap();
+            assert_eq!(
+                (prompt.clone(), response_prefix.clone()),
+                messages(anthropic, json!({})).unwrap(),
+                "{openai}"
+            );
+            assert_eq!(response_prefix, prefix);
+            assert!(prompt.ends_with(&format!("<think>\n\n</think>\n\n{prefix}")));
+        }
+        // `none` offers no tools; a forced choice keeps every tool offered.
+        let (none, _) = chat(json!("none"), json!({})).unwrap();
+        assert!(!none.contains("<tools>"));
+        assert!(chat(named.clone(), json!({}))
+            .unwrap()
+            .0
+            .contains("<tools>"));
+        // Refused on both: a tool not offered, and a forced call while thinking.
+        let unknown = json!({"type": "function", "function": {"name": "nope"}});
+        let refusals = [
+            chat(unknown, json!({})).map(|_| ()),
+            messages(json!({"type": "tool", "name": "nope"}), json!({})).map(|_| ()),
+            chat(json!("required"), json!({"enable_thinking": true})).map(|_| ()),
+            messages(
+                json!({"type": "any"}),
+                json!({"thinking": {"type": "enabled"}}),
+            )
+            .map(|_| ()),
+            chat(json!("required"), json!({"tools": []})).map(|_| ()),
+            chat(json!("sometimes"), json!({})).map(|_| ()),
+            chat(
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"tools": [{"type": "function", "function": {"name": "", "parameters": {}}}]}),
+            )
+            .map(|_| ()),
+            chat(
+                json!({"type": "function", "function": {"name": "get weather"}}),
+                json!({"tools": [{"type": "function", "function": {"name": "get weather", "parameters": {}}}]}),
+            )
+            .map(|_| ()),
+        ];
+        for refusal in refusals {
+            match refusal {
+                Err(ServerError::BadRequest { param, .. }) => {
+                    assert_eq!(param.as_deref(), Some("tool_choice"))
+                }
+                other => panic!("expected a 400 naming tool_choice, got {other:?}"),
+            }
+        }
+        // Without the model's template the opener's protocol is unknown.
+        let body = json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+            "tool_choice": named,
+        });
+        assert!(serde_json::from_value::<ChatCompletionRequest>(body)
+            .unwrap()
+            .prompt(None)
+            .is_err());
+    }
+
+    #[test]
     fn reasoning_effort_matches_the_messages_endpoint() {
         let template =
             include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
@@ -2452,25 +2595,14 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             serde_json::from_value(body).unwrap()
         };
-        let prompt = |extra: Value| {
-            let req = request(extra);
-            let effort = req.reasoning_effort().unwrap();
-            render_chat_prompt(
-                &req.messages,
-                &[],
-                req.resolve_thinking(),
-                Some(template),
-                effort,
-            )
-            .unwrap()
-        };
+        let prompt = |extra: Value| request(extra).prompt(Some(template)).unwrap().0;
         let anthropic = |output_config: Value| {
             let req: crate::wire::anthropic::MessagesRequest = serde_json::from_value(json!({
                 "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
                 "thinking": {"type": "enabled"}, "output_config": output_config,
             }))
             .unwrap();
-            crate::wire::anthropic::render_for_test(&req, template)
+            req.prompt(Some(template)).unwrap().0
         };
         // Each level shared with /v1/messages renders the same prompt there.
         for level in ["low", "medium", "high", "xhigh", "max"] {
@@ -2799,10 +2931,11 @@ mod tests {
             assert_eq!(param.as_deref(), Some(field));
             assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
         }
-        // `none` is what the server does only when there is no tool to call.
+        // `none` with tools offers none of them (see
+        // `tool_choice_matches_the_messages_endpoint`).
         let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);
-        let (param, _) = job(json!({"tool_choice": "none", "tools": tools})).unwrap_err();
-        assert_eq!(param.as_deref(), Some("tool_choice"));
+        let none = job(json!({"tool_choice": "none", "tools": tools})).unwrap();
+        assert_eq!(none.prompt_tokens, plain.prompt_tokens);
     }
 
     #[test]

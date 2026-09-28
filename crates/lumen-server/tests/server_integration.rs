@@ -1735,6 +1735,7 @@ fn make_job_request(max_tokens: usize) -> JobRequest {
         // these engine-mechanics gates are unaffected.
         enable_thinking: false,
         reasoning_budget: 0,
+        response_prefix: String::new(),
     }
 }
 
@@ -2590,6 +2591,7 @@ fn make_stop_job_request(max_tokens: usize, stop: Vec<String>) -> JobRequest {
         suffix_threshold: 32,
         enable_thinking: false,
         reasoning_budget: 0,
+        response_prefix: String::new(),
     }
 }
 

@@ -221,9 +221,9 @@ async fn chat_completions(
     // it, so the wire emitter and the prompt tail agree (both call the single
     // shared resolver with the same inputs → same result).
     let thinking = req.resolve_thinking();
-    // Build the tool schemas BEFORE `into_job` consumes the request; the
-    // collectors type native `<parameter>` values by them.
-    let tool_schemas = std::sync::Arc::new(wire::openai::tool_schemas(&req.tools));
+    // The tool calls the reply may carry, taken BEFORE `into_job` consumes the
+    // request: the collectors type native `<parameter>` values by its schemas.
+    let tools = req.reply_tools();
     // OpenAI `stream_options.include_usage` — resolved before `into_job`
     // consumes the request; only the streaming path consults it.
     let include_usage = req.include_usage();
@@ -242,20 +242,14 @@ async fn chat_completions(
             current_unix_time(),
             thinking,
             stop,
-            tool_schemas,
+            tools,
             include_usage,
         );
         Ok(sse_response(body))
     } else {
-        let resp = wire::openai::collect_chat(
-            rx,
-            model_id,
-            current_unix_time(),
-            thinking,
-            stop,
-            tool_schemas,
-        )
-        .await?;
+        let resp =
+            wire::openai::collect_chat(rx, model_id, current_unix_time(), thinking, stop, tools)
+                .await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }
@@ -295,19 +289,18 @@ async fn messages(
     // Resolve reasoning before `into_job` consumes the request (same shared
     // resolver as the prompt tail -> consistent result).
     let thinking = req.resolve_thinking();
-    // Tool schemas built before `into_job` consumes the request (type native
-    // `<parameter>` values in the collectors).
-    let tool_schemas = std::sync::Arc::new(wire::anthropic::tool_schemas(&req.tools));
+    // The tool calls the reply may carry, taken before `into_job` consumes the
+    // request (the collectors type native `<parameter>` values by them).
+    let tools = req.reply_tools();
     let job = req.into_job(&state.engine)?;
     wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::anthropic::stream_messages(rx, model_id, thinking, stop, tool_schemas);
+        let body = wire::anthropic::stream_messages(rx, model_id, thinking, stop, tools);
         Ok(sse_response(body))
     } else {
-        let resp =
-            wire::anthropic::collect_messages(rx, model_id, thinking, stop, tool_schemas).await?;
+        let resp = wire::anthropic::collect_messages(rx, model_id, thinking, stop, tools).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
 }

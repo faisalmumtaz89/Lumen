@@ -118,6 +118,7 @@ fn job(max_tokens: usize, enable_thinking: bool, reasoning_budget: usize) -> Job
         suffix_threshold: 32,
         enable_thinking,
         reasoning_budget,
+        response_prefix: String::new(),
     }
 }
 
@@ -345,4 +346,19 @@ async fn forced_close_at_the_context_edge_ends_with_length() {
             assert_eq!(d.completion_tokens, budget, "budget {budget}");
         }
     }
+}
+
+/// A response prefix (a forced tool call's opener, already at the end of the
+/// prompt) is the reply's first text, sent before any decoded token and not
+/// counted as generated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_prefix_opens_the_reply_uncounted() {
+    let handle = boot_engine();
+    let plain = drain(&handle, job(5, false, 0)).await;
+    let mut request = job(5, false, 0);
+    request.response_prefix = "<tool_call>\n<function=f>\n".into();
+    let prefixed = drain(&handle, request).await;
+    assert_eq!(prefixed.fragments[0], "<tool_call>\n<function=f>\n");
+    assert_eq!(prefixed.fragments[1..], plain.fragments[..]);
+    assert_eq!(prefixed.completion_tokens, plain.completion_tokens);
 }

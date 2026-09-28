@@ -158,6 +158,17 @@ pub const TOOL_CALL_OPEN: &str = "<tool_call>";
 /// The literal closing marker.
 pub const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
+/// The start of a tool call in the native protocol, through the function name
+/// when one is given: a reply forced to call a tool continues from here. It
+/// ends where a token does (after a newline), so the model's next token is the
+/// one it would produce there itself.
+pub fn forced_tool_call_prefix(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{TOOL_CALL_OPEN}\n{FUNCTION_OPEN}{name}>\n"),
+        None => format!("{TOOL_CALL_OPEN}\n"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------

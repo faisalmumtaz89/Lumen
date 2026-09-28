@@ -4,12 +4,14 @@
 //! non-streaming response shape for one external API.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lumen_runtime::tooling::ToolSchemas;
 use serde_json::Value;
 
 use crate::error::ServerError;
+use crate::sse::ReplyTools;
 
 pub mod anthropic;
 pub mod image;
@@ -212,6 +214,94 @@ pub(crate) fn template_reasoning_effort(level: &str) -> Option<Option<&'static s
         "medium" => Some(Some("medium")),
         "high" | "xhigh" | "max" => Some(None),
         _ => None,
+    }
+}
+
+/// A request's tool choice, as both chat APIs express it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolChoice {
+    /// The model decides.
+    Auto,
+    /// No tool call: the prompt offers no tools.
+    None,
+    /// A call to some offered tool.
+    Required,
+    /// A call to this tool.
+    Named(String),
+}
+
+impl ToolChoice {
+    /// Refuse a choice the request cannot honour: a named tool it does not
+    /// offer or whose name is not one both APIs allow (1 to 64 letters, digits,
+    /// `_`, `-`; the name goes into the prompt, see [`Self::response_prefix`]), a
+    /// required call with no tools, or a forced call while thinking is on (the
+    /// reply opens with the call) or without the model's chat template, whose
+    /// tool-call protocol the opener follows.
+    pub(crate) fn check<'a>(
+        &self,
+        mut tools: impl Iterator<Item = &'a str>,
+        thinking: bool,
+        templated: bool,
+    ) -> Result<(), ServerError> {
+        let refusal = match self {
+            Self::Auto | Self::None => return Ok(()),
+            Self::Required if tools.next().is_none() => {
+                "tool_choice requires a tool call but `tools` is empty"
+            }
+            Self::Named(name)
+                if name.is_empty()
+                    || name.len() > 64
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+            {
+                "tool_choice names a tool whose name is not 1 to 64 letters, digits, `_` or `-`"
+            }
+            Self::Named(name) if !tools.any(|t| t == name) => {
+                "tool_choice names no tool that `tools` offers"
+            }
+            _ if thinking => "tool_choice cannot force a tool call while thinking is on",
+            _ if !templated => {
+                "tool_choice cannot force a tool call without the model's chat template"
+            }
+            _ => return Ok(()),
+        };
+        Err(ServerError::bad_request_field(
+            refusal,
+            "tool_choice",
+            "invalid_value",
+        ))
+    }
+
+    /// Whether the prompt offers the tools: not for [`Self::None`].
+    pub(crate) fn offers_tools(&self) -> bool {
+        *self != Self::None
+    }
+
+    /// The tool calls a reply may carry: none under [`Self::None`] (tool-call
+    /// markup stays text), only calls to the named tool under
+    /// [`Self::Named`].
+    pub(crate) fn reply_tools(&self, schemas: ToolSchemas) -> ReplyTools {
+        ReplyTools {
+            schemas: Arc::new(schemas),
+            parsed: *self != Self::None,
+            only: match self {
+                Self::Named(name) => Some(name.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    /// The text a forced reply starts with: the model's tool-call opener, with
+    /// the tool's name when one is named. It ends the prompt, so the model
+    /// continues the call, and is reported as the start of the reply.
+    pub(crate) fn response_prefix(&self) -> String {
+        use lumen_runtime::tooling::forced_tool_call_prefix;
+        match self {
+            Self::Auto | Self::None => String::new(),
+            Self::Required => forced_tool_call_prefix(None),
+            Self::Named(name) => forced_tool_call_prefix(Some(name)),
+        }
     }
 }
 
