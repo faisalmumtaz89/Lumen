@@ -150,6 +150,10 @@ pub struct ChatCompletionRequest {
     /// {"name": ...}}`; see [`Self::tool_choice`].
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    /// `false`: at most one tool call per reply. A boolean; see
+    /// [`Self::into_job`].
+    #[serde(default)]
+    pub parallel_tool_calls: Option<Value>,
     /// Every field the request does not declare; see [`CHAT_UNSUPPORTED`].
     #[serde(flatten)]
     pub other: serde_json::Map<String, Value>,
@@ -339,11 +343,6 @@ const CHAT_UNSUPPORTED: &[super::Unsupported] = &[
         refused: "returning log probabilities",
     },
     super::Unsupported {
-        field: "parallel_tool_calls",
-        accepts: |v| *v == true,
-        refused: "limiting a reply to one tool call",
-    },
-    super::Unsupported {
         field: "verbosity",
         accepts: |v| v == "medium",
         refused: "a verbosity other than `medium`",
@@ -515,7 +514,10 @@ impl ChatCompletionRequest {
     pub fn reply_tools(&self) -> ReplyTools {
         self.tool_choice()
             .unwrap_or(super::ToolChoice::Auto)
-            .reply_tools(tool_schemas(&self.tools))
+            .reply_tools(
+                tool_schemas(&self.tools),
+                self.parallel_tool_calls == Some(Value::Bool(false)),
+            )
     }
 
     /// The prompt for this request and the text the reply starts with, which
@@ -568,6 +570,17 @@ impl ChatCompletionRequest {
         // silently accepted/clamped.
         super::refuse_unsupported(&self.other, CHAT_UNSUPPORTED)?;
         super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
+        if self
+            .parallel_tool_calls
+            .as_ref()
+            .is_some_and(|p| !p.is_null() && !p.is_boolean())
+        {
+            return Err(ServerError::bad_request_field(
+                "parallel_tool_calls must be a boolean",
+                "parallel_tool_calls",
+                "invalid_type",
+            ));
+        }
         validate_sampler_ranges(self.temperature, self.top_p)?;
         if self.messages.is_empty() {
             return Err(ServerError::bad_request_field(
@@ -2907,7 +2920,6 @@ mod tests {
             ("modalities", json!(["text", "audio"])),
             ("audio", json!({"voice": "alloy", "format": "wav"})),
             ("web_search_options", json!({})),
-            ("parallel_tool_calls", json!(false)),
             ("verbosity", json!("low")),
             ("moderation", json!({"model": "omni-moderation-latest"})),
             ("guided_json", json!({"type": "object"})),
@@ -2931,6 +2943,27 @@ mod tests {
             assert_eq!(param.as_deref(), Some(field));
             assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
         }
+        // `parallel_tool_calls: false` limits the reply to one call.
+        let single = |extra: Value| {
+            let mut body = base();
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ChatCompletionRequest>(body)
+                .unwrap()
+                .reply_tools()
+                .single
+        };
+        for bad in [json!("false"), json!(0), json!({})] {
+            let (param, code) = job(json!({"parallel_tool_calls": bad})).unwrap_err();
+            assert_eq!(
+                (param.as_deref(), code.as_deref()),
+                (Some("parallel_tool_calls"), Some("invalid_type"))
+            );
+        }
+        assert!(single(json!({"parallel_tool_calls": false})));
+        assert!(!single(json!({"parallel_tool_calls": true})));
+        assert!(!single(json!({})));
         // `none` with tools offers none of them (see
         // `tool_choice_matches_the_messages_endpoint`).
         let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);

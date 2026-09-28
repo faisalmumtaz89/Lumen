@@ -175,6 +175,14 @@ impl MessagesRequest {
     /// `output_config.effort` (`low`, `medium`, `high`, `xhigh` or `max`) as
     /// the chat template's `reasoning_effort`, mapped by the shared
     /// [`super::template_reasoning_effort`]. Any other value is refused.
+    /// `tool_choice.disable_parallel_tool_use`: at most one tool call.
+    fn single_tool_call(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .and_then(|c| c.get("disable_parallel_tool_use"))
+            == Some(&Value::Bool(true))
+    }
+
     fn tool_choice(&self) -> Result<super::ToolChoice, ServerError> {
         use super::ToolChoice;
         let choice = self.tool_choice.as_ref().unwrap_or(&Value::Null);
@@ -183,11 +191,12 @@ impl MessagesRequest {
         }
         if choice
             .get("disable_parallel_tool_use")
-            .is_some_and(|d| !d.is_null() && *d != false)
+            .is_some_and(|d| !d.is_null() && !d.is_boolean())
         {
-            return Err(super::unsupported(
+            return Err(ServerError::bad_request_field(
+                "tool_choice.disable_parallel_tool_use must be a boolean",
                 "tool_choice",
-                "limiting a reply to one tool call",
+                "invalid_type",
             ));
         }
         match (choice["type"].as_str(), choice["name"].as_str()) {
@@ -209,7 +218,7 @@ impl MessagesRequest {
     pub fn reply_tools(&self) -> ReplyTools {
         self.tool_choice()
             .unwrap_or(super::ToolChoice::Auto)
-            .reply_tools(tool_schemas(&self.tools))
+            .reply_tools(tool_schemas(&self.tools), self.single_tool_call())
     }
 
     /// The prompt for this request and the text the reply starts with, which
@@ -1775,10 +1784,33 @@ mod tests {
         };
         let plain = job(json!({})).unwrap();
         let tool = json!({"name": "f", "input_schema": {"type": "object"}});
+        let (param, code) =
+            job(json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": "true"}}))
+                .unwrap_err();
+        assert_eq!(
+            (param.as_deref(), code.as_deref()),
+            (Some("tool_choice"), Some("invalid_type"))
+        );
+        let single = |choice: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "tool_choice": choice,
+            }))
+            .unwrap()
+            .reply_tools()
+            .single
+        };
+        assert!(single(
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        ));
+        assert!(!single(
+            json!({"type": "auto", "disable_parallel_tool_use": false})
+        ));
+        assert!(!single(json!({"type": "auto"})));
         for accepted in [
             json!({"tool_choice": {"type": "auto"}, "mcp_servers": [], "container": null}),
             json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": false}}),
             json!({"tool_choice": {"type": "none"}}),
+            json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}),
         ] {
             assert_eq!(job(accepted).unwrap().prompt_tokens, plain.prompt_tokens);
         }
@@ -1796,10 +1828,6 @@ mod tests {
             ),
             (
                 json!({"tool_choice": {"type": "tool", "name": "f"}}),
-                "tool_choice",
-            ),
-            (
-                json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}),
                 "tool_choice",
             ),
             (

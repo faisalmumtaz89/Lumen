@@ -51,6 +51,9 @@ pub struct ReplyTools {
     /// Under a named tool choice, the only tool a call may name; calls to any
     /// other tool are dropped.
     pub only: Option<String>,
+    /// At most one tool call (OpenAI `parallel_tool_calls: false`, Anthropic
+    /// `disable_parallel_tool_use: true`); calls after the first are dropped.
+    pub single: bool,
 }
 
 impl Default for ReplyTools {
@@ -59,6 +62,7 @@ impl Default for ReplyTools {
             schemas: Arc::default(),
             parsed: true,
             only: None,
+            single: false,
         }
     }
 }
@@ -68,6 +72,7 @@ impl Default for ReplyTools {
 fn parse_answer(
     parser: &mut StreamingParser,
     tools: &ReplyTools,
+    calls: &mut usize,
     answer: &str,
 ) -> (String, Vec<ParsedToolCall>) {
     if !tools.parsed {
@@ -77,6 +82,11 @@ fn parse_answer(
     if let Some(only) = &tools.only {
         parsed.tool_calls.retain(|c| c.name == *only);
     }
+    if tools.single {
+        // Room for one call over the whole reply.
+        parsed.tool_calls.truncate(1usize.saturating_sub(*calls));
+    }
+    *calls += parsed.tool_calls.len();
     (parsed.text, parsed.tool_calls)
 }
 
@@ -93,6 +103,8 @@ pub struct SseSafeEmitter {
     parser: StreamingParser,
     /// Which parsed tool calls the reply keeps.
     tools: ReplyTools,
+    /// Tool calls kept so far.
+    calls: usize,
 }
 
 impl Default for SseSafeEmitter {
@@ -105,6 +117,7 @@ impl Default for SseSafeEmitter {
             reasoning: ReasoningExtractor::new(false),
             parser: StreamingParser::new(),
             tools: ReplyTools::default(),
+            calls: 0,
         }
     }
 }
@@ -120,6 +133,7 @@ impl SseSafeEmitter {
             reasoning: ReasoningExtractor::new(thinking),
             parser: StreamingParser::new(),
             tools: ReplyTools::default(),
+            calls: 0,
         }
     }
 
@@ -136,6 +150,7 @@ impl SseSafeEmitter {
             reasoning: ReasoningExtractor::new(thinking),
             parser: StreamingParser::with_schemas(tools.schemas.clone()),
             tools,
+            calls: 0,
         }
     }
 
@@ -145,7 +160,12 @@ impl SseSafeEmitter {
     /// (reasoning never contains tool calls); only answer content is parsed.
     fn process_safe_text(&mut self, safe_text: &str) -> EmitDelta {
         let split = self.reasoning.feed(safe_text);
-        let (text, tool_calls) = parse_answer(&mut self.parser, &self.tools, &split.content);
+        let (text, tool_calls) = parse_answer(
+            &mut self.parser,
+            &self.tools,
+            &mut self.calls,
+            &split.content,
+        );
         EmitDelta {
             reasoning: split.reasoning,
             text,
@@ -191,7 +211,8 @@ impl SseSafeEmitter {
         let mut answer_tail = String::new();
         answer_tail.push_str(&split.content);
         answer_tail.push_str(&reasoning_fin.content);
-        let (text, tool_calls) = parse_answer(&mut self.parser, &self.tools, &answer_tail);
+        let (text, tool_calls) =
+            parse_answer(&mut self.parser, &self.tools, &mut self.calls, &answer_tail);
         let fin: StreamingFinish = if self.tools.parsed {
             self.parser.finish()
         } else {
@@ -403,6 +424,23 @@ mod tests {
             .iter()
             .chain(&fin.tool_calls)
             .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, ["f"]);
+    }
+
+    #[test]
+    fn a_single_call_reply_keeps_only_its_first_call_across_pushes() {
+        let tools = ReplyTools {
+            single: true,
+            ..ReplyTools::default()
+        };
+        let mut e = SseSafeEmitter::with_tools(false, tools);
+        let first = e.push(TWO_CALLS);
+        let later = e.push("<tool_call>\n<function=h>\n</function>\n</tool_call>");
+        let (fin, _) = e.finish();
+        let names: Vec<_> = [first, later, fin]
+            .iter()
+            .flat_map(|d| d.tool_calls.iter().map(|c| c.name.clone()))
             .collect();
         assert_eq!(names, ["f"]);
     }

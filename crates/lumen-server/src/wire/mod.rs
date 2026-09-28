@@ -280,8 +280,8 @@ impl ToolChoice {
 
     /// The tool calls a reply may carry: none under [`Self::None`] (tool-call
     /// markup stays text), only calls to the named tool under
-    /// [`Self::Named`].
-    pub(crate) fn reply_tools(&self, schemas: ToolSchemas) -> ReplyTools {
+    /// [`Self::Named`], and at most one when `single`.
+    pub(crate) fn reply_tools(&self, schemas: ToolSchemas, single: bool) -> ReplyTools {
         ReplyTools {
             schemas: Arc::new(schemas),
             parsed: *self != Self::None,
@@ -289,6 +289,7 @@ impl ToolChoice {
                 Self::Named(name) => Some(name.clone()),
                 _ => None,
             },
+            single,
         }
     }
 
