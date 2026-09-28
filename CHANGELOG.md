@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **A missing CUDA library crashed `lumen` and `lumen-server`.** Without the NVIDIA driver,
   cuBLAS or NVRTC on the loader path they panicked on the first CUDA call. They now stop with
   an error that names the missing libraries and what to install.
+- **`lumen-server` did not find a model pulled under a registry alias.** `lumen pull
+  qwen3.5-moe:q4_0` caches it under its registry key, but the server looked for the alias's
+  own name. The server now resolves names through the model registry, as `lumen` does.
 - **`lumen run` and `lumen-server` ran on the CPU in a container given one GPU of a multi-GPU
   host.** CUDA was auto-selected only when `/dev/nvidia0` existed, and such a container sees
   only its own GPU's node (`/dev/nvidia1`, ...). Any `/dev/nvidiaN` now selects CUDA.
