@@ -154,8 +154,8 @@ check_cuda_userland() {
   if [ -n "$missing" ]; then
     err "CUDA libraries not found on the loader paths this probe checked:$missing"
     err "The install will complete, but inference will fail unless the NVIDIA"
-    err "driver and the CUDA 12 or 13 runtime libraries (cuBLAS, NVRTC) are"
-    err "loadable at run time (or LD_LIBRARY_PATH points at them)."
+    err "driver plus cuBLAS and NVRTC from CUDA 12, or a full CUDA 13 toolkit,"
+    err "are loadable at run time (or LD_LIBRARY_PATH points at them)."
   fi
 }
 

@@ -12,8 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **The one-line installer reported installed CUDA libraries as missing.** When cuBLAS and
   NVRTC were found only through the system loader cache (CUDA 13 in `/opt/cuda`, for
   example), its check died of SIGPIPE under `pipefail` and it warned that inference would
-  fail. It now finds them there, names CUDA 12 or 13 when they are really missing, and no
-  longer says it is using a default model when `--model` was given.
+  fail. It now finds them there, and when they are really missing it names what the binary
+  needs: cuBLAS and NVRTC from CUDA 12, or a full CUDA 13 toolkit. It also no longer says it
+  is using a default model when `--model` was given.
 
 ## [0.36.0] — 2026-09-28
 
