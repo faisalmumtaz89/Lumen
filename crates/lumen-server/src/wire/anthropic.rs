@@ -229,8 +229,8 @@ impl MessagesRequest {
         }
         let reasoning_effort = self.reasoning_effort()?;
         let enable_thinking = self.resolve_thinking();
-        // Per-request reasoning budget (Anthropic `thinking.budget_tokens`);
-        // falls back to the shared default. Carried for Part 4 (decode loop).
+        // Reasoning-token cap within `max_tokens` (Anthropic
+        // `thinking.budget_tokens`); falls back to the shared default.
         let reasoning_budget = self
             .thinking
             .as_ref()

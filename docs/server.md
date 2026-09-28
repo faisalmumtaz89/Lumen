@@ -89,7 +89,7 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 
 The Qwen3.5 family supports an optional `<think>...</think>` reasoning trace. Lumen exposes a per-request reasoning toggle across all surfaces. **Thinking is OFF by default** (the assistant prompt opens a closed empty-think block, `<think>\n\n</think>\n\n`, so the model answers directly). When enabled, the open `<think>\n` tail is emitted, the model produces a reasoning trace, and Lumen routes that trace to a separate field — it is never mixed into the answer text.
 
-The reasoning budget is **separate from `max_tokens`** (industry-convergent with Anthropic `thinking.budget_tokens` / Gemini `thinking_budget`), so a long reasoning trace never starves the answer. Default reasoning budget is `2048` tokens (`runtime_defaults::chat_reasoning_budget_default`).
+`max_tokens` (and `max_completion_tokens` on `/v1/chat/completions`) limits every generated token, reasoning included, as both APIs define it; a reply that reaches it while still reasoning ends there with `length` / `max_tokens`. Within that limit the reasoning budget caps the trace: when it runs out the server closes the reasoning block and the answer uses what remains. Default reasoning budget is `2048` tokens (`runtime_defaults::chat_reasoning_budget_default`). Without `max_tokens`, `/v1/chat/completions` is bounded only by the context window and `/v1/completions` stops at 256 tokens.
 
 **Precedence** (resolved by `runtime_defaults::resolve_enable_thinking`): explicit per-request field → `LUMEN_CHAT_ENABLE_THINKING` env override → process default (OFF).
 
@@ -100,10 +100,10 @@ The reasoning budget is **separate from `max_tokens`** (industry-convergent with
 | CLI `lumen run` | `--think` (and `--no-think` forces off, overriding the env var) | — | reasoning printed to stderr, answer to stdout |
 
 ```bash
-# OpenAI: enable reasoning, cap the trace at 1024 tokens, answer budget separate
+# OpenAI: enable reasoning, cap the trace at 1024 of the 2048 tokens
 curl -fsS http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Plan a 3-day trip"}],"enable_thinking":true,"reasoning_budget":1024,"max_tokens":512}'
+  -d '{"model":"qwen3.5-9b","messages":[{"role":"user","content":"Plan a 3-day trip"}],"enable_thinking":true,"reasoning_budget":1024,"max_tokens":2048}'
 
 # vLLM-compatible form (chat_template_kwargs)
 #   "chat_template_kwargs": {"enable_thinking": true}
@@ -111,7 +111,7 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 # Anthropic: enable extended thinking with a 1024-token budget
 curl -fsS http://localhost:8000/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5-9b","max_tokens":512,"messages":[{"role":"user","content":"Plan a 3-day trip"}],"thinking":{"type":"enabled","budget_tokens":1024}}'
+  -d '{"model":"qwen3.5-9b","max_tokens":2048,"messages":[{"role":"user","content":"Plan a 3-day trip"}],"thinking":{"type":"enabled","budget_tokens":1024}}'
 ```
 
 A reasoning effort sets how much the model reasons while thinking is on: `output_config.effort` on `/v1/messages` and `reasoning_effort` on `/v1/chat/completions`. The levels both APIs share map the same way: `low` and `medium` reach the chat template as its `reasoning_effort` (Qwen3.8 instructs brief reasoning at `low`), while `high`, `xhigh`, `max` and an absent effort keep the template's default (`xhigh` on Qwen3.8). OpenAI's `minimal` runs as `low`. On `/v1/chat/completions` an effort also asks for reasoning, and `none` turns it off, unless `enable_thinking` or `chat_template_kwargs.enable_thinking` is given. Any other value is refused with a 400.

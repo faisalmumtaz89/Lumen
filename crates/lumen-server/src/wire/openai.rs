@@ -135,9 +135,8 @@ pub struct ChatCompletionRequest {
     /// [`lumen_runtime::runtime_defaults::resolve_enable_thinking`].
     #[serde(default)]
     pub enable_thinking: Option<bool>,
-    /// Separate reasoning-token budget (industry-convergent with Anthropic
-    /// `thinking.budget_tokens` / Gemini `thinking_budget`). Carried on the
-    /// request DTO now; the decode-loop enforcement is Part 4 (separate work).
+    /// Reasoning-token cap within `max_tokens` (like Anthropic
+    /// `thinking.budget_tokens`); the shared default when absent.
     #[serde(default)]
     pub reasoning_budget: Option<usize>,
     /// vLLM-compatible `{"chat_template_kwargs": {"enable_thinking": ...}}`.
@@ -545,10 +544,11 @@ impl ChatCompletionRequest {
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
         let eos = engine.eos_tokens_for_request();
+        // Reasoning included; absent, only the context window bounds it.
         let max_tokens = self
             .max_completion_tokens
             .or(self.max_tokens)
-            .unwrap_or(256);
+            .unwrap_or(usize::MAX);
         // server-internal sampler defaults aligned with CLI's
         // production defaults (`--repeat-penalty 1.05`). The
         // OpenAI API surface is preserved: the `repetition_penalty` field
@@ -2750,6 +2750,8 @@ mod tests {
         .unwrap();
         assert_eq!(ignored.prompt_tokens, plain.prompt_tokens);
         assert_eq!(ignored.max_tokens, plain.max_tokens);
+        // Without a limit only the context window bounds the reply.
+        assert_eq!(plain.max_tokens, usize::MAX);
         // The newer name for max_tokens is honoured, and wins.
         assert_eq!(
             job(json!({"max_completion_tokens": 7})).unwrap().max_tokens,
