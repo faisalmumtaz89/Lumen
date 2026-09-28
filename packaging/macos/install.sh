@@ -7,7 +7,8 @@
 # Detects your machine (macOS Apple Silicon -> Metal · Linux x86_64 + NVIDIA ->
 # CUDA), downloads the matching prebuilt binaries from the latest GitHub release,
 # checks their SHA-256 (integrity of the GitHub-hosted asset; authenticity comes
-# from HTTPS to github.com), installs `lumen` + `lumen-server`, lets you pick a
+# from HTTPS to github.com), installs `lumen` + `lumen-server` (and `lbi-convert`,
+# the image-checkpoint converter, when the release ships it), lets you pick a
 # model + quant, prepares it, and prints the exact command to start. No Rust
 # toolchain, no CUDA SDK.
 #
@@ -273,7 +274,9 @@ writable_nosudo() {
     p="$parent"
   done
 }
-# Copy both binaries into $1 using the command prefix $2 ("" or "sudo").
+# Copy the binaries into $1 using the command prefix $2 ("" or "sudo"):
+# lumen and lumen-server always, lbi-convert when the tarball carries it (the
+# Linux/CUDA tarball does from v0.33.0; the macOS one does not).
 # stderr is suppressed so a no-sudo probe failure is SILENT — the caller decides
 # whether the failure is fatal and prints a clean message if so.
 install_to() {
@@ -282,6 +285,9 @@ install_to() {
   for b in lumen lumen-server; do
     $S install -m 0755 "$SRC/bin/$b" "$d/$b" 2>/dev/null || return 1
   done
+  if [ -f "$SRC/bin/lbi-convert" ]; then
+    $S install -m 0755 "$SRC/bin/lbi-convert" "$d/lbi-convert" 2>/dev/null || return 1
+  fi
   # The tarball's license + third-party notice files must accompany the
   # installed copies; older tarballs may lack them, so this is best-effort.
   if [ -f "$SRC/LICENSE-MIT" ]; then
@@ -378,7 +384,9 @@ fi
 
 LUMEN="$DEST/lumen"
 VER="$("$LUMEN" --version 2>/dev/null | awk '{print $NF}' || echo '?')"
-field "Installed" "lumen + lumen-server → $DEST ${C_DIM}·${C_RESET} $VER"
+INSTALLED="lumen + lumen-server"
+[ -x "$DEST/lbi-convert" ] && [ -f "$SRC/bin/lbi-convert" ] && INSTALLED="$INSTALLED + lbi-convert"
+field "Installed" "$INSTALLED → $DEST ${C_DIM}·${C_RESET} $VER"
 
 if [ -n "$PROFILE_EDITED" ]; then
   info "added $DEST to PATH in: $PROFILE_EDITED"
