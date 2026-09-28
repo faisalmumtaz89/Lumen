@@ -65,8 +65,11 @@ pub struct ThinkingConfig {
     pub budget_tokens: Option<usize>,
 }
 
+/// A `/v1/messages` request. Fields this server does not use (`metadata`,
+/// `context_management`, `output_config.effort`, and the others Anthropic
+/// clients attach) are ignored, not rejected; a structured-output request
+/// (`output_config.format`) is refused.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
@@ -76,9 +79,8 @@ pub struct MessagesRequest {
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Anthropic-valid sampler subset. The Messages API exposes `top_p` and
-    /// `top_k` (NOT presence/frequency penalties); both are honored on the
-    /// CLI and were previously HTTP-400-rejected here by `deny_unknown_fields`.
-    /// `None` (omitted) leaves the sampler default untouched.
+    /// `top_k` (NOT presence/frequency penalties); both are honored as on the
+    /// CLI. `None` (omitted) leaves the sampler default untouched.
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -95,6 +97,10 @@ pub struct MessagesRequest {
     /// `LUMEN_CHAT_ENABLE_THINKING` env override then the process default.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    /// Read only for `format`: decoding cannot be constrained to a schema, so
+    /// a structured-output request is refused rather than answered in free text.
+    #[serde(default)]
+    pub output_config: Option<Value>,
 }
 
 impl MessagesRequest {
@@ -108,6 +114,18 @@ impl MessagesRequest {
     }
 
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        if self
+            .output_config
+            .as_ref()
+            .and_then(|c| c.get("format"))
+            .is_some_and(|f| !f.is_null())
+        {
+            return Err(ServerError::bad_request_field(
+                "output_config.format (structured output) is not supported",
+                "output_config.format",
+                "invalid_value",
+            ));
+        }
         let enable_thinking = self.resolve_thinking();
         // Per-request reasoning budget (Anthropic `thinking.budget_tokens`);
         // falls back to the shared default. Carried for Part 4 (decode loop).
@@ -1083,6 +1101,7 @@ mod tests {
                 thinking_type: "enabled".into(),
                 budget_tokens: None,
             }),
+            output_config: None,
         };
         assert!(enabled.resolve_thinking());
         let disabled = MessagesRequest {
@@ -1424,16 +1443,74 @@ mod tests {
         assert_eq!(job.sampling.top_k, Some(50));
     }
 
-    #[test]
-    fn messages_unknown_field_still_400s_deny_unknown_fields_intact() {
-        let body = serde_json::json!({
+    #[tokio::test]
+    async fn messages_unknown_top_level_fields_are_ignored() {
+        let engine = EngineHandle::new_for_test(4096);
+        let plain = serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 16,
-            "definitely_not_a_field": 1
+            "max_tokens": 16
         });
-        let r: Result<MessagesRequest, _> = serde_json::from_value(body);
-        assert!(r.is_err(), "unknown top-level field must still be rejected");
+        let mut extended = plain.clone();
+        for (k, v) in [
+            ("metadata", json!({"user_id": "u"})),
+            ("output_config", json!({"effort": "low"})),
+            (
+                "context_management",
+                json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+            ),
+            ("safeguards", json!([{"type": "dangerous_tool_use"}])),
+            ("definitely_not_a_field", json!(1)),
+        ] {
+            extended[k] = v;
+        }
+        let plain: MessagesRequest = serde_json::from_value(plain).unwrap();
+        let extended: MessagesRequest = serde_json::from_value(extended)
+            .expect("unknown top-level fields must be ignored, not rejected");
+        let (plain, extended) = (
+            plain.into_job(&engine).unwrap(),
+            extended.into_job(&engine).unwrap(),
+        );
+        assert_eq!(plain.prompt_tokens, extended.prompt_tokens);
+        assert_eq!(plain.max_tokens, extended.max_tokens);
+    }
+
+    #[tokio::test]
+    async fn messages_output_format_is_refused_not_ignored() {
+        let engine = EngineHandle::new_for_test(4096);
+        let request = |output_config: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+                "output_config": output_config
+            }))
+            .unwrap()
+        };
+        for format in [
+            json!({"type": "json_schema", "schema": {"type": "object"}}),
+            json!("json"),
+            json!({}),
+        ] {
+            let err = request(json!({"effort": "low", "format": format}))
+                .into_job(&engine)
+                .unwrap_err();
+            let resp = axum::response::IntoResponse::into_response(err);
+            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["param"], "output_config.format");
+            assert_eq!(body["error"]["code"], "invalid_value");
+        }
+        for accepted in [
+            json!(null),
+            json!({"effort": "low"}),
+            json!({"format": null}),
+        ] {
+            assert!(request(accepted).into_job(&engine).is_ok());
+        }
     }
 
     // ---- F16(b): Anthropic synchronous oversize-prompt guard ----

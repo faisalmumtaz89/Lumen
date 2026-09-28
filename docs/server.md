@@ -44,6 +44,8 @@ POST /v1/images/generations # Text to image (`--features image` builds with
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
 
+`/v1/messages` ignores fields it does not use, such as `metadata` or `output_config.effort`, so Anthropic clients that attach them are served. A structured-output request (`output_config.format`) is refused with a 400, since decoding cannot be constrained to a schema. `/v1/chat/completions` and `/v1/completions` refuse an unknown field with a 400.
+
 `/v1/completions` takes `prompt` as a string, an array of strings (concatenated), or an array of token ids. Token ids reach the model unchanged, with no tokenization and no special tokens added, so a client can send the exact ids it measured elsewhere. An id at or above the model's vocabulary size, an array mixing strings with ids or holding anything else, or a prompt that resolves to no tokens, is refused with a 400.
 
 Both wire formats support SSE streaming. Tool-call parsing is template-driven: v1 (current) ships the Qwen3.5 `<tool_call>` / `</tool_call>` marker pattern with a streaming parser that uses partial-marker hold-back; additional templates are registered as new model families ship. Reference embedder: [`crates/lumen-server/tests/server_integration.rs`](../crates/lumen-server/tests/server_integration.rs). Reference binary: [`crates/lumen-server/src/bin/lumen-server.rs`](../crates/lumen-server/src/bin/lumen-server.rs).
