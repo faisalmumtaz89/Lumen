@@ -29,9 +29,41 @@ pub struct CudaDevice {
 /// containers (e.g. Modal). `cuInit` is idempotent -- safe to call
 /// multiple times.
 pub fn device_count() -> Result<usize, RuntimeError> {
+    check_cuda_libraries()?;
     cudarc::driver::result::init().map_err(cuda_driver_err)?;
     let count = cudarc::driver::result::device::get_count().map_err(cuda_driver_err)?;
     Ok(count as usize)
+}
+
+/// Fail with an error that names the CUDA libraries that cannot be loaded.
+/// cudarc panics on the first use of a missing library, so the entry points
+/// check them before any driver, cuBLAS or NVRTC call.
+fn check_cuda_libraries() -> Result<(), RuntimeError> {
+    // SAFETY: each check only tries to open its library.
+    let present = unsafe {
+        [
+            (
+                "libcuda (NVIDIA driver)",
+                cudarc::driver::sys::is_culib_present(),
+            ),
+            ("libcublas", cudarc::cublas::sys::is_culib_present()),
+            ("libnvrtc", cudarc::nvrtc::sys::is_culib_present()),
+        ]
+    };
+    let missing: Vec<&str> = present
+        .iter()
+        .filter(|(_, found)| !found)
+        .map(|(name, _)| *name)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeError::Compute(format!(
+        "CUDA libraries not found: {}. Lumen needs the NVIDIA driver plus cuBLAS and NVRTC \
+         from CUDA 12, or a full CUDA 13 toolkit, loadable at run time (or LD_LIBRARY_PATH \
+         pointing at them)",
+        missing.join(", ")
+    )))
 }
 
 impl CudaDevice {
@@ -42,6 +74,7 @@ impl CudaDevice {
     ///
     /// Initializes a cuBLAS handle bound to the device's default stream.
     pub fn new(device_id: usize) -> Result<Self, RuntimeError> {
+        check_cuda_libraries()?;
         let count = device_count().map_err(|_| {
             RuntimeError::Compute("No CUDA driver found -- is the NVIDIA driver installed?".into())
         })?;
