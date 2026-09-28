@@ -418,9 +418,8 @@ async fn legacy_completion_empty_prompt_is_refused() {
 ///      shape as schema 400, only `code` differs)
 ///   4. `max_tokens` is string not number
 ///   5. Invalid `stream` value (string instead of bool)
-///   6. Unknown extra field (Lumen schema is `additionalProperties:
-///      false` per `#[serde(deny_unknown_fields)]` on the top-level
-///      request DTOs)
+///   6. A field asking for output the server cannot produce (`n` > 1;
+///      a field the server does not use is ignored instead)
 ///
 /// Each case asserts:
 ///   - HTTP status is 400 (NOT 422)
@@ -586,23 +585,20 @@ async fn bad_request_returns_400() {
     .await;
     assert_eq!(v5["error"]["code"], "invalid_type", "C5 code");
 
-    // Case 6: unknown extra field — schema is additionalProperties:false.
+    // Case 6: a field asking for output the server cannot produce.
     let v6 = post_and_assert_envelope(
         &client,
         uri.clone(),
         serde_json::json!({
             "model": MODEL_ID,
             "messages": [{"role": "user", "content": "x"}],
-            "garbage_field_not_in_spec": 42,
+            "n": 2,
         }),
-        "C6 unknown-field",
+        "C6 unproducible-field",
     )
     .await;
-    assert_eq!(v6["error"]["code"], "unknown_field", "C6 code");
-    assert_eq!(
-        v6["error"]["param"], "garbage_field_not_in_spec",
-        "C6 param"
-    );
+    assert_eq!(v6["error"]["code"], "invalid_value", "C6 code");
+    assert_eq!(v6["error"]["param"], "n", "C6 param");
 }
 
 /// G3: real-SDK round-trip — when the `LUMEN_TEST_OPENAI_SDK`
@@ -642,16 +638,12 @@ except Exception as e:
     sys.exit(2)
 client = OpenAI(base_url=os.environ["LUMEN_BASE_URL"], api_key="not-used")
 try:
-    # Manually craft a body missing `model` via the raw HTTP layer the
-    # SDK uses internally. The SDK enforces `model` on its side, so we
-    # must bypass typed checks via `with_raw_response`-style calls.
-    # Simpler: send a "messages" with wrong type for max_tokens via the
-    # SDK's `extra_body` to force a wire-level schema rejection.
+    # A request the SDK sends as-is but the server must refuse.
     client.chat.completions.create(
         model="lumen-test:synthetic",
         messages=[{"role": "user", "content": "x"}],
         max_tokens=4,
-        extra_body={"garbage_field_not_in_spec": 42},  # triggers unknown_field
+        n=2,  # more than one choice: refused with a 400
     )
     print("UNEXPECTED-SUCCESS", file=sys.stderr)
     sys.exit(3)
@@ -661,9 +653,9 @@ except BadRequestError as e:
     err = body.get("error", {})
     if err.get("type") != "invalid_request_error":
         print(f"BAD-TYPE: {err}", file=sys.stderr); sys.exit(4)
-    if err.get("code") != "unknown_field":
+    if err.get("code") != "invalid_value":
         print(f"BAD-CODE: {err}", file=sys.stderr); sys.exit(5)
-    if err.get("param") != "garbage_field_not_in_spec":
+    if err.get("param") != "n":
         print(f"BAD-PARAM: {err}", file=sys.stderr); sys.exit(6)
     print("BadRequestError-OK")
     sys.exit(0)

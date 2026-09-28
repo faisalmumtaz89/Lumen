@@ -44,7 +44,16 @@ POST /v1/images/generations # Text to image (`--features image` builds with
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
 
-`/v1/messages` ignores fields it does not use, such as `metadata`, so Anthropic clients that attach them are served. A structured-output request (`output_config.format`) is refused with a 400, since decoding cannot be constrained to a schema. `/v1/chat/completions` and `/v1/completions` refuse an unknown field with a 400.
+Every endpoint ignores a top-level request field it does not use, such as `metadata`, `user`, `store` or `service_tier`, so clients that attach them are served. A top-level field that asks for output the server cannot produce is refused with a 400 naming it, rather than silently dropped:
+
+| Endpoint | Refused unless left at its default |
+|---|---|
+| `/v1/chat/completions` and `/v1/completions` | `n` or `best_of` above 1, `echo`, `logit_bias` with a non-zero bias, `response_format` other than text, and the extensions other OpenAI-compatible servers honour: structured output (`guided_json`, `guided_choice`, `guided_regex`, `guided_grammar`, `structured_outputs`, `structural_tag`, `json_schema`, `regex`, `ebnf`, `grammar`), `prompt_logprobs`, `min_tokens`, `stop_token_ids`, `include_stop_str_in_output`, `no_stop_trim`, `repetition_penalty`, `bad_words`, `allowed_token_ids`, `logits_processors`, `custom_logit_processor`, `use_beam_search`, `length_penalty`, `truncate_prompt_tokens`, `skip_special_tokens: false`, `spaces_between_special_tokens: false`, `return_tokens_as_token_ids`, `lora_path` and `reasoning` (use `reasoning_effort`) |
+| `/v1/chat/completions` | `logprobs`, `top_logprobs`, the legacy `functions` / `function_call`, `tool_choice` other than `auto` (or `none` with no tools), `parallel_tool_calls: false`, `verbosity` other than `medium`, `modalities` other than text, `audio`, `web_search_options`, `moderation`, and the extensions `add_generation_prompt: false`, `continue_final_message`, `add_special_tokens`, `chat_template`, `documents`, `mm_processor_kwargs`, `separate_reasoning: false`, `stream_reasoning: false` and `return_hidden_states` |
+| `/v1/completions` | `suffix`, `logprobs` |
+| `/v1/messages` | `output_config.format` or `output_format` (structured output), `tool_choice` other than `auto` (or `none` with no tools) or with `disable_parallel_tool_use`, `mcp_servers`, `container`, and tools whose `type` is not `custom` (Anthropic-defined tools such as web search or bash) |
+
+`/v1/chat/completions` takes `max_completion_tokens` as the newer name for `max_tokens`; it wins when both are given. `stream_options.include_usage` adds the final usage chunk on both OpenAI endpoints.
 
 A system message after the start of the conversation (`role: "system"` inside `/v1/messages` `messages`, or any but the first message of `/v1/chat/completions`) stays where it was sent, so its instructions apply from that point on and the prompt before it is unchanged. It renders the way the model's chat template renders it; a template that only accepts a system message at the start (Qwen3.5, Qwen3.8) gets it as a system turn in that template's own framing. Lumen first renders a probe conversation with the template and refuses the request with a 400 when the probe shows the template moving such a message to the start, dropping it or rendering it as another role.
 

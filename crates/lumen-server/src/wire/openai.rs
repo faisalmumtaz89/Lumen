@@ -4,13 +4,10 @@
 //! - <https://platform.openai.com/docs/api-reference/chat>
 //! - <https://platform.openai.com/docs/api-reference/completions>
 //!
-//! the top-level request bodies (`ChatCompletionRequest`,
-//! `CompletionRequest`) carry `#[serde(deny_unknown_fields)]` to match
-//! the OpenAI schema's `additionalProperties: false` contract. Unknown
-//! top-level fields trigger HTTP 400 + OpenAI envelope with
-//! `code="unknown_field"` via the [`crate::router::OpenAiJson`] extractor.
-//! Inner DTOs (messages, tool defs, tool calls) keep the original
-//! permissive behavior so forward-compatible client extras still pass.
+//! A field a request body does not declare is ignored, as on `/v1/messages`,
+//! unless it asks for output this server cannot produce: those are listed in
+//! [`OPENAI_UNSUPPORTED`], [`CHAT_UNSUPPORTED`] and [`COMPLETION_UNSUPPORTED`]
+//! and refused with a 400 (see [`super::refuse_unsupported`]).
 
 use std::sync::Arc;
 
@@ -69,9 +66,8 @@ pub struct ToolDefFunction {
 }
 
 /// vLLM-/SGLang-compatible `chat_template_kwargs`. The only field Lumen reads
-/// is `enable_thinking`; any other keys pass through and are ignored (the
-/// struct is permissive — NOT `deny_unknown_fields` — so forward-compatible
-/// extras don't 400). This mirrors the vLLM OpenAI server, which accepts
+/// is `enable_thinking`; any other keys are ignored. This mirrors the vLLM
+/// OpenAI server, which accepts
 /// `{"chat_template_kwargs": {"enable_thinking": false}}` to toggle the
 /// Qwen3.5 reasoning block.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,18 +77,19 @@ pub struct ChatTemplateKwargs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub max_tokens: Option<usize>,
+    /// The newer name for `max_tokens`; wins when both are given.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
-    /// Nucleus-sampling cutoff (OpenAI `top_p`). Honored on the CLI today but
-    /// previously HTTP-400-rejected here by `deny_unknown_fields`. `None`
+    /// Nucleus-sampling cutoff (OpenAI `top_p`), honored as on the CLI. `None`
     /// (omitted) leaves the sampler default untouched.
     #[serde(default)]
     pub top_p: Option<f32>,
@@ -152,12 +149,300 @@ pub struct ChatCompletionRequest {
     /// [`Self::resolve_thinking`].
     #[serde(default)]
     pub reasoning_effort: Option<Value>,
+    /// Every field the request does not declare; see [`CHAT_UNSUPPORTED`].
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
-/// OpenAI `stream_options` object (streaming requests only). Strict like the
-/// parent request struct: unknown fields 400.
+/// Fields both OpenAI endpoints refuse unless left at their default: the ones
+/// the two share, then the extensions other OpenAI-compatible servers honour,
+/// since a client sending them expects them to apply.
+const OPENAI_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "n",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "more than one choice",
+    },
+    super::Unsupported {
+        field: "best_of",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "choosing among several completions",
+    },
+    super::Unsupported {
+        field: "use_beam_search",
+        accepts: |v| *v == false,
+        refused: "beam search",
+    },
+    super::Unsupported {
+        field: "length_penalty",
+        accepts: |v| super::is_number(v, 1.0),
+        refused: "a length penalty",
+    },
+    super::Unsupported {
+        field: "echo",
+        accepts: |v| *v == false,
+        refused: "echoing the prompt",
+    },
+    super::Unsupported {
+        field: "logit_bias",
+        accepts: super::is_zero_bias,
+        refused: "biasing token probabilities",
+    },
+    super::Unsupported {
+        field: "prompt_logprobs",
+        accepts: |_| false,
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "return_tokens_as_token_ids",
+        accepts: |v| *v == false,
+        refused: "returning token ids",
+    },
+    super::Unsupported {
+        field: "response_format",
+        accepts: |v| v["type"] == "text",
+        refused: "structured output",
+    },
+    super::Unsupported {
+        field: "structural_tag",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_json",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_choice",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_regex",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "guided_grammar",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "structured_outputs",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "json_schema",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "regex",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "ebnf",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "grammar",
+        accepts: |_| false,
+        refused: "constrained output",
+    },
+    super::Unsupported {
+        field: "min_tokens",
+        accepts: |v| super::is_number(v, 0.0),
+        refused: "a minimum length",
+    },
+    super::Unsupported {
+        field: "stop_token_ids",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "stop token ids",
+    },
+    super::Unsupported {
+        field: "include_stop_str_in_output",
+        accepts: |v| *v == false,
+        refused: "keeping the stop string",
+    },
+    super::Unsupported {
+        field: "no_stop_trim",
+        accepts: |v| *v == false,
+        refused: "keeping the stop string",
+    },
+    super::Unsupported {
+        field: "repetition_penalty",
+        accepts: |_| false,
+        refused: "a per-request repetition penalty",
+    },
+    super::Unsupported {
+        field: "bad_words",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "banned words",
+    },
+    super::Unsupported {
+        field: "allowed_token_ids",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "restricting the vocabulary",
+    },
+    super::Unsupported {
+        field: "logits_processors",
+        accepts: |_| false,
+        refused: "logits processors",
+    },
+    super::Unsupported {
+        field: "custom_logit_processor",
+        accepts: |_| false,
+        refused: "logits processors",
+    },
+    super::Unsupported {
+        field: "truncate_prompt_tokens",
+        accepts: |_| false,
+        refused: "truncating the prompt",
+    },
+    super::Unsupported {
+        field: "skip_special_tokens",
+        accepts: |v| *v == true,
+        refused: "keeping special tokens in the text",
+    },
+    super::Unsupported {
+        field: "spaces_between_special_tokens",
+        accepts: |v| *v == true,
+        refused: "changing special-token spacing",
+    },
+    super::Unsupported {
+        field: "lora_path",
+        accepts: |_| false,
+        refused: "LoRA adapters",
+    },
+    super::Unsupported {
+        field: "reasoning",
+        accepts: |_| false,
+        refused: "`reasoning` (use `reasoning_effort`)",
+    },
+];
+
+/// Chat fields that must stay at their default, besides [`OPENAI_UNSUPPORTED`].
+/// `tool_choice` is checked separately (see [`ChatCompletionRequest::into_job`]).
+const CHAT_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "logprobs",
+        accepts: |v| *v == false,
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "top_logprobs",
+        accepts: |v| super::is_number(v, 0.0),
+        refused: "returning log probabilities",
+    },
+    super::Unsupported {
+        field: "parallel_tool_calls",
+        accepts: |v| *v == true,
+        refused: "limiting a reply to one tool call",
+    },
+    super::Unsupported {
+        field: "verbosity",
+        accepts: |v| v == "medium",
+        refused: "a verbosity other than `medium`",
+    },
+    super::Unsupported {
+        field: "moderation",
+        accepts: |_| false,
+        refused: "moderation",
+    },
+    super::Unsupported {
+        field: "functions",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "legacy function calling (use `tools`)",
+    },
+    super::Unsupported {
+        field: "function_call",
+        accepts: |v| v == "none" || v == "auto",
+        refused: "legacy function calling (use `tools`)",
+    },
+    super::Unsupported {
+        field: "modalities",
+        accepts: |v| v.as_array().is_some_and(|a| a.iter().all(|m| m == "text")),
+        refused: "output other than text",
+    },
+    super::Unsupported {
+        field: "audio",
+        accepts: |_| false,
+        refused: "audio output",
+    },
+    super::Unsupported {
+        field: "web_search_options",
+        accepts: |_| false,
+        refused: "web search",
+    },
+    super::Unsupported {
+        field: "add_generation_prompt",
+        accepts: |v| *v == true,
+        refused: "rendering without the assistant prompt",
+    },
+    super::Unsupported {
+        field: "continue_final_message",
+        accepts: |v| *v == false,
+        refused: "continuing the last message",
+    },
+    super::Unsupported {
+        field: "add_special_tokens",
+        accepts: |v| *v == false,
+        refused: "adding special tokens to the prompt",
+    },
+    super::Unsupported {
+        field: "chat_template",
+        accepts: |_| false,
+        refused: "a request chat template",
+    },
+    super::Unsupported {
+        field: "documents",
+        accepts: |_| false,
+        refused: "documents",
+    },
+    super::Unsupported {
+        field: "mm_processor_kwargs",
+        accepts: |_| false,
+        refused: "multimodal input",
+    },
+    super::Unsupported {
+        field: "separate_reasoning",
+        accepts: |v| *v == true,
+        refused: "reasoning mixed into the answer",
+    },
+    super::Unsupported {
+        field: "stream_reasoning",
+        accepts: |v| *v == true,
+        refused: "withholding streamed reasoning",
+    },
+    super::Unsupported {
+        field: "return_hidden_states",
+        accepts: |v| *v == false,
+        refused: "returning hidden states",
+    },
+];
+
+/// Completion fields that must stay at their default, besides
+/// [`OPENAI_UNSUPPORTED`].
+const COMPLETION_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "suffix",
+        accepts: |v| v == "",
+        refused: "a suffix after the completion",
+    },
+    super::Unsupported {
+        field: "logprobs",
+        accepts: |_| false,
+        refused: "returning log probabilities",
+    },
+];
+
+/// OpenAI `stream_options` object (streaming requests only). Other keys are
+/// ignored like unknown request fields.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StreamOptions {
     /// When true, emit the final usage chunk (empty `choices` + `usage`)
     /// before `data: [DONE]`.
@@ -225,6 +510,19 @@ impl ChatCompletionRequest {
         // ROBUST-007 (2026-06-11 checklist): out-of-range sampler params and
         // empty `messages` must 400 like other malformed fields, not be
         // silently accepted/clamped.
+        super::refuse_unsupported(&self.other, CHAT_UNSUPPORTED)?;
+        super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
+        // `auto`, or `none` with no tools to call, is what the server does.
+        let tool_choice = self.other.get("tool_choice").unwrap_or(&Value::Null);
+        if !(tool_choice.is_null()
+            || tool_choice == "auto"
+            || (tool_choice == "none" && self.tools.is_empty()))
+        {
+            return Err(super::unsupported(
+                "tool_choice",
+                "a tool choice other than `auto`",
+            ));
+        }
         validate_sampler_ranges(self.temperature, self.top_p)?;
         if self.messages.is_empty() {
             return Err(ServerError::bad_request_field(
@@ -247,7 +545,10 @@ impl ChatCompletionRequest {
         super::check_prompt_length(prompt_tokens.len(), engine.context_length())?;
         let stop_text = parse_stop_field(self.stop);
         let eos = engine.eos_tokens_for_request();
-        let max_tokens = self.max_tokens.unwrap_or(256);
+        let max_tokens = self
+            .max_completion_tokens
+            .or(self.max_tokens)
+            .unwrap_or(256);
         // server-internal sampler defaults aligned with CLI's
         // production defaults (`--repeat-penalty 1.05`). The
         // OpenAI API surface is preserved: the `repetition_penalty` field
@@ -300,7 +601,6 @@ impl ChatCompletionRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: Value,
@@ -311,9 +611,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub seed: Option<u64>,
     /// Mirror of the OpenAI-valid sampler set carried on chat completions
-    /// (see `ChatCompletionRequest`): honored on the CLI, previously
-    /// 400-rejected here by `deny_unknown_fields`. Same zero-normalization /
-    /// override semantics as the chat path.
+    /// (see `ChatCompletionRequest`), honored as on the CLI. Same
+    /// zero-normalization / override semantics as the chat path.
     #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default)]
@@ -332,10 +631,26 @@ pub struct CompletionRequest {
     /// render nothing) until `max_tokens` or another stop. Off by default.
     #[serde(default)]
     pub ignore_eos: bool,
+    /// Streaming only: `include_usage` adds the final usage chunk, as on chat.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// Every field the request does not declare; see [`COMPLETION_UNSUPPORTED`].
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl CompletionRequest {
+    /// True when the streaming client asked for the final usage chunk.
+    pub fn include_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        super::refuse_unsupported(&self.other, COMPLETION_UNSUPPORTED)?;
+        super::refuse_unsupported(&self.other, OPENAI_UNSUPPORTED)?;
         // ROBUST-007: same sampler-range guard as the chat endpoint.
         validate_sampler_ranges(self.temperature, self.top_p)?;
         let prompt_tokens = completion_prompt_tokens(self.prompt, engine)?;
@@ -763,6 +1078,7 @@ pub fn stream_completion(
     model: String,
     created: u64,
     stop: Vec<String>,
+    include_usage: bool,
 ) -> Body {
     let (tx, body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     // Legacy completions have no chat template / `<think>` block: thinking is
@@ -777,8 +1093,7 @@ pub fn stream_completion(
         false,
         stop,
         Arc::new(ToolSchemas::default()),
-        // The legacy surface has no `stream_options`; never emit a usage chunk.
-        false,
+        include_usage,
     ));
     body_from_byte_stream(body_rx)
 }
@@ -1073,15 +1388,15 @@ async fn drive_chat_stream(
         })
     };
     let _ = tx.send(sse_frame(&tail.to_string())).await;
-    // OpenAI `stream_options.include_usage` contract (chat only): when the
-    // client requested it, ONE extra chunk with empty `choices` and the usage
-    // totals goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When
-    // not requested, nothing is emitted here — the stream stays byte-identical
-    // to the historical shape.
-    if chat && include_usage {
+    // OpenAI `stream_options.include_usage` contract: when the client
+    // requested it, ONE extra chunk with empty `choices` and the usage totals
+    // goes out AFTER the finish chunk and BEFORE `data: [DONE]`. When not
+    // requested, nothing is emitted here — the stream stays byte-identical to
+    // the historical shape.
+    if include_usage {
         let usage = json!({
             "id": id,
-            "object": "chat.completion.chunk",
+            "object": if chat { "chat.completion.chunk" } else { "text_completion" },
             "created": created,
             "model": model,
             "choices": [],
@@ -1613,16 +1928,21 @@ mod tests {
     /// empty `choices` + the usage totals, positioned as the LAST data frame
     /// before `data: [DONE]` (the OpenAI streaming contract).
     #[tokio::test]
-    async fn stream_chat_usage_chunk_present_when_requested() {
-        let events = vec![
-            tok("hi"),
-            TokenEvent::Done {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: 7,
-                completion_tokens: 3,
-            },
-        ];
-        let sse = stream_openai_to_string(events, true, true).await;
+    async fn stream_usage_chunk_present_when_requested() {
+        for (chat, object) in [(true, "chat.completion.chunk"), (false, "text_completion")] {
+            let events = vec![
+                tok("hi"),
+                TokenEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                },
+            ];
+            assert_usage_chunk(&stream_openai_to_string(events, chat, true).await, object);
+        }
+    }
+
+    fn assert_usage_chunk(sse: &str, object: &str) {
         let frames: Vec<&str> = sse
             .split("\n\n")
             .filter_map(|b| b.trim().strip_prefix("data: "))
@@ -1635,6 +1955,7 @@ mod tests {
             0,
             "usage chunk must carry empty choices: {usage_frame}"
         );
+        assert_eq!(v["object"], object);
         assert_eq!(v["usage"]["prompt_tokens"], 7);
         assert_eq!(v["usage"]["completion_tokens"], 3);
         assert_eq!(v["usage"]["total_tokens"], 10);
@@ -2306,8 +2627,7 @@ mod tests {
 
     #[test]
     fn chat_request_with_sampler_params_deserializes_not_400() {
-        // Previously these fields tripped `deny_unknown_fields` -> HTTP 400.
-        // They must now deserialize cleanly onto the DTO.
+        // These fields must deserialize cleanly onto the DTO.
         let body = serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],
@@ -2390,16 +2710,126 @@ mod tests {
         assert_eq!(req.frequency_penalty, Some(0.4));
     }
 
+    /// Build a job from `base` plus `extra`, or the 400's param and code.
+    fn job_or_param<R: serde::de::DeserializeOwned>(
+        base: Value,
+        extra: Value,
+        into_job: impl Fn(R, &EngineHandle) -> Result<JobRequest, ServerError>,
+    ) -> Result<JobRequest, (Option<String>, Option<String>)> {
+        let engine = EngineHandle::new_for_test(4096);
+        let mut body = base;
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let req: R = serde_json::from_value(body).expect("the request parses");
+        into_job(req, &engine).map_err(|e| match e {
+            ServerError::BadRequest { param, code, .. } => (param, code),
+            other => panic!("expected a 400, got {other:?}"),
+        })
+    }
+
     #[test]
-    fn unknown_field_still_400s_deny_unknown_fields_intact() {
-        // Guard: adding the sampler fields must NOT loosen deny_unknown_fields.
-        let body = serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            "definitely_not_a_field": 1
-        });
-        let r: Result<ChatCompletionRequest, _> = serde_json::from_value(body);
-        assert!(r.is_err(), "unknown top-level field must still be rejected");
+    fn chat_ignores_unused_fields_and_refuses_unproducible_ones() {
+        let base = || json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let job = |extra: Value| job_or_param(base(), extra, ChatCompletionRequest::into_job);
+        let plain = job(json!({})).unwrap();
+        // Fields this server does not use, and unproducible ones at their
+        // defaults, leave the job as it was.
+        let ignored = job(json!({
+            "store": true, "metadata": {"k": "v"}, "user": "u", "safety_identifier": "s",
+            "service_tier": "auto", "prompt_cache_key": "k", "parallel_tool_calls": true,
+            "prediction": {"type": "content", "content": "x"}, "verbosity": "medium",
+            "definitely_not_a_field": 1, "n": 1.0, "logprobs": false, "top_logprobs": 0,
+            "logit_bias": {"42": 0}, "response_format": {"type": "text", "strict": false},
+            "tool_choice": "none", "function_call": "none", "functions": [], "modalities": [],
+            "audio": null, "echo": false, "best_of": 1, "use_beam_search": false,
+            "skip_special_tokens": true, "add_generation_prompt": true, "min_tokens": 0,
+            "stop_token_ids": [], "separate_reasoning": true, "priority": 0, "request_id": "r",
+            "stream_options": {"include_usage": false, "include_obfuscation": false},
+        }))
+        .unwrap();
+        assert_eq!(ignored.prompt_tokens, plain.prompt_tokens);
+        assert_eq!(ignored.max_tokens, plain.max_tokens);
+        // The newer name for max_tokens is honoured, and wins.
+        assert_eq!(
+            job(json!({"max_completion_tokens": 7})).unwrap().max_tokens,
+            7
+        );
+        assert_eq!(
+            job(json!({"max_tokens": 9, "max_completion_tokens": 7}))
+                .unwrap()
+                .max_tokens,
+            7
+        );
+        for (field, value) in [
+            ("n", json!(2)),
+            ("response_format", json!({"type": "json_object"})),
+            ("logprobs", json!(true)),
+            ("top_logprobs", json!(3)),
+            ("logit_bias", json!({"42": 5})),
+            ("functions", json!([{"name": "f", "parameters": {}}])),
+            ("function_call", json!({"name": "f"})),
+            ("tool_choice", json!("required")),
+            ("modalities", json!(["text", "audio"])),
+            ("audio", json!({"voice": "alloy", "format": "wav"})),
+            ("web_search_options", json!({})),
+            ("parallel_tool_calls", json!(false)),
+            ("verbosity", json!("low")),
+            ("moderation", json!({"model": "omni-moderation-latest"})),
+            ("guided_json", json!({"type": "object"})),
+            ("guided_choice", json!(["yes", "no"])),
+            ("structured_outputs", json!({"regex": "a+"})),
+            ("grammar", json!("root ::= \"a\"")),
+            ("structural_tag", json!("{}")),
+            ("echo", json!(true)),
+            ("prompt_logprobs", json!(1)),
+            ("min_tokens", json!(5)),
+            ("stop_token_ids", json!([1])),
+            ("repetition_penalty", json!(1.1)),
+            ("bad_words", json!(["x"])),
+            ("add_generation_prompt", json!(false)),
+            ("chat_template", json!("{{ messages }}")),
+            ("lora_path", json!("adapter")),
+            ("reasoning", json!({"effort": "high"})),
+            ("skip_special_tokens", json!(false)),
+        ] {
+            let (param, code) = job(json!({ field: value })).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field));
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
+        }
+        // `none` is what the server does only when there is no tool to call.
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {}}}]);
+        let (param, _) = job(json!({"tool_choice": "none", "tools": tools})).unwrap_err();
+        assert_eq!(param.as_deref(), Some("tool_choice"));
+    }
+
+    #[test]
+    fn completions_ignore_unused_fields_and_refuse_unproducible_ones() {
+        let base = || json!({"model": "m", "prompt": "hi"});
+        let job = |extra: Value| job_or_param(base(), extra, CompletionRequest::into_job);
+        let plain = job(json!({})).unwrap();
+        let ignored = job(json!({
+            "user": "u", "definitely_not_a_field": 1, "n": 1, "best_of": 1.0, "echo": false,
+            "suffix": "", "logit_bias": {}, "logprobs": null,
+        }))
+        .unwrap();
+        assert_eq!(ignored.prompt_tokens, plain.prompt_tokens);
+        assert_eq!(ignored.max_tokens, plain.max_tokens);
+        for (field, value) in [
+            ("n", json!(2)),
+            ("best_of", json!(3)),
+            ("echo", json!(true)),
+            ("suffix", json!("tail")),
+            ("logit_bias", json!({"42": 5})),
+            ("logprobs", json!(2)),
+            ("guided_regex", json!("a+")),
+            ("response_format", json!({"type": "json_object"})),
+            ("min_tokens", json!(5)),
+        ] {
+            let (param, code) = job(json!({ field: value })).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field));
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{field}");
+        }
     }
 
     /// `ignore_eos` reaches the job on both endpoints, off by default, and

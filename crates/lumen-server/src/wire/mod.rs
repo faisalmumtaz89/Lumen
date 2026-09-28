@@ -215,6 +215,54 @@ pub(crate) fn template_reasoning_effort(level: &str) -> Option<Option<&'static s
     }
 }
 
+/// A request field that must stay at its default, because any other value asks
+/// for output this server cannot produce. `accepts` says whether a value asks
+/// for nothing more than the default does; `refused` names what it asks for.
+pub(crate) struct Unsupported {
+    pub field: &'static str,
+    pub accepts: fn(&Value) -> bool,
+    pub refused: &'static str,
+}
+
+/// Whether `value` is the number `n`, however it is written (`1`, `1.0`).
+pub(crate) fn is_number(value: &Value, n: f64) -> bool {
+    value.as_f64() == Some(n)
+}
+
+/// Whether a `logit_bias` map biases nothing.
+pub(crate) fn is_zero_bias(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|m| m.values().all(|b| is_number(b, 0.0)))
+}
+
+/// The 400 for a field whose value asks for something this server cannot do.
+pub(crate) fn unsupported(field: &str, refused: &str) -> ServerError {
+    ServerError::bad_request_field(
+        format!("{field}: {refused} is not supported"),
+        field,
+        "invalid_value",
+    )
+}
+
+/// Every endpoint ignores a field it does not use, as long as ignoring it cannot
+/// change the answer. The fields in `table` could, so a value other than null or
+/// one they accept is refused rather than silently dropped. `other` holds the
+/// fields the request does not declare.
+pub(crate) fn refuse_unsupported(
+    other: &serde_json::Map<String, Value>,
+    table: &[Unsupported],
+) -> Result<(), ServerError> {
+    for u in table {
+        if let Some(value) = other.get(u.field) {
+            if !value.is_null() && !(u.accepts)(value) {
+                return Err(unsupported(u.field, u.refused));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A request's reasoning effort field as its level: `None` when absent or null,
 /// a 400 naming `param` when it is not a string. The level itself is checked by
 /// the caller, since each API lists its own.

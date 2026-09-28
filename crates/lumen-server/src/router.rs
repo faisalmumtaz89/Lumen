@@ -14,7 +14,7 @@
 //!
 //! All request handlers use the [`OpenAiJson`] extractor instead of axum's
 //! built-in `Json<T>`. Schema-deserialization errors (missing fields, wrong
-//! types, unknown fields when `deny_unknown_fields` applies) are converted
+//! types) are converted
 //! to [`ServerError::BadRequest`] with `param` populated from
 //! `serde_json::Error::path()` and a stable `code` derived from
 //! `Error::classify()`. The response is HTTP 400 with the OpenAI envelope
@@ -101,7 +101,6 @@ pub fn build_router_with_images(
 // Mapping rules from `serde_json::Error`:
 //   - `missing field "X"`             → code=`missing_field`,    param=X
 //   - `invalid type ... at line/col`  → code=`invalid_type`,     param=path
-//   - `unknown field "X"`             → code=`unknown_field`,    param=X
 //   - other Data errors               → code=`invalid_value`,    param=path
 //   - Syntax errors (truncated JSON)  → code=`invalid_json`,     param=None
 //   - Io / Eof                        → code=`invalid_json`,     param=None
@@ -136,7 +135,6 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
     // serde_json messages have stable shapes we can parse:
     //   "missing field `messages` at line 1 column 18"
     //   "invalid type: integer `5`, expected a sequence at line 1 column 30"
-    //   "unknown field `garbage`, expected one of `model`, ... at line 1 column 30"
     //   "EOF while parsing a value at line 1 column 0"
     //   "expected `:` at line 1 column 8"
     if let Some(field) = extract_quoted_after(&msg, "missing field") {
@@ -144,13 +142,6 @@ fn map_serde_error(e: serde_json::Error) -> ServerError {
             format!("missing required field: `{field}`"),
             field,
             "missing_field",
-        );
-    }
-    if let Some(field) = extract_quoted_after(&msg, "unknown field") {
-        return ServerError::bad_request_field(
-            format!("unknown field: `{field}`"),
-            field,
-            "unknown_field",
         );
     }
     if msg.starts_with("invalid type") {
@@ -277,12 +268,14 @@ async fn completions(
 ) -> Result<Response, ServerError> {
     let model_id = state.engine.model_info().id.clone();
     let stream = req.stream.unwrap_or(false);
+    let include_usage = req.include_usage();
     let job = req.into_job(&state.engine)?;
     wire::bench_token_ids_guard(stream, &job.stop_text)?;
     let stop = job.stop_text.clone();
     let rx = state.engine.submit(job, 128).await?;
     if stream {
-        let body = wire::openai::stream_completion(rx, model_id, current_unix_time(), stop);
+        let body =
+            wire::openai::stream_completion(rx, model_id, current_unix_time(), stop, include_usage);
         Ok(sse_response(body))
     } else {
         let resp =

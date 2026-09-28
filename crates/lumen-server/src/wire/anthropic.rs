@@ -46,6 +46,12 @@ pub struct AnthropicMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicTool {
+    /// `custom` (the default) is a tool the client defines and runs. Other
+    /// types are Anthropic-defined tools (web search, code execution, bash,
+    /// text editor, ...), whose schemas this server does not know; they are
+    /// refused.
+    #[serde(default, rename = "type")]
+    pub tool_type: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -54,9 +60,8 @@ pub struct AnthropicTool {
 }
 
 /// Anthropic extended-thinking config: `{"type": "enabled"|"adaptive"|"disabled",
-/// "budget_tokens": N}`. Permissive (not `deny_unknown_fields`) so future
-/// Anthropic keys such as `display` pass through. An unknown `type` is refused
-/// rather than read as off.
+/// "budget_tokens": N}`. Other keys, such as `display`, are ignored. An unknown
+/// `type` is refused rather than read as off.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
@@ -127,7 +132,30 @@ pub struct MessagesRequest {
     /// unknown top-level fields; anything but an object is refused.
     #[serde(default)]
     pub output_config: Option<serde_json::Map<String, Value>>,
+    /// Every field the request does not declare; see [`MESSAGES_UNSUPPORTED`].
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
+
+/// `/v1/messages` fields that must stay at their default. `tool_choice` and
+/// tool types are checked separately (see [`MessagesRequest::into_job`]).
+const MESSAGES_UNSUPPORTED: &[super::Unsupported] = &[
+    super::Unsupported {
+        field: "output_format",
+        accepts: |_| false,
+        refused: "structured output",
+    },
+    super::Unsupported {
+        field: "mcp_servers",
+        accepts: |v| v.as_array().is_some_and(|a| a.is_empty()),
+        refused: "MCP servers",
+    },
+    super::Unsupported {
+        field: "container",
+        accepts: |_| false,
+        refused: "a code execution container",
+    },
+];
 
 impl MessagesRequest {
     /// Resolve the per-request reasoning toggle via the single shared resolver.
@@ -162,6 +190,31 @@ impl MessagesRequest {
     }
 
     pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        super::refuse_unsupported(&self.other, MESSAGES_UNSUPPORTED)?;
+        // `auto`, or `none` with no tools to call, is what the server does.
+        let tool_choice = self.other.get("tool_choice").unwrap_or(&Value::Null);
+        let parallel_allowed = tool_choice
+            .get("disable_parallel_tool_use")
+            .map_or(true, |d| *d == false || d.is_null());
+        if !(tool_choice.is_null()
+            || (tool_choice["type"] == "auto" && parallel_allowed)
+            || (tool_choice["type"] == "none" && self.tools.is_empty()))
+        {
+            return Err(super::unsupported(
+                "tool_choice",
+                "a tool choice other than `auto`",
+            ));
+        }
+        if self
+            .tools
+            .iter()
+            .any(|t| t.tool_type.as_deref().is_some_and(|ty| ty != "custom"))
+        {
+            return Err(super::unsupported(
+                "tools[].type",
+                "a tool type other than `custom`",
+            ));
+        }
         if self
             .output_config
             .as_ref()
@@ -1229,6 +1282,7 @@ mod tests {
                 budget_tokens: None,
             }),
             output_config: None,
+            other: Default::default(),
         };
         assert!(enabled.resolve_thinking());
         let disabled = MessagesRequest {
@@ -1676,6 +1730,72 @@ mod tests {
                 }
                 other => panic!("{bad}: expected a 400, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_refuse_what_they_cannot_produce() {
+        let engine = EngineHandle::new_for_test(4096);
+        let job = |extra: Value| {
+            let mut body = json!({
+                "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<MessagesRequest>(body)
+                .expect("the request parses")
+                .into_job(&engine)
+                .map_err(|e| match e {
+                    ServerError::BadRequest { param, code, .. } => (param, code),
+                    other => panic!("expected a 400, got {other:?}"),
+                })
+        };
+        let plain = job(json!({})).unwrap();
+        let tool = json!({"name": "f", "input_schema": {"type": "object"}});
+        for accepted in [
+            json!({"tool_choice": {"type": "auto"}, "mcp_servers": [], "container": null}),
+            json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": false}}),
+            json!({"tool_choice": {"type": "none"}}),
+        ] {
+            assert_eq!(job(accepted).unwrap().prompt_tokens, plain.prompt_tokens);
+        }
+        let custom = json!({"type": "custom", "name": "f", "input_schema": {"type": "object"}});
+        assert_eq!(
+            job(json!({"tools": [custom]})).unwrap().prompt_tokens,
+            job(json!({"tools": [tool]})).unwrap().prompt_tokens
+        );
+        for (extra, field) in [
+            (json!({"tool_choice": {"type": "any"}}), "tool_choice"),
+            (
+                json!({"tool_choice": {"type": "tool", "name": "f"}}),
+                "tool_choice",
+            ),
+            (
+                json!({"tool_choice": {"type": "auto", "disable_parallel_tool_use": true}}),
+                "tool_choice",
+            ),
+            (
+                json!({"mcp_servers": [{"type": "url", "url": "https://x", "name": "x"}]}),
+                "mcp_servers",
+            ),
+            (json!({"container": "c"}), "container"),
+            (
+                json!({"output_format": {"type": "json_schema"}}),
+                "output_format",
+            ),
+            (
+                json!({"tool_choice": {"type": "none"}, "tools": [tool.clone()]}),
+                "tool_choice",
+            ),
+            (
+                json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
+                "tools[].type",
+            ),
+        ] {
+            let (param, code) = job(extra.clone()).unwrap_err();
+            assert_eq!(param.as_deref(), Some(field), "{extra}");
+            assert_eq!(code.as_deref(), Some("invalid_value"), "{extra}");
         }
     }
 
