@@ -321,3 +321,28 @@ async fn limit_reached_while_reasoning_ends_the_reply() {
     assert_eq!(d.completion_tokens, 4);
     assert_eq!(d.finish, FinishReason::Length);
 }
+
+/// Sweeping the reasoning budget across the context edge: a close that fits
+/// with room to spare is injected and the answer carries on past the budget,
+/// and a close that no longer fits ends the reply with Length at the budget,
+/// like any reply that reaches the window. A close that fills the window
+/// exactly also ends at the budget, so it is not told apart here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_close_at_the_context_edge_ends_with_length() {
+    let handle = boot_engine();
+    let prompt = job(0, false, 0).prompt_tokens.len();
+    let close = "</think>\n\n".len();
+    for budget in MAX_SEQ_LEN - 20..MAX_SEQ_LEN {
+        let d = drain(&handle, job(usize::MAX, true, budget)).await;
+        assert_eq!(d.finish, FinishReason::Length, "budget {budget}");
+        let room = MAX_SEQ_LEN as isize - (prompt + budget + close) as isize;
+        if room > 0 {
+            assert!(
+                d.completion_tokens > budget,
+                "budget {budget}: the answer follows the close"
+            );
+        } else if room < 0 {
+            assert_eq!(d.completion_tokens, budget, "budget {budget}");
+        }
+    }
+}

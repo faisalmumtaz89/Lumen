@@ -2049,7 +2049,9 @@ impl EngineWorker {
             {
                 let ids = close_ids.get_or_insert_with(|| self.tokenizer.encode("</think>\n\n"));
                 if !ids.is_empty() {
-                    if session.kv().seq_len() + ids.len() > self.config.max_seq_len {
+                    // `extend` writes the pending sampled token too, so the
+                    // bound is on the session's token count, not the KV's.
+                    if session.token_count() + ids.len() > self.config.max_seq_len {
                         finish_reason = FinishReason::Length;
                         break;
                     }
