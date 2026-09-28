@@ -1584,6 +1584,25 @@ pub fn publish_cuda_nvfp4_admission() {
     lumen_format::serving_rules::set_cuda_planar_kernels_enabled(cuda_nvfp4_enabled());
 }
 
+/// True when the machine exposes an NVIDIA GPU device node: `/dev/nvidia0`,
+/// `/dev/nvidia1`, and so on. A container given one GPU of a multi-GPU host
+/// sees only that GPU's node, which need not be `/dev/nvidia0`. The CLI and
+/// the server auto-select CUDA from it.
+pub fn nvidia_gpu_present() -> bool {
+    std::fs::read_dir("/dev").is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| is_nvidia_gpu_node(&entry.file_name().to_string_lossy()))
+    })
+}
+
+/// `nvidia` followed by a device number. `nvidiactl`, `nvidia-uvm` and
+/// `nvidia-modeset` are the driver's shared nodes, not GPUs.
+fn is_nvidia_gpu_node(name: &str) -> bool {
+    name.strip_prefix("nvidia")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `LUMEN_CUDA_Q6K_HEAD=0`: kill-switch for the source-fidelity Q6_K output
 /// head planes. When OFF the CUDA init skips the plane build and serves the
 /// head from the provider's F32 dequant copy (SGEMV; ~5 GB extra VRAM —
@@ -2907,6 +2926,25 @@ mod tests {
     // the global state we toggle (env mutation in ANY module races env reads
     // here, so the lock must be crate-global). Taken FIRST in each test.
     use crate::ENV_TEST_LOCK as SERIAL;
+
+    #[test]
+    fn nvidia_gpu_node_names() {
+        for gpu in ["nvidia0", "nvidia1", "nvidia7", "nvidia12"] {
+            assert!(is_nvidia_gpu_node(gpu), "{gpu}");
+        }
+        for other in [
+            "nvidia",
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia-uvm-tools",
+            "nvidia-modeset",
+            "nvidia-caps",
+            "nvidia1a",
+            "nvme0",
+        ] {
+            assert!(!is_nvidia_gpu_node(other), "{other}");
+        }
+    }
 
     #[test]
     fn ct4_role_parsing() {

@@ -1069,7 +1069,7 @@ pub(crate) fn run_inference(args: &[String]) {
         #[cfg(not(target_os = "macos"))]
         {
             // Check for NVIDIA GPU presence.
-            if std::path::Path::new("/dev/nvidia0").exists() {
+            if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
                 #[cfg(feature = "cuda")]
                 {
                     use_cuda = true;
