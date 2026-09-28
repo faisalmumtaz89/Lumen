@@ -99,7 +99,10 @@ impl TryFrom<String> for ThinkingType {
 pub struct MessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
-    pub max_tokens: usize,
+    /// Required by `/v1/messages` (see [`Self::into_job`]); not by
+    /// `/v1/messages/count_tokens`.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
     #[serde(default)]
     pub system: Option<Value>,
     #[serde(default)]
@@ -295,7 +298,11 @@ impl MessagesRequest {
         }
     }
 
-    pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+    /// Refuse what this request asks for that the server cannot produce;
+    /// shared by `/v1/messages` and `/v1/messages/count_tokens`. The prompt's
+    /// length is `into_job`'s to check: a count of a prompt longer than the
+    /// context is still a count.
+    fn check(&self) -> Result<(), ServerError> {
         super::refuse_unsupported(&self.other, MESSAGES_UNSUPPORTED)?;
         if self
             .tools
@@ -319,6 +326,26 @@ impl MessagesRequest {
                 "invalid_value",
             ));
         }
+        Ok(())
+    }
+
+    /// The input tokens `/v1/messages` would run for this request: its prompt,
+    /// tokenized. Served as `/v1/messages/count_tokens`.
+    pub fn count_tokens(&self, engine: &EngineHandle) -> Result<usize, ServerError> {
+        self.check()?;
+        let (prompt, _) = self.prompt(engine.chat_template())?;
+        Ok(engine.tokenize_for_request(&prompt).len())
+    }
+
+    pub fn into_job(self, engine: &EngineHandle) -> Result<JobRequest, ServerError> {
+        let max_tokens = self.max_tokens.ok_or_else(|| {
+            ServerError::bad_request_field(
+                "missing required field: `max_tokens`",
+                "max_tokens",
+                "missing_field",
+            )
+        })?;
+        self.check()?;
         let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
         let enable_thinking = self.resolve_thinking();
         // Reasoning-token cap within `max_tokens` (Anthropic
@@ -353,7 +380,7 @@ impl MessagesRequest {
         };
         Ok(JobRequest {
             prompt_tokens,
-            max_tokens: self.max_tokens,
+            max_tokens,
             stop_text: self.stop_sequences,
             eos_token_ids: eos,
             ignore_eos: false,
@@ -1317,7 +1344,7 @@ mod tests {
         let enabled = MessagesRequest {
             model: "m".into(),
             messages: vec![],
-            max_tokens: 1,
+            max_tokens: Some(1),
             system: None,
             temperature: None,
             top_p: None,
@@ -1780,6 +1807,44 @@ mod tests {
                 other => panic!("{bad}: expected a 400, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn count_tokens_is_the_prompt_messages_would_run() {
+        let engine = EngineHandle::new_for_test(8192);
+        let body = json!({
+            "model": "m",
+            "system": "Be brief.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "R"},
+                    {"type": "text", "text": "hello"},
+                ]},
+                {"role": "user", "content": "weather?"},
+            ],
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+            "thinking": {"type": "disabled"},
+        });
+        let counted = serde_json::from_value::<MessagesRequest>(body.clone())
+            .unwrap()
+            .count_tokens(&engine)
+            .unwrap();
+        let mut run = body;
+        run["max_tokens"] = json!(16);
+        let job = serde_json::from_value::<MessagesRequest>(run)
+            .unwrap()
+            .into_job(&engine)
+            .unwrap();
+        assert_eq!(counted, job.prompt_tokens.len());
+        // A request `/v1/messages` refuses is refused here too.
+        let refused = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "messages": [], "mcp_servers": [{"type": "url", "url": "https://x"}],
+        }))
+        .unwrap()
+        .count_tokens(&engine);
+        assert!(matches!(refused, Err(ServerError::BadRequest { .. })));
     }
 
     #[tokio::test]

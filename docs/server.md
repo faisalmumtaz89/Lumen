@@ -37,12 +37,15 @@ The bin is gated behind the `bin` Cargo feature so library embedders that wire t
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible
 POST /v1/messages           # Anthropic-compatible, SSE streaming
+POST /v1/messages/count_tokens # Anthropic-compatible token count
 GET  /v1/models             # Model list
 POST /v1/images/generations # Text to image (`--features image` builds with
                             # LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT set)
 ```
 
 The image endpoint — conversion, limits, request shape and how it shares a device with the text model — is described in [image-generation.md](image-generation.md).
+
+`/v1/messages/count_tokens` takes a `/v1/messages` request body (without `max_tokens`) and returns `{"input_tokens": N}`, the prompt tokens `/v1/messages` would run for it and report as `usage.input_tokens`. It refuses the same invalid or unsupported request content as `/v1/messages`, and still counts a prompt longer than the context window, which `/v1/messages` refuses.
 
 Every endpoint ignores a top-level request field it does not use, such as `metadata`, `user`, `store` or `service_tier`, so clients that attach them are served. A top-level field that asks for output the server cannot produce is refused with a 400 naming it, rather than silently dropped:
 

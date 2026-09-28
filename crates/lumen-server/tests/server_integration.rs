@@ -278,6 +278,45 @@ async fn anthropic_messages_non_streaming() {
     assert!(v["usage"]["input_tokens"].as_u64().unwrap() > 0);
 }
 
+/// `/v1/messages/count_tokens` counts the prompt `/v1/messages` would run for
+/// the same request (its `usage.input_tokens`), without `max_tokens`, which
+/// `/v1/messages` itself still requires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_count_tokens_matches_messages_input_tokens() {
+    let (addr, client, _tmp, _handle) = boot_server().await;
+    let messages: Uri = format!("http://{addr}/v1/messages").parse().unwrap();
+    let count: Uri = format!("http://{addr}/v1/messages/count_tokens")
+        .parse()
+        .unwrap();
+    // The test server's context is 96 byte-level tokens.
+    let request = serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let counted = post_json(&client, count.clone(), request.clone()).await;
+    let mut run = request.clone();
+    run["max_tokens"] = serde_json::json!(MAX_TOKENS);
+    run["temperature"] = serde_json::json!(0.0);
+    let served = post_json(&client, messages.clone(), run).await;
+    assert_eq!(counted["input_tokens"], served["usage"]["input_tokens"]);
+    assert!(counted["input_tokens"].as_u64().unwrap() > 0);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(messages)
+        .header("content-type", "application/json")
+        .body(Full::new(bytes::Bytes::from(
+            serde_json::to_vec(&request).unwrap(),
+        )))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let missing: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(missing["error"]["param"], "max_tokens");
+    assert_eq!(missing["error"]["code"], "missing_field");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anthropic_messages_streaming_emits_typed_events() {
     let (addr, client, _tmp, _handle) = boot_server().await;

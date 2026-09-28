@@ -57,6 +57,7 @@ pub fn build_router(engine: EngineHandle) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/debug/memory_breakdown", get(memory_breakdown))
         .with_state(state)
 }
@@ -85,6 +86,7 @@ pub fn build_router_with_images(
                 .route("/v1/chat/completions", post(chat_completions))
                 .route("/v1/completions", post(completions))
                 .route("/v1/messages", post(messages))
+                .route("/v1/messages/count_tokens", post(count_tokens))
                 .route("/debug/memory_breakdown", get(memory_breakdown))
                 .with_state(state),
         )
@@ -303,6 +305,20 @@ async fn messages(
         let resp = wire::anthropic::collect_messages(rx, model_id, thinking, stop, tools).await?;
         Ok((StatusCode::OK, Json(resp)).into_response())
     }
+}
+
+/// `POST /v1/messages/count_tokens`: the input tokens `/v1/messages` would run
+/// for the same request.
+async fn count_tokens(
+    State(state): State<AppState>,
+    OpenAiJson(req): OpenAiJson<wire::anthropic::MessagesRequest>,
+) -> Result<Response, ServerError> {
+    let input_tokens = req.count_tokens(&state.engine)?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({"input_tokens": input_tokens})),
+    )
+        .into_response())
 }
 
 // ----------------------------- shared utilities -------------------------
