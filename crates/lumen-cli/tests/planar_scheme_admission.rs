@@ -78,7 +78,7 @@ fn an_nvfp4_artifact_is_refused_by_name_on_the_backends_that_cannot_serve_it() {
     // without CUDA, no flag (the mmap provider and the CLI's own choice of
     // backend), `--streaming` (the same provider with the weights left out of
     // GPU residency) and the synchronous/asynchronous providers. A CUDA build serves it with
-    // `--cuda`, and with no flag or `--sync` on a machine with /dev/nvidia0
+    // `--cuda`, and with no flag or `--sync` on a machine with an NVIDIA GPU
     // (`--streaming` fails there instead: its GDN layers need GPU-resident
     // weights), so this set is asked only without CUDA. `--metal` is not
     // here because off macOS it is refused before the scheme is read.

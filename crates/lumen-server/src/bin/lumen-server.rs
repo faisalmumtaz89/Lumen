@@ -509,7 +509,7 @@ fn select_backend(choice: BackendChoice) -> BackendChoice {
             }
             #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
             {
-                if std::path::Path::new("/dev/nvidia0").exists() {
+                if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
                     BackendChoice::Cuda
                 } else {
                     BackendChoice::Cpu

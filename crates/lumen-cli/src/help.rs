@@ -134,7 +134,7 @@ OPTIONS:
     --cuda                Use CUDA GPU compute backend (NVIDIA, requires --features cuda)
 
     If no backend flag (--metal, --cuda, --simd) is given, auto-detects:
-      macOS -> Metal,  Linux with /dev/nvidia0 -> CUDA,  else -> SIMD (CPU)
+      macOS -> Metal,  Linux with an NVIDIA GPU -> CUDA,  else -> SIMD (CPU)
     --cuda-device <n>     Select CUDA device ordinal (default: 0, implies --cuda)
     --accelerate          Use Accelerate AMX batched prefill (macOS only, use with --simd)
     --gpu-resident        Pre-load all weights into GPU Metal buffers (DEFAULT with --metal)
