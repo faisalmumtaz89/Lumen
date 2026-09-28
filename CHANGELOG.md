@@ -5,6 +5,52 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Added
+
+- **`tool_choice` on `/v1/chat/completions` and `/v1/messages`.** `none` leaves the tools
+  out of the prompt and returns any tool-call markup as text; `required` (Anthropic `any`)
+  and a named tool force a call by ending the prompt with the model's tool-call opener, and
+  a named choice returns only calls to that tool. `parallel_tool_calls: false` (Anthropic
+  `disable_parallel_tool_use: true`) keeps a reply's first tool call only. A forced call is
+  refused while thinking is on, with no tools, for a tool not offered or with an invalid
+  name, and for a model without an embedded chat template.
+- **A request's reasoning effort.** `output_config.effort` on `/v1/messages` and
+  `reasoning_effort` on `/v1/chat/completions` reach the chat template: `low` and `medium`
+  pass through (Qwen3.8 instructs brief reasoning at `low`), and `high`, `xhigh` and `max`
+  keep its default.
+  On `/v1/chat/completions` an effort also asks for reasoning, `none` turns it off, and
+  `minimal` runs as `low`.
+- **`/v1/messages/count_tokens`.** It returns the prompt tokens `/v1/messages` would run for
+  the same request, the number that endpoint reports as `usage.input_tokens`.
+- **A system message partway through a conversation.** It stays where it was sent, on both
+  chat APIs: as the chat template renders it, or, for a template that only accepts one at
+  the start (Qwen3.5, Qwen3.8), as a system turn in that template's framing.
+
+### Changed
+
+- **`max_tokens` includes reasoning.** `max_tokens` and `max_completion_tokens` limit every
+  generated token, reasoning included, as both APIs define them; the reasoning budget caps
+  the trace within that limit. Without a limit, `/v1/chat/completions` is bounded only by
+  the context window rather than stopping at 256 tokens.
+- **One rule for request fields on every endpoint.** A field the server does not use is
+  ignored on `/v1/chat/completions` and `/v1/completions` too, instead of refused; a field
+  asking for output the server cannot produce (several choices, log probabilities,
+  structured output, audio, and the like) is refused with a 400 naming it on all three
+  endpoints. `/v1/chat/completions` accepts `max_completion_tokens`, and
+  `/v1/completions` honours `stream_options.include_usage`.
+
+### Fixed
+
+- **`thinking.type: "adaptive"` was read as thinking off.** It now turns thinking on; an
+  unknown type is refused instead of read as off.
+- **An earlier turn's reasoning was dropped from the prompt.** Reasoning sent back
+  (`reasoning_content`, or a `thinking` block) now reaches the chat template, which renders
+  it into that turn.
+- **A reasoning close that no longer fit the context ended the reply with an error.** It
+  now ends with `length`, like any reply that reaches the context window.
+
 ## [0.35.0] — 2026-09-28
 
 ### Added
