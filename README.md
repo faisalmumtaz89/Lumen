@@ -23,7 +23,7 @@ lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
 
 That one command downloads the model on first use, converts it, picks your backend (Metal on Apple Silicon, CUDA on NVIDIA), and streams tokens.
 
-> **Status:** Production-ready for the shipped Qwen3.5 / Qwen3.8 models (dense 9B, dense 27B, and MoE-35B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
+> **Status:** Serves the Qwen3.5 / Qwen3.8 models (dense 9B, dense 27B, and MoE-35B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series); each model, format and GPU's status is in [Model support](docs/support.md). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
 
 ## Quick start
 
@@ -52,15 +52,16 @@ lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
 lumen run qwen3.5-moe:q4_0 "Explain quantum computing in one paragraph"   # mixture-of-experts
 ```
 
-More install paths (Docker, the one-command `clone → running server` script): **[Getting started](docs/getting-started.md)**.
+More on installing, pulling and running: **[Getting started](docs/getting-started.md)**.
 
 ## What it is
 
 - **One self-contained binary, zero ML dependencies** — native CUDA C and Metal MSL kernels, a native BPE tokenizer, and the native `.lbc` model format, all in Rust. No PyTorch, no ONNX, no Python runtime.
-- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-8.0+ device (driver-only).
+- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-8.0+ device.
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
-- **Runs on NVIDIA cc 8.0+ (Ampere / Hopper) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
+- **Text to image** with Qwen-Image-2.1 on CUDA, on the same GPU as a text model, which pauses while an image generates.
+- **Runs on NVIDIA cc 8.0+ (Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
 - **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
 ## Supported models & hardware
@@ -70,7 +71,7 @@ v1 (current) verifies the Qwen3.5 family and the Qwen3.8-27B dense model end-to-
 | Model | Architecture | Parameters | Quants |
 |-------|--------------|------------|--------|
 | `qwen3.5-9b` | Dense GDN-hybrid | 9B | Q8_0, Q4_0, BF16 |
-| `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16, Q4_K_M (16.2 GB download), Q5_K_M (19.5 GB download) |
+| `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16, Q4_K_M (16.2 GiB download), Q5_K_M (19.5 GiB download) |
 | `qwen3.5-moe` | MoE GDN-hybrid | 35B total / 3B active | Q8_0, Q4_0, BF16 |
 
 The two K-quant cells are served as stored on CUDA only. On Apple Silicon (the Metal
@@ -79,13 +80,19 @@ layer plane upcast to Q8_0, the head re-quantised, a K-quant embedding dequantis
 so the artifact comes out larger than the `Q8_0` one while carrying the source's coarser
 precision; prefer `Q8_0` or `Q4_0` there.
 
-| Backend | Hardware | Status |
+The 27B also runs from Hugging Face checkpoints imported as stored with `lumen convert
+--from-hf` ([how](docs/lbc-format.md)), on CUDA only: NVIDIA ModelOpt NVFP4 + FP8, and
+compressed-tensors INT4 (group 32).
+
+| Backend | Hardware | Formats |
 |---------|----------|--------|
-| **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100) | Production-ready |
-| **Metal** | Apple Silicon (M-series) | Production-ready |
+| **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100, RTX 5090) | Every format above; the BF16 27B and MoE need an 80 GB H100-class GPU |
+| **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 
-`lumen models` lists what is available and disk-cached. Live support matrix and per-config verification status: **[docs/support.md](docs/support.md)**.
+Image: Qwen-Image-2.1 on CUDA, converted with `lbi-convert` — **[docs/image-generation.md](docs/image-generation.md)**.
+
+`lumen models` lists what is available and disk-cached. Per-model, per-format status and verification: **[docs/support.md](docs/support.md)**.
 
 ## HTTP server
 
@@ -100,12 +107,12 @@ curl http://localhost:8000/v1/models
 
 ```text
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
-POST /v1/completions        # OpenAI-compatible
+POST /v1/completions        # OpenAI-compatible, SSE streaming
 POST /v1/messages           # Anthropic-compatible, SSE streaming
 POST /v1/images/generations # Text to image (`--features image`), see docs/image-generation.md
 ```
 
-Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**. Serving Qwen-Image-2.1 next to a text model: **[docs/image-generation.md](docs/image-generation.md)**.
+On CUDA, `--kv-precision bf16` halves the KV cache's memory for long contexts. Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**.
 
 ## Performance
 
@@ -121,22 +128,23 @@ same-GPU H100 batteries):
 | Q4_0  | A100-80GB | 93.6 | 0.598× |
 | BF16  | H100 | 104.1 | 0.575× |
 
-Full per-cell decode + prefill numbers (every model × quant, on A100-80GB and M3 Ultra), methodology, and baseline comparisons: **[bench/RESULTS.md](bench/RESULTS.md)**. Long-context decode is validated to 65K+ tokens.
+Per-cell decode + prefill numbers for the 9B and the MoE (A100-80GB, M3 Ultra), methodology, and baseline comparisons: **[bench/RESULTS.md](bench/RESULTS.md)**; recorded RTX 5090 numbers: **[docs/support.md](docs/support.md)**.
 
 ## Architecture
 
 ```text
 lumen-format      LBC binary format, quantization descriptors, test model generators
-lumen-convert     GGUF -> LBC converter (qwen35 dense, qwen35moe MoE)
+lumen-convert     GGUF and Hugging Face checkpoint -> LBC converter (qwen35, qwen35moe)
 lumen-runtime     CUDA backend (200+ NVRTC kernels), Metal backend (MSL shaders),
                   CPU + SIMD NEON references, KV cache (memory + disk),
                   GDN recurrent state, sampling, sessions, suffix prefill
 lumen-server      axum HTTP server: OpenAI + Anthropic SSE endpoints, tool calling
 lumen-bench       benchmark harness with JSON + table output
 lumen-cli         CLI: built-in BPE tokenizer, model registry, HuggingFace downloader
+lumen-image       Qwen-Image-2.1 text-to-image (CUDA) and the lbi-convert converter
 ```
 
-Shipped instances share an L=32 stack of GDN linear-attention layers interleaved with full-attention layers, with a fused gate+up+SwiGLU+down FFN (dense) or top-k expert dispatch (MoE). Forward-pass details, the `.lbc` on-disk format, and suffix-prefill cache reuse: **[docs/architecture.md](docs/architecture.md)**.
+The shipped models interleave GDN linear-attention layers with full-attention layers (32 layers in the 9B, 40 in the MoE, 64 in the 27B), with a SwiGLU FFN (dense) or top-k expert dispatch (MoE). Forward-pass details, the `.lbc` on-disk format, and suffix-prefill cache reuse: **[docs/architecture.md](docs/architecture.md)**.
 
 ## Building & testing
 
@@ -152,7 +160,7 @@ Rust is pinned via `rust-toolchain.toml`; CUDA needs `libnvrtc` + `libcublas` pr
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — install, pull, run (binaries, Docker, source)
+- [Getting started](docs/getting-started.md) — install, pull, run (binaries, source)
 - [CLI reference](docs/cli.md) — all subcommands and flags (or `lumen run --help`)
 - [HTTP server](docs/server.md) — endpoints, reasoning, library embedding
 - [Image generation](docs/image-generation.md) — Qwen-Image-2.1 on the same device as a text model

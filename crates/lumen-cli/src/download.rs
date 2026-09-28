@@ -819,7 +819,7 @@ mod inner {
     #[cfg(test)]
     mod registry_files {
         //! requires network access: HEADs the registry's K-quant files and checks the advertised
-        //! Content-Length against the sizes pinned below (README.md rounds them to 16.2 / 19.5 GB)
+        //! Content-Length against the sizes pinned below (README.md rounds them to 16.2 / 19.5 GiB)
         use super::*;
 
         #[test]
