@@ -47,6 +47,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- The one-line installer also installs `lbi-convert`, the Qwen-Image-2.1 checkpoint
+  converter the Linux/CUDA release ships, so image generation needs no extra download.
 - **`thinking.type: "adaptive"` was read as thinking off.** It now turns thinking on; an
   unknown type is refused instead of read as off.
 - **An earlier turn's reasoning was dropped from the prompt.** Reasoning sent back
