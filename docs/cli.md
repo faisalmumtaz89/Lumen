@@ -19,7 +19,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | Flag | Description |
 |------|-------------|
 | `--system <text>` | System prompt |
-| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS) |
+| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS; 8192 on CUDA when `--context-len` is not given) |
 | `--temperature <f>` | Sampling temperature (0 = greedy, default 0.7) |
 | `--top-p` / `--top-k` / `--min-p` | Nucleus / top-K / min-prob cutoffs |
 | `--repetition-penalty` / `--presence-penalty` / `--frequency-penalty` | Sampling penalties |
