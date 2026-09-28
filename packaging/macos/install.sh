@@ -131,7 +131,11 @@ has_nvidia() {
 # library would otherwise surface as a confusing failure on the first run.
 cuda_lib_present() {  # $1 = library name prefix, e.g. libnvrtc.so
   local d f
-  if have ldconfig && ldconfig -p 2>/dev/null | grep -q "$1"; then return 0; fi
+  # Not `ldconfig -p | grep -q`: grep stops at its first match, ldconfig then
+  # dies of SIGPIPE, and pipefail reports the library as missing.
+  if have ldconfig; then
+    case "$(ldconfig -p 2>/dev/null)" in *"$1"*) return 0 ;; esac
+  fi
   local -a dirs=(/usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64 /usr/lib/wsl/lib
                  /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib)
   local IFS=':'
@@ -150,8 +154,8 @@ check_cuda_userland() {
   if [ -n "$missing" ]; then
     err "CUDA libraries not found on the loader paths this probe checked:$missing"
     err "The install will complete, but inference will fail unless the NVIDIA"
-    err "driver userland and the CUDA 12.x toolkit runtime are loadable at run"
-    err "time (or LD_LIBRARY_PATH points at them)."
+    err "driver and the CUDA 12 or 13 runtime libraries (cuBLAS, NVRTC) are"
+    err "loadable at run time (or LD_LIBRARY_PATH points at them)."
   fi
 }
 
@@ -425,9 +429,11 @@ if [ "$INTERACTIVE" = "1" ]; then
     read -r qpick < /dev/tty || qpick=""
     case "$qpick" in 2) QUANT="q4_0" ;; 3) QUANT="bf16" ;; *) QUANT="$DEFAULT_QUANT" ;; esac
   fi
-else
-  MODEL="${MODEL:-$DEFAULT_MODEL}"; QUANT="${QUANT:-$DEFAULT_QUANT}"
+elif [ -z "$MODEL" ]; then
+  MODEL="$DEFAULT_MODEL"; QUANT="${QUANT:-$DEFAULT_QUANT}"
   [ "$ASSUME_YES" = "1" ] || info "no terminal: using default $MODEL:$QUANT (pass --model/--quant to choose)"
+else
+  QUANT="${QUANT:-$DEFAULT_QUANT}"
 fi
 # Canonicalize any MoE alias so pull, run AND lumen-server all agree on the cache stem.
 case "$MODEL" in
