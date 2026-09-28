@@ -90,7 +90,8 @@ OPTIONS:
                           stdout. Default OFF (closed empty-think tail). --no-think forces OFF
                           (overrides LUMEN_CHAT_ENABLE_THINKING).
     --tokens <ids>        Space-separated token IDs (--prompt and --tokens are mutually exclusive)
-    --max-tokens <n>      Max tokens to generate (default: unlimited, stops at EOS)
+    --max-tokens <n>      Max tokens to generate (default: unlimited, stops at EOS;
+                          8192 on CUDA when --context-len is not given)
                           PRODUCTION: pass --max-tokens 512 (minimum) for multilingual prompts;
                           the Qwen3.5 chat template opens a <think>...</think> block that may
                           consume the budget before producing the answer in the target language.

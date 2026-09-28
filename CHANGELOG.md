@@ -47,6 +47,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **`lumen run` ran out of memory on a 32 GB CUDA GPU.** With neither `--max-tokens` nor
+  `--context-len` the answer was unlimited, so the KV cache was sized to the model's whole
+  window, 32 GB for Qwen3.8-27B. On CUDA such an answer now stops at 8192 tokens and the
+  cache is sized to match. Metal and CPU are unchanged.
 - The one-line installer also installs `lbi-convert`, the Qwen-Image-2.1 checkpoint
   converter the Linux/CUDA release ships, so image generation needs no extra download.
 - **`thinking.type: "adaptive"` was read as thinking off.** It now turns thinking on; an
