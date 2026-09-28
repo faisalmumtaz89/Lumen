@@ -5,6 +5,16 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Fixed
+
+- **The one-line installer reported installed CUDA libraries as missing.** When cuBLAS and
+  NVRTC were found only through the system loader cache (CUDA 13 in `/opt/cuda`, for
+  example), its check died of SIGPIPE under `pipefail` and it warned that inference would
+  fail. It now finds them there, names CUDA 12 or 13 when they are really missing, and no
+  longer says it is using a default model when `--model` was given.
+
 ## [0.36.0] — 2026-09-28
 
 ### Added
