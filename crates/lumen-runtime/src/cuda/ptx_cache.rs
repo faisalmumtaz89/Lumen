@@ -16,7 +16,9 @@
 //! property: the driver JIT (PTX -> SASS) still runs on the actual host, and
 //! the driver's own compute cache (`~/.nv/ComputeCache`) transparently caches
 //! that second stage. The expensive, dominant stage we eliminate is the NVRTC
-//! source->PTX compile.
+//! source->PTX compile. When NVRTC is newer than the driver, which refuses its
+//! PTX, kernels are compiled for the device's own architecture instead and the
+//! entry holds that cubin, keyed by its `sm_*` target.
 //!
 //! # Cache key
 //!
@@ -179,7 +181,7 @@ impl<'a> CacheKey<'a> {
     }
 }
 
-/// Try to load cached NVRTC PTX bytes for `key`. Returns `None` on any miss,
+/// Try to load the cached NVRTC output for `key`. Returns `None` on any miss,
 /// read error, or validation failure -- the caller must then recompile. A bad
 /// cache file is never fatal.
 pub(crate) fn load(key: &CacheKey) -> Option<Vec<u8>> {
@@ -188,11 +190,14 @@ pub(crate) fn load(key: &CacheKey) -> Option<Vec<u8>> {
     }
     let path = key.cache_path()?;
     let bytes = std::fs::read(&path).ok()?;
-    parse_entry(&bytes)
+    let payload = parse_entry(&bytes)?;
+    // cuModuleLoadData reads PTX as NUL-terminated text, so a PTX payload that
+    // lost its terminator is rejected; a cubin (an `sm_*` target) has none.
+    (key.arch.starts_with("sm_") || payload.last() == Some(&0)).then_some(payload)
 }
 
-/// Atomically write `ptx` (the NVRTC `Image` bytes, including the trailing NUL)
-/// to the cache for `key`. Best-effort: any failure is silently ignored (the
+/// Atomically write `ptx` (the NVRTC `Image` bytes, including the trailing NUL,
+/// or a cubin) to the cache for `key`. Best-effort: any failure is silently ignored (the
 /// kernel still loaded from the fresh compile; the cache is just not populated
 /// this time). Uses temp-file + rename so a partial write can never be read.
 pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
@@ -305,8 +310,8 @@ fn serialize_entry(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Parse + validate a cache entry, returning the payload (PTX bytes) on
-/// success. Returns `None` on any structural mismatch, so a corrupt or
+/// Parse + validate a cache entry, returning the payload (PTX or cubin bytes)
+/// on success. Returns `None` on any structural mismatch, so a corrupt or
 /// truncated file is treated as a miss (-> recompile), never trusted.
 fn parse_entry(bytes: &[u8]) -> Option<Vec<u8>> {
     // MAGIC(8) + len(4) + ... + crc(4) minimum.
@@ -327,11 +332,6 @@ fn parse_entry(bytes: &[u8]) -> Option<Vec<u8>> {
     let payload = &bytes[12..payload_end];
     let stored_crc = u32::from_le_bytes(bytes[payload_end..crc_end].try_into().ok()?);
     if crc32(payload) != stored_crc {
-        return None;
-    }
-    // A valid PTX `Image` from NVRTC is NUL-terminated text. cuModuleLoadData
-    // requires a NUL terminator; reject a payload that lost it.
-    if payload.last() != Some(&0) {
         return None;
     }
     Some(payload.to_vec())
@@ -656,13 +656,41 @@ mod tests {
         assert!(parse_entry(&ser).is_none());
     }
 
-    /// A payload lacking the NUL terminator must be rejected (cuModuleLoadData
-    /// requires it).
+    /// A PTX payload lacking the NUL terminator is rejected (cuModuleLoadData
+    /// reads PTX as NUL-terminated text); a cubin, keyed by its `sm_*` target,
+    /// carries no terminator and loads as stored.
     #[test]
-    fn entry_missing_nul_rejected() {
-        let payload = b"ptx no nul";
-        let ser = serialize_entry(payload);
-        assert!(parse_entry(&ser).is_none());
+    fn only_a_ptx_payload_needs_its_nul_terminator() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-ptxc-nul-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::env::set_var("LUMEN_CUDA_PTX_CACHE_DIR", &dir);
+        std::env::remove_var("LUMEN_CUDA_PTX_CACHE");
+
+        let key = |arch| CacheKey {
+            source: "k",
+            arch,
+            fast_math: false,
+            cc: (8, 0),
+            nvrtc_version: (13, 4),
+            driver_version: 13000,
+        };
+        store(&key("compute_80"), b"ptx no nul");
+        assert_eq!(load(&key("compute_80")), None);
+        store(&key("compute_80"), b"ptx\0");
+        assert_eq!(load(&key("compute_80")).as_deref(), Some(&b"ptx\0"[..]));
+        let cubin = b"\x7fELF cubin, no terminator";
+        store(&key("sm_80"), cubin);
+        assert_eq!(load(&key("sm_80")).as_deref(), Some(&cubin[..]));
+
+        std::env::remove_var("LUMEN_CUDA_PTX_CACHE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Differing any key component yields a different digest (no collision

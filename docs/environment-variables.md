@@ -93,7 +93,7 @@ Set any to `=0` to opt out. Model-aware defaults are noted per row.
 | `LUMEN_CUDA_MOE_BF16_NATIVE` | ON (MoE-bf16 raw path) | kill-switch | Native BF16 MoE (no F32 upcast). | `=0` to force the F32-upcast MoE path. |
 | `LUMEN_CUDA_MOE_DOWN_TILED_F32ACT` | ON (under `MOE_GROUPED_TILED`) | kill-switch | F32-accumulated tiled MoE down-projection. | `=0` to A/B the down-projection accumulator. |
 | `LUMEN_CUDA_GPU_SAMPLE` | ON | kill-switch | GPU-side argmax/sampling (avoids a DtoH per token). | `=0` to sample on the host. |
-| `LUMEN_CUDA_PTX_CACHE` | ON | kill-switch | Cache compiled PTX between runs. | `=0` to force a cold recompile. |
+| `LUMEN_CUDA_PTX_CACHE` | ON | kill-switch | Cache compiled kernels between runs: PTX, or a cubin for the GPU when NVRTC is newer than the driver. | `=0` to force a cold recompile. |
 | `LUMEN_CUDA_Q8_SPLIT` | ON (Q8-dense and BF16-dense); OFF Q4/MoE | kill-switch | Raw+split layout for Q8_0 weights (+4.5% Q8 decode). On BF16-dense it clones only the converter's Q8-floored GDN `ssm_out` set (~1.61 GB on 27B). | `=0` to A/B the packed Q8 layout. |
 | `LUMEN_CUDA_Q8_SCALE_HW` | ON (Q8-dense) | kill-switch | Native `LDG.E.U16` scale fetch for Q8 matvec (+0.4% Q8 decode). | `=0` to A/B the scalar scale fetch. |
 | `LUMEN_CUDA_OUTPUT_PROJ_SPLIT` | ON (Q8-dense); OFF else | kill-switch | Split-K layout for the ~1 GB output projection. The clone is made after the sibling clones and only when it leaves the 2 GB decode slack free; when it does not fit, or the free-memory query fails, it is skipped with a message and the packed output_proj is used (`LUMEN_CUDA_F16_CACHE_FORCE=1` makes it anyway). | `=0` to A/B the packed output_proj. |

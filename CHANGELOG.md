@@ -27,6 +27,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `lumen pull qwen3.8-27b:q4_0` warned that the metadata disagreed with the model. The converter
   now accounts for them and warns only about a real mismatch.
 
+- **CUDA kernels failed to load when the CUDA toolkit was newer than the driver.** A driver
+  refuses PTX from a newer toolkit, so installing the latest CUDA 12 or 13 toolkit on an older
+  driver of the same major version stopped `lumen` and `lumen-server` at start-up. Kernels are
+  now compiled for the GPU's own architecture in that case, which the driver loads.
+
 ## [0.36.1] — 2026-09-29
 
 ### Fixed
