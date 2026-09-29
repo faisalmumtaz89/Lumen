@@ -32,7 +32,7 @@ class Lumen < Formula
 
       Pull a model and chat:
         lumen pull qwen3.5-9b:q8_0
-        lumen "Write a haiku about Rust"
+        lumen "Write a haiku about light"
 
       Or run the OpenAI-compatible server:
         lumen-server --model qwen3.5-9b --quant q8_0 --port 8000

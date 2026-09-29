@@ -1402,7 +1402,7 @@ print_next_steps() {
     printf '    -H "Content-Type: application/json" \\\n'
     printf '    -d '"'"'{\n'
     printf '      "model": "%s",\n' "$model_id"
-    printf '      "messages": [{"role": "user", "content": "Write a haiku about Rust."}],\n'
+    printf '      "messages": [{"role": "user", "content": "Write a haiku about light."}],\n'
     printf '      "max_tokens": 128\n'
     printf '    }'"'"'\n'
     printf '\n'
@@ -1411,10 +1411,10 @@ print_next_steps() {
     printf '\n'
     printf '  %s# 3) One-shot inference with the CLI (separate process)%s\n' "$C_DIM" "$C_RESET"
     if [ "$SEL_IS_PATH" = "1" ]; then
-      printf '  %s run --model %s --prompt "Write a haiku about Rust."\n' \
+      printf '  %s run --model %s --prompt "Write a haiku about light."\n' \
         "$(_shq "$LUMEN_BIN")" "$(_shq "$SEL_MODEL")"
     else
-      printf '  %s run %s "Write a haiku about Rust."\n' "$(_shq "$LUMEN_BIN")" "$SEL_SPEC"
+      printf '  %s run %s "Write a haiku about light."\n' "$(_shq "$LUMEN_BIN")" "$SEL_SPEC"
     fi
     printf '\n'
     printf '  %sStop the server:%s press Ctrl-C in THIS terminal.\n' "$C_BLD" "$C_RESET"

@@ -484,7 +484,7 @@ env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_
 
 # ── Step 6 · print the exact next steps (positional model:quant forms) ────────
 say ""
-say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready"
+say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready in $cache"
 say ""
 say "  ${C_BOLD}Chat${C_RESET}     lumen run $MODEL:$QUANT \"Write a haiku about light\""
 say "  ${C_BOLD}Serve${C_RESET}    lumen-server $MODEL:$QUANT          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"

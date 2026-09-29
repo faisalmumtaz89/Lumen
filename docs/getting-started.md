@@ -52,7 +52,7 @@ All three `qwen3.5-9b` quants (Q8_0, Q4_0, BF16) are in the registry and auto-do
 ```bash
 # Default sampling: temperature 0.7 with a random seed — output varies each run.
 # For reproducible output add `--seed <n>`; for greedy/argmax use `--temperature 0`.
-lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
+lumen run qwen3.5-9b:q8_0 "Write a haiku about light"
 
 # Longer answer with an explicit temperature
 lumen run qwen3.5-9b:q8_0 "Explain quantum computing" \
