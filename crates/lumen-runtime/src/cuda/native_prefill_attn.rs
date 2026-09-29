@@ -324,8 +324,8 @@ impl NativeAttnKernels {
 /// pre-filled with 0xA5 so a byte a kernel fails to write changes its digest. The digests were recorded
 /// on an RTX 5090 (NVRTC 13.3, driver 610) from a run whose outputs the GPU suite
 /// (`tests/cuda_native_attention_test.rs`) checks against its oracles; the machine code comes from the
-/// driver's PTX compiler (from NVRTC when it is newer than the driver), so a different NVRTC or driver
-/// may compile it differently and is then refused until the digests are recorded for it.
+/// driver's PTX compiler (from NVRTC when it is a newer minor version than the driver), so a different
+/// NVRTC or driver may compile it differently and is then refused until the digests are recorded for it.
 pub mod smoke {
     use super::*;
     use crate::cuda::native_prefill_kernels::smoke::{bf16, weights};

@@ -143,7 +143,7 @@ impl CudaDevice {
     }
 
     /// Compile CUDA source to PTX via NVRTC and load as a module (to a cubin
-    /// for the device when NVRTC is newer than the driver; see
+    /// for the device when NVRTC is a newer minor version than the driver; see
     /// `compile_and_load_cached`).
     ///
     /// Routes through the persistent PTX disk cache: on a cache hit the NVRTC
@@ -221,9 +221,9 @@ impl CudaDevice {
     ///     them.
     ///
     /// The target is `arch` (PTX, which the driver JIT-compiles), except when
-    /// the loaded NVRTC is newer than the driver: the driver refuses that
-    /// toolkit's PTX, so the kernel is compiled for the device's own
-    /// architecture instead ([`sass_arch_for`]).
+    /// the loaded NVRTC is a newer minor version than the driver and the device
+    /// can run `arch`: the driver refuses that toolkit's PTX, so the kernel is
+    /// compiled for the device's own architecture instead ([`sass_arch_for`]).
     ///
     /// Caching is default-ON and a pure optimization: disabling it
     /// (`LUMEN_CUDA_PTX_CACHE=0`) only changes startup latency, never output.
@@ -598,14 +598,15 @@ struct PtxCacheKeyEnv {
 
 /// Say once, under `LUMEN_CUDA_VERBOSE`, that kernels are compiled for the
 /// device itself because NVRTC is newer than the driver: the PTX targets that
-/// other lines name then all build this one architecture.
+/// other lines name then build this one architecture, except a target the
+/// device cannot run, which stays PTX and is refused.
 fn announce_sass(env: &PtxCacheKeyEnv) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     if super::decode::cuda_verbose() {
         ONCE.call_once(|| {
             eprintln!(
-                "[CUDA] NVRTC {}.{} is newer than the driver (CUDA {}.{}): kernels are compiled \
-                 for sm_{}{} instead of PTX",
+                "[CUDA] NVRTC {}.{} is newer than the driver (CUDA {}.{}): kernels this GPU can \
+                 run are compiled for sm_{}{} instead of PTX",
                 env.nvrtc_version.0,
                 env.nvrtc_version.1,
                 env.driver_version / 1000,
@@ -1156,6 +1157,14 @@ mod sass_arch_tests {
 
     #[test]
     fn a_target_above_the_device_stays_on_ptx() {
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_86")).as_deref(),
+            Some("sm_86")
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_89")),
+            None
+        );
         assert_eq!(
             sass_arch_for((13, 4), 13000, (7, 5), Some("compute_80")),
             None

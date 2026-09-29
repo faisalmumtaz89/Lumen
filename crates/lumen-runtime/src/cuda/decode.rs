@@ -1237,7 +1237,7 @@ pub(crate) fn compile_all_kernels(
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!(
-                            "[CUDA] {name}: {arch} refused ({e}); falling back to NVRTC's default target"
+                            "[CUDA] {name}: {arch} refused ({e}); falling back to the default target"
                         );
                         attn_codegen.set("default");
                         device.compile_and_load(&attn_source)?

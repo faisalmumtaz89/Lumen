@@ -16,9 +16,10 @@
 //! property: the driver JIT (PTX -> SASS) still runs on the actual host, and
 //! the driver's own compute cache (`~/.nv/ComputeCache`) transparently caches
 //! that second stage. The expensive, dominant stage we eliminate is the NVRTC
-//! source->PTX compile. When NVRTC is newer than the driver, which refuses its
-//! PTX, kernels are compiled for the device's own architecture instead and the
-//! entry holds that cubin, keyed by its `sm_*` target.
+//! source->PTX compile. When NVRTC is a newer minor version than the driver,
+//! which refuses its PTX, a kernel the device can run is compiled for the
+//! device's own architecture instead and the entry holds that cubin, keyed by
+//! its `sm_*` target.
 //!
 //! # Cache key
 //!
