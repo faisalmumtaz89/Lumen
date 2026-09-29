@@ -142,7 +142,9 @@ impl CudaDevice {
         self.ctx.compute_capability().map_err(cuda_driver_err)
     }
 
-    /// Compile CUDA source to PTX via NVRTC and load as a module.
+    /// Compile CUDA source to PTX via NVRTC and load as a module (to a cubin
+    /// for the device when NVRTC is a newer minor version than the driver; see
+    /// `compile_and_load_cached`).
     ///
     /// Routes through the persistent PTX disk cache: on a cache hit the NVRTC
     /// compile is skipped and the cached PTX is handed straight to
@@ -209,13 +211,19 @@ impl CudaDevice {
     /// `compile_and_load*` entry points.
     ///
     /// Flow:
-    ///  1. Build the cache key (source hash + arch + fast_math + compute
+    ///  1. Build the cache key (source hash + target + fast_math + compute
     ///     capability + NVRTC version + driver version).
-    ///  2. On a cache hit, load the cached PTX bytes via `cuModuleLoadData`
+    ///  2. On a cache hit, load the cached bytes via `cuModuleLoadData`
     ///     (the exact same driver path a fresh compile uses -> byte-identical
     ///     SASS).
-    ///  3. On a miss (or any cache read error), NVRTC-compile, atomically
-    ///     write the PTX to the cache, then load it.
+    ///  3. On a miss (or any cache read error), NVRTC-compile, load, and
+    ///     atomically write the bytes to the cache once the driver accepts
+    ///     them.
+    ///
+    /// The target is `arch` (PTX, which the driver JIT-compiles), except when
+    /// the loaded NVRTC is a newer minor version than the driver and the device
+    /// can run `arch`: the driver refuses that toolkit's PTX, so the kernel is
+    /// compiled for the device's own architecture instead ([`sass_arch_for`]).
     ///
     /// Caching is default-ON and a pure optimization: disabling it
     /// (`LUMEN_CUDA_PTX_CACHE=0`) only changes startup latency, never output.
@@ -225,15 +233,25 @@ impl CudaDevice {
         arch: Option<&'static str>,
         fast_math: bool,
     ) -> Result<Arc<CudaModule>, RuntimeError> {
-        // Compute-capability + toolchain components of the cache key. If any
-        // query fails we fall back to a non-cached compile (cache disabled for
-        // this call) rather than failing the load.
-        let key_env = self.ptx_cache_key_env();
+        // Compute-capability + toolchain versions: the SASS decision and the
+        // cache key. If a query fails the kernel compiles to `arch` and loads
+        // uncached rather than failing the load.
+        let toolchain = self.toolchain();
+        let sass = toolchain
+            .as_ref()
+            .and_then(|env| sass_arch_for(env.nvrtc_version, env.driver_version, env.cc, arch));
+        let target = sass.as_deref().or(arch).unwrap_or("default");
+        if let Some(env) = toolchain.as_ref().filter(|_| sass.is_some()) {
+            announce_sass(env);
+        }
 
-        if let Some(env) = key_env.as_ref() {
+        if let Some(env) = toolchain
+            .as_ref()
+            .filter(|_| super::ptx_cache::cache_enabled())
+        {
             let key = super::ptx_cache::CacheKey {
                 source: cuda_source,
-                arch: arch.unwrap_or("default"),
+                arch: target,
                 fast_math,
                 cc: env.cc,
                 nvrtc_version: env.nvrtc_version,
@@ -249,23 +267,30 @@ impl CudaDevice {
             // as a miss for the cold/warm log so the headline reflects reality.
             if super::ptx_cache::is_driver_rejected(&key) {
                 super::ptx_cache::record_miss();
+                let cause = if sass.is_none() {
+                    format!(
+                        " The usual cause is a CUDA toolkit newer than the driver: NVRTC \
+                         {}.{} emits a PTX ISA the driver cannot load. Install the toolkit \
+                         matching `nvidia-smi`'s CUDA version, or update the driver.",
+                        key.nvrtc_version.0, key.nvrtc_version.1
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(RuntimeError::Compute(format!(
-                    "CUDA driver {} rejected this build's PTX for arch '{}' on cc {}.{} \
+                    "CUDA driver {} rejected this build's {} for arch '{}' on cc {}.{} \
                      on an earlier launch (driver-reject marker present; skipping the \
-                     doomed recompile). The usual cause is a CUDA toolkit newer than \
-                     the driver: NVRTC {}.{} emits a PTX ISA the driver cannot load. \
-                     Install the toolkit matching `nvidia-smi`'s CUDA version, or \
-                     update the driver; the marker clears itself once either changes.",
+                     doomed recompile).{cause} The marker clears itself once the toolkit \
+                     or the driver changes.",
                     key.driver_version,
+                    image_kind(key.arch),
                     key.arch,
                     key.cc.0,
                     key.cc.1,
-                    key.nvrtc_version.0,
-                    key.nvrtc_version.1
                 )));
             }
 
-            // Cache hit: load the cached PTX bytes directly.
+            // Cache hit: load the cached bytes directly.
             if let Some(cached) = super::ptx_cache::load(&key) {
                 let ptx = cudarc::nvrtc::Ptx::from_binary(cached);
                 match self.ctx.load_module(ptx) {
@@ -282,7 +307,8 @@ impl CudaDevice {
                         // a lost context) leaves the entry alone, and a
                         // successful `store` clears any marker in any case.
                         eprintln!(
-                            "[CUDA] cached PTX for {} (arch {}) failed to load: {}; recompiling",
+                            "[CUDA] cached {} for {} (arch {}) failed to load: {}; recompiling",
+                            image_kind(key.arch),
                             key.digest_hex(),
                             key.arch,
                             ptx_load_message(e.0, key.driver_version, key.nvrtc_version, key.arch)
@@ -295,18 +321,17 @@ impl CudaDevice {
             }
 
             // Miss (or rejected cache entry): NVRTC-compile, then load. Only
-            // persist the PTX once the driver has *accepted* it -- caching PTX
-            // the local driver rejects is worthless (it can never warm-hit) and
-            // bloats the cache, so on rejection we write a driver-reject marker
-            // instead and return the error for the caller to fall back on.
+            // persist the bytes once the driver has *accepted* them -- caching
+            // code the local driver rejects is worthless (it can never
+            // warm-hit) and bloats the cache, so on rejection we write a
+            // driver-reject marker instead and return the error for the caller
+            // to fall back on.
             super::ptx_cache::record_miss();
-            let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
-            // Capture the PTX bytes *before* the load_module move so we can
-            // persist them only on driver acceptance.
-            let ptx_bytes = ptx.as_bytes().map(|b| b.to_vec());
-            match self.ctx.load_module(ptx) {
+            let (image, bytes) =
+                Self::nvrtc_compile(cuda_source, arch, sass.as_deref(), fast_math)?;
+            match self.ctx.load_module(image) {
                 Ok(module) => {
-                    if let Some(bytes) = ptx_bytes {
+                    if let Some(bytes) = bytes {
                         super::ptx_cache::store(&key, &bytes);
                     }
                     return Ok(module);
@@ -325,46 +350,54 @@ impl CudaDevice {
             }
         }
 
-        // Cache key unavailable (version query failed) -> plain compile+load.
-        let ptx = Self::nvrtc_compile(cuda_source, arch, fast_math)?;
-        // No cache key means the NVRTC/driver version query failed, so the
-        // message names the driver's error and the arch but no versions.
-        self.ctx.load_module(ptx).map_err(|e| {
-            RuntimeError::Compute(ptx_load_message(e.0, 0, (0, 0), arch.unwrap_or("default")))
-        })
+        // Cache disabled or a version query failed -> plain compile+load. The
+        // message names the versions when they are known.
+        let (image, _) = Self::nvrtc_compile(cuda_source, arch, sass.as_deref(), fast_math)?;
+        let (driver, nvrtc) = toolchain
+            .as_ref()
+            .map_or((0, (0, 0)), |env| (env.driver_version, env.nvrtc_version));
+        self.ctx
+            .load_module(image)
+            .map_err(|e| RuntimeError::Compute(ptx_load_message(e.0, driver, nvrtc, target)))
     }
 
-    /// Run NVRTC source->PTX compilation with the given arch / fast_math flags.
+    /// NVRTC-compile `cuda_source` into the image the driver loads and the
+    /// bytes the cache keeps: PTX for `arch` (NVRTC's default target when
+    /// `None`), or, when `sass` names a real architecture, a cubin for it.
     fn nvrtc_compile(
         cuda_source: &str,
         arch: Option<&'static str>,
+        sass: Option<&str>,
         fast_math: bool,
-    ) -> Result<cudarc::nvrtc::Ptx, RuntimeError> {
-        if arch.is_none() && !fast_math {
-            return cudarc::nvrtc::compile_ptx(cuda_source).map_err(cuda_nvrtc_err);
+    ) -> Result<(cudarc::nvrtc::Ptx, Option<Vec<u8>>), RuntimeError> {
+        if let Some(real) = sass {
+            let cubin = nvrtc_cubin(cuda_source, real, fast_math)?;
+            return Ok((cudarc::nvrtc::Ptx::from_binary(cubin.clone()), Some(cubin)));
         }
-        let opts = cudarc::nvrtc::CompileOptions {
-            arch,
-            // Raw --use_fast_math flag for full effect:
-            // --fmad=true --ftz=true --prec-div=false --prec-sqrt=false
-            // (cudarc's use_fast_math field only adds --fmad=true).
-            options: if fast_math {
-                vec!["--use_fast_math".to_string()]
-            } else {
-                Vec::new()
-            },
-            ..Default::default()
+        let ptx = if arch.is_none() && !fast_math {
+            cudarc::nvrtc::compile_ptx(cuda_source).map_err(cuda_nvrtc_err)?
+        } else {
+            let opts = cudarc::nvrtc::CompileOptions {
+                arch,
+                // Raw --use_fast_math flag for full effect:
+                // --fmad=true --ftz=true --prec-div=false --prec-sqrt=false
+                // (cudarc's use_fast_math field only adds --fmad=true).
+                options: if fast_math {
+                    vec!["--use_fast_math".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            cudarc::nvrtc::compile_ptx_with_opts(cuda_source, opts).map_err(cuda_nvrtc_err)?
         };
-        cudarc::nvrtc::compile_ptx_with_opts(cuda_source, opts).map_err(cuda_nvrtc_err)
+        let bytes = ptx.as_bytes().map(<[u8]>::to_vec);
+        Ok((ptx, bytes))
     }
 
-    /// Query the environment components of the PTX cache key (compute
-    /// capability + NVRTC version + driver version). Returns `None` if any
-    /// query fails, which disables caching for that load (graceful fallback).
-    fn ptx_cache_key_env(&self) -> Option<PtxCacheKeyEnv> {
-        if !super::ptx_cache::cache_enabled() {
-            return None;
-        }
+    /// Query the compute capability and the NVRTC and driver versions: the
+    /// SASS decision and the cache key. `None` if any query fails.
+    fn toolchain(&self) -> Option<PtxCacheKeyEnv> {
         let cc = self.compute_capability().ok()?;
         let nvrtc_version = nvrtc_version().ok()?;
         let driver_version = driver_version().ok()?;
@@ -563,6 +596,28 @@ struct PtxCacheKeyEnv {
     driver_version: i32,
 }
 
+/// Say once, under `LUMEN_CUDA_VERBOSE`, that kernels are compiled for the
+/// device itself because NVRTC is newer than the driver: the PTX targets that
+/// other lines name then build this one architecture, except a target the
+/// device cannot run, which stays PTX and is refused.
+fn announce_sass(env: &PtxCacheKeyEnv) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if super::decode::cuda_verbose() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "[CUDA] NVRTC {}.{} is newer than the driver (CUDA {}.{}): kernels this GPU can \
+                 run are compiled for sm_{}{} instead of PTX",
+                env.nvrtc_version.0,
+                env.nvrtc_version.1,
+                env.driver_version / 1000,
+                env.driver_version % 1000 / 10,
+                env.cc.0,
+                env.cc.1,
+            );
+        });
+    }
+}
+
 /// Query the NVRTC library version as (major, minor) via `nvrtcVersion`.
 ///
 /// Part of the PTX cache key: a toolkit upgrade that changes the NVRTC version
@@ -638,6 +693,102 @@ pub(crate) fn dp4a_arch_for(cc: i32, supported: &[i32]) -> Option<&'static str> 
         .collect();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     candidates.into_iter().find_map(arch_name)
+}
+
+/// The real architecture a kernel is compiled for when the loaded NVRTC is
+/// newer than the driver within one CUDA major version, `None` otherwise. The
+/// driver refuses PTX from a newer toolkit (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`)
+/// but loads code compiled for the device's own architecture (CUDA minor
+/// version compatibility), so the kernel targets `sm_<cc>`, keeping the `a`
+/// suffix of an architecture-specific `requested` target. A `requested` target
+/// above the device stays on PTX, which the driver refuses as it refuses any
+/// target the device cannot run, so the caller's fallback runs as usual.
+/// `driver_version` is `cuDriverGetVersion`'s `1000 * major + 10 * minor`.
+pub(crate) fn sass_arch_for(
+    nvrtc: (i32, i32),
+    driver_version: i32,
+    cc: (i32, i32),
+    requested: Option<&str>,
+) -> Option<String> {
+    let driver = (driver_version / 1000, driver_version % 1000 / 10);
+    if nvrtc.0 != driver.0 || nvrtc.1 <= driver.1 {
+        return None;
+    }
+    let above_device = requested
+        .and_then(|arch| arch.strip_prefix("compute_"))
+        .and_then(|number| number.trim_end_matches('a').parse::<i32>().ok())
+        .is_some_and(|target| target > cc.0 * 10 + cc.1);
+    if above_device {
+        return None;
+    }
+    let suffix = if requested.is_some_and(|arch| arch.ends_with('a')) {
+        "a"
+    } else {
+        ""
+    };
+    Some(format!("sm_{}{}{suffix}", cc.0, cc.1))
+}
+
+/// Compile `cuda_source` with NVRTC for the real architecture `arch` (`sm_*`)
+/// and return the cubin; the options are the PTX build's with that target.
+fn nvrtc_cubin(cuda_source: &str, arch: &str, fast_math: bool) -> Result<Vec<u8>, RuntimeError> {
+    use cudarc::nvrtc::{result, sys};
+    let source = std::ffi::CString::new(cuda_source)
+        .map_err(|e| RuntimeError::Compute(format!("CUDA source holds a NUL byte: {e}")))?;
+    let mut options = vec![format!("--gpu-architecture={arch}")];
+    if fast_math {
+        options.push("--use_fast_math".to_string());
+    }
+    let program = result::create_program(&source, None)
+        .map_err(|e| RuntimeError::Compute(format!("NVRTC could not create a program: {e:?}")))?;
+    // SAFETY: `program` was created above and is destroyed exactly once, after
+    // its last use; the size query sizes the buffer the cubin is written into.
+    let cubin = unsafe {
+        match result::compile_program(program, &options) {
+            Ok(()) => {
+                let mut size = 0usize;
+                sys::nvrtcGetCUBINSize(program, &mut size)
+                    .result()
+                    .and_then(|()| {
+                        let mut cubin = vec![0u8; size];
+                        sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr().cast())
+                            .result()
+                            .map(|()| cubin)
+                    })
+                    .map_err(|e| {
+                        RuntimeError::Compute(format!("NVRTC returned no cubin for {arch}: {e:?}"))
+                    })
+            }
+            Err(e) => {
+                let log = result::get_program_log(program)
+                    .map(|log| {
+                        std::ffi::CStr::from_ptr(log.as_ptr())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                Err(RuntimeError::Compute(format!(
+                    "CUDA NVRTC compilation error for {arch} ({e:?}, options {options:?}): {log}"
+                )))
+            }
+        }
+    };
+    // SAFETY: see above; `program` is not used after this call.
+    let destroyed = unsafe { result::destroy_program(program) };
+    let cubin = cubin?;
+    destroyed
+        .map_err(|e| RuntimeError::Compute(format!("NVRTC could not free a program: {e:?}")))?;
+    Ok(cubin)
+}
+
+/// What the driver is handed for `arch`: a cubin for a real architecture
+/// (`sm_*`), PTX for a virtual one.
+fn image_kind(arch: &str) -> &'static str {
+    if arch.starts_with("sm_") {
+        "cubin"
+    } else {
+        "PTX"
+    }
 }
 
 /// The native prefill group's NVRTC target: `compute_120a` on a compute
@@ -764,9 +915,10 @@ fn ptx_load_message(
              the CUDA toolkit matching `nvidia-smi`'s CUDA version (or update the driver); stale \
              cache entries and reject markers clear themselves once either version changes."
         ),
-        _ => {
-            format!("CUDA driver refused the PTX produced for arch '{arch}' ({code:?}) {versions}")
-        }
+        _ => format!(
+            "CUDA driver refused the {} produced for arch '{arch}' ({code:?}) {versions}",
+            image_kind(arch)
+        ),
     }
 }
 
@@ -972,5 +1124,77 @@ mod fp4_native_arch_tests {
     fn a_new_enough_nvrtc_that_does_not_list_target_120_gets_nothing() {
         assert_eq!(fp4_native_arch_for((12, 0), (12, 8), &[80, 90, 100]), None);
         assert_eq!(fp4_native_arch_for((12, 0), (12, 7), NVRTC_13_1), None);
+    }
+}
+
+#[cfg(test)]
+mod sass_arch_tests {
+    use super::sass_arch_for;
+
+    #[test]
+    fn nvrtc_newer_than_the_driver_compiles_for_the_device() {
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (12, 0), None).as_deref(),
+            Some("sm_120")
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13000, (8, 0), Some("compute_80")).as_deref(),
+            Some("sm_80")
+        );
+        assert_eq!(
+            sass_arch_for((12, 8), 12040, (8, 6), Some("compute_61")).as_deref(),
+            Some("sm_86")
+        );
+    }
+
+    #[test]
+    fn an_architecture_specific_target_keeps_its_suffix() {
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (12, 0), Some("compute_120a")).as_deref(),
+            Some("sm_120a")
+        );
+    }
+
+    #[test]
+    fn a_target_above_the_device_stays_on_ptx() {
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_86")).as_deref(),
+            Some("sm_86")
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_89")),
+            None
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13000, (7, 5), Some("compute_80")),
+            None
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_120")),
+            None
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (12, 0), Some("compute_120")).as_deref(),
+            Some("sm_120")
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13000, (7, 5), None).as_deref(),
+            Some("sm_75")
+        );
+    }
+
+    #[test]
+    fn a_driver_as_new_as_nvrtc_keeps_ptx() {
+        assert_eq!(sass_arch_for((13, 3), 13030, (12, 0), None), None);
+        assert_eq!(sass_arch_for((13, 0), 13030, (12, 0), None), None);
+        assert_eq!(
+            sass_arch_for((12, 4), 13000, (8, 0), Some("compute_80")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_newer_major_version_is_not_minor_version_compatible() {
+        assert_eq!(sass_arch_for((13, 0), 12090, (8, 0), None), None);
     }
 }

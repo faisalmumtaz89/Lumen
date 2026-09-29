@@ -287,9 +287,9 @@ impl NativeGdnKernels {
 /// gates small enough that every head carries its state across the chunk boundary), every output
 /// pre-filled with 0xA5 so an unwritten byte changes the digest. The digests were recorded from the
 /// kernels on an RTX 5090 (NVRTC 13.3, driver 610), after the GPU suite had checked the same outputs
-/// against its f64 models; the machine code comes from the driver's PTX compiler, so a different
-/// NVRTC or driver may compile it differently and is then refused until the digests are recorded
-/// for it.
+/// against its f64 models; the machine code comes from the driver's PTX compiler (from NVRTC when it
+/// is a newer minor version than the driver), so a different NVRTC or driver may compile it
+/// differently and is then refused until the digests are recorded for it.
 pub mod smoke {
     use super::*;
     use crate::cuda::native_prefill_kernels::smoke::bf16;
