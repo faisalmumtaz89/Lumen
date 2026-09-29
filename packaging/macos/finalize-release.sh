@@ -18,6 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 : "${TAG:?TAG env required}"
 REPO="faisalmumtaz89/Lumen"
+IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"  # ghcr names are lowercase
 mkdir -p dist
 
 # ── Linux/CUDA raw-binary tarball (for users who don't want Docker) ───────────
@@ -32,12 +33,14 @@ Lumen — LLM and image inference for Linux x86_64 / NVIDIA CUDA
 Build: ${TAG}
 
 PREREQUISITES
-  - NVIDIA GPU + driver (>= 525 recommended).
-  - CUDA runtime libs libnvrtc + libcublas present at run time (loaded dynamically;
-    no build-time CUDA SDK). On Ubuntu: the cuda-nvrtc-12-2 + libcublas-12-2
-    packages — or just run the published Docker image: ghcr.io/${REPO}.
-  - Kernels JIT-compile at first run via NVRTC; the PTX disk cache makes subsequent
-    launches sub-second (set LUMEN_CACHE_DIR to persist it).
+  - NVIDIA GPU with compute capability 8.0 or newer, and its driver: 535 or newer
+    with CUDA 12, 580 or newer with CUDA 13.
+  - cuBLAS and NVRTC loadable at run time (no build-time CUDA SDK): from CUDA 12
+    (for example NVIDIA's cuda-nvrtc-12-X and libcublas-12-X packages) or a full
+    CUDA 13 toolkit — or just run the published Docker image:
+    ${IMAGE}
+  - Kernels compile at the first run via NVRTC and are cached, so later launches
+    skip the compile.
 
 INSTALL   sudo cp bin/lumen bin/lumen-server bin/lbi-convert /usr/local/bin/
 RUN       lumen pull qwen3.5-9b:q8_0
@@ -45,7 +48,7 @@ RUN       lumen pull qwen3.5-9b:q8_0
 IMAGES    lbi-convert /path/to/Qwen-Image-2.1 /path/to/lbi
           LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \\
             lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 8000
-          (see docs/image-generation.md)
+          https://github.com/${REPO}/blob/main/docs/image-generation.md
 EOF
 tar -C "$(dirname "$stage")" -czf "dist/lumen-${TAG}-linux-x86_64-cuda.tar.gz" "$(basename "$stage")"
 ( cd dist && shasum -a 256 "lumen-${TAG}-linux-x86_64-cuda.tar.gz" > "lumen-${TAG}-linux-x86_64-cuda.tar.gz.sha256" )

@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   SOCKS proxy that `https_proxy` or `all_proxy` names, read as curl reads them, and go direct
   when `no_proxy` lists Hugging Face's host.
 
+- **The Linux download's README named the wrong driver and image.** It gave driver 525 for
+  CUDA 12, which Lumen cannot load, and a Docker image name the registry rejects. It now names
+  driver 535 or newer with CUDA 12, 580 or newer with CUDA 13, the GPU's minimum compute
+  capability, and the image as published.
+
 ## [0.37.0] — 2026-09-29
 
 ### Added
