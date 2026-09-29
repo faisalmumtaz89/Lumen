@@ -241,6 +241,9 @@ impl CudaDevice {
             .as_ref()
             .and_then(|env| sass_arch_for(env.nvrtc_version, env.driver_version, env.cc, arch));
         let target = sass.as_deref().or(arch).unwrap_or("default");
+        if let Some(env) = toolchain.as_ref().filter(|_| sass.is_some()) {
+            announce_sass(env);
+        }
 
         if let Some(env) = toolchain
             .as_ref()
@@ -593,6 +596,27 @@ struct PtxCacheKeyEnv {
     driver_version: i32,
 }
 
+/// Say once, under `LUMEN_CUDA_VERBOSE`, that kernels are compiled for the
+/// device itself because NVRTC is newer than the driver: the PTX targets that
+/// other lines name then all build this one architecture.
+fn announce_sass(env: &PtxCacheKeyEnv) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if super::decode::cuda_verbose() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "[CUDA] NVRTC {}.{} is newer than the driver (CUDA {}.{}): kernels are compiled \
+                 for sm_{}{} instead of PTX",
+                env.nvrtc_version.0,
+                env.nvrtc_version.1,
+                env.driver_version / 1000,
+                env.driver_version % 1000 / 10,
+                env.cc.0,
+                env.cc.1,
+            );
+        });
+    }
+}
+
 /// Query the NVRTC library version as (major, minor) via `nvrtcVersion`.
 ///
 /// Part of the PTX cache key: a toolkit upgrade that changes the NVRTC version
@@ -675,8 +699,10 @@ pub(crate) fn dp4a_arch_for(cc: i32, supported: &[i32]) -> Option<&'static str> 
 /// driver refuses PTX from a newer toolkit (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`)
 /// but loads code compiled for the device's own architecture (CUDA minor
 /// version compatibility), so the kernel targets `sm_<cc>`, keeping the `a`
-/// suffix of an architecture-specific `requested` target. `driver_version` is
-/// `cuDriverGetVersion`'s `1000 * major + 10 * minor`.
+/// suffix of an architecture-specific `requested` target. A `requested` target
+/// above the device stays on PTX, which the driver refuses as it refuses any
+/// target the device cannot run, so the caller's fallback runs as usual.
+/// `driver_version` is `cuDriverGetVersion`'s `1000 * major + 10 * minor`.
 pub(crate) fn sass_arch_for(
     nvrtc: (i32, i32),
     driver_version: i32,
@@ -685,6 +711,13 @@ pub(crate) fn sass_arch_for(
 ) -> Option<String> {
     let driver = (driver_version / 1000, driver_version % 1000 / 10);
     if nvrtc.0 != driver.0 || nvrtc.1 <= driver.1 {
+        return None;
+    }
+    let above_device = requested
+        .and_then(|arch| arch.strip_prefix("compute_"))
+        .and_then(|number| number.trim_end_matches('a').parse::<i32>().ok())
+        .is_some_and(|target| target > cc.0 * 10 + cc.1);
+    if above_device {
         return None;
     }
     let suffix = if requested.is_some_and(|arch| arch.ends_with('a')) {
@@ -1118,6 +1151,26 @@ mod sass_arch_tests {
         assert_eq!(
             sass_arch_for((13, 4), 13030, (12, 0), Some("compute_120a")).as_deref(),
             Some("sm_120a")
+        );
+    }
+
+    #[test]
+    fn a_target_above_the_device_stays_on_ptx() {
+        assert_eq!(
+            sass_arch_for((13, 4), 13000, (7, 5), Some("compute_80")),
+            None
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (8, 6), Some("compute_120")),
+            None
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13030, (12, 0), Some("compute_120")).as_deref(),
+            Some("sm_120")
+        );
+        assert_eq!(
+            sass_arch_for((13, 4), 13000, (7, 5), None).as_deref(),
+            Some("sm_75")
         );
     }
 

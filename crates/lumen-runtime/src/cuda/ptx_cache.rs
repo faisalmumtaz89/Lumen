@@ -127,8 +127,8 @@ pub(crate) struct CacheKey<'a> {
     /// Kernel source string (`.cu` contents). Borrowed only for hashing; never
     /// stored, so the lifetime is the caller's source slice.
     pub source: &'a str,
-    /// Target arch passed to NVRTC, e.g. "compute_80" / "compute_61", or
-    /// "default" when no explicit arch is set.
+    /// Target arch passed to NVRTC, e.g. "compute_80" / "compute_61", "sm_120"
+    /// for a cubin, or "default" when no explicit arch is set.
     pub arch: &'a str,
     /// Whether `--use_fast_math` (and its sub-flags) is enabled.
     pub fast_math: bool,
