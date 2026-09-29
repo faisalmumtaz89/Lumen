@@ -86,7 +86,7 @@ INSTALL
 
 RUN (chat in one command)
   lumen pull qwen3.5-9b:q8_0          # downloads + converts to ~/.cache/lumen
-  lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
+  lumen run qwen3.5-9b:q8_0 "Write a haiku about light"
 
 RUN (HTTP server, OpenAI-compatible)
   lumen pull qwen3.5-moe-35b-a3b:q8_0

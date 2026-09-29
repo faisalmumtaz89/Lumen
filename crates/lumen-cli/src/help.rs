@@ -69,7 +69,7 @@ CONFIGURATION PRECEDENCE:
 
 EXAMPLES:
     lumen run qwen3.5-9b:q8_0 \"What is the meaning of life?\"
-    lumen run qwen3.5-9b:q4_0 \"Write a haiku about Rust\"
+    lumen run qwen3.5-9b:q4_0 \"Write a haiku about light\"
     lumen run qwen3.5-9b:bf16 \"Explain quantum computing\" --max-tokens 200
     lumen run --model qwen3-5-9b --prompt \"hello\" --temperature 0.7
 

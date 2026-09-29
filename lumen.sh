@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./lumen "What is the meaning of life?"
-#   ./lumen --model qwen3.5-9b:q8_0 "Write a haiku about Rust"
+#   ./lumen --model qwen3.5-9b:q8_0 "Write a haiku about light"
 #   ./lumen pull qwen3.5-9b:q8_0
 #   ./lumen models
 #

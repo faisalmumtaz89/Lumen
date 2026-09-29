@@ -18,7 +18,7 @@
 A single binary that downloads a model, runs it GPU-resident, and prints text — built from scratch with zero ML dependencies (no PyTorch, no ONNX, no Python), native CUDA C and Metal kernels, a native tokenizer, and a native model format.
 
 ```bash
-lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
+lumen run qwen3.5-9b:q8_0 "Write a haiku about light"
 ```
 
 That one command downloads the model on first use, converts it, picks your backend (Metal on Apple Silicon, CUDA on NVIDIA), and streams tokens.
@@ -48,7 +48,7 @@ cargo install --path crates/lumen-cli --features cuda   # NVIDIA Linux (CUDA)
 **Run** — the model auto-downloads + converts on first use, then runs GPU-resident on your backend (Metal on Apple Silicon, CUDA on NVIDIA):
 
 ```bash
-lumen run qwen3.5-9b:q8_0 "Write a haiku about Rust"
+lumen run qwen3.5-9b:q8_0 "Write a haiku about light"
 lumen run qwen3.5-moe:q4_0 "Explain quantum computing in one paragraph"   # mixture-of-experts
 ```
 

@@ -207,7 +207,7 @@ fn pull_cmd(args: &[String]) {
 
     println!("\nReady: {}", lbc_out.display());
     println!(
-        "Run with: lumen run {}:{} \"Hello\"",
+        "Run with: lumen run {}:{} \"Write a haiku about light\"",
         resolved_name,
         quant.to_lowercase()
     );

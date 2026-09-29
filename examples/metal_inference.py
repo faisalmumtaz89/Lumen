@@ -9,7 +9,7 @@ Prerequisites:
 
 Usage (model registry -- auto-downloads on first run):
   python examples/metal_inference.py
-  python examples/metal_inference.py --model tinyllama:q8_0 --prompt "Write a haiku about Rust"
+  python examples/metal_inference.py --model tinyllama:q8_0 --prompt "Write a haiku about light"
   python examples/metal_inference.py --model qwen2.5-3b:q8_0 --prompt "Explain gravity" --max-tokens 100
 
 Usage (local .lbc file):
