@@ -330,8 +330,9 @@ pub fn switches(native_prefill: bool, prefill_f32: bool) -> Result<(), Refusal> 
     Ok(())
 }
 
-/// Whether a model whose planes are stored in `schemes` carries NVFP4 or FP8 planes: the models the
-/// load log names the prefill route for, since the native route and its F32 alternative are theirs.
+/// Whether a model whose planes are stored in `schemes` carries NVFP4 or FP8 planes: the models whose
+/// load log names the prefill route (a refusal always, the admitted route under `LUMEN_CUDA_VERBOSE`),
+/// since the native route and its F32 alternative are theirs.
 /// Any other model keeps its own prefill (by default the F16 GEMM), which a route line would misname.
 pub fn carries_planar_planes(schemes: impl IntoIterator<Item = QuantScheme>) -> bool {
     schemes

@@ -191,7 +191,7 @@ def _run_validation(gpu_name: str) -> dict:
         last_beat = start
         while time.time() - start < timeout_s:
             # Echo any new server-log content (so `modal app logs` shows the
-            # NVRTC compile / PTX cache / listening lines live).
+            # compile notice / listening lines live).
             try:
                 txt_now = open(log_path).read()
             except Exception:  # noqa: BLE001
@@ -223,7 +223,7 @@ def _run_validation(gpu_name: str) -> dict:
                 ready_s = round(time.time() - start, 2)
                 ptx_line = None
                 for ln in txt_now.splitlines():
-                    if "PTX cache" in ln:
+                    if "compiling kernels" in ln:
                         ptx_line = ln.strip()
                     low = ln.lower()
                     if ("nvrtc" in low or "compile" in low) and (

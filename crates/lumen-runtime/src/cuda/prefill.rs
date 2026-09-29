@@ -581,7 +581,9 @@ fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
 fn announce_q8_hgemm_once() {
     static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    if !Q8_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if super::decode::cuda_verbose()
+        && !Q8_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         eprintln!("[CUDA] Prefill Q8_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
     }
 }
@@ -590,7 +592,7 @@ fn announce_q8_hgemm_once() {
 /// split clone): its own line, so a route receipt shows which dequant fed the HGEMM.
 fn announce_q8_split_hgemm_once() {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if super::decode::cuda_verbose() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
             "[CUDA] Prefill Q8_0 split-layout HGEMM: ACTIVE (dequant split->F16->tensor core path)"
         );
@@ -687,7 +689,8 @@ pub(crate) unsafe fn launch_gemm_projection(
     // 14/15 PASS. It is gated to BF16 models because the same lever REGRESSES MoE
     // q8 (adds a DD-REP). Env override: `LUMEN_CUDA_GDN_AB_F32=0` forces OFF, any
     // other value forces ON.
-    let gdn_ab_f32_on = match std::env::var("LUMEN_CUDA_GDN_AB_F32").ok().as_deref() {
+    let gdn_ab_f32_env = std::env::var("LUMEN_CUDA_GDN_AB_F32").ok();
+    let gdn_ab_f32_on = match gdn_ab_f32_env.as_deref() {
         Some("0") | Some("false") | Some("FALSE") => false,
         Some(_) => true,
         None => crate::runtime_defaults::model_is_moe_bf16(),
@@ -706,7 +709,9 @@ pub(crate) unsafe fn launch_gemm_projection(
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
         static HGEMM_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        if !HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if super::decode::cuda_verbose()
+            && !HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             eprintln!("[CUDA] Prefill HGEMM: ACTIVE (tensor core path)");
         }
 
@@ -833,7 +838,9 @@ pub(crate) unsafe fn launch_gemm_projection(
             if use_mmq {
                 static MMQ_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !MMQ_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if super::decode::cuda_verbose()
+                    && !MMQ_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     eprintln!(
                         "[CUDA]: Prefill Q8 MMQ: ACTIVE ({label}, batch={batch}, \
                          out_dim={out_dim}, in_dim={in_dim})"
@@ -865,7 +872,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                 if force_alpha_beta_f32 {
                     static AB_F32_LOGGED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
-                    if !AB_F32_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if (gdn_ab_f32_env.is_some() || super::decode::cuda_verbose())
+                        && !AB_F32_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
                         eprintln!(
                             "[CUDA]: GDN alpha/beta forced through F32 SGEMM \
                              (F32 SGEMM on dequantized GDN alpha/beta; bypasses MMQ/HGEMM)"
@@ -963,7 +972,9 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
             static F16_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !F16_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if super::decode::cuda_verbose()
+                && !F16_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 eprintln!("[CUDA] Prefill HGEMM F16Raw: ACTIVE (native F16 tensor core path)");
             }
 
@@ -1043,7 +1054,9 @@ pub(crate) unsafe fn launch_gemm_projection(
             } else {
                 static Q4_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !Q4_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if super::decode::cuda_verbose()
+                    && !Q4_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     eprintln!("[CUDA] Prefill Q4_0 HGEMM: ACTIVE (dequant->F16->tensor core path)");
                 }
 
@@ -1201,7 +1214,9 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
             static BF16_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            if !BF16_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if super::decode::cuda_verbose()
+                && !BF16_HGEMM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 eprintln!("[CUDA] Prefill BF16 GemmEx: ACTIVE (native BF16 tensor core path)");
             }
 
@@ -1539,7 +1554,9 @@ pub(crate) unsafe fn launch_gemm_residual(
             if use_mmq {
                 static MMQ_RES_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !MMQ_RES_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if super::decode::cuda_verbose()
+                    && !MMQ_RES_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     eprintln!(
                         "[CUDA]: Prefill Q8 MMQ+residual: ACTIVE ({label}, batch={batch}, \
                          out_dim={out_dim}, in_dim={in_dim})"

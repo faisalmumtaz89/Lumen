@@ -376,15 +376,17 @@ fn autotune_cublas_algos_bf16(
 
         if let Some(originals) = proxy_to_originals.get(&(proxy_out, proxy_in)) {
             for &(orig_out, orig_in) in originals {
-                if orig_out != proxy_out || orig_in != proxy_in {
-                    eprintln!(
-                        "[CUDA] Autotune BF16 HGEMV ({orig_out}x{orig_in}): \
-                         using proxy ({proxy_out}x{proxy_in}) best={algo_name} ({best_time:.3}ms)"
-                    );
-                } else {
-                    eprintln!(
-                        "[CUDA] Autotune BF16 HGEMV ({orig_out}x{orig_in}): best={algo_name} ({best_time:.3}ms)"
-                    );
+                if super::decode::cuda_verbose() {
+                    if orig_out != proxy_out || orig_in != proxy_in {
+                        eprintln!(
+                            "[CUDA] Autotune BF16 HGEMV ({orig_out}x{orig_in}): \
+                             using proxy ({proxy_out}x{proxy_in}) best={algo_name} ({best_time:.3}ms)"
+                        );
+                    } else {
+                        eprintln!(
+                            "[CUDA] Autotune BF16 HGEMV ({orig_out}x{orig_in}): best={algo_name} ({best_time:.3}ms)"
+                        );
+                    }
                 }
                 cache.insert((orig_out, orig_in), best_algo);
             }
@@ -615,15 +617,17 @@ fn autotune_cublas_algos(
         // Map the proxy result back to all original shapes that share this proxy.
         if let Some(originals) = proxy_to_originals.get(&(proxy_out, proxy_in)) {
             for &(orig_out, orig_in) in originals {
-                if orig_out != proxy_out || orig_in != proxy_in {
-                    eprintln!(
-                        "[CUDA] Autotune HGEMV ({orig_out}x{orig_in}): \
-                         using proxy ({proxy_out}x{proxy_in}) best={algo_name} ({best_time:.3}ms)"
-                    );
-                } else {
-                    eprintln!(
-                        "[CUDA] Autotune HGEMV ({orig_out}x{orig_in}): best={algo_name} ({best_time:.3}ms)"
-                    );
+                if super::decode::cuda_verbose() {
+                    if orig_out != proxy_out || orig_in != proxy_in {
+                        eprintln!(
+                            "[CUDA] Autotune HGEMV ({orig_out}x{orig_in}): \
+                             using proxy ({proxy_out}x{proxy_in}) best={algo_name} ({best_time:.3}ms)"
+                        );
+                    } else {
+                        eprintln!(
+                            "[CUDA] Autotune HGEMV ({orig_out}x{orig_in}): best={algo_name} ({best_time:.3}ms)"
+                        );
+                    }
                 }
                 cache.best_algo.insert((orig_out, orig_in), best_algo);
             }
@@ -18288,14 +18292,16 @@ fn build_precomputed_batch_ptrs(
 
     let num_layers = layer_weights.len();
     let has_grouped_gemm = probe_grouped_gemm(device);
-    if has_grouped_gemm {
-        eprintln!(
-            "[CUDA] cublasGemmGroupedBatchedEx available (CUDA 12.5+) -- QKV grouped GEMM enabled"
-        );
-    } else {
-        eprintln!(
-            "[CUDA] cublasGemmGroupedBatchedEx not available -- using separate Q + batched KV"
-        );
+    if super::decode::cuda_verbose() {
+        if has_grouped_gemm {
+            eprintln!(
+                "[CUDA] cublasGemmGroupedBatchedEx available (CUDA 12.5+) -- QKV grouped GEMM enabled"
+            );
+        } else {
+            eprintln!(
+                "[CUDA] cublasGemmGroupedBatchedEx not available -- using separate Q + batched KV"
+            );
+        }
     }
 
     // Get stable device pointers for scratch output buffers.
@@ -18916,7 +18922,9 @@ impl ComputeBackend for CudaBackend {
         let embed_bf16 = embed_module
             .load_function("embed_token_bf16")
             .map_err(|e| RuntimeError::Compute(format!("Failed to load embed_token_bf16: {e}")))?;
-        eprintln!("[CUDA] embed_token_bf16: OK");
+        if super::decode::cuda_verbose() {
+            eprintln!("[CUDA] embed_token_bf16: OK");
+        }
         self.embed_f32_func = Some(embed_f32);
         self.embed_q8_0_func = Some(embed_q8_0);
         self.embed_f16_func = Some(embed_f16);
@@ -18933,7 +18941,11 @@ impl ComputeBackend for CudaBackend {
         match self.device.compute_capability() {
             Ok((cc_major, cc_minor)) => {
                 crate::runtime_defaults::set_device_cc_major(cc_major.clamp(0, 255) as u8);
-                if cc_major == 12 {
+                if cc_major == 12
+                    && (super::decode::cuda_verbose()
+                        || std::env::var_os("LUMEN_CUDA_NORM_CTA5_DUAL").is_some()
+                        || std::env::var_os("LUMEN_CUDA_ATTN_CODEGEN").is_some())
+                {
                     // The body class is recorded before the backend is built, so this is the
                     // resolution in force for the model being loaded: the capability-keyed
                     // default, the legacy switch and any per-variable override folded in.
@@ -18946,7 +18958,9 @@ impl ComputeBackend for CudaBackend {
                         super::decode::attn_codegen_selection(),
                     );
                 }
-                if !matches!(cc_major, 8 | 9) && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
+                if !matches!(cc_major, 8 | 9)
+                    && parse_env_truthy("LUMEN_CUDA_SOA_LOCKED").is_none()
+                    && super::decode::cuda_verbose()
                 {
                     eprintln!(
                         "[CUDA] cc {cc_major}.{cc_minor}: LUMEN_CUDA_SOA_LOCKED defaults OFF, and with it the \
@@ -18982,7 +18996,7 @@ impl ComputeBackend for CudaBackend {
             ))
         })?;
         let mut kernels = decode::compile_all_kernels(&self.device, self.kv_precision, attn_spec)?;
-        {
+        if super::decode::cuda_verbose() {
             let (hits, misses) = super::ptx_cache::stats();
             let elapsed = kernel_compile_start.elapsed();
             let state = if !super::ptx_cache::cache_enabled() {
@@ -19039,7 +19053,9 @@ impl ComputeBackend for CudaBackend {
                 let buf_bytes = decode::q8_1_buffer_bytes(max_dim) as usize;
                 match self.device.alloc_zeros::<u8>(buf_bytes) {
                     Ok(buf) => {
-                        eprintln!("[CUDA] Q8_1 scratch: {buf_bytes} bytes allocated");
+                        if super::decode::cuda_verbose() {
+                            eprintln!("[CUDA] Q8_1 scratch: {buf_bytes} bytes allocated");
+                        }
                         Some(buf)
                     }
                     Err(e) => {
@@ -19069,13 +19085,15 @@ impl ComputeBackend for CudaBackend {
                     head_dim as u32,
                     max_seq_len as u32,
                 )?;
-                eprintln!(
-                    "[CUDA mem] decode-attention scratch: {} chunks x {num_heads} heads x head_dim {head_dim} ({:.1} MiB), fixed for every context (one-tile bound {}, target {})",
-                    scratch.chunks,
-                    scratch.bytes() as f64 / (1024.0 * 1024.0),
-                    scratch.policy.one_tile_max,
-                    scratch.policy.target
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA mem] decode-attention scratch: {} chunks x {num_heads} heads x head_dim {head_dim} ({:.1} MiB), fixed for every context (one-tile bound {}, target {})",
+                        scratch.chunks,
+                        scratch.bytes() as f64 / (1024.0 * 1024.0),
+                        scratch.policy.one_tile_max,
+                        scratch.policy.target
+                    );
+                }
                 scratch
             },
         };
@@ -19108,10 +19126,12 @@ impl ComputeBackend for CudaBackend {
         // Memory diagnostic: print expected vs actual GPU allocation per step.
         // Helps diagnose OOM by surfacing each large allocation site.
         let mem_before_globals = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] before global tensor upload: {:.2} GB free",
-            (mem_before_globals as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] before global tensor upload: {:.2} GB free",
+                (mem_before_globals as f64) / 1.0e9
+            );
+        }
 
         // Upload embedding: prefer quantized raw if available, else F32.
         // BF16 embedding now uploads RAW bytes (2 B/elem) instead of dequanting
@@ -19132,7 +19152,9 @@ impl ComputeBackend for CudaBackend {
                     q @ (QuantScheme::Q4_K | QuantScheme::Q5_K | QuantScheme::Q6_K) => {
                         // K-quant embedding: raw superblocks, gathered natively.
                         let raw_mb = raw.len() as f64 / 1.0e6;
-                        eprintln!("[CUDA mem] uploading {q:?} embedding raw: {raw_mb:.1} MB");
+                        if super::decode::cuda_verbose() {
+                            eprintln!("[CUDA mem] uploading {q:?} embedding raw: {raw_mb:.1} MB");
+                        }
                         super::gpu_buffers::kquant_plane_counters().count_native(q);
                         embedding_kquant = Some((q, self.device.htod_copy(raw.as_slice())?));
                         (placeholder, None, None, None, None)
@@ -19151,7 +19173,9 @@ impl ComputeBackend for CudaBackend {
                         // GPU footprint (~2 GB on a 248320x4096 vocab) vs the
                         // host-side BF16 -> F32 dequant path.
                         let raw_mb = raw.len() as f64 / 1.0e6;
-                        eprintln!("[CUDA mem] uploading BF16 embedding raw: {raw_mb:.1} MB");
+                        if super::decode::cuda_verbose() {
+                            eprintln!("[CUDA mem] uploading BF16 embedding raw: {raw_mb:.1} MB");
+                        }
                         let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
                         (placeholder, None, None, None, Some(gpu_bf16))
                     }
@@ -19166,11 +19190,13 @@ impl ComputeBackend for CudaBackend {
                 (gpu_f32, None, None, None, None)
             };
         let mem_after_embedding = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] after embedding upload: {:.2} GB free (consumed: {:.2} GB)",
-            (mem_after_embedding as f64) / 1.0e9,
-            (mem_before_globals.saturating_sub(mem_after_embedding) as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] after embedding upload: {:.2} GB free (consumed: {:.2} GB)",
+                (mem_after_embedding as f64) / 1.0e9,
+                (mem_before_globals.saturating_sub(mem_after_embedding) as f64) / 1.0e9
+            );
+        }
 
         // Upload output projection: prefer quantized raw if available, else F32.
         // BF16 output_proj now uploads RAW bytes (2 B/elem) instead of dequanting
@@ -19221,7 +19247,9 @@ impl ComputeBackend for CudaBackend {
                     // via the matvec_bf16 kernel. Saves ~2 GB GPU VRAM vs the
                     // previous host-side BF16 -> F32 dequant + cuBLAS SGEMV path.
                     let raw_mb = raw.len() as f64 / 1.0e6;
-                    eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
+                    if super::decode::cuda_verbose() {
+                        eprintln!("[CUDA mem] uploading BF16 output_proj raw: {raw_mb:.1} MB");
+                    }
                     let gpu_bf16 = self.device.htod_copy(raw.as_slice())?;
                     (placeholder, None, None, None, Some(gpu_bf16), None)
                 }
@@ -19249,9 +19277,11 @@ impl ComputeBackend for CudaBackend {
                     // source bytes exactly.
                     let n_sb = raw.len() / 210;
                     let raw_mb = raw.len() as f64 / 1.0e6;
-                    eprintln!(
-                        "[CUDA mem] uploading Q6_K output_proj (split planes): {raw_mb:.1} MB"
-                    );
+                    if super::decode::cuda_verbose() {
+                        eprintln!(
+                            "[CUDA mem] uploading Q6_K output_proj (split planes): {raw_mb:.1} MB"
+                        );
+                    }
                     let mut ql = vec![0u8; n_sb * 128];
                     let mut qh = vec![0u8; n_sb * 64];
                     let mut sc = vec![0u8; n_sb * 16];
@@ -19275,10 +19305,12 @@ impl ComputeBackend for CudaBackend {
                 QuantScheme::Nvfp4 => {
                     // The stored planes go up as they are: E2M1 nibbles with their per-16 E4M3 block scales. No
                     // repack and no shadow F32 copy; the head is served by the planar matvec.
-                    eprintln!(
-                        "[CUDA mem] uploading NVFP4 output_proj raw: {:.1} MB",
-                        raw.len() as f64 / 1.0e6
-                    );
+                    if super::decode::cuda_verbose() {
+                        eprintln!(
+                            "[CUDA mem] uploading NVFP4 output_proj raw: {:.1} MB",
+                            raw.len() as f64 / 1.0e6
+                        );
+                    }
                     super::gpu_buffers::kquant_plane_counters().count_native(QuantScheme::Nvfp4);
                     let gpu_nvfp4 = self.device.htod_copy(raw.as_slice())?;
                     (placeholder, None, None, None, None, Some(gpu_nvfp4))
@@ -19294,11 +19326,13 @@ impl ComputeBackend for CudaBackend {
             (gpu_f32, None, None, None, None, None)
         };
         let mem_after_output_proj = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] after output_proj upload: {:.2} GB free (consumed: {:.2} GB)",
-            (mem_after_output_proj as f64) / 1.0e9,
-            (mem_after_embedding.saturating_sub(mem_after_output_proj) as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] after output_proj upload: {:.2} GB free (consumed: {:.2} GB)",
+                (mem_after_output_proj as f64) / 1.0e9,
+                (mem_after_embedding.saturating_sub(mem_after_output_proj) as f64) / 1.0e9
+            );
+        }
 
         let globals = GpuGlobals {
             final_norm: self.device.htod_copy(&self.final_norm)?,
@@ -19325,17 +19359,19 @@ impl ComputeBackend for CudaBackend {
         // compiles the write kernel they share and records the capacity.
         let kv_module = super::kv_cache::compile_kv_module(&self.device, self.kv_precision)?;
         let kv_caches: Vec<Option<KvCacheGpu>> = (0..num_layers).map(|_| None).collect();
-        eprintln!(
-            "[CUDA mem] KV caches: allocated at weight load for the attention layers only \
-             (max_seq_len={max_seq_len}, kv={}, {} MB per layer)",
-            match self.kv_precision {
-                KvPrecision::F16 => "f16",
-                KvPrecision::Bf16 => "bf16",
-                _ => "f32",
-            },
-            (2 * num_kv_heads * max_seq_len * head_dim * self.kv_precision.bytes_per_element())
-                / (1024 * 1024)
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] KV caches: allocated at weight load for the attention layers only \
+                 (max_seq_len={max_seq_len}, kv={}, {} MB per layer)",
+                match self.kv_precision {
+                    KvPrecision::F16 => "f16",
+                    KvPrecision::Bf16 => "bf16",
+                    _ => "f32",
+                },
+                (2 * num_kv_heads * max_seq_len * head_dim * self.kv_precision.bytes_per_element())
+                    / (1024 * 1024)
+            );
+        }
 
         // Pre-allocate logits buffer for the zero-sync decode path.
         let vocab_size = hyperparams.vocab_size as usize;
@@ -19354,10 +19390,12 @@ impl ComputeBackend for CudaBackend {
             Ok(ws) => {
                 match self.device.set_cublas_workspace(&ws) {
                     Ok(()) => {
-                        eprintln!(
-                            "[CUDA] cuBLAS workspace: {} MB",
-                            CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
-                        );
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] cuBLAS workspace: {} MB",
+                                CUBLAS_WORKSPACE_SIZE / (1024 * 1024),
+                            );
+                        }
                         Some(ws)
                     }
                     Err(e) => {
@@ -19407,7 +19445,9 @@ impl ComputeBackend for CudaBackend {
         ) && kernels.matvec_q8_aligned_q8_1_hw.is_some()
             && kernels.matvec_q8_aligned_q8_1_hw_residual.is_some();
         if use_q8_scale_hw {
-            eprintln!("[CUDA] LUMEN_CUDA_Q8_SCALE_HW: prefer matvec_q8_aligned_q8_1_hw on Q8Aligned dispatch");
+            if super::decode::cuda_verbose() {
+                eprintln!("[CUDA] LUMEN_CUDA_Q8_SCALE_HW: prefer matvec_q8_aligned_q8_1_hw on Q8Aligned dispatch");
+            }
         } else if env_truthy("LUMEN_CUDA_Q8_SCALE_HW") {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SCALE_HW=1 set but matvec_q8_aligned_q8_1_hw unavailable; using existing aligned kernel");
         }
@@ -19417,7 +19457,7 @@ impl ComputeBackend for CudaBackend {
             "LUMEN_CUDA_Q8_SPLIT",
             crate::runtime_defaults::q8_split_default,
         );
-        if use_q8_split {
+        if use_q8_split && super::decode::cuda_verbose() {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_SPLIT: Q8_0 weights will be cloned to split layout for decode");
         }
         // LUMEN_CUDA_Q8_MATVEC_FAST (default-OFF): route the Q8 split decode
@@ -19442,7 +19482,7 @@ impl ComputeBackend for CudaBackend {
         // epilogue, harness gate-banked (receipts §23). `=0` reverts to the
         // scalar/locked split kernels (byte-identical to the pre-mmvq default).
         let use_q8_mmvq = parse_env_truthy("LUMEN_CUDA_Q8_MMVQ").unwrap_or(true);
-        if use_q8_mmvq {
+        if use_q8_mmvq && super::decode::cuda_verbose() {
             eprintln!("[CUDA] LUMEN_CUDA_Q8_MMVQ: Q8/Q4 split decode matvec uses the llama mmvq port (near-tie; GQ+router gated)");
         }
         // LUMEN_CUDA_SOA_LOCKED selects the codegen-LOCKED Q4 split kernel.
@@ -19461,7 +19501,9 @@ impl ComputeBackend for CudaBackend {
             } else {
                 "default"
             };
-            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED on ({how}): Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
+            if how == "env" || super::decode::cuda_verbose() {
+                eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED on ({how}): Q4_0 weights cloned to split layout; decode uses the codegen-locked split kernel");
+            }
         } else if use_q4_split {
             eprintln!("[CUDA] LUMEN_CUDA_Q4_SPLIT=1: Q4_0 weights will be cloned to split layout for decode");
         }
@@ -19472,7 +19514,7 @@ impl ComputeBackend for CudaBackend {
             "LUMEN_CUDA_OUTPUT_PROJ_SPLIT",
             crate::runtime_defaults::output_proj_split_default,
         );
-        if use_output_proj_split {
+        if use_output_proj_split && super::decode::cuda_verbose() {
             eprintln!("[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT: output_proj Q8_0 will be cloned to split layout for decode");
         }
         // output_proj fast-path: F16 dequant cache + cuBLAS HGEMV-N=1.
@@ -19505,7 +19547,10 @@ impl ComputeBackend for CudaBackend {
                 32
             }
         };
-        if output_proj_nr != 32 {
+        if output_proj_nr != 32
+            && (std::env::var_os("LUMEN_CUDA_OUTPUT_PROJ_NR").is_some()
+                || super::decode::cuda_verbose())
+        {
             eprintln!(
                 "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_NR={output_proj_nr}: output_proj SPLIT dispatch will use NR={output_proj_nr} kernel"
             );
@@ -19533,7 +19578,9 @@ impl ComputeBackend for CudaBackend {
             && kernels.matvec_q4_split_q8_1_locked.is_some()
             && kernels.matvec_q4_split_q8_1_locked_residual.is_some();
         if kernels.use_soa_locked {
-            eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4 split dispatch uses the codegen-locked kernel (layout-independent bitwise-identical F32)");
+            if super::decode::cuda_verbose() {
+                eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1: Q4 split dispatch uses the codegen-locked kernel (layout-independent bitwise-identical F32)");
+            }
         } else if use_soa_locked {
             eprintln!("[CUDA] LUMEN_CUDA_SOA_LOCKED=1 set but prerequisites missing (need Q4 split dispatch active + locked kernels loaded); using unlocked split / base path");
         }
@@ -19636,15 +19683,17 @@ impl ComputeBackend for CudaBackend {
             // 16,384 positions on Qwen3.8-27B.
             kv_widen: if kv16 {
                 let floats = num_kv_heads * max_seq_len * head_dim;
-                eprintln!(
-                    "[CUDA mem] KV widening buffers for the prefill readers: {} MB (kv={})",
-                    (2 * floats * 4) / (1024 * 1024),
-                    if self.kv_precision == KvPrecision::F16 {
-                        "f16"
-                    } else {
-                        "bf16"
-                    }
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA mem] KV widening buffers for the prefill readers: {} MB (kv={})",
+                        (2 * floats * 4) / (1024 * 1024),
+                        if self.kv_precision == KvPrecision::F16 {
+                            "f16"
+                        } else {
+                            "bf16"
+                        }
+                    );
+                }
                 Some((
                     self.device.alloc_zeros::<f32>(floats)?,
                     self.device.alloc_zeros::<f32>(floats)?,
@@ -21476,10 +21525,12 @@ impl ComputeBackend for CudaBackend {
         }
 
         let mem_before_layers = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] before layer weight upload: {:.2} GB free",
-            (mem_before_layers as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] before layer weight upload: {:.2} GB free",
+                (mem_before_layers as f64) / 1.0e9
+            );
+        }
 
         for layer_idx in 0..num_layers {
             // Use get_layer_raw to bypass dequantization — we need Q8_0/Q4_0/F16
@@ -21634,7 +21685,7 @@ impl ComputeBackend for CudaBackend {
                             build_gate_up,
                         )?;
                         st.moe_repacked[layer_idx] = Some(rp);
-                        if layer_idx == 0 {
+                        if layer_idx == 0 && super::decode::cuda_verbose() {
                             eprintln!(
                                 "[CUDA] W-infra: repacked planes built (layer 0: \
                                  E={num_experts} H={hidden_dim} I={inter_dim} \
@@ -21647,7 +21698,9 @@ impl ComputeBackend for CudaBackend {
 
             cache.push(gpu_weights);
             // Print every 4 layers to avoid log flooding while still catching OOM zones.
-            if (layer_idx + 1) % 4 == 0 || layer_idx + 1 == num_layers {
+            if ((layer_idx + 1) % 4 == 0 || layer_idx + 1 == num_layers)
+                && super::decode::cuda_verbose()
+            {
                 let mem_now = self.device.free_memory().unwrap_or(0);
                 eprintln!(
                     "[CUDA mem] after layer {} weights uploaded: {:.2} GB free",
@@ -21658,11 +21711,13 @@ impl ComputeBackend for CudaBackend {
         }
 
         let mem_after_raw_layers = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] all {num_layers} layer raw weights uploaded: {:.2} GB free (consumed: {:.2} GB)",
-            (mem_after_raw_layers as f64) / 1.0e9,
-            (mem_before_layers.saturating_sub(mem_after_raw_layers) as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] all {num_layers} layer raw weights uploaded: {:.2} GB free (consumed: {:.2} GB)",
+                (mem_after_raw_layers as f64) / 1.0e9,
+                (mem_before_layers.saturating_sub(mem_after_raw_layers) as f64) / 1.0e9
+            );
+        }
 
         // Pre-dequant Q8_0 weights to F16 for HGEMM prefill (tensor core path).
         // This runs the dequant_q8_0_to_f16 kernel once per Q8_0 weight tensor,
@@ -21692,13 +21747,15 @@ impl ComputeBackend for CudaBackend {
                 allocated += 1;
             }
             let mem_after_kv = self.device.free_memory().unwrap_or(0);
-            eprintln!(
-                "[CUDA mem] after KV cache alloc ({allocated} attention layers of {num_layers}, \
-                 max_seq_len={}): {:.2} GB free (consumed: {:.2} GB)",
-                st.kv_max_seq_len,
-                (mem_after_kv as f64) / 1.0e9,
-                (mem_before_kv.saturating_sub(mem_after_kv) as f64) / 1.0e9
-            );
+            if super::decode::cuda_verbose() {
+                eprintln!(
+                    "[CUDA mem] after KV cache alloc ({allocated} attention layers of {num_layers}, \
+                     max_seq_len={}): {:.2} GB free (consumed: {:.2} GB)",
+                    st.kv_max_seq_len,
+                    (mem_after_kv as f64) / 1.0e9,
+                    (mem_before_kv.saturating_sub(mem_after_kv) as f64) / 1.0e9
+                );
+            }
         }
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
@@ -21754,11 +21811,13 @@ impl ComputeBackend for CudaBackend {
             })?;
         }
         let mem_after_f16_cache = self.device.free_memory().unwrap_or(0);
-        eprintln!(
-            "[CUDA mem] after F16 dequant caches: {:.2} GB free (consumed: {:.2} GB)",
-            (mem_after_f16_cache as f64) / 1.0e9,
-            (mem_before_f16_cache.saturating_sub(mem_after_f16_cache) as f64) / 1.0e9
-        );
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] after F16 dequant caches: {:.2} GB free (consumed: {:.2} GB)",
+                (mem_after_f16_cache as f64) / 1.0e9,
+                (mem_before_f16_cache.saturating_sub(mem_after_f16_cache) as f64) / 1.0e9
+            );
+        }
 
         // GDN ssm_alpha / ssm_beta F16 cache (env LUMEN_CUDA_GDN_AB_F16, MoE-gated,
         // default OFF -> byte-identical). `dequant_layer_q8_to_f16` above
@@ -21807,10 +21866,12 @@ impl ComputeBackend for CudaBackend {
                     n_cached += 1;
                 }
             }
-            eprintln!(
-                "[CUDA] GDN_AB_F16: ACTIVE — dequanted {n_cached} ssm_alpha/ssm_beta \
-                 weights to F16 (decode+prefill bit-identical projection path)"
-            );
+            if super::decode::cuda_verbose() {
+                eprintln!(
+                    "[CUDA] GDN_AB_F16: ACTIVE — dequanted {n_cached} ssm_alpha/ssm_beta \
+                     weights to F16 (decode+prefill bit-identical projection path)"
+                );
+            }
         }
 
         // Tile ssm_norm from [head_dim] to [value_dim] for GDN layers.
@@ -21878,7 +21939,7 @@ impl ComputeBackend for CudaBackend {
                 /// What becomes of the raw Q8_0 plane once its split sibling exists.
                 enum RawPlaneRelease {
                     /// Every route that could read the raw plane reads the split layout
-                    /// instead: free it, and print the byte-sum receipt.
+                    /// instead: free it (the byte-sum receipt prints under `LUMEN_CUDA_VERBOSE`).
                     Release,
                     /// Keep both copies and print nothing: an artifact whose planes are
                     /// Q4_0 / Q8_0 / BF16, whose receipts stay exactly as shipped.
@@ -21935,28 +21996,32 @@ impl ComputeBackend for CudaBackend {
                 // `n_layers_split` distinct layers received any split sibling;
                 // `total_jobs` counts eligible clone jobs ENUMERATED (not all
                 // attempted — the loop aborts on OOM).
-                eprintln!(
-                    "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
-                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
-                     enumerated: eligible Q8Raw FFN always; GDN ssm_out when \
-                     LUMEN_CUDA_Q8_SPLIT_SSMOUT=1; attention/GDN projections on \
-                     wide-GDN models when LUMEN_CUDA_Q8_SPLIT_ATTN=1)",
-                    (budget.budget_bytes as f64) / 1.0e9,
-                    (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.slack_bytes as f64) / 1.0e9,
-                    if budget.from_env { "env" } else { "free-mem" },
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] Q8 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
+                         slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
+                         {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                         enumerated: eligible Q8Raw FFN always; GDN ssm_out when \
+                         LUMEN_CUDA_Q8_SPLIT_SSMOUT=1; attention/GDN projections on \
+                         wide-GDN models when LUMEN_CUDA_Q8_SPLIT_ATTN=1)",
+                        (budget.budget_bytes as f64) / 1.0e9,
+                        (budget.free_mem_bytes as f64) / 1.0e9,
+                        (budget.slack_bytes as f64) / 1.0e9,
+                        if budget.from_env { "env" } else { "free-mem" },
+                        (budget.kv_reserve_bytes as f64) / 1.0e9,
+                    );
+                }
                 let mem_after_q8_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
                     (mem_before_q8_split.saturating_sub(mem_after_q8_split) as f64) / 1.0e9;
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q8_SPLIT=1: cloned Q8 split siblings on \
-                     {n_layers_split} layers, {total_jobs} jobs enumerated, \
-                     {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
-                    oom_layer,
-                );
+                if oom_count > 0 || super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] LUMEN_CUDA_Q8_SPLIT=1: cloned Q8 split siblings on \
+                         {n_layers_split} layers, {total_jobs} jobs enumerated, \
+                         {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
+                        oom_layer,
+                    );
+                }
                 match raw_plane_release {
                     RawPlaneRelease::KeepSilently => {}
                     RawPlaneRelease::Keep(why) => eprintln!(
@@ -21964,13 +22029,17 @@ impl ComputeBackend for CudaBackend {
                          resident and the prefill keeps reading the raw plane (clone \
                          pass {consumed_gb:.2} GB)"
                     ),
-                    RawPlaneRelease::Release => eprintln!(
-                        "[CUDA] Q8 split planes resident once: raw planes released after the \
-                         clone={raw_released} (byte-sum {:.2} GB; measured net device memory \
-                         of the clone pass {consumed_gb:.2} GB; the prefill dequantizes the \
-                         split layout)",
-                        (raw_released_bytes as f64) / 1.0e9,
-                    ),
+                    RawPlaneRelease::Release => {
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] Q8 split planes resident once: raw planes released after the \
+                                 clone={raw_released} (byte-sum {:.2} GB; measured net device memory \
+                                 of the clone pass {consumed_gb:.2} GB; the prefill dequantizes the \
+                                 split layout)",
+                                (raw_released_bytes as f64) / 1.0e9,
+                            );
+                        }
+                    }
                 }
             } else if st.use_q8_split {
                 eprintln!(
@@ -22036,9 +22105,11 @@ impl ComputeBackend for CudaBackend {
                     None => {}
                     Some(Ok(split_buf)) => {
                         st.globals.output_proj_q8_split = Some(split_buf);
-                        eprintln!(
-                            "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1: output_proj cloned to split layout ({vocab_size}x{hidden})"
-                        );
+                        if super::decode::cuda_verbose() {
+                            eprintln!(
+                                "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1: output_proj cloned to split layout ({vocab_size}x{hidden})"
+                            );
+                        }
                     }
                     Some(Err(e)) => {
                         eprintln!(
@@ -22046,7 +22117,10 @@ impl ComputeBackend for CudaBackend {
                         );
                     }
                 }
-            } else if st.use_output_proj_split {
+            } else if st.use_output_proj_split
+                && (std::env::var_os("LUMEN_CUDA_OUTPUT_PROJ_SPLIT").is_some()
+                    || super::decode::cuda_verbose())
+            {
                 eprintln!(
                     "[CUDA] LUMEN_CUDA_OUTPUT_PROJ_SPLIT=1 set but split kernel or Q8 output_proj unavailable; falling back to Q8Aligned/Q8Raw path"
                 );
@@ -22137,26 +22211,30 @@ impl ComputeBackend for CudaBackend {
                 // `n_layers_split` distinct layers received a split sibling out of the
                 // model's `num_layers` FFN-bearing layers (64 for 27B); `total_jobs`
                 // gate/up/down weight-jobs were attempted.
-                eprintln!(
-                    "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
-                     slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
-                     {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
-                     enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
-                    (budget.budget_bytes as f64) / 1.0e9,
-                    (budget.free_mem_bytes as f64) / 1.0e9,
-                    (budget.slack_bytes as f64) / 1.0e9,
-                    if budget.from_env { "env" } else { "free-mem" },
-                    (budget.kv_reserve_bytes as f64) / 1.0e9,
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] Q4 split-clone budget: resolved={:.2} GB (free={:.2} GB, \
+                         slack={:.2} GB, source={}; KV already allocated: {:.2} GB); cloned \
+                         {n_layers_split}/{num_layers} layers ({total_jobs} weight-jobs \
+                         enumerated: FFN always, attention when LUMEN_CUDA_Q4_SPLIT_ATTN=1)",
+                        (budget.budget_bytes as f64) / 1.0e9,
+                        (budget.free_mem_bytes as f64) / 1.0e9,
+                        (budget.slack_bytes as f64) / 1.0e9,
+                        if budget.from_env { "env" } else { "free-mem" },
+                        (budget.kv_reserve_bytes as f64) / 1.0e9,
+                    );
+                }
                 let mem_after_q4_split = self.device.free_memory().unwrap_or(0);
                 let consumed_gb =
                     (mem_before_q4_split.saturating_sub(mem_after_q4_split) as f64) / 1.0e9;
-                eprintln!(
-                    "[CUDA] LUMEN_CUDA_Q4_SPLIT=1: cloned Q4 split siblings on \
-                     {n_layers_split} layers, {total_jobs} jobs attempted, \
-                     {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
-                    oom_layer,
-                );
+                if oom_count > 0 || super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] LUMEN_CUDA_Q4_SPLIT=1: cloned Q4 split siblings on \
+                         {n_layers_split} layers, {total_jobs} jobs attempted, \
+                         {oom_count} OOMs (first at layer {:?}), {consumed_gb:.2} GB consumed",
+                        oom_layer,
+                    );
+                }
             } else if st.use_q4_split {
                 eprintln!(
                     "[CUDA] LUMEN_CUDA_Q4_SPLIT=1 set but split kernels unavailable; \
@@ -22218,9 +22296,11 @@ impl ComputeBackend for CudaBackend {
             let q_gate_dim = q_dim * 2;
             st.scratch.q_gate = Some(self.device.alloc_zeros(q_gate_dim)?);
             st.scratch.gate_buf = Some(self.device.alloc_zeros(q_dim)?);
-            eprintln!(
-                "[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements"
-            );
+            if super::decode::cuda_verbose() {
+                eprintln!(
+                    "[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements"
+                );
+            }
         }
 
         st.has_gdn_layers = has_gdn;
@@ -22239,7 +22319,7 @@ impl ComputeBackend for CudaBackend {
         // it keeps dp4a. Keyed off the GDN v-head width (a config value, not a name):
         // 32 -> F32, 48 -> int8. Gated on has_gdn so non-GDN models keep int8.
         st.kernels.q4_decode_f32_act = has_gdn && hp_copy.gdn_dims().num_v_heads == 32;
-        if st.kernels.q4_decode_f32_act {
+        if st.kernels.q4_decode_f32_act && super::decode::cuda_verbose() {
             eprintln!(
                 "[CUDA] Q4_0 decode: F32-activation quality path ON \
                  (narrow-GDN precision-fragile config, v_heads=32)"
@@ -22265,7 +22345,10 @@ impl ComputeBackend for CudaBackend {
                 _ if st.kernels.q4_decode_f32_act => Q4F32ActKernel::Nr4,
                 _ => Q4F32ActKernel::Smem,
             };
-        if !matches!(st.kernels.q4_f32act_kernel, Q4F32ActKernel::Smem) {
+        if !matches!(st.kernels.q4_f32act_kernel, Q4F32ActKernel::Smem)
+            && (std::env::var_os("LUMEN_CUDA_Q4_F32ACT_KERNEL").is_some()
+                || super::decode::cuda_verbose())
+        {
             eprintln!(
                 "[CUDA] Q4_0 F32-act decode matvec variant: {:?} \
                  (LUMEN_CUDA_Q4_F32ACT_KERNEL; FULL F32 activations, occupancy-only)",
@@ -22284,9 +22367,11 @@ impl ComputeBackend for CudaBackend {
                 let n_kv = ptrs.kv_a_ptrs.len();
                 let n_ffn = ptrs.ffn_a_ptrs.len();
                 let n_qkv = ptrs.qkv_a_ptrs.len();
-                eprintln!(
-                    "[CUDA] Pre-computed batched GEMM ptrs: {n_kv} KV, {n_ffn} FFN, {n_qkv} QKV layers"
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] Pre-computed batched GEMM ptrs: {n_kv} KV, {n_ffn} FFN, {n_qkv} QKV layers"
+                    );
+                }
                 st.precomputed_ptrs = Some(ptrs);
             }
             Err(e) => {
@@ -22345,7 +22430,9 @@ impl ComputeBackend for CudaBackend {
             match autotune_cublas_algos(&self.device, &shapes) {
                 Ok(cache) => {
                     let n = cache.best_algo.len();
-                    eprintln!("[CUDA] Autotuned cuBLAS algorithms for {n} HGEMV shapes");
+                    if super::decode::cuda_verbose() {
+                        eprintln!("[CUDA] Autotuned cuBLAS algorithms for {n} HGEMV shapes");
+                    }
                     st.algo_cache = cache;
                 }
                 Err(e) => {
@@ -22406,7 +22493,9 @@ impl ComputeBackend for CudaBackend {
             match autotune_cublas_algos_bf16(&self.device, &shapes) {
                 Ok(cache) => {
                     let n = cache.len();
-                    eprintln!("[CUDA] Autotuned BF16 cuBLAS algorithms for {n} HGEMV shapes");
+                    if super::decode::cuda_verbose() {
+                        eprintln!("[CUDA] Autotuned BF16 cuBLAS algorithms for {n} HGEMV shapes");
+                    }
                     // Publish to the static cache. If a previous session of this
                     // process already populated it (multi-init test seam),
                     // ignore — first writer wins (per-shape selection is shape-
@@ -22432,8 +22521,9 @@ impl ComputeBackend for CudaBackend {
             );
         }
 
-        // The prefill route, chosen once for this model and named in the log for a model with NVFP4
-        // or FP8 planes, the only one the native route can admit.
+        // The prefill route, chosen once for this model and, for a model with NVFP4 or FP8 planes
+        // (the only one the native route can admit), named in the log: a refusal always, the
+        // admitted route under `LUMEN_CUDA_VERBOSE`.
         st.native_prefill = None;
         // A 16-bit store's widening pair, which every memory check of the first load since init
         // has counted as taken, is released while the native route is tried, so the route sees the memory it would
@@ -22444,12 +22534,16 @@ impl ComputeBackend for CudaBackend {
         let secs = publishing.elapsed().as_secs_f64();
         match published {
             Ok((route, line)) => {
-                eprintln!(
-                    "[CUDA] prefill route: native NVFP4/FP8 (published in {secs:.1} s; {line})"
-                );
+                if super::decode::cuda_verbose() {
+                    eprintln!(
+                        "[CUDA] prefill route: native NVFP4/FP8 (published in {secs:.1} s; {line})"
+                    );
+                }
                 st.native_prefill = Some(route);
                 st.native_prefill_refusal = None;
-                if matches!(st.kv_precision, KvPrecision::F16 | KvPrecision::Bf16) {
+                if matches!(st.kv_precision, KvPrecision::F16 | KvPrecision::Bf16)
+                    && super::decode::cuda_verbose()
+                {
                     eprintln!(
                         "[CUDA mem] KV widening buffers released: the native route reads the cache in place"
                     );

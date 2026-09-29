@@ -1566,7 +1566,7 @@ pub fn cuda_nvfp4_enabled() -> bool {
 /// own prefill whatever the switch. Default ON: an artifact the
 /// native NVFP4/FP8 prefill route admits (`cuda::native_prefill`) is prefilled by it, chosen once at load;
 /// the switch is that route's admission condition Q9, and for an artifact with NVFP4 or FP8 planes the
-/// load log names the route either way.
+/// load log names a refusal (the admitted route under `LUMEN_CUDA_VERBOSE`).
 pub fn native_prefill_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_NATIVE_PREFILL") {

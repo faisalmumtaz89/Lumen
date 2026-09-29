@@ -29,8 +29,7 @@ use lumen_format::QuantScheme;
 /// SM 80) is tracked as.
 #[inline]
 pub(crate) fn cuda_verbose() -> bool {
-    // Read once per process; OS env var reads are not on a hot path here
-    // (every call site is inside the one-shot `compile_all_kernels`).
+    // Read once per process: the prefill and MoE dispatch paths ask on every call.
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECKED.get_or_init(|| {
         std::env::var("LUMEN_CUDA_VERBOSE")
