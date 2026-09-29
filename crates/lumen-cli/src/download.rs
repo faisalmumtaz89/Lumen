@@ -117,7 +117,10 @@ mod inner {
 
     /// A read or write that makes no progress for this long is a stalled
     /// transfer, not a slow one.
+    #[cfg(not(test))]
     const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    #[cfg(test)]
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// The proxy a request goes through, with the variable that named it.
     pub(crate) type Route = Option<(ureq::Proxy, &'static str)>;
@@ -276,7 +279,152 @@ mod inner {
         })
     }
 
+    /// Attempts in a row that add nothing to what this run has held of the
+    /// file, after which a download stops.
+    const ATTEMPTS: u32 = 6;
+
+    /// The wait before a retry: doubled after each attempt that added
+    /// nothing (1, 2, 4, 8 and 16 s), back to the start after one that did.
+    #[cfg(not(test))]
+    const BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    #[cfg(test)]
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Why a request, or an attempt at the rest of a file, ended early.
+    enum Failure {
+        /// A dropped, refused or stalled connection, or a busy server: another
+        /// attempt may get further. Said in plain words.
+        Transient(String),
+        /// The server cannot continue from the bytes kept: the next attempt
+        /// starts from the first byte.
+        Restart(String),
+        /// Anything another attempt would meet again.
+        Final(DownloadError),
+    }
+
+    impl std::fmt::Display for Failure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Failure::Transient(reason) | Failure::Restart(reason) => f.write_str(reason),
+                Failure::Final(e) => e.fmt(f),
+            }
+        }
+    }
+
+    const CANNOT_CONTINUE: &str = "the server could not continue from the bytes already downloaded";
+
+    /// Whether an I/O error is the network's: a refused, reset, dropped or
+    /// stalled connection, or no route to the host.
+    fn is_network(e: &std::io::Error) -> bool {
+        use std::io::ErrorKind;
+        matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::BrokenPipe
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::UnexpectedEof
+        ) || matches!(
+            e.raw_os_error(),
+            Some(libc::ENETUNREACH | libc::EHOSTUNREACH | libc::ENETDOWN)
+        )
+    }
+
+    /// A network error on an open connection, in plain words; None for any
+    /// other I/O error.
+    fn network_failure(e: &std::io::Error, route: &Route) -> Option<String> {
+        if !is_network(e) {
+            return None;
+        }
+        let via = via(route);
+        Some(match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => closed_early(route),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                format!("no data arrived{via} for {} s", STALL_TIMEOUT.as_secs())
+            }
+            _ => format!("the connection{via} was lost"),
+        })
+    }
+
+    fn closed_early(route: &Route) -> String {
+        format!(
+            "the connection{} closed before the file was complete",
+            via(route)
+        )
+    }
+
+    /// A failed request as a [`Failure`]: one a later attempt may get past
+    /// in plain words, anything else with the request's own error.
+    fn request_failure(
+        method: &str,
+        url: &str,
+        route: &Route,
+        ranged: bool,
+        e: &ureq::Error,
+    ) -> Failure {
+        let proxy = route.as_ref().map(|(_, name)| *name);
+        let transient = match e {
+            ureq::Error::Status(416, _) if ranged => {
+                return Failure::Restart(CANNOT_CONTINUE.to_string())
+            }
+            ureq::Error::Status(code, _) if *code == 408 || *code == 429 || *code >= 500 => {
+                Some(format!("the server answered {code}{}", via(route)))
+            }
+            ureq::Error::Status(..) => None,
+            ureq::Error::Transport(t) => {
+                let io = std::error::Error::source(t)
+                    .and_then(|source| source.downcast_ref::<std::io::Error>());
+                match (t.kind(), proxy) {
+                    (ureq::ErrorKind::Dns, Some(name)) => {
+                        Some(format!("could not look up the proxy in {name}"))
+                    }
+                    (ureq::ErrorKind::Dns, None) => {
+                        Some("could not look up the server's address".to_string())
+                    }
+                    (ureq::ErrorKind::ProxyConnect, Some(name)) => Some(format!(
+                        "the proxy in {name} did not open a connection to the server"
+                    )),
+                    (ureq::ErrorKind::ConnectionFailed, _) if io.is_some_and(is_network) => {
+                        Some(match proxy {
+                            Some(name) => {
+                                format!(
+                                    "could not connect to the server through the proxy in {name}"
+                                )
+                            }
+                            None => "could not connect to the server".to_string(),
+                        })
+                    }
+                    (ureq::ErrorKind::Io, _) => io.and_then(|io| network_failure(io, route)),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(reason) = transient {
+            return Failure::Transient(reason);
+        }
+        // ureq words a 401 or 407 from the proxy as "Provided proxy
+        // credentials are incorrect", also when none were sent.
+        let why = match e {
+            ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ProxyUnauthorized => {
+                "the proxy requires authentication; lumen sends the user name and \
+                 password in the proxy URL (user:password@host, percent-encoded) with \
+                 Basic authentication"
+                    .to_string()
+            }
+            _ => e.to_string(),
+        };
+        Failure::Final(DownloadError::Io(format!(
+            "{method} request failed for {url}{}: {why}",
+            via(route)
+        )))
+    }
+
     /// Issue a stored-bytes request and hand back only a usable response.
+    /// With `resume`, the request asks for the rest of the file from the
+    /// byte given, provided the file still has the ETag given.
     /// A header line with no colon is accepted by ureq's parser, and its
     /// value accessors then index past the end of the line — during response
     /// construction for some headers, on later lookups for others — so both
@@ -286,39 +434,29 @@ mod inner {
         method: &str,
         url: &str,
         route: &Route,
-    ) -> Result<ureq::Response, DownloadError> {
-        let request = stored_bytes_request(method, url, route);
-        let outcome = fenced(|| request.call());
-        let resp = match outcome {
+        resume: Option<(u64, &str)>,
+    ) -> Result<ureq::Response, Failure> {
+        let mut request = stored_bytes_request(method, url, route);
+        if let Some((offset, etag)) = resume {
+            request = request
+                .set("Range", &format!("bytes={offset}-"))
+                .set("If-Range", etag);
+        }
+        let resp = match fenced(|| request.call()) {
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                // ureq words a 401 or 407 from the proxy as "Provided proxy
-                // credentials are incorrect", also when none were sent.
-                let why = match &e {
-                    ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ProxyUnauthorized => {
-                        "the proxy requires authentication; lumen sends the user name and \
-                         password in the proxy URL (user:password@host, percent-encoded) with \
-                         Basic authentication"
-                            .to_string()
-                    }
-                    _ => e.to_string(),
-                };
-                return Err(DownloadError::Io(format!(
-                    "{method} request failed for {url}{}: {why}",
-                    via(route)
-                )));
-            }
+            Ok(Err(e)) => return Err(request_failure(method, url, route, resume.is_some(), &e)),
             Err(_) => {
-                return Err(DownloadError::Io(format!(
+                return Err(Failure::Final(DownloadError::Io(format!(
                     "the response from {url} could not be read safely (a header line the parser cannot slice, or an internal error); refusing the response"
-                )))
+                ))))
             }
         };
-        reject_unusable_response(&resp)?;
+        reject_unusable_response(&resp, resume.is_some()).map_err(Failure::Final)?;
         Ok(resp)
     }
 
-    /// A response is stored only when it is a complete 200 whose every
+    /// A response is stored only when it is a complete 200 (or, for a
+    /// request for the rest of a file, a 206) whose every
     /// `Content-Encoding` value is a bare `identity` and every
     /// `Transfer-Encoding` value is `chunked`. The value count is checked
     /// against the number of header lines carrying that name, so a readable
@@ -334,10 +472,15 @@ mod inner {
     /// character (a space before the colon, an obsolete folded continuation
     /// starting with a space or tab, a high byte) is dropped by ureq before
     /// any header view exists.
-    fn reject_unusable_response(resp: &ureq::Response) -> Result<(), DownloadError> {
-        if resp.status() != 200 {
+    fn reject_unusable_response(resp: &ureq::Response, ranged: bool) -> Result<(), DownloadError> {
+        if resp.status() != 200 && !(ranged && resp.status() == 206) {
+            let stored = if ranged {
+                "a 200 or 206"
+            } else {
+                "a complete 200"
+            };
             return Err(DownloadError::Io(format!(
-                "server answered {} {} for {}; only a complete 200 response is stored",
+                "server answered {} {} for {}; only {stored} response is stored",
                 resp.status(),
                 resp.status_text(),
                 resp.get_url()
@@ -424,7 +567,7 @@ mod inner {
             Ok(Err(e)) => return unknown(format!("HEAD failed: {e}")),
             Err(()) => return unknown("HEAD response could not be read safely".to_string()),
         };
-        if let Err(e) = reject_unusable_response(&resp) {
+        if let Err(e) = reject_unusable_response(&resp, false) {
             return unknown(format!("HEAD unusable: {e}"));
         }
         let values = match header_values(&resp, "content-length") {
@@ -462,11 +605,16 @@ mod inner {
 
     /// Download a GGUF file from HuggingFace.
     ///
-    /// The file is downloaded to a `.part` temporary file whose full byte count
-    /// is verified, then hashed, then atomically renamed to the final path; the
-    /// `.sha256` sidecar is written after the rename (so a published file may
-    /// briefly exist without its sidecar — harmless, as the sidecar is
-    /// write-only metadata that no load path consults).
+    /// The file is downloaded to `{filename}.{machine}-{uid}.partial`, locked
+    /// for the length of the download so a second download of the same file
+    /// by the same user on the same machine waits for this one. A dropped or
+    /// stalled connection is retried, continuing from the byte reached when
+    /// the server identifies the file by a strong ETag; a download that stops
+    /// keeps those bytes, and the next one continues from them. The full byte
+    /// count is verified, then the file is hashed and atomically renamed to
+    /// the final path; the `.sha256` sidecar is written after the rename (so
+    /// a published file may briefly exist without its sidecar — harmless, as
+    /// the sidecar is write-only metadata that no load path consults).
     ///
     /// If the final file already exists and is non-empty, this is a cache hit and
     /// the existing path is returned immediately.
@@ -508,32 +656,26 @@ mod inner {
         let filename = local_name.as_str();
 
         let final_path = dest_dir.join(filename);
-        // The staging name carries the PID: two concurrent first-time
-        // downloads of the same file must not clobber each other's .part
-        // before the atomic rename. The .sha256 sidecar keeps its stable
-        // name BY DESIGN: it is shared last-writer-wins metadata, written
-        // after the winner's rename, and write-only in production (only its
-        // unit test reads it back). Because the cache keys on the flattened
-        // basename while the hash is of the source URL (repo + path), two
-        // different sources sharing a basename can leave a sidecar whose hash
-        // does not match the resident file — harmless, since no load path
-        // consults it; correctness rests on the atomic rename publishing only
+        // The .sha256 sidecar keeps its stable name BY DESIGN: it is shared
+        // last-writer-wins metadata, written after the rename that publishes
+        // the file, and write-only in production (only its unit test reads it
+        // back). Because the cache keys on the flattened basename while the
+        // hash is of the source URL (repo + path), two different sources
+        // sharing a basename can leave a sidecar whose hash does not match the
+        // resident file — harmless, since no load path consults it;
+        // correctness rests on the atomic rename publishing only
         // fully-verified bytes.
         let sha_path = dest_dir.join(format!("{filename}.sha256"));
-        // Reclaim BEFORE the cache-hit return: after one racer succeeds,
-        // every future call takes the cache-hit fast path, so litter from
-        // a SIGKILLed racer would otherwise never be reclaimed. The scan
-        // is a small read_dir plus one libc::kill per stale candidate — cheap.
+        // Reclaim BEFORE the cache-hit return: every call after the file is
+        // published takes the cache-hit fast path, so the per-process partial
+        // files crashed downloads left behind would otherwise never be
+        // reclaimed. The scan is a small read_dir plus one libc::kill per
+        // stale candidate — cheap.
         reclaim_stale_parts(dest_dir, filename);
 
-        // Cache hit: file already exists and is non-empty.
-        if final_path.is_file() {
-            if let Ok(meta) = std::fs::metadata(&final_path) {
-                if meta.len() > 0 {
-                    eprintln!("Cache hit: {}", final_path.display());
-                    return Ok(final_path);
-                }
-            }
+        if is_published(&final_path) {
+            eprintln!("Cache hit: {}", final_path.display());
+            return Ok(final_path);
         }
 
         // The URL uses the full repo path, which may include a subdirectory;
@@ -557,162 +699,678 @@ mod inner {
             DownloadError::Io(format!("failed to create {}: {e}", dest_dir.display()))
         })?;
 
-        // Start the download.
-        eprintln!("Downloading: {url}");
-        let resp = call_for_stored_bytes("GET", &url, &route)?;
-
-        // Get content length from the actual response (might differ from HEAD due to CDN).
-        let content_length = header_values(&resp, "content-length")?
-            .first()
-            .and_then(|cl| cl.parse::<u64>().ok())
-            .or(size);
-
-        // Set up progress bar.
-        let pb = if let Some(total) = content_length {
-            let pb = indicatif::ProgressBar::new(total);
-            pb.set_style(
-                indicatif::ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-                    .progress_chars("=>-"),
-            );
-            pb
-        } else {
-            let pb = indicatif::ProgressBar::new_spinner();
-            pb.set_style(
-                indicatif::ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
-                    .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
-            );
-            pb
+        let Some(mut partial) = Partial::lock(dest_dir, filename, &final_path)? else {
+            eprintln!("Cache hit: {}", final_path.display());
+            return Ok(final_path);
         };
-
-        // Download to .part file. The guard removes OUR pid-named staging
-        // file on every early-error return (network, write, flush, hash,
-        // rename); it is defused only after the atomic rename succeeds —
-        // the old fixed name self-overwrote, so without this the PID
-        // scheme would turn each aborted multi-GB pull into invisible
-        // litter no lumen command can reclaim.
-        // Exclusive creation with a collision-retried nonce: PIDs are NOT
-        // unique across PID namespaces (two containers sharing a cache
-        // volume can both be namespace-local PID 1, giving both the same
-        // pid-named path — a truncating create would resurrect the exact
-        // clobber race, this time publishing a silently partial FINAL).
-        // `create_new` (O_EXCL) makes the filesystem the arbiter; on a
-        // name collision we retry with a fresh nonce rather than truncate.
-        // create_exclusive_staging captures the inode from the fd it just
-        // O_EXCL-created and returns it, so the guard here is armed with the
-        // identity it will check on Drop without a second stat. The fstat
-        // failure window lives inside that helper, and its only outcome is a
-        // bounded, self-healing leak (the .part is left for reclaim, never
-        // deleted by path unverified) — not a wrong-file deletion.
-        let (part_path, mut file, own_dev_ino) = create_exclusive_staging(dest_dir, filename)?;
-        let mut part_guard = StagingGuard {
-            path: part_path.clone(),
-            dev_ino: own_dev_ino,
-            armed: true,
-        };
-        let mut reader = resp.into_reader();
-
-        let mut buf = vec![0u8; 64 * 1024]; // 64 KB buffer
-        let mut total_written: u64 = 0;
-
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| {
-                DownloadError::Io(format!("read error during download{}: {e}", via(&route)))
-            })?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])
-                .map_err(|e| DownloadError::Io(format!("write error: {e}")))?;
-            total_written += n as u64;
-            pb.set_position(total_written);
+        if partial.have > 0 {
+            eprintln!(
+                "Resuming {filename}: {} already downloaded.",
+                partial.done()
+            );
         }
 
-        file.flush()
-            .map_err(|e| DownloadError::Io(format!("flush error: {e}")))?;
+        eprintln!("Downloading: {url}");
+        let pb = indicatif::ProgressBar::no_length();
+        show_total(&pb, partial.total.or(size));
+        pb.set_position(partial.have);
 
-        pb.finish_with_message("download complete");
-
-        // Verify the full byte count before publishing. The guard cleans up
-        // the .part file on an error return.
-        verify_complete_transfer(content_length, total_written)?;
-
-        // Hash through OUR OWN file descriptor, never by reopening the
-        // pathname: after an unlink (e.g. a reclaimer that judged this
-        // transfer stalled) the NAME can be reused by a fresh exclusive
-        // create, and a pathname reopen would hash — and then rename —
-        // someone else's in-progress bytes.
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| DownloadError::Io(format!("seek error before hashing: {e}")))?;
-        let hash = sha256_of_reader(&mut file)?;
-
-        // Identity check before the by-path rename: the pathname must
-        // still be OUR inode. If it is not (unlinked and possibly reused),
-        // renaming would publish a stranger's partial file — disarm the
-        // guard (the path is not ours to delete) and fail cleanly; a
-        // retry re-downloads.
-        {
-            use std::os::unix::fs::MetadataExt;
-            let path_dev_ino = std::fs::metadata(&part_path)
-                .map(|m| (m.dev(), m.ino()))
-                .ok();
-            if path_dev_ino != Some(own_dev_ino) {
-                part_guard.armed = false;
+        // The most of each version of the file (by its strong ETag) this run
+        // has held, the attempts in a row that added nothing, and the wait
+        // before the next attempt.
+        let mut held: Vec<(String, u64)> = partial
+            .etag
+            .iter()
+            .map(|etag| (etag.clone(), partial.have))
+            .collect();
+        let mut idle = 0;
+        let mut wait = BACKOFF;
+        while partial.total != Some(partial.have) {
+            let restarts = partial.restarts;
+            let failure = match attempt(&url, &route, size, &mut partial, &pb) {
+                Ok(()) => match verify_complete_transfer(partial.total, partial.have) {
+                    Ok(()) => break,
+                    Err(e) => Failure::Final(e),
+                },
+                Err(failure) => failure,
+            };
+            // What the attempt ended holding, before a restart drops it.
+            let done = partial.done();
+            let reason = match failure {
+                Failure::Transient(reason) => reason,
+                Failure::Restart(reason) => {
+                    partial.restart(None, None)?;
+                    reason
+                }
+                Failure::Final(e) => {
+                    pb.abandon();
+                    if partial.kept() {
+                        return Err(DownloadError::Io(format!(
+                            "{e}. The {done} downloaded so far is kept in {}; running the same \
+                             command again continues from there.",
+                            partial.path.display()
+                        )));
+                    }
+                    partial.drop_unless_kept();
+                    return Err(e);
+                }
+            };
+            // Progress is more of one version of the file than this run has
+            // held of it. A start from the first byte counts only for the
+            // first version the run holds: a server that sends a version whole
+            // again, or another version each time, could else be asked
+            // without end.
+            let restarted = partial.restarts != restarts;
+            let progress = match &partial.etag {
+                Some(etag) if partial.have > 0 => match held.iter_mut().find(|(v, _)| v == etag) {
+                    Some((_, most)) => {
+                        let more = !restarted && partial.have > *most;
+                        if more {
+                            *most = partial.have;
+                        }
+                        more
+                    }
+                    None => {
+                        let first = held.is_empty();
+                        held.push((etag.clone(), partial.have));
+                        first
+                    }
+                },
+                _ => false,
+            };
+            if progress {
+                idle = 0;
+                wait = BACKOFF;
+            } else {
+                idle += 1;
+            }
+            if idle == ATTEMPTS {
+                pb.abandon();
+                let next = if partial.kept() {
+                    "resume"
+                } else {
+                    "try again"
+                };
+                let done = partial.done();
+                partial.drop_unless_kept();
                 return Err(DownloadError::Io(format!(
-                    "staging file {} was unlinked or replaced during the \
-                     download (a reclaimer judged this transfer stalled, or \
-                     the cache dir was cleaned) — retry the download",
-                    part_path.display()
+                    "stopped at {done} after {ATTEMPTS} attempts without progress ({reason}). \
+                     Run the same command again to {next}."
                 )));
             }
+            pb.suspend(|| {
+                eprintln!(
+                    "Download interrupted at {done}: {reason}. Retrying in {} s.",
+                    wait.as_secs()
+                )
+            });
+            std::thread::sleep(wait);
+            if idle > 0 {
+                wait *= 2;
+            }
         }
-        // The fd stays open through the rename: keeping it open prevents
-        // inode recycling from blurring the identity we just verified.
-        let file_kept_open = file;
+        pb.finish_with_message("download complete");
 
-        // Atomic rename FIRST: .part -> final, then the sidecar. The rename
-        // publishes only fully size- and hash-verified bytes, so the final
-        // file is correct the instant it appears. The sidecar write that
-        // follows is best-effort write-only metadata; a crash or write
+        // Hash through the descriptor that wrote the bytes; the lock keeps
+        // every other lumen process away from them.
+        use std::io::Seek;
+        partial
+            .file
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| DownloadError::Io(format!("seek error before hashing: {e}")))?;
+        let hash = sha256_of_reader(&mut partial.file)?;
+        if !partial.holds_path() {
+            return Err(partial.replaced());
+        }
+
+        // Atomic rename FIRST: .partial -> final, then the sidecar, with the
+        // lock still held, so a process waiting for it finds the published
+        // file. The rename publishes only fully size-verified bytes, so the
+        // final file is correct the instant it appears. The sidecar write
+        // that follows is best-effort write-only metadata; a crash or write
         // failure between the two can leave the final without a current
         // sidecar indefinitely, which is harmless because no load path reads
         // it (the cache hit checks only that the file exists and is nonempty).
-        //
-        // Rename FAILURE is cleaned up here, explicitly, while our fd is
-        // still open: a `?` would drop `file_kept_open` before the guard's
-        // Drop ran (reverse declaration order), letting the freed inode be
-        // recycled and the guard's identity check pass on a stranger's
-        // file. With the fd held, a path whose (dev, ino) matches ours IS
-        // ours, so the delete is safe.
-        if let Err(e) = std::fs::rename(&part_path, &final_path) {
-            use std::os::unix::fs::MetadataExt;
-            part_guard.armed = false;
-            let still_ours = std::fs::metadata(&part_path)
-                .map(|m| (m.dev(), m.ino()) == own_dev_ino)
-                .unwrap_or(false);
-            if still_ours {
-                let _ = std::fs::remove_file(&part_path);
-            }
-            drop(file_kept_open);
-            return Err(DownloadError::Io(format!(
+        std::fs::rename(&partial.path, &final_path).map_err(|e| {
+            DownloadError::Io(format!(
                 "failed to rename {} -> {}: {e}",
-                part_path.display(),
+                partial.path.display(),
                 final_path.display()
-            )));
-        }
-        part_guard.armed = false;
-        drop(file_kept_open);
+            ))
+        })?;
+        let _ = partial.forget_source();
+        drop(partial);
 
         // Write SHA-256 sidecar (shared name, last-writer-wins by design).
         std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
             DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
         })?;
+        // What other downloads of the file kept is of no use from now on.
+        reclaim_stale_parts(dest_dir, filename);
 
         eprintln!("Saved: {} (SHA-256: {hash})", final_path.display());
         Ok(final_path)
+    }
+
+    /// Options to read and write a file whose path may not be a symbolic
+    /// link: in a cache directory others can write to, one could otherwise
+    /// point the download at a file of the user's. Nor does the open wait
+    /// on a named pipe planted there (a plain file ignores the flag).
+    fn no_follow() -> std::fs::OpenOptions {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options
+    }
+
+    /// `{filename}.{machine}-{uid}`, or `{filename}.{uid}` where the system
+    /// keeps no identity for the machine, the name the files a download keeps
+    /// start with. They are shared only by one user's downloads on one
+    /// machine, as far as machines have identities of their own: a network
+    /// file system may keep locks per machine, so a lock would exclude
+    /// nothing between machines, and in a cache several users share another
+    /// user's files may be writable but not removable. The machine is named
+    /// by a hash of its stable identity, never by its host name, which a
+    /// container gets anew each run; a container has no identity of its own,
+    /// and its processes share the locks of the host's kernel. Machines that
+    /// share an identity (containers, or clones that kept one) share the
+    /// name, and on a cache between them only locks that work between
+    /// machines keep their downloads apart.
+    fn shared_stem(filename: &str) -> String {
+        // SAFETY: getuid has no failure mode.
+        let uid = unsafe { libc::getuid() };
+        match machine_id() {
+            Some(id) => {
+                let digest = Sha256::digest(format!("lumen partial download {id}"));
+                format!("{filename}.{}-{uid}", &hex_encode(&digest)[..16])
+            }
+            None => format!("{filename}.{uid}"),
+        }
+    }
+
+    /// The machine's hardware UUID.
+    #[cfg(target_os = "macos")]
+    fn machine_id() -> Option<String> {
+        let mut id = [0u8; 16];
+        let wait = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        // SAFETY: gethostuuid writes the 16 bytes of a uuid_t into `id`.
+        (unsafe { libc::gethostuuid(id.as_mut_ptr(), &wait) } == 0).then(|| hex_encode(&id))
+    }
+
+    /// The machine ID systemd keeps, when there is one: 32 hex digits
+    /// (absent, empty or "uninitialized" in most containers).
+    #[cfg(not(target_os = "macos"))]
+    fn machine_id() -> Option<String> {
+        let id = std::fs::read_to_string("/etc/machine-id").ok()?;
+        let id = id.trim();
+        (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+    }
+
+    /// Why a partial that exists cannot be opened for this download, when a
+    /// file of its own would do instead; None when nothing in the directory
+    /// can be written (a read-only file system).
+    fn unusable(e: &std::io::Error) -> Option<String> {
+        match e.raw_os_error() {
+            Some(libc::EROFS) => None,
+            Some(libc::ELOOP) => Some("it is a symbolic link".to_string()),
+            _ if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Some("this user may not write it".to_string())
+            }
+            _ => Some(e.to_string()),
+        }
+    }
+
+    /// Whether `path` is a published (nonempty) file.
+    fn is_published(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+    }
+
+    /// The record at `path`, the file's full length and strong ETag, when
+    /// what is there holds one. A named pipe planted there reads as empty.
+    fn read_record(path: &Path) -> Option<(u64, String)> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let mut text = String::new();
+        (&file).take(1024).read_to_string(&mut text).ok()?;
+        let (total, etag) = text.trim_end().split_once(' ')?;
+        let total = total.parse::<u64>().ok()?;
+        is_strong_etag(etag).then(|| (total, etag.to_string()))
+    }
+
+    /// The bytes of one download kept so far, locked by this process. They
+    /// are kept in `{filename}.{machine}-{uid}.partial`, and while they can be
+    /// continued, the same name with `.meta` added records the file's full
+    /// length and the strong ETag it was sent with: without both, no later
+    /// response can be matched to them. A download that cannot use that
+    /// partial safely goes to a file of its own, with no record, that no
+    /// later run continues.
+    struct Partial {
+        file: std::fs::File,
+        path: PathBuf,
+        /// The record's path; None for a download in a file of its own.
+        meta: Option<PathBuf>,
+        /// Bytes in the file, all of one version of the source.
+        have: u64,
+        /// The file's full length, once a response has said.
+        total: Option<u64>,
+        /// The version's strong ETag, once a response has sent one.
+        etag: Option<String>,
+        /// How often the file was started over: an attempt that leaves this
+        /// alone added to the bytes kept before it.
+        restarts: u64,
+    }
+
+    impl Partial {
+        /// Lock the partial download of `final_path`, waiting while another
+        /// lumen process downloads the same file, and read what it holds;
+        /// None when the file was published meanwhile. The lock belongs to
+        /// the partial file and ends when the file closes, also when its
+        /// process dies. Its holder publishes by renaming the file, so a
+        /// waiter that wakes holding a file no longer at the path opens the
+        /// path again. When the partial cannot be used safely (a file system
+        /// without locks, a partial this user may not write, or one that is
+        /// not a plain file with a single name), the download goes to a file
+        /// of its own, as downloads did before they could be continued.
+        fn lock(
+            dest_dir: &Path,
+            filename: &str,
+            final_path: &Path,
+        ) -> Result<Option<Self>, DownloadError> {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::io::AsRawFd;
+            let stem = shared_stem(filename);
+            let path = dest_dir.join(format!("{stem}.partial"));
+            let failed = |what: &str, e: std::io::Error| {
+                DownloadError::Io(format!("failed to {what} {}: {e}", path.display()))
+            };
+            let own = |why: String| Self::own(dest_dir, filename, &why).map(Some);
+            let mut told = false;
+            let (file, have) = loop {
+                if is_published(final_path) {
+                    return Ok(None);
+                }
+                let (file, created) = match no_follow().create_new(true).open(&path) {
+                    Ok(file) => (file, true),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match no_follow().open(&path) {
+                            Ok(file) => (file, false),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => match unusable(&e) {
+                                Some(why) => {
+                                    return own(format!(
+                                        "{} cannot be used ({why})",
+                                        path.display()
+                                    ))
+                                }
+                                None => return Err(failed("open", e)),
+                            },
+                        }
+                    }
+                    Err(e) => return Err(failed("create", e)),
+                };
+                let unusable = || {
+                    own(format!(
+                        "{} is not a plain file with a single name",
+                        path.display()
+                    ))
+                };
+                if !file.metadata().map_err(|e| failed("inspect", e))?.is_file() {
+                    return unusable();
+                }
+                // SAFETY: flock on a descriptor this function owns.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    let code = e.raw_os_error().unwrap_or_default();
+                    if matches!(code, libc::ENOLCK | libc::ENOSYS)
+                        || code == libc::ENOTSUP
+                        || code == libc::EOPNOTSUPP
+                    {
+                        // No download on this file system writes the shared
+                        // partial, so one this call created goes again.
+                        if created {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        return own(format!(
+                            "{} does not support file locks",
+                            dest_dir.display()
+                        ));
+                    }
+                    if code != libc::EWOULDBLOCK {
+                        return Err(failed("lock", e));
+                    }
+                    if !told {
+                        eprintln!("Waiting for another download of {filename} to finish...");
+                        told = true;
+                    }
+                    // SAFETY: as above; a signal ends the wait early, so wait again.
+                    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(failed("lock", e));
+                        }
+                    }
+                }
+                let held = file.metadata().map_err(|e| failed("inspect", e))?;
+                let named = std::fs::symlink_metadata(&path).ok();
+                if !named.is_some_and(|m| (m.dev(), m.ino()) == (held.dev(), held.ino())) {
+                    continue;
+                }
+                // Another name for the file, a hard link, would have the
+                // download empty and rewrite a file of the user's.
+                if held.nlink() != 1 {
+                    return unusable();
+                }
+                break (file, held.len());
+            };
+            let meta = dest_dir.join(format!("{stem}.partial.meta"));
+            let (total, etag) =
+                read_record(&meta).map_or((None, None), |(total, etag)| (Some(total), Some(etag)));
+            let mut partial = Self {
+                file,
+                path,
+                meta: Some(meta),
+                have,
+                total,
+                etag,
+                restarts: 0,
+            };
+            if partial.resumable() {
+                use std::io::Seek;
+                partial
+                    .file
+                    .seek(std::io::SeekFrom::Start(have))
+                    .map_err(|e| partial.failed("seek in", e))?;
+            } else {
+                partial.restart(None, None)?;
+            }
+            Ok(Some(partial))
+        }
+
+        /// A download in a file of its own, `{filename}.{pid}-{nonce}.part`,
+        /// which reclaim_stale_parts removes once its process is gone. It
+        /// retries like any other, but no later run continues it: nothing
+        /// guards it against a second writer.
+        fn own(dest_dir: &Path, filename: &str, why: &str) -> Result<Self, DownloadError> {
+            eprintln!("Note: {why}, so if this download stops, the next run starts it over.");
+            for attempt in 0u32..16 {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(attempt, |d| d.subsec_nanos())
+                    .wrapping_add(attempt);
+                let path = dest_dir.join(format!("{filename}.{}-{nonce}.part", std::process::id()));
+                match no_follow().create_new(true).open(&path) {
+                    Ok(file) => {
+                        return Ok(Self {
+                            file,
+                            path,
+                            meta: None,
+                            have: 0,
+                            total: None,
+                            etag: None,
+                            restarts: 0,
+                        })
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        return Err(DownloadError::Io(format!(
+                            "failed to create {}: {e}",
+                            path.display()
+                        )))
+                    }
+                }
+            }
+            Err(DownloadError::Io(format!(
+                "could not create a file of its own for {filename} in {}",
+                dest_dir.display()
+            )))
+        }
+
+        fn failed(&self, what: &str, e: std::io::Error) -> DownloadError {
+            DownloadError::Io(format!("failed to {what} {}: {e}", self.path.display()))
+        }
+
+        /// Whether a later response can be matched to the bytes kept: they
+        /// are some or all of a file whose length and strong ETag are known.
+        fn resumable(&self) -> bool {
+            self.etag.is_some()
+                && self
+                    .total
+                    .is_some_and(|total| (1..=total).contains(&self.have))
+        }
+
+        /// Whether a later run can continue the bytes kept.
+        fn kept(&self) -> bool {
+            self.meta.is_some() && self.resumable() && self.holds_path()
+        }
+
+        /// Whether the path still names the file this download writes. The
+        /// path and its record are acted on by name, and someone may remove
+        /// the file while the download runs, after which another download of
+        /// the same file makes a new one there.
+        fn holds_path(&self) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.file.metadata().map(|m| (m.dev(), m.ino()));
+            let named = std::fs::symlink_metadata(&self.path).map(|m| (m.dev(), m.ino()));
+            matches!((held, named), (Ok(held), Ok(named)) if held == named)
+        }
+
+        fn replaced(&self) -> DownloadError {
+            DownloadError::Io(format!(
+                "{} was removed or replaced during the download, so nothing was published; \
+                 run the same command again",
+                self.path.display()
+            ))
+        }
+
+        /// Empty the file for a transfer from the first byte of the version
+        /// `total` and `etag` describe, and record them when both are known.
+        /// The file is emptied before the record changes, so no record ever
+        /// vouches for bytes of another version, and the old record is
+        /// removed before a new one is created, so a link planted in its
+        /// place is never written through.
+        fn restart(
+            &mut self,
+            total: Option<u64>,
+            etag: Option<String>,
+        ) -> Result<(), DownloadError> {
+            use std::io::Seek;
+            if self.meta.is_some() && !self.holds_path() {
+                return Err(self.replaced());
+            }
+            self.file.set_len(0).map_err(|e| self.failed("empty", e))?;
+            self.file
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| self.failed("seek in", e))?;
+            self.have = 0;
+            self.total = total;
+            self.etag = etag;
+            self.restarts += 1;
+            self.forget_source()?;
+            match (&self.meta, self.total, &self.etag) {
+                (Some(meta), Some(total), Some(etag)) => no_follow()
+                    .create_new(true)
+                    .open(meta)
+                    .and_then(|mut file| file.write_all(format!("{total} {etag}\n").as_bytes()))
+                    .map_err(|e| {
+                        DownloadError::Io(format!("failed to write {}: {e}", meta.display()))
+                    }),
+                _ => Ok(()),
+            }
+        }
+
+        fn append(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
+            self.file
+                .write_all(bytes)
+                .map_err(|e| DownloadError::Io(format!("write error: {e}")))?;
+            self.have += bytes.len() as u64;
+            Ok(())
+        }
+
+        /// Remove the record of the file's length and ETag.
+        fn forget_source(&self) -> Result<(), DownloadError> {
+            let Some(meta) = &self.meta else {
+                return Ok(());
+            };
+            match std::fs::remove_file(meta) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(DownloadError::Io(
+                    format!("failed to remove {}: {e}", meta.display()),
+                )),
+                _ => Ok(()),
+            }
+        }
+
+        /// On a failure: keep bytes a later run can continue, remove the rest,
+        /// and leave alone a path that names another download's file.
+        fn drop_unless_kept(&self) {
+            if !self.kept() && self.holds_path() {
+                let _ = std::fs::remove_file(&self.path);
+                let _ = self.forget_source();
+            }
+        }
+
+        /// "1.2 GB of 15.0 GB", or the bytes alone while the length is unknown.
+        fn done(&self) -> String {
+            let have = crate::cache::format_size(self.have);
+            match self.total {
+                Some(total) => format!("{have} of {}", crate::cache::format_size(total)),
+                None => have,
+            }
+        }
+    }
+
+    /// A strong entity tag: quoted, not weak (`W/`), not empty, and made of
+    /// the visible ASCII an entity tag may hold (RFC 9110), which is also
+    /// what a request header can carry. Only these can vouch that two
+    /// responses carry bytes of the same file.
+    fn is_strong_etag(tag: &str) -> bool {
+        tag.len() > 2
+            && tag.starts_with('"')
+            && tag.ends_with('"')
+            && tag[1..tag.len() - 1]
+                .bytes()
+                .all(|b| b == b'!' || (b'#'..=b'~').contains(&b))
+    }
+
+    /// The response's ETag, when it sent one and that one is strong.
+    fn strong_etag(resp: &ureq::Response) -> Result<Option<String>, DownloadError> {
+        Ok(match header_values(resp, "etag")?.as_slice() {
+            [tag] if is_strong_etag(tag) => Some(tag.clone()),
+            _ => None,
+        })
+    }
+
+    /// The response's `Content-Length`, which [`reject_unusable_response`]
+    /// has checked is one plain number.
+    fn content_length(resp: &ureq::Response) -> Result<Option<u64>, DownloadError> {
+        Ok(header_values(resp, "content-length")?
+            .first()
+            .and_then(|length| length.parse::<u64>().ok()))
+    }
+
+    /// Whether a 206 carries exactly the rest of the file `partial` holds
+    /// the start of: from its next byte to the last byte of the same length,
+    /// under the same ETag. The ETag is required: a CDN may serve a range
+    /// whatever the request's If-Range says (Hugging Face's does), so only
+    /// the 206's own ETag shows the bytes are of the file already kept.
+    fn continues(resp: &ureq::Response, partial: &Partial) -> Result<bool, DownloadError> {
+        let (Some(total), Some(etag)) = (partial.total, &partial.etag) else {
+            return Ok(false);
+        };
+        let rest = format!("bytes {}-{}/{total}", partial.have, total - 1);
+        Ok(header_values(resp, "content-range")? == [rest]
+            && content_length(resp)?.map_or(true, |length| length == total - partial.have)
+            && strong_etag(resp)?.as_ref() == Some(etag))
+    }
+
+    /// Show the bytes against `total`, or on their own while it is unknown.
+    fn show_total(pb: &indicatif::ProgressBar, total: Option<u64>) {
+        match total {
+            Some(total) => {
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                        .progress_chars("=>-"),
+                );
+                pb.set_length(total);
+            }
+            None => {
+                pb.set_style(
+                    indicatif::ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
+                );
+                pb.unset_length();
+            }
+        }
+    }
+
+    /// One request for the rest of the file: the bytes after those `partial`
+    /// holds when a response can be matched to them, else the whole file.
+    /// Appends what arrives until the body ends.
+    fn attempt(
+        url: &str,
+        route: &Route,
+        advisory: Option<u64>,
+        partial: &mut Partial,
+        pb: &indicatif::ProgressBar,
+    ) -> Result<(), Failure> {
+        let etag = partial.etag.clone().filter(|_| partial.resumable());
+        let resume = etag.as_deref().map(|etag| (partial.have, etag));
+        let resp = call_for_stored_bytes("GET", url, route, resume)?;
+        if resp.status() == 206 {
+            if !continues(&resp, partial).map_err(Failure::Final)? {
+                return Err(Failure::Restart(CANNOT_CONTINUE.to_string()));
+            }
+        } else {
+            if resume.is_some() {
+                pb.suspend(|| eprintln!("The server sent the whole file again; starting over."));
+            }
+            let total = content_length(&resp).map_err(Failure::Final)?.or(advisory);
+            let etag = strong_etag(&resp).map_err(Failure::Final)?;
+            partial.restart(total, etag).map_err(Failure::Final)?;
+            show_total(pb, total);
+        }
+        pb.set_position(partial.have);
+        let mut reader = resp.into_reader();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| {
+                // ureq's chunk decoder reports a body cut at the edge of a
+                // chunk as invalid input.
+                if e.kind() == std::io::ErrorKind::InvalidInput {
+                    return Failure::Transient(closed_early(route));
+                }
+                match network_failure(&e, route) {
+                    Some(reason) => Failure::Transient(reason),
+                    None => Failure::Final(DownloadError::Io(format!(
+                        "read error during download{}: {e}",
+                        via(route)
+                    ))),
+                }
+            })?;
+            if n == 0 {
+                break;
+            }
+            partial.append(&buf[..n]).map_err(Failure::Final)?;
+            pb.set_position(partial.have);
+        }
+        // A body that ends early without a network error: one sent without a
+        // length or chunked framing, closed by a dropped connection.
+        if partial.total.is_some_and(|total| partial.have < total) {
+            return Err(Failure::Transient(closed_early(route)));
+        }
+        Ok(())
     }
 
     /// Compute SHA-256 hash of a file. Returns the hex-encoded digest.
@@ -727,8 +1385,8 @@ mod inner {
     }
 
     /// Streaming SHA-256 over an already-open reader — used by the
-    /// download path to hash through its own descriptor (a pathname
-    /// reopen could read a reused name's bytes after an unlink).
+    /// download path to hash the bytes through the descriptor that wrote
+    /// them.
     pub fn sha256_of_reader<R: Read>(reader: &mut R) -> Result<String, DownloadError> {
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
@@ -742,87 +1400,6 @@ mod inner {
             hasher.update(&buf[..n]);
         }
         Ok(hex_encode(&hasher.finalize()))
-    }
-
-    /// Removes the caller's PID-named staging file unless defused (set
-    /// `armed = false` after the atomic rename). Covers every early-error
-    /// return and panic unwind in the download path.
-    struct StagingGuard {
-        path: std::path::PathBuf,
-        /// (device, inode) of OUR staging file, captured at creation: the
-        /// guard must never delete a stranger's file that reused our
-        /// pathname after a reclaimer unlinked ours mid-download. The
-        /// check-to-unlink window inside Drop is a microsecond-class
-        /// TOCTOU (a replacement landing between metadata and remove_file)
-        /// — an absolute guarantee needs serialized cleanup, which is
-        /// deliberately out of scope; the residual is ledgered.
-        dev_ino: (u64, u64),
-        armed: bool,
-    }
-
-    impl Drop for StagingGuard {
-        fn drop(&mut self) {
-            if self.armed {
-                use std::os::unix::fs::MetadataExt;
-                let still_ours = std::fs::metadata(&self.path)
-                    .map(|m| (m.dev(), m.ino()) == self.dev_ino)
-                    .unwrap_or(false);
-                if still_ours {
-                    let _ = std::fs::remove_file(&self.path);
-                }
-            }
-        }
-    }
-
-    /// Exclusive staging creation: opens `{base}.part`-style paths with
-    /// `create_new` (O_EXCL), retrying with a fresh nonce on collision so
-    /// two writers can never share (and truncate) one staging file — PIDs
-    /// alone are not unique across PID namespaces. The final path shape is
-    /// `{filename}.{pid}-{nonce}.part`. Returns the path, the read+write fd,
-    /// and the fd's `(dev, ino)` so the caller can arm its cleanup guard
-    /// atomically — no window between the exclusive create and the armed
-    /// guard. A failed stat on the fresh fd (near-impossible) leaves the
-    /// `.part` for `reclaim_stale_parts` to sweep rather than deleting it by
-    /// path unverified, which could not confirm the file is still ours.
-    pub fn create_exclusive_staging(
-        dest_dir: &Path,
-        filename: &str,
-    ) -> Result<(std::path::PathBuf, std::fs::File, (u64, u64)), DownloadError> {
-        // Built by joining onto dest_dir — never by string-mangling the
-        // full path, which breaks valid non-UTF-8 Unix cache directories.
-        for attempt in 0u32..16 {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(attempt)
-                .wrapping_add(attempt);
-            let candidate =
-                dest_dir.join(format!("{filename}.{}-{nonce}.part", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .read(true) // the SAME fd is later re-read for hashing
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(f) => {
-                    use std::os::unix::fs::MetadataExt;
-                    let m = f
-                        .metadata()
-                        .map_err(|e| DownloadError::Io(format!("fstat error on staging: {e}")))?;
-                    return Ok((candidate, f, (m.dev(), m.ino())));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(DownloadError::Io(format!(
-                        "failed to create staging {}: {e}",
-                        candidate.display()
-                    )))
-                }
-            }
-        }
-        Err(DownloadError::Io(
-            "could not create a unique staging file after 16 attempts".into(),
-        ))
     }
 
     /// Decide whether a finished transfer is safe to publish. A clean EOF is
@@ -850,19 +1427,27 @@ mod inner {
         }
     }
 
-    /// Best-effort reclamation of `{filename}.<pid>[-<nonce>].part`
-    /// stragglers from crashed runs. Deletion requires BOTH a stale mtime
+    /// Best-effort reclamation of the `{filename}.<pid>[-<nonce>].part`
+    /// files a download in a file of its own (and every download of an
+    /// earlier version) writes, left behind by runs that crashed or were
+    /// stopped. Deletion requires BOTH a stale mtime
     /// (>60s grace — a live writer refreshes mtime on every chunk, in any
     /// PID namespace) AND either ESRCH in our namespace or >24h staleness
     /// (pid numbers are namespace-local, so a foreign container's live
     /// writer can look dead here; mtime freshness is the cross-namespace
     /// protection). EPERM means alive under another user and keeps.
     /// Legacy fixed-name `{filename}.part` litter is age-gated at >1h —
-    /// same mtime-freshness rationale.
+    /// same mtime-freshness rationale. Once the file is published, no
+    /// download continues a `.partial` of it, whichever machine or user kept
+    /// it, since every later pull is a cache hit: one not written for a
+    /// minute is removed with its record, and a record whose partial is gone
+    /// goes too (a download still writing a removed one stops before it
+    /// publishes).
     pub fn reclaim_stale_parts(dest_dir: &std::path::Path, filename: &str) {
         let Ok(entries) = std::fs::read_dir(dest_dir) else {
             return;
         };
+        let published = is_published(&dest_dir.join(filename));
         let prefix = format!("{filename}.");
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -870,6 +1455,28 @@ mod inner {
             let Some(rest) = name.strip_prefix(&prefix) else {
                 continue;
             };
+            if rest.ends_with(".partial") {
+                let idle = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > 60);
+                if published && idle {
+                    let _ = std::fs::remove_file(entry.path());
+                    let _ = std::fs::remove_file(dest_dir.join(format!("{name}.meta")));
+                }
+                continue;
+            }
+            if let Some(partial) = name
+                .strip_suffix(".meta")
+                .filter(|p| p.ends_with(".partial"))
+            {
+                if published && std::fs::symlink_metadata(dest_dir.join(partial)).is_err() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                continue;
+            }
             let Some(pid) = rest.strip_suffix(".part") else {
                 // Legacy pre-PID litter: exactly `{filename}.part`.
                 // Reclaim only when stale by mtime (an old-binary
@@ -1133,30 +1740,33 @@ mod inner {
             );
         }
 
-        /// A proxy on loopback that answers one connection with `answer` and
-        /// hands over the request head it read: the CONNECT for an https URL,
-        /// the request itself for an http one.
+        /// A proxy on loopback that answers `connections` connections with
+        /// `answer` each and hands over the request heads it read: the CONNECT
+        /// for an https URL, the request itself for an http one.
         fn recording_proxy(
             answer: &'static [u8],
+            connections: u32,
         ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
             use std::io::{Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let Ok((mut sock, _)) = listener.accept() else {
-                    return;
-                };
-                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).is_ok_and(|n| n == 1) {
-                    head.push(byte[0]);
+                for _ in 0..connections {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        return;
+                    };
+                    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).is_ok_and(|n| n == 1)
+                    {
+                        head.push(byte[0]);
+                    }
+                    let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+                    sock.write_all(answer).ok();
                 }
-                tx.send(String::from_utf8_lossy(&head).into_owned())
-                    .unwrap();
-                sock.write_all(answer).ok();
             });
             (addr, rx)
         }
@@ -1179,10 +1789,10 @@ mod inner {
                 ("dom%5Cjdoe:pw@{addr}", "ZG9tXGpkb2U6cHc="),                  // dom\jdoe:pw
                 ("http://jdoe:100%zz@{addr}", "amRvZToxMDAleno="),             // jdoe:100%zz
             ] {
-                let (addr, heads) = recording_proxy(FORBIDDEN);
+                let (addr, heads) = recording_proxy(FORBIDDEN, 1);
                 let value = value.replace("{addr}", &addr.to_string());
                 let route = route(OFFLINE, &[("https_proxy", &value)]).unwrap();
-                let err = call_for_stored_bytes("GET", OFFLINE, &route)
+                let err = call_for_stored_bytes("GET", OFFLINE, &route, None)
                     .unwrap_err()
                     .to_string();
                 let head = head_from(&heads);
@@ -1198,9 +1808,10 @@ mod inner {
             let (addr, _heads) = recording_proxy(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                   Proxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\r\n",
+                1,
             );
             let route = route(OFFLINE, &[("https_proxy", &format!("http://{addr}"))]).unwrap();
-            let err = call_for_stored_bytes("GET", OFFLINE, &route)
+            let err = call_for_stored_bytes("GET", OFFLINE, &route, None)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1256,9 +1867,12 @@ mod inner {
             dir
         }
 
+        /// A proxy that refuses to open a connection is asked again, like any
+        /// failure another attempt may get past, and the download then stops
+        /// with the reason, naming the variable.
         #[test]
         fn a_download_goes_through_the_proxy_the_environment_names() {
-            let (addr, heads) = recording_proxy(FORBIDDEN);
+            let (addr, heads) = recording_proxy(FORBIDDEN, ATTEMPTS);
             let dir = empty_dir("env");
             let result = with_proxy_env(&[("HTTPS_PROXY", format!("http://{addr}"))], || {
                 let base = BaseUrl::local("https://hf.invalid".to_string());
@@ -1270,15 +1884,22 @@ mod inner {
                 head.starts_with("CONNECT hf.invalid:443 HTTP/1.1\r\n"),
                 "{head}"
             );
-            assert!(err.contains("through the proxy in HTTPS_PROXY"), "{err}");
+            assert!(
+                err.contains("(the proxy in HTTPS_PROXY did not open a connection to the server)"),
+                "{err}"
+            );
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
             std::fs::remove_dir_all(&dir).ok();
         }
 
+        /// Every attempt breaks the same way; with no ETag nothing is kept,
+        /// so the download stops without leaving a file behind.
         #[test]
         fn a_transfer_that_breaks_through_a_proxy_names_the_variable() {
-            let (addr, heads) =
-                recording_proxy(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\npartial");
+            let (addr, heads) = recording_proxy(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\npartial",
+                ATTEMPTS,
+            );
             let dir = empty_dir("broken");
             let base = BaseUrl::local("http://mirror.invalid".to_string());
             let result = with_proxy_env(&[("http_proxy", format!("http://{addr}"))], || {
@@ -1292,9 +1913,11 @@ mod inner {
                 ),
                 "{head}"
             );
-            assert!(
-                err.contains("read error during download through the proxy in http_proxy"),
-                "{err}"
+            assert_eq!(
+                err,
+                "stopped at 7 B of 64 B after 6 attempts without progress (the connection \
+                 through the proxy in http_proxy closed before the file was complete). Run the \
+                 same command again to try again."
             );
             assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
             std::fs::remove_dir_all(&dir).ok();
@@ -1307,7 +1930,7 @@ mod inner {
 
         #[test]
         fn a_download_through_an_http_proxy_completes() {
-            let (addr, heads) = recording_proxy(COMPLETE);
+            let (addr, heads) = recording_proxy(COMPLETE, 1);
             let dir = empty_dir("http-done");
             let base = BaseUrl::local("http://mirror.invalid".to_string());
             let result = with_proxy_env(&[("http_proxy", format!("http://{addr}"))], || {
@@ -1420,12 +2043,1435 @@ mod inner {
                 ureq::Proxy::new(format!("http://{addr}")).unwrap(),
                 "https_proxy",
             ));
-            let err = call_for_stored_bytes("GET", OFFLINE, &route)
+            let err = call_for_stored_bytes("GET", OFFLINE, &route, None)
                 .unwrap_err()
                 .to_string();
             // Refused by the dead proxy, not a name lookup of the target.
-            assert!(err.contains("Connection Failed"), "{err}");
-            assert!(err.contains("through the proxy in https_proxy"), "{err}");
+            assert_eq!(
+                err,
+                "could not connect to the server through the proxy in https_proxy"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod resume {
+        //! Downloads that are cut, stopped, changed or run twice at once,
+        //! against a server on loopback.
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        const FILE: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        /// Another version of FILE, the same length and different from the
+        /// first byte, so a file mixed from the two equals neither.
+        const NEW: &[u8] = b"9876543210ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const V1: &str = "\"v1\"";
+        const V2: &str = "\"v2\"";
+        /// A strong ETag as long as the ones Hugging Face's CDN sends.
+        const LONG: &str = "\"a44b0e06af0c97cece312f6dca52b3639d038d1a74a2e194b22e159f9ccdbb21\"";
+
+        /// A 200 for all of `body`, cut after `sent` bytes.
+        fn whole(etag: Option<&str>, body: &[u8], sent: usize) -> Vec<u8> {
+            let etag = etag
+                .map(|tag| format!("ETag: {tag}\r\n"))
+                .unwrap_or_default();
+            let mut out = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{etag}Connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            out.extend_from_slice(&body[..sent]);
+            out
+        }
+
+        /// A 206 with the given `Content-Range`, ETag and body.
+        fn part(range: &str, etag: Option<&str>, body: &[u8]) -> Vec<u8> {
+            let etag = etag
+                .map(|tag| format!("ETag: {tag}\r\n"))
+                .unwrap_or_default();
+            let mut out = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: {range}\r\nContent-Length: {}\r\n\
+                 {etag}Connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            out.extend_from_slice(body);
+            out
+        }
+
+        /// A 206 for the rest of `body` from `from`.
+        fn rest(etag: &str, body: &[u8], from: usize) -> Vec<u8> {
+            let range = format!("bytes {from}-{}/{}", body.len() - 1, body.len());
+            part(&range, Some(etag), &body[from..])
+        }
+
+        fn status(line: &str) -> Vec<u8> {
+            format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes()
+        }
+
+        /// The byte a request asks for the rest of the file from.
+        fn range_from(head: &str) -> Option<usize> {
+            head.lines().find_map(|line| {
+                line.strip_prefix("range: bytes=")?
+                    .strip_suffix('-')?
+                    .parse()
+                    .ok()
+            })
+        }
+
+        /// A server on loopback that answers each request with what `respond`
+        /// returns for its head (lowercased), each connection on a thread of
+        /// its own, and closes the connection; a HEAD gets the head of the
+        /// response only. It takes `connections` connections, or what arrives
+        /// in ten seconds, refuses any more, and hands back the heads.
+        fn serve(
+            connections: usize,
+            respond: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+        ) -> (BaseUrl, std::thread::JoinHandle<Vec<String>>) {
+            use std::io::{BufRead, BufReader};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = BaseUrl::local(format!("http://{}", listener.local_addr().unwrap()));
+            listener.set_nonblocking(true).unwrap();
+            let respond = Arc::new(respond);
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut handlers = Vec::new();
+                while handlers.len() < connections && std::time::Instant::now() < deadline {
+                    let Ok((stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    };
+                    let (respond, heads) = (respond.clone(), heads.clone());
+                    handlers.push(std::thread::spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
+                        let wire = Some(std::time::Duration::from_secs(5));
+                        stream.set_read_timeout(wire).unwrap();
+                        stream.set_write_timeout(wire).unwrap();
+                        let mut reader = BufReader::new(stream);
+                        let mut head = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            head.push_str(&line.to_ascii_lowercase());
+                        }
+                        heads.lock().unwrap().push(head.clone());
+                        let mut response = respond(&head);
+                        if head.starts_with("head ") {
+                            let end = response
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map_or(response.len(), |at| at + 4);
+                            response.truncate(end);
+                        }
+                        let _ = reader.get_mut().write_all(&response);
+                    }));
+                }
+                drop(listener);
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+                let heads = heads.lock().unwrap().clone();
+                heads
+            });
+            (base, server)
+        }
+
+        fn gets(heads: &[String]) -> Vec<&String> {
+            heads
+                .iter()
+                .filter(|head| head.starts_with("get "))
+                .collect()
+        }
+
+        fn scratch(tag: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("lumen-resume-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// This user's partial of m.gguf on this machine, and its record.
+        fn kept() -> String {
+            format!("{}.partial", shared_stem("m.gguf"))
+        }
+
+        fn record() -> String {
+            format!("{}.meta", kept())
+        }
+
+        /// `names`, sorted as `names()` lists a directory.
+        fn listed(names: &[&str]) -> Vec<String> {
+            let mut names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            names.sort();
+            names
+        }
+
+        /// Leave the bytes and record a stopped download of FILE leaves.
+        fn seed(dir: &Path, bytes: &[u8], meta: Option<&str>) {
+            std::fs::write(dir.join(kept()), bytes).unwrap();
+            if let Some(meta) = meta {
+                std::fs::write(dir.join(record()), meta).unwrap();
+            }
+        }
+
+        fn pull(base: &BaseUrl, dir: &Path) -> Result<PathBuf, DownloadError> {
+            download_from(base, "org/repo", "m.gguf", dir, true)
+        }
+
+        #[test]
+        fn a_cut_transfer_continues_from_the_byte_it_reached() {
+            let (base, server) = serve(3, |head| match range_from(head) {
+                None => whole(Some(V1), FILE, 10),
+                Some(from) => rest(V1, FILE, from),
+            });
+            let dir = scratch("cut");
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 2, "{heads:?}");
+            assert!(
+                gets[1].contains("\r\nrange: bytes=10-\r\n")
+                    && gets[1].contains("\r\nif-range: \"v1\"\r\n"),
+                "{}",
+                gets[1]
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_stopped_download_keeps_its_bytes_and_the_next_run_continues() {
+            // Cut at byte 10, then busy until the retries run out.
+            let (base, server) = serve(2 + ATTEMPTS as usize, |head| match range_from(head) {
+                None => whole(Some(LONG), FILE, 10),
+                Some(_) => status("503 Service Unavailable"),
+            });
+            let dir = scratch("stopped");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 10 B of 36 B after 6 attempts without progress (the server \
+                 answered 503). Run the same command again to resume."
+            );
+            assert_eq!(names(&dir), listed(&[&kept(), &record()]));
+            assert_eq!(
+                std::fs::read_to_string(dir.join(record())).unwrap(),
+                format!("36 {LONG}\n")
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), 1 + ATTEMPTS as usize);
+
+            let (base, server) = serve(2, |head| match range_from(head) {
+                None => whole(Some(LONG), FILE, FILE.len()),
+                Some(from) => rest(LONG, FILE, from),
+            });
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 1, "{heads:?}");
+            assert_eq!(range_from(gets[0]), Some(10), "{}", gets[0]);
+            assert!(
+                gets[0].contains(&format!("\r\nif-range: {LONG}\r\n")),
+                "{}",
+                gets[0]
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// As Hugging Face's CDN does: the range is served whatever If-Range
+        /// says, under the ETag of the file as it is now.
+        #[test]
+        fn a_changed_file_starts_over_when_the_server_ignores_if_range() {
+            let (base, server) = serve(3, |head| match range_from(head) {
+                None => whole(Some(V2), NEW, NEW.len()),
+                Some(from) => rest(V2, NEW, from),
+            });
+            let dir = scratch("changed");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), NEW);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 2, "{heads:?}");
+            assert_eq!(range_from(gets[0]), Some(10));
+            assert_eq!(range_from(gets[1]), None);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// As the HTTP standard has it: a changed file is sent whole.
+        #[test]
+        fn a_changed_file_sent_whole_replaces_the_bytes_kept() {
+            let (base, server) = serve(2, |_| whole(Some(V2), NEW, NEW.len()));
+            let dir = scratch("changed-whole");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), NEW);
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 1, "{heads:?}");
+            assert_eq!(range_from(gets[0]), Some(10));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn an_answer_that_does_not_continue_the_bytes_kept_starts_over() {
+            let rest_of_file = &FILE[10..];
+            for (tag, answer) in [
+                // Each answer is wrong in one respect only.
+                ("start", part("bytes 0-25/36", Some(V1), &FILE[..26])),
+                ("total", part("bytes 10-35/40", Some(V1), rest_of_file)),
+                ("length", part("bytes 10-35/36", Some(V1), &[b'x'; 30])),
+                ("no-etag", part("bytes 10-35/36", None, rest_of_file)),
+                (
+                    "weak",
+                    part("bytes 10-35/36", Some("W/\"v1\""), rest_of_file),
+                ),
+                ("unsatisfiable", status("416 Range Not Satisfiable")),
+            ] {
+                let (base, server) = serve(3, move |head| match range_from(head) {
+                    None => whole(Some(V1), FILE, FILE.len()),
+                    Some(_) => answer.clone(),
+                });
+                let dir = scratch(tag);
+                seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+                let path = pull(&base, &dir).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                let heads = server.join().unwrap();
+                let gets = gets(&heads);
+                assert_eq!(gets.len(), 2, "{tag}: {heads:?}");
+                assert_eq!(range_from(gets[1]), None, "{tag}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A body sent without a length ends at a clean close, so only the
+        /// length the HEAD gave shows that it was cut.
+        #[test]
+        fn a_body_without_a_length_that_ends_early_is_continued() {
+            let (base, server) = serve(3, |head| match range_from(head) {
+                _ if head.starts_with("head ") => whole(Some(V1), FILE, FILE.len()),
+                None => {
+                    let mut out =
+                        format!("HTTP/1.1 200 OK\r\nETag: {V1}\r\nConnection: close\r\n\r\n")
+                            .into_bytes();
+                    out.extend_from_slice(&FILE[..10]);
+                    out
+                }
+                Some(from) => rest(V1, FILE, from),
+            });
+            let dir = scratch("no-length");
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 2, "{heads:?}");
+            assert_eq!(range_from(gets[1]), Some(10));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A 206 sent in chunks has no length of its own; its range and tag
+        /// are enough to continue.
+        #[test]
+        fn a_chunked_answer_continues_the_bytes_kept() {
+            let (base, server) = serve(3, |head| match range_from(head) {
+                None => whole(Some(V1), FILE, 10),
+                Some(from) => {
+                    let body = &FILE[from..];
+                    let mut out = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-35/36\r\n\
+                         ETag: {V1}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                         {:x}\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(body);
+                    out.extend_from_slice(b"\r\n0\r\n\r\n");
+                    out
+                }
+            });
+            let dir = scratch("chunked");
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 2, "{heads:?}");
+            assert_eq!(range_from(gets[1]), Some(10));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A chunked body cut at the edge of a chunk, before a chunk's line
+        /// ending or inside a chunk is continued like any other cut body.
+        #[test]
+        fn a_chunked_body_cut_anywhere_is_continued() {
+            for (tag, cut) in [
+                ("between", "a\r\n0123456789\r\n"),
+                ("before-line-end", "a\r\n0123456789"),
+                ("inside", "a\r\n01234"),
+            ] {
+                let first = std::sync::atomic::AtomicBool::new(true);
+                let (base, server) = serve(3, move |head| match range_from(head) {
+                    _ if head.starts_with("head ") => whole(Some(V1), FILE, FILE.len()),
+                    None if first.swap(false, std::sync::atomic::Ordering::SeqCst) => format!(
+                        "HTTP/1.1 200 OK\r\nETag: {V1}\r\nTransfer-Encoding: chunked\r\n\
+                         Connection: close\r\n\r\n{cut}"
+                    )
+                    .into_bytes(),
+                    None => whole(Some(V1), FILE, FILE.len()),
+                    Some(from) => rest(V1, FILE, from),
+                });
+                let dir = scratch(&format!("chunk-cut-{tag}"));
+                let path = pull(&base, &dir).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                assert_eq!(gets(&server.join().unwrap()).len(), 2, "{tag}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A file that changed on the server starts over, and the bytes of
+        /// the new version count as progress from then on, however few they
+        /// are next to the bytes of the old version that were dropped.
+        #[test]
+        fn after_a_new_start_each_continued_attempt_is_progress() {
+            let (base, server) = serve(10, |head| {
+                let old = head.contains("\r\nif-range: \"v1\"\r\n");
+                match range_from(head) {
+                    _ if head.starts_with("head ") => whole(Some(V2), NEW, NEW.len()),
+                    Some(from) if old => rest(V2, NEW, from),
+                    None => whole(Some(V2), NEW, 5),
+                    Some(from) => {
+                        let mut cut = rest(V2, NEW, from);
+                        cut.truncate(cut.len() - NEW.len().saturating_sub(from + 5));
+                        cut
+                    }
+                }
+            });
+            let dir = scratch("new-start");
+            seed(&dir, &FILE[..30], Some("36 \"v1\"\n"));
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), NEW);
+            let heads = server.join().unwrap();
+            assert_eq!(gets(&heads).len(), 9, "{heads:?}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A server that sends the whole file whatever is asked, and is cut
+        /// a little further each time, never lets the download continue, so
+        /// it stops after the fixed number of attempts.
+        #[test]
+        fn a_server_that_always_starts_over_is_not_asked_without_end() {
+            let sent = std::sync::atomic::AtomicUsize::new(10);
+            let (base, server) = serve(2 + ATTEMPTS as usize, move |head| {
+                if head.starts_with("head ") {
+                    return whole(Some(V1), FILE, FILE.len());
+                }
+                whole(
+                    Some(V1),
+                    FILE,
+                    sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                )
+            });
+            let dir = scratch("always-whole");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 16 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to resume."
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), 1 + ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A server that continues the file one time and sends it whole the
+        /// next, cut at the same bytes each time, never gives the download
+        /// more than it held before, so it stops after the fixed number of
+        /// attempts.
+        #[test]
+        fn a_server_that_continues_only_at_times_is_not_asked_without_end() {
+            let (base, server) = serve(3 + ATTEMPTS as usize, |head| match range_from(head) {
+                _ if head.starts_with("head ") => whole(Some(V1), FILE, FILE.len()),
+                Some(10) => {
+                    let mut cut = rest(V1, FILE, 10);
+                    cut.truncate(cut.len() - (FILE.len() - 20));
+                    cut
+                }
+                _ => whole(Some(V1), FILE, 10),
+            });
+            let dir = scratch("sometimes");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 20 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to resume."
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), 2 + ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A server whose ETag for the file alternates between two values, as
+        /// servers behind one address can when each makes its own: it
+        /// continues each version from byte 10 to byte 20, then sends the
+        /// other whole, cut at byte 10. Each version is judged by the most of
+        /// it the run has held, so the download stops after the fixed number
+        /// of attempts.
+        #[test]
+        fn a_server_that_alternates_two_versions_is_not_asked_without_end() {
+            let (base, server) = serve(5 + ATTEMPTS as usize, |head| {
+                if head.starts_with("head ") {
+                    return whole(Some(V1), FILE, FILE.len());
+                }
+                let asked = if head.contains("\r\nif-range: \"v1\"\r\n") {
+                    Some(V1)
+                } else if head.contains("\r\nif-range: \"v2\"\r\n") {
+                    Some(V2)
+                } else {
+                    None
+                };
+                match (range_from(head), asked) {
+                    (Some(10), Some(tag)) => {
+                        let mut cut = rest(tag, FILE, 10);
+                        cut.truncate(cut.len() - (FILE.len() - 20));
+                        cut
+                    }
+                    (Some(_), Some(tag)) => whole(Some(if tag == V1 { V2 } else { V1 }), FILE, 10),
+                    _ => whole(Some(V1), FILE, 10),
+                }
+            });
+            let dir = scratch("two-versions");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 20 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to resume."
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), 4 + ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A server that sends another version of the file with every answer,
+        /// each cut: the download holds a new version each time, but only the
+        /// first counts, so it stops after the fixed number of attempts.
+        #[test]
+        fn a_new_version_in_every_answer_is_not_asked_without_end() {
+            let answers = std::sync::atomic::AtomicUsize::new(0);
+            let (base, server) = serve(2 + ATTEMPTS as usize, move |head| {
+                if head.starts_with("head ") {
+                    return whole(Some(V1), FILE, FILE.len());
+                }
+                let n = answers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                whole(Some(&format!("\"v{n}\"")), FILE, 10)
+            });
+            let dir = scratch("every-answer-new");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 10 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to resume."
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), 1 + ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The bytes a run starts with count as held: a server that sends the
+        /// whole file again, cut where the bytes kept end, adds nothing.
+        #[test]
+        fn bytes_a_run_starts_with_count_as_held() {
+            let (base, server) = serve(1 + ATTEMPTS as usize, |_| whole(Some(V1), FILE, 10));
+            let dir = scratch("held-at-start");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 10 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to resume."
+            );
+            assert_eq!(gets(&server.join().unwrap()).len(), ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// An attempt that brings no bytes of the file is not progress, even
+        /// the first one.
+        #[test]
+        fn an_attempt_that_brings_no_bytes_is_not_progress() {
+            let (base, server) = serve(1 + ATTEMPTS as usize, |_| whole(Some(V1), FILE, 0));
+            let dir = scratch("no-bytes");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 0 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to try again."
+            );
+            assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+            assert_eq!(gets(&server.join().unwrap()).len(), ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn without_a_strong_etag_a_cut_transfer_starts_over() {
+            for (tag, etag) in [
+                ("none", None),
+                ("weak", Some("W/\"v1\"")),
+                ("empty", Some("\"\"")),
+                ("unquoted", Some("v1\"")),
+                ("two", Some("\"v1\"\r\nETag: \"v1\"")),
+            ] {
+                let cut = std::sync::atomic::AtomicBool::new(true);
+                let (base, server) = serve(3, move |head| {
+                    let first_get = head.starts_with("get ")
+                        && cut.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    whole(etag, FILE, if first_get { 10 } else { FILE.len() })
+                });
+                let dir = scratch(&format!("etag-{tag}"));
+                let path = pull(&base, &dir).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                let heads = server.join().unwrap();
+                let gets = gets(&heads);
+                assert_eq!(gets.len(), 2, "{tag}: {heads:?}");
+                assert_eq!(range_from(gets[1]), None, "{tag}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        #[test]
+        fn a_download_that_cannot_be_continued_leaves_nothing_when_it_stops() {
+            let (base, server) = serve(1 + ATTEMPTS as usize, |_| whole(None, FILE, 10));
+            let dir = scratch("no-etag-stops");
+            let started = std::time::Instant::now();
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            // Five waits between six attempts, each twice the one before.
+            assert!(started.elapsed() >= BACKOFF * 31, "{:?}", started.elapsed());
+            assert_eq!(
+                err,
+                "stopped at 10 B of 36 B after 6 attempts without progress (the connection \
+                 closed before the file was complete). Run the same command again to try again."
+            );
+            assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+            assert_eq!(gets(&server.join().unwrap()).len(), ATTEMPTS as usize);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn bytes_no_record_vouches_for_are_not_continued() {
+            for (tag, meta) in [
+                ("no-record", None),
+                ("weak", Some("36 W/\"v1\"\n")),
+                ("shorter", Some("5 \"v1\"\n")),
+                ("garbled", Some("36\n")),
+            ] {
+                let (base, server) = serve(2, |_| whole(Some(V1), FILE, FILE.len()));
+                let dir = scratch(&format!("record-{tag}"));
+                // Longer than the file, so bytes left past its end would show.
+                seed(&dir, &[b'x'; 50], meta);
+                let path = pull(&base, &dir).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                let heads = server.join().unwrap();
+                let gets = gets(&heads);
+                assert_eq!(gets.len(), 1, "{tag}: {heads:?}");
+                assert_eq!(range_from(gets[0]), None, "{tag}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A record whose ETag holds a byte no request header can carry, as a
+        /// damaged or planted record could, is not continued: asking with it
+        /// would fail the same way on every run.
+        #[test]
+        fn a_record_with_a_tag_no_request_can_carry_is_not_continued() {
+            let (base, server) = serve(2, |_| whole(Some(V1), FILE, FILE.len()));
+            let dir = scratch("unsendable");
+            seed(&dir, &NEW[..10], Some("36 \"v\u{1}1\"\n"));
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 1, "{heads:?}");
+            assert_eq!(range_from(gets[0]), None);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_partial_that_is_already_complete_is_published_without_fetching() {
+            // Room for one request past the HEAD, so a GET would be answered
+            // and seen; the test takes it itself when none came.
+            let (base, server) = serve(2, |_| whole(Some(V1), FILE, FILE.len()));
+            let dir = scratch("complete");
+            seed(&dir, FILE, Some("36 \"v1\"\n"));
+            let path = pull(&base, &dir).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            let addr = base.as_str().trim_start_matches("http://").to_string();
+            if let Ok(mut probe) = std::net::TcpStream::connect(addr) {
+                let _ = probe.write_all(b"HEAD /probe HTTP/1.1\r\n\r\n");
+            }
+            assert!(gets(&server.join().unwrap()).is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Where the shared partial cannot be used safely, the download goes
+        /// to a file of its own: it still completes, still continues a cut
+        /// transfer in the same run, and leaves the file in the way alone.
+        #[test]
+        fn a_partial_that_cannot_be_used_safely_is_left_alone() {
+            use std::os::unix::fs::PermissionsExt;
+            // Root may write any file, so only another user sees the unwritable case.
+            let root = unsafe { libc::geteuid() } == 0;
+            for tag in ["hard-link", "symbolic-link", "pipe", "unwritable"] {
+                if tag == "unwritable" && root {
+                    continue;
+                }
+                let (base, server) = serve(3, |head| match range_from(head) {
+                    None => whole(Some(V1), FILE, 10),
+                    Some(from) => rest(V1, FILE, from),
+                });
+                let dir = scratch(&format!("unusable-{tag}"));
+                let other = dir.join("other");
+                std::fs::write(&other, b"someone else's bytes").unwrap();
+                let partial = dir.join(kept());
+                match tag {
+                    "hard-link" => std::fs::hard_link(&other, &partial).unwrap(),
+                    "symbolic-link" => std::os::unix::fs::symlink(&other, &partial).unwrap(),
+                    "pipe" => {
+                        let name = std::ffi::CString::new(partial.to_str().unwrap()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+                    }
+                    _ => {
+                        std::fs::copy(&other, &partial).unwrap();
+                        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o444))
+                            .unwrap();
+                    }
+                }
+                let path = pull(&base, &dir).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                assert_eq!(
+                    std::fs::read(&other).unwrap(),
+                    b"someone else's bytes",
+                    "{tag}"
+                );
+                if tag != "pipe" {
+                    assert_eq!(
+                        std::fs::read(&partial).unwrap(),
+                        b"someone else's bytes",
+                        "{tag}"
+                    );
+                }
+                assert_eq!(
+                    names(&dir),
+                    listed(&["m.gguf", &kept(), "m.gguf.sha256", "other"]),
+                    "{tag}"
+                );
+                let heads = server.join().unwrap();
+                let gets = gets(&heads);
+                assert_eq!(gets.len(), 2, "{tag}: {heads:?}");
+                assert_eq!(range_from(gets[1]), Some(10), "{tag}");
+                std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o644)).ok();
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A link or a named pipe planted where the record is kept is removed,
+        /// never written through or waited on: the download completes and the
+        /// file a link points at is left alone.
+        #[test]
+        fn a_link_or_pipe_in_place_of_the_record_is_not_followed() {
+            for tag in ["hard-link", "symbolic-link", "pipe"] {
+                let (base, server) = serve(2, |_| whole(Some(V1), FILE, FILE.len()));
+                let dir = scratch(&format!("record-{tag}"));
+                let other = dir.join("other");
+                std::fs::write(&other, b"36 \"v1\"\n").unwrap();
+                let record = dir.join(record());
+                match tag {
+                    "hard-link" => std::fs::hard_link(&other, &record).unwrap(),
+                    "symbolic-link" => std::os::unix::fs::symlink(&other, &record).unwrap(),
+                    _ => {
+                        let name = std::ffi::CString::new(record.to_str().unwrap()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+                    }
+                }
+                let (done, finished) = std::sync::mpsc::channel();
+                let (base_url, dir_path) = (base.as_str().to_string(), dir.clone());
+                std::thread::spawn(move || {
+                    let _ = done.send(pull(&BaseUrl::local(base_url), &dir_path));
+                });
+                let path = finished
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("the download waited on the record")
+                    .unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), FILE, "{tag}");
+                assert_eq!(std::fs::read(&other).unwrap(), b"36 \"v1\"\n", "{tag}");
+                assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256", "other"], "{tag}");
+                server.join().unwrap();
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A download in a file of its own that stops leaves nothing and says
+        /// the next run starts over.
+        #[test]
+        fn a_download_in_a_file_of_its_own_leaves_nothing_when_it_stops() {
+            let (base, server) = serve(2 + ATTEMPTS as usize, |head| match range_from(head) {
+                None => whole(Some(V1), FILE, 10),
+                Some(_) => status("503 Service Unavailable"),
+            });
+            let dir = scratch("own-stops");
+            let other = dir.join("other");
+            std::fs::write(&other, b"x").unwrap();
+            std::fs::hard_link(&other, dir.join(kept())).unwrap();
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "stopped at 10 B of 36 B after 6 attempts without progress (the server \
+                 answered 503). Run the same command again to try again."
+            );
+            assert_eq!(names(&dir), listed(&[&kept(), "other"]));
+            server.join().unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The per-process files of downloads that are gone are removed; a
+        /// live one, a fresh one and the shared partial are not.
+        #[test]
+        fn only_files_of_downloads_that_are_gone_are_reclaimed() {
+            let dir = scratch("reclaim");
+            let gone = 2_147_483_646; // above any pid_max: no such process
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+            let live = std::process::id();
+            for (name, when) in [
+                (format!("m.gguf.{gone}-1.part"), old),
+                (
+                    format!("m.gguf.{gone}-2.part"),
+                    std::time::SystemTime::now(),
+                ),
+                (format!("m.gguf.{live}-3.part"), old),
+                ("m.gguf.part".to_string(), old),
+                (kept(), old),
+                (record(), old),
+                (format!("n.gguf.{gone}-4.part"), old),
+            ] {
+                let file = std::fs::File::create(dir.join(name)).unwrap();
+                file.set_modified(when).unwrap();
+            }
+            reclaim_stale_parts(&dir, "m.gguf");
+            assert_eq!(
+                names(&dir),
+                listed(&[
+                    &format!("m.gguf.{gone}-2.part"),
+                    &format!("m.gguf.{live}-3.part"),
+                    &kept(),
+                    &record(),
+                    &format!("n.gguf.{gone}-4.part"),
+                ])
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// G1's stall: part of the body, then nothing for longer than the
+        /// stall timeout while the connection stays open.
+        #[test]
+        fn a_stalled_transfer_continues_from_the_byte_it_reached() {
+            use std::io::{BufRead, BufReader};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = BaseUrl::local(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let mut heads = Vec::new();
+                let mut held = Vec::new();
+                for stream in listener.incoming().take(3) {
+                    let mut reader = BufReader::new(stream.unwrap());
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line.to_ascii_lowercase());
+                    }
+                    let answer = match range_from(&head) {
+                        _ if head.starts_with("head ") => whole(Some(V1), FILE, 0),
+                        None => whole(Some(V1), FILE, 10),
+                        Some(from) => rest(V1, FILE, from),
+                    };
+                    let mut stream = reader.into_inner();
+                    stream.write_all(&answer).unwrap();
+                    if range_from(&head).is_none() && head.starts_with("get ") {
+                        // Say nothing more, and keep the connection open.
+                        held.push(stream);
+                    }
+                    heads.push(head);
+                }
+                heads
+            });
+            let dir = scratch("stall");
+            let started = std::time::Instant::now();
+            let path = pull(&base, &dir).unwrap();
+            assert!(
+                started.elapsed() >= STALL_TIMEOUT,
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            let heads = server.join().unwrap();
+            let gets = gets(&heads);
+            assert_eq!(gets.len(), 2, "{heads:?}");
+            assert_eq!(range_from(gets[1]), Some(10));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A waiter that wakes after the holder published, to find a new
+        /// partial another download has since made, holds the published file:
+        /// it must look again, not continue or empty what it holds.
+        #[test]
+        fn a_waiter_that_wakes_to_another_partial_leaves_the_published_file_alone() {
+            use std::os::unix::io::AsRawFd;
+            let (base, server) = serve(1, |_| whole(Some(V1), FILE, FILE.len()));
+            let dir = scratch("waiter");
+            let partial = dir.join(kept());
+            std::fs::write(&partial, FILE).unwrap();
+            let held = std::fs::File::open(&partial).unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let (base, dir2) = (base, dir.clone());
+            let waiter = std::thread::spawn(move || pull(&base, &dir2));
+            // The waiter asks the size, then blocks on the lock.
+            assert_eq!(server.join().unwrap().len(), 1);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // As the holder does: publish by renaming the locked file; then a
+            // third download makes a new partial before the lock is let go.
+            std::fs::rename(&partial, dir.join("m.gguf")).unwrap();
+            std::fs::write(&partial, b"").unwrap();
+            drop(held);
+            let path = waiter.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Once the file is published, what downloads of it by other
+        /// machines or users kept is of no use: a partial not written for a
+        /// minute goes with its record, and so does a record without its
+        /// partial. Before, or while a partial is being written, nothing goes.
+        #[test]
+        fn what_other_downloads_kept_goes_once_the_file_is_published() {
+            let dir = scratch("kept-by-others");
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            let other_machine = format!("m.gguf.0123456789abcdef-{}.partial", unsafe {
+                libc::getuid()
+            });
+            // Another user's, on a machine with no identity.
+            let container = format!("m.gguf.{}.partial", unsafe { libc::getuid() } + 1);
+            let written_now = "m.gguf.fedcba9876543210-7.partial".to_string();
+            let record_alone = "m.gguf.00000000000000aa-9.partial.meta".to_string();
+            let names_kept = [
+                other_machine.clone(),
+                format!("{other_machine}.meta"),
+                container.clone(),
+                format!("{container}.meta"),
+                written_now.clone(),
+                format!("{written_now}.meta"),
+                record_alone.clone(),
+                kept(),
+                record(),
+            ];
+            for name in &names_kept {
+                let file = std::fs::File::create(dir.join(name)).unwrap();
+                if name != &written_now {
+                    file.set_modified(old).unwrap();
+                }
+            }
+            reclaim_stale_parts(&dir, "m.gguf");
+            let mut before: Vec<&str> = names_kept.iter().map(String::as_str).collect();
+            assert_eq!(names(&dir), listed(&before));
+
+            std::fs::write(dir.join("m.gguf"), FILE).unwrap();
+            reclaim_stale_parts(&dir, "m.gguf");
+            before.retain(|name| name.starts_with(written_now.as_str()));
+            before.push("m.gguf");
+            assert_eq!(names(&dir), listed(&before));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A download publishes, then sweeps what other downloads of the file
+        /// kept.
+        #[test]
+        fn a_download_reclaims_what_others_kept_once_it_publishes() {
+            let (base, server) = serve(2, |_| whole(Some(V1), FILE, FILE.len()));
+            let dir = scratch("reclaim-after-publish");
+            // Another user's, on a machine with no identity.
+            let other = format!("m.gguf.{}.partial", unsafe { libc::getuid() } + 1);
+            let container = dir.join(&other);
+            std::fs::write(&container, &FILE[..5]).unwrap();
+            std::fs::write(dir.join(format!("{other}.meta")), "36 \"v1\"\n").unwrap();
+            let file = std::fs::File::options()
+                .write(true)
+                .open(&container)
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+                .unwrap();
+            pull(&base, &dir).unwrap();
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            server.join().unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A download is published only when its length is known and every
+        /// byte of it arrived: with no length anywhere, or with more bytes than
+        /// the length, nothing is published.
+        #[test]
+        fn a_download_whose_length_does_not_hold_is_not_published() {
+            let (base, server) = serve(2, |_| {
+                let mut out = format!("HTTP/1.1 200 OK\r\nETag: {V1}\r\nConnection: close\r\n\r\n")
+                    .into_bytes();
+                out.extend_from_slice(FILE);
+                out
+            });
+            let dir = scratch("no-length-anywhere");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert!(err.contains("no Content-Length"), "{err}");
+            assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+            server.join().unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+
+            let (base, server) = serve(2, |head| {
+                let from = range_from(head).unwrap_or(0);
+                let mut body = FILE[from..].to_vec();
+                body.extend_from_slice(b"XXXX");
+                let mut out = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-35/36\r\n\
+                     ETag: {V1}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                     {:x}\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&body);
+                out.extend_from_slice(b"\r\n0\r\n\r\n");
+                out
+            });
+            let dir = scratch("past-the-end");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert_eq!(err, "size mismatch: expected 36 bytes, got 40 bytes");
+            assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+            server.join().unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// An answer that continues the bytes kept is stored only if it is
+        /// unencoded, like any other; the bytes kept stay for the next run.
+        #[test]
+        fn an_encoded_answer_that_continues_the_bytes_kept_is_refused() {
+            let (base, server) = serve(2, |head| {
+                let from = range_from(head).unwrap_or(0);
+                let encoded = vec![0x1f_u8; FILE.len() - from];
+                let mut out = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-35/36\r\n\
+                     Content-Length: {}\r\nContent-Encoding: gzip\r\nETag: {V1}\r\n\
+                     Connection: close\r\n\r\n",
+                    encoded.len()
+                )
+                .into_bytes();
+                out.extend_from_slice(&encoded);
+                out
+            });
+            let dir = scratch("encoded-206");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert!(
+                err.contains("server sent [\"gzip\"] Content-Encoding")
+                    && err.ends_with("running the same command again continues from there."),
+                "{err}"
+            );
+            assert_eq!(std::fs::read(dir.join(kept())).unwrap(), &FILE[..10]);
+            assert_eq!(names(&dir), listed(&[&kept(), &record()]));
+            server.join().unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A download whose partial is removed while it runs, and made anew by
+        /// a second download of the same file, never publishes the second
+        /// one's bytes, nor removes or rewrites its partial or record, whether
+        /// it then finishes, fails or has to start over; the second finishes
+        /// the file.
+        #[test]
+        fn a_partial_removed_while_its_download_runs_is_left_to_the_next() {
+            use std::io::{BufRead, BufReader};
+            for case in ["finishes", "fails", "starts-over"] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let base = BaseUrl::local(format!("http://{}", listener.local_addr().unwrap()));
+                let (to_first, first_waits) = std::sync::mpsc::channel::<()>();
+                let (to_second, second_waits) = std::sync::mpsc::channel::<()>();
+                let server = std::thread::spawn(move || {
+                    let mut gets = 0;
+                    let mut handlers = Vec::new();
+                    let mut waits = [first_waits, second_waits].into_iter();
+                    let connections = if case == "finishes" { 5 } else { 6 };
+                    for stream in listener.incoming().take(connections) {
+                        let mut reader = BufReader::new(stream.unwrap());
+                        let mut head = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            head.push_str(&line.to_ascii_lowercase());
+                        }
+                        let mut stream = reader.into_inner();
+                        if head.starts_with("head ") {
+                            stream.write_all(&whole(Some(V1), FILE, 0)).unwrap();
+                            continue;
+                        }
+                        gets += 1;
+                        let answer = match range_from(&head) {
+                            // The first download's own answer and the second's:
+                            // part of the file, the rest once the test says.
+                            None => {
+                                let sent = if gets == 1 { 10 } else { 5 };
+                                stream.write_all(&whole(Some(V1), FILE, sent)).unwrap();
+                                let wait = waits.next().unwrap();
+                                handlers.push(std::thread::spawn(move || {
+                                    wait.recv().unwrap();
+                                    if sent == 10 && case == "finishes" {
+                                        let _ = stream.write_all(&FILE[10..]);
+                                    }
+                                }));
+                                continue;
+                            }
+                            // The first download asks again.
+                            Some(10) if case == "fails" => status("404 Not Found"),
+                            Some(10) => whole(Some(V2), NEW, NEW.len()),
+                            Some(from) => rest(V1, FILE, from),
+                        };
+                        stream.write_all(&answer).unwrap();
+                    }
+                    for handler in handlers {
+                        handler.join().unwrap();
+                    }
+                });
+                let dir = scratch(&format!("removed-{case}"));
+                let partial = dir.join(kept());
+                let grown_to = |len: u64| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while std::fs::metadata(&partial).map_or(true, |m| m.len() != len) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{case}: never {len} B"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                };
+                std::thread::scope(|s| {
+                    let first = s.spawn(|| pull(&base, &dir));
+                    grown_to(10);
+                    std::fs::remove_file(&partial).unwrap();
+                    let second = s.spawn(|| pull(&base, &dir));
+                    grown_to(5);
+                    to_first.send(()).unwrap();
+                    let err = first.join().unwrap().unwrap_err().to_string();
+                    let replaced = format!(
+                        "{} was removed or replaced during the download, so nothing was \
+                         published; run the same command again",
+                        partial.display()
+                    );
+                    if case == "fails" {
+                        assert!(err.contains("404") && !err.contains("kept in"), "{err}");
+                    } else {
+                        assert_eq!(err, replaced, "{case}");
+                    }
+                    assert!(!dir.join("m.gguf").exists(), "{case}");
+                    assert_eq!(std::fs::read(&partial).unwrap(), &FILE[..5], "{case}");
+                    assert_eq!(
+                        std::fs::read_to_string(dir.join(record())).unwrap(),
+                        "36 \"v1\"\n",
+                        "{case}"
+                    );
+                    to_second.send(()).unwrap();
+                    let path = second.join().unwrap().unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), FILE, "{case}");
+                });
+                server.join().unwrap();
+                assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"], "{case}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A pull sweeps what dead downloads of the same file left, also
+        /// when it finds the file published and fetches nothing.
+        #[test]
+        fn a_pull_reclaims_what_dead_downloads_left() {
+            let dir = scratch("reclaim-on-pull");
+            std::fs::write(dir.join("m.gguf"), FILE).unwrap();
+            let left = dir.join("m.gguf.2147483646-1.part");
+            let file = std::fs::File::create(&left).unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+                .unwrap();
+            let base = BaseUrl::local("http://127.0.0.1:9".to_string());
+            assert_eq!(pull(&base, &dir).unwrap(), dir.join("m.gguf"));
+            assert_eq!(names(&dir), ["m.gguf"]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_failure_another_attempt_cannot_change_stops_at_once() {
+            let (base, server) = serve(2, |_| status("404 Not Found"));
+            let dir = scratch("404");
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            assert!(err.contains("404"), "{err}");
+            assert!(names(&dir).is_empty(), "{:?}", names(&dir));
+            assert_eq!(gets(&server.join().unwrap()).len(), 1);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A failure no other attempt can get past keeps the bytes a later
+        /// run can continue, and says where they are.
+        #[test]
+        fn a_failure_that_stops_at_once_keeps_what_can_be_continued() {
+            let (base, server) = serve(2, |head| {
+                if head.starts_with("head ") {
+                    whole(Some(V1), FILE, FILE.len())
+                } else {
+                    status("403 Forbidden")
+                }
+            });
+            let dir = scratch("403-kept");
+            seed(&dir, &FILE[..10], Some("36 \"v1\"\n"));
+            let err = pull(&base, &dir).unwrap_err().to_string();
+            let tail = format!(
+                "403. The 10 B of 36 B downloaded so far is kept in {}; running the same \
+                 command again continues from there.",
+                dir.join(kept()).display()
+            );
+            assert!(err.ends_with(&tail), "{err}");
+            assert_eq!(names(&dir), listed(&[&kept(), &record()]));
+            assert_eq!(std::fs::read(dir.join(kept())).unwrap(), &FILE[..10]);
+            assert_eq!(gets(&server.join().unwrap()).len(), 1);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A download in a file of its own leaves a file reclaim_stale_parts
+        /// knows: removed once stale, kept while its download may be running.
+        #[test]
+        fn a_file_of_its_own_is_reclaimed_once_stale() {
+            let dir = scratch("own-reclaim");
+            let stale = Partial::own(&dir, "m.gguf", "a test").unwrap();
+            let fresh = Partial::own(&dir, "m.gguf", "a test").unwrap();
+            // This process is alive, so only its age makes the file stale.
+            stale
+                .file
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600),
+                )
+                .unwrap();
+            reclaim_stale_parts(&dir, "m.gguf");
+            let fresh_name = fresh.path.file_name().unwrap().to_string_lossy();
+            assert_eq!(names(&dir), [fresh_name]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The files a download keeps are named for this machine, by a hash
+        /// of its identity, and for this user, so only downloads a lock can
+        /// exclude share them.
+        #[test]
+        fn kept_files_are_named_for_this_machine_and_user() {
+            let uid = unsafe { libc::getuid() };
+            let stem = shared_stem("m.gguf");
+            let identified = cfg!(target_os = "macos")
+                || std::fs::read_to_string("/etc/machine-id").is_ok_and(|id| {
+                    let id = id.trim();
+                    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                });
+            if identified {
+                let machine = stem
+                    .strip_prefix("m.gguf.")
+                    .and_then(|rest| rest.strip_suffix(&format!("-{uid}")))
+                    .unwrap_or_else(|| panic!("{stem}"));
+                assert!(
+                    machine.len() == 16
+                        && machine
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{stem}"
+                );
+            } else {
+                assert_eq!(stem, format!("m.gguf.{uid}"));
+            }
+            assert_eq!(shared_stem("m.gguf"), stem);
+        }
+
+        #[test]
+        fn a_second_download_of_the_same_file_waits_for_the_first() {
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = Mutex::new(released);
+            let (seen, heads_seen) = std::sync::mpsc::channel::<String>();
+            let seen = Mutex::new(seen);
+            let (base, server) = serve(3, move |head| {
+                seen.lock().unwrap().send(head.to_string()).unwrap();
+                if head.starts_with("get ") {
+                    let released = released.lock().unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                whole(Some(V1), FILE, FILE.len())
+            });
+            let dir = scratch("waits");
+            let next = || {
+                heads_seen
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap()
+            };
+            let (first, second) = std::thread::scope(|s| {
+                let first = s.spawn(|| pull(&base, &dir));
+                assert!(next().starts_with("head "));
+                // The first download holds the lock from before it asks for
+                // the file until after it publishes it.
+                assert!(next().starts_with("get "));
+                let second = s.spawn(|| pull(&base, &dir));
+                assert!(next().starts_with("head "));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                release.send(()).unwrap();
+                (first.join().unwrap(), second.join().unwrap())
+            });
+            let path = first.unwrap();
+            assert_eq!(second.unwrap(), path);
+            assert_eq!(std::fs::read(&path).unwrap(), FILE);
+            assert_eq!(names(&dir), ["m.gguf", "m.gguf.sha256"]);
+            assert_eq!(gets(&server.join().unwrap()).len(), 1);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn failures_are_retried_only_when_another_attempt_may_get_past_them() {
+            let transient = |url: &str| match call_for_stored_bytes("GET", url, &None, None) {
+                Err(Failure::Transient(reason)) => reason,
+                Err(other) => panic!("{url}: {other}"),
+                Ok(_) => panic!("{url}: answered"),
+            };
+            let refused = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap()
+            };
+            assert_eq!(
+                transient(&format!("http://{refused}/m")),
+                "could not connect to the server"
+            );
+            assert_eq!(
+                transient("http://lumen.invalid/m"),
+                "could not look up the server's address"
+            );
+
+            let (base, server) = serve(5, |head| {
+                let code = head.split(' ').nth(1).unwrap().trim_start_matches('/');
+                status(&format!("{code} Answer"))
+            });
+            for code in ["408", "429", "500", "503"] {
+                assert_eq!(
+                    transient(&format!("{}/{code}", base.as_str())),
+                    format!("the server answered {code}")
+                );
+            }
+            match call_for_stored_bytes("GET", &format!("{}/404", base.as_str()), &None, None) {
+                Err(Failure::Final(e)) => assert!(e.to_string().contains("404"), "{e}"),
+                Err(other) => panic!("retried: {other}"),
+                Ok(_) => panic!("answered"),
+            }
+            assert_eq!(server.join().unwrap().len(), 5);
+
+            // A TLS handshake the server answers in plain text is not the
+            // network's doing, so it is not retried.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                }
+            });
+            match call_for_stored_bytes("GET", &format!("https://{addr}/m"), &None, None) {
+                Err(Failure::Final(e)) => assert!(e.to_string().contains("tls"), "{e}"),
+                Err(other) => panic!("retried: {other}"),
+                Ok(_) => panic!("answered"),
+            }
+
+            // A tunnel the proxy opened and that closes in the TLS handshake.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                if let Ok((mut sock, _)) = listener.accept() {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).is_ok_and(|n| n == 1)
+                    {
+                        head.push(byte[0]);
+                    }
+                    let _ = sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                    let _ = sock.read(&mut [0u8; 512]);
+                }
+            });
+            let route: Route = Some((
+                ureq::Proxy::new(format!("http://{addr}")).unwrap(),
+                "HTTPS_PROXY",
+            ));
+            match call_for_stored_bytes("GET", "https://huggingface.invalid/m.gguf", &route, None) {
+                Err(Failure::Transient(reason)) => assert_eq!(
+                    reason,
+                    "could not connect to the server through the proxy in HTTPS_PROXY"
+                ),
+                Err(other) => panic!("not retried: {other}"),
+                Ok(_) => panic!("answered"),
+            }
+
+            // A read-only file system fails the download; the rest of what
+            // stops an existing partial being opened sends it to a file of
+            // its own.
+            let why = |code| unusable(&std::io::Error::from_raw_os_error(code));
+            assert_eq!(why(libc::EROFS), None);
+            assert_eq!(why(libc::ELOOP).unwrap(), "it is a symbolic link");
+            assert_eq!(why(libc::EACCES).unwrap(), "this user may not write it");
+
+            let words = |e: std::io::Error| network_failure(&e, &None);
+            use std::io::ErrorKind;
+            for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+                assert_eq!(
+                    words(kind.into()).unwrap(),
+                    format!("no data arrived for {} s", STALL_TIMEOUT.as_secs())
+                );
+            }
+            assert_eq!(
+                words(ErrorKind::UnexpectedEof.into()).unwrap(),
+                "the connection closed before the file was complete"
+            );
+            for kind in [
+                ErrorKind::ConnectionRefused,
+                ErrorKind::ConnectionReset,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::NotConnected,
+                ErrorKind::BrokenPipe,
+            ] {
+                assert_eq!(
+                    words(kind.into()).unwrap(),
+                    "the connection was lost",
+                    "{kind:?}"
+                );
+            }
+            for code in [libc::ENETUNREACH, libc::EHOSTUNREACH, libc::ENETDOWN] {
+                assert_eq!(
+                    words(std::io::Error::from_raw_os_error(code)).unwrap(),
+                    "the connection was lost",
+                    "{code}"
+                );
+            }
+            assert_eq!(words(ErrorKind::InvalidData.into()), None);
         }
     }
 }
@@ -1592,27 +3638,6 @@ mod tests {
             }
         }
     }
-    #[cfg(feature = "download")]
-    #[test]
-    fn exclusive_staging_write_then_hash_via_same_fd() {
-        // Regression for the EBADF cold-download failure: the staging fd is
-        // opened read+write, written, seeked to 0, and hashed through the
-        // SAME descriptor — the exact production flow.
-        use std::io::{Seek, Write};
-        let dir = std::env::temp_dir().join(format!("lumen-staging-fd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (path, mut f, _dev_ino) = super::create_exclusive_staging(&dir, "m.gguf").unwrap();
-        f.write_all(b"lumen staging bytes").unwrap();
-        f.flush().unwrap();
-        f.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let h = super::sha256_of_reader(&mut f).unwrap();
-        assert_eq!(h.len(), 64, "hex sha256 expected");
-        // Same-fd hash must match the by-path hash of the same bytes.
-        let h2 = super::compute_sha256(&path).unwrap();
-        assert_eq!(h, h2);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     #[cfg(feature = "download")]
     #[test]
     fn verify_complete_transfer_rejects_short_and_unknown() {

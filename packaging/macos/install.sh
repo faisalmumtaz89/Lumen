@@ -464,7 +464,7 @@ case "$QUANT" in
 esac
 free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
 if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
-  info "WARNING: ~${free_gb} GB free at $cache; $MODEL:$QUANT needs roughly ${need} GB peak (source GGUF + converted LBC coexist; downloads are NOT resumable)."
+  info "WARNING: ~${free_gb} GB free at $cache; $MODEL:$QUANT needs roughly ${need} GB peak (source GGUF + converted LBC coexist)."
   if [ "$INTERACTIVE" = "1" ]; then
     printf '  Continue anyway? [y/N] '
     read -r go < /dev/tty || go=""
@@ -480,7 +480,7 @@ info "preparing $MODEL:$QUANT (downloaded and converted once, then reused)"
 env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_BASE \
     -u LUMEN_ALLOW_INSECURE_BASE -u LUMEN_INSECURE_SKIP_CHECKSUM \
     LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes >/dev/null \
-  || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer (it restarts cleanly), or run: $DEST/lumen pull $MODEL:$QUANT --yes"
+  || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer, or run: $DEST/lumen pull $MODEL:$QUANT --yes"
 
 # ── Step 6 · print the exact next steps (positional model:quant forms) ────────
 say ""

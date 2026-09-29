@@ -62,7 +62,7 @@ lumen run qwen3.5-9b:q8_0 "Explain quantum computing" \
 lumen run qwen3.5-moe-35b-a3b:q4_0 "What is the meaning of life?" --max-tokens 200
 ```
 
-(MoE and 27B BF16 are the highest-quality builds; they ship as large nested 2-shard GGUFs (~55–70 GB) that `lumen pull <model>:bf16` — and the installer's BF16 menu option — auto-download and convert. The download is large and not resumable, so make sure you have ample free disk.)
+(MoE and 27B BF16 are the highest-quality builds; they ship as large nested 2-shard GGUFs (~55–70 GB) that `lumen pull <model>:bf16` — and the installer's BF16 menu option — auto-download and convert. The download is large, so make sure you have ample free disk; if it is interrupted, running the same command again continues it where it stopped.)
 
 The backend is auto-detected: macOS → Metal, Linux with a CUDA device → CUDA, else SIMD CPU fallback. Force a backend with `--cuda`, `--metal`, or `--simd`. Pick a CUDA device with `--cuda-device <n>`.
 

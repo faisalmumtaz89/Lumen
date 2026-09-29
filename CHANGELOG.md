@@ -5,6 +5,17 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Changed
+
+- **An interrupted model download continues where it stopped.** `lumen pull`, and so `lumen run`
+  and the one-line installer, retry a dropped or stalled connection from the byte already
+  reached, and a download that stops, whether by Ctrl-C or after its retries run out, keeps its
+  bytes: running the same command again picks up from there. Two downloads of the same file at
+  once by the same user on the same machine no longer both fetch it: the second waits for the
+  first.
+
 ## [0.37.1] — 2026-09-30
 
 ### Fixed

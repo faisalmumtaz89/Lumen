@@ -10,7 +10,7 @@
 #    3. Build the CLI + server   (correct Cargo features for the backend)
 #    4. Pick + pull a model      (download GGUF → convert to .lbc → cache; idempotent)
 #    5. Start lumen-server       (and print copy-paste curl + `lumen run` examples)
-#    6. Clean up on exit         (stop the server, remove this run's partials)
+#    6. Clean up on exit         (stop the server)
 #
 #  Runnable from the repo root:  ./scripts/quickstart.sh
 #
@@ -83,10 +83,8 @@ SERVER_PID=""
 SERVER_LOG=""
 SERVER_STARTED="0"
 
-# Per-run scratch (mktemp dir; removed on exit). Also tracks GGUF .part files
-# this run created so cleanup never touches a user's pre-existing cache.
+# Per-run scratch (mktemp dir; removed on exit).
 SCRATCH_DIR=""
-PARTFILES_BEFORE=""     # newline list of *.part present BEFORE we pulled
 
 # CLI flags / config (env defaults applied in configure()).
 OPT_MODEL="${LUMEN_QS_MODEL:-}"
@@ -307,9 +305,8 @@ to_upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # True if a command exists on PATH.
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# True (0) if $1 appears as an EXACT line within the newline-separated list $2.
-# Used by cleanup to decide whether a partial-download path pre-existed this run
-# (exact match, never substring — so one path being a prefix/substring of
+# True (0) if $1 appears as an EXACT line within the newline-separated list $2
+# (exact match, never substring — so one entry being a prefix/substring of
 # another can never mis-classify).
 line_in_list() {
   local needle="$1" haystack="$2" line oldifs="$IFS"
@@ -1214,15 +1211,6 @@ validate_selection() {
 #  Pull (download + convert + cache) — idempotent
 # -----------------------------------------------------------------------------
 
-# Snapshot *.part files in the cache dir BEFORE we pull, so cleanup only removes
-# partials that THIS run created (never a concurrent process's in-flight file).
-snapshot_partials() {
-  PARTFILES_BEFORE=""
-  if [ -d "$CACHE_DIR" ]; then
-    PARTFILES_BEFORE="$(find "$CACHE_DIR" -maxdepth 1 -type f -name '*.part' 2>/dev/null || true)"
-  fi
-}
-
 pull_model() {
   log_step "Fetch the model: $SEL_SPEC"
 
@@ -1240,7 +1228,6 @@ pull_model() {
 
   log_info "Not cached. Downloading + converting (this can be several GB)."
   log_info "Cache: $CACHE_DIR"
-  snapshot_partials
 
   # `lumen pull` is idempotent and verifies integrity (SHA-256 sidecar). It
   # prints 'Already cached' if a prior run finished. We pass --yes so the
@@ -1465,27 +1452,6 @@ cleanup() {
     fi
   fi
 
-  # Remove ONLY the partial downloads this run created (never pre-existing ones,
-  # never a concurrent pull's in-flight file). We compare by EXACT line, not
-  # substring, so one path being a substring of another can never mis-classify.
-  if [ -d "$CACHE_DIR" ]; then
-    local now_parts p
-    now_parts="$(find "$CACHE_DIR" -maxdepth 1 -type f -name '*.part' 2>/dev/null || true)"
-    if [ -n "$now_parts" ]; then
-      local oldifs="$IFS"
-      IFS=$'\n'
-      for p in $now_parts; do
-        # Skip if this exact path existed before we started (not ours).
-        if line_in_list "$p" "$PARTFILES_BEFORE"; then
-          continue
-        fi
-        log_debug "removing partial download: $p" 2>/dev/null || true
-        rm -f "$p" 2>/dev/null || true
-      done
-      IFS="$oldifs"
-    fi
-  fi
-
   # Remove our scratch dir (server log lives here; we already tail'd it on error).
   if [ -n "$SCRATCH_DIR" ] && [ -d "$SCRATCH_DIR" ]; then
     rm -rf "$SCRATCH_DIR" 2>/dev/null || true
@@ -1503,8 +1469,8 @@ on_interrupt() {
 install_traps() {
   # SCRATCH_DIR must exist before traps can clean it. The EXIT trap is the real
   # guarantor: it runs on a normal return AND after any of the signal handlers
-  # below call `exit`, so the server is stopped and partials are removed on
-  # every termination path we can influence.
+  # below call `exit`, so the server is stopped on every termination path we
+  # can influence.
   #   - INT  (Ctrl-C, foreground): friendly message, exit 130.
   #   - TERM (kill, supervisor):   exit 143.
   #   - HUP  (terminal/SSH disconnect): exit 129 — without this, a server
