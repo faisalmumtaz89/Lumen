@@ -119,27 +119,144 @@ mod inner {
     /// transfer, not a slow one.
     const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// The proxy a request goes through, with the variable that named it.
+    pub(crate) type Route = Option<(ureq::Proxy, &'static str)>;
+
     /// A request for the bytes with no content coding applied. A server that
     /// honors the header does not touch any `Content-Length` it sends; one
     /// that encodes anyway is caught by [`reject_unusable_response`], since
     /// the crate is built without transparent decompression. A secure URL is
-    /// never followed to a plaintext one.
-    pub(crate) fn stored_bytes_request(method: &str, url: &str) -> ureq::Request {
+    /// never followed to a plaintext one. The request goes through `route`'s
+    /// proxy, redirects included.
+    pub(crate) fn stored_bytes_request(method: &str, url: &str, route: &Route) -> ureq::Request {
         let secure = url
             .get(..8)
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
-        ureq::AgentBuilder::new()
+        let mut agent = ureq::AgentBuilder::new()
             .https_only(secure)
             .timeout_read(STALL_TIMEOUT)
-            .timeout_write(STALL_TIMEOUT)
+            .timeout_write(STALL_TIMEOUT);
+        if let Some((proxy, _)) = route {
+            agent = agent.proxy(proxy.clone());
+        }
+        agent
             .build()
             .request(method, url)
             .set("Accept-Encoding", "identity")
     }
 
+    /// " through the proxy in <variable>" for a proxied route, else nothing:
+    /// the suffix a failed request or a broken transfer through a proxy
+    /// carries.
+    fn via(route: &Route) -> String {
+        route
+            .as_ref()
+            .map(|(_, name)| format!(" through the proxy in {name}"))
+            .unwrap_or_default()
+    }
+
+    /// The route the environment sets for `url` ([`env_proxy`]).
+    pub(crate) fn env_route(url: &str) -> Result<Route, DownloadError> {
+        env_proxy(url, |name| std::env::var(name).ok())
+    }
+
+    /// The proxy the environment sets for `url`, chosen as curl chooses it:
+    /// `https_proxy` for an https URL or `http_proxy` for an http one, else
+    /// `all_proxy`, each read lowercase first, then uppercase; an empty value
+    /// counts as unset. A loopback host, or one that `no_proxy` covers, is
+    /// reached directly. An HTTP or SOCKS proxy is accepted, its user name and
+    /// password percent-decoded as curl reads them. `var` reads one
+    /// environment variable.
+    fn env_proxy(url: &str, var: impl Fn(&str) -> Option<String>) -> Result<Route, DownloadError> {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| DownloadError::Io(format!("invalid URL {url}: {e}")))?;
+        let host = parsed
+            .host_str()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let set = |name: &str| var(name).filter(|value| !value.is_empty());
+        let loopback = host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        let no_proxy = set("no_proxy").or_else(|| set("NO_PROXY"));
+        if loopback || no_proxy.is_some_and(|list| no_proxy_covers(&list, &host)) {
+            return Ok(None);
+        }
+        let names = if parsed.scheme() == "https" {
+            ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+        } else {
+            ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"]
+        };
+        let Some((name, value)) = names
+            .into_iter()
+            .find_map(|name| set(name).map(|value| (name, value)))
+        else {
+            return Ok(None);
+        };
+        // The value is never echoed: it may carry a password.
+        ureq::Proxy::new(proxy_spec(&value))
+            .map(|proxy| Some((proxy, name)))
+            .map_err(|e| DownloadError::Io(format!("{name} is not a proxy URL lumen can use: {e}")))
+    }
+
+    /// `value` in the form ureq parses: the user name and password
+    /// percent-decoded (a password holding `@` is written `%40`, as curl
+    /// requires), a user name without a password given an empty one (ureq
+    /// refuses the bare name; curl sends `name:`), and `socks5h` spelled
+    /// `socks5`, whose connections ureq already resolve on the proxy. A part
+    /// that does not decode is kept.
+    fn proxy_spec(value: &str) -> String {
+        let (scheme, rest) = match value.split_once("://") {
+            Some(("socks5h", rest)) => ("socks5://", rest),
+            Some((scheme, rest)) => (&value[..scheme.len() + 3], rest),
+            None => ("", value),
+        };
+        let Some((userinfo, address)) = rest.rsplit_once('@') else {
+            return format!("{scheme}{rest}");
+        };
+        let decode = |part: &str| {
+            percent_encoding::percent_decode_str(part)
+                .decode_utf8()
+                .map_or_else(|_| part.to_string(), |text| text.into_owned())
+        };
+        let userinfo = match userinfo.split_once(':') {
+            Some((user, password)) => format!("{}:{}", decode(user), decode(password)),
+            None => format!("{}:", decode(userinfo)),
+        };
+        format!("{scheme}{userinfo}@{address}")
+    }
+
+    /// Whether a `no_proxy` list (entries split by commas or whitespace)
+    /// covers `host`, given lowercase and without a trailing dot: `*` covers
+    /// every host, and any other entry covers the host it names and that
+    /// host's subdomains, written with or without a leading `.` or `*.`.
+    fn no_proxy_covers(list: &str, host: &str) -> bool {
+        list.split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .map(|entry| {
+                entry
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.')
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| {
+                entry == "*"
+                    || host == entry
+                    || host
+                        .strip_suffix(entry.as_str())
+                        .is_some_and(|rest| rest.ends_with('.'))
+            })
+    }
+
     /// Run a ureq call or header read with a panic turned into `Err`.
-    /// Unwinding is safe to assert: the closures only read a `Response` or
-    /// build a fresh agent, so no shared state is left half-updated. The
+    /// Unwinding is safe to assert: the closures only send a request built
+    /// for that call or read a `Response`, so no shared state is left
+    /// half-updated. The
     /// panic hook is left alone — it is process-global, and replacing it
     /// would also swallow the failure text of any other thread (including
     /// this crate's own tests) — so the parser's one panic line still
@@ -165,14 +282,31 @@ mod inner {
     /// construction for some headers, on later lookups for others — so both
     /// the call and every value read are fenced: a panic is a refusal, not
     /// an abort of the process on a hostile origin.
-    fn call_for_stored_bytes(method: &str, url: &str) -> Result<ureq::Response, DownloadError> {
-        let outcome = fenced(|| stored_bytes_request(method, url).call());
+    fn call_for_stored_bytes(
+        method: &str,
+        url: &str,
+        route: &Route,
+    ) -> Result<ureq::Response, DownloadError> {
+        let request = stored_bytes_request(method, url, route);
+        let outcome = fenced(|| request.call());
         let resp = match outcome {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
+                // ureq words a 401 or 407 from the proxy as "Provided proxy
+                // credentials are incorrect", also when none were sent.
+                let why = match &e {
+                    ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ProxyUnauthorized => {
+                        "the proxy requires authentication; lumen sends the user name and \
+                         password in the proxy URL (user:password@host, percent-encoded) with \
+                         Basic authentication"
+                            .to_string()
+                    }
+                    _ => e.to_string(),
+                };
                 return Err(DownloadError::Io(format!(
-                    "{method} request failed for {url}: {e}"
-                )))
+                    "{method} request failed for {url}{}: {why}",
+                    via(route)
+                )));
             }
             Err(_) => {
                 return Err(DownloadError::Io(format!(
@@ -268,12 +402,24 @@ mod inner {
     /// for a GET without a length), so anything but a clean, complete 200
     /// makes the size unknown rather than failing the download; the GET
     /// answers to every rule on its own.
-    fn get_remote_size(url: &str) -> Result<Option<u64>, DownloadError> {
+    ///
+    /// The size is not asked for through any proxy. Through an HTTP proxy
+    /// ureq 2 reads the tunnel's CONNECT answer as the HEAD's own bodiless
+    /// response and pools its socket, which clears the socket's read and write
+    /// timeouts, so a stalled TLS handshake would hang the pull with no limit.
+    /// A SOCKS route has no such hang; one rule keeps every proxied pull alike:
+    /// the prompt shows an unknown size, and the GET must carry its own
+    /// Content-Length, since there is no HEAD size to fall back on.
+    fn get_remote_size(url: &str, route: &Route) -> Result<Option<u64>, DownloadError> {
+        if route.is_some() {
+            return Ok(None);
+        }
         let unknown = |why: String| {
             eprintln!("Size unknown before download ({why}); the GET's own length decides.");
             Ok(None)
         };
-        let resp = match fenced(|| stored_bytes_request("HEAD", url).call()) {
+        let request = stored_bytes_request("HEAD", url, route);
+        let resp = match fenced(|| request.call()) {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return unknown(format!("HEAD failed: {e}")),
             Err(()) => return unknown("HEAD response could not be read safely".to_string()),
@@ -394,8 +540,12 @@ mod inner {
         // the local file is the flat basename.
         let url = model_url(base_url.as_str(), repo, &url_path);
 
+        // The route every request of this download takes; an unusable proxy
+        // setting fails here, before anything is fetched.
+        let route = env_route(&url)?;
+
         // Get file size for confirmation and progress bar.
-        let size = get_remote_size(&url)?;
+        let size = get_remote_size(&url, &route)?;
 
         // Confirm with user unless --yes was passed.
         if !skip_confirm && !confirm_download(repo, filename, size)? {
@@ -409,7 +559,7 @@ mod inner {
 
         // Start the download.
         eprintln!("Downloading: {url}");
-        let resp = call_for_stored_bytes("GET", &url)?;
+        let resp = call_for_stored_bytes("GET", &url, &route)?;
 
         // Get content length from the actual response (might differ from HEAD due to CDN).
         let content_length = header_values(&resp, "content-length")?
@@ -468,9 +618,9 @@ mod inner {
         let mut total_written: u64 = 0;
 
         loop {
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| DownloadError::Io(format!("read error during download: {e}")))?;
+            let n = reader.read(&mut buf).map_err(|e| {
+                DownloadError::Io(format!("read error during download{}: {e}", via(&route)))
+            })?;
             if n == 0 {
                 break;
             }
@@ -830,11 +980,452 @@ mod inner {
             for (key, size) in [("Q4_K_M", 17_442_399_968u64), ("Q5_K_M", 20_923_877_088u64)] {
                 let src = &entry.gguf_files[key];
                 let url = model_url("https://huggingface.co", &src.repo, src.file());
-                let got = get_remote_size(&url)
+                let got = get_remote_size(&url, &None)
                     .expect("HEAD")
                     .expect("Content-Length");
                 assert_eq!(got, size, "{key}: {url}");
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod proxy_env {
+        use super::*;
+
+        const HF: &str = "https://huggingface.co/Qwen/x/resolve/main/m.gguf";
+
+        /// For tests that send requests: `.invalid` never resolves (RFC 6761),
+        /// so a regression that bypasses the proxy fails at name lookup
+        /// instead of reaching a real host.
+        const OFFLINE: &str = "https://huggingface.invalid/Qwen/x/resolve/main/m.gguf";
+
+        fn route(url: &str, vars: &[(&str, &str)]) -> Result<Route, DownloadError> {
+            env_proxy(url, |name| {
+                vars.iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            })
+        }
+
+        fn proxy(url: &str, vars: &[(&str, &str)]) -> Result<Option<ureq::Proxy>, DownloadError> {
+            route(url, vars).map(|route| route.map(|(proxy, _)| proxy))
+        }
+
+        fn http(addr: &str) -> Option<ureq::Proxy> {
+            Some(ureq::Proxy::new(addr).unwrap())
+        }
+
+        #[test]
+        fn an_https_url_takes_https_proxy_then_all_proxy() {
+            assert_eq!(proxy(HF, &[]).unwrap(), None);
+            let both = [("https_proxy", "http://a:1"), ("all_proxy", "http://b:2")];
+            assert_eq!(proxy(HF, &both).unwrap(), http("http://a:1"));
+            assert_eq!(
+                proxy(HF, &[("ALL_PROXY", "http://b:2")]).unwrap(),
+                http("http://b:2")
+            );
+            assert_eq!(
+                proxy(HF, &[("HTTPS_PROXY", "proxy.corp:3128")]).unwrap(),
+                http("http://proxy.corp:3128")
+            );
+            let cased = [
+                ("https_proxy", "http://lower:1"),
+                ("HTTPS_PROXY", "http://upper:2"),
+            ];
+            assert_eq!(proxy(HF, &cased).unwrap(), http("http://lower:1"));
+        }
+
+        #[test]
+        fn a_scheme_takes_only_its_own_proxy_variable() {
+            let only_http = [("http_proxy", "http://a:1"), ("HTTP_PROXY", "http://a:1")];
+            assert_eq!(proxy(HF, &only_http).unwrap(), None);
+            let only_https = [("https_proxy", "http://a:1")];
+            assert_eq!(
+                proxy("http://mirror.test/m.gguf", &only_https).unwrap(),
+                None
+            );
+            assert_eq!(
+                proxy("http://mirror.test/m.gguf", &only_http).unwrap(),
+                http("http://a:1")
+            );
+        }
+
+        #[test]
+        fn an_empty_value_counts_as_unset() {
+            let vars = [("https_proxy", ""), ("HTTPS_PROXY", "http://a:1")];
+            assert_eq!(proxy(HF, &vars).unwrap(), http("http://a:1"));
+            let vars = [("https_proxy", "http://a:1"), ("no_proxy", "")];
+            assert_eq!(proxy(HF, &vars).unwrap(), http("http://a:1"));
+        }
+
+        #[test]
+        fn no_proxy_covers_a_host_and_its_subdomains() {
+            let covered = |list: &str, host: &str| {
+                let vars = [("https_proxy", "http://a:1"), ("no_proxy", list)];
+                proxy(&format!("https://{host}/m"), &vars)
+                    .unwrap()
+                    .is_none()
+            };
+            assert!(covered("*", "huggingface.co"));
+            assert!(covered("huggingface.co", "huggingface.co"));
+            assert!(covered("huggingface.co", "cdn-lfs.huggingface.co"));
+            assert!(covered(".huggingface.co", "cdn-lfs.huggingface.co"));
+            assert!(covered("*.huggingface.co", "cdn-lfs.huggingface.co"));
+            assert!(covered("internal, HuggingFace.co.", "huggingface.co"));
+            assert!(covered("internal huggingface.co", "huggingface.co"));
+            assert!(!covered("face.co", "huggingface.co"));
+            assert!(!covered("cdn.huggingface.co", "huggingface.co"));
+            assert!(!covered("internal,,", "huggingface.co"));
+            let upper = [
+                ("https_proxy", "http://a:1"),
+                ("NO_PROXY", "huggingface.co"),
+            ];
+            assert_eq!(proxy(HF, &upper).unwrap(), None);
+        }
+
+        #[test]
+        fn a_loopback_host_is_never_proxied() {
+            let vars = [("http_proxy", "http://a:1"), ("https_proxy", "http://a:1")];
+            for url in [
+                "http://127.0.0.1:8080/m",
+                "http://localhost:8080/m",
+                "http://[::1]:8080/m",
+                "https://127.0.0.2/m",
+            ] {
+                assert_eq!(proxy(url, &vars).unwrap(), None, "{url}");
+            }
+        }
+
+        #[test]
+        fn an_unusable_setting_is_refused_without_echoing_its_value() {
+            let bad = proxy(HF, &[("HTTPS_PROXY", "ftp://user:secret@h:21")])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                bad.contains("HTTPS_PROXY") && !bad.contains("secret"),
+                "{bad}"
+            );
+        }
+
+        #[test]
+        fn the_route_names_the_variable_it_came_from() {
+            let vars = [("HTTPS_PROXY", "http://a:1"), ("all_proxy", "http://b:2")];
+            assert_eq!(
+                route(HF, &vars).unwrap().map(|(_, name)| name),
+                Some("HTTPS_PROXY")
+            );
+            let vars = [("ALL_PROXY", "http://b:2")];
+            assert_eq!(
+                route(HF, &vars).unwrap().map(|(_, name)| name),
+                Some("ALL_PROXY")
+            );
+        }
+
+        #[test]
+        fn a_socks_proxy_is_accepted_and_socks5h_resolves_on_the_proxy() {
+            let socks = |value: &str| proxy(HF, &[("all_proxy", value)]).unwrap();
+            let want = Some(ureq::Proxy::new("socks5://u:p@h:1080").unwrap());
+            assert_eq!(socks("socks5://u:p@h:1080"), want);
+            assert_eq!(socks("socks5h://u:p@h:1080"), want);
+            assert_eq!(
+                socks("socks4a://h:1080"),
+                Some(ureq::Proxy::new("socks4a://h:1080").unwrap())
+            );
+        }
+
+        /// A proxy on loopback that answers one connection with `answer` and
+        /// hands over the request head it read: the CONNECT for an https URL,
+        /// the request itself for an http one.
+        fn recording_proxy(
+            answer: &'static [u8],
+        ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                tx.send(String::from_utf8_lossy(&head).into_owned())
+                    .unwrap();
+                sock.write_all(answer).ok();
+            });
+            (addr, rx)
+        }
+
+        const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+
+        fn head_from(heads: &std::sync::mpsc::Receiver<String>) -> String {
+            heads
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the proxy was never contacted")
+        }
+
+        #[test]
+        fn credentials_reach_the_proxy_as_curl_sends_them() {
+            // Each value with the Basic credentials curl sends for it.
+            for (value, sent) in [
+                ("http://jdoe:P%40ss%3Aw%2Fd@{addr}", "amRvZTpQQHNzOncvZA=="), // jdoe:P@ss:w/d
+                ("http://tok@{addr}", "dG9rOg=="),                             // tok:
+                ("http://u%3Ap@{addr}", "dTpwOg=="),                           // u:p:
+                ("dom%5Cjdoe:pw@{addr}", "ZG9tXGpkb2U6cHc="),                  // dom\jdoe:pw
+                ("http://jdoe:100%zz@{addr}", "amRvZToxMDAleno="),             // jdoe:100%zz
+            ] {
+                let (addr, heads) = recording_proxy(FORBIDDEN);
+                let value = value.replace("{addr}", &addr.to_string());
+                let route = route(OFFLINE, &[("https_proxy", &value)]).unwrap();
+                let err = call_for_stored_bytes("GET", OFFLINE, &route)
+                    .unwrap_err()
+                    .to_string();
+                let head = head_from(&heads);
+                let header = format!("Proxy-Authorization: basic {sent}");
+                assert!(head.lines().any(|line| line == header), "{value}: {head}");
+                // A 403 is a refusal, not a request for credentials.
+                assert!(!err.contains("requires authentication"), "{err}");
+            }
+        }
+
+        #[test]
+        fn a_proxy_that_wants_authentication_says_so() {
+            let (addr, _heads) = recording_proxy(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\r\n",
+            );
+            let route = route(OFFLINE, &[("https_proxy", &format!("http://{addr}"))]).unwrap();
+            let err = call_for_stored_bytes("GET", OFFLINE, &route)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("through the proxy in https_proxy: the proxy requires authentication"),
+                "{err}"
+            );
+            assert!(!err.contains("incorrect"), "{err}");
+        }
+
+        /// Serializes the tests that set proxy variables in the process
+        /// environment, which a download reads.
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// Run `f` with exactly `vars` set among the proxy variables, and
+        /// restore the environment before returning.
+        fn with_proxy_env<T>(vars: &[(&str, String)], f: impl FnOnce() -> T) -> T {
+            const NAMES: [&str; 8] = [
+                "https_proxy",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "HTTP_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+                "no_proxy",
+                "NO_PROXY",
+            ];
+            let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved: Vec<_> = NAMES
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            for name in NAMES {
+                std::env::remove_var(name);
+            }
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+            let out = f();
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            out
+        }
+
+        fn empty_dir(tag: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("lumen-proxy-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_download_goes_through_the_proxy_the_environment_names() {
+            let (addr, heads) = recording_proxy(FORBIDDEN);
+            let dir = empty_dir("env");
+            let result = with_proxy_env(&[("HTTPS_PROXY", format!("http://{addr}"))], || {
+                let base = BaseUrl::local("https://hf.invalid".to_string());
+                download_from(&base, "org/repo", "m.gguf", &dir, true)
+            });
+            let err = result.unwrap_err().to_string();
+            let head = head_from(&heads);
+            assert!(
+                head.starts_with("CONNECT hf.invalid:443 HTTP/1.1\r\n"),
+                "{head}"
+            );
+            assert!(err.contains("through the proxy in HTTPS_PROXY"), "{err}");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_transfer_that_breaks_through_a_proxy_names_the_variable() {
+            let (addr, heads) =
+                recording_proxy(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\npartial");
+            let dir = empty_dir("broken");
+            let base = BaseUrl::local("http://mirror.invalid".to_string());
+            let result = with_proxy_env(&[("http_proxy", format!("http://{addr}"))], || {
+                download_from(&base, "org/repo", "m.gguf", &dir, true)
+            });
+            let err = result.unwrap_err().to_string();
+            let head = head_from(&heads);
+            assert!(
+                head.starts_with(
+                    "GET http://mirror.invalid/org/repo/resolve/main/m.gguf HTTP/1.1\r\n"
+                ),
+                "{head}"
+            );
+            assert!(
+                err.contains("read error during download through the proxy in http_proxy"),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        const STORED: &[u8] = b"stored model bytes";
+
+        /// A complete response for STORED, as an origin sends it.
+        const COMPLETE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\nstored model bytes";
+
+        #[test]
+        fn a_download_through_an_http_proxy_completes() {
+            let (addr, heads) = recording_proxy(COMPLETE);
+            let dir = empty_dir("http-done");
+            let base = BaseUrl::local("http://mirror.invalid".to_string());
+            let result = with_proxy_env(&[("http_proxy", format!("http://{addr}"))], || {
+                download_from(&base, "org/repo", "m.gguf", &dir, true)
+            });
+            let path = result.unwrap();
+            assert!(head_from(&heads).starts_with(
+                "GET http://mirror.invalid/org/repo/resolve/main/m.gguf HTTP/1.1\r\n"
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), STORED);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A SOCKS5 proxy on loopback that requires a user name and password
+        /// (RFC 1929) and answers the tunnelled request with `answer`; hands
+        /// over the user name, password and target it was sent.
+        fn recording_socks5(
+            answer: &'static [u8],
+        ) -> (
+            std::net::SocketAddr,
+            std::sync::mpsc::Receiver<(String, String, String)>,
+        ) {
+            use std::io::{Read, Write};
+            fn take(sock: &mut std::net::TcpStream, n: usize) -> Vec<u8> {
+                let mut bytes = vec![0u8; n];
+                sock.read_exact(&mut bytes).unwrap();
+                bytes
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let greeting = take(&mut sock, 2);
+                let methods = take(&mut sock, greeting[1] as usize);
+                assert!(methods.contains(&2), "no username/password method offered");
+                sock.write_all(&[5, 2]).unwrap();
+                let len = take(&mut sock, 2)[1] as usize;
+                let user = String::from_utf8(take(&mut sock, len)).unwrap();
+                let len = take(&mut sock, 1)[0] as usize;
+                let password = String::from_utf8(take(&mut sock, len)).unwrap();
+                sock.write_all(&[1, 0]).unwrap();
+                let request = take(&mut sock, 4);
+                assert_eq!(request[3], 3, "the target is sent as a name");
+                let len = take(&mut sock, 1)[0] as usize;
+                let host = String::from_utf8(take(&mut sock, len)).unwrap();
+                let port = u16::from_be_bytes(take(&mut sock, 2).try_into().unwrap());
+                sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(take(&mut sock, 1)[0]);
+                }
+                tx.send((user, password, format!("{host}:{port}"))).unwrap();
+                sock.write_all(answer).unwrap();
+            });
+            (addr, rx)
+        }
+
+        #[test]
+        fn a_download_through_socks5_completes_with_the_decoded_credentials() {
+            let (addr, sent) = recording_socks5(COMPLETE);
+            let dir = empty_dir("socks-done");
+            let base = BaseUrl::local("http://mirror.invalid".to_string());
+            let value = format!("socks5://jdoe:P%40ss%3Aw%2Fd@{addr}");
+            let result = with_proxy_env(&[("all_proxy", value)], || {
+                download_from(&base, "org/repo", "m.gguf", &dir, true)
+            });
+            let path = result.unwrap();
+            let (user, password, target) = sent
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the proxy was never contacted");
+            assert_eq!(
+                (user.as_str(), password.as_str(), target.as_str()),
+                ("jdoe", "P@ss:w/d", "mirror.invalid:80")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), STORED);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A proxy that accepts connections and never answers: a request
+        /// through it would stall.
+        fn silent_proxy() -> (std::net::TcpListener, Route) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let proxy = ureq::Proxy::new(format!("http://{addr}")).unwrap();
+            (listener, Some((proxy, "https_proxy")))
+        }
+
+        #[test]
+        fn the_advisory_size_is_not_asked_for_through_a_proxy() {
+            let (listener, route) = silent_proxy();
+            listener.set_nonblocking(true).unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(get_remote_size(OFFLINE, &route).unwrap(), None);
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert!(listener.accept().is_err(), "the proxy was contacted");
+        }
+
+        #[test]
+        fn a_failure_through_a_proxy_names_the_variable() {
+            let addr = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap()
+            };
+            let route = Some((
+                ureq::Proxy::new(format!("http://{addr}")).unwrap(),
+                "https_proxy",
+            ));
+            let err = call_for_stored_bytes("GET", OFFLINE, &route)
+                .unwrap_err()
+                .to_string();
+            // Refused by the dead proxy, not a name lookup of the target.
+            assert!(err.contains("Connection Failed"), "{err}");
+            assert!(err.contains("through the proxy in https_proxy"), "{err}");
         }
     }
 }

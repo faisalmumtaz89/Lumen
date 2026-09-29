@@ -5,6 +5,15 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Fixed
+
+- **`lumen pull` ignored proxy settings.** On a network that reaches the internet only through
+  a proxy, model downloads, and so the one-line installer, failed. Downloads now use the HTTP or
+  SOCKS proxy that `https_proxy` or `all_proxy` names, read as curl reads them, and go direct
+  when `no_proxy` lists Hugging Face's host.
+
 ## [0.37.0] — 2026-09-29
 
 ### Added
