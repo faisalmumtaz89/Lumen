@@ -70,7 +70,7 @@ pub(crate) fn extract_hyperparams(
     //   - undercount in `block_count`
     let real_layers = real_main_layer_count(gguf);
     // A producer that counts the MTP blocks in `block_count` records how many
-    // in `nextn_predict_layers`; a difference that accounts for is the
+    // in `nextn_predict_layers`; a difference of exactly that many is the
     // expected layout, not a discrepancy.
     let nextn = gguf
         .get_u32(&format!("{prefix}.nextn_predict_layers"))
@@ -216,6 +216,12 @@ pub(crate) fn extract_hyperparams(
     Ok((hp, arch))
 }
 
+/// Whether `block_count` is anything other than the `observed` backbone layers
+/// plus the `nextn` MTP blocks a producer may count in it.
+fn block_count_unexplained(block_count: u32, observed: u32, nextn: u32) -> bool {
+    observed.checked_add(nextn) != Some(block_count)
+}
+
 /// Return the number of REAL (non-MTP) backbone layers detected in the GGUF
 /// tensor list, or `None` if no `blk.N.*` tensors are present.
 ///
@@ -238,12 +244,6 @@ pub(crate) fn extract_hyperparams(
 /// is a gap (e.g. blk.5 is missing but blk.6 exists), only the consecutive
 /// prefix is returned — that's the contract our per-layer arch dispatchers
 /// rely on.
-/// Whether `block_count` differs from the `observed` backbone layers by more
-/// than the `nextn` MTP blocks it may include.
-fn block_count_unexplained(block_count: u32, observed: u32, nextn: u32) -> bool {
-    observed.checked_add(nextn) != Some(block_count)
-}
-
 fn real_main_layer_count(gguf: &GgufFile) -> Option<u32> {
     use std::collections::{HashMap, HashSet};
 
