@@ -69,13 +69,21 @@ pub(crate) fn extract_hyperparams(
     //   - simple off-by-one in `block_count` metadata
     //   - undercount in `block_count`
     let real_layers = real_main_layer_count(gguf);
+    // A producer that counts the MTP blocks in `block_count` records how many
+    // in `nextn_predict_layers`; a difference that accounts for is the
+    // expected layout, not a discrepancy.
+    let nextn = gguf
+        .get_u32(&format!("{prefix}.nextn_predict_layers"))
+        .unwrap_or(0);
     let num_layers = match real_layers {
         Some(observed) if observed != metadata_block_count => {
-            eprintln!(
-                "  WARNING: {prefix}.block_count metadata says {metadata_block_count} but \
-                 observed {observed} real (non-MTP) blk.* layers in tensor list. \
-                 Using observed value.",
-            );
+            if block_count_unexplained(metadata_block_count, observed, nextn) {
+                eprintln!(
+                    "  WARNING: {prefix}.block_count metadata says {metadata_block_count} but \
+                     observed {observed} real (non-MTP) blk.* layers in tensor list. \
+                     Using observed value.",
+                );
+            }
             observed
         }
         Some(observed) => observed,
@@ -230,6 +238,12 @@ pub(crate) fn extract_hyperparams(
 /// is a gap (e.g. blk.5 is missing but blk.6 exists), only the consecutive
 /// prefix is returned — that's the contract our per-layer arch dispatchers
 /// rely on.
+/// Whether `block_count` differs from the `observed` backbone layers by more
+/// than the `nextn` MTP blocks it may include.
+fn block_count_unexplained(block_count: u32, observed: u32, nextn: u32) -> bool {
+    observed.checked_add(nextn) != Some(block_count)
+}
+
 fn real_main_layer_count(gguf: &GgufFile) -> Option<u32> {
     use std::collections::{HashMap, HashSet};
 
@@ -413,5 +427,24 @@ pub(crate) fn quant_descriptor_for(scheme: QuantScheme) -> QuantizationDescripto
             block_byte_size: 0,
             scale_offset_in_block: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_count_unexplained;
+
+    #[test]
+    fn mtp_blocks_named_by_nextn_explain_the_difference() {
+        assert!(!block_count_unexplained(65, 64, 1));
+        assert!(!block_count_unexplained(33, 32, 1));
+    }
+
+    #[test]
+    fn any_other_difference_is_unexplained() {
+        assert!(block_count_unexplained(65, 64, 0));
+        assert!(block_count_unexplained(66, 64, 1));
+        assert!(block_count_unexplained(63, 64, 1));
+        assert!(block_count_unexplained(65, 64, u32::MAX));
     }
 }
