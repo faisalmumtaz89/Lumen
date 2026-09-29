@@ -13,6 +13,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `Accept: image/png`**, so `curl -o image.png` saves the image without JSON tools. JSON stays
   the default.
 
+### Fixed
+
+- **Converting a model with multi-token-prediction layers printed a false warning.** Such a GGUF
+  counts those layers in `block_count` and records how many in `nextn_predict_layers`, so
+  `lumen pull qwen3.8-27b:q4_0` warned that the metadata disagreed with the model. The converter
+  now accounts for them and warns only about a real mismatch.
+
 ## [0.36.1] — 2026-09-29
 
 ### Fixed
