@@ -13,6 +13,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `Accept: image/png`**, so `curl -o image.png` saves the image without JSON tools. JSON stays
   the default.
 
+### Changed
+
+- **The one-line installer's closing lines no longer repeat or contradict each other.** It no
+  longer echoes `lumen pull`'s own summary, says "ready" rather than "ready (cached)" after a
+  fresh download, and suggests the same first prompt as the site.
+
 ### Fixed
 
 - **Converting a model with multi-token-prediction layers printed a false warning.** Such a GGUF

@@ -472,21 +472,21 @@ if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
   fi
 fi
 say ""
-info "preparing $MODEL:$QUANT (download + convert; one-time)"
+info "preparing $MODEL:$QUANT (downloaded and converted once, then reused)"
 # Strip the installer's own LUMEN_* input vars (model/quant/prefix/tag/release-base/
 # insecure flags) from the child env — they configure the installer, not lumen, so
 # lumen's env-var typo validator would otherwise warn about each one. LUMEN_CACHE_DIR
 # IS a real lumen var and is passed through explicitly.
 env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_BASE \
     -u LUMEN_ALLOW_INSECURE_BASE -u LUMEN_INSECURE_SKIP_CHECKSUM \
-    LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes \
+    LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes >/dev/null \
   || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer (it restarts cleanly), or run: $DEST/lumen pull $MODEL:$QUANT --yes"
 
 # ── Step 6 · print the exact next steps (positional model:quant forms) ────────
 say ""
-say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready (cached)"
+say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready"
 say ""
-say "  ${C_BOLD}Chat${C_RESET}     lumen run $MODEL:$QUANT \"Write a haiku about Rust\""
+say "  ${C_BOLD}Chat${C_RESET}     lumen run $MODEL:$QUANT \"Write a haiku about light\""
 say "  ${C_BOLD}Serve${C_RESET}    lumen-server $MODEL:$QUANT          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"
 say ""
 # PATH reminder only if $DEST isn't already on PATH (e.g. fresh ~/.local/bin).
