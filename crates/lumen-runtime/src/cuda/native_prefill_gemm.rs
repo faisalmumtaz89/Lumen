@@ -199,6 +199,9 @@ impl NativeGemm {
         let (table, source) = match algo_cache::load(&identity, lib)? {
             Ok((table, path)) => (table, TableSource::Cached(path)),
             Err(reason) => {
+                eprintln!(
+                    "[CUDA] measuring the prefill GEMM plans for this GPU, about half a minute"
+                );
                 let ws = workspace.device_ptr(&device.stream).0;
                 let mut plans = Vec::with_capacity(matmuls.len());
                 for (s, shape) in SHAPES.iter().enumerate() {

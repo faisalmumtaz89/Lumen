@@ -61,12 +61,12 @@ modal run packaging/modal/validate_arches.py --arches T4,H100 # a subset
 Each arch:
 1. wipes its own PTX-cache subdir, **cold-launches** the server (NVRTC compiles
    all ~252 modules for this arch), times "listening", records the
-   `PTX cache cold` log line and the number of `.ptxc` files written;
+   `compiling kernels` log line and the number of `.ptxc` files written;
 2. runs **DET-001** (20× temp-0 greedy on a fixed prompt → must be 1 distinct);
 3. runs a **coherence** smoke test (capital of France → Paris, 17×23 → 391, …);
 4. measures rough **decode tok/s**;
 5. **warm-relaunches** (cache now populated) and times "listening" again —
-   warm must be much faster than cold and report `PTX cache warm`.
+   warm must be much faster than cold and print no `compiling kernels` line.
 
 The container stops as soon as the function returns, so the whole matrix is a
 few GPU-minutes. The driver prints a JSON matrix to stdout.

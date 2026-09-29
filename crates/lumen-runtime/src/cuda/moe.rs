@@ -2336,7 +2336,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped gate_up W10 (K4, register-C wide-M IMMA): ACTIVE \
                      (counts MG1={} MG2={} MG3={} MG4={}, total_cols={total_cols}, \
@@ -2421,7 +2421,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped gate_up TILED-BF16-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2464,7 +2464,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped gate_up TILED-Q4-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2507,7 +2507,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped gate_up TILED: ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2599,7 +2599,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped down TILED-BF16-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2636,7 +2636,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped down TILED-Q4-F32ACT: ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2673,7 +2673,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
+            if super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[CUDA]: MoE grouped down TILED-F32ACT (rescue): ACTIVE (num_tiles={num_tiles16}, \
                      total_cols={total_cols}, inter_dim={inter_dim}, hidden_dim={hidden_dim})"
@@ -2898,7 +2898,7 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
-        if shared_tiled && !LOGGED.swap(true, Ordering::Relaxed) {
+        if shared_tiled && super::decode::cuda_verbose() && !LOGGED.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "[CUDA]: shared-expert TILED-Q4-F32ACT: ACTIVE (batch={batch}, \
                  inter_dim={inter_dim_eff}, hidden_dim={hidden_dim})"

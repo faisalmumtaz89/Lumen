@@ -165,7 +165,7 @@ impl<'a> CacheKey<'a> {
         hex(&h.finalize())
     }
 
-    fn cache_path(&self) -> Option<PathBuf> {
+    pub(crate) fn cache_path(&self) -> Option<PathBuf> {
         ptx_cache_dir().map(|d| d.join(format!("{}.ptxc", self.digest_hex())))
     }
 
@@ -198,16 +198,21 @@ pub(crate) fn load(key: &CacheKey) -> Option<Vec<u8>> {
 }
 
 /// Atomically write `ptx` (the NVRTC `Image` bytes, including the trailing NUL,
-/// or a cubin) to the cache for `key`. Best-effort: any failure is silently ignored (the
-/// kernel still loaded from the fresh compile; the cache is just not populated
-/// this time). Uses temp-file + rename so a partial write can never be read.
+/// or a cubin) to the cache for `key`. Best-effort: a failure leaves the cache
+/// unpopulated this time (the kernel still loaded from the fresh compile) and is
+/// reported once per process. Uses temp-file + rename so a partial write can
+/// never be read.
 pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
     if !cache_enabled() {
         return;
     }
-    let Some(path) = key.cache_path() else { return };
+    let Some(path) = key.cache_path() else {
+        warn_unwritable(None);
+        return;
+    };
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
+        warn_unwritable(Some(dir));
         return;
     }
     // The driver accepted PTX for this key, so any driver-reject marker it
@@ -216,7 +221,24 @@ pub(crate) fn store(key: &CacheKey, ptx: &[u8]) {
     if let Some(reject) = key.reject_path() {
         let _ = std::fs::remove_file(reject);
     }
-    write_atomically(&path, &serialize_entry(ptx));
+    if !write_atomically(&path, &serialize_entry(ptx)) {
+        warn_unwritable(Some(dir));
+    }
+}
+
+/// Say, once per process, that the cache could not take an entry: the kernels
+/// compiled now compile again on the next run.
+fn warn_unwritable(dir: Option<&Path>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| match dir {
+        Some(dir) => eprintln!(
+            "[CUDA] could not write the kernel cache in {}; kernels compile again on the next run",
+            dir.display()
+        ),
+        None => eprintln!(
+            "[CUDA] no directory for the kernel cache; kernels compile again on the next run"
+        ),
+    });
 }
 
 /// Write `bytes` to `path` through a temp file and a rename, so a reader sees

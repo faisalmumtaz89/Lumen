@@ -187,6 +187,10 @@ OPTIONS:
     --verbose-routing     Print per-layer MoE router diagnostics (entropy, expert selection)
 
 ENVIRONMENT VARIABLES (CUDA backend):
+    LUMEN_CUDA_VERBOSE=1
+                          Print the CUDA backend's start-up details: kernel
+                          cache, memory use and the routes chosen by default.
+                          Warnings and errors print without it.
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                           Per-decode-step CPU sleep in microseconds, applied AFTER
                           `device.synchronize()` in the CUDA decode paths. Default
@@ -212,9 +216,10 @@ ENVIRONMENT VARIABLES (CUDA backend):
                           with NVRTC 13.3 and driver 610; a toolchain whose
                           build changes those outputs fails it) and every GEMM has
                           a plan verified once and cached (measuring the plans
-                          adds about half a minute to the first load); the load log
-                          names the route chosen and, for the F32 route, the
-                          first condition that failed."
+                          adds about half a minute to the first load); when the
+                          native route is refused, the load log names the first
+                          condition that failed (LUMEN_CUDA_VERBOSE=1 names the
+                          admitted route too)."
     );
 }
 

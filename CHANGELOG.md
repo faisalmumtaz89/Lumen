@@ -20,6 +20,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   fresh download and names the folder that holds the model, and suggests the same first prompt as
   the site, as do the README, the docs and the command help.
 
+- **`lumen` and `lumen-server` print far fewer CUDA start-up lines by default.** The memory
+  receipts, kernel routes and autotune results that preceded every answer now print only with
+  `LUMEN_CUDA_VERBOSE=1`; warnings and errors still print, as does a K-quant model's
+  quantized-planes summary. One line says when kernels are compiled rather than loaded from the
+  cache, or NVFP4/FP8 prefill plans are measured, and a kernel cache that cannot be written is
+  reported.
+
 ### Fixed
 
 - **Converting a model with multi-token-prediction layers printed a false warning.** Such a GGUF

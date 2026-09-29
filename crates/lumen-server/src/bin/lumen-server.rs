@@ -161,6 +161,10 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            each generation loads them faster. CUDA only.
 
 ENVIRONMENT VARIABLES (CUDA backend):
+    LUMEN_CUDA_VERBOSE=1
+                           Print the CUDA backend's start-up details: kernel
+                           cache, memory use and the routes chosen by default.
+                           Warnings and errors print without it.
     LUMEN_CUDA_DECODE_DELAY_US=<N>
                            Per-decode-step CPU sleep in microseconds, applied
                            after `cudaDeviceSynchronize` in the CUDA decode

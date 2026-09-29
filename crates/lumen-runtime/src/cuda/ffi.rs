@@ -327,6 +327,7 @@ impl CudaDevice {
             // driver-reject marker instead and return the error for the caller
             // to fall back on.
             super::ptx_cache::record_miss();
+            announce_compiling(key.cache_path().is_some());
             let (image, bytes) =
                 Self::nvrtc_compile(cuda_source, arch, sass.as_deref(), fast_math)?;
             match self.ctx.load_module(image) {
@@ -352,6 +353,7 @@ impl CudaDevice {
 
         // Cache disabled or a version query failed -> plain compile+load. The
         // message names the versions when they are known.
+        announce_compiling(false);
         let (image, _) = Self::nvrtc_compile(cuda_source, arch, sass.as_deref(), fast_math)?;
         let (driver, nvrtc) = toolchain
             .as_ref()
@@ -586,6 +588,21 @@ impl CudaDevice {
         }
         Ok(())
     }
+}
+
+/// Say, once per process, that kernels are being compiled: a first run waits
+/// on it, and the default output shows nothing else while it does. `cached`:
+/// the compiled kernels are written to the cache for a later run to load (a
+/// write that fails says so).
+fn announce_compiling(cached: bool) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if cached {
+            eprintln!("[CUDA] compiling kernels for this GPU; later runs load them from the cache");
+        } else {
+            eprintln!("[CUDA] compiling kernels for this GPU");
+        }
+    });
 }
 
 /// Environment components of a PTX cache key (everything except the per-kernel
