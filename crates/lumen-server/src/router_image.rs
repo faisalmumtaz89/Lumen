@@ -96,6 +96,45 @@ pub struct ImageState {
     pub sources: Option<lumen_image::pipeline::GpuSources>,
 }
 
+/// Whether the client asked for the PNG itself rather than the JSON body: its
+/// `Accept` header weighs `image/png` above `application/json`, each weighed by
+/// the most specific media range that names it (RFC 9110 §12.5.1). No header,
+/// or one that names neither, keeps the JSON default.
+#[cfg(feature = "image")]
+fn prefers_png(headers: &axum::http::HeaderMap) -> bool {
+    // Weights by specificity: the exact type, `type/*`, then `*/*`.
+    let mut png = [None::<f32>; 3];
+    let mut json = [None::<f32>; 3];
+    let note = |slot: &mut Option<f32>, q: f32| *slot = Some(slot.map_or(q, |s| s.max(q)));
+    for value in headers.get_all(axum::http::header::ACCEPT) {
+        let Ok(value) = value.to_str() else { continue };
+        for range in value.split(',') {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let q = parts.find_map(|param| {
+                let (name, value) = param.split_once('=')?;
+                name.trim().eq_ignore_ascii_case("q").then(|| value.trim())
+            });
+            let Some(q) = q.map_or(Some(1.0), |q| q.parse::<f32>().ok()) else {
+                continue;
+            };
+            match media.as_str() {
+                "image/png" => note(&mut png[0], q),
+                "image/*" => note(&mut png[1], q),
+                "application/json" => note(&mut json[0], q),
+                "application/*" => note(&mut json[1], q),
+                "*/*" => {
+                    note(&mut png[2], q);
+                    note(&mut json[2], q);
+                }
+                _ => {}
+            }
+        }
+    }
+    let weight = |w: [Option<f32>; 3]| w.into_iter().flatten().next().unwrap_or(0.0);
+    weight(png) > weight(json)
+}
+
 /// Base64, so the response carries a PNG without a separate file store.
 #[cfg(feature = "image")]
 fn base64_encode(bytes: &[u8]) -> String {
@@ -127,8 +166,10 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(feature = "image")]
 pub async fn generate_image(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<ImageState>>,
+    headers: axum::http::HeaderMap,
     crate::router::OpenAiJson(req): crate::router::OpenAiJson<ImageGenerationRequest>,
 ) -> Result<Response, ServerError> {
+    let png_body = prefers_png(&headers);
     let engine = state.engine.clone();
     if let Some(model) = &req.model {
         if model != &state.config.model_id {
@@ -275,6 +316,9 @@ pub async fn generate_image(
     .await
     .map_err(|e| ServerError::Internal(format!("generation task failed: {e}")))??;
 
+    if png_body {
+        return Ok(([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response());
+    }
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -327,5 +371,51 @@ mod tests {
     fn base64_handles_high_bytes() {
         assert_eq!(base64_encode(&[0xFF, 0xFF, 0xFF]), "////");
         assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+    }
+
+    /// `prefers_png` over a request carrying one `Accept` line per value.
+    fn png_for(accept: &[&str]) -> bool {
+        let mut headers = axum::http::HeaderMap::new();
+        for value in accept {
+            headers.append(axum::http::header::ACCEPT, value.parse().unwrap());
+        }
+        super::prefers_png(&headers)
+    }
+
+    #[test]
+    fn json_stays_the_default() {
+        assert!(!png_for(&[]));
+        assert!(!png_for(&["*/*"]));
+        assert!(!png_for(&["application/json"]));
+        assert!(!png_for(&["text/html"]));
+        assert!(!png_for(&["image/png, application/json"]));
+    }
+
+    #[test]
+    fn a_client_that_names_png_gets_png() {
+        assert!(png_for(&["image/png"]));
+        assert!(png_for(&["IMAGE/PNG"]));
+        assert!(png_for(&["image/*"]));
+        assert!(png_for(&["image/png, */*;q=0.8"]));
+        assert!(png_for(&["application/json;q=0.5, image/png"]));
+        assert!(png_for(&["text/html", "image/png"]));
+    }
+
+    #[test]
+    fn the_most_specific_range_sets_the_weight() {
+        assert!(!png_for(&["image/png;q=0, image/*"]));
+        assert!(!png_for(&["image/*;q=0.2, */*"]));
+        assert!(!png_for(&["image/png;q=0.4, application/json;q=0.5"]));
+        assert!(png_for(&["image/png;q=0.6, application/json;q=0.5"]));
+        assert!(png_for(&["image/png; Q=0.9, */*;q=0.1"]));
+        assert!(png_for(&[
+            "image/png ; q = 0.9 , application/json ; q = 0.8"
+        ]));
+    }
+
+    #[test]
+    fn a_range_with_an_unreadable_weight_is_ignored() {
+        assert!(!png_for(&["image/png;q=high"]));
+        assert!(png_for(&["image/png;q=high, image/*"]));
     }
 }

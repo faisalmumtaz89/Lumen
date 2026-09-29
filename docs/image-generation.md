@@ -69,6 +69,18 @@ The response is `{"created": <unix-seconds>, "data": [{"b64_json": "<PNG>"}]}` (
 `{"url": "data:image/png;base64,…"}`). The same request with the same seed produces the
 same bytes.
 
+A request that sends `Accept: image/png` receives the PNG itself (`Content-Type: image/png`)
+instead, so curl alone can save it:
+
+```sh
+curl -fsS http://localhost:8000/v1/images/generations \
+  -H 'content-type: application/json' -H 'accept: image/png' \
+  -d '{"prompt":"A red apple on a wooden table"}' -o apple.png
+```
+
+`image/png` is weighed against `application/json` as HTTP content negotiation defines it;
+with no `Accept` header, or `*/*`, the response is JSON.
+
 ## Sharing the device with a text model
 
 Generations run one at a time. When the text model is served on the same CUDA device, a

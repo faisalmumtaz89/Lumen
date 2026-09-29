@@ -5,6 +5,14 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Added
+
+- **`POST /v1/images/generations` returns the PNG itself to a request that sends
+  `Accept: image/png`**, so `curl -o image.png` saves the image without JSON tools. JSON stays
+  the default.
+
 ## [0.36.1] — 2026-09-29
 
 ### Fixed
