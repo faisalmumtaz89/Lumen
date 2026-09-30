@@ -31,6 +31,30 @@ place of `model:quant`: `lumen-server /path/to/qwen3-5-9b-Q8_0.lbc`.
 
 The bin is gated behind the `bin` Cargo feature so library embedders that wire their own tokenizer / backend keep the `lumen-server` dep graph minimal. `lumen-server --help` lists all flags.
 
+## Requests from web pages
+
+A browser adds an `Origin` header to every request a web page sends other than a plain GET or HEAD, and
+`lumen-server` refuses any request that carries one (403) unless that origin is allowed. Without this, any site open
+in a browser on the machine could have it generate text and images, including by DNS rebinding. Clients that are not
+web pages, such as curl, the OpenAI and Anthropic SDKs and editor extensions, send no `Origin` and are not affected.
+
+These clients send one, and each needs its origin allowed as it sends it; the refusal names it:
+
+- a web app, whether it reaches the server through a reverse proxy that adds CORS headers or is served from the same
+  site as the API;
+- a browser extension: `chrome-extension://<id>`, or `moz-extension://<uuid>` in Firefox;
+- an app built on a web view, such as a Tauri app: `tauri://localhost`, or `http://tauri.localhost` on Windows.
+
+```bash
+lumen-server qwen3.5-9b:q8_0 --allow-origin https://app.example.com --allow-origin chrome-extension://<id>
+```
+
+`--allow-origin` only lets these requests through: the server sends no CORS headers, so a page on another origin still
+needs a proxy that adds them to read the answers. `null`, the origin of sandboxed frames and local files, cannot be
+allowed, since any site can produce it; some extensions and older web-view apps send `null` for the same reason, and
+the refusal says so when they do (`this one's origin, "null", cannot be`) — such a client must be served from the same
+origin as the API instead.
+
 ## Endpoints
 
 ```text
@@ -140,7 +164,7 @@ recovery and timing tests; a build without the feature has none of this code.
 Custom embedders own the tokenizer and weight provider; the runtime owns the GPU.
 
 ```rust
-use lumen_server::{build_router, EngineWorker};
+use lumen_server::{build_router, AllowedOrigins, EngineWorker};
 
 let handle = EngineWorker::spawn(
     runtime_config,
@@ -151,13 +175,13 @@ let handle = EngineWorker::spawn(
     model_info,
     /* inbox_size */ 32,
 );
-let router = build_router(handle);
+let router = build_router(handle, AllowedOrigins::default());
 axum::serve(listener, router).await?;
 ```
 
-`EngineWorker::spawn` signature: `(config, hyperparams, backend, weights, tokenizer, model_info, inbox_size) -> EngineHandle` ([`crates/lumen-server/src/engine.rs`](../crates/lumen-server/src/engine.rs)). `build_router(engine: EngineHandle)` returns the configured axum `Router` ([`crates/lumen-server/src/router.rs`](../crates/lumen-server/src/router.rs)). `AppState` is constructed internally by `build_router` from the handle — embedders pass the handle directly.
+`EngineWorker::spawn` signature: `(config, hyperparams, backend, weights, tokenizer, model_info, inbox_size) -> EngineHandle` ([`crates/lumen-server/src/engine.rs`](../crates/lumen-server/src/engine.rs)). `build_router(engine: EngineHandle, origins: AllowedOrigins)` returns the configured axum `Router`, refusing requests from web pages whose origin `origins` does not list (`AllowedOrigins::from_values` takes the `--allow-origin` values) ([`crates/lumen-server/src/router.rs`](../crates/lumen-server/src/router.rs)). `AppState` is constructed internally by `build_router` from the handle — embedders pass the handle directly.
 
 ## Known limitations
 
-- **Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
+- **Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines, and allow the origin of any web app it serves with `--allow-origin`.
 - **Mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.

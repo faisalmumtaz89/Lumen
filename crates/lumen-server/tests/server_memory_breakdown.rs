@@ -52,7 +52,8 @@ use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use lumen_runtime::RuntimeConfig;
 
 use lumen_server::{
-    build_router, EngineHandle, EngineWorker, IdentityByteTokenizer, ModelInfo, Tokenize,
+    build_router, AllowedOrigins, EngineHandle, EngineWorker, IdentityByteTokenizer, ModelInfo,
+    Tokenize,
 };
 
 const MAX_TOKENS: usize = 4;
@@ -168,7 +169,7 @@ async fn boot() -> (
     );
 
     let handle_for_app = handle.clone();
-    let app = build_router(handle_for_app);
+    let app = build_router(handle_for_app, AllowedOrigins::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

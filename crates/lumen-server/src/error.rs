@@ -35,6 +35,11 @@ pub enum ServerError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    /// A request this server refuses to serve at all, such as one from a web
+    /// page whose origin is not allowed.
+    #[error("{0}")]
+    Forbidden(String),
+
     /// Underlying runtime error while running inference.
     #[error("runtime error: {0}")]
     Runtime(String),
@@ -111,6 +116,7 @@ impl ServerError {
         match self {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::EngineUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -120,6 +126,7 @@ impl ServerError {
         match self {
             Self::BadRequest { .. } => "invalid_request_error",
             Self::ModelNotFound(_) => "not_found_error",
+            Self::Forbidden(_) => "permission_error",
             Self::Runtime(_) => "api_error",
             Self::EngineUnavailable(_) => "overloaded_error",
             Self::Internal(_) => "api_error",

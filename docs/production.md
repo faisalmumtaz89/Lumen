@@ -37,7 +37,7 @@ Operational policy items required before production deployment:
 - **MoE-35B-A3B decode vs llama.cpp — retained record**: Q8 0.567× and Q4 0.598× on A100 (co-located); BF16 0.575× on H100 (separate per-engine batteries; 104.1 vs 181.1 tok/s — the highest absolute throughput of the three but the lowest ratio; A100 decode unmeasured). The previously published 0.902×/0.584×/0.674× figures have no retained measurement artifacts.
 - **PURE-greedy long-form (≥ 512 tokens)** deterministically loops on all 4 quants. Use sampling or repetition penalty in production.
 - **`lumen-server` mid-stream client disconnect** can wedge the engine worker. Pending fix; work around with a reverse-proxy that buffers SSE responses.
-- **`lumen-server` Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines.
+- **`lumen-server` Authorization / CORS / per-request timeout** are not implemented; deploy behind a reverse proxy that enforces auth, CORS, and request deadlines, and allow the origin of any web app it serves with `--allow-origin` (a request from a web page is refused otherwise).
 - **Lumen chat template forces `<think>\n` open for the v1 Qwen3.5 family**, the `--prompt` path on `lumen run` bypasses the template; for server use, the production behavior is the chat-templated path. Future model families will register their own chat templates without changing the dispatch layer.
 
 ## GPU memory peaks

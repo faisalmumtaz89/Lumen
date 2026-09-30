@@ -21,11 +21,13 @@
 //! `{"error":{"message", "type":"invalid_request_error", "param", "code"}}`.
 //! This replaces axum's default 422 + plain-text rejection.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -33,6 +35,7 @@ use serde::de::DeserializeOwned;
 
 use crate::engine::EngineHandle;
 use crate::error::ServerError;
+use crate::origins::{refuse_unlisted_origins, AllowedOrigins};
 use crate::wire;
 
 /// Application state passed to every handler.
@@ -41,7 +44,8 @@ pub struct AppState {
     pub engine: EngineHandle,
 }
 
-/// Build the axum router.
+/// Build the axum router. A request from a web page whose origin `origins`
+/// does not list is refused before any route sees it (see [`crate::origins`]).
 ///
 /// The `/debug/memory_breakdown` endpoint is registered unconditionally so
 /// the surface is uniform. The handler returns 404 when
@@ -50,7 +54,7 @@ pub struct AppState {
 /// This keeps the default response surface byte-identical to the legacy
 /// router shape — no new live route response body, no new shipped data
 /// when the operator has not explicitly opted in to debug instrumentation.
-pub fn build_router(engine: EngineHandle) -> Router {
+pub fn build_router(engine: EngineHandle, origins: AllowedOrigins) -> Router {
     let state = AppState { engine };
     Router::new()
         .route("/v1/models", get(list_models))
@@ -60,6 +64,10 @@ pub fn build_router(engine: EngineHandle) -> Router {
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/debug/memory_breakdown", get(memory_breakdown))
         .with_state(state)
+        .layer(from_fn_with_state(
+            Arc::new(origins),
+            refuse_unlisted_origins,
+        ))
 }
 
 /// As [`build_router`], additionally serving `POST /v1/images/generations`.
@@ -72,6 +80,7 @@ pub fn build_router(engine: EngineHandle) -> Router {
 pub fn build_router_with_images(
     engine: EngineHandle,
     images: std::sync::Arc<crate::router_image::ImageState>,
+    origins: AllowedOrigins,
 ) -> Router {
     let state = AppState { engine };
     Router::new()
@@ -90,6 +99,10 @@ pub fn build_router_with_images(
                 .route("/debug/memory_breakdown", get(memory_breakdown))
                 .with_state(state),
         )
+        .layer(from_fn_with_state(
+            Arc::new(origins),
+            refuse_unlisted_origins,
+        ))
 }
 
 // ----------------------------- OpenAiJson extractor ---------------------

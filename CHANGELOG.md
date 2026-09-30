@@ -5,6 +5,17 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Security
+
+- **Web pages could make `lumen-server` generate.** Any site open in a browser on the machine could send the server
+  a request it would run, including by DNS rebinding. The server now refuses a request that carries an `Origin`
+  header unless that origin is allowed with the new `--allow-origin` flag (repeatable).
+  Clients that are not web pages, such as curl, the SDKs and editor extensions, send no `Origin` and are unaffected.
+  A web app (behind a proxy that adds CORS headers, or served from the same site as the API), a browser extension, or
+  an app built on a web view, such as a Tauri app, now needs its origin allowed; the refusal names it.
+
 ## [0.38.0] — 2026-09-30
 
 ### Changed
