@@ -604,12 +604,14 @@ struct CudaFactory {
 
 #[cfg(feature = "cuda")]
 impl CudaFactory {
-    /// The global planes CUDA takes as stored. The F32 dequant is kept
-    /// (skip=false) until the skip is validated on real CUDA hardware; the
-    /// CPU embed fallback is statically unreachable after init(), so this
-    /// holds unread host heap, not a live dependency.
+    /// The global planes CUDA takes as stored. The F32 dequant of a plane the
+    /// backend takes raw is skipped: the raw plane is the backend's copy and the
+    /// CPU embed fallback is statically unreachable after init(), so the F32 was
+    /// only ~8 GB of unread host heap — allocated on every build, so it also
+    /// inflated each text-model restore behind an image generation. Skipping it
+    /// is byte-identical (the same validation Metal already relies on).
     const RAW_ACCEPTANCE: RawAcceptance = RawAcceptance {
-        skip_f32_when_raw: false,
+        skip_f32_when_raw: true,
         q6k_head: true,
         bf16_head: true,
         nvfp4_head: true,
