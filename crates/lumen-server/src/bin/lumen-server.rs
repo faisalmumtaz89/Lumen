@@ -459,6 +459,28 @@ fn registry_key(name: &str) -> String {
         .map_or_else(|| name.replace('.', "-"), |entry| entry.key.clone())
 }
 
+/// The model id reported on the wire (`/v1/models`, and echoed in responses).
+/// A registry name is reported as given; a model given as a file path is reduced
+/// to the file's name without its directory or extension, so a server launched
+/// by path does not expose the operator's home directory and user name (a
+/// request to `/v1/models` would otherwise return, e.g.,
+/// `/Users/alice/models/qwen3-5-9b-Q8_0.lbc`). Path detection matches the
+/// positional argument parser above.
+fn model_public_id(model: &str) -> String {
+    let looks_like_path = model.contains('/')
+        || model.contains('\\')
+        || model.ends_with(".lbc")
+        || model.ends_with(".gguf");
+    if !looks_like_path {
+        return model.to_string();
+    }
+    std::path::Path::new(model)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| model.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer adapter — wraps `lumen_cli::tokenize::BpeTokenizer` to implement
 // the `lumen_server::Tokenize` trait. Same shape as the soak harness adapter
@@ -1075,7 +1097,7 @@ async fn run(args: Args) -> Result<(), String> {
         collect_per_layer_timings: false,
     };
     let model_info = ModelInfo {
-        id: args.model.clone(),
+        id: model_public_id(&args.model),
         owned_by: "lumen".to_string(),
         created: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1439,6 +1461,26 @@ mod tests {
         assert_eq!(super::registry_key("qwen3.5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("qwen3-5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("my.model"), "my-model");
+    }
+
+    #[test]
+    fn model_public_id_reports_a_name_never_a_path() {
+        // A registry name is reported verbatim — its dots are not an extension.
+        assert_eq!(super::model_public_id("qwen3.8-27b"), "qwen3.8-27b");
+        assert_eq!(super::model_public_id("qwen3.5-9b"), "qwen3.5-9b");
+        assert_eq!(
+            super::model_public_id("qwen3-5-moe-35b-a3b"),
+            "qwen3-5-moe-35b-a3b"
+        );
+        // A path is reduced to the file's name — no directory, no extension.
+        assert_eq!(
+            super::model_public_id("/Users/alice/models/qwen3-5-9b-Q8_0.lbc"),
+            "qwen3-5-9b-Q8_0"
+        );
+        assert_eq!(super::model_public_id("/home/bob/m.gguf"), "m");
+        assert_eq!(super::model_public_id("./sub/dir/qwen.lbc"), "qwen");
+        // A bare filename has no directory to expose but still drops the extension.
+        assert_eq!(super::model_public_id("model.lbc"), "model");
     }
 
     #[test]
