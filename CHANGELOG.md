@@ -5,6 +5,14 @@ All notable changes to Lumen are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 `0.1.0` is published.
 
+## [Unreleased]
+
+### Changed
+
+- `lumen-server` reports the served model on `/v1/models` (and in response `model` fields) by name. A server
+  started with a model file path now reports the file's name without its directory, rather than the full path,
+  which previously exposed the directory it was launched from.
+
 ## [0.39.0] — 2026-09-30
 
 ### Security
