@@ -267,14 +267,19 @@ fn bytes_as_f32(bytes: &[u8]) -> Result<&[f32], RuntimeError> {
         return Ok(&[]);
     }
     let ptr = bytes.as_ptr();
-    // Global allocators guarantee at least pointer-size alignment (>= 4 on all
-    // platforms), and mmap returns page-aligned memory. Debug-assert to catch
-    // exotic edge cases. Skipped for empty slices whose pointer is undefined.
-    debug_assert_eq!(
-        ptr.align_offset(std::mem::align_of::<f32>()),
-        0,
-        "weight bytes not 4-byte aligned"
-    );
+    // The pointer must be 4-byte aligned for the `&[f32]` cast below. A heap
+    // buffer (SyncWeightProvider's `Arc<[u8]>`) always is, but the memory-mapped
+    // provider hands back bytes at their file offset, and the reader only
+    // bounds-checks subtensors (header alignment 1 is accepted). A tensor at a
+    // non-4-aligned offset would make the cast unsound, so reject it at runtime
+    // rather than rely on a debug-only assertion that is compiled out in release.
+    if ptr.align_offset(std::mem::align_of::<f32>()) != 0 {
+        return Err(RuntimeError::Compute(format!(
+            "F32 weight bytes are not 4-byte aligned in memory (ptr {ptr:p}); this \
+             tensor sits at a non-4-aligned file offset. Rebuild the model with the \
+             current converter, or serve with --sync."
+        )));
+    }
     // SAFETY: bytes is contiguous LE f32 data on a LE platform. Alignment
     // verified above. Length is bytes.len() / 4 elements.
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const f32, bytes.len() / 4) })
@@ -2160,6 +2165,25 @@ mod tests {
     fn bytes_as_f32_misaligned_length() {
         let bytes = vec![0u8; 5]; // Not divisible by 4
         assert!(bytes_as_f32(&bytes).is_err());
+    }
+
+    #[test]
+    fn bytes_as_f32_misaligned_pointer() {
+        // The memory-mapped provider can hand back bytes at a non-4-aligned
+        // address (a tensor at an odd file offset). That must be a clean Err,
+        // never an unaligned `&[f32]` cast (UB in release / panic in debug).
+        let buf = vec![0u8; 16];
+        let base = buf.as_ptr() as usize;
+        // Offset forcing a 1-mod-4 start, with a length divisible by 4.
+        let off = (1 + 4 - base % 4) % 4;
+        let misaligned = &buf[off..off + 8];
+        assert_ne!(
+            misaligned.as_ptr() as usize % 4,
+            0,
+            "test setup: expected a misaligned pointer"
+        );
+        assert_eq!(misaligned.len() % 4, 0, "test setup: expected len % 4 == 0");
+        assert!(bytes_as_f32(misaligned).is_err());
     }
 
     #[test]
