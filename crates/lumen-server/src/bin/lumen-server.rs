@@ -909,21 +909,40 @@ async fn run(args: Args) -> Result<(), String> {
             .into());
     }
 
-    // Provider selection: the Metal GPU-resident path defaults
-    // to the zero-copy `MmapWeightProvider` so the no-copy unified-buffer path
-    // (`LUMEN_METAL_MMAP_ONLY=1`) engages and we avoid the ~10 GB redundant CPU
-    // copy + GPU private weight copy that `SyncWeightProvider` (pread-into-Vec,
-    // non-page-aligned) forces. `--sync`, CUDA, and CPU keep `SyncWeightProvider`
-    // (CUDA/CPU read F32-dequantized layers; the sync path is also the
-    // guarded fallback). Mmap and sync are proven byte-identical on the
-    // Metal path by `metal_sync_mmap_argmax_parity_test`.
-    let use_mmap_provider = matches!(backend_choice, BackendChoice::Metal) && !args.sync_provider;
+    // Provider selection: the Metal GPU-resident path and CUDA NVFP4 both use
+    // the zero-copy `MmapWeightProvider`.
+    //
+    // Metal engages the no-copy unified-buffer path (`LUMEN_METAL_MMAP_ONLY=1`),
+    // avoiding the ~10 GB redundant CPU copy + GPU private weight copy that
+    // `SyncWeightProvider` (pread-into-Vec, non-page-aligned) forces.
+    //
+    // CUDA NVFP4 uses it because that model shares the device with the image
+    // endpoint: every image generation evicts the text backend, and restoring it
+    // rebuilds from the provider. `SyncWeightProvider` hands each layer out as a
+    // freshly allocated host buffer; mimalloc keeps that freed staging committed
+    // in its arenas (tens of GB, growing across image cycles). Serving each
+    // layer's raw bytes straight from the mapping into the htod copy makes those
+    // pages file-backed and reclaimable, so RssAnon stays flat. The bytes read
+    // are identical either way (`get_layer_raw_is_byte_identical_across_sync_and_mmap`)
+    // and go to the same GPU buffers, so inference is unchanged.
+    //
+    // `--sync`, other CUDA quants, and CPU keep `SyncWeightProvider` (the guarded
+    // fallback). Mmap and sync are proven byte-identical on the Metal path by
+    // `metal_sync_mmap_argmax_parity_test`.
+    let cuda_nvfp4 = matches!(backend_choice, BackendChoice::Cuda)
+        && lbc.uses_quant(lumen_format::quantization::QuantScheme::Nvfp4);
+    let use_mmap_provider =
+        !args.sync_provider && (matches!(backend_choice, BackendChoice::Metal) || cuda_nvfp4);
     let provider: ServerWeights = if use_mmap_provider {
-        // Enable the no-copy residency path. We set the env BEFORE the backend
-        // constructor / `preload_weights` reads it (gpu_resident.rs probe). An
+        // Enable Metal's no-copy unified-buffer residency path. Metal only: it is
+        // that backend's zero-copy GPU-resident route (gpu_resident.rs probe),
+        // whereas CUDA reads the mapped layers into ordinary htod copies. We set
+        // the env BEFORE the backend constructor / `preload_weights` reads it. An
         // explicit operator override (e.g. `LUMEN_METAL_MMAP_ONLY=0`) still wins
         // because we only set it when unset.
-        if std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
+        if matches!(backend_choice, BackendChoice::Metal)
+            && std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none()
+        {
             // SAFETY: single-threaded boot, before any worker thread is spawned.
             unsafe {
                 std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
