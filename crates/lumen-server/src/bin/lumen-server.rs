@@ -39,7 +39,7 @@ use lumen_runtime::RuntimeConfig;
 
 #[cfg(feature = "image")]
 use lumen_server::build_router_with_images;
-use lumen_server::{build_router, EngineWorker, ModelInfo, Tokenize};
+use lumen_server::{build_router, AllowedOrigins, EngineWorker, ModelInfo, Tokenize};
 
 // ---------------------------------------------------------------------------
 // CLI parsing — manual, matches `lumen-cli/src/run.rs` style (no `clap` dep).
@@ -59,6 +59,8 @@ struct Args {
     quant: Option<String>,
     host: String,
     port: u16,
+    /// `--allow-origin`: the web pages whose requests are served.
+    origins: AllowedOrigins,
     context_len: usize,
     backend: BackendChoice,
     backend_device: usize,
@@ -82,6 +84,7 @@ impl Default for Args {
             quant: None,
             host: "127.0.0.1".to_string(),
             port: 8000,
+            origins: AllowedOrigins::default(),
             context_len: 8192,
             backend: BackendChoice::Auto,
             backend_device: 0,
@@ -120,6 +123,14 @@ OPTIONS:
                            Default: q8_0
     --host <HOST>          Listen host. Default: 127.0.0.1
     --port <N>             Listen port. Default: 8000
+    --allow-origin <ORIGIN>
+                           Serve requests whose Origin header is ORIGIN, as
+                           the client sends it (https://app.example.com,
+                           chrome-extension://<id>, tauri://localhost);
+                           repeatable. Web pages, browser extensions and
+                           web-view apps send one and are refused unless
+                           allowed; curl and the SDKs send none. Adds no
+                           CORS headers.
     --context-len <N>      Max sequence length (KV cache size).
                            Capped at the model's native max_seq_len.
                            Default: 8192
@@ -203,6 +214,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     // tag only sets the quant when `--quant` was NOT given, so an explicit
     // `--quant` always wins regardless of argument order.
     let mut quant_explicit = false;
+    let mut origins = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -218,6 +230,10 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--host" => {
                 i += 1;
                 args.host = raw.get(i).ok_or("--host requires a value")?.clone();
+            }
+            "--allow-origin" => {
+                i += 1;
+                origins.push(raw.get(i).ok_or("--allow-origin requires a value")?.clone());
             }
             "--port" => {
                 i += 1;
@@ -327,6 +343,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     if args.model.is_empty() {
         return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
     }
+    args.origins = AllowedOrigins::from_values(&origins)?;
     Ok(args)
 }
 
@@ -1174,12 +1191,12 @@ async fn run(args: Args) -> Result<(), String> {
                 resident,
                 sources,
             });
-            build_router_with_images(handle, state)
+            build_router_with_images(handle, state, args.origins.clone())
         }
-        None => build_router(handle),
+        None => build_router(handle, args.origins.clone()),
     };
     #[cfg(not(feature = "image"))]
-    let app = build_router(handle);
+    let app = build_router(handle, args.origins.clone());
     let bind_addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -1422,6 +1439,22 @@ mod tests {
         assert_eq!(super::registry_key("qwen3.5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("qwen3-5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("my.model"), "my-model");
+    }
+
+    #[test]
+    fn allow_origin_takes_origins_and_refuses_anything_else() {
+        let origins = [
+            "m",
+            "--allow-origin",
+            "https://a.example",
+            "--allow-origin",
+            "http://b.example:8080",
+        ];
+        assert!(parse_args(&argv(&origins)).is_ok());
+        let err = parse_args(&argv(&["m", "--allow-origin", "https://a.example/"])).unwrap_err();
+        assert!(err.starts_with("--allow-origin takes one origin"), "{err}");
+        let err = parse_args(&argv(&["m", "--allow-origin"])).unwrap_err();
+        assert_eq!(err, "--allow-origin requires a value");
     }
 
     #[test]

@@ -30,7 +30,8 @@ use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use lumen_runtime::RuntimeConfig;
 
 use lumen_server::{
-    build_router, EngineHandle, EngineWorker, IdentityByteTokenizer, ModelInfo, Tokenize,
+    build_router, AllowedOrigins, EngineHandle, EngineWorker, IdentityByteTokenizer, ModelInfo,
+    Tokenize,
 };
 
 const MAX_TOKENS: usize = 4;
@@ -44,6 +45,18 @@ const MODEL_ID: &str = "lumen-test:synthetic";
 /// `channel_pool_len()` after the request loop has drained —
 /// a structural leak / bound check, not a perf check.
 async fn boot_server() -> (
+    SocketAddr,
+    Client<HttpConnector, Full<bytes::Bytes>>,
+    tempfile::TempDir,
+    EngineHandle,
+) {
+    boot_server_allowing(AllowedOrigins::default()).await
+}
+
+/// As [`boot_server`], serving web pages of `origins`.
+async fn boot_server_allowing(
+    origins: AllowedOrigins,
+) -> (
     SocketAddr,
     Client<HttpConnector, Full<bytes::Bytes>>,
     tempfile::TempDir,
@@ -99,7 +112,7 @@ async fn boot_server() -> (
         4,
     );
 
-    let app = build_router(handle.clone());
+    let app = build_router(handle.clone(), origins);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1383,7 +1396,7 @@ async fn boot_server_with_panic_backend() -> (
         4,
     );
 
-    let app = build_router(handle.clone());
+    let app = build_router(handle.clone(), AllowedOrigins::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2601,7 +2614,7 @@ async fn boot_server_scripted(
         model_info,
         4,
     );
-    let app = build_router(handle.clone());
+    let app = build_router(handle.clone(), AllowedOrigins::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -2895,4 +2908,297 @@ async fn f4_openai_chat_empty_stop_streams_full_text() {
         "EMPTY stop must stream the FULL text verbatim (byte-identity at the wire)"
     );
     assert_eq!(v["choices"][0]["finish_reason"], "length");
+}
+
+// ----------------------------- requests from web pages -------------------
+
+/// Send `method` to `path` with `headers` (a name may repeat) and `body`; the
+/// status and the body as JSON.
+async fn send(
+    client: &Client<HttpConnector, Full<bytes::Bytes>>,
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &[u8])],
+    body: &str,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(format!("http://{addr}{path}"));
+    for (name, value) in headers {
+        req = req.header(
+            *name,
+            hyper::header::HeaderValue::from_bytes(value).unwrap(),
+        );
+    }
+    let req = req
+        .body(Full::new(bytes::Bytes::from(body.to_string())))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes)}));
+    (status, json)
+}
+
+fn chat_body() -> String {
+    serde_json::json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": MAX_TOKENS,
+    })
+    .to_string()
+}
+
+/// The refusal of a web page whose origin is `origin`.
+fn refusal(origin: &str) -> String {
+    format!(
+        "requests from web pages are refused unless their origin is allowed; to allow this one, \
+         start lumen-server with --allow-origin {origin}"
+    )
+}
+
+/// A page on any site, sending what a browser lets it send without asking
+/// first (a text/plain POST) or anything else, is refused on every route
+/// before the route reads the request; a client that is not a web page is
+/// served as before. An unknown path is refused too (the check wraps the
+/// fallback, not only the matched routes), so no path a page probes escapes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_from_web_pages_are_refused() {
+    let (addr, client, _tmp, _handle) = boot_server().await;
+    let completion = serde_json::json!({"model": MODEL_ID, "prompt": "hi", "max_tokens": 4});
+    let message = serde_json::json!({
+        "model": MODEL_ID,
+        "max_tokens": 4,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let text = [("content-type", &b"text/plain"[..])];
+    for (method, path, body) in [
+        ("POST", "/v1/chat/completions", chat_body()),
+        ("POST", "/v1/completions", completion.to_string()),
+        ("POST", "/v1/messages", message.to_string()),
+        ("POST", "/v1/messages/count_tokens", message.to_string()),
+        ("POST", "/v1/chat/completions", "not json".to_string()),
+        ("GET", "/v1/models", String::new()),
+        ("OPTIONS", "/v1/chat/completions", String::new()),
+        ("POST", "/no/such/path", chat_body()),
+        ("GET", "/", String::new()),
+    ] {
+        let headers = [text[0], ("origin", &b"https://evil.example"[..])];
+        let (status, v) = send(&client, addr, method, path, &headers, &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {v}");
+        assert_eq!(v["error"]["type"], "permission_error", "{method} {path}");
+        assert_eq!(v["error"]["message"], refusal("https://evil.example"));
+    }
+    let (status, v) = send(
+        &client,
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        &text,
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v["choices"][0]["message"]["content"].is_string(), "{v}");
+}
+
+/// DNS rebinding makes a page's own name point at this machine, so its
+/// requests name the page's host as theirs; they carry the page's origin all
+/// the same. `null` (sandboxed frames, local files) and a value that is not
+/// an origin at all cannot be allowed, and the refusal says so. With two
+/// `Origin` headers, the one not allowed is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebinding_opaque_and_unreadable_origins_are_refused() {
+    let (addr, client, _tmp, _handle) =
+        boot_server_allowing(AllowedOrigins::from_values(&["https://app.example".into()]).unwrap())
+            .await;
+    let port = addr.port();
+    let host = format!("attacker.example:{port}");
+    let origin = format!("http://attacker.example:{port}");
+    let rebound = [("host", host.as_bytes()), ("origin", origin.as_bytes())];
+    let (status, v) = send(
+        &client,
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        &rebound,
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"]["message"], refusal(&origin));
+
+    for (value, shown) in [
+        (&b"null"[..], "\"null\""),
+        (
+            &b"http://\xe9t\xe9.example"[..],
+            "\"http://\u{fffd}t\u{fffd}.example\"",
+        ),
+    ] {
+        let headers = [("origin", value)];
+        let (status, v) = send(
+            &client,
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &headers,
+            &chat_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(
+            v["error"]["message"],
+            format!(
+                "requests from web pages are refused unless their origin is allowed, and this \
+                 one's origin, {shown}, cannot be"
+            )
+        );
+    }
+
+    let two = [
+        ("origin", &b"https://app.example"[..]),
+        ("origin", &b"https://evil.example"[..]),
+    ];
+    let (status, v) = send(
+        &client,
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        &two,
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"]["message"], refusal("https://evil.example"));
+}
+
+/// A listed origin is served, whatever the case of its letters, and only
+/// if every `Origin` header the request carries is listed. Origins of
+/// extensions and web-view apps are listed as they are sent, and listing
+/// them lets no `null` through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listed_origins_are_served() {
+    let extension = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+    let firefox = "moz-extension://6f2c8f7e-3b1d-4c55-9a4e-0d1e2f3a4b5c";
+    let values = [
+        "https://app.example",
+        extension,
+        firefox,
+        "tauri://localhost",
+    ];
+    let listed = AllowedOrigins::from_values(&values.map(String::from)).unwrap();
+    let (addr, client, _tmp, _handle) = boot_server_allowing(listed).await;
+    for (headers, want) in [
+        (
+            vec![("origin", &b"https://APP.example"[..])],
+            StatusCode::OK,
+        ),
+        (vec![("origin", extension.as_bytes())], StatusCode::OK),
+        (vec![("origin", firefox.as_bytes())], StatusCode::OK),
+        (vec![("origin", &b"tauri://localhost"[..])], StatusCode::OK),
+        (vec![("origin", &b"null"[..])], StatusCode::FORBIDDEN),
+        (
+            vec![(
+                "origin",
+                &b"chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"[..],
+            )],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            vec![
+                ("origin", &b"https://app.example"[..]),
+                ("origin", &b"https://app.example"[..]),
+            ],
+            StatusCode::OK,
+        ),
+        (
+            vec![("origin", &b"https://app.example:8443"[..])],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            vec![("origin", &b"http://app.example"[..])],
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (status, v) = send(
+            &client,
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &headers,
+            &chat_body(),
+        )
+        .await;
+        assert_eq!(status, want, "{headers:?}: {v}");
+    }
+}
+
+/// A refused request's body is read first, as every other error's is, so a
+/// client that sends a long body before it reads the answer gets the
+/// refusal rather than a reset connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_request_with_a_long_body_is_answered() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (addr, _client, _tmp, _handle) = boot_server().await;
+    for size in [64 << 10, 1 << 20] {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\norigin: https://evil.example\r\n\
+             content-type: text/plain\r\ncontent-length: {size}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&vec![b' '; size]).await.unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).await.unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 403"), "{size}: {answer}");
+        assert!(
+            answer.contains(&refusal("https://evil.example")),
+            "{size}: {answer}"
+        );
+    }
+}
+
+/// With images served too, the image route is refused like the text routes,
+/// and a request without `Origin` still reaches it.
+#[cfg(feature = "image")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_from_web_pages_are_refused_on_the_image_route() {
+    use lumen_server::router_image::{ImageConfig, ImageState};
+    let (_, client, tmp, handle) = boot_server().await;
+    let images = ImageState {
+        config: ImageConfig {
+            lbi_dir: tmp.path().to_path_buf(),
+            checkpoint_dir: tmp.path().to_path_buf(),
+            model_id: "lumen-test:image".into(),
+            use_gpu: false,
+            pin_text_encoder: false,
+        },
+        engine: handle.clone(),
+        resident: None,
+        sources: None,
+    };
+    let app =
+        lumen_server::build_router_with_images(handle, Arc::new(images), AllowedOrigins::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let image = serde_json::json!({"model": "another", "prompt": "a lighthouse"}).to_string();
+    let web = [("origin", &b"https://evil.example"[..])];
+    for (path, body) in [
+        ("/v1/images/generations", image.clone()),
+        ("/v1/chat/completions", chat_body()),
+    ] {
+        let (status, v) = send(&client, addr, "POST", path, &web, &body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {v}");
+        assert_eq!(v["error"]["message"], refusal("https://evil.example"));
+    }
+    // Without `Origin`, the route answers for itself: it serves another model.
+    let (status, v) = send(&client, addr, "POST", "/v1/images/generations", &[], &image).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], "unknown_model", "{v}");
 }

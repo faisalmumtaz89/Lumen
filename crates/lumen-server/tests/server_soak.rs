@@ -75,7 +75,7 @@ use lumen_runtime::pipeline::PipelineMode;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use lumen_runtime::{MetalF32Backend, RuntimeConfig};
 
-use lumen_server::{build_router, DiskKvConfig, EngineWorker, ModelInfo, Tokenize};
+use lumen_server::{build_router, AllowedOrigins, DiskKvConfig, EngineWorker, ModelInfo, Tokenize};
 
 const MODEL_ID: &str = "qwen3.5-9b:q8_0";
 const SAMPLE_INTERVAL_SEC: u64 = 30;
@@ -399,7 +399,7 @@ async fn boot_soak_server(
         Some(disk_kv),
     );
 
-    let app = build_router(handle);
+    let app = build_router(handle, AllowedOrigins::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

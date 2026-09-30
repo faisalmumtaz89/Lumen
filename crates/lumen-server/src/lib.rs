@@ -49,6 +49,7 @@ pub mod engine;
 pub mod error;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
+pub mod origins;
 pub mod router;
 pub mod router_image;
 pub mod sse;
@@ -61,6 +62,7 @@ pub use engine::{
     PooledReceiver, TokenEvent, Tokenize, EVICTED_MESSAGE, RESTORE_FAILED_PREFIX,
 };
 pub use error::ServerError;
+pub use origins::AllowedOrigins;
 #[cfg(feature = "image")]
 pub use router::build_router_with_images;
 pub use router::{build_router, AppState};

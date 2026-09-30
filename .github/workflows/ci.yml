@@ -90,6 +90,11 @@ jobs:
       # server binary's own unit tests.
       - name: cuda server admission tests
         run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/cuda --release --test planar_scheme_admission --bin lumen-server
+      # The image route exists only with the image feature, and requests from
+      # web pages are refused before they reach the GPU, so the integration
+      # suite runs here with that feature, without one.
+      - name: server integration tests (image feature)
+        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/image --release --test server_integration
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-runtime/test-prefill-dump,lumen-runtime/test-fault-injection,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
