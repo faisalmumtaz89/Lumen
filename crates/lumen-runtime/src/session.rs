@@ -1687,12 +1687,9 @@ mod tests {
         let full = Session::new(baseline_config(64), hp, SamplingParams::default()).unwrap();
         assert!(full.kv().allocated_bytes() > 0);
 
-        let bare = Session::new_without_host_kv_mirror(
-            baseline_config(64),
-            hp,
-            SamplingParams::default(),
-        )
-        .unwrap();
+        let bare =
+            Session::new_without_host_kv_mirror(baseline_config(64), hp, SamplingParams::default())
+                .unwrap();
         assert_eq!(bare.kv().allocated_bytes(), 0);
         assert_eq!(bare.kv().config().num_layers, hp.num_layers as usize);
         assert_eq!(bare.kv().seq_len(), 0);
