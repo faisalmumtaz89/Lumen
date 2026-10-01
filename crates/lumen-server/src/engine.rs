@@ -2380,11 +2380,31 @@ impl EngineWorker {
     /// decoder is never invoked). Every session the worker runs — the first
     /// one and each rebuild — comes from here, so no rebuild loses a hook.
     fn fresh_session(&self) -> Result<Session, RuntimeError> {
-        let mut session = Session::new(
-            self.config.clone(),
-            self.hyperparams,
-            SamplingParams::default(),
-        )?;
+        // A device-resident backend (CUDA) keeps its live KV in VRAM and never
+        // touches the host key/value mirror, so skip allocating it: that is the
+        // ~num_kv_heads*head_dim*bpe*max_seq_len*num_layers*2 bytes of zeroed
+        // host memory the eviction path would otherwise re-create — and
+        // mimalloc retain in its arenas — on every image lease. With no backend
+        // attached yet, keep the mirror (the safe default); the first eviction
+        // runs with the backend present and replaces the session with one that
+        // omits it.
+        let host_kv_mirror = self
+            .backend
+            .as_ref()
+            .map_or(true, |b| b.uses_host_kv_mirror());
+        let mut session = if host_kv_mirror {
+            Session::new(
+                self.config.clone(),
+                self.hyperparams,
+                SamplingParams::default(),
+            )?
+        } else {
+            Session::new_without_host_kv_mirror(
+                self.config.clone(),
+                self.hyperparams,
+                SamplingParams::default(),
+            )?
+        };
         session.set_bench_top2(self.bench_top2);
         let tok = Arc::clone(&self.tokenizer);
         session.set_token_decoder(Arc::new(move |id: u32| tok.decode_id_bytes(id)));

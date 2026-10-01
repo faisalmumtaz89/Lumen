@@ -2975,8 +2975,17 @@ fn run_generation(
             // sees what failed.
             lumen_runtime::error::RuntimeError::Compute(format!("--session-resume {p}: {e}"))
         })?
-    } else {
+    } else if backend.uses_host_kv_mirror() {
         Session::new(
+            engine.config().clone(),
+            *engine.hyperparams(),
+            sampling.clone(),
+        )?
+    } else {
+        // A device-resident backend (CUDA) keeps its live KV in VRAM and never
+        // reads the host mirror, so skip allocating it (see
+        // ComputeBackend::uses_host_kv_mirror).
+        Session::new_without_host_kv_mirror(
             engine.config().clone(),
             *engine.hyperparams(),
             sampling.clone(),

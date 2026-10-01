@@ -579,6 +579,15 @@ pub struct KvCache {
 
     /// Current sequence length.
     seq_len: usize,
+
+    /// Whether the per-layer host `keys`/`values` buffers are allocated.
+    ///
+    /// `true` for every backend that reads or writes the host mirror (CPU,
+    /// SIMD, Metal — see [`crate::compute::ComputeBackend::uses_host_kv_mirror`]);
+    /// `false` for a device-resident backend whose live KV is held in its own
+    /// VRAM cache and never synced to the host (CUDA), in which case the host
+    /// buffers are left empty and the host-byte accessors must not be called.
+    host_mirror: bool,
 }
 
 impl KvCache {
@@ -588,6 +597,27 @@ impl KvCache {
     /// quantized format (Int8 or Int4) that is not yet implemented. Accepting
     /// an unimplemented precision would silently corrupt data.
     pub fn new(config: KvCacheConfig) -> Result<Self, RuntimeError> {
+        Self::new_impl(config, true)
+    }
+
+    /// Allocate a KV cache without the per-layer host key/value buffers.
+    ///
+    /// For a device-resident backend whose live KV lives in its own VRAM
+    /// cache and which never syncs KV back to the host — see
+    /// [`crate::compute::ComputeBackend::uses_host_kv_mirror`] — the host
+    /// `keys`/`values` buffers are never read or written. Allocated eagerly
+    /// they would be
+    /// `num_kv_heads * head_dim * bpe * max_seq_len * num_layers * 2` bytes of
+    /// zeroed, dead host memory, re-created on every session reset. This
+    /// constructor leaves them empty (the outer per-layer `Vec`s are still
+    /// present, so indexing and bounds checks are unchanged) and marks the
+    /// cache so the host-byte accessors (`view_mut`, `layer_raw_bytes`,
+    /// `layer_raw_bytes_mut`, `set_layer_raw_bytes`) debug-assert if called.
+    pub fn new_without_host_mirror(config: KvCacheConfig) -> Result<Self, RuntimeError> {
+        Self::new_impl(config, false)
+    }
+
+    fn new_impl(config: KvCacheConfig, host_mirror: bool) -> Result<Self, RuntimeError> {
         if !config.precision.is_implemented() {
             return Err(RuntimeError::Unsupported(format!(
                 "KV cache precision {:?} is not yet implemented",
@@ -597,10 +627,17 @@ impl KvCache {
         let num_layers = config.num_layers;
         // Head-first layout: [head][pos][dim] — pre-fill entire buffer.
         // This allows scatter-writes during append and contiguous reads per head.
-        let per_layer_bytes = config.num_kv_heads
-            * config.head_dim
-            * config.precision.bytes_per_element()
-            * config.max_seq_len;
+        // A device-resident cache (`host_mirror == false`) leaves the per-layer
+        // buffers empty: the backend holds the live KV in VRAM and never touches
+        // these, so allocating them would only burn zeroed host memory.
+        let per_layer_bytes = if host_mirror {
+            config.num_kv_heads
+                * config.head_dim
+                * config.precision.bytes_per_element()
+                * config.max_seq_len
+        } else {
+            0
+        };
         let keys = (0..num_layers)
             .map(|_| vec![0u8; per_layer_bytes])
             .collect();
@@ -612,6 +649,7 @@ impl KvCache {
             keys,
             values,
             seq_len: 0,
+            host_mirror,
         })
     }
 
@@ -626,6 +664,12 @@ impl KvCache {
                 self.config.num_layers
             )));
         }
+        debug_assert!(
+            self.host_mirror,
+            "view_mut on a KvCache built without a host mirror: this backend's \
+             KV is device-resident (ComputeBackend::uses_host_kv_mirror == false), \
+             so the per-layer host buffers are empty"
+        );
 
         Ok(KvCacheView {
             layer_idx,
@@ -649,6 +693,10 @@ impl KvCache {
                 "layer index {idx} out of range"
             )));
         }
+        debug_assert!(
+            self.host_mirror,
+            "commit_view on a KvCache built without a host mirror"
+        );
         self.keys[idx] = view.keys;
         self.values[idx] = view.values;
         Ok(())
@@ -690,6 +738,10 @@ impl KvCache {
     /// `max_seq_len=8192`-sized file on disk. To size a `--kv-disk-space-mb`
     /// budget, multiply by `max_seq_len / seq_len`, not by 1.
     pub fn total_bytes(&self) -> u64 {
+        // A device-resident cache (no host mirror) holds no host KV bytes.
+        if !self.host_mirror {
+            return 0;
+        }
         let bpe = self.config.precision.bytes_per_element() as u64;
         let per_token = self.config.num_kv_heads as u64 * self.config.head_dim as u64 * bpe * 2; // K + V
         self.seq_len as u64 * per_token * self.config.num_layers as u64
@@ -709,6 +761,10 @@ impl KvCache {
     /// NOT account for; treat the value as an order-of-magnitude indicator
     /// of memory pressure, not a precise VRAM ledger.
     pub fn allocated_bytes(&self) -> u64 {
+        // A device-resident cache (no host mirror) reserves no host KV bytes.
+        if !self.host_mirror {
+            return 0;
+        }
         let bpe = self.config.precision.bytes_per_element() as u64;
         let per_token = self.config.num_kv_heads as u64 * self.config.head_dim as u64 * bpe * 2; // K + V
         self.config.max_seq_len as u64 * per_token * self.config.num_layers as u64
@@ -756,6 +812,10 @@ impl KvCache {
                 self.config.num_layers
             )));
         }
+        debug_assert!(
+            self.host_mirror,
+            "layer_raw_bytes on a KvCache built without a host mirror"
+        );
         Ok((
             self.keys[layer_idx].as_slice(),
             self.values[layer_idx].as_slice(),
@@ -780,6 +840,10 @@ impl KvCache {
                 self.config.num_layers
             )));
         }
+        debug_assert!(
+            self.host_mirror,
+            "layer_raw_bytes_mut on a KvCache built without a host mirror"
+        );
         // Split borrows of self.keys[layer_idx] and self.values[layer_idx]:
         // the two Vec<u8>s are siblings inside disjoint outer Vecs, so we
         // can safely produce two non-aliasing mutable slices.
@@ -807,6 +871,10 @@ impl KvCache {
                 self.config.num_layers
             )));
         }
+        debug_assert!(
+            self.host_mirror,
+            "set_layer_raw_bytes on a KvCache built without a host mirror"
+        );
         let expected = self.config.num_kv_heads
             * self.config.max_seq_len
             * self.config.head_dim
@@ -864,6 +932,49 @@ mod tests {
             head_dim: 4,
             precision: KvPrecision::F32,
         }
+    }
+
+    /// Regression guard. A device-resident cache (CUDA: live KV in VRAM, host
+    /// mirror never read) must allocate zero host key/value bytes, while the
+    /// default cache still reserves the full mirror. Re-allocating — and
+    /// zeroing — the dead mirror on every session reset was the host-RAM
+    /// retention this guards against.
+    #[test]
+    fn new_without_host_mirror_allocates_no_host_bytes() {
+        // per_layer_bytes = num_kv_heads(2) * head_dim(4) * bpe(4) * max_seq_len(16) = 512
+        // allocated_bytes = per_layer_bytes * 2 (K+V) * num_layers(2) = 2048
+        let full = KvCache::new(test_config()).unwrap();
+        assert_eq!(full.allocated_bytes(), 2048);
+        assert!(full.keys.iter().all(|k| k.len() == 512));
+        assert!(full.values.iter().all(|v| v.len() == 512));
+
+        let bare = KvCache::new_without_host_mirror(test_config()).unwrap();
+        assert_eq!(bare.allocated_bytes(), 0);
+        assert_eq!(bare.total_bytes(), 0);
+        // The outer per-layer Vecs are still present (indexing/bounds unchanged);
+        // only the inner byte buffers are empty.
+        assert_eq!(bare.config().num_layers, 2);
+        assert_eq!(bare.keys.len(), 2);
+        assert_eq!(bare.values.len(), 2);
+        assert!(bare.keys.iter().all(|k| k.is_empty()));
+        assert!(bare.values.iter().all(|v| v.is_empty()));
+    }
+
+    /// The seq_len cursor — the only KV state a device-resident backend touches
+    /// (CUDA calls `seq_len`/`advance_seq_len` and nothing else) — behaves
+    /// identically with no host mirror, and `total_bytes` stays 0 as it grows.
+    #[test]
+    fn new_without_host_mirror_tracks_seq_len() {
+        let mut bare = KvCache::new_without_host_mirror(test_config()).unwrap();
+        assert_eq!(bare.seq_len(), 0);
+        bare.advance_seq_len().unwrap();
+        bare.advance_seq_len().unwrap();
+        assert_eq!(bare.seq_len(), 2);
+        assert_eq!(bare.total_bytes(), 0);
+        bare.truncate_to(1);
+        assert_eq!(bare.seq_len(), 1);
+        bare.reset();
+        assert_eq!(bare.seq_len(), 0);
     }
 
     #[test]

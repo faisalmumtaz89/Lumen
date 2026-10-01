@@ -184,17 +184,48 @@ impl Session {
         hyperparams: ModelHyperparams,
         sampling: SamplingParams,
     ) -> Result<Self, RuntimeError> {
+        Self::new_inner(config, hyperparams, sampling, true)
+    }
+
+    /// Create a session whose KV cache omits the per-layer host key/value
+    /// mirror.
+    ///
+    /// For a backend that keeps its live KV entirely on the device and never
+    /// syncs it back to the host — [`ComputeBackend::uses_host_kv_mirror`]
+    /// returns `false` (CUDA) — the host mirror is dead memory re-allocated on
+    /// every session reset. This skips it; behaviour is otherwise identical to
+    /// [`Self::new`]. Callers pick it from the backend capability (the engine
+    /// worker's `fresh_session` and the CLI generate path).
+    pub fn new_without_host_kv_mirror(
+        config: RuntimeConfig,
+        hyperparams: ModelHyperparams,
+        sampling: SamplingParams,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_inner(config, hyperparams, sampling, false)
+    }
+
+    fn new_inner(
+        config: RuntimeConfig,
+        hyperparams: ModelHyperparams,
+        sampling: SamplingParams,
+        host_kv_mirror: bool,
+    ) -> Result<Self, RuntimeError> {
         let num_layers = hyperparams.num_layers as usize;
         if num_layers == 0 {
             return Err(RuntimeError::Config("model has 0 layers".into()));
         }
-        let kv = KvCache::new(KvCacheConfig {
+        let kv_config = KvCacheConfig {
             max_seq_len: config.max_seq_len,
             num_layers,
             num_kv_heads: hyperparams.num_kv_heads as usize,
             head_dim: hyperparams.head_dim as usize,
             precision: config.kv_precision,
-        })?;
+        };
+        let kv = if host_kv_mirror {
+            KvCache::new(kv_config)?
+        } else {
+            KvCache::new_without_host_mirror(kv_config)?
+        };
         let rng = Xorshift64::new(sampling.seed.unwrap_or(42));
         Ok(Self {
             config,
@@ -1642,6 +1673,29 @@ mod tests {
             max_seq_len,
             collect_per_layer_timings: false,
         }
+    }
+
+    /// Regression guard: `new_without_host_kv_mirror` (used by the engine
+    /// worker's `fresh_session` and the CLI generate path when the backend is
+    /// device-resident) builds a session whose KV cache reserves no host bytes,
+    /// while the default `new` reserves the full mirror. Both agree on layer
+    /// count and seq_len.
+    #[test]
+    fn session_without_host_kv_mirror_skips_the_host_cache() {
+        let hp = synthetic_hyperparams();
+
+        let full = Session::new(baseline_config(64), hp, SamplingParams::default()).unwrap();
+        assert!(full.kv().allocated_bytes() > 0);
+
+        let bare = Session::new_without_host_kv_mirror(
+            baseline_config(64),
+            hp,
+            SamplingParams::default(),
+        )
+        .unwrap();
+        assert_eq!(bare.kv().allocated_bytes(), 0);
+        assert_eq!(bare.kv().config().num_layers, hp.num_layers as usize);
+        assert_eq!(bare.kv().seq_len(), 0);
     }
 
     #[test]
