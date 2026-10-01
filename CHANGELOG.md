@@ -7,11 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.40.0] — 2026-10-01
+
 ### Changed
 
 - `lumen-server` reports the served model on `/v1/models` (and in response `model` fields) by name. A server
   started with a model file path now reports the file's name without its directory, rather than the full path,
   which previously exposed the directory it was launched from.
+
+### Fixed
+
+- **The CUDA backend held tens of GiB of host memory it never used.** The live KV cache lives in device memory and
+  the quantized weight planes are uploaded directly to the GPU, but the serving path still allocated the F32
+  dequantized embedding and output-projection copies and a per-layer host key/value mirror that the CUDA backend
+  never reads. Both were re-created on every session reset — such as the eviction and restore around image
+  generation — and retained by the allocator, so resident host memory grew by tens of GiB and stayed there for the
+  whole awake period. CUDA now skips both; model output and decode, prefill, and image timings are unchanged. CPU,
+  SIMD, and Metal keep the host-side buffers they read.
 
 ## [0.39.0] — 2026-09-30
 
@@ -1896,7 +1908,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.39.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.37.1...v0.38.0
 [0.37.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.37.0...v0.37.1
