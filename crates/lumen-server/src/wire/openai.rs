@@ -609,9 +609,11 @@ impl ChatCompletionRequest {
         // production defaults (`--repeat-penalty 1.05`). The
         // OpenAI API surface is preserved: the `repetition_penalty` field
         // is NOT in the request schema (OpenAI does not expose it) so this
-        // default applies only on the server-internal codepath. When the
-        // client explicitly sends `temperature=0`, greedy decoding takes
-        // over and the repetition penalty is a no-op for argmax anyway.
+        // default applies only on the server-internal codepath, and only when
+        // sampling: at greedy decoding (`temperature <= 0.0`) a repetition penalty
+        // would reshape the logits BEFORE the argmax and change the chosen token,
+        // so `diag_repetition_penalty` defaults it to 1.0 there (unless the env
+        // override is set). See its doc for the resolution order and the tradeoff.
         //
         // An omitted `seed` resolves to a fresh per-request random seed (the
         // OpenAI/llama.cpp convention) so identical requests vary; pass an
@@ -625,15 +627,16 @@ impl ChatCompletionRequest {
         let presence_penalty = super::normalize_zero_penalty(self.presence_penalty);
         let frequency_penalty = super::normalize_zero_penalty(self.frequency_penalty)
             .unwrap_or_else(super::diag_frequency_penalty);
+        let temperature = self
+            .temperature
+            .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature);
         let sampling = SamplingParams {
-            temperature: self
-                .temperature
-                .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature),
+            temperature,
             seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
-            repetition_penalty: Some(super::diag_repetition_penalty()),
+            repetition_penalty: Some(super::diag_repetition_penalty(temperature)),
             presence_penalty,
             frequency_penalty: Some(frequency_penalty),
             repeat_last_n: super::diag_repeat_last_n(),
@@ -734,15 +737,16 @@ impl CompletionRequest {
         let presence_penalty = super::normalize_zero_penalty(self.presence_penalty);
         let frequency_penalty = super::normalize_zero_penalty(self.frequency_penalty)
             .unwrap_or_else(super::diag_frequency_penalty);
+        let temperature = self
+            .temperature
+            .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature);
         let sampling = SamplingParams {
-            temperature: self
-                .temperature
-                .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature),
+            temperature,
             seed: Some(self.seed.unwrap_or_else(super::next_random_seed)),
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
-            repetition_penalty: Some(super::diag_repetition_penalty()),
+            repetition_penalty: Some(super::diag_repetition_penalty(temperature)),
             presence_penalty,
             frequency_penalty: Some(frequency_penalty),
             repeat_last_n: super::diag_repeat_last_n(),

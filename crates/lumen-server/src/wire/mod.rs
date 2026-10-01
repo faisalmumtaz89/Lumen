@@ -122,30 +122,55 @@ pub(crate) fn next_random_seed() -> u64 {
     start.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Server-internal repetition penalty, model-aware. When the operator does
-/// not set `LUMEN_REPETITION_PENALTY` explicitly, the default is resolved by
-/// [`lumen_runtime::runtime_defaults::repetition_penalty_default`]: `1.03`
-/// for MoE (Qwen3.5-MoE-35B-A3B class, all quants), `1.05` for dense / unset.
+/// Server-internal repetition penalty, model-aware and greedy-aware. Resolved
+/// per request from the effective `temperature`, in this order:
 ///
-/// The historical 1.08/1.10 MoE band-aid is gone; the root cause was fixed in
-/// the GDN decode path (the F64 delta-rule accumulator + the decode-vs-prefill
-/// parity stack, all default-ON for MoE), so the math near-tie lands at greedy
-/// without a heavy penalty. The MoE value is now CAPPED at 1.03: a penalty of
-/// 1.05 or higher penalizes legitimate digit repetition and CORRUPTS MoE
-/// arithmetic (the matrix-proven "17 x 20 = … = 39" at 1.05), while 1.03 is the
-/// floor that keeps the F64-fixed math correct AND tames MoE long-form
-/// repetition. Dense keeps 1.05 (no GDN recurrence, arithmetic unaffected).
-/// See `repetition_penalty_default` for the full rationale and the lever-sweep
-/// evidence — it is the single source of truth for this value.
+/// 1. `LUMEN_REPETITION_PENALTY=<f32>` (finite, > 0) always wins — diagnostics,
+///    or restoring the previous default (`=1.05` dense, `=1.03` MoE).
+/// 2. At greedy decoding (`temperature <= 0.0`, the sampler's own greedy switch)
+///    the default repetition penalty is `1.0`: greedy then selects the argmax of
+///    the model's own logits, not penalty-shifted ones (a non-unit penalty
+///    reshapes the logits BEFORE the argmax in `sampling::sample_logits` and
+///    changes which token wins). This is the model's greedy output, matching
+///    the common `temperature = 0` convention; the GDN F64 decode fix keeps the
+///    arithmetic correct at greedy without the penalty.
 ///
-/// The env var `LUMEN_REPETITION_PENALTY=<f32>` still overrides this default
-/// (e.g. for diagnostics or to restore pure-greedy with `=1.0`).
-pub(crate) fn diag_repetition_penalty() -> f32 {
-    std::env::var("LUMEN_REPETITION_PENALTY")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or_else(lumen_runtime::runtime_defaults::repetition_penalty_default)
+///    Tradeoff: the penalty's *other* role was damping long-form repetition, which
+///    pure greedy gives up — long generations can repeat or loop (dense and q8/q4
+///    MoE have no other default guard; only BF16 MoE keeps `anti_restate`). To
+///    restore taming set `LUMEN_REPETITION_PENALTY` (process-global, all requests),
+///    or use `temperature > 0` (per request).
+///    "Greedy" here means no *repetition* penalty: an active `frequency_penalty`
+///    or `anti_restate` still shapes the selection.
+/// 3. Otherwise (sampling, `temperature > 0`) the model-aware default from
+///    [`lumen_runtime::runtime_defaults::repetition_penalty_default`]: `1.05`
+///    dense, `1.03` MoE (Qwen3.5-MoE-35B-A3B class, all quants).
+///
+/// The MoE 1.03 cap and the dense 1.05 rationale (the historical 1.08/1.10 MoE
+/// band-aid is gone; 1.05+ corrupts MoE digit arithmetic — the matrix-proven
+/// "17 x 20 = … = 39") live in `repetition_penalty_default`, the single source
+/// of truth for the sampling-temperature default.
+pub(crate) fn diag_repetition_penalty(temperature: f32) -> f32 {
+    repetition_penalty_for(
+        std::env::var("LUMEN_REPETITION_PENALTY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok()),
+        temperature,
+    )
+}
+
+/// Pure resolution core for [`diag_repetition_penalty`] (the
+/// `LUMEN_REPETITION_PENALTY` env is already parsed into `env_override`). Split
+/// out so the resolution order is unit-tested without touching process env. A
+/// non-finite or `<= 0` `env_override` is ignored.
+fn repetition_penalty_for(env_override: Option<f32>, temperature: f32) -> f32 {
+    if let Some(env) = env_override.filter(|v| v.is_finite() && *v > 0.0) {
+        return env;
+    }
+    if temperature <= 0.0 {
+        return 1.0;
+    }
+    lumen_runtime::runtime_defaults::repetition_penalty_default()
 }
 
 /// Server-internal frequency penalty (count-based: `logit[t] -= freq * count[t]`).
@@ -464,6 +489,63 @@ pub(crate) fn normalize_zero_penalty(v: Option<f32>) -> Option<f32> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn repetition_penalty_env_override_wins_even_at_greedy() {
+        // A set env value (finite, > 0) always wins, including at temperature 0,
+        // which restores the previous default behaviour (`=1.05` at temp 0).
+        assert_eq!(repetition_penalty_for(Some(1.05), 0.0), 1.05);
+        assert_eq!(repetition_penalty_for(Some(1.05), 0.7), 1.05);
+        assert_eq!(repetition_penalty_for(Some(2.0), 0.0), 2.0);
+    }
+
+    #[test]
+    fn repetition_penalty_is_unity_at_greedy_without_env() {
+        // `temperature <= 0.0` is the sampler's greedy switch; pure greedy applies
+        // no penalty so the argmax is over the raw logits.
+        assert_eq!(repetition_penalty_for(None, 0.0), 1.0);
+        assert_eq!(repetition_penalty_for(None, -0.5), 1.0);
+    }
+
+    #[test]
+    fn repetition_penalty_uses_model_default_when_sampling() {
+        // `temperature > 0` keeps the model-aware default (unchanged behaviour).
+        // Pin the omitted-temperature fallback (`default_temperature`, 0.7): an
+        // omitted temperature must stay penalized, not become pure greedy — guards
+        // the wire constructors' `unwrap_or_else(default_temperature)`.
+        assert_eq!(
+            repetition_penalty_for(None, lumen_runtime::runtime_defaults::default_temperature()),
+            lumen_runtime::runtime_defaults::repetition_penalty_default()
+        );
+        assert_eq!(
+            repetition_penalty_for(None, 0.7),
+            lumen_runtime::runtime_defaults::repetition_penalty_default()
+        );
+    }
+
+    #[test]
+    fn repetition_penalty_rejects_nonpositive_or_nonfinite_env() {
+        // A rejected env override falls through to the temperature logic.
+        assert_eq!(repetition_penalty_for(Some(0.0), 0.0), 1.0);
+        assert_eq!(repetition_penalty_for(Some(-1.0), 0.0), 1.0);
+        assert_eq!(repetition_penalty_for(Some(f32::NAN), 0.0), 1.0);
+        assert_eq!(
+            repetition_penalty_for(Some(-1.0), 0.7),
+            lumen_runtime::runtime_defaults::repetition_penalty_default()
+        );
+    }
+
+    #[test]
+    fn repetition_penalty_greedy_boundary_matches_the_sampler() {
+        // The `<= 0.0` cutoff must agree with the sampler's greedy switch on edge
+        // values. (serde rejects NaN/Inf in request JSON, so these reach the
+        // resolver only defensively, but it must stay correct for all of them.)
+        let default = lumen_runtime::runtime_defaults::repetition_penalty_default();
+        assert_eq!(repetition_penalty_for(None, -0.0), 1.0); // signed zero -> greedy
+        assert_eq!(repetition_penalty_for(None, f32::NEG_INFINITY), 1.0); // -inf -> greedy
+        assert_eq!(repetition_penalty_for(None, f32::from_bits(1)), default); // subnormal > 0 -> sampling
+        assert_eq!(repetition_penalty_for(None, f32::NAN), default); // NaN -> not greedy -> default
+    }
 
     #[test]
     fn tool_call_ids_do_not_repeat_within_or_across_generators() {

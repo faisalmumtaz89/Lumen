@@ -2339,14 +2339,13 @@ async fn e5_normal_max_tokens_length_still_works() {
 //     default would be a value that breaks the sampler chain (e.g. NaN,
 //     0.0, negative).
 //  2. Sending `temperature=0` + seed=42 -> the server must produce
-//     byte-identical output across repeated requests. At `temperature=0`
-//     the engine takes the GREEDY (argmax) path and the repetition
-//     penalty is a no-op for argmax (the highest-logit token is selected
-//     regardless of the penalty shift), so the output remains
-//     deterministic and matches the prior behavior even with the new
-//     default. This catches a regression where the server-internal
-//     default would accidentally engage the slow CPU readback path even
-//     under temperature=0 in a way that breaks reproducibility.
+//     byte-identical output across repeated requests. Greedy (argmax)
+//     decoding is deterministic for a fixed penalty, so repeated identical
+//     requests yield identical output. (The penalty value DOES shape which
+//     token wins the argmax -- it is not a no-op at greedy -- but it is the
+//     same across repeats, so determinism holds.) This catches a regression
+//     where the server-internal default would accidentally engage the slow
+//     CPU readback path under temperature=0 in a way that breaks reproducibility.
 // =========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2385,10 +2384,11 @@ async fn sampler_default_sampler_accepts_request_without_params() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sampler_default_sampler_temp0_is_deterministic() {
     // Item 2 validation: 3 sequential temp=0/seed=42 requests with NO
-    // other sampler params must produce byte-identical content. The new
-    // server-internal `repetition_penalty=1.05` default must not break
-    // determinism at temperature=0 because argmax is invariant to
-    // monotonic logit shifts.
+    // other sampler params must produce byte-identical content. At
+    // temperature=0 the server defaults the repetition penalty to 1.0
+    // (pure greedy); greedy argmax is deterministic, so repeated identical
+    // requests must match. (A non-unit penalty would change which token
+    // wins, but not the determinism this test checks.)
     let (addr, client, _tmp, _handle) = boot_server().await;
     let uri: Uri = format!("http://{addr}/v1/chat/completions")
         .parse()
