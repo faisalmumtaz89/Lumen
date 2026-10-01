@@ -21165,6 +21165,24 @@ impl ComputeBackend for CudaBackend {
         ))
     }
 
+    /// When CUDA serves a session entirely through its fused GPU path — batched
+    /// prefill plus GPU-resident decode, both operating on the device
+    /// `KvCacheGpu` and reading only `KvCache::seq_len` — the host key/value
+    /// mirror is never touched, so the session skips allocating it.
+    ///
+    /// That full-fusion guarantee is exactly
+    /// `caps().batched_prefill && caps().gpu_resident` (both require preloaded
+    /// weights; batched prefill additionally requires a GDN model). When either
+    /// is false the session falls back to the generic `forward_pass`, which
+    /// reads and writes the host mirror via `KvCache::view_mut`, so the mirror
+    /// must be present. Deriving this from `caps()` keeps it consistent with the
+    /// dispatch that reads the same capabilities, rather than assuming every
+    /// served model is GDN and preloaded.
+    fn uses_host_kv_mirror(&self) -> bool {
+        let caps = self.caps();
+        !(caps.batched_prefill && caps.gpu_resident)
+    }
+
     fn sync_kv_from_cpu(
         &self,
         _kv: &crate::kv::KvCache,

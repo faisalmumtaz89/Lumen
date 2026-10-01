@@ -509,6 +509,24 @@ pub trait ComputeBackend: Send + Sync {
         Ok(())
     }
 
+    /// Whether this backend reads or writes the host-side `KvCache` key/value
+    /// mirror.
+    ///
+    /// CPU and SIMD backends compute attention directly from the host buffers
+    /// (via `KvCache::view_mut` in the forward pass), and Metal's batched
+    /// prefill also writes them (then [`Self::sync_kv_to_cpu`] serialises them
+    /// for disk-KV), so all of those return `true` — the default.
+    ///
+    /// A fully device-resident backend whose live KV lives in its own VRAM
+    /// cache and which never syncs KV back to the host (CUDA: `KvCacheGpu`,
+    /// with `sync_kv_to_cpu` unimplemented) returns `false`. The session then
+    /// builds its [`KvCache`] via `KvCache::new_without_host_mirror`, skipping
+    /// the per-layer host buffers that would otherwise be allocated — and
+    /// zeroed — on every session reset for no purpose.
+    fn uses_host_kv_mirror(&self) -> bool {
+        true
+    }
+
     /// Inverse of [`Self::sync_kv_to_cpu`]: copy CPU KV bytes (and optional
     /// recurrent state) into the backend's GPU-resident buffers so the
     /// next forward pass uses the restored state.
