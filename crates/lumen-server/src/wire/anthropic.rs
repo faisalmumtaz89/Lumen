@@ -364,14 +364,15 @@ impl MessagesRequest {
         // apply server-internal only: every request gets a fresh random seed,
         // so identical requests vary (matching the real Anthropic API's
         // non-deterministic behavior).
+        let temperature = self
+            .temperature
+            .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature);
         let sampling = SamplingParams {
-            temperature: self
-                .temperature
-                .unwrap_or_else(lumen_runtime::runtime_defaults::default_temperature),
+            temperature,
             seed: Some(super::next_random_seed()),
             top_p: self.top_p,
             top_k: self.top_k,
-            repetition_penalty: Some(super::diag_repetition_penalty()),
+            repetition_penalty: Some(super::diag_repetition_penalty(temperature)),
             frequency_penalty: Some(super::diag_frequency_penalty()),
             repeat_last_n: super::diag_repeat_last_n(),
             anti_restate: super::diag_anti_restate(),
