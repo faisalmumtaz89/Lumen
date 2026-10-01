@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-10-01
+
+### Changed
+
+- **CUDA NVFP4 models load weights through the memory-mapped provider.** Weight planes upload
+  to the device straight from the mapped file instead of being read into a host buffer first,
+  the path the Metal backend already uses. Image generation on the shared image-and-text GPU
+  path — where the text backend is rebuilt around each image — is faster, with lower resident
+  host memory and faster cold start. The device bytes are unchanged, so model output is
+  identical, and `--sync` still selects the read-into-host provider. An F32 tensor stored at a
+  file offset that is not four-byte aligned is now rejected with a clear error instead of being
+  read through a misaligned pointer; artifacts produced by the converter are always aligned and
+  unaffected.
+
 ## [0.40.0] — 2026-10-01
 
 ### Changed
@@ -1908,7 +1922,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.37.1...v0.38.0
