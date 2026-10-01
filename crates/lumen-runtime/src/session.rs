@@ -175,6 +175,11 @@ pub struct Session {
     prefill_time: Duration,
     /// Cumulative time spent inside decode across all `next_token` calls.
     decode_time: Duration,
+    /// Whether to use the legacy GDN warm-append path (a per-token decode of the
+    /// suffix) instead of the cold-restart fallback in `extend_with_cache`.
+    /// Resolved once at construction from `LUMEN_GDN_WARM_APPEND` (see
+    /// `gdn_warm_append_enabled`); tests override it via `set_gdn_warm_append`.
+    gdn_warm_append: bool,
 }
 
 impl Session {
@@ -240,6 +245,7 @@ impl Session {
             timings: Vec::new(),
             prefill_time: Duration::ZERO,
             decode_time: Duration::ZERO,
+            gdn_warm_append: Self::gdn_warm_append_enabled(),
         })
     }
 
@@ -542,6 +548,22 @@ impl Session {
         }
     }
 
+    /// Whether to keep the legacy GDN warm-append path (a per-token decode of
+    /// the suffix) instead of the cold-restart fallback in `extend_with_cache`.
+    /// Off by default; set `LUMEN_GDN_WARM_APPEND=1` to restore it for rollback
+    /// or A/B measurement. Any other value, or unset, selects the cold path.
+    fn gdn_warm_append_enabled() -> bool {
+        std::env::var("LUMEN_GDN_WARM_APPEND").as_deref() == Ok("1")
+    }
+
+    /// Test hook: force the GDN warm-append path on or off, bypassing the env,
+    /// so parallel tests can exercise both routes without racing on a process
+    /// global.
+    #[cfg(test)]
+    fn set_gdn_warm_append(&mut self, enabled: bool) {
+        self.gdn_warm_append = enabled;
+    }
+
     /// Feed the single un-fed trailing token that a completed sampling step
     /// leaves behind. `next_token` pushes the sampled token into `tokens` and
     /// defers its forward pass to the NEXT call — which never comes once a
@@ -747,6 +769,43 @@ impl Session {
         // `new_full_prompt[common..]`.
         let suffix = &new_full_prompt[common..];
         let suffix_len = suffix.len();
+
+        // GDN warm-append fallback. For a GDN backend the only correct warm
+        // append is a per-token decode loop (see the Case 4 comment below):
+        // batched prefill does not continue the live recurrent state. That loop
+        // runs at decode speed, roughly 70 tok/s on the 27B, while a cold
+        // batched prefill of the whole prompt runs ~100x faster per token, so
+        // cold wins for any suffix larger than a fraction of a percent of the
+        // prompt — which is almost every real continuation — and never stalls a
+        // long one. The two routes are also distinct kernels whose logits are
+        // not guaranteed bit-identical (`corr010_kv_cache_equivalence_test`), so
+        // routing deterministically on the cold path keeps a resubmitted prompt
+        // reproducible. `common == prior_len` holds here because a GDN
+        // divergence (`common < prior_len`) already cold-restarted above. A
+        // suffix below `suffix_threshold` is left to the per-token path below:
+        // decoding a handful of tokens is trivially cheap and beats reprocessing
+        // the whole prompt, and it is the same short-tail path already taken
+        // without a warm append — so the healthy tiny case is untouched.
+        // `LUMEN_GDN_WARM_APPEND=1` restores the legacy per-token path.
+        if backend.caps().gdn
+            && backend.caps().batched_prefill
+            && common == prior_len
+            && total_len > prior_len
+            && suffix_len >= suffix_threshold.max(1)
+            && !self.gdn_warm_append
+        {
+            self.truncate_to(0);
+            backend.reset_recurrent_state();
+            let r = self.extend(new_full_prompt, backend, weights)?;
+            return Ok(SuffixPrefillResult {
+                reused_prefix_len: 0,
+                suffix_len: r.processed_tokens,
+                processed_tokens: r.processed_tokens,
+                fell_back_to_cold: true,
+                used_single_token_path: false,
+                prefill_time: r.prefill_time,
+            });
+        }
 
         // Warm append: reconcile the one-token KV lag a completed sampling
         // step leaves behind before dispatching the suffix (see
@@ -2444,6 +2503,8 @@ mod tests {
         let (provider, _nb, hp) = synthetic_setup();
         let backend = MockGpuBackend::new(true);
         let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        // Legacy per-token warm path (GDN extensions route to cold by default).
+        session.set_gdn_warm_append(true);
         let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
         let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
         session
@@ -2463,6 +2524,100 @@ mod tests {
         assert_eq!(
             backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
             41
+        );
+        assert_eq!(session.kv().seq_len(), extended.len());
+        assert_eq!(backend.state_val(), cold_state(true, &extended));
+    }
+
+    /// By default a GDN warm extension cold-restarts (truncate to 0, reset
+    /// recurrent state, one batched prefill) instead of the slow per-token
+    /// decode loop. The result reuses no prefix, is not the single-token path,
+    /// and is byte-equal to a cold prefill of the same tokens.
+    #[test]
+    fn warm_append_gdn_defaults_to_cold_restart() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        // Force the default (cold) route regardless of ambient LUMEN_GDN_WARM_APPEND.
+        session.set_gdn_warm_append(false);
+        let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
+        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
+        let r = session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        assert!(
+            r.fell_back_to_cold,
+            "GDN warm extension must cold-restart by default"
+        );
+        assert!(
+            !r.used_single_token_path,
+            "cold restart is the batched path, not the single-token loop"
+        );
+        assert_eq!(r.reused_prefix_len, 0, "cold restart reuses no prefix");
+        // One batched prefill, no per-token suffix decodes.
+        assert_eq!(
+            backend.prefill_calls.load(Ordering::SeqCst) - prefills_before,
+            1,
+            "cold restart dispatches exactly one batched prefill"
+        );
+        assert_eq!(
+            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
+            0,
+            "cold restart decodes no suffix tokens"
+        );
+        assert_eq!(session.kv().seq_len(), extended.len());
+        assert_eq!(backend.state_val(), cold_state(true, &extended));
+    }
+
+    /// A GDN warm extension with a suffix below `suffix_threshold` keeps the
+    /// per-token path (a short tail is cheaper than a full re-prefill): it does
+    /// not cold-restart, dispatches no batched prefill, and folds to cold state.
+    #[test]
+    fn warm_append_gdn_tiny_suffix_keeps_per_token_path() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut session = Session::new(baseline_config(128), hp, sampling).unwrap();
+        session
+            .extend(&[0u32, 1, 2, 3], &backend, &provider)
+            .unwrap();
+        for _ in 0..2 {
+            session.next_token(&backend, &provider).unwrap();
+        }
+        // Tiny suffix: 8 tokens, below DEFAULT_SUFFIX_THRESHOLD (32).
+        let mut extended = session.tokens().to_vec();
+        extended.extend((0..8).map(|i| (i % 4) as u32));
+        session.set_gdn_warm_append(false); // default route
+        let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
+        let r = session
+            .extend_with_cache(
+                &extended,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+            )
+            .unwrap();
+        assert!(
+            !r.fell_back_to_cold,
+            "a tiny GDN suffix must not cold-restart"
+        );
+        assert!(
+            r.used_single_token_path,
+            "a tiny GDN suffix uses the per-token path"
+        );
+        assert_eq!(
+            backend.prefill_calls.load(Ordering::SeqCst),
+            prefills_before,
+            "a tiny GDN suffix must not dispatch batched prefill"
         );
         assert_eq!(session.kv().seq_len(), extended.len());
         assert_eq!(backend.state_val(), cold_state(true, &extended));
@@ -2503,6 +2658,8 @@ mod tests {
         let (provider, _nb, hp) = synthetic_setup();
         let backend = MockGpuBackend::new(true);
         let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+        // Legacy per-token warm path (GDN extensions route to cold by default).
+        session.set_gdn_warm_append(true);
         let tail = *session.tokens().last().unwrap();
         *backend.speculative_tail.lock().unwrap() = Some(tail);
         let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
