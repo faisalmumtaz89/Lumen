@@ -1935,7 +1935,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.41.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.38.0...v0.39.0
