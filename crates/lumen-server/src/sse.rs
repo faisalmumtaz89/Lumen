@@ -19,7 +19,8 @@
 use std::sync::Arc;
 
 use lumen_runtime::tooling::{
-    ParsedToolCall, ReasoningExtractor, StreamingFinish, StreamingParser, ToolSchemas,
+    ParsedToolCall, ReasoningExtractor, StreamEvent, StreamingFinish, StreamingParser, ToolSchemas,
+    ToolStreamEvent,
 };
 
 /// The output of a single [`SseSafeEmitter::push`] call.
@@ -29,14 +30,44 @@ pub struct EmitDelta {
     /// the request enabled thinking AND the model is still inside the
     /// `<think>...</think>` block. The caller routes this to
     /// `reasoning_content` (OpenAI), a `thinking` content block (Anthropic),
-    /// or a labelled CLI section — NEVER into the user-visible answer.
+    /// or a labelled CLI section — NEVER into the user-visible answer. Reasoning
+    /// is a separate field because it never interleaves with content (the
+    /// extractor is one-way: everything before `</think>` is reasoning).
     pub reasoning: String,
 
-    /// Plain user-visible text safe to forward right now.
-    pub text: String,
+    /// Post-reasoning content in SOURCE order: user-visible `Text` fragments
+    /// interleaved with tool-call events. Streaming consumers play these in order
+    /// (so text before/between/after a tool call keeps its place); the tool events
+    /// are already filtered to the request's tool choice. `text()` and
+    /// `tool_stream()` give the plain-text / tool-only views.
+    pub events: Vec<StreamEvent>,
 
-    /// Tool calls that finalized in this push.
+    /// Tool calls that finalized in this push (for the NON-STREAMING aggregate).
     pub tool_calls: Vec<ParsedToolCall>,
+}
+
+impl EmitDelta {
+    /// Concatenate the `Text` events into plain answer text.
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for ev in &self.events {
+            if let StreamEvent::Text(t) = ev {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
+    /// The tool-call events in order (the kept, tool-choice-filtered set).
+    pub fn tool_stream(&self) -> Vec<ToolStreamEvent> {
+        self.events
+            .iter()
+            .filter_map(|ev| match ev {
+                StreamEvent::Tool(te) => Some(te.clone()),
+                StreamEvent::Text(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// The tool calls a reply may carry. `schemas` types native `<parameter>`
@@ -67,27 +98,91 @@ impl Default for ReplyTools {
     }
 }
 
+/// Keeps the streamed tool-call events (`tool_stream`) consistent with the
+/// tool-choice filter applied to the finalized `tool_calls`: a call's
+/// `Start`/`ArgJsonDelta`/`End` are forwarded only when its name satisfies
+/// `only` and the `single` cap is not already spent. The keep/drop decision is
+/// made at `Start` (the name is known there) and held across pushes, because one
+/// call's events span several feeds; a dropped call's deltas and closing `End`
+/// are dropped too, so every emitted call is well formed. Calls are sequential
+/// in the native protocol (one `</tool_call>` closes before the next opens), so
+/// `kept` and the finalized `calls` counter stay in lockstep for the `single`
+/// cap and reach the same verdict for every call.
+#[derive(Default)]
+struct ToolStreamGate {
+    /// Calls forwarded so far (for the `single` cap, mirroring `calls`).
+    kept: usize,
+    /// Inside a call whose events are being forwarded (between its kept `Start`
+    /// and its `End`). False between calls and inside a dropped call.
+    emitting: bool,
+}
+
+impl ToolStreamGate {
+    /// Copy the ordered content events through, passing `Text` verbatim and keeping
+    /// a tool call's events only when its name satisfies `only` and the `single`
+    /// cap is not spent — so the streamed calls mirror the kept `tool_calls` while
+    /// text keeps its source position relative to them.
+    fn filter(&mut self, tools: &ReplyTools, events: Vec<StreamEvent>, out: &mut Vec<StreamEvent>) {
+        for ev in events {
+            match ev {
+                StreamEvent::Text(t) => out.push(StreamEvent::Text(t)),
+                StreamEvent::Tool(ToolStreamEvent::Start { name }) => {
+                    // MSRV 1.75: `Option::is_none_or` (1.82) is unavailable.
+                    let name_ok = tools.only.as_ref().map_or(true, |o| *o == name);
+                    let room = !tools.single || self.kept == 0;
+                    if name_ok && room {
+                        self.kept += 1;
+                        self.emitting = true;
+                        out.push(StreamEvent::Tool(ToolStreamEvent::Start { name }));
+                    } else {
+                        self.emitting = false;
+                    }
+                }
+                StreamEvent::Tool(ToolStreamEvent::ArgJsonDelta { partial_json }) => {
+                    if self.emitting {
+                        out.push(StreamEvent::Tool(ToolStreamEvent::ArgJsonDelta {
+                            partial_json,
+                        }));
+                    }
+                }
+                StreamEvent::Tool(ToolStreamEvent::End) => {
+                    if self.emitting {
+                        out.push(StreamEvent::Tool(ToolStreamEvent::End));
+                    }
+                    self.emitting = false;
+                }
+            }
+        }
+    }
+}
+
 /// Parse tool calls out of answer text, keeping the calls the reply may carry;
-/// with parsing off the text passes through unchanged.
+/// with parsing off the whole answer passes through as one `Text` event. The
+/// ordered content events pass through `gate` so the kept tool events mirror the
+/// kept `tool_calls` exactly, and text keeps its position among them.
 fn parse_answer(
     parser: &mut StreamingParser,
     tools: &ReplyTools,
     calls: &mut usize,
+    gate: &mut ToolStreamGate,
     answer: &str,
-) -> (String, Vec<ParsedToolCall>) {
+) -> (Vec<StreamEvent>, Vec<ParsedToolCall>) {
     if !tools.parsed {
-        return (answer.to_string(), Vec::new());
+        return (vec![StreamEvent::Text(answer.to_string())], Vec::new());
     }
-    let mut parsed = parser.feed(answer);
+    let parsed = parser.feed(answer);
+    let mut events = Vec::new();
+    gate.filter(tools, parsed.events, &mut events);
+    let mut tool_calls = parsed.tool_calls;
     if let Some(only) = &tools.only {
-        parsed.tool_calls.retain(|c| c.name == *only);
+        tool_calls.retain(|c| c.name == *only);
     }
     if tools.single {
         // Room for one call over the whole reply.
-        parsed.tool_calls.truncate(1usize.saturating_sub(*calls));
+        tool_calls.truncate(1usize.saturating_sub(*calls));
     }
-    *calls += parsed.tool_calls.len();
-    (parsed.text, parsed.tool_calls)
+    *calls += tool_calls.len();
+    (events, tool_calls)
 }
 
 /// Buffers decoded token fragments until they are safe to emit on the wire.
@@ -105,6 +200,9 @@ pub struct SseSafeEmitter {
     tools: ReplyTools,
     /// Tool calls kept so far.
     calls: usize,
+    /// Keeps streamed tool events consistent with the kept `tool_calls` under the
+    /// request's tool-choice filter (`only`/`single`).
+    stream_gate: ToolStreamGate,
 }
 
 impl Default for SseSafeEmitter {
@@ -118,6 +216,7 @@ impl Default for SseSafeEmitter {
             parser: StreamingParser::new(),
             tools: ReplyTools::default(),
             calls: 0,
+            stream_gate: ToolStreamGate::default(),
         }
     }
 }
@@ -134,6 +233,7 @@ impl SseSafeEmitter {
             parser: StreamingParser::new(),
             tools: ReplyTools::default(),
             calls: 0,
+            stream_gate: ToolStreamGate::default(),
         }
     }
 
@@ -151,6 +251,7 @@ impl SseSafeEmitter {
             parser: StreamingParser::with_schemas(tools.schemas.clone()),
             tools,
             calls: 0,
+            stream_gate: ToolStreamGate::default(),
         }
     }
 
@@ -160,15 +261,16 @@ impl SseSafeEmitter {
     /// (reasoning never contains tool calls); only answer content is parsed.
     fn process_safe_text(&mut self, safe_text: &str) -> EmitDelta {
         let split = self.reasoning.feed(safe_text);
-        let (text, tool_calls) = parse_answer(
+        let (events, tool_calls) = parse_answer(
             &mut self.parser,
             &self.tools,
             &mut self.calls,
+            &mut self.stream_gate,
             &split.content,
         );
         EmitDelta {
             reasoning: split.reasoning,
-            text,
+            events,
             tool_calls,
         }
     }
@@ -211,8 +313,13 @@ impl SseSafeEmitter {
         let mut answer_tail = String::new();
         answer_tail.push_str(&split.content);
         answer_tail.push_str(&reasoning_fin.content);
-        let (text, tool_calls) =
-            parse_answer(&mut self.parser, &self.tools, &mut self.calls, &answer_tail);
+        let (events, tool_calls) = parse_answer(
+            &mut self.parser,
+            &self.tools,
+            &mut self.calls,
+            &mut self.stream_gate,
+            &answer_tail,
+        );
         let fin: StreamingFinish = if self.tools.parsed {
             self.parser.finish()
         } else {
@@ -222,8 +329,12 @@ impl SseSafeEmitter {
         let mut delta = EmitDelta::default();
         delta.reasoning.push_str(&split.reasoning);
         delta.reasoning.push_str(&reasoning_fin.reasoning);
-        delta.text.push_str(&text);
-        delta.text.push_str(&fin.flushed_text);
+        delta.events.extend(events);
+        // Held-back text the parser was sitting on, now safe, as a trailing Text
+        // event after this feed's content.
+        if !fin.flushed_text.is_empty() {
+            delta.events.push(StreamEvent::Text(fin.flushed_text));
+        }
         delta.tool_calls.extend(tool_calls);
 
         (delta, fin.incomplete_tool_call)
@@ -280,7 +391,7 @@ mod tests {
     fn passes_through_plain_ascii_in_one_call() {
         let mut e = SseSafeEmitter::new(false);
         let d = e.push("hello world");
-        assert_eq!(d.text, "hello world");
+        assert_eq!(d.text(), "hello world");
         assert_eq!(d.reasoning, "", "thinking-off must never produce reasoning");
         assert!(d.tool_calls.is_empty());
     }
@@ -296,18 +407,18 @@ mod tests {
         // Push first 2 bytes by routing through pending_bytes directly.
         e.push_raw_bytes_for_test(&bytes[..2]);
         let d1 = e.push_raw_bytes_for_test(&[]);
-        assert_eq!(d1.text, "", "should hold partial codepoint");
+        assert_eq!(d1.text(), "", "should hold partial codepoint");
         let d2 = e.push_raw_bytes_for_test(&bytes[2..]);
-        assert_eq!(d2.text, "日");
+        assert_eq!(d2.text(), "日");
     }
 
     #[test]
     fn holds_back_partial_tool_call_marker() {
         let mut e = SseSafeEmitter::new(false);
         let d = e.push("Calling <tool");
-        assert_eq!(d.text, "Calling ", "must hold the marker prefix");
+        assert_eq!(d.text(), "Calling ", "must hold the marker prefix");
         let d2 = e.push("_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call> end");
-        assert_eq!(d2.text, " end");
+        assert_eq!(d2.text(), " end");
         assert_eq!(d2.tool_calls.len(), 1);
         assert_eq!(d2.tool_calls[0].name, "f");
     }
@@ -317,11 +428,11 @@ mod tests {
         let mut e = SseSafeEmitter::new(false);
         let d_push = e.push("partial <to");
         // "partial " is safe, "<to" is held back.
-        assert_eq!(d_push.text, "partial ");
+        assert_eq!(d_push.text(), "partial ");
         let (d_finish, incomplete) = e.finish();
         // The flush emits the held-back fragment that turned out NOT to be
         // a tool-call marker.
-        assert_eq!(d_finish.text, "<to");
+        assert_eq!(d_finish.text(), "<to");
         assert!(incomplete.is_none());
     }
 
@@ -340,7 +451,7 @@ mod tests {
         let mut e = SseSafeEmitter::default();
         let d = e.push("text</think>more");
         assert_eq!(d.reasoning, "");
-        assert_eq!(d.text, "text</think>more");
+        assert_eq!(d.text(), "text</think>more");
     }
 
     // ---- Reasoning extraction (thinking ON) ----
@@ -350,7 +461,7 @@ mod tests {
         let mut e = SseSafeEmitter::new(true);
         let d = e.push("let me reason</think>The answer.");
         assert_eq!(d.reasoning, "let me reason");
-        assert_eq!(d.text, "The answer.");
+        assert_eq!(d.text(), "The answer.");
         assert!(d.tool_calls.is_empty());
     }
 
@@ -361,10 +472,10 @@ mod tests {
         let mut e = SseSafeEmitter::new(true);
         let d = e.push("thinking about weather</think>Sure. ");
         assert_eq!(d.reasoning, "thinking about weather");
-        assert_eq!(d.text, "Sure. ");
+        assert_eq!(d.text(), "Sure. ");
         let d2 = e.push("<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call> done");
         assert_eq!(d2.reasoning, "");
-        assert_eq!(d2.text, " done");
+        assert_eq!(d2.text(), " done");
         assert_eq!(d2.tool_calls.len(), 1);
         assert_eq!(d2.tool_calls[0].name, "f");
     }
@@ -374,10 +485,10 @@ mod tests {
         let mut e = SseSafeEmitter::new(true);
         let d1 = e.push("reasoning</thi");
         assert_eq!(d1.reasoning, "reasoning", "partial </think> held back");
-        assert_eq!(d1.text, "");
+        assert_eq!(d1.text(), "");
         let d2 = e.push("nk>answer");
         assert_eq!(d2.reasoning, "");
-        assert_eq!(d2.text, "answer");
+        assert_eq!(d2.text(), "answer");
     }
 
     #[test]
@@ -389,7 +500,7 @@ mod tests {
         assert_eq!(d.reasoning, "still reasoning");
         let (fin, incomplete) = e.finish();
         assert_eq!(fin.reasoning, "</thi");
-        assert_eq!(fin.text, "");
+        assert_eq!(fin.text(), "");
         assert!(incomplete.is_none());
     }
 
@@ -410,7 +521,7 @@ mod tests {
         let d = e.push(TWO_CALLS);
         let (fin, incomplete) = e.finish();
         assert!(d.tool_calls.is_empty() && fin.tool_calls.is_empty());
-        assert_eq!(format!("{}{}", d.text, fin.text), TWO_CALLS);
+        assert_eq!(format!("{}{}", d.text(), fin.text()), TWO_CALLS);
         assert_eq!(incomplete, None);
     }
 
@@ -443,5 +554,90 @@ mod tests {
             .flat_map(|d| d.tool_calls.iter().map(|c| c.name.clone()))
             .collect();
         assert_eq!(names, ["f"]);
+    }
+
+    /// Wire-consistency gate: the wire layer streams a tool call's input from
+    /// `tool_stream`, so the calls reconstructed from the streamed events
+    /// (`Start`→`End`, the `ArgJsonDelta`s concatenated) MUST equal the
+    /// finalized, filtered `tool_calls` — byte-for-byte on arguments, and the
+    /// same set under each tool choice (auto, a named `only`, `single`). Fed
+    /// char-by-char so a call's events span pushes, the worst case for the gate.
+    #[test]
+    fn streamed_tool_events_reconstruct_the_kept_calls() {
+        const CALL_F: &str = "<tool_call>\n<function=f>\n<parameter=path>\n\
+                              src/lib.rs\n</parameter>\n</function>\n</tool_call>";
+        const CALL_G: &str = "<tool_call>\n<function=g>\n<parameter=note>\n\
+                              say \"hi\"\tnow\n</parameter>\n</function>\n</tool_call>";
+        let emission = format!("preamble {CALL_F} middle {CALL_G} tail");
+
+        // Collect, over a char-by-char drive, both the finalized filtered calls
+        // and the (name, arguments_json) reconstructed from the streamed events.
+        fn drive(
+            emission: &str,
+            tools: ReplyTools,
+        ) -> (Vec<(String, String)>, Vec<(String, String)>) {
+            let mut e = SseSafeEmitter::with_tools(false, tools);
+            let mut calls = Vec::new();
+            let mut events: Vec<ToolStreamEvent> = Vec::new();
+            let mut b = [0u8; 4];
+            for ch in emission.chars() {
+                let d = e.push(ch.encode_utf8(&mut b));
+                events.extend(d.tool_stream());
+                calls.extend(d.tool_calls.into_iter().map(|c| (c.name, c.arguments_json)));
+            }
+            let (fin, _incomplete) = e.finish();
+            events.extend(fin.tool_stream());
+            calls.extend(
+                fin.tool_calls
+                    .into_iter()
+                    .map(|c| (c.name, c.arguments_json)),
+            );
+
+            let mut recon = Vec::new();
+            let (mut name, mut args, mut inside) = (String::new(), String::new(), false);
+            for ev in events {
+                match ev {
+                    ToolStreamEvent::Start { name: n } => {
+                        name = n;
+                        args.clear();
+                        inside = true;
+                    }
+                    ToolStreamEvent::ArgJsonDelta { partial_json } if inside => {
+                        args.push_str(&partial_json)
+                    }
+                    ToolStreamEvent::ArgJsonDelta { .. } => {}
+                    ToolStreamEvent::End => {
+                        if inside {
+                            recon.push((name.clone(), args.clone()));
+                            inside = false;
+                        }
+                    }
+                }
+            }
+            (calls, recon)
+        }
+
+        let auto = ReplyTools::default();
+        let only_g = ReplyTools {
+            only: Some("g".into()),
+            ..ReplyTools::default()
+        };
+        let single = ReplyTools {
+            single: true,
+            ..ReplyTools::default()
+        };
+        for (label, tools, want) in [
+            ("auto", auto, vec!["f", "g"]),
+            ("only=g", only_g, vec!["g"]),
+            ("single", single, vec!["f"]),
+        ] {
+            let (calls, recon) = drive(&emission, tools);
+            let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, want, "{label}: kept call names");
+            assert_eq!(
+                recon, calls,
+                "{label}: streamed events must reconstruct the kept calls"
+            );
+        }
     }
 }

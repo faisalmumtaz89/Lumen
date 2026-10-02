@@ -26,7 +26,9 @@
 
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
+use lumen_runtime::tooling::{
+    compose_system_with_tools, StreamEvent, ToolSchema, ToolSchemas, ToolStreamEvent,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -750,6 +752,126 @@ pub fn stream_messages(
     body_from_byte_stream(body_rx)
 }
 
+/// Idle-keepalive interval: emit a ping after this long with no wire output.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One step of the Anthropic content-block stream, in emission order. The driver
+/// turns each [`crate::sse::EmitDelta`] (and the end-of-stream flush) into an
+/// ordered list of these and plays them through [`BlockState`], so the live loop
+/// and the flush share ONE state machine for opening, filling, and closing the
+/// thinking / text / tool_use content blocks.
+enum BlockStep {
+    Reasoning(String),
+    Text(String),
+    Tool(ToolStreamEvent),
+}
+
+/// Open/closed state of the single in-flight Anthropic content block. At most one
+/// of thinking / text / tool_use is open at a time; opening a new block (or the
+/// end-of-stream flush) closes the current one via `close_current` and advances
+/// `index`, so indices are always unique and every start has one stop.
+#[derive(Default)]
+struct BlockState {
+    index: usize,
+    thinking_open: bool,
+    text_open: bool,
+    tool_open: bool,
+    /// Set once any tool_use block opens, so the terminal stop_reason can be
+    /// upgraded Stop -> tool_use (matching the non-streaming Anthropic path).
+    emitted_tool: bool,
+    /// Set when a tool block is closed WITHOUT its own `End` (a call cut off
+    /// mid-input). Persists across later blocks so the terminal stop_reason stays
+    /// max_tokens even when a well-formed call follows the truncated one.
+    truncated: bool,
+}
+
+/// Send one SSE event; `Err(())` signals the client hung up (the driver returns).
+async fn send_block(tx: &mpsc::Sender<Vec<u8>>, event: &str, data: &Value) -> Result<(), ()> {
+    tx.send(sse_event(event, &data.to_string()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Close whichever content block is open (thinking, text, or tool_use) before a
+/// different block opens or the stream ends, advancing `index`. A tool_use block
+/// closed here was abandoned without its own `End` (cut off mid-input), so the turn
+/// is marked `truncated` — this is what keeps indices unique and stop_reason
+/// correct when a truncated call is followed by more text or another call.
+async fn close_current(tx: &mpsc::Sender<Vec<u8>>, st: &mut BlockState) -> Result<(), ()> {
+    if st.thinking_open || st.text_open || st.tool_open {
+        let s = json!({ "type": "content_block_stop", "index": st.index });
+        send_block(tx, "content_block_stop", &s).await?;
+        st.index += 1;
+        if st.tool_open {
+            st.truncated = true;
+        }
+        st.thinking_open = false;
+        st.text_open = false;
+        st.tool_open = false;
+    }
+    Ok(())
+}
+
+/// Play one [`BlockStep`] through the content-block state machine.
+async fn emit_block_step(
+    tx: &mpsc::Sender<Vec<u8>>,
+    st: &mut BlockState,
+    step: BlockStep,
+) -> Result<(), ()> {
+    match step {
+        BlockStep::Reasoning(text) => {
+            if !st.thinking_open {
+                let b = json!({ "type": "content_block_start", "index": st.index,
+                    "content_block": { "type": "thinking", "thinking": "" } });
+                send_block(tx, "content_block_start", &b).await?;
+                st.thinking_open = true;
+            }
+            let d = json!({ "type": "content_block_delta", "index": st.index,
+                "delta": { "type": "thinking_delta", "thinking": text } });
+            send_block(tx, "content_block_delta", &d).await?;
+        }
+        BlockStep::Text(text) => {
+            // Append to an already-open text block (one content_block with many
+            // text_deltas, as the real Anthropic API does). Close a thinking block,
+            // or a tool block abandoned mid-input, before opening the text block —
+            // the latter keeps text off a truncated call's index.
+            if st.thinking_open || st.tool_open {
+                close_current(tx, st).await?;
+            }
+            if !st.text_open {
+                let b = json!({ "type": "content_block_start", "index": st.index,
+                    "content_block": { "type": "text", "text": "" } });
+                send_block(tx, "content_block_start", &b).await?;
+                st.text_open = true;
+            }
+            let d = json!({ "type": "content_block_delta", "index": st.index,
+                "delta": { "type": "text_delta", "text": text } });
+            send_block(tx, "content_block_delta", &d).await?;
+        }
+        BlockStep::Tool(ToolStreamEvent::Start { name }) => {
+            st.emitted_tool = true;
+            close_current(tx, st).await?;
+            let b = json!({ "type": "content_block_start", "index": st.index,
+                "content_block": { "type": "tool_use", "id": super::tool_call_id("toolu"),
+                    "name": name, "input": {} } });
+            send_block(tx, "content_block_start", &b).await?;
+            st.tool_open = true;
+        }
+        BlockStep::Tool(ToolStreamEvent::ArgJsonDelta { partial_json }) => {
+            let d = json!({ "type": "content_block_delta", "index": st.index,
+                "delta": { "type": "input_json_delta", "partial_json": partial_json } });
+            send_block(tx, "content_block_delta", &d).await?;
+        }
+        BlockStep::Tool(ToolStreamEvent::End) => {
+            let s = json!({ "type": "content_block_stop", "index": st.index });
+            send_block(tx, "content_block_stop", &s).await?;
+            st.index += 1;
+            st.tool_open = false;
+        }
+    }
+    Ok(())
+}
+
 async fn drive_messages_stream(
     mut rx: JobResponseChannel,
     tx: mpsc::Sender<Vec<u8>>,
@@ -772,17 +894,10 @@ async fn drive_messages_stream(
     // note for the worker/wire division of labour.
     let mut stop_matcher = StopMatcher::new(stop);
     let mut finish_reason: Option<FinishReason> = None;
-    // `thinking` content block (Anthropic extended-thinking). Opened lazily on
-    // the first reasoning delta, closed before the first text/tool block. Stays
-    // closed on the thinking-off default path (no reasoning ever arrives).
-    let mut thinking_block_open = false;
-    let mut text_block_open = false;
-    let mut block_count = 0usize;
-    // Set once a `tool_use` block is streamed. Mirrors the OpenAI streaming
-    // path (`emitted_any_tool_call`): the worker reports `Stop` at end-of-turn
-    // even for a tool-call turn, so the wire layer upgrades the terminal
-    // stop_reason to `tool_use` (matches the non-streaming Anthropic path).
-    let mut emitted_any_tool_call = false;
+    // Content-block state machine for the thinking / text / tool_use blocks. The
+    // same `BlockState` drives the live loop and the end-of-stream flush, so a
+    // tool_use block whose input spans feeds opens, fills, and closes coherently.
+    let mut st = BlockState::default();
     let mut input_tokens = 0usize;
     let mut output_tokens = 0usize;
 
@@ -808,7 +923,29 @@ async fn drive_messages_stream(
         return;
     }
 
-    while let Some(evt) = rx.recv().await {
+    // Keepalive clock. The ping fires after PING_INTERVAL of WIRE inactivity (no
+    // frame emitted), not token inactivity: a long buffered argument receives
+    // tokens while emitting nothing and must still be kept alive. `last_emit`
+    // advances only when a frame goes out, so the deadline tracks the wire.
+    let mut last_emit = tokio::time::Instant::now();
+    loop {
+        let evt = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(evt) => evt,
+                None => break,
+            },
+            _ = tokio::time::sleep_until(last_emit + PING_INTERVAL) => {
+                // Keepalive during a long prefill/queue wait before the first token,
+                // or a long buffered argument mid-generation: the Anthropic
+                // protocol's `event: ping`. Incremental streaming covers gaps where
+                // frames flow; this covers gaps where they do not.
+                if tx.send(sse_event("ping", "{\"type\":\"ping\"}")).await.is_err() {
+                    return;
+                }
+                last_emit = tokio::time::Instant::now();
+                continue;
+            }
+        };
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             // Bench surface: the router refuses streaming requests while it is
@@ -823,151 +960,58 @@ responses; use stream=false" }});
             }
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
-                // Reasoning trace -> a `thinking` content block, emitted BEFORE
-                // any text/tool block. Opens lazily; never fires on the
-                // thinking-off default path (delta.reasoning stays empty).
+                // A token that emits nothing (a buffered argument accumulating) must
+                // not reset the keepalive clock — only real wire output does.
+                let mut emitted = false;
+                // Reasoning precedes all content (the extractor is one-way).
                 if !delta.reasoning.is_empty() {
-                    if !thinking_block_open {
-                        let b = json!({
-                            "type": "content_block_start",
-                            "index": block_count,
-                            "content_block": { "type": "thinking", "thinking": "" }
-                        });
-                        if tx
-                            .send(sse_event("content_block_start", &b.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        thinking_block_open = true;
-                    }
-                    let d = json!({
-                        "type": "content_block_delta",
-                        "index": block_count,
-                        "delta": { "type": "thinking_delta", "thinking": delta.reasoning }
-                    });
-                    if tx
-                        .send(sse_event("content_block_delta", &d.to_string()))
+                    if emit_block_step(&tx, &mut st, BlockStep::Reasoning(delta.reasoning))
                         .await
                         .is_err()
                     {
                         return;
+                    }
+                    emitted = true;
+                }
+                // Play the content events in SOURCE order: text through the stop
+                // matcher, tool events straight through. Keeping the parser's order is
+                // what lets text before / between / after a tool call land in its own
+                // block at the right place — no reordering heuristic, so a truncated
+                // call followed by text and another call cannot corrupt the blocks.
+                let mut hit_stop = false;
+                for ev in delta.events {
+                    match ev {
+                        StreamEvent::Text(t) => {
+                            let (safe_text, hit) = stop_matcher.push(&t);
+                            if !safe_text.is_empty() {
+                                if emit_block_step(&tx, &mut st, BlockStep::Text(safe_text))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                emitted = true;
+                            }
+                            if hit {
+                                hit_stop = true;
+                                break;
+                            }
+                        }
+                        StreamEvent::Tool(te) => {
+                            if emit_block_step(&tx, &mut st, BlockStep::Tool(te))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            emitted = true;
+                        }
                     }
                 }
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
-                if !safe_text.is_empty() {
-                    // The reasoning block (if any) must close before answer text.
-                    if thinking_block_open {
-                        let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx
-                            .send(sse_event("content_block_stop", &s.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        thinking_block_open = false;
-                        block_count += 1;
-                    }
-                    if !text_block_open {
-                        // Open the first text content block.
-                        let b = json!({
-                            "type": "content_block_start",
-                            "index": block_count,
-                            "content_block": { "type": "text", "text": "" }
-                        });
-                        if tx
-                            .send(sse_event("content_block_start", &b.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        text_block_open = true;
-                    }
-                    let d = json!({
-                        "type": "content_block_delta",
-                        "index": block_count,
-                        "delta": { "type": "text_delta", "text": safe_text }
-                    });
-                    if tx
-                        .send(sse_event("content_block_delta", &d.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                for tc in delta.tool_calls {
-                    emitted_any_tool_call = true;
-                    // Close the reasoning block before the first tool block too
-                    // (reasoning precedes all answer content).
-                    if thinking_block_open {
-                        let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx
-                            .send(sse_event("content_block_stop", &s.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        thinking_block_open = false;
-                        block_count += 1;
-                    }
-                    // Close any open text block before opening the tool block.
-                    if text_block_open {
-                        let s = json!({ "type": "content_block_stop", "index": block_count });
-                        if tx
-                            .send(sse_event("content_block_stop", &s.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        text_block_open = false;
-                        block_count += 1;
-                    }
-                    let idx = block_count;
-                    let start_block = json!({
-                        "type": "content_block_start",
-                        "index": idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": super::tool_call_id("toolu"),
-                            "name": tc.name,
-                            "input": {},
-                        }
-                    });
-                    if tx
-                        .send(sse_event("content_block_start", &start_block.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    // Emit the JSON arguments as a single input_json_delta.
-                    let d = json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": { "type": "input_json_delta", "partial_json": tc.arguments_json }
-                    });
-                    if tx
-                        .send(sse_event("content_block_delta", &d.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let stop_block = json!({ "type": "content_block_stop", "index": idx });
-                    if tx
-                        .send(sse_event("content_block_stop", &stop_block.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    block_count += 1;
+                // Advance the clock AFTER the frames are sent: a send that blocks on
+                // backpressure must not leave a stale (early) deadline behind it.
+                if emitted {
+                    last_emit = tokio::time::Instant::now();
                 }
                 if hit_stop {
                     // Wire-side stop (redundant safety net). Report StopSequence
@@ -994,92 +1038,80 @@ responses; use stream=false" }});
             }
         }
     }
-    // Flush residual.
-    let (residual, _incomplete) = emitter.finish();
-    // Residual reasoning -> the (possibly still-open) thinking block. Empty on
-    // the thinking-off default path.
-    if !residual.reasoning.is_empty() {
-        if !thinking_block_open {
-            let b = json!({
-                "type": "content_block_start",
-                "index": block_count,
-                "content_block": { "type": "thinking", "thinking": "" }
-            });
-            let _ = tx
-                .send(sse_event("content_block_start", &b.to_string()))
-                .await;
-            thinking_block_open = true;
-        }
-        let d = json!({
-            "type": "content_block_delta",
-            "index": block_count,
-            "delta": { "type": "thinking_delta", "thinking": residual.reasoning }
-        });
-        let _ = tx
-            .send(sse_event("content_block_delta", &d.to_string()))
-            .await;
-    }
-    // Drop the residual answer text once a stop sequence fired (post-stop
-    // content); otherwise route the emitter residual through the stop matcher
-    // (catches a stop straddling the emitter's held tail) and drain it. Empty
-    // stop => `residual.text` verbatim + nothing, byte-identical to before.
+    // Flush residual: reasoning, then any tool events that close in the flush,
+    // then residual answer text -- same ordering and state machine as the loop.
+    // Errors are ignored here: the stream is ending.
+    let (residual, incomplete) = emitter.finish();
     let stopped_by_sequence = finish_reason == Some(FinishReason::StopSequence);
-    let final_text = if stopped_by_sequence {
+    if !residual.reasoning.is_empty() {
+        let _ = emit_block_step(&tx, &mut st, BlockStep::Reasoning(residual.reasoning)).await;
+    }
+    // Play the residual content in SOURCE order, through the same state machine as
+    // the loop. Once a stop sequence fired, residual content is post-stop and
+    // dropped; otherwise text passes through the stop matcher (catching a stop
+    // straddling the held tail) and tool events close any call that finished in the
+    // flush.
+    if !stopped_by_sequence {
+        for ev in residual.events {
+            match ev {
+                StreamEvent::Text(t) => {
+                    let safe = if stop_matcher.is_active() {
+                        stop_matcher.push(&t).0
+                    } else {
+                        t
+                    };
+                    if !safe.is_empty() {
+                        let _ = emit_block_step(&tx, &mut st, BlockStep::Text(safe)).await;
+                    }
+                }
+                StreamEvent::Tool(te) => {
+                    let _ = emit_block_step(&tx, &mut st, BlockStep::Tool(te)).await;
+                }
+            }
+        }
+    }
+    // Trailing text: the stop matcher's held tail (now safe), dropped once a stop
+    // fired. The cut-off tool body is appended below.
+    let mut final_text = if stopped_by_sequence {
         String::new()
     } else {
-        let (residual_safe, _) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
-        } else {
-            (residual.text.clone(), false)
-        };
-        let mut t = residual_safe;
-        t.push_str(&stop_matcher.finish());
-        t
+        stop_matcher.finish()
     };
+    // A tool call cut off mid-body: a NATIVE one already streamed its partial
+    // input into the still-open tool block (closed below; never duplicated as
+    // text); a legacy / pre-`<function=>` one streamed nothing, so its body is
+    // surfaced as answer text so it is never silently lost. Either way the finish
+    // reason is forced to Length so the client sees a truncation and continues.
+    // `tool_open` is taken to be THIS incomplete call's own block, which holds for
+    // well-formed output and any single truncated call; the trained format never
+    // emits the one shape that breaks it (a native call that reaches `</tool_call>`
+    // with a parameter left open, keeping the block open across a following call).
+    if let Some(body) = &incomplete {
+        if !st.tool_open {
+            final_text.push_str(body);
+        }
+    }
     if !final_text.is_empty() {
-        // Close the reasoning block before residual answer text.
-        if thinking_block_open {
-            let s = json!({ "type": "content_block_stop", "index": block_count });
-            let _ = tx
-                .send(sse_event("content_block_stop", &s.to_string()))
-                .await;
-            thinking_block_open = false;
-            block_count += 1;
-        }
-        if !text_block_open {
-            let b = json!({
-                "type": "content_block_start",
-                "index": block_count,
-                "content_block": { "type": "text", "text": "" }
-            });
-            let _ = tx
-                .send(sse_event("content_block_start", &b.to_string()))
-                .await;
-            text_block_open = true;
-        }
-        let d = json!({
-            "type": "content_block_delta",
-            "index": block_count,
-            "delta": { "type": "text_delta", "text": final_text }
-        });
-        let _ = tx
-            .send(sse_event("content_block_delta", &d.to_string()))
-            .await;
+        let _ = emit_block_step(&tx, &mut st, BlockStep::Text(final_text)).await;
     }
-    // Close whichever block is still open (thinking-only reply, or text).
-    if thinking_block_open || text_block_open {
-        let s = json!({ "type": "content_block_stop", "index": block_count });
-        let _ = tx
-            .send(sse_event("content_block_stop", &s.to_string()))
-            .await;
-    }
+    // Close whichever block is still open (thinking-only reply, text, or a tool
+    // block cut off mid-input); closing a tool block here sets `truncated`.
+    let _ = close_current(&tx, &mut st).await;
     // A tool-call turn ends with the worker's natural `Stop`; upgrade it to
     // `ToolCalls` so the terminal message_delta reports stop_reason "tool_use"
-    // (byte-identical to the OpenAI streaming + non-streaming Anthropic paths).
-    let reason = match finish_reason {
-        Some(FinishReason::Stop) if emitted_any_tool_call => FinishReason::ToolCalls,
-        Some(r) => r,
-        None => FinishReason::Stop,
+    // (matching the OpenAI streaming + non-streaming Anthropic paths). A turn
+    // truncated mid tool call -> max_tokens (via Length): either the parser
+    // reported an incomplete body, OR some tool call was abandoned without its
+    // `End` (`truncated`) — never report that partial, invalid-JSON call as a
+    // clean stop, even when a well-formed call follows it.
+    let reason = if incomplete.is_some() || st.truncated {
+        FinishReason::Length
+    } else {
+        match finish_reason {
+            Some(FinishReason::Stop) if st.emitted_tool => FinishReason::ToolCalls,
+            Some(r) => r,
+            None => FinishReason::Stop,
+        }
     };
     let delta_msg = json!({
         "type": "message_delta",
@@ -1133,7 +1165,7 @@ pub async fn collect_messages(
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 reasoning.push_str(&delta.reasoning);
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
+                let (safe_text, hit_stop) = stop_matcher.push(&delta.text());
                 text.push_str(&safe_text);
                 for tc in delta.tool_calls {
                     tool_blocks.push(json!({
@@ -1166,23 +1198,32 @@ pub async fn collect_messages(
             TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
-    let (residual, _) = emitter.finish();
+    let (residual, incomplete) = emitter.finish();
     reasoning.push_str(&residual.reasoning);
     // Drop the residual answer text once a stop sequence fired (post-stop
     // content); otherwise stop-match + drain the emitter residual. Empty stop =>
     // verbatim append, byte-identical.
     if finish != FinishReason::StopSequence {
         let (residual_safe, _) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
+            stop_matcher.push(&residual.text())
         } else {
-            (residual.text.clone(), false)
+            (residual.text(), false)
         };
         text.push_str(&residual_safe);
         text.push_str(&stop_matcher.finish());
     }
+    // surface a tool call cut off inside its body as answer text (never drop it).
+    if let Some(body) = &incomplete {
+        text.push_str(body);
+    }
 
     if !tool_blocks.is_empty() && finish == FinishReason::Stop {
         finish = FinishReason::ToolCalls;
+    }
+    // an incomplete tool call means the turn was truncated -> report max_tokens
+    // (via Length) so the client continues instead of trusting a clean stop.
+    if incomplete.is_some() {
+        finish = FinishReason::Length;
     }
 
     let mut content_blocks: Vec<Value> = Vec::new();
@@ -1515,6 +1556,15 @@ mod tests {
         thinking: bool,
         stop: Vec<String>,
     ) -> String {
+        stream_messages_to_string_tools(events, thinking, stop, ReplyTools::default()).await
+    }
+
+    async fn stream_messages_to_string_tools(
+        events: Vec<TokenEvent>,
+        thinking: bool,
+        stop: Vec<String>,
+        tools: ReplyTools,
+    ) -> String {
         let (tx, rx) = mpsc::channel(events.len().max(1));
         let return_sender = tx.clone();
         for e in events {
@@ -1529,13 +1579,30 @@ mod tests {
             "test".into(),
             thinking,
             stop,
-            ReplyTools::default(),
+            tools,
         ));
         let mut out = String::new();
         while let Some(chunk) = body_rx.recv().await {
             out.push_str(&String::from_utf8_lossy(&chunk));
         }
         out
+    }
+
+    /// A `ReplyTools` with one `string`-typed parameter so the native streamer
+    /// takes the incremental `StreamString` path. Without a schema the value is
+    /// `BufferTyped` — held until the close — so it never exercises char streaming.
+    fn string_param_tools(func: &str, param: &str) -> ReplyTools {
+        let schema = ToolSchema {
+            name: func.into(),
+            description: String::new(),
+            parameters_json_schema: format!(
+                "{{\"type\":\"object\",\"properties\":{{\"{param}\":{{\"type\":\"string\"}}}}}}"
+            ),
+        };
+        ReplyTools {
+            schemas: std::sync::Arc::new(ToolSchemas::from_tools(&[schema])),
+            ..ReplyTools::default()
+        }
     }
 
     /// Pull `delta.stop_reason` from the terminal `message_delta` SSE event.
@@ -1551,6 +1618,459 @@ mod tests {
             }
         }
         panic!("no message_delta event in stream: {sse}");
+    }
+
+    #[tokio::test]
+    async fn collect_messages_incomplete_tool_call_surfaces_partial_as_max_tokens() {
+        // a tool call cut off inside its body (EOS before </tool_call>) must surface
+        // the partial body as a text block and report max_tokens, not drop it as a clean
+        // end_turn.
+        let events = vec![
+            tok("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"content\": \"fn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        let resp = collect_messages_from_events(events, false).await;
+        assert_eq!(resp["stop_reason"], "max_tokens");
+        let blocks = resp["content"].as_array().unwrap();
+        let text: String = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert!(
+            text.contains("fn main()"),
+            "partial surfaced as text: {text:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "tool_use"),
+            "an incomplete call is not a complete tool_use"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_messages_incomplete_tool_call_surfaces_partial_as_max_tokens() {
+        // The streaming analogue: the partial body is emitted as a text delta and the
+        // terminal message_delta reports stop_reason max_tokens.
+        let events = vec![
+            tok("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"content\": \"fn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert_eq!(stream_stop_reason(&sse), "max_tokens");
+        assert!(
+            sse.contains("fn main()"),
+            "partial surfaced in stream: {sse}"
+        );
+    }
+
+    /// A NATIVE tool call's input streams as it is generated — many
+    /// `input_json_delta` frames across feeds, not one buffered frame at close —
+    /// and the concatenated `partial_json` is valid JSON with the generated value.
+    /// This keeps a client fed during a long tool argument instead of going silent
+    /// until the call closes (which can trip a client's idle watchdog).
+    #[tokio::test]
+    async fn stream_messages_native_tool_input_streams_incrementally() {
+        let events = vec![
+            tok("<tool_call>\n<function=write_file>\n<parameter=content>\n"),
+            tok("line one\n"),
+            tok("line two\n"),
+            tok("line three\n"),
+            tok("</parameter>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 12,
+            },
+        ];
+        // A `string` schema so `content` streams incrementally via StreamString —
+        // the path this test exists to exercise (a schemaless value would buffer).
+        let sse = stream_messages_to_string_tools(
+            events,
+            false,
+            Vec::new(),
+            string_param_tools("write_file", "content"),
+        )
+        .await;
+        assert_eq!(
+            sse.matches("\"type\":\"tool_use\"").count(),
+            1,
+            "exactly one tool_use block: {sse}"
+        );
+        let mut args = String::new();
+        let mut parts: Vec<String> = Vec::new();
+        for block in sse.split("\n\n") {
+            if !block.contains("event: content_block_delta") {
+                continue;
+            }
+            let data = block
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .unwrap();
+            let v: Value = serde_json::from_str(data).unwrap();
+            if v["delta"]["type"] == "input_json_delta" {
+                let p = v["delta"]["partial_json"].as_str().unwrap().to_string();
+                args.push_str(&p);
+                parts.push(p);
+            }
+        }
+        assert!(
+            parts.len() > 1,
+            "tool input must stream incrementally, got {} frame(s): {sse}",
+            parts.len()
+        );
+        // The value must stream ACROSS frames, not arrive whole in one (which a
+        // buffered path would do): early and late value bytes land in different
+        // frames. This is the timing guarantee, not just the framing count.
+        assert!(
+            !parts
+                .iter()
+                .any(|p| p.contains("line one") && p.contains("line three")),
+            "value must stream across frames, not arrive whole: {parts:?}"
+        );
+        let parsed: Value =
+            serde_json::from_str(&args).expect("concatenated partial_json must be valid JSON");
+        assert_eq!(parsed["content"], "line one\nline two\nline three");
+        assert_eq!(stream_stop_reason(&sse), "tool_use");
+    }
+
+    /// A NATIVE tool call cut off mid-input (EOS before `</tool_call>`): the opened
+    /// tool_use block is closed in the flush, the partial arguments already sent as
+    /// `input_json_delta` are NOT also duplicated as a text block, and the turn
+    /// reports max_tokens. (The legacy-JSON analogue above surfaces as text because
+    /// nothing was streamed yet.)
+    #[tokio::test]
+    async fn stream_messages_native_incomplete_tool_call_closes_block_as_max_tokens() {
+        let events = vec![
+            tok("<tool_call>\n<function=write_file>\n<parameter=content>\nfn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        // String schema so the partial `content` streams (StreamString) before the
+        // cut-off, exercising the open-tool-block truncation path.
+        let sse = stream_messages_to_string_tools(
+            events,
+            false,
+            Vec::new(),
+            string_param_tools("write_file", "content"),
+        )
+        .await;
+        assert_eq!(stream_stop_reason(&sse), "max_tokens");
+        assert_eq!(
+            sse.matches("\"type\":\"tool_use\"").count(),
+            1,
+            "the opened tool_use block is present: {sse}"
+        );
+        assert!(
+            sse.contains("\"type\":\"input_json_delta\""),
+            "the partial was streamed as tool input: {sse}"
+        );
+        assert!(
+            !sse.contains("\"type\":\"text_delta\""),
+            "a native partial must not also surface as text: {sse}"
+        );
+        assert_eq!(
+            sse.matches("\"type\":\"content_block_start\"").count(),
+            sse.matches("\"type\":\"content_block_stop\"").count(),
+            "every opened content block must be closed: {sse}"
+        );
+    }
+
+    /// Plain multi-token text streams as ONE text content block with many
+    /// text_deltas (as the real Anthropic API does), not one block per token. A
+    /// standard client reading `content[0].text` must see the whole answer, not
+    /// just the first token — the regression the BlockState refactor introduced.
+    #[tokio::test]
+    async fn stream_messages_multi_token_text_is_one_block() {
+        let events = vec![
+            tok("Hello"),
+            tok(" world"),
+            tok(" again"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 3,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        assert_eq!(
+            sse.matches("\"type\":\"text\"").count(),
+            1,
+            "exactly one text content block: {sse}"
+        );
+        assert_eq!(
+            sse.matches("\"type\":\"content_block_start\"").count(),
+            1,
+            "one content_block_start: {sse}"
+        );
+        assert_eq!(
+            sse.matches("\"type\":\"text_delta\"").count(),
+            3,
+            "all three deltas land in that one block: {sse}"
+        );
+    }
+
+    /// Text that sits between two tool calls — all arriving in ONE feed while a
+    /// tool block is still open from the previous feed — keeps source order and
+    /// unique block indices: tool_use(0), text(1), tool_use(2). The pre-fix bug
+    /// opened the text block at the second call's index and emitted an orphan stop.
+    #[tokio::test]
+    async fn stream_messages_text_between_two_calls_in_one_feed_keeps_order() {
+        let events = vec![
+            tok("<tool_call>\n<function=f>\n"),
+            tok("</function>\n</tool_call>between<tool_call>\n<function=g>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string(events, false, Vec::new()).await;
+        let mut starts: Vec<(u64, String)> = Vec::new();
+        let mut stops: Vec<u64> = Vec::new();
+        for block in sse.split("\n\n") {
+            let Some(data) = block.lines().find_map(|l| l.strip_prefix("data: ")) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("content_block_start") => starts.push((
+                    v["index"].as_u64().unwrap(),
+                    v["content_block"]["type"].as_str().unwrap().to_string(),
+                )),
+                Some("content_block_stop") => stops.push(v["index"].as_u64().unwrap()),
+                _ => {}
+            }
+        }
+        let indices: Vec<u64> = starts.iter().map(|(i, _)| *i).collect();
+        let types: Vec<&str> = starts.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "blocks open at unique indices 0,1,2: {starts:?}"
+        );
+        assert_eq!(
+            types,
+            vec!["tool_use", "text", "tool_use"],
+            "f, the between-text, then g — in source order: {starts:?}"
+        );
+        stops.sort_unstable();
+        assert_eq!(
+            stops,
+            vec![0, 1, 2],
+            "each block closed once, no orphan stop: {sse}"
+        );
+    }
+
+    /// A tool call whose outer `</tool_call>` ARRIVES but whose parameter never
+    /// closed: the buffered parse finalizes an empty call, so `incomplete` is None —
+    /// this truncation is caught ONLY by the open-tool-block / `truncated` guard.
+    /// Must report max_tokens, one closed tool_use block, and never duplicate the
+    /// partial as text. (Regression guard for the load-bearing `truncated` branch.)
+    #[tokio::test]
+    async fn stream_messages_param_unclosed_with_outer_close_is_max_tokens() {
+        let events = vec![
+            tok("<tool_call>\n<function=f>\n<parameter=x>\n1</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 6,
+            },
+        ];
+        let sse = stream_messages_to_string_tools(
+            events,
+            false,
+            Vec::new(),
+            string_param_tools("f", "x"),
+        )
+        .await;
+        assert_eq!(stream_stop_reason(&sse), "max_tokens", "{sse}");
+        assert_eq!(sse.matches("\"type\":\"tool_use\"").count(), 1, "{sse}");
+        assert!(
+            !sse.contains("\"type\":\"text_delta\""),
+            "the partial must not be duplicated as text: {sse}"
+        );
+        assert_eq!(
+            sse.matches("\"type\":\"content_block_start\"").count(),
+            sse.matches("\"type\":\"content_block_stop\"").count(),
+            "the block is closed: {sse}"
+        );
+    }
+
+    /// A truncated call (param unclosed, outer `</tool_call>` present) FOLLOWED by a
+    /// complete call: both tool_use blocks must get unique, closed indices (no reuse,
+    /// no orphan stop), and the turn must still report max_tokens — the truncation
+    /// signal persists past the well-formed call that follows it.
+    #[tokio::test]
+    async fn stream_messages_truncated_call_then_complete_call_stays_valid() {
+        let events = vec![
+            tok("<tool_call>\n<function=f>\n<parameter=x>\n1</tool_call>"),
+            tok("<tool_call>\n<function=g>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 8,
+            },
+        ];
+        let sse = stream_messages_to_string_tools(
+            events,
+            false,
+            Vec::new(),
+            string_param_tools("f", "x"),
+        )
+        .await;
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "max_tokens",
+            "truncation persists past the complete call: {sse}"
+        );
+        let mut starts: Vec<u64> = Vec::new();
+        let mut stops: Vec<u64> = Vec::new();
+        let mut tool_uses = 0;
+        for block in sse.split("\n\n") {
+            let Some(data) = block.lines().find_map(|l| l.strip_prefix("data: ")) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("content_block_start") => {
+                    starts.push(v["index"].as_u64().unwrap());
+                    if v["content_block"]["type"] == "tool_use" {
+                        tool_uses += 1;
+                    }
+                }
+                Some("content_block_stop") => stops.push(v["index"].as_u64().unwrap()),
+                _ => {}
+            }
+        }
+        assert_eq!(tool_uses, 2, "two tool_use blocks: {sse}");
+        let mut uniq = starts.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            starts.len(),
+            "indices unique (no reuse): {starts:?}"
+        );
+        stops.sort_unstable();
+        assert_eq!(
+            stops, uniq,
+            "every opened block closed once, no orphan: {sse}"
+        );
+    }
+
+    /// A TRUNCATED call, then intervening text, then another call that SPANS feeds —
+    /// the hardest ordering case. Source-ordered events keep "between" between f and g,
+    /// so f closes (truncated), the text gets its OWN block, and g opens fresh and
+    /// streams its full input: unique closed indices, no JSON in the text block, no
+    /// orphan stop, max_tokens for the truncated f. The pre-rework heuristic emitted
+    /// Start(g) before the text and corrupted the blocks (JSON in the text block, an
+    /// orphan stop) — this is the regression guard for that fix.
+    #[tokio::test]
+    async fn stream_messages_truncated_then_text_then_spanning_call_stays_valid() {
+        let mk = |n: &str, p: &str| ToolSchema {
+            name: n.into(),
+            description: String::new(),
+            parameters_json_schema: format!(
+                "{{\"type\":\"object\",\"properties\":{{\"{p}\":{{\"type\":\"string\"}}}}}}"
+            ),
+        };
+        let tools = ReplyTools {
+            schemas: std::sync::Arc::new(ToolSchemas::from_tools(&[mk("f", "x"), mk("g", "y")])),
+            ..ReplyTools::default()
+        };
+        let events = vec![
+            tok("<tool_call>\n<function=f>\n<parameter=x>\n1</tool_call>"),
+            tok("between<tool_call>\n<function=g>\n<parameter=y>\n2"),
+            tok("\n</parameter>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 12,
+            },
+        ];
+        let sse = stream_messages_to_string_tools(events, false, Vec::new(), tools).await;
+
+        let mut starts: Vec<(u64, String)> = Vec::new();
+        let mut stops: Vec<u64> = Vec::new();
+        let mut text_by_index: std::collections::BTreeMap<u64, String> = Default::default();
+        let mut input_by_index: std::collections::BTreeMap<u64, String> = Default::default();
+        for block in sse.split("\n\n") {
+            let Some(data) = block.lines().find_map(|l| l.strip_prefix("data: ")) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("content_block_start") => starts.push((
+                    v["index"].as_u64().unwrap(),
+                    v["content_block"]["type"].as_str().unwrap().to_string(),
+                )),
+                Some("content_block_stop") => stops.push(v["index"].as_u64().unwrap()),
+                Some("content_block_delta") => {
+                    let i = v["index"].as_u64().unwrap();
+                    if let Some(t) = v["delta"]["text"].as_str() {
+                        text_by_index.entry(i).or_default().push_str(t);
+                    }
+                    if let Some(j) = v["delta"]["partial_json"].as_str() {
+                        input_by_index.entry(i).or_default().push_str(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let indices: Vec<u64> = starts.iter().map(|(i, _)| *i).collect();
+        let types: Vec<&str> = starts.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "unique indices f / text / g: {starts:?}"
+        );
+        assert_eq!(
+            types,
+            vec!["tool_use", "text", "tool_use"],
+            "source order f, between-text, g: {starts:?}"
+        );
+        stops.sort_unstable();
+        assert_eq!(
+            stops,
+            vec![0, 1, 2],
+            "each block closed once, no orphan stop: {sse}"
+        );
+        assert_eq!(
+            text_by_index.get(&1).map(String::as_str),
+            Some("between"),
+            "the between-text is in the TEXT block: {sse}"
+        );
+        assert_eq!(
+            input_by_index.get(&2).map(String::as_str),
+            Some("{\"y\":\"2\"}"),
+            "g streams its full, valid input in its OWN block: {sse}"
+        );
+        assert!(
+            !input_by_index.contains_key(&1),
+            "no tool JSON leaked into the text block: {sse}"
+        );
+        assert_eq!(
+            stream_stop_reason(&sse),
+            "max_tokens",
+            "the truncated f forces max_tokens: {sse}"
+        );
     }
 
     /// The Anthropic protocol carries usage on the terminal `message_delta`.
@@ -1588,6 +2108,108 @@ mod tests {
             }
         }
         panic!("no message_delta event in stream: {sse}");
+    }
+
+    /// The idle keepalive: when no token arrives for the ping interval — a long
+    /// prefill or queue wait before the first token — the driver emits
+    /// `event: ping` so the client's idle watchdog does not abort the turn. The
+    /// incremental streaming covers every in-generation gap; this is the one gap
+    /// (before generation starts) that pings cover. Virtual time auto-advances to
+    /// the pending timer, so the test does not actually wait.
+    #[tokio::test(start_paused = true)]
+    async fn stream_messages_emits_ping_during_a_long_idle_gap() {
+        let (tx, rx) = mpsc::channel(8);
+        let return_sender = tx.clone();
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = mpsc::channel::<Vec<u8>>(256);
+        let driver = tokio::spawn(drive_messages_stream(
+            pooled,
+            body_tx,
+            "test".into(),
+            false,
+            Vec::new(),
+            ReplyTools::default(),
+        ));
+        // message_start goes out immediately; with no token queued the driver then
+        // parks on the select and virtual time auto-advances to fire the ping.
+        let start = body_rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&start).contains("message_start"));
+        let ping = body_rx.recv().await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&ping).contains("event: ping"),
+            "a long idle gap before the first token must emit a keepalive ping"
+        );
+        // A token + Done then close the turn cleanly (once events flow the ready
+        // token wins the select without advancing time, so no further pings).
+        tx.send(tok("hi")).await.unwrap();
+        tx.send(TokenEvent::Done {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            rest.contains("message_stop"),
+            "turn completes after the ping: {rest}"
+        );
+        driver.await.unwrap();
+    }
+
+    /// The keepalive measures WIRE output, not token arrival: a token that emits
+    /// nothing (here a held-back tool-marker prefix) must not reset the clock, so a
+    /// ping still fires. This is the long-buffered-argument case — tokens flow while
+    /// nothing reaches the wire.
+    #[tokio::test(start_paused = true)]
+    async fn stream_messages_ping_fires_while_a_token_is_held_back() {
+        let (tx, rx) = mpsc::channel(8);
+        let return_sender = tx.clone();
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = mpsc::channel::<Vec<u8>>(256);
+        let driver = tokio::spawn(drive_messages_stream(
+            pooled,
+            body_tx,
+            "test".into(),
+            false,
+            Vec::new(),
+            ReplyTools::default(),
+        ));
+        let start = body_rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&start).contains("message_start"));
+        // A partial open-marker is held back and emits no wire frame.
+        tx.send(tok("<tool")).await.unwrap();
+        // The held-back token did not reset the clock, so a ping still fires.
+        let ping = body_rx.recv().await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&ping).contains("event: ping"),
+            "a non-emitting token must not suppress the keepalive: {}",
+            String::from_utf8_lossy(&ping)
+        );
+        // Terminate via Done: the driver holds a return-sender clone, so dropping
+        // the test's sender alone never closes its input channel.
+        tx.send(TokenEvent::Done {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // The held "<tool" turned out not to be a marker; it flushes as text.
+        assert!(
+            rest.contains("message_stop"),
+            "turn still completes: {rest}"
+        );
+        driver.await.unwrap();
     }
 
     /// A streamed tool-call turn must report the terminal stop_reason
