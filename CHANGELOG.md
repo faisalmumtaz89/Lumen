@@ -19,6 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   connection active during a long prefill or a buffered argument, and a tool call cut off
   mid-body is surfaced with a truncation reason rather than silently dropped. The streamed
   argument bytes are identical to the non-streaming path.
+- **Requests that set `temperature` 0 decode pure greedy.** The server no longer applies an
+  internal repetition penalty on a `temperature` 0 request, so temperature-0 output is exactly
+  greedy. An omitted `temperature` is unchanged. Because greedy decoding has no repetition
+  damping, a very long temperature-0 generation can repeat; set `LUMEN_REPETITION_PENALTY` or
+  use a `temperature` greater than 0 to restore it.
 
 ## [0.41.0] — 2026-10-01
 
