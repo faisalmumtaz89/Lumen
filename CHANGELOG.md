@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.42.0] — 2026-10-02
+
+### Changed
+
+- **Streaming tool calls deliver their arguments incrementally.** On both the Anthropic
+  (`/v1/messages`) and OpenAI (`/v1/chat/completions`) streaming endpoints, a tool call's
+  arguments now stream to the client as they are generated — Anthropic `input_json_delta`,
+  OpenAI `function.arguments` deltas — instead of a single frame when the call closes, and
+  assistant text keeps its position relative to tool calls. Periodic keepalive pings keep the
+  connection active during a long prefill or a buffered argument, and a tool call cut off
+  mid-body is surfaced with a truncation reason rather than silently dropped. The streamed
+  argument bytes are identical to the non-streaming path.
+
 ## [0.41.0] — 2026-10-01
 
 ### Changed
