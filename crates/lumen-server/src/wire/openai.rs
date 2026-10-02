@@ -11,7 +11,9 @@
 
 use axum::body::Body;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::tooling::{compose_system_with_tools, ToolSchema, ToolSchemas};
+use lumen_runtime::tooling::{
+    compose_system_with_tools, StreamEvent, ToolSchema, ToolSchemas, ToolStreamEvent,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -1167,6 +1169,9 @@ pub fn stream_completion(
     body_from_byte_stream(body_rx)
 }
 
+/// Idle-keepalive interval: emit a ping after this long with no wire output.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn drive_chat_stream(
     mut rx: JobResponseChannel,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1194,6 +1199,16 @@ async fn drive_chat_stream(
     let mut finish_reason: Option<FinishReason> = None;
     let mut tool_call_index = 0usize;
     let mut emitted_any_tool_call = false;
+    // True between a streamed tool call's first chunk (its name) and the end of
+    // its arguments. If the stream ends while true the call was cut off mid-input:
+    // its partial arguments already went out, so the flush must NOT also surface
+    // the body as content (that would duplicate it).
+    let mut tool_open = false;
+    // Set when a tool call is abandoned without its `End` (cut off mid-input):
+    // either a new call's first chunk arrives while one is still open, or the
+    // stream ends with `tool_open`. Persists so a truncated call followed by a
+    // well-formed one still reports finish_reason "length".
+    let mut truncated_tool_call = false;
     // Usage totals from the worker's `Done` event, reported in the final usage
     // chunk when `stream_options.include_usage` was requested. On the rare
     // wire-side stop path (the redundant net fires before the worker's Done)
@@ -1218,7 +1233,28 @@ async fn drive_chat_stream(
         }
     }
 
-    while let Some(evt) = rx.recv().await {
+    // Keepalive clock: fire after PING_INTERVAL of WIRE inactivity (no frame
+    // emitted), not token inactivity, so a long buffered argument — tokens
+    // arriving while nothing is emitted — is still kept alive. `last_emit` advances
+    // only when a frame goes out.
+    let mut last_emit = tokio::time::Instant::now();
+    loop {
+        let evt = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(evt) => evt,
+                None => break,
+            },
+            _ = tokio::time::sleep_until(last_emit + PING_INTERVAL) => {
+                // Keepalive during a long prefill/queue wait before the first token,
+                // or a long buffered argument mid-generation: an SSE comment, which
+                // every EventSource client ignores.
+                if tx.send(b": ping\n\n".to_vec()).await.is_err() {
+                    return;
+                }
+                last_emit = tokio::time::Instant::now();
+                continue;
+            }
+        };
         match evt {
             TokenEvent::PrefillDone { .. } => {}
             // Bench surface: the router refuses streaming requests while it is
@@ -1245,9 +1281,24 @@ async fn drive_chat_stream(
                 } else {
                     crate::sse::EmitDelta {
                         reasoning: String::new(),
-                        text: delta_text,
+                        events: vec![StreamEvent::Text(delta_text)],
                         tool_calls: Vec::new(),
                     }
+                };
+                // OpenAI reassembles `content` and indexed `tool_calls` independently,
+                // so the plain-text and tool-event views of the ordered delta are the
+                // two wire channels; computed once each.
+                let answer_text = delta.text();
+                let tool_events = delta.tool_stream();
+                let (safe_text, hit_stop) = stop_matcher.push(&answer_text);
+                // Wire-inactivity keepalive clock: a token that emits at least one
+                // frame resets it; a purely buffering token (empty reasoning, text,
+                // and tool stream) does not, so a long buffered argument still
+                // receives keepalives.
+                let will_emit = if chat {
+                    !delta.reasoning.is_empty() || !safe_text.is_empty() || !tool_events.is_empty()
+                } else {
+                    !safe_text.is_empty()
                 };
                 // Reasoning trace (chat only): emit `delta.reasoning_content`
                 // chunks BEFORE answer content. The trace bypasses the stop
@@ -1270,7 +1321,6 @@ async fn drive_chat_stream(
                         return;
                     }
                 }
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
                 if !safe_text.is_empty() {
                     let frame = if chat {
                         json!({
@@ -1301,35 +1351,73 @@ async fn drive_chat_stream(
                         return;
                     }
                 }
-                for tc in delta.tool_calls {
-                    tool_call_index += 1;
-                    emitted_any_tool_call = true;
-                    if chat {
-                        let frame = json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": tool_call_index - 1,
-                                        "id": super::tool_call_id("call"),
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.name,
-                                            "arguments": tc.arguments_json,
-                                        }
-                                    }]
-                                },
-                                "finish_reason": null,
-                            }],
-                        });
-                        if tx.send(sse_frame(&frame.to_string())).await.is_err() {
-                            return;
+                // Stream the tool call's input incrementally: one opening chunk
+                // carrying the index/id/type/name and an empty `arguments`, then an
+                // arguments-only delta per fragment as it is generated (the OpenAI
+                // streaming tool-call contract). `tool_stream` is empty on the raw
+                // `/v1/completions` path, so this never fires there.
+                for ev in tool_events {
+                    match ev {
+                        ToolStreamEvent::Start { name } => {
+                            if tool_open {
+                                // The previous call never emitted its End — truncated.
+                                truncated_tool_call = true;
+                            }
+                            tool_call_index += 1;
+                            emitted_any_tool_call = true;
+                            tool_open = true;
+                            let frame = json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{
+                                            "index": tool_call_index - 1,
+                                            "id": super::tool_call_id("call"),
+                                            "type": "function",
+                                            "function": { "name": name, "arguments": "" }
+                                        }]
+                                    },
+                                    "finish_reason": null,
+                                }],
+                            });
+                            if tx.send(sse_frame(&frame.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        ToolStreamEvent::ArgJsonDelta { partial_json } => {
+                            let frame = json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{
+                                            "index": tool_call_index - 1,
+                                            "function": { "arguments": partial_json }
+                                        }]
+                                    },
+                                    "finish_reason": null,
+                                }],
+                            });
+                            if tx.send(sse_frame(&frame.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        ToolStreamEvent::End => {
+                            tool_open = false;
                         }
                     }
+                }
+                // Advance the keepalive clock AFTER the frames are sent (a blocked
+                // backpressured send must not leave a stale early deadline).
+                if will_emit {
+                    last_emit = tokio::time::Instant::now();
                 }
                 if hit_stop {
                     // Wire-side stop (redundant safety net; the worker normally
@@ -1358,7 +1446,7 @@ async fn drive_chat_stream(
         }
     }
 
-    let (residual, _incomplete) = emitter.finish();
+    let (residual, incomplete) = emitter.finish();
     // Flush any residual reasoning trace (chat only) before the residual
     // answer text. Empty on the thinking-off default path.
     if chat && !residual.reasoning.is_empty() {
@@ -1384,18 +1472,32 @@ async fn drive_chat_stream(
     // stop could straddle the emitter's held tail) and drain the matcher. With
     // an empty stop list this is `(residual.text, "")`: byte-identical.
     let stopped_by_sequence = finish_reason == Some(FinishReason::StopSequence);
-    let final_content = if stopped_by_sequence {
+    let mut final_content = if stopped_by_sequence {
         String::new()
     } else {
         let (residual_safe, _residual_hit) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
+            stop_matcher.push(&residual.text())
         } else {
-            (residual.text.clone(), false)
+            (residual.text(), false)
         };
         let mut c = residual_safe;
         c.push_str(&stop_matcher.finish());
         c
     };
+    // A tool call cut off mid-body: a NATIVE one already streamed its partial
+    // arguments (tool_open), so its body must NOT be re-surfaced as content; a
+    // legacy / pre-`<function=>` one streamed nothing, so its body is surfaced as
+    // content so it is never lost. Either way the finish reason below is forced to
+    // Length ("length") so the client sees a truncation and continues.
+    // `tool_open` is taken to be THIS incomplete call's own block, which holds for
+    // well-formed output and any single truncated call; the trained format never
+    // emits the one shape that breaks it (a native call that reaches `</tool_call>`
+    // with a parameter left open, keeping the block open across a following call).
+    if let Some(body) = &incomplete {
+        if !tool_open {
+            final_content.push_str(body);
+        }
+    }
     if !final_content.is_empty() {
         let frame = if chat {
             json!({
@@ -1426,10 +1528,18 @@ async fn drive_chat_stream(
             return;
         }
     }
-    let reason = match finish_reason {
-        Some(FinishReason::Stop) if emitted_any_tool_call => FinishReason::ToolCalls,
-        Some(r) => r,
-        None => FinishReason::Stop,
+    // A turn truncated mid tool call -> "length" (via Length): either the parser
+    // reported an incomplete body, OR a tool call is still open (`tool_open` — its
+    // outer `</tool_call>` arrived but a parameter never closed, so no End was
+    // emitted). Never report that partial, invalid-JSON call as a clean tool_calls.
+    let reason = if incomplete.is_some() || tool_open || truncated_tool_call {
+        FinishReason::Length
+    } else {
+        match finish_reason {
+            Some(FinishReason::Stop) if emitted_any_tool_call => FinishReason::ToolCalls,
+            Some(r) => r,
+            None => FinishReason::Stop,
+        }
     };
     let tail = if chat {
         json!({
@@ -1520,7 +1630,7 @@ pub async fn collect_chat(
             TokenEvent::Token { delta_text, .. } => {
                 let delta = emitter.push(&delta_text);
                 reasoning.push_str(&delta.reasoning);
-                let (safe_text, hit_stop) = stop_matcher.push(&delta.text);
+                let (safe_text, hit_stop) = stop_matcher.push(&delta.text());
                 content.push_str(&safe_text);
                 for tc in delta.tool_calls {
                     tool_calls.push(json!({
@@ -1553,7 +1663,7 @@ pub async fn collect_chat(
             TokenEvent::Error(msg) => return Err(ServerError::classify_runtime(msg)),
         }
     }
-    let (residual, _) = emitter.finish();
+    let (residual, incomplete) = emitter.finish();
     reasoning.push_str(&residual.reasoning);
     // Once a stop sequence fired, drop the residual answer text (post-stop
     // content). Otherwise pass the emitter residual through the stop matcher
@@ -1561,16 +1671,25 @@ pub async fn collect_chat(
     // stop => appends `residual.text` verbatim + nothing, byte-identical.
     if finish != FinishReason::StopSequence {
         let (residual_safe, _) = if stop_matcher.is_active() {
-            stop_matcher.push(&residual.text)
+            stop_matcher.push(&residual.text())
         } else {
-            (residual.text.clone(), false)
+            (residual.text(), false)
         };
         content.push_str(&residual_safe);
         content.push_str(&stop_matcher.finish());
     }
+    // surface a tool call cut off inside its body as content (never drop it).
+    if let Some(body) = &incomplete {
+        content.push_str(body);
+    }
 
     if !tool_calls.is_empty() && finish == FinishReason::Stop {
         finish = FinishReason::ToolCalls;
+    }
+    // an incomplete tool call means the turn was truncated -> report "length"
+    // (via Length) so the client continues instead of trusting a clean stop.
+    if incomplete.is_some() {
+        finish = FinishReason::Length;
     }
 
     let mut msg = if tool_calls.is_empty() {
@@ -1967,6 +2086,31 @@ mod tests {
         chat: bool,
         include_usage: bool,
     ) -> String {
+        stream_openai_to_string_tools(events, chat, include_usage, ReplyTools::default()).await
+    }
+
+    /// A `ReplyTools` with one `string`-typed parameter so the native streamer
+    /// takes the incremental `StreamString` path (a schemaless value buffers).
+    fn string_param_tools(func: &str, param: &str) -> ReplyTools {
+        let schema = ToolSchema {
+            name: func.into(),
+            description: String::new(),
+            parameters_json_schema: format!(
+                "{{\"type\":\"object\",\"properties\":{{\"{param}\":{{\"type\":\"string\"}}}}}}"
+            ),
+        };
+        ReplyTools {
+            schemas: std::sync::Arc::new(ToolSchemas::from_tools(&[schema])),
+            ..ReplyTools::default()
+        }
+    }
+
+    async fn stream_openai_to_string_tools(
+        events: Vec<TokenEvent>,
+        chat: bool,
+        include_usage: bool,
+        tools: ReplyTools,
+    ) -> String {
         let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
         let return_sender = tx.clone();
         for e in events {
@@ -1983,7 +2127,7 @@ mod tests {
             chat,
             false,
             Vec::new(),
-            ReplyTools::default(),
+            tools,
             include_usage,
         ));
         let mut out = String::new();
@@ -1991,6 +2135,190 @@ mod tests {
             out.push_str(&String::from_utf8_lossy(&chunk));
         }
         out
+    }
+
+    /// On the OpenAI wire a NATIVE tool call's arguments stream as many
+    /// `function.arguments` deltas — one opening chunk carrying the name and an
+    /// empty `arguments`, then arguments-only deltas — and the concatenation is
+    /// valid JSON with the generated value, not one buffered frame at close.
+    #[tokio::test]
+    async fn stream_chat_native_tool_arguments_stream_incrementally() {
+        let events = vec![
+            tok("<tool_call>\n<function=write_file>\n<parameter=content>\n"),
+            tok("line one\n"),
+            tok("line two\n"),
+            tok("</parameter>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 9,
+            },
+        ];
+        // String schema so `content` streams via StreamString (a schemaless value
+        // buffers to one frame, defeating the point of this test).
+        let sse = stream_openai_to_string_tools(
+            events,
+            true,
+            false,
+            string_param_tools("write_file", "content"),
+        )
+        .await;
+        let mut name = String::new();
+        let mut args = String::new();
+        let mut arg_strings: Vec<String> = Vec::new();
+        for frame in sse.split("\n\n") {
+            let data = match frame.lines().find_map(|l| l.strip_prefix("data: ")) {
+                Some(d) if d != "[DONE]" => d,
+                _ => continue,
+            };
+            let v: serde_json::Value = serde_json::from_str(data).unwrap();
+            let tc = match v["choices"][0]["delta"]["tool_calls"].get(0) {
+                Some(tc) => tc.clone(),
+                None => continue,
+            };
+            if let Some(n) = tc["function"]["name"].as_str() {
+                name.push_str(n);
+            }
+            if let Some(a) = tc["function"]["arguments"].as_str() {
+                if !a.is_empty() {
+                    arg_strings.push(a.to_string());
+                }
+                args.push_str(a);
+            }
+        }
+        assert_eq!(
+            name, "write_file",
+            "name is sent once on the opening chunk: {sse}"
+        );
+        assert!(
+            arg_strings.len() > 1,
+            "arguments must stream incrementally, got {} frame(s): {sse}",
+            arg_strings.len()
+        );
+        // The VALUE itself must split across frames (StreamString), not arrive whole in
+        // one frame: a buffered value would yield a `{"content":"`, the whole value,
+        // and a `}` — three frames, but with both halves together in one. Asserting no
+        // single frame carries both halves is what distinguishes true char streaming.
+        assert!(
+            !arg_strings
+                .iter()
+                .any(|a| a.contains("line one") && a.contains("line two")),
+            "the value must stream in pieces, not arrive whole in one frame: {arg_strings:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("concatenated arguments must be valid JSON");
+        assert_eq!(parsed["content"], "line one\nline two");
+        assert!(
+            sse.contains("\"finish_reason\":\"tool_calls\""),
+            "a tool-call turn reports finish_reason tool_calls: {sse}"
+        );
+    }
+
+    /// A native tool call cut off mid-argument: the partial `function.arguments`
+    /// already streamed must NOT be re-surfaced as message content, and the turn
+    /// reports finish_reason "length" (the OpenAI analogue of max_tokens), never a
+    /// clean "tool_calls" over invalid JSON.
+    #[tokio::test]
+    async fn stream_chat_native_incomplete_tool_call_is_length() {
+        let events = vec![
+            tok("<tool_call>\n<function=write_file>\n<parameter=content>\nfn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        let sse = stream_openai_to_string_tools(
+            events,
+            true,
+            false,
+            string_param_tools("write_file", "content"),
+        )
+        .await;
+        assert!(
+            sse.contains("\"finish_reason\":\"length\""),
+            "a cut-off tool call reports length: {sse}"
+        );
+        assert!(
+            sse.contains("\"arguments\""),
+            "the partial streamed as tool arguments: {sse}"
+        );
+        assert!(
+            !sse.contains("\"content\":\""),
+            "nothing is surfaced as message content: {sse}"
+        );
+    }
+
+    /// A truncated tool call followed by a complete one must report finish_reason
+    /// "length": the complete call clears `tool_open`, so `truncated_tool_call` is
+    /// what carries the truncation signal to the terminal frame.
+    #[tokio::test]
+    async fn stream_chat_truncated_call_then_complete_call_is_length() {
+        let events = vec![
+            tok("<tool_call>\n<function=f>\n<parameter=x>\n1</tool_call>"),
+            tok("<tool_call>\n<function=g>\n</function>\n</tool_call>"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 8,
+            },
+        ];
+        let sse =
+            stream_openai_to_string_tools(events, true, false, string_param_tools("f", "x")).await;
+        assert!(
+            sse.contains("\"finish_reason\":\"length\""),
+            "truncation persists past the complete call: {sse}"
+        );
+    }
+
+    /// The idle keepalive: with no token for the ping interval (a long prefill or
+    /// queue wait before the first token) the driver emits an SSE comment, which
+    /// every EventSource client ignores, so a slow-to-start turn is not aborted.
+    /// Virtual time auto-advances to the pending timer, so the test does not wait.
+    #[tokio::test(start_paused = true)]
+    async fn stream_chat_emits_ping_during_a_long_idle_gap() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let return_sender = tx.clone();
+        let pooled = crate::engine::PooledReceiver::new(rx, return_sender, None, 0, None);
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let driver = tokio::spawn(drive_chat_stream(
+            pooled,
+            body_tx,
+            "m".into(),
+            1234,
+            true,
+            false,
+            Vec::new(),
+            ReplyTools::default(),
+            false,
+        ));
+        // The role head chunk goes out immediately; with no token queued the driver
+        // parks on the select and virtual time auto-advances to fire the keepalive.
+        let head = body_rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&head).contains("role"));
+        let ping = body_rx.recv().await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&ping).contains(": ping"),
+            "a long idle gap must emit an SSE-comment keepalive"
+        );
+        tx.send(tok("hi")).await.unwrap();
+        tx.send(TokenEvent::Done {
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        while let Some(chunk) = body_rx.recv().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            rest.contains("[DONE]"),
+            "turn completes after the ping: {rest}"
+        );
+        driver.await.unwrap();
     }
 
     /// `stream_options.include_usage: true` -> exactly ONE extra chunk with
@@ -2224,6 +2552,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn collect_chat_incomplete_tool_call_surfaces_partial_as_length() {
+        // a tool call cut off inside its body (EOS before </tool_call>) must surface
+        // the partial body as content and report "length", not drop it as a clean "stop".
+        let events = vec![
+            tok("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"content\": \"fn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        let resp = collect_chat_from_events(events, "test".into(), 1, false)
+            .await
+            .unwrap();
+        assert_eq!(resp["choices"][0]["finish_reason"], "length");
+        let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("fn main()"),
+            "partial surfaced as content: {content:?}"
+        );
+        assert!(
+            resp["choices"][0]["message"]["tool_calls"].is_null(),
+            "an incomplete call is not a complete tool_call"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_incomplete_tool_call_surfaces_partial_as_length() {
+        // The streaming analogue: the partial body is emitted as a content delta and the
+        // terminal chunk reports finish_reason "length".
+        let events = vec![
+            tok("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"content\": \"fn main() {"),
+            TokenEvent::Done {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 20,
+            },
+        ];
+        let sse = stream_openai_to_string(events, true, false).await;
+        assert!(
+            sse.contains("fn main()"),
+            "partial surfaced in stream: {sse}"
+        );
+        assert!(
+            sse.contains("\"finish_reason\":\"length\""),
+            "length reason in stream: {sse}"
+        );
     }
 
     // ---- F4: wire-side stop matcher seeding (non-streaming chat) ----

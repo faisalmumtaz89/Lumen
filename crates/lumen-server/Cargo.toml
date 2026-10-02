@@ -60,7 +60,7 @@ mimalloc = { workspace = true, optional = true }
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "client", "client-legacy", "http1"] }
 http-body-util = "0.1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 # soak harness — reuses lumen-cli's `BpeTokenizer` via the
 # `lumen_cli` library facade so the soak does not fork the BPE

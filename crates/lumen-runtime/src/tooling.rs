@@ -233,6 +233,17 @@ impl Qwen35Renderer {
 /// avoid pulling in serde for the runtime crate. RFC 8259 §7.
 fn json_string_into(s: &str, out: &mut String) {
     out.push('"');
+    json_escape_into(s, out);
+    out.push('"');
+}
+
+/// JSON-escape `s` WITHOUT the surrounding quotes, appending to `out`. The
+/// escaping is per-character and matches serde_json / [`json_string_into`]
+/// (RFC 8259 §7), so a string escaped in pieces on character boundaries
+/// concatenates to the same bytes as escaping it whole. The incremental
+/// tool-call streamer relies on that property to stream a string argument value
+/// chunk-by-chunk and still match the buffered path's JSON byte-for-byte.
+fn json_escape_into(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -249,27 +260,80 @@ fn json_string_into(s: &str, out: &mut String) {
             c => out.push(c),
         }
     }
-    out.push('"');
 }
 
 // ---------------------------------------------------------------------------
 // Streaming parser
 // ---------------------------------------------------------------------------
 
-/// What the streaming parser produces from one `feed` call.
+/// One incremental tool-call event, emitted while a NATIVE (`<function=…>`)
+/// tool-call body streams, for wire formats that stream tool input (Anthropic
+/// `input_json_delta`, OpenAI `tool_calls` argument deltas). Between a `Start`
+/// and its `End`, the concatenation of every `ArgJsonDelta.partial_json` equals
+/// the buffered path's `ParsedToolCall.arguments_json` byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolStreamEvent {
+    /// A tool call opened. `name` is the function name (now known).
+    Start { name: String },
+    /// A fragment of the arguments JSON object, already framed and escaped.
+    ArgJsonDelta { partial_json: String },
+    /// The tool call closed; its arguments JSON is now complete and valid.
+    End,
+}
+
+/// One ordered item in a `feed` call's output: plain user-visible text, or a
+/// tool-call event. Keeping text and tool events in ONE source-ordered list is
+/// what lets the wire layer preserve their exact interleaving (text before,
+/// between, or after tool calls) instead of trying to reconstruct it from separate
+/// fields — the reconstruction that could not be made correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// Plain assistant text safe to forward now (no held-back marker prefix).
+    Text(String),
+    /// A native tool-call event (`Start` / `ArgJsonDelta` / `End`), or a legacy
+    /// body's atomic `Start` + arguments + `End`.
+    Tool(ToolStreamEvent),
+}
+
+/// What the streaming parser produces from one `feed` call: the content as an
+/// ordered [`StreamEvent`] list, plus any tool calls finalized this feed.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StreamingDelta {
-    /// Plain assistant text that is safe to forward to the client right now.
-    ///
-    /// "Safe" means: no possible prefix of a tool-call open marker is being
-    /// held back. The text is byte-exact: concatenating every delta's
-    /// `text` field reconstructs the full assistant content stripped of
-    /// tool-call markers and their inner JSON bodies.
-    pub text: String,
+    /// Content in SOURCE order: `Text` fragments interleaved with tool-call events.
+    /// Concatenating every `Text` across all deltas reconstructs the full assistant
+    /// content with tool-call markers and bodies removed; the tool events stream a
+    /// call's input incrementally (native bodies) or atomically (legacy bodies).
+    pub events: Vec<StreamEvent>,
 
-    /// Tool calls fully parsed during this feed call. Each call has its
-    /// closing marker observed; the JSON body is captured verbatim.
+    /// Tool calls fully parsed during this feed call (closing marker observed, JSON
+    /// body captured verbatim). Used by the NON-STREAMING consumers (collect_*),
+    /// which emit one block at the close; streaming consumers use `events`.
     pub tool_calls: Vec<ParsedToolCall>,
+}
+
+impl StreamingDelta {
+    /// Concatenate the `Text` events into plain answer text — the view the
+    /// non-streaming aggregate and the stop matcher want.
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for ev in &self.events {
+            if let StreamEvent::Text(t) = ev {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
+    /// The tool-call events, in order — the view the byte-identity tests want.
+    pub fn tool_stream(&self) -> Vec<ToolStreamEvent> {
+        self.events
+            .iter()
+            .filter_map(|ev| match ev {
+                StreamEvent::Tool(te) => Some(te.clone()),
+                StreamEvent::Text(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// State of the streaming tool-call parser.
@@ -306,6 +370,10 @@ pub struct StreamingParser {
     /// heuristically and legacy JSON bodies exactly. Shared (`Arc`) because the
     /// same schema set is handed to every request's parser.
     schemas: Option<Arc<ToolSchemas>>,
+    /// Incremental streamer for native tool-call bodies; emits the
+    /// `StreamingDelta::tool_stream` events in parallel with the buffered parse,
+    /// reset per tool call. Byte-identical to the buffered `tool_calls` output.
+    native: NativeStreamer,
 }
 
 /// What [`StreamingParser::finish`] returns.
@@ -332,6 +400,7 @@ impl StreamingParser {
             held_back: String::new(),
             current_body: String::new(),
             schemas: None,
+            native: NativeStreamer::new(None),
         }
     }
 
@@ -344,6 +413,7 @@ impl StreamingParser {
             mode: ParserMode::Outside,
             held_back: String::new(),
             current_body: String::new(),
+            native: NativeStreamer::new(Some(Arc::clone(&schemas))),
             schemas: Some(schemas),
         }
     }
@@ -386,12 +456,17 @@ impl StreamingParser {
         }
 
         if let Some(pos) = find_subslice(bytes, marker) {
-            // Emit [0, pos) as safe text.
-            delta.text.push_str(&input[..pos]);
+            // Emit [0, pos) as safe text, ordered before this call's tool events.
+            if pos > 0 {
+                delta
+                    .events
+                    .push(StreamEvent::Text(input[..pos].to_string()));
+            }
             // Transition into the call body. We DROP the open marker
             // itself from the output stream.
             self.mode = ParserMode::InsideCall;
             self.current_body.clear();
+            self.native = NativeStreamer::new(self.schemas.clone());
             let body_start = pos + m;
             // Continue parsing the remainder as inside-call.
             let remainder = &input[body_start..];
@@ -402,7 +477,11 @@ impl StreamingParser {
             // it back, and emit the rest as safe text.
             let hold_len = longest_marker_prefix(bytes, marker);
             let safe_end_in_input = n - hold_len;
-            delta.text.push_str(&input[..safe_end_in_input]);
+            if safe_end_in_input > 0 {
+                delta
+                    .events
+                    .push(StreamEvent::Text(input[..safe_end_in_input].to_string()));
+            }
             self.held_back.push_str(&input[safe_end_in_input..]);
         }
     }
@@ -417,11 +496,37 @@ impl StreamingParser {
         if let Some(pos) = find_subslice(bytes, close) {
             // body grows by input[..pos]
             self.current_body.push_str(&input[..pos]);
+            // Stream the same body bytes incrementally (native bodies only), then
+            // close the streamed object at end-of-body for the rare well-formed
+            // call that omits `</function>`. Collect into a local vec so the tool
+            // events append to `events` in source order (after any preceding text).
+            let mut tool_evs = Vec::new();
+            self.native.feed(&input[..pos], &mut tool_evs);
+            self.native.end_of_body(&mut tool_evs);
             // Finalize. Native `<function=>` bodies are typed by the request's
             // schemas; legacy JSON bodies ignore them.
             if let Some(call) = parse_call_body(&self.current_body, self.schemas.as_deref()) {
+                // A native `<function=>` body already streamed its input
+                // incrementally above; a legacy JSON body streams nothing, so
+                // surface it as one atomic Start + arguments + End. Detect legacy
+                // by the SAME rule `parse_call_body` dispatches on — the first
+                // non-whitespace byte is `{` — so a `<function=>` appearing inside a
+                // legacy JSON string value neither suppresses the real call nor
+                // double-emits (the streamer is inert on legacy bodies).
+                if self.current_body.trim_start().starts_with('{') {
+                    tool_evs.push(ToolStreamEvent::Start {
+                        name: call.name.clone(),
+                    });
+                    tool_evs.push(ToolStreamEvent::ArgJsonDelta {
+                        partial_json: call.arguments_json.clone(),
+                    });
+                    tool_evs.push(ToolStreamEvent::End);
+                }
                 delta.tool_calls.push(call);
             }
+            delta
+                .events
+                .extend(tool_evs.into_iter().map(StreamEvent::Tool));
             self.current_body.clear();
             self.mode = ParserMode::Outside;
             // Continue with the tail (could contain plain text or another
@@ -437,6 +542,11 @@ impl StreamingParser {
             let hold_len = longest_marker_prefix(bytes, close);
             let safe_end = bytes.len() - hold_len;
             self.current_body.push_str(&input[..safe_end]);
+            let mut tool_evs = Vec::new();
+            self.native.feed(&input[..safe_end], &mut tool_evs);
+            delta
+                .events
+                .extend(tool_evs.into_iter().map(StreamEvent::Tool));
             self.held_back.push_str(&input[safe_end..]);
         }
     }
@@ -643,7 +753,7 @@ pub fn parse_final_with_schemas(
 fn run_final(assistant_text: &str, mut p: StreamingParser) -> ParsedAssistant {
     let mut out = ParsedAssistant::default();
     let delta = p.feed(assistant_text);
-    out.content.push_str(&delta.text);
+    out.content.push_str(&delta.text());
     out.tool_calls.extend(delta.tool_calls);
     let fin = p.finish();
     out.content.push_str(&fin.flushed_text);
@@ -757,12 +867,17 @@ fn parse_native_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<P
     let mut map = serde_json::Map::new();
     let mut rest = &after_name[name_end + 1..];
     // Known limitation (RISK-2): a `<parameter>` value that itself contains the
-    // literal `</parameter>` (or `</tool_call>` at the outer streaming marker
-    // scan) truncates the block early. The trained Qwen3.5 format never emits
-    // those markers inside a value, and because the batch and streaming paths
-    // scan for the SAME markers, any such truncation is byte-identical on both —
-    // so the streaming==batch guarantee is preserved. Not rewritten to a full
-    // nested parser: that carries regression risk for no observed benefit.
+    // literal `</parameter>` truncates that parameter early — IDENTICALLY on the
+    // batch and streaming paths (both stop the value at `</parameter>`), so the
+    // streaming==batch guarantee holds for it. A value containing the OUTER
+    // `</tool_call>` marker is the one case the two paths do NOT agree on: the batch
+    // path is handed a body already cut at `</tool_call>` and drops the unclosed
+    // parameter (`{}`), while the streamer is mid-value and emits the partial input
+    // with no `End` (the wire then reports a truncated turn). The trained Qwen3.5
+    // format never emits either marker inside a value, and in the `</tool_call>` case
+    // the stream still degrades safely (truncation signalled, block integrity intact,
+    // nothing lost on the client's terms). Not rewritten to a full nested parser:
+    // that carries regression risk for no observed benefit.
     while let Some(p) = rest.find(PARAM_OPEN) {
         let after_open = &rest[p + PARAM_OPEN.len()..];
         let Some(pname_end) = after_open.find('>') else {
@@ -786,6 +901,289 @@ fn parse_native_call_body(body: &str, schemas: Option<&ToolSchemas>) -> Option<P
         name,
         arguments_json: JsonValue::Object(map).to_string(),
     })
+}
+
+/// A newline immediately followed by the parameter close. The template puts one
+/// `\n` right before `</parameter>` and the buffered parser strips it, so while
+/// streaming a string value this whole suffix must be held back until the close
+/// is ruled out — otherwise that trailing newline leaks into the value.
+const NL_PARAM_CLOSE: &str = "\n</parameter>";
+
+/// Round `i` down to a UTF-8 character boundary of `s`, so a held-back tail never
+/// splits a multi-byte character (`feed` always receives valid UTF-8).
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Phase of [`NativeStreamer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeState {
+    SeekFunction,
+    ReadFuncName,
+    SeekParamOrEnd,
+    ReadParamName,
+    StreamString,
+    BufferTyped,
+    /// The body is legacy JSON (first non-whitespace byte `{`), which
+    /// `parse_call_body` routes to the JSON parser. The streamer emits nothing;
+    /// the legacy atomic triple is produced at finalize.
+    NotNative,
+    Done,
+}
+
+/// Streams a NATIVE (`<function=NAME><parameter=X>…</parameter>…</function>`)
+/// tool-call body incrementally as [`ToolStreamEvent`]s. Between the `Start` and
+/// `End`, the concatenation of every `ArgJsonDelta.partial_json` equals the
+/// buffered [`parse_native_call_body`] `arguments_json` byte-for-byte: it reuses
+/// the same [`json_string_into`]/[`json_escape_into`] escaping, the same
+/// [`strip_one_surrounding_newline`] trim, and the same [`coerce_param_value`]
+/// typing. Only `string`-typed parameters stream their value char-by-char; every
+/// other type, and every value with no declared type, is buffered to its close
+/// and coerced exactly as the buffered path (those values are short). A legacy
+/// JSON body never contains `<function=`, so this emits nothing for it.
+#[derive(Debug, Clone)]
+struct NativeStreamer {
+    state: NativeState,
+    hold: String,
+    schemas: Option<Arc<ToolSchemas>>,
+    func: String,
+    param: String,
+    first_param: bool,
+    leading_nl_pending: bool,
+    /// Latched once the body's first non-whitespace byte proves it NATIVE (not a
+    /// legacy `{`): later chunks are no longer re-classified, so a non-`{` first
+    /// chunk followed by a `{` chunk cannot flip the streamer to `NotNative`.
+    committed_native: bool,
+    /// Accumulator for a `BufferTyped` value (typed / composite parameters, which
+    /// cannot stream and must be coerced whole). Appended across feeds so the hold
+    /// stays bounded — O(n) total, not O(n^2).
+    typed_buf: String,
+}
+
+impl NativeStreamer {
+    fn new(schemas: Option<Arc<ToolSchemas>>) -> Self {
+        Self {
+            state: NativeState::SeekFunction,
+            hold: String::new(),
+            schemas,
+            func: String::new(),
+            param: String::new(),
+            first_param: true,
+            leading_nl_pending: false,
+            committed_native: false,
+            typed_buf: String::new(),
+        }
+    }
+
+    fn param_type(&self) -> Option<String> {
+        self.schemas
+            .as_ref()
+            .and_then(|s| s.param_type(&self.func, &self.param))
+            .map(str::to_string)
+    }
+
+    /// Longest suffix of `s` that is a prefix of `marker` (markers are ASCII).
+    fn marker_tail(s: &str, marker: &str) -> usize {
+        longest_marker_prefix(s.as_bytes(), marker.as_bytes())
+    }
+
+    /// Feed the next body text; append any events to `out`.
+    fn feed(&mut self, chunk: &str, out: &mut Vec<ToolStreamEvent>) {
+        let mut input = std::mem::take(&mut self.hold);
+        input.push_str(chunk);
+        let mut rest = input.as_str();
+        loop {
+            match self.state {
+                NativeState::SeekFunction => {
+                    // Native-vs-legacy detection matching `parse_call_body`: a body
+                    // whose first non-whitespace byte is `{` is LEGACY JSON — the
+                    // streamer stays inert (the legacy atomic triple is emitted at
+                    // finalize). Any other body is native, so seek its `<function=`
+                    // opener. This also stops the streamer from matching a
+                    // `<function=` that merely appears inside a legacy JSON string.
+                    // The decision is LATCHED at the first non-whitespace byte
+                    // (`committed_native`): once a non-`{` body is seen, a later chunk
+                    // starting with `{` cannot flip it (the body's true start wins,
+                    // as `parse_call_body` dispatches on the whole trimmed body).
+                    if !self.committed_native {
+                        let trimmed = rest.trim_start();
+                        if trimmed.is_empty() {
+                            // Leading whitespace before the first non-ws byte is
+                            // insignificant (it precedes `<function=` / `{`, which both
+                            // the streamer and `parse_call_body` skip or trim), so
+                            // DISCARD it rather than re-holding the whole prefix every
+                            // feed — the latter is O(n^2) for a long whitespace run.
+                            return;
+                        }
+                        if trimmed.starts_with('{') {
+                            self.state = NativeState::NotNative;
+                            return;
+                        }
+                        self.committed_native = true;
+                    }
+                    match rest.find(FUNCTION_OPEN) {
+                        Some(p) => {
+                            rest = &rest[p + FUNCTION_OPEN.len()..];
+                            self.state = NativeState::ReadFuncName;
+                        }
+                        None => {
+                            let keep = Self::marker_tail(rest, FUNCTION_OPEN);
+                            self.hold = rest[rest.len() - keep..].to_string();
+                            return;
+                        }
+                    }
+                }
+                NativeState::ReadFuncName => match rest.find('>') {
+                    Some(e) => {
+                        self.func = rest[..e].trim().to_string();
+                        out.push(ToolStreamEvent::Start {
+                            name: self.func.clone(),
+                        });
+                        rest = &rest[e + 1..];
+                        self.state = NativeState::SeekParamOrEnd;
+                    }
+                    None => {
+                        self.hold = rest.to_string();
+                        return;
+                    }
+                },
+                NativeState::SeekParamOrEnd => match rest.find(PARAM_OPEN) {
+                    Some(p) => {
+                        rest = &rest[p + PARAM_OPEN.len()..];
+                        self.state = NativeState::ReadParamName;
+                    }
+                    None => {
+                        // The buffered parser scans every `<parameter=` to the end of
+                        // the body and never treats `</function>` as a terminator (it
+                        // is skipped like any other between-parameter text). Match
+                        // that: hold only a possible `<parameter=` prefix and let
+                        // `end_of_body` (the outer `</tool_call>`) close the object.
+                        let keep = Self::marker_tail(rest, PARAM_OPEN);
+                        self.hold = rest[rest.len() - keep..].to_string();
+                        return;
+                    }
+                },
+                NativeState::ReadParamName => match rest.find('>') {
+                    Some(e) => {
+                        self.param = rest[..e].trim().to_string();
+                        let mut prefix = String::from(if self.first_param { "{" } else { "," });
+                        json_string_into(&self.param, &mut prefix);
+                        prefix.push(':');
+                        self.first_param = false;
+                        rest = &rest[e + 1..];
+                        if self.param_type().as_deref() == Some("string") {
+                            prefix.push('"');
+                            out.push(ToolStreamEvent::ArgJsonDelta {
+                                partial_json: prefix,
+                            });
+                            self.leading_nl_pending = true;
+                            self.state = NativeState::StreamString;
+                        } else {
+                            out.push(ToolStreamEvent::ArgJsonDelta {
+                                partial_json: prefix,
+                            });
+                            self.state = NativeState::BufferTyped;
+                        }
+                    }
+                    None => {
+                        self.hold = rest.to_string();
+                        return;
+                    }
+                },
+                NativeState::StreamString => {
+                    if self.leading_nl_pending && !rest.is_empty() {
+                        rest = rest.strip_prefix('\n').unwrap_or(rest);
+                        self.leading_nl_pending = false;
+                    }
+                    match rest.find(PARAM_CLOSE) {
+                        Some(p) => {
+                            // Strip the one trailing '\n' the template adds (parity
+                            // with `strip_one_surrounding_newline`; the leading one
+                            // was dropped on entry), then close the JSON string.
+                            let val = rest[..p].strip_suffix('\n').unwrap_or(&rest[..p]);
+                            let mut d = String::new();
+                            json_escape_into(val, &mut d);
+                            d.push('"');
+                            out.push(ToolStreamEvent::ArgJsonDelta { partial_json: d });
+                            rest = &rest[p + PARAM_CLOSE.len()..];
+                            self.state = NativeState::SeekParamOrEnd;
+                        }
+                        None => {
+                            // Hold a possible `</parameter>` prefix, OR a `\n`
+                            // followed by a `</parameter>` prefix: a newline right
+                            // before the close is the trailing one to strip, so it
+                            // must not be emitted until the close is ruled out.
+                            let keep = Self::marker_tail(rest, PARAM_CLOSE)
+                                .max(Self::marker_tail(rest, NL_PARAM_CLOSE));
+                            let safe = floor_char_boundary(rest, rest.len() - keep);
+                            if safe > 0 {
+                                let mut d = String::new();
+                                json_escape_into(&rest[..safe], &mut d);
+                                out.push(ToolStreamEvent::ArgJsonDelta { partial_json: d });
+                            }
+                            self.hold = rest[safe..].to_string();
+                            return;
+                        }
+                    }
+                }
+                NativeState::BufferTyped => match rest.find(PARAM_CLOSE) {
+                    Some(p) => {
+                        // Close: the full value is the accumulator plus this chunk's
+                        // head. Coerce it exactly as the buffered path.
+                        self.typed_buf.push_str(&rest[..p]);
+                        let val = strip_one_surrounding_newline(&self.typed_buf);
+                        let coerced = coerce_param_value(val, self.param_type().as_deref());
+                        out.push(ToolStreamEvent::ArgJsonDelta {
+                            partial_json: coerced.to_string(),
+                        });
+                        self.typed_buf.clear();
+                        rest = &rest[p + PARAM_CLOSE.len()..];
+                        self.state = NativeState::SeekParamOrEnd;
+                    }
+                    None => {
+                        // Accumulate all but a possible `</parameter>` prefix into the
+                        // dedicated buffer; hold only that bounded suffix. This keeps
+                        // a long typed/composite value O(n) total instead of
+                        // re-copying the whole value into `hold` every feed (O(n^2)).
+                        let keep = Self::marker_tail(rest, PARAM_CLOSE);
+                        let safe = floor_char_boundary(rest, rest.len() - keep);
+                        self.typed_buf.push_str(&rest[..safe]);
+                        self.hold = rest[safe..].to_string();
+                        return;
+                    }
+                },
+                NativeState::NotNative | NativeState::Done => return,
+            }
+            if rest.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// The body ended (the outer `</tool_call>` was reached). If the streamer is
+    /// cleanly between parameters, close the arguments object (`{}` when empty,
+    /// else `}`) and emit `End`. This is the normal close: `</function>` is NOT a
+    /// terminator (matching the buffered parser, which scans every `<parameter=`
+    /// to the end of the body), so a well-formed call reaches here in
+    /// `SeekParamOrEnd` with its `</function>` already skipped. A streamer still
+    /// mid-value (or still seeking the function) means the call was cut off: it
+    /// emits no `End`, and the caller surfaces the truncation (a tool block still
+    /// open at end of stream becomes max_tokens).
+    fn end_of_body(&mut self, out: &mut Vec<ToolStreamEvent>) {
+        if self.state == NativeState::SeekParamOrEnd {
+            out.push(ToolStreamEvent::ArgJsonDelta {
+                partial_json: if self.first_param { "{}" } else { "}" }.to_string(),
+            });
+            out.push(ToolStreamEvent::End);
+            self.state = NativeState::Done;
+        }
+    }
 }
 
 /// Strip exactly one leading and one trailing `\n` (the template's per-value
@@ -1194,7 +1592,7 @@ mod tests {
     fn streaming_no_tool_calls_passes_through() {
         let mut p = StreamingParser::new();
         let delta = p.feed("hello world");
-        assert_eq!(delta.text, "hello world");
+        assert_eq!(delta.text(), "hello world");
         assert!(delta.tool_calls.is_empty());
         let fin = p.finish();
         assert!(fin.flushed_text.is_empty());
@@ -1206,7 +1604,7 @@ mod tests {
         let chunk = format!("Sure. {call} The weather is sunny.");
         let mut p = StreamingParser::new();
         let delta = p.feed(&chunk);
-        assert_eq!(delta.text, "Sure.  The weather is sunny.");
+        assert_eq!(delta.text(), "Sure.  The weather is sunny.");
         assert_eq!(delta.tool_calls.len(), 1);
         assert_eq!(delta.tool_calls[0].name, "get_weather");
         assert_eq!(delta.tool_calls[0].arguments_json, "{\"city\": \"Paris\"}");
@@ -1217,7 +1615,7 @@ mod tests {
         // "<tool" arrives in one chunk, "_call>{...}</tool_call>" in the next.
         let mut p = StreamingParser::new();
         let d1 = p.feed("Calling: <tool");
-        assert_eq!(d1.text, "Calling: ", "the <tool prefix must be held back");
+        assert_eq!(d1.text(), "Calling: ", "the <tool prefix must be held back");
         assert!(d1.tool_calls.is_empty());
 
         let d2 = p.feed(
@@ -1225,7 +1623,7 @@ mod tests {
         );
         assert_eq!(d2.tool_calls.len(), 1);
         assert_eq!(d2.tool_calls[0].name, "calc");
-        assert_eq!(d2.text, " done");
+        assert_eq!(d2.text(), " done");
     }
 
     #[test]
@@ -1237,7 +1635,7 @@ mod tests {
         let d = p.feed("ll> finished");
         assert_eq!(d.tool_calls.len(), 1);
         assert_eq!(d.tool_calls[0].name, "calc");
-        assert_eq!(d.text, " finished");
+        assert_eq!(d.text(), " finished");
     }
 
     #[test]
@@ -1250,7 +1648,7 @@ mod tests {
         assert_eq!(delta.tool_calls.len(), 2);
         assert_eq!(delta.tool_calls[0].name, "a");
         assert_eq!(delta.tool_calls[1].name, "b");
-        assert_eq!(delta.text, " mid  end");
+        assert_eq!(delta.text(), " mid  end");
     }
 
     #[test]
@@ -1273,7 +1671,7 @@ mod tests {
         for ch in full.chars() {
             let buf = ch.to_string();
             let d = p.feed(&buf);
-            text_acc.push_str(&d.text);
+            text_acc.push_str(&d.text());
             calls_acc.extend(d.tool_calls);
         }
         let fin = p.finish();
@@ -1603,6 +2001,263 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].arguments_json, r#"{"date":"2026"}"#);
     }
 
+    /// Concatenate the streaming parser's `tool_stream` argument deltas when the
+    /// full `<tool_call>…</tool_call>` emission is fed as the given chunks.
+    fn stream_chunks(chunks: &[&str], schemas: Arc<ToolSchemas>) -> String {
+        let mut p = StreamingParser::with_schemas(schemas);
+        let mut evs = Vec::new();
+        for c in chunks {
+            evs.extend(p.feed(c).tool_stream());
+        }
+        let _ = p.finish();
+        let mut out = String::new();
+        let mut inside = false;
+        for e in evs {
+            match e {
+                ToolStreamEvent::Start { .. } => inside = true,
+                ToolStreamEvent::ArgJsonDelta { partial_json } if inside => {
+                    out.push_str(&partial_json)
+                }
+                ToolStreamEvent::ArgJsonDelta { .. } => {}
+                ToolStreamEvent::End => inside = false,
+            }
+        }
+        out
+    }
+
+    /// Split `s` into random-length (1..=5) char-boundary chunks, driven by a
+    /// seeded LCG so any failure reproduces.
+    fn random_char_chunks(s: &str, rng: &mut u64) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut chunks = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            *rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = 1 + ((*rng >> 33) as usize % 5);
+            let end = (i + len).min(chars.len());
+            chunks.push(chars[i..end].iter().collect());
+            i = end;
+        }
+        chunks
+    }
+
+    /// The streaming path is DEFINED as "byte-identical to the buffered parse, just
+    /// incremental": the concatenated `tool_stream` argument deltas must equal the
+    /// buffered `arguments_json` for the same call — fed whole-text, char-by-char,
+    /// at EVERY two-way split point, and across 200 seeded-random chunkings — over
+    /// an adversarial corpus (escaping, CRLF/tab, multibyte, a `</parameter`
+    /// substring, empty values, typed scalars + composites). Char-boundary chunking
+    /// at any split point is the true worst case: `SseEmitter::push` buffers partial
+    /// UTF-8 in `pending_bytes` and feeds the parser only complete codepoints via
+    /// `drain_complete_utf8`, so the parser never receives a split multi-byte char.
+    #[test]
+    fn streaming_tool_args_byte_identical_to_buffered() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let cases: Vec<Vec<(&str, &str)>> = vec![
+            vec![("title", "Team Sync")],
+            vec![("title", "")],
+            vec![("title", "quote \" and backslash \\ end")],
+            vec![("title", "carriage\r\nreturn\tand tab")],
+            vec![("title", "emoji 😀 and CJK 日本語 end")],
+            vec![("title", "has a </parameter but no close here")],
+            vec![("title", "multi\nline\nvalue\n")],
+            vec![("date", "2026-08-01"), ("count", "3"), ("all_day", "true")],
+            vec![
+                ("time", r#"{"start":"14:00","end":"15:00"}"#),
+                ("attendees", r#"["Omar","Layla"]"#),
+            ],
+            vec![
+                ("title", "Sync"),
+                ("date", "2026"),
+                ("count", "7"),
+                ("all_day", "False"),
+            ],
+        ];
+        for (i, params) in cases.iter().enumerate() {
+            let emission = native_call("schedule_event", params);
+            let buffered = parse_final_with_schemas(&emission, schemas.clone()).tool_calls[0]
+                .arguments_json
+                .clone();
+            let chars: Vec<char> = emission.chars().collect();
+
+            assert_eq!(
+                stream_chunks(&[&emission], schemas.clone()),
+                buffered,
+                "case {i} whole"
+            );
+
+            let singles: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+            let refs: Vec<&str> = singles.iter().map(String::as_str).collect();
+            assert_eq!(
+                stream_chunks(&refs, schemas.clone()),
+                buffered,
+                "case {i} char"
+            );
+
+            for sp in 1..chars.len() {
+                let a: String = chars[..sp].iter().collect();
+                let b: String = chars[sp..].iter().collect();
+                assert_eq!(
+                    stream_chunks(&[&a, &b], schemas.clone()),
+                    buffered,
+                    "case {i} 2-split@{sp}"
+                );
+            }
+
+            let mut rng = 0x5eed_u64 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for _ in 0..200 {
+                let parts = random_char_chunks(&emission, &mut rng);
+                let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+                assert_eq!(
+                    stream_chunks(&refs, schemas.clone()),
+                    buffered,
+                    "case {i} random"
+                );
+            }
+        }
+    }
+
+    /// A legacy JSON body carries no incremental native events, so the parser
+    /// surfaces it to `tool_stream` as exactly one atomic triple — Start, the
+    /// full arguments, End — whose payload is byte-identical to the finalized
+    /// call. This is what lets the wire layer stream BOTH protocols from
+    /// `tool_stream` alone (never falling back to the buffered `tool_calls`).
+    #[test]
+    fn legacy_json_call_streams_as_one_atomic_triple() {
+        let emission = "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": 1}}\n</tool_call>";
+        let mut p = StreamingParser::new();
+        let delta = p.feed(emission);
+        let _ = p.finish();
+        assert_eq!(delta.tool_calls.len(), 1, "one legacy call finalized");
+        let args = delta.tool_calls[0].arguments_json.clone();
+        assert_eq!(
+            delta.tool_stream(),
+            vec![
+                ToolStreamEvent::Start { name: "f".into() },
+                ToolStreamEvent::ArgJsonDelta { partial_json: args },
+                ToolStreamEvent::End,
+            ],
+            "legacy body must stream as one atomic Start+args+End"
+        );
+    }
+
+    /// A legacy JSON body whose argument value contains the literal native marker
+    /// `<function=g>` must still stream as the real call (keyed on the body's
+    /// leading `{`, like `parse_call_body`), never as a phantom `g` call: the
+    /// streamer stays inert on legacy bodies and the atomic triple carries `f`.
+    #[test]
+    fn legacy_body_with_embedded_function_marker_streams_the_real_call() {
+        let emission = "<tool_call>\n{\"name\": \"f\", \"arguments\": \
+                        {\"x\": \"<function=g></function>\"}}\n</tool_call>";
+        // Fed whole, and split so the leading `{` lands in the second chunk.
+        for chunks in [vec![emission], vec!["<tool_call>\n", &emission[12..]]] {
+            let mut p = StreamingParser::new();
+            let mut calls = Vec::new();
+            let mut stream = Vec::new();
+            for c in &chunks {
+                let d = p.feed(c);
+                stream.extend(d.tool_stream());
+                calls.extend(d.tool_calls);
+            }
+            let _ = p.finish();
+            assert_eq!(calls.len(), 1, "exactly one call");
+            assert_eq!(calls[0].name, "f", "the real call, not the embedded marker");
+            assert_eq!(
+                stream,
+                vec![
+                    ToolStreamEvent::Start { name: "f".into() },
+                    ToolStreamEvent::ArgJsonDelta {
+                        partial_json: calls[0].arguments_json.clone(),
+                    },
+                    ToolStreamEvent::End,
+                ],
+                "no phantom `g`"
+            );
+        }
+    }
+
+    /// A value whose raw text contains `</parameter></function><parameter=…>` is
+    /// truncated at the first `</parameter>` on BOTH paths; the streamer then scans
+    /// PAST the `</function>` to the next parameter, exactly as the buffered parser
+    /// does (it never treats `</function>` as a terminator). Streamed args are
+    /// byte-identical to the buffered parse, and the later parameter is captured.
+    #[test]
+    fn embedded_function_close_does_not_terminate_param_scan() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let emission = "<tool_call>\n<function=schedule_event>\n<parameter=title>\n\
+                        A</parameter></function><parameter=date>\nB\n</parameter>\n\
+                        </function>\n</tool_call>";
+        let buffered = parse_final_with_schemas(emission, schemas.clone()).tool_calls[0]
+            .arguments_json
+            .clone();
+        assert_eq!(stream_chunks(&[emission], schemas.clone()), buffered);
+        assert!(
+            buffered.contains("title"),
+            "both params captured: {buffered}"
+        );
+        assert!(
+            buffered.contains("date"),
+            "scan continued past </function>: {buffered}"
+        );
+    }
+
+    /// A native call cut off mid-value (no outer `</tool_call>`) streams its Start
+    /// and partial args but NO End, and `finish` reports the incomplete body — so
+    /// the wire layer sees a still-open call (→ max_tokens), never a clean close.
+    #[test]
+    fn native_truncation_mid_value_emits_no_end() {
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let mut p = StreamingParser::with_schemas(schemas);
+        let delta = p.feed("<tool_call>\n<function=schedule_event>\n<parameter=title>\nTeam");
+        let fin = p.finish();
+        assert!(
+            matches!(
+                delta.tool_stream().first(),
+                Some(ToolStreamEvent::Start { .. })
+            ),
+            "the call opened"
+        );
+        assert!(
+            !delta.tool_stream().contains(&ToolStreamEvent::End),
+            "a cut-off call emits no End"
+        );
+        assert!(
+            fin.incomplete_tool_call.is_some(),
+            "finish reports the incomplete body"
+        );
+    }
+
+    /// Duplicate parameter names are the one shape where streamed bytes differ
+    /// from the buffered parse: the buffered parser keeps the last value (map
+    /// insert) while the stream emits each occurrence. Both are VALID JSON that
+    /// `serde_json` (and the standard last-wins semantics the server and typical
+    /// clients use) resolve to the SAME object, and the trained template never
+    /// emits duplicate names. This locks that equivalence under serde_json; a
+    /// receiver that preserves duplicate keys (e.g. an object-pairs hook) is out of
+    /// scope because the model never produces this shape.
+    #[test]
+    fn duplicate_param_names_stream_valid_json_with_same_object() {
+        let emission = "<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n\
+                        <parameter=x>\n2\n</parameter>\n</function>\n</tool_call>";
+        let mut p = StreamingParser::new();
+        let delta = p.feed(emission);
+        let _ = p.finish();
+        let buffered = &delta.tool_calls[0].arguments_json;
+        let streamed: String = delta
+            .tool_stream()
+            .iter()
+            .filter_map(|e| match e {
+                ToolStreamEvent::ArgJsonDelta { partial_json } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        let bv: JsonValue = serde_json::from_str(buffered).unwrap();
+        let sv: JsonValue = serde_json::from_str(&streamed).unwrap();
+        assert_eq!(bv, sv, "streamed={streamed} buffered={buffered}");
+    }
+
     #[test]
     fn native_nested_object_and_array_json_parsed() {
         let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
@@ -1698,7 +2353,7 @@ mod tests {
         let mut calls = Vec::new();
         for ch in emission.chars() {
             let d = p.feed(&ch.to_string());
-            text.push_str(&d.text);
+            text.push_str(&d.text());
             calls.extend(d.tool_calls);
         }
         let fin = p.finish();
@@ -1711,6 +2366,90 @@ mod tests {
             calls[0].arguments_json,
             r#"{"title":"Sync","count":2,"time":{"start":"09:00"}}"#
         );
+    }
+
+    #[test]
+    fn native_classification_latches_across_a_non_brace_preamble_chunk() {
+        // Regression: a body fed as a non-`{` preamble chunk and then a `{` chunk
+        // must stay NATIVE and stream its call. The native-vs-legacy decision is
+        // latched at the body's first non-whitespace byte, so chunk 2's leading `{`
+        // cannot reclassify the body as legacy and drop the call from the stream
+        // (the buffered parse, which dispatches on the whole trimmed body, keeps it).
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let full = "<tool_call>\nnote{<function=schedule_event>\n\
+                    <parameter=title>\nHi\n</parameter>\n</function>\n</tool_call>";
+        let buffered = parse_final_with_schemas(full, schemas.clone()).tool_calls[0]
+            .arguments_json
+            .clone();
+        let streamed = stream_chunks(
+            &[
+                "<tool_call>\nnote",
+                "{<function=schedule_event>\n<parameter=title>\n\
+                 Hi\n</parameter>\n</function>\n</tool_call>",
+            ],
+            schemas,
+        );
+        // Before latching this was "" (the call was dropped from the stream).
+        assert_eq!(
+            streamed, buffered,
+            "latched native body must stream the call"
+        );
+        assert_eq!(buffered, r#"{"title":"Hi"}"#);
+    }
+
+    #[test]
+    fn large_typed_array_streams_byte_identical_across_small_chunks() {
+        // A long typed (array) value is buffered to its close and coerced whole; it
+        // must accumulate across many feeds into the SAME JSON as the buffered parse.
+        // The accumulator appends into a dedicated buffer and holds only a bounded
+        // `</parameter>`-prefix suffix, so this stays O(n) rather than re-copying the
+        // whole value every feed — char-by-char here drives one feed per character.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let arr = format!(
+            "[{}]",
+            (0..200)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let emission = native_call("schedule_event", &[("attendees", &arr)]);
+        let buffered = parse_final_with_schemas(&emission, schemas.clone()).tool_calls[0]
+            .arguments_json
+            .clone();
+        let chars: Vec<String> = emission.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        let streamed = stream_chunks(&refs, schemas);
+        assert_eq!(streamed, buffered, "typed array must stream byte-identical");
+        assert!(buffered.starts_with(r#"{"attendees":[0,1,2,"#));
+    }
+
+    #[test]
+    fn whitespace_prefix_before_function_streams_the_call() {
+        // Insignificant leading whitespace inside `<tool_call>` before `<function=`
+        // is DISCARDED each feed (not re-held, which would be O(n^2) for a long run);
+        // the call must still stream byte-identically to the buffered parse. The
+        // whitespace is split into its own chunks to drive the discard path repeatedly.
+        let schemas = Arc::new(ToolSchemas::from_tools(&[schedule_tool()]));
+        let full = "<tool_call>\n   \n  \t <function=schedule_event>\n\
+                    <parameter=title>\nHi\n</parameter>\n</function>\n</tool_call>";
+        let buffered = parse_final_with_schemas(full, schemas.clone()).tool_calls[0]
+            .arguments_json
+            .clone();
+        let streamed = stream_chunks(
+            &[
+                "<tool_call>\n",
+                "   ",
+                "  \t ",
+                "<function=schedule_event>\n<parameter=title>\n\
+                 Hi\n</parameter>\n</function>\n</tool_call>",
+            ],
+            schemas,
+        );
+        assert_eq!(
+            streamed, buffered,
+            "whitespace prefix must not change the call"
+        );
+        assert_eq!(buffered, r#"{"title":"Hi"}"#);
     }
 
     #[test]
