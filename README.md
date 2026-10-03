@@ -60,7 +60,7 @@ More on installing, pulling and running: **[Getting started](docs/getting-starte
 - **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-8.0+ device.
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
-- **Text to image** with Qwen-Image-2.1 on CUDA, on the same GPU as a text model, which pauses while an image generates.
+- **Text to image** with Qwen-Image-2.1 on CUDA, from a separate image-only server.
 - **Runs on NVIDIA cc 8.0+ (Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
 - **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
@@ -109,8 +109,9 @@ curl http://localhost:8000/v1/models
 POST /v1/chat/completions   # OpenAI-compatible, SSE streaming
 POST /v1/completions        # OpenAI-compatible, SSE streaming
 POST /v1/messages           # Anthropic-compatible, SSE streaming
-POST /v1/images/generations # Text to image (`--features image`), see docs/image-generation.md
 ```
+
+Text to image runs as its own server: a `--features image` build started with `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` and no model serves `POST /v1/images/generations` ([docs/image-generation.md](docs/image-generation.md)).
 
 On CUDA, `--kv-precision bf16` halves the KV cache's memory for long contexts. Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**.
 
@@ -163,10 +164,10 @@ Rust is pinned via `rust-toolchain.toml`; CUDA needs `libnvrtc` + `libcublas` pr
 - [Getting started](docs/getting-started.md) — install, pull, run (binaries, source)
 - [CLI reference](docs/cli.md) — all subcommands and flags (or `lumen run --help`)
 - [HTTP server](docs/server.md) — endpoints, reasoning, library embedding
-- [Image generation](docs/image-generation.md) — Qwen-Image-2.1 on the same device as a text model
+- [Image generation](docs/image-generation.md) — Qwen-Image-2.1 from an image-only server
 - [Model support](docs/support.md) — live support matrix and verification status
 - [Production deployment](docs/production.md) — serving mode, GPU sizing, known limitations
-- [Environment variables](docs/environment-variables.md) — all `LUMEN_*` flags
+- [Environment variables](docs/environment-variables.md) — `LUMEN_*` runtime flags
 - [Benchmarks](bench/RESULTS.md) — per-cell numbers and methodology
 - [Releases & versioning](RELEASING.md) · [Changelog](CHANGELOG.md)
 
