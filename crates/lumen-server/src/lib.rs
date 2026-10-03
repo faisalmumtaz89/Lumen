@@ -57,9 +57,9 @@ pub mod tokenstop;
 pub mod wire;
 
 pub use engine::{
-    BackendFactory, CancellationFlag, CancellationGuard, DiskKvConfig, EngineHandle, EngineWorker,
-    ExclusiveGuard, FinishReason, IdentityByteTokenizer, JobRequest, JobResponseChannel, ModelInfo,
-    PooledReceiver, TokenEvent, Tokenize, EVICTED_MESSAGE, RESTORE_FAILED_PREFIX,
+    CancellationFlag, CancellationGuard, DiskKvConfig, EngineHandle, EngineWorker, FinishReason,
+    IdentityByteTokenizer, JobRequest, JobResponseChannel, ModelInfo, PooledReceiver, TokenEvent,
+    Tokenize,
 };
 pub use error::ServerError;
 pub use origins::AllowedOrigins;

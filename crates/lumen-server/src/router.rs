@@ -70,35 +70,23 @@ pub fn build_router(engine: EngineHandle, origins: AllowedOrigins) -> Router {
         ))
 }
 
-/// As [`build_router`], additionally serving `POST /v1/images/generations`.
-///
-/// Separate rather than a flag on `build_router`: the image route carries its
-/// own state (where the converted components live), and a text-only deployment
-/// should not have the route present at all — a request to it should 404 the way
-/// any unknown path does, not 400 with a message about a feature.
+/// Build the router for an image-only server: `POST /v1/images/generations` plus
+/// `GET /v1/models`, which lists the one image model so a client — and the
+/// deployment's guard — can probe readiness and discover the model the same way as
+/// on the text server. No text routes: a chat request 404s the way any unknown path
+/// does. A text-only deployment uses [`build_router`] and has no image route at all.
 #[cfg(feature = "image")]
 pub fn build_router_with_images(
-    engine: EngineHandle,
     images: std::sync::Arc<crate::router_image::ImageState>,
     origins: AllowedOrigins,
 ) -> Router {
-    let state = AppState { engine };
     Router::new()
         .route(
             "/v1/images/generations",
             post(crate::router_image::generate_image),
         )
+        .route("/v1/models", get(crate::router_image::list_image_models))
         .with_state(images)
-        .merge(
-            Router::new()
-                .route("/v1/models", get(list_models))
-                .route("/v1/chat/completions", post(chat_completions))
-                .route("/v1/completions", post(completions))
-                .route("/v1/messages", post(messages))
-                .route("/v1/messages/count_tokens", post(count_tokens))
-                .route("/debug/memory_breakdown", get(memory_breakdown))
-                .with_state(state),
-        )
         .layer(from_fn_with_state(
             Arc::new(origins),
             refuse_unlisted_origins,

@@ -163,9 +163,9 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            The model id the endpoint reports and accepts
                            (default Qwen-Image-2.1).
     LUMEN_IMAGE_DEVICE=cuda|gpu|cpu
-                           Where generations run (default cuda). On the CUDA
-                           text engine's device, each generation evicts the
-                           text model for its duration.
+                           Where generations run (default cuda). On CUDA the
+                           transformer and VAE stay resident on the device
+                           between generations.
     LUMEN_IMAGE_PIN_TEXT_ENCODER=1
                            Keep the text encoder's weights in page-locked host
                            memory (12.9 GiB, held for the server's lifetime) so
@@ -340,9 +340,9 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
         }
         i += 1;
     }
-    if args.model.is_empty() {
-        return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
-    }
+    // Whether a model is required is decided in `run`, once the image endpoint's
+    // configuration is known: a server with image config and no `--model` serves
+    // images only. Here we only finish parsing.
     args.origins = AllowedOrigins::from_values(&origins)?;
     Ok(args)
 }
@@ -587,61 +587,6 @@ struct WeightGlobals<'a> {
     weight_tying: bool,
 }
 
-/// Rebuilds the CUDA backend for the engine's exclusive-lease restore.
-///
-/// The image endpoint needs the whole card, so the engine evicts the text
-/// model for the duration of a generation and rebuilds it afterwards. Every
-/// input the original construction used is captured here — the provider is
-/// shared (`Arc`, not re-opened), so a restore re-uploads from the same host
-/// weights rather than re-reading the checkpoint.
-#[cfg(feature = "cuda")]
-struct CudaFactory {
-    device: usize,
-    kv_precision: KvPrecision,
-    hyperparams: lumen_format::ModelHyperparams,
-    weights: ServerWeights,
-}
-
-#[cfg(feature = "cuda")]
-impl CudaFactory {
-    /// The global planes CUDA takes as stored. The F32 dequant of a plane the
-    /// backend takes raw is skipped: the raw plane is the backend's copy and the
-    /// CPU embed fallback is statically unreachable after init(), so the F32 was
-    /// only ~8 GB of unread host heap — allocated on every build, so it also
-    /// inflated each text-model restore behind an image generation. Skipping it
-    /// is byte-identical (the same validation Metal already relies on).
-    const RAW_ACCEPTANCE: RawAcceptance = RawAcceptance {
-        skip_f32_when_raw: true,
-        q6k_head: true,
-        bf16_head: true,
-        nvfp4_head: true,
-        bf16_embedding: true,
-        kquant_embedding: true,
-    };
-}
-
-#[cfg(feature = "cuda")]
-impl lumen_server::BackendFactory for CudaFactory {
-    fn device(&self) -> usize {
-        self.device
-    }
-
-    fn build(&self) -> Result<Box<dyn ComputeBackend>, String> {
-        let mut cuda = CudaBackend::new(self.device)
-            .map_err(|e| format!("CUDA backend unavailable (device {}): {e}", self.device))?;
-        // The store is chosen before init(): the backend compiles the store's
-        // kernels as a group and allocates every cache in it.
-        cuda.set_kv_precision(self.kv_precision)
-            .map_err(|e| format!("CUDA KV precision: {e}"))?;
-        wire_global_tensors_and_raw(&mut cuda, &self.weights.globals(), Self::RAW_ACCEPTANCE);
-        cuda.init(&self.hyperparams)
-            .map_err(|e| format!("CUDA init: {e}"))?;
-        cuda.preload_weights(self.weights.as_dyn())
-            .map_err(|e| format!("CUDA preload_weights: {e}"))?;
-        Ok(Box::new(cuda))
-    }
-}
-
 /// The server's weight provider — either the legacy full-copy `SyncWeightProvider`
 /// or the zero-copy `MmapWeightProvider`. Both implement `WeightProvider`
 /// (`Send + Sync`), so either can back the engine's `Arc<dyn WeightProvider>`.
@@ -829,6 +774,37 @@ async fn run(args: Args) -> Result<(), String> {
             ));
         }
     }
+    // One model per process. With the image endpoint configured and no `--model`, serve
+    // images only: skip the text engine and serve just the image routes (plus `/v1/models`
+    // for the image model). With `--model`, the text engine builds below — the image
+    // endpoint cannot also run in that process. With neither, there is nothing to serve.
+    #[cfg(feature = "image")]
+    if args.model.is_empty() {
+        let config = image_config.ok_or_else(|| {
+            "a model is required: pass `MODEL:QUANT` or --model, or set LUMEN_IMAGE_LBI and \
+             LUMEN_IMAGE_CKPT to serve images only (try --help)"
+                .to_string()
+        })?;
+        let state = build_image_state(config)?;
+        let app = build_router_with_images(state, args.origins.clone());
+        return serve(app, &args.host, args.port).await;
+    }
+    // A text model and the image endpoint cannot share one process: the two exceed the
+    // card, so they run as separate servers.
+    #[cfg(feature = "image")]
+    if image_config.is_some() {
+        return Err(
+            "a text model and the image endpoint cannot run in one process; start two \
+                    servers — one with --model, one with LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT \
+                    and no --model"
+                .to_string(),
+        );
+    }
+    #[cfg(not(feature = "image"))]
+    if args.model.is_empty() {
+        return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
+    }
+
     let lbc_path = resolve_model_path(&args.model, args.quant.as_deref())?;
     eprintln!("[lumen-server] model: {}", lbc_path.display());
 
@@ -918,14 +894,10 @@ async fn run(args: Args) -> Result<(), String> {
     // avoiding the ~10 GB redundant CPU copy + GPU private weight copy that
     // `SyncWeightProvider` (pread-into-Vec, non-page-aligned) forces.
     //
-    // CUDA NVFP4 uses it because that model shares the device with the image
-    // endpoint: every image generation evicts the text backend, and restoring it
-    // re-reads every layer from the provider. `SyncWeightProvider` preads each
-    // layer into a freshly allocated host buffer before the device copy; serving
-    // the mapped bytes straight into the htod copy skips that per-layer host copy,
-    // so both the initial preload and each restore are faster. Since a restore
-    // runs on every image lease, back-to-back 1024x1024 images run ~27% faster
-    // (each one waits on the prior restore), and cold startup is faster too. The
+    // CUDA NVFP4 uses it to skip a redundant per-layer host copy at preload:
+    // `SyncWeightProvider` preads each layer into a freshly allocated host buffer
+    // before the device copy, whereas serving the mapped bytes straight into the
+    // htod copy skips that, so the one-time preload and cold startup are faster.
     // Both providers serve the same raw file bytes through `get_layer_raw` (the
     // same range + subtensor offsets, with no per-scheme dequant), so the bytes
     // reaching the GPU are identical: the Q8 case is unit-tested
@@ -1031,13 +1003,6 @@ async fn run(args: Args) -> Result<(), String> {
         eprintln!("[lumen-server] context_length: {context_length}");
     }
 
-    // The CUDA backend is built by the factory that can also rebuild it, so
-    // the image endpoint can evict and restore the engine's backend; the other
-    // backends have no factory and get the plain `spawn`, which cannot be
-    // evicted.
-    #[cfg(feature = "cuda")]
-    let mut cuda_factory: Option<Arc<CudaFactory>> = None;
-
     // Build the concrete backend, wire global tensors + raw quantized blobs,
     // call init(), then preload_weights() (required for GPU-resident upload
     // on Metal AND CUDA; `tests/server_soak.rs:357-366` documents the requirement).
@@ -1081,15 +1046,37 @@ async fn run(args: Args) -> Result<(), String> {
             #[cfg(feature = "cuda")]
             {
                 let kv_precision = resolve_kv_precision(args.kv_precision, KvPrecision::F32);
-                let factory = Arc::new(CudaFactory {
-                    device: args.backend_device,
-                    kv_precision,
-                    hyperparams: hyperparams_capped,
-                    weights: provider.clone(),
-                });
-                let cuda = lumen_server::BackendFactory::build(factory.as_ref())?;
-                cuda_factory = Some(factory);
-                (cuda, kv_precision)
+                let mut cuda = CudaBackend::new(args.backend_device).map_err(|e| {
+                    format!(
+                        "CUDA backend unavailable (device {}): {e}",
+                        args.backend_device
+                    )
+                })?;
+                // The store is chosen before init(): the backend compiles the store's
+                // kernels as a group and allocates every cache in it.
+                cuda.set_kv_precision(kv_precision)
+                    .map_err(|e| format!("CUDA KV precision: {e}"))?;
+                // Skip the unused F32 dequant of a plane CUDA takes raw: the raw plane
+                // is the backend's copy and the CPU embed fallback is statically
+                // unreachable after init(), so the F32 would be only ~8 GB of unread
+                // host heap. Runtime-validated byte-identical (as Metal already relies on).
+                wire_global_tensors_and_raw(
+                    &mut cuda,
+                    &provider.globals(),
+                    RawAcceptance {
+                        skip_f32_when_raw: true,
+                        q6k_head: true,
+                        bf16_head: true,
+                        nvfp4_head: true,
+                        bf16_embedding: true,
+                        kquant_embedding: true,
+                    },
+                );
+                cuda.init(&hyperparams_capped)
+                    .map_err(|e| format!("CUDA init: {e}"))?;
+                cuda.preload_weights(provider.as_dyn())
+                    .map_err(|e| format!("CUDA preload_weights: {e}"))?;
+                (Box::new(cuda), kv_precision)
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -1138,29 +1125,6 @@ async fn run(args: Args) -> Result<(), String> {
     // `vocab_size`/`num_layers` from this, and `Session` sizes its KV from
     // `RuntimeConfig.max_seq_len`, but passing capped keeps the snapshot
     // internally consistent — no native-262144 value leaks downstream).
-    #[cfg(feature = "cuda")]
-    let handle = match cuda_factory {
-        Some(factory) => EngineWorker::spawn_rebuildable(
-            runtime_cfg,
-            hyperparams_capped,
-            backend,
-            factory,
-            provider.into_arc(),
-            tokenizer,
-            model_info,
-            args.inbox_size,
-        ),
-        None => EngineWorker::spawn(
-            runtime_cfg,
-            hyperparams_capped,
-            backend,
-            provider.into_arc(),
-            tokenizer,
-            model_info,
-            args.inbox_size,
-        ),
-    };
-    #[cfg(not(feature = "cuda"))]
     let handle = EngineWorker::spawn(
         runtime_cfg,
         hyperparams_capped,
@@ -1171,81 +1135,22 @@ async fn run(args: Args) -> Result<(), String> {
         args.inbox_size,
     );
 
-    // Bind and serve. Graceful shutdown on Ctrl-C / SIGTERM.
-    // The image endpoint, enabled only when a converted checkpoint is pointed
-    // at. Absent, the route does not exist and the text surface is unchanged.
-    #[cfg(feature = "image")]
-    let app = match image_config {
-        Some(config) => {
-            // The CUDA path's containers stay open for the server's lifetime. On
-            // a device the text model does not use, the transformer and the VAE
-            // also stay loaded between generations.
-            let sources = if config.use_gpu {
-                let paths = lumen_image::pipeline::PipelinePaths::from_roots(
-                    &config.lbi_dir,
-                    &config.checkpoint_dir,
-                );
-                let mut sources = lumen_image::pipeline::GpuSources::open(&paths)
-                    .map_err(|e| format!("the image endpoint cannot open its model: {e}"))?;
-                if config.pin_text_encoder {
-                    sources.pin_text_encoder().map_err(|e| {
-                        format!(
-                            "LUMEN_IMAGE_PIN_TEXT_ENCODER=1, but the text encoder cannot be \
-                             page-locked: {e}"
-                        )
-                    })?;
-                }
-                Some(sources)
-            } else {
-                None
-            };
-            let (resident, sources) = match sources {
-                Some(sources) if !handle.holds_device(lumen_image::pipeline::GPU_DEVICE) => (
-                    Some(std::sync::Mutex::new(
-                        lumen_image::pipeline::GpuResident::load(sources).map_err(|e| {
-                            format!(
-                                "the image endpoint cannot keep its transformer and VAE loaded \
-                                 on CUDA device {}: {e}",
-                                lumen_image::pipeline::GPU_DEVICE
-                            )
-                        })?,
-                    )),
-                    None,
-                ),
-                sources => (None, sources),
-            };
-            eprintln!(
-                "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}{}",
-                config.model_id,
-                if config.use_gpu { "cuda" } else { "cpu" },
-                config.lbi_dir.display(),
-                config.checkpoint_dir.display(),
-                if !config.use_gpu {
-                    ""
-                } else if resident.is_some() {
-                    "; the transformer and VAE stay loaded between generations"
-                } else {
-                    "; each generation evicts the text model for its duration"
-                },
-                if config.pin_text_encoder {
-                    "; the text encoder loads from page-locked host memory"
-                } else {
-                    ""
-                },
-            );
-            let state = std::sync::Arc::new(lumen_server::router_image::ImageState {
-                config,
-                engine: handle.clone(),
-                resident,
-                sources,
-            });
-            build_router_with_images(handle, state, args.origins.clone())
-        }
-        None => build_router(handle, args.origins.clone()),
-    };
-    #[cfg(not(feature = "image"))]
+    // One model per process: the image-only path returned earlier, and a text model with
+    // image config was refused above, so by here the server is text-only.
     let app = build_router(handle, args.origins.clone());
-    let bind_addr = format!("{}:{}", args.host, args.port);
+
+    // `log_level` is captured for future structured-log wiring; today the bin logs via
+    // `eprintln!` only, so we acknowledge the value to avoid an unused-field warning.
+    let _ = &args.log_level;
+    serve(app, &args.host, args.port).await
+}
+
+/// Bind the listener and serve `app` until shutdown; the device is released when the
+/// process exits. Shutdown is graceful on Ctrl-C (SIGINT): in-flight requests finish and
+/// any running image generation is asked to stop. Shared by the text-only and
+/// image-only serving paths.
+async fn serve(app: axum::Router, host: &str, port: u16) -> Result<(), String> {
+    let bind_addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| format!("bind {bind_addr}: {e}"))?;
@@ -1255,12 +1160,6 @@ async fn run(args: Args) -> Result<(), String> {
     eprintln!("[lumen-server] listening on http://{local}");
     eprintln!("[lumen-server] try: curl http://{local}/v1/models");
     eprintln!("[lumen-server] (Ctrl-C to stop)");
-
-    // `log_level` is captured for future structured-log wiring; today the
-    // bin logs via `eprintln!` only, so we acknowledge the value to avoid
-    // an unused-variable warning without committing to a specific log crate.
-    let _ = &args.log_level;
-
     let shutdown = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             eprintln!("[lumen-server] ctrl_c watcher failed: {e}");
@@ -1269,13 +1168,69 @@ async fn run(args: Args) -> Result<(), String> {
         #[cfg(feature = "image")]
         lumen_server::router_image::request_shutdown();
     };
-
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|e| format!("axum serve: {e}"))?;
     eprintln!("[lumen-server] stopped");
     Ok(())
+}
+
+/// Open the image endpoint's model containers and build its router state. On the GPU
+/// (`config.use_gpu`) the transformer and VAE are loaded resident and stay on the device
+/// across generations; on the CPU each generation runs on the host.
+#[cfg(feature = "image")]
+fn build_image_state(
+    config: lumen_server::router_image::ImageConfig,
+) -> Result<Arc<lumen_server::router_image::ImageState>, String> {
+    let resident = if config.use_gpu {
+        let paths = lumen_image::pipeline::PipelinePaths::from_roots(
+            &config.lbi_dir,
+            &config.checkpoint_dir,
+        );
+        let mut sources = lumen_image::pipeline::GpuSources::open(&paths)
+            .map_err(|e| format!("the image endpoint cannot open its model: {e}"))?;
+        if config.pin_text_encoder {
+            sources.pin_text_encoder().map_err(|e| {
+                format!(
+                    "LUMEN_IMAGE_PIN_TEXT_ENCODER=1, but the text encoder cannot be \
+                     page-locked: {e}"
+                )
+            })?;
+        }
+        Some(std::sync::Mutex::new(
+            lumen_image::pipeline::GpuResident::load(sources).map_err(|e| {
+                format!(
+                    "the image endpoint cannot keep its transformer and VAE loaded \
+                     on CUDA device {}: {e}",
+                    lumen_image::pipeline::GPU_DEVICE
+                )
+            })?,
+        ))
+    } else {
+        None
+    };
+    eprintln!(
+        "[lumen-server] /v1/images/generations enabled: model {} on {} from {} + {}{}{}",
+        config.model_id,
+        if config.use_gpu { "cuda" } else { "cpu" },
+        config.lbi_dir.display(),
+        config.checkpoint_dir.display(),
+        if config.use_gpu {
+            "; the transformer and VAE stay loaded between generations"
+        } else {
+            ""
+        },
+        if config.pin_text_encoder {
+            "; the text encoder loads from page-locked host memory"
+        } else {
+            ""
+        },
+    );
+    Ok(Arc::new(lumen_server::router_image::ImageState {
+        config,
+        resident,
+    }))
 }
 
 /// The image endpoint's configuration from `LUMEN_IMAGE_*`, `None` when the
@@ -1637,9 +1592,18 @@ mod tests {
     }
 
     #[test]
-    fn no_model_is_error() {
-        let e = parse_args(&argv(&[]));
-        assert!(e.is_err(), "expected error, got {e:?}");
+    fn no_model_parses_ok_requirement_deferred_to_run() {
+        // The model requirement moved out of parsing into `run`: with the image endpoint
+        // configured and no `--model`, the server serves images only, so whether a model
+        // is required depends on the image config that `run` reads. Parsing an empty argv
+        // now succeeds with an empty model; `run` turns that into an error only when no
+        // image endpoint is configured (validated end-to-end against the built server).
+        let args = parse_args(&argv(&[])).expect("empty argv now parses");
+        assert!(
+            args.model.is_empty(),
+            "expected an empty model, got {:?}",
+            args.model
+        );
     }
 
     /// Records the output head the wiring hands over.
@@ -1709,7 +1673,14 @@ mod tests {
         super::wire_global_tensors_and_raw(
             &mut backend,
             &globals,
-            super::CudaFactory::RAW_ACCEPTANCE,
+            super::RawAcceptance {
+                skip_f32_when_raw: true,
+                q6k_head: true,
+                bf16_head: true,
+                nvfp4_head: true,
+                bf16_embedding: true,
+                kquant_embedding: true,
+            },
         );
         assert_eq!(backend.output_proj_len, 0);
         assert_eq!(

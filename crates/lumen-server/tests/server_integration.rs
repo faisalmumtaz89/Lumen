@@ -3161,13 +3161,14 @@ async fn a_refused_request_with_a_long_body_is_answered() {
     }
 }
 
-/// With images served too, the image route is refused like the text routes,
-/// and a request without `Origin` still reaches it.
+/// A request from a web page is refused on the image route (the origin layer runs
+/// before routing), while a request without `Origin` reaches it.
 #[cfg(feature = "image")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_from_web_pages_are_refused_on_the_image_route() {
     use lumen_server::router_image::{ImageConfig, ImageState};
-    let (_, client, tmp, handle) = boot_server().await;
+    // The image-only router needs no text engine; boot_server's is kept alive but unused.
+    let (_, client, tmp, _handle) = boot_server().await;
     let images = ImageState {
         config: ImageConfig {
             lbi_dir: tmp.path().to_path_buf(),
@@ -3176,12 +3177,9 @@ async fn requests_from_web_pages_are_refused_on_the_image_route() {
             use_gpu: false,
             pin_text_encoder: false,
         },
-        engine: handle.clone(),
         resident: None,
-        sources: None,
     };
-    let app =
-        lumen_server::build_router_with_images(handle, Arc::new(images), AllowedOrigins::default());
+    let app = lumen_server::build_router_with_images(Arc::new(images), AllowedOrigins::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -3189,16 +3187,71 @@ async fn requests_from_web_pages_are_refused_on_the_image_route() {
     });
     let image = serde_json::json!({"model": "another", "prompt": "a lighthouse"}).to_string();
     let web = [("origin", &b"https://evil.example"[..])];
-    for (path, body) in [
-        ("/v1/images/generations", image.clone()),
-        ("/v1/chat/completions", chat_body()),
-    ] {
-        let (status, v) = send(&client, addr, "POST", path, &web, &body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {v}");
-        assert_eq!(v["error"]["message"], refusal("https://evil.example"));
-    }
+    let (status, v) = send(
+        &client,
+        addr,
+        "POST",
+        "/v1/images/generations",
+        &web,
+        &image,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"]["message"], refusal("https://evil.example"));
     // Without `Origin`, the route answers for itself: it serves another model.
     let (status, v) = send(&client, addr, "POST", "/v1/images/generations", &[], &image).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["error"]["code"], "unknown_model", "{v}");
+}
+
+/// Image-only mode (no text engine): the server answers the image route and lists the
+/// image model at `/v1/models` (so a client or guard can probe readiness and discover
+/// the model), while the chat routes are absent and 404.
+#[cfg(feature = "image")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_only_router_serves_image_and_models_but_not_chat() {
+    use lumen_server::router_image::{ImageConfig, ImageState};
+    // No text engine is needed; the boot_server engine is kept alive but unused so its
+    // background server does not error.
+    let (_addr, client, tmp, _handle) = boot_server().await;
+    let images = ImageState {
+        config: ImageConfig {
+            lbi_dir: tmp.path().to_path_buf(),
+            checkpoint_dir: tmp.path().to_path_buf(),
+            model_id: "lumen-test:image".into(),
+            use_gpu: false,
+            pin_text_encoder: false,
+        },
+        resident: None,
+    };
+    let app = lumen_server::build_router_with_images(Arc::new(images), AllowedOrigins::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    // `/v1/models` lists the one image model.
+    let (status, v) = send(&client, addr, "GET", "/v1/models", &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["data"][0]["id"], "lumen-test:image", "{v}");
+    // The image route is present: it validates the request (unknown model) rather than 404.
+    let image = serde_json::json!({"model": "another", "prompt": "a lighthouse"}).to_string();
+    let (status, v) = send(&client, addr, "POST", "/v1/images/generations", &[], &image).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["code"], "unknown_model", "{v}");
+    // The chat route is absent in image-only mode.
+    let (status, _v) = send(
+        &client,
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        &[],
+        &chat_body(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "chat must 404 in image-only mode"
+    );
 }
