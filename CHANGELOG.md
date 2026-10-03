@@ -7,6 +7,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.43.0] — 2026-10-03
+
+### Added
+
+- **Image-only serving mode.** Start `lumen-server` with `LUMEN_IMAGE_LBI` and
+  `LUMEN_IMAGE_CKPT` and no `--model` to serve `/v1/images/generations` and `/v1/models`
+  for the image model without loading a text model. The transformer and VAE stay resident
+  on the device between generations.
+
+### Changed
+
+- **One model per process.** A `lumen-server` process serves either a text model
+  (`--model`) or the image endpoint, not both, and the text engine builds once for its
+  lifetime. Text and image output are unchanged from the previous release.
+
+### Removed
+
+- **The combined text-and-image process.** A text model and the image endpoint exceed a
+  single GPU, so they now run as separate servers; passing `--model` together with the
+  image environment variables is refused with guidance to start two. The in-process
+  hand-off that swapped the text model out for each image generation is gone.
+
 ## [0.42.0] — 2026-10-02
 
 ### Changed
@@ -1941,6 +1963,7 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
 [unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.42.0...HEAD
+[0.43.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.39.0...v0.40.0

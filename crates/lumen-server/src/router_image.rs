@@ -80,20 +80,11 @@ pub struct ImageConfig {
 /// The generation endpoint's state.
 pub struct ImageState {
     pub config: ImageConfig,
-    /// The text engine, so a generation can take the device exclusively and
-    /// release it when it finishes.
-    pub engine: crate::engine::EngineHandle,
-    /// The transformer and VAE kept on the device between generations, when
-    /// the text engine is not on it; `None` when it is (each generation then
-    /// loads its components under the lease) and on the CPU.
+    /// The transformer and VAE kept resident on the device between generations;
+    /// `None` on the CPU (`config.use_gpu` false), where each generation runs on
+    /// the host.
     #[cfg(feature = "image")]
     pub resident: Option<std::sync::Mutex<lumen_image::pipeline::GpuResident>>,
-    /// The tokenizer and the containers' mappings, kept open for generations
-    /// that load their components under the lease; `None` when `resident`
-    /// holds them and on the CPU. With `config.use_gpu`, exactly one of the two
-    /// is set: a generation with neither runs on the CPU.
-    #[cfg(feature = "image")]
-    pub sources: Option<lumen_image::pipeline::GpuSources>,
 }
 
 /// Whether the client asked for the PNG itself rather than the JSON body: its
@@ -163,6 +154,26 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// `GET /v1/models` on an image-only server: reports the single image model it
+/// serves, in the same shape as the text server's listing, so a client — and the
+/// deployment's guard — probes readiness and discovers the model uniformly across
+/// both server kinds. Mounted only when no text engine is present (see
+/// [`crate::router::build_router_with_images`]); otherwise the text listing is served.
+#[cfg(feature = "image")]
+pub async fn list_image_models(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ImageState>>,
+) -> impl axum::response::IntoResponse {
+    axum::Json(serde_json::json!({
+        "object": "list",
+        "data": [{
+            "id": state.config.model_id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "lumen",
+        }]
+    }))
+}
+
 #[cfg(feature = "image")]
 pub async fn generate_image(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<ImageState>>,
@@ -170,7 +181,6 @@ pub async fn generate_image(
     crate::router::OpenAiJson(req): crate::router::OpenAiJson<ImageGenerationRequest>,
 ) -> Result<Response, ServerError> {
     let png_body = prefers_png(&headers);
-    let engine = state.engine.clone();
     if let Some(model) = &req.model {
         if model != &state.config.model_id {
             return Err(ServerError::bad_request_field(
@@ -232,10 +242,8 @@ pub async fn generate_image(
     let seed = req.seed.unwrap_or(42);
     let out_format = req.response_format.clone();
 
-    // One generation at a time: each loads a component set that fills the
-    // card (or, on the CPU path, the host) on its own, so a second one
-    // running alongside would fail both. The text engine's lease serialises
-    // only the generations that evict it; this covers the rest.
+    // One generation at a time: a generation fills the device (or, on the CPU
+    // path, the host) on its own, so a second running alongside would fail both.
     let one_at_a_time = GENERATION.lock().await;
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(std::sync::Arc::clone(&cancelled));
@@ -254,13 +262,10 @@ pub async fn generate_image(
             init_latents: None,
         };
         // A client that left, or a shutdown that began, has no reader for the
-        // image. Checked before the lease, so a request that is already over
-        // never evicts the text model; again after it, since the grant can
-        // wait behind a running text request, so the guard's drop restores
-        // the model straight away instead of after a generation nobody
-        // collects; and at every step of a running generation, which stops
-        // there. The response carries only the finished image, so the step
-        // counts have no reader.
+        // image, so the generation is stopped: checked before it starts, so work
+        // that is already unwanted never begins, and at every step of a running
+        // generation, which stops there. The response carries only the finished
+        // image, so the step counts have no reader.
         let stop = || cancelled.load(std::sync::atomic::Ordering::Acquire) || shutting_down();
         let stopped = || {
             if shutting_down() {
@@ -268,19 +273,6 @@ pub async fn generate_image(
             } else {
                 ServerError::Internal("the client disconnected".to_string())
             }
-        };
-        if stop() {
-            return Err(stopped());
-        }
-        // Take the device exclusively when the text model is on it: the model
-        // is evicted for the duration and restored when the guard is dropped
-        // below, before the PNG is encoded. Without it the two do not fit the card
-        // together. A text engine off that device (CPU, another card) needs
-        // no eviction.
-        let lease = if cfg.use_gpu && engine.holds_device(lumen_image::pipeline::GPU_DEVICE) {
-            Some(engine.try_exclusive()?)
-        } else {
-            None
         };
         if stop() {
             return Err(stopped());
@@ -305,12 +297,9 @@ pub async fn generate_image(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .generate(&gen_req, &mut progress)
                 .map_err(failed)?
-        } else if let Some(sources) = &resident_state.sources {
-            lumen_image::pipeline::generate_gpu(sources, &gen_req, &mut progress).map_err(failed)?
         } else {
             lumen_image::pipeline::generate_cpu(&paths, &gen_req, &mut progress).map_err(failed)?
         };
-        drop(lease);
         Ok(lumen_image::png::encode(&rgba))
     })
     .await

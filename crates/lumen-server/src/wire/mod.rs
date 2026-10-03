@@ -673,31 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_runtime_evicted_is_retryable_503() {
-        // The worker's refusal while the model is evicted for an image
-        // generation is transient, so it takes the retryable shape.
-        let e = ServerError::classify_runtime(crate::engine::EVICTED_MESSAGE);
-        assert!(
-            matches!(e, ServerError::EngineUnavailable(_)),
-            "evicted refusal is EngineUnavailable (503), got {e:?}"
-        );
-    }
-
-    #[test]
-    fn classify_runtime_failed_restore_is_retryable_503() {
-        // The worker retries the rebuild on the next request, so this is as
-        // transient as the eviction itself.
-        let e = ServerError::classify_runtime(format!(
-            "{}device busy; the next request retries it",
-            crate::engine::RESTORE_FAILED_PREFIX
-        ));
-        assert!(
-            matches!(e, ServerError::EngineUnavailable(_)),
-            "failed-restore refusal is EngineUnavailable (503), got {e:?}"
-        );
-    }
-
-    #[test]
     fn classify_runtime_compute_error_stays_500() {
         // A genuine compute/IO failure must NOT be downgraded to 400.
         let e = ServerError::classify_runtime("compute: matmul kernel returned NaN");
