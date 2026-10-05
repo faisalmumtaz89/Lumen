@@ -16,7 +16,8 @@ in with the `image` Cargo feature. The Linux/CUDA release tarball and Docker ima
   generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start on a device with less than
   21.0 GiB in total, naming both amounts. The transformer and the VAE normally stay loaded
-  between generations; see [Device memory](#device-memory).
+  between generations, and the server uses spare room beside them: on a 32 GiB card,
+  1024×1024 generations take up to about 30 GiB. See [Device memory](#device-memory).
 
 ## Convert the checkpoint
 
@@ -100,8 +101,8 @@ still runs out of memory drops the kept layers and that size's record and runs a
 repeated 1024×1024 images settle with about 10 GiB of the 12.9 GiB kept, and the
 encoder's upload drops from 12.9 GiB to 2.9 GiB. Prompt encoding and image
 decoding run beside the resident transformer when they fit. When one runs out of device
-memory there — a 2048×2048 decode on a 32 GiB card, a prompt of thousands of tokens, or
-any prompt on a card much smaller than 32 GiB — the transformer is released and the step
+memory there — a 2048×2048 decode on a 32 GiB card, or any prompt on a card much smaller
+than 32 GiB — the transformer is released and the step
 retried, along with any text-encoder layers kept beside it. A decode that still does not
 fit on its own, as at 3840×2176 on a 32 GiB card, is split into horizontal bands, twice
 as many at each retry down to bands of 512 image rows, and the count is remembered for

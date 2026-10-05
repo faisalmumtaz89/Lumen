@@ -552,8 +552,8 @@ impl GpuSources {
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
-/// there — a 2048x2048 decode, a prompt of thousands of tokens, any encode on
-/// a card much smaller than 32 GiB — is retried once with the transformer
+/// there — a 2048x2048 decode on a 32 GiB card, any encode on a card much
+/// smaller than 32 GiB — is retried once with the transformer
 /// released, and the next generation loads it again. The smallest prompt and
 /// the smallest image that ran out are remembered, so work at least that large
 /// releases the transformer first instead of failing again.

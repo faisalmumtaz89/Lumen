@@ -104,7 +104,8 @@ lumen-server - OpenAI / Anthropic-compatible HTTP server for Lumen
 USAGE:
     lumen-server [OPTIONS] [MODEL:QUANT]
     lumen-server [OPTIONS] --model <MODEL> [--quant <Q>]
-    LUMEN_IMAGE_LBI=<dir> LUMEN_IMAGE_CKPT=<dir> lumen-server [OPTIONS]   (images only)
+    LUMEN_IMAGE_LBI=<dir> LUMEN_IMAGE_CKPT=<dir> lumen-server [OPTIONS]
+                           (images only; a --features image build)
 
 MODEL (positional or --model):
     MODEL:QUANT            Registry name with an optional quant tag, e.g.
