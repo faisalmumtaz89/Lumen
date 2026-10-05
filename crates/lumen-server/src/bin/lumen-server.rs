@@ -104,6 +104,8 @@ lumen-server - OpenAI / Anthropic-compatible HTTP server for Lumen
 USAGE:
     lumen-server [OPTIONS] [MODEL:QUANT]
     lumen-server [OPTIONS] --model <MODEL> [--quant <Q>]
+    LUMEN_IMAGE_LBI=<dir> LUMEN_IMAGE_CKPT=<dir> lumen-server [OPTIONS]
+                           (images only; a --features image build)
 
 MODEL (positional or --model):
     MODEL:QUANT            Registry name with an optional quant tag, e.g.
@@ -155,8 +157,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
     LUMEN_IMAGE_LBI=<dir>  Converted image components (transformer.lbi,
-                           vae.lbi, text_encoder.lbi). With LUMEN_IMAGE_CKPT,
-                           enables POST /v1/images/generations.
+                           vae.lbi, text_encoder.lbi). With LUMEN_IMAGE_CKPT
+                           and no model, the server serves images only; a
+                           model as well is refused (one model per process).
     LUMEN_IMAGE_CKPT=<dir> The source checkpoint, for processor/vocab.json,
                            processor/merges.txt and processor/added_tokens.json.
     LUMEN_IMAGE_MODEL_ID=<id>
@@ -164,8 +167,8 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            (default Qwen-Image-2.1).
     LUMEN_IMAGE_DEVICE=cuda|gpu|cpu
                            Where generations run (default cuda). On CUDA the
-                           transformer and VAE stay resident on the device
-                           between generations.
+                           transformer and VAE normally stay resident on the
+                           device between generations.
     LUMEN_IMAGE_PIN_TEXT_ENCODER=1
                            Keep the text encoder's weights in page-locked host
                            memory (12.9 GiB, held for the server's lifetime) so
@@ -198,12 +201,19 @@ EXAMPLES:
     # Direct file path
     lumen-server --model /path/to/qwen3-5-9b-Q8_0.lbc --port 8080
 
-ENDPOINTS:
+    # Images only (a --features image build), beside a text server on 8000
+    LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/ckpt lumen-server --port 8001
+
+ENDPOINTS (text server):
     GET  /v1/models                  OpenAI-style model list
     POST /v1/chat/completions        OpenAI chat completion (SSE optional)
     POST /v1/completions             OpenAI text completion (SSE optional)
     POST /v1/messages                Anthropic messages (SSE optional)
-    POST /v1/images/generations      Text to image (--features image, LUMEN_IMAGE_* set)
+    POST /v1/messages/count_tokens   Anthropic token count
+
+ENDPOINTS (image-only server):
+    GET  /v1/models                  The image model
+    POST /v1/images/generations      Text to image
 "
     );
 }

@@ -1,8 +1,10 @@
 # Image generation
 
-`lumen-server` can serve Qwen-Image-2.1 text-to-image next to a text model on one
-CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in with the
-`image` Cargo feature. The Linux/CUDA release tarball and Docker image ship a
+`lumen-server` serves Qwen-Image-2.1 text-to-image as an image-only server: started with
+the image variables and no model, it serves `POST /v1/images/generations` and a
+`GET /v1/models` that lists the image model, and no text routes. A text model runs in a
+separate `lumen-server` process; one process does not serve both. The endpoint is compiled
+in with the `image` Cargo feature. The Linux/CUDA release tarball and Docker image ship a
 `lumen-server` built with it and the `lbi-convert` converter.
 
 ## Requirements
@@ -13,8 +15,9 @@ CUDA device. The endpoint is `POST /v1/images/generations` and is compiled in wi
   transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
   generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start on a device with less than
-  21.0 GiB in total, naming both amounts. How the components are held depends on where
-  the text model runs; see [Sharing the device with a text model](#sharing-the-device-with-a-text-model).
+  21.0 GiB in total, naming both amounts. The transformer and the VAE normally stay loaded
+  between generations, and the server uses spare room beside them: on a 32 GiB card,
+  1024×1024 generations take up to about 30 GiB. See [Device memory](#device-memory).
 
 ## Convert the checkpoint
 
@@ -34,9 +37,11 @@ directly at run time.
 
 ```sh
 # from source: cargo build --release -p lumen-server --features bin,cuda,image
-LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \
-  lumen-server qwen3.8-27b:q4_0 --backend cuda
+LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 lumen-server --port 8000
 ```
+
+A model passed as well is refused at startup: run the text model as its own `lumen-server`
+on another port, and on a device that cannot hold both, start one server at a time.
 
 Both variables must be set together; the server checks every file it will need at
 startup (tensor shapes, bf16 storage for the weights the CUDA path multiplies, the VAE
@@ -81,17 +86,12 @@ curl -fsS http://localhost:8000/v1/images/generations \
 `image/png` is weighed against `application/json` as HTTP content negotiation defines it;
 with no `Accept` header, or `*/*`, the response is JSON.
 
-## Sharing the device with a text model
+## Device memory
 
-Generations run one at a time. When the text model is served on the same CUDA device, a
-generation evicts it, loads the three image components one at a time, and restores the
-text model before the image is returned; text requests made meanwhile get a retryable
-`503` with the message `the model is evicted for an image generation; retry shortly`.
-
-When the text model runs on the CPU or on another device, the image endpoint keeps the
-transformer and the VAE loaded on CUDA device 0 between generations (about 14.4 GiB,
-held while the server runs), and the text encoder loads for each image; the server
-fails to start if that device cannot hold them. The text encoder's first layers stay
+Generations run one at a time. On CUDA the server loads the transformer and the VAE on
+device 0 at startup and keeps them there between generations (about 14.4 GiB), except
+when the transformer has to make room as described below, and the text encoder loads for
+each image; the server fails to start if that device cannot hold them. The text encoder's first layers stay
 loaded between images when there is room. The first image of a size that runs with the
 transformer loaded throughout keeps none, and the server records how much device memory
 that size's denoising and decoding need; later images of that size, with the transformer
@@ -101,8 +101,8 @@ still runs out of memory drops the kept layers and that size's record and runs a
 repeated 1024×1024 images settle with about 10 GiB of the 12.9 GiB kept, and the
 encoder's upload drops from 12.9 GiB to 2.9 GiB. Prompt encoding and image
 decoding run beside the resident transformer when they fit. When one runs out of device
-memory there — a 2048×2048 decode on a 32 GiB card, a prompt of thousands of tokens, or
-any prompt on a card much smaller than 32 GiB — the transformer is released and the step
+memory there — a 2048×2048 decode on a 32 GiB card, or any prompt on a card much smaller
+than 32 GiB — the transformer is released and the step
 retried, along with any text-encoder layers kept beside it. A decode that still does not
 fit on its own, as at 3840×2176 on a 32 GiB card, is split into horizontal bands, twice
 as many at each retry down to bands of 512 image rows, and the count is remembered for
@@ -111,8 +111,7 @@ as a one-pass decode, bit for bit. After an encoding the transformer is
 loaded again for the denoising steps of the same generation, after a decode by the next
 generation. Later work at least that large
 releases it up front. Images are identical either way. Any generation that runs out pays
-for its failed attempt; work at or above a remembered size costs what the evicting mode
-costs. A single
+for its failed attempt. A single
 out-of-memory event caused by another process on the device, if dropping the kept text
 layers does not clear it and the transformer has to be released, lowers that size
 threshold for the rest of the server's life.
@@ -131,10 +130,9 @@ faster. Page-locked memory is not bounded by memlock or cgroup memory limits, so
 only on a host that can spare that memory beside everything else it runs; the server
 fails to start if the copy cannot be made.
 
-A request whose client disconnects is dropped: if it was still queued nothing
-is evicted, and if its generation was running it stops at the next denoising step and the
-text model is restored then (the disconnect is seen when the connection carries no further
-pipelined request behind the image request). Stopping the server (Ctrl-C) stops a generation that is still
+A request whose client disconnects is dropped: if it was still queued it never runs, and
+if its generation was running it stops at the next denoising step (the disconnect is seen
+when the connection carries no further pipelined request behind the image request). Stopping the server (Ctrl-C) stops a generation that is still
 denoising the same way and answers it with `503`; one already decoding its image completes.
 
 Errors are the same JSON shape as the text endpoints: validation failures are `400` with

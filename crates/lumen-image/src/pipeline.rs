@@ -62,8 +62,7 @@ impl PipelinePaths {
     /// identify each container as that component at the expected shapes
     /// (stored as bf16 when `gpu`, which is what the device transformer
     /// multiplies), and the tokenizer with the chat template's markers as
-    /// whole tokens. A checkpoint that fails here would fail every request
-    /// after the text model had been evicted for it.
+    /// whole tokens. A checkpoint that fails here would fail every request.
     pub fn check(&self, gpu: bool) -> Result<(), PipelineError> {
         let named = |path: &Path, e: &dyn std::fmt::Display| {
             PipelineError::Unsupported(format!("{}: {e}", path.display()))
@@ -417,8 +416,8 @@ pub const GPU_DEVICE: usize = 0;
 /// as the device's used memory at the peak of a 2048x2048 generation (the
 /// VAE decode; a 1024x1024 generation peaks at 15,663 MiB while denoising) on
 /// an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
-/// less total memory would fail a request at that size after the text model
-/// had been evicted for it, so the startup check refuses it instead.
+/// less total memory would fail a request at that size, so the startup check
+/// refuses it instead.
 pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
 
 /// Refuse a device whose total memory is below [`PEAK_DEVICE_BYTES`].
@@ -537,9 +536,8 @@ impl GpuSources {
     }
 }
 
-/// The transformer and the VAE held on the device between generations, for a
-/// device nothing else needs in between (the text model on the CPU or on
-/// another card).
+/// The transformer and the VAE held on the device between generations, as the
+/// image-only server runs them (no text model shares its process).
 ///
 /// The text encoder loads for each generation, but its first layers can stay:
 /// the three do not fit on a 32 GiB card together with a decode's activations
@@ -554,8 +552,8 @@ impl GpuSources {
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
-/// there — a 2048x2048 decode, a prompt of thousands of tokens, any encode on
-/// a card much smaller than 32 GiB — is retried once with the transformer
+/// there — a 2048x2048 decode on a 32 GiB card, any encode on a card much
+/// smaller than 32 GiB — is retried once with the transformer
 /// released, and the next generation loads it again. The smallest prompt and
 /// the smallest image that ran out are remembered, so work at least that large
 /// releases the transformer first instead of failing again.
