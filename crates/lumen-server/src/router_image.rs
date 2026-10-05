@@ -5,7 +5,7 @@
 //!
 //! The handler is deliberately blocking on a worker thread: the pipeline is
 //! CPU- or GPU-bound for tens of seconds and would otherwise stall the async
-//! reactor that serves the text endpoints.
+//! reactor.
 
 use axum::response::Response;
 

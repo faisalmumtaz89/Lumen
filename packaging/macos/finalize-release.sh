@@ -46,8 +46,8 @@ INSTALL   sudo cp bin/lumen bin/lumen-server bin/lbi-convert /usr/local/bin/
 RUN       lumen pull qwen3.5-9b:q8_0
           lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 8000
 IMAGES    lbi-convert /path/to/Qwen-Image-2.1 /path/to/lbi
-          LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 \\
-            lumen-server --model qwen3.5-9b --quant q8_0 --backend cuda --port 8000
+          LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/Qwen-Image-2.1 lumen-server --port 8001
+          (an image-only server, separate from the text server; give it no model)
           https://github.com/${REPO}/blob/main/docs/image-generation.md
 EOF
 tar -C "$(dirname "$stage")" -czf "dist/lumen-${TAG}-linux-x86_64-cuda.tar.gz" "$(basename "$stage")"
