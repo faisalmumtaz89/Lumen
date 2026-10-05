@@ -3,8 +3,9 @@
 #
 # Canonical registry of models supported by the Lumen inference engine.
 # Lumen ships the Qwen3.5 family plus the Qwen3.8-27B dense
-# models (all `qwen35`/`qwen35moe` GGUF architectures). Other architectures
-# are not supported and will be rejected at conversion time.
+# models (all `qwen35`/`qwen35moe` GGUF architectures) and the Qwen-Image-2.1
+# text-to-image checkpoint. Other architectures are not supported and will be
+# rejected at conversion time.
 
 [meta]
 schema_version = 1
@@ -14,6 +15,7 @@ default_quant = "Q8_0"
 supported_architectures = [
     "qwen35",     # Qwen3.5 (GatedDeltaNet, dense FFN)
     "qwen35moe",  # Qwen3.5 MoE (GatedDeltaNet, sparse FFN)
+    "qwen-image", # Qwen-Image-2.1 (text encoder, DiT transformer, VAE)
 ]
 
 supported_quantizations = ["BF16", "Q8_0", "Q4_0", "Q4_K_M", "Q5_K_M"]
@@ -89,6 +91,39 @@ tokenizer = "Qwen/Qwen3.8-27B"
     ] }
 
 
+# The image model: a Hugging Face checkpoint, pinned to one commit, that
+# `lumen pull` downloads file by file and converts with lumen-image into the
+# three `.lbi` containers the image-only `lumen-server` serves. Every file
+# carries the size and SHA-256 the pinned commit publishes; a download that
+# differs is refused. The converter reads `transformer/`, `vae/` and
+# `text_encoder/`; the server reads `processor/` at run time.
+[models.qwen-image-2-1]
+display_name = "Qwen-Image-2.1"
+architecture = "qwen-image"
+parameters = "20B"
+
+    [models.qwen-image-2-1.checkpoint]
+    repo = "Qwen/Qwen-Image-2.1"
+    revision = "d26bb61231c349cf6b7896fa83353113880e1ba3"
+    files = [
+        { path = "transformer/config.json", size = 370, sha256 = "56ae3281c4e6c2d1aa3658252d187488071815fd79bef15808bb0205fc1a2241" },
+        { path = "transformer/diffusion_pytorch_model-00001-of-00002.safetensors", size = 9968332504, sha256 = "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b" },
+        { path = "transformer/diffusion_pytorch_model-00002-of-00002.safetensors", size = 4261951904, sha256 = "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa" },
+        { path = "transformer/diffusion_pytorch_model.safetensors.index.json", size = 30283, sha256 = "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2" },
+        { path = "vae/config.json", size = 2079, sha256 = "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2" },
+        { path = "vae/diffusion_pytorch_model.safetensors", size = 1350989512, sha256 = "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417" },
+        { path = "text_encoder/config.json", size = 1517, sha256 = "6001331949f7f86ab6d791a80b12246d4f8da5159fa08c3e62368a39f36d63a9" },
+        { path = "text_encoder/model-00001-of-00004.safetensors", size = 4998056552, sha256 = "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f" },
+        { path = "text_encoder/model-00002-of-00004.safetensors", size = 4915962464, sha256 = "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42" },
+        { path = "text_encoder/model-00003-of-00004.safetensors", size = 4915962496, sha256 = "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e" },
+        { path = "text_encoder/model-00004-of-00004.safetensors", size = 2704357976, sha256 = "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd" },
+        { path = "text_encoder/model.safetensors.index.json", size = 67795, sha256 = "859146bff8db1d617fca8b457a5223edff963bb70076b3645f2189fe0540a147" },
+        { path = "processor/vocab.json", size = 2776833, sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910" },
+        { path = "processor/merges.txt", size = 1671853, sha256 = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5" },
+        { path = "processor/added_tokens.json", size = 707, sha256 = "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680" },
+    ]
+
+
 # =============================================================================
 # Aliases -- short names mapping to canonical model keys
 # =============================================================================
@@ -99,3 +134,4 @@ tokenizer = "Qwen/Qwen3.8-27B"
 "qwen3.5-moe" = "qwen3-5-moe-35b-a3b"
 "qwen3.8-27b" = "qwen3-8-27b"
 "qwen3-8-27b" = "qwen3-8-27b"
+"qwen-image" = "qwen-image-2-1"

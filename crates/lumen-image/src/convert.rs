@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use lumen_format::QuantScheme;
 
-use crate::lbi::{LbiError, LbiWriter};
+use crate::lbi::{LbiError, LbiFile, LbiWriter};
 use crate::safetensors::{SafetensorsError, SafetensorsFile, DTYPE_BF16, DTYPE_F16, DTYPE_F32};
 use crate::shard_index::ShardIndex;
 
@@ -39,6 +39,12 @@ pub enum ConvertError {
     /// would otherwise be dropped silently. Boxed because it carries the full
     /// discrepancy detail and would otherwise dominate the enum's size.
     ShardIndexMismatch(Box<ShardIndexMismatch>),
+    /// A written `.lbi`, opened again, does not hold the tensors written.
+    ReadBack {
+        component: String,
+        written: usize,
+        read: usize,
+    },
 }
 
 impl std::fmt::Display for ConvertError {
@@ -67,6 +73,14 @@ impl std::fmt::Display for ConvertError {
                  indexed-but-absent={:?} present-but-unindexed={:?} \
                  duplicated={:?} misplaced={:?} unindexed shard files={:?}",
                 m.component, m.missing, m.unexpected, m.duplicated, m.misplaced, m.unreferenced
+            ),
+            Self::ReadBack {
+                component,
+                written,
+                read,
+            } => write!(
+                f,
+                "{component}: wrote {written} tensors but read back {read}"
             ),
         }
     }
@@ -124,6 +138,56 @@ pub struct ConvertReport {
     pub total_bytes: u64,
     /// Count of tensors per dtype, for a printed summary.
     pub dtypes: HashMap<String, usize>,
+}
+
+/// The three components a Qwen-Image-2.1 checkpoint directory holds, each
+/// converted into `<out_dir>/<component>.lbi`.
+pub const COMPONENTS: [&str; 3] = ["transformer", "vae", "text_encoder"];
+
+/// Convert `<checkpoint_dir>/{transformer,vae,text_encoder}` into
+/// `<out_dir>/{transformer,vae,text_encoder}.lbi`, each from its shard index
+/// when it has one and from its single file otherwise, then open every file
+/// written and check it holds the tensors written. One report per component,
+/// in [`COMPONENTS`] order.
+pub fn convert_checkpoint(
+    checkpoint_dir: &Path,
+    out_dir: &Path,
+) -> Result<Vec<ConvertReport>, ConvertError> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut reports = Vec::with_capacity(COMPONENTS.len());
+    for component in COMPONENTS {
+        let comp_dir = checkpoint_dir.join(component);
+        let config = component_config(&comp_dir)?;
+        let target = out_dir.join(format!("{component}.lbi"));
+        let report = if has_shard_index(&comp_dir) {
+            convert_component(checkpoint_dir, component, &target, config)?
+        } else {
+            convert_single_file(&single_shard(&comp_dir)?, component, &target, config)?
+        };
+        let read = LbiFile::open(&target)?.len();
+        if read != report.tensor_count {
+            return Err(ConvertError::ReadBack {
+                component: component.to_string(),
+                written: report.tensor_count,
+                read,
+            });
+        }
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+/// The component's `config.json`, which the `.lbi` carries.
+fn component_config(dir: &Path) -> Result<serde_json::Value, ConvertError> {
+    let path = dir.join("config.json");
+    let at = |e: &dyn std::fmt::Display| {
+        ConvertError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        ))
+    };
+    let bytes = std::fs::read(&path).map_err(|e| at(&e))?;
+    serde_json::from_slice(&bytes).map_err(|e| at(&e))
 }
 
 /// Build `<component>.lbi` from the shards named in `<component>/model.safetensors.index.json`.

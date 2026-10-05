@@ -64,7 +64,8 @@ POST /v1/messages           # Anthropic-compatible, SSE streaming
 POST /v1/messages/count_tokens # Anthropic-compatible token count
 GET  /v1/models             # Model list
 POST /v1/images/generations # Text to image: an image-only server (`--features image`
-                            # build, LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT set, no model)
+                            # build): `lumen-server qwen-image`, or LUMEN_IMAGE_LBI and
+                            # LUMEN_IMAGE_CKPT set with no model
 ```
 
 A server serves either a text model (every route above but the image one) or images (the image route and `/v1/models`), never both. The image endpoint — conversion, limits, request shape and device memory — is described in [image-generation.md](image-generation.md).

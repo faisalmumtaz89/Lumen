@@ -210,8 +210,12 @@ pub struct LbiWriter {
 impl LbiWriter {
     /// Start a writer. The final path is not created until
     /// [`finish`](Self::finish); tensor bytes accumulate in a sibling
-    /// temporary file.
-    pub fn create(path: &Path, config: serde_json::Value) -> Result<Self, LbiError> {
+    /// temporary file. The config is stored with its object keys sorted, so
+    /// the same checkpoint converts to the same bytes whether or not the
+    /// binary's serde_json keeps insertion order (a feature another crate in
+    /// the build can turn on).
+    pub fn create(path: &Path, mut config: serde_json::Value) -> Result<Self, LbiError> {
+        config.sort_all_objects();
         let part = path.with_extension("lbi.part");
         let tmp = path.with_extension("lbi.blobs.tmp");
         Ok(Self {

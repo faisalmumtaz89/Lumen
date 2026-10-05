@@ -8,7 +8,8 @@ use std::collections::HashMap;
 /// Embedded registry TOML (compiled into the binary).
 const REGISTRY_TOML: &str = include_str!("../../../model_registry.toml");
 
-/// A resolved model entry from the registry.
+/// A resolved model entry from the registry: a text model with one GGUF
+/// source per quantization, or an image model with one pinned checkpoint.
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub key: String,
@@ -17,6 +18,58 @@ pub struct ModelEntry {
     pub parameters: String,
     pub tokenizer: String,
     pub gguf_files: HashMap<String, GgufSource>,
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// A Hugging Face checkpoint pinned to one commit: the files `lumen pull`
+/// downloads, each with the size and SHA-256 that commit publishes.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    pub repo: String,
+    pub revision: String,
+    pub files: Vec<CheckpointFile>,
+}
+
+/// One file of a [`Checkpoint`], by its path in the repository.
+#[derive(Debug, Clone)]
+pub struct CheckpointFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+impl Checkpoint {
+    /// The bytes every file adds up to.
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.size).sum()
+    }
+}
+
+impl ModelEntry {
+    /// What a listing shows after the name: the quantizations a text model
+    /// comes in, sorted, or what the image model is.
+    pub fn variants(&self) -> String {
+        if self.checkpoint.is_some() {
+            return "text to image".to_owned();
+        }
+        let mut quants: Vec<&str> = self.gguf_files.keys().map(|s| s.as_str()).collect();
+        quants.sort_unstable();
+        quants.join(", ")
+    }
+
+    /// The `name:quant` tags `lumen pull` takes for a text model, or the bare
+    /// name for the image model.
+    pub fn pull_tags(&self) -> Vec<String> {
+        if self.checkpoint.is_some() {
+            return vec![self.key.clone()];
+        }
+        let mut quants: Vec<&str> = self.gguf_files.keys().map(|s| s.as_str()).collect();
+        quants.sort_unstable();
+        quants
+            .iter()
+            .map(|q| format!("{}:{}", self.key, q.to_lowercase()))
+            .collect()
+    }
 }
 
 /// Source location for a GGUF (single-file or multi-shard) on HuggingFace.
@@ -190,6 +243,53 @@ pub fn load_registry() -> Registry {
                 }
             }
 
+            let checkpoint = model_table
+                .get("checkpoint")
+                .and_then(|v| v.as_table())
+                .map(|t| {
+                    let text = |name: &str| {
+                        t.get(name)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| panic!("checkpoint of {key} must have {name}"))
+                            .to_owned()
+                    };
+                    let files = t
+                        .get("files")
+                        .and_then(|v| v.as_array())
+                        .unwrap_or_else(|| panic!("checkpoint of {key} must list files"))
+                        .iter()
+                        .map(|f| {
+                            let f = f.as_table().unwrap_or_else(|| {
+                                panic!("checkpoint file of {key} must be a table")
+                            });
+                            let text = |name: &str| {
+                                f.get(name)
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_else(|| {
+                                        panic!("checkpoint file of {key} must have {name}")
+                                    })
+                                    .to_owned()
+                            };
+                            CheckpointFile {
+                                path: text("path"),
+                                size: f
+                                    .get("size")
+                                    .and_then(|v| v.as_integer())
+                                    .and_then(|n| u64::try_from(n).ok())
+                                    .unwrap_or_else(|| {
+                                        panic!("checkpoint file of {key} must have size")
+                                    }),
+                                sha256: text("sha256"),
+                            }
+                        })
+                        .collect();
+                    Checkpoint {
+                        repo: text("repo"),
+                        revision: text("revision"),
+                        files,
+                    }
+                });
+
             models.insert(
                 key.clone(),
                 ModelEntry {
@@ -199,6 +299,7 @@ pub fn load_registry() -> Registry {
                     parameters,
                     tokenizer,
                     gguf_files,
+                    checkpoint,
                 },
             );
         }
@@ -317,10 +418,71 @@ mod tests {
             list.iter().map(|e| e.architecture.as_str()).collect();
         for arch in &archs {
             assert!(
-                matches!(*arch, "qwen35" | "qwen35moe"),
-                "registry contains non-Qwen3.5 arch {}",
+                matches!(*arch, "qwen35" | "qwen35moe" | "qwen-image"),
+                "registry contains an unsupported arch {}",
                 arch,
             );
+        }
+    }
+
+    #[test]
+    fn every_model_is_a_gguf_text_model_or_a_pinned_checkpoint() {
+        let reg = load_registry();
+        for entry in reg.list() {
+            assert!(
+                entry.gguf_files.is_empty() != entry.checkpoint.is_none(),
+                "{} must have either GGUF files or a checkpoint",
+                entry.key
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_qwen_image() {
+        let reg = load_registry();
+        let entry = reg
+            .resolve("qwen-image")
+            .expect("alias qwen-image must resolve");
+        assert_eq!(entry.key, "qwen-image-2-1");
+        assert_eq!(entry.display_name, "Qwen-Image-2.1");
+        assert_eq!(entry.architecture, "qwen-image");
+        assert!(entry.gguf_files.is_empty());
+        let ckpt = entry
+            .checkpoint
+            .as_ref()
+            .expect("qwen-image-2-1 must have a checkpoint");
+        assert_eq!(ckpt.repo, "Qwen/Qwen-Image-2.1");
+        assert_eq!(ckpt.revision, "d26bb61231c349cf6b7896fa83353113880e1ba3");
+        assert_eq!(ckpt.files.len(), 15);
+        assert_eq!(ckpt.total_bytes(), 33_120_164_845);
+        for f in &ckpt.files {
+            assert!(
+                !f.path.starts_with('/')
+                    && !f.path.contains("..")
+                    && f.path.split('/').count() == 2,
+                "{}: a component directory and a file name",
+                f.path
+            );
+            assert!(f.size > 0, "{}: size", f.path);
+            assert!(
+                f.sha256.len() == 64 && f.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{}: sha256",
+                f.path
+            );
+        }
+        let paths: Vec<&str> = ckpt.files.iter().map(|f| f.path.as_str()).collect();
+        for needed in [
+            "transformer/config.json",
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/config.json",
+            "text_encoder/model.safetensors.index.json",
+            "processor/vocab.json",
+            "processor/merges.txt",
+            "processor/added_tokens.json",
+        ] {
+            assert!(paths.contains(&needed), "{needed} must be listed");
         }
     }
 
@@ -499,9 +661,10 @@ mod tests {
     }
 
     #[test]
-    fn all_models_have_tokenizer() {
+    fn all_text_models_have_tokenizer() {
+        // The image model's tokenizer is the checkpoint's own processor/ directory.
         let reg = load_registry();
-        for entry in reg.list() {
+        for entry in reg.list().into_iter().filter(|e| e.checkpoint.is_none()) {
             assert!(
                 !entry.tokenizer.is_empty(),
                 "model {} has no tokenizer",

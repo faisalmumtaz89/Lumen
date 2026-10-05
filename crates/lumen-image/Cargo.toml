@@ -94,4 +94,5 @@ name = "lbi-verify"
 path = "src/bin/lbi_verify.rs"
 
 [dev-dependencies]
-serde_json = "1"
+# Insertion order on, so the sorted-config test can see the writer sort.
+serde_json = { version = "1", features = ["preserve_order"] }

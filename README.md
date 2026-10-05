@@ -90,7 +90,7 @@ compressed-tensors INT4 (group 32).
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 
-Image: Qwen-Image-2.1 on CUDA, converted with `lbi-convert` — **[docs/image-generation.md](docs/image-generation.md)**.
+Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
 
 `lumen models` lists what is available and disk-cached. Per-model, per-format status and verification: **[docs/support.md](docs/support.md)**.
 
@@ -111,7 +111,7 @@ POST /v1/completions        # OpenAI-compatible, SSE streaming
 POST /v1/messages           # Anthropic-compatible, SSE streaming
 ```
 
-Text to image runs as its own server: a `--features image` build started with `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` and no model serves `POST /v1/images/generations` ([docs/image-generation.md](docs/image-generation.md)).
+Text to image runs as its own server: `lumen pull qwen-image`, then `lumen-server qwen-image` (a `--features image` build, which the Linux/CUDA release is) serves `POST /v1/images/generations` ([docs/image-generation.md](docs/image-generation.md)).
 
 On CUDA, `--kv-precision bf16` halves the KV cache's memory for long contexts. Wire formats, reasoning / extended thinking, sampling & reproducibility, and embedding the engine as a library: **[docs/server.md](docs/server.md)**.
 

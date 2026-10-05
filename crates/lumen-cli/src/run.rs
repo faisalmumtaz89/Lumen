@@ -187,15 +187,13 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
         let key_lower = entry.key.to_lowercase();
         let dist = levenshtein(&input_lower, &key_lower);
         if dist <= 3 || key_lower.starts_with(&input_lower) || input_lower.starts_with(&key_lower) {
-            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            quants.sort();
             candidates.push((
                 dist,
                 format!(
                     "  {:<20} {} ({})",
                     entry.key,
                     entry.display_name,
-                    quants.join(", ")
+                    entry.variants()
                 ),
             ));
         }
@@ -211,13 +209,11 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
         {
             // Resolve to display the canonical entry info.
             if let Some(entry) = registry.resolve(alias) {
-                let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-                quants.sort();
                 let line = format!(
                     "  {:<20} {} ({})",
                     alias,
                     entry.display_name,
-                    quants.join(", ")
+                    entry.variants()
                 );
                 // Avoid duplicates (alias might resolve to same model already added).
                 if !candidates.iter().any(|(_, l)| l == &line) {
@@ -760,14 +756,7 @@ pub(crate) fn run_inference(args: &[String]) {
                 let registry = crate::registry::load_registry();
                 eprintln!("Available models:");
                 for entry in registry.list() {
-                    let mut quants: Vec<&str> =
-                        entry.gguf_files.keys().map(|s| s.as_str()).collect();
-                    quants.sort();
-                    let tags: Vec<String> = quants
-                        .iter()
-                        .map(|q| format!("{}:{}", entry.key, q.to_lowercase()))
-                        .collect();
-                    eprintln!("  {}", tags.join(", "));
+                    eprintln!("  {}", entry.pull_tags().join(", "));
                 }
                 eprintln!("\nUsage: lumen run <model>:<quant> \"your prompt\"");
                 eprintln!("Example: lumen run qwen3.5-9b:q8_0 \"What is 2+2?\"");
@@ -1557,14 +1546,11 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
                 eprintln!("Error: unknown model '{}'\n", model_name);
                 eprintln!("Available models:");
                 for entry in reg.list() {
-                    let mut quants: Vec<&str> =
-                        entry.gguf_files.keys().map(|s| s.as_str()).collect();
-                    quants.sort();
                     eprintln!(
                         "  {:<20} {} ({})",
                         entry.key,
                         entry.display_name,
-                        quants.join(", ")
+                        entry.variants()
                     );
                 }
             }
@@ -1572,6 +1558,14 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
             std::process::exit(1);
         }
     };
+
+    if entry.checkpoint.is_some() {
+        eprintln!(
+            "Error: {} makes images, not text. Serve it with: lumen-server {model_name}",
+            entry.display_name
+        );
+        std::process::exit(1);
+    }
 
     // Determine quantization.
     let quant = if let Some(ref q) = explicit_quant {

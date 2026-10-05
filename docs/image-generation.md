@@ -1,11 +1,28 @@
 # Image generation
 
 `lumen-server` serves Qwen-Image-2.1 text-to-image as an image-only server: started with
-the image variables and no model, it serves `POST /v1/images/generations` and a
-`GET /v1/models` that lists the image model, and no text routes. A text model runs in a
-separate `lumen-server` process; one process does not serve both. The endpoint is compiled
-in with the `image` Cargo feature. The Linux/CUDA release tarball and Docker image ship a
-`lumen-server` built with it and the `lbi-convert` converter.
+the image model's name, or with the image variables, and no text model, it serves
+`POST /v1/images/generations` and a `GET /v1/models` that lists the image model, and no
+text routes. A text model runs in a separate `lumen-server` process; one process does not
+serve both. The endpoint is compiled in with the `image` Cargo feature. The Linux/CUDA
+release tarball and Docker image ship a `lumen-server` built with it and the `lbi-convert`
+converter.
+
+```sh
+lumen pull qwen-image
+lumen-server qwen-image
+```
+
+`lumen pull qwen-image` downloads the checkpoint from Hugging Face (33 GB, pinned to one
+commit; every file is checked against its pinned size and SHA-256 and refused otherwise),
+converts it into the three `.lbi` containers under `~/.cache/lumen/qwen-image-2-1/lbi/`,
+and removes the downloaded weights, keeping the tokenizer files under `processor/`. A pull
+that stops continues where it stopped on the next run; a complete one reports the cache.
+It refuses on a `lumen` built without CUDA, since the model runs on CUDA only.
+`lumen-server qwen-image` serves what the pull cached; `LUMEN_IMAGE_MODEL_ID`,
+`LUMEN_IMAGE_DEVICE` and `LUMEN_IMAGE_PIN_TEXT_ENCODER` apply to it as below, while
+`LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` are for a checkpoint converted by hand and are
+refused beside the name. The rest of this page covers that by-hand path and the endpoint.
 
 ## Requirements
 

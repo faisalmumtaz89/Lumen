@@ -131,13 +131,7 @@ fn pull_cmd(args: &[String]) {
         eprintln!("Usage: lumen pull <model>:<quant> [--yes]");
         eprintln!("\nAvailable models:");
         for entry in reg.list() {
-            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            quants.sort();
-            let tags: Vec<String> = quants
-                .iter()
-                .map(|q| format!("{}:{}", entry.key, q.to_lowercase()))
-                .collect();
-            eprintln!("  {}", tags.join(", "));
+            eprintln!("  {}", entry.pull_tags().join(", "));
         }
         std::process::exit(1);
     });
@@ -153,6 +147,18 @@ fn pull_cmd(args: &[String]) {
         }
         std::process::exit(1);
     });
+
+    if let Some(checkpoint) = &entry.checkpoint {
+        if tag_quant.is_some() || quant_override.is_some() {
+            eprintln!(
+                "{} comes in one form and takes no quantization: lumen pull {resolved_name}",
+                entry.display_name
+            );
+            std::process::exit(1);
+        }
+        pull_image(entry, checkpoint, resolved_name, skip_confirm);
+        return;
+    }
 
     // Quant priority: colon tag > --quant flag > auto-select (single) > error (multiple)
     let quant_owned: String;
@@ -288,6 +294,160 @@ fn pull_download_gguf(_repo: &str, _filename: &str, _skip_confirm: bool) -> std:
     std::process::exit(1);
 }
 
+/// Download the image model's pinned checkpoint and convert it into the
+/// `.lbi` files the image-only `lumen-server` serves. Exits on failure.
+///
+/// The checkpoint lands in `<cache>/<key>/` in its own layout and the `.lbi`
+/// in `<cache>/<key>/lbi/`. Once the conversion has been read back, the
+/// component directories are removed: only `processor/` is read at run time.
+/// A later pull downloads only what is missing, so an interrupted one is
+/// continued, and a complete one is reported as cached.
+#[cfg(feature = "download")]
+fn pull_image(
+    entry: &registry::ModelEntry,
+    checkpoint: &registry::Checkpoint,
+    name: &str,
+    skip_confirm: bool,
+) {
+    use std::io::Write;
+
+    if !cfg!(feature = "cuda") {
+        eprintln!(
+            "{} makes images on NVIDIA CUDA, and this lumen was built without CUDA; nothing was \
+             downloaded.",
+            entry.display_name
+        );
+        std::process::exit(1);
+    }
+    let dir = cache::image_checkpoint_dir(&entry.key);
+    let lbi_dir = cache::image_lbi_dir(&entry.key);
+    if cache::cached_image(&entry.key) {
+        println!("Already cached: {}", lbi_dir.display());
+        return;
+    }
+    let converted = cache::IMAGE_SERVED_FILES
+        .iter()
+        .filter(|f| f.starts_with("lbi/"))
+        .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0));
+    // With the conversion done, only the tokenizer files can be missing.
+    let needed: Vec<&registry::CheckpointFile> = checkpoint
+        .files
+        .iter()
+        .filter(|f| !converted || f.path.starts_with("processor/"))
+        .collect();
+    let to_download: Vec<&registry::CheckpointFile> = needed
+        .iter()
+        .copied()
+        .filter(|f| {
+            !std::fs::metadata(dir.join(&f.path)).is_ok_and(|m| m.is_file() && m.len() == f.size)
+        })
+        .collect();
+    let bytes: u64 = to_download.iter().map(|f| f.size).sum();
+    if !to_download.is_empty() && !skip_confirm {
+        let disk = if converted {
+            cache::format_size(bytes)
+        } else {
+            // The .lbi hold the same tensor bytes the safetensors do.
+            format!(
+                "{} after conversion",
+                cache::format_size(2 * checkpoint.total_bytes())
+            )
+        };
+        eprint!(
+            "Download {} from {} ({}, {} on disk)? [Y/n] ",
+            entry.display_name,
+            checkpoint.repo,
+            cache::format_size(bytes),
+            disk
+        );
+        std::io::stderr().flush().ok();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            std::process::exit(1);
+        }
+        let answer = input.trim();
+        if !(answer.is_empty()
+            || answer.eq_ignore_ascii_case("y")
+            || answer.eq_ignore_ascii_case("yes"))
+        {
+            eprintln!("Download declined.");
+            std::process::exit(1);
+        }
+    }
+    for file in to_download {
+        let dest_dir = dir.join(file.path.rsplit_once('/').map_or("", |(d, _)| d));
+        std::fs::create_dir_all(&dest_dir).unwrap_or_else(|e| {
+            eprintln!("Error: failed to create {}: {e}", dest_dir.display());
+            std::process::exit(1);
+        });
+        let path = dir.join(&file.path);
+        if path.exists() {
+            // A file of another size is not the pinned one.
+            std::fs::remove_file(&path).unwrap_or_else(|e| {
+                eprintln!("Error: failed to remove {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        }
+        download::download_pinned(&checkpoint.repo, &checkpoint.revision, file, &dest_dir)
+            .unwrap_or_else(|e| {
+                eprintln!("Download failed: {e}");
+                std::process::exit(1);
+            });
+    }
+    if !converted {
+        eprintln!(
+            "Converting to LBI: {} -> {}",
+            dir.display(),
+            lbi_dir.display()
+        );
+        let reports =
+            lumen_image::convert::convert_checkpoint(&dir, &lbi_dir).unwrap_or_else(|e| {
+                eprintln!("Conversion failed: {e}");
+                std::process::exit(1);
+            });
+        for report in &reports {
+            eprintln!(
+                "  {:14} {:4} tensors  {}",
+                report.component,
+                report.tensor_count,
+                cache::format_size(report.total_bytes)
+            );
+        }
+        let mut removed = 0u64;
+        for component in lumen_image::convert::COMPONENTS {
+            removed += checkpoint
+                .files
+                .iter()
+                .filter(|f| f.path.starts_with(&format!("{component}/")))
+                .map(|f| f.size)
+                .sum::<u64>();
+            let comp_dir = dir.join(component);
+            std::fs::remove_dir_all(&comp_dir).unwrap_or_else(|e| {
+                eprintln!("Error: failed to remove {}: {e}", comp_dir.display());
+                std::process::exit(1);
+            });
+        }
+        eprintln!(
+            "Removed the downloaded checkpoint files ({}); the converted files and processor/ are what the server reads.",
+            cache::format_size(removed)
+        );
+    }
+    println!("\nReady: {}", lbi_dir.display());
+    println!("Serve with: lumen-server {name}");
+}
+
+#[cfg(not(feature = "download"))]
+fn pull_image(
+    _entry: &registry::ModelEntry,
+    _checkpoint: &registry::Checkpoint,
+    _name: &str,
+    _skip_confirm: bool,
+) {
+    eprintln!("Error: download support is not compiled in.");
+    eprintln!("Rebuild with: cargo build --release --features download");
+    std::process::exit(1);
+}
+
 /// Convert a GGUF file to LBC. Exits on failure.
 fn pull_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path) {
     use lumen_convert::convert::{convert_gguf_to_lbc, ConvertOptions};
@@ -318,22 +478,34 @@ fn pull_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path) {
 
 /// List cached models and available models from the registry.
 fn models_cmd() {
-    let cached = cache::list_cached();
+    let reg = registry::load_registry();
+    let mut cached = cache::list_cached();
+    for entry in reg.list().into_iter().filter(|e| e.checkpoint.is_some()) {
+        if cache::cached_image(&entry.key) {
+            let lbi_dir = cache::image_lbi_dir(&entry.key);
+            let size = std::fs::read_dir(&lbi_dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            cached.push((entry.key.clone(), lbi_dir, size));
+        }
+    }
     if cached.is_empty() {
         println!("No cached models.");
         println!("Download one with: lumen pull <model-name>");
         println!();
 
-        let reg = registry::load_registry();
         println!("Available models:");
         for entry in reg.list() {
-            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            quants.sort();
             println!(
                 "  {:<20} {} ({})",
                 entry.key,
                 entry.display_name,
-                quants.join(", ")
+                entry.variants()
             );
         }
         return;
@@ -345,10 +517,19 @@ fn models_cmd() {
     }
 
     // Also show available (not yet cached) models.
-    let reg = registry::load_registry();
     let cached_stems: Vec<&str> = cached.iter().map(|(name, _, _)| name.as_str()).collect();
     let mut available = Vec::new();
     for entry in reg.list() {
+        if entry.checkpoint.is_some() {
+            if !cached_stems.contains(&entry.key.as_str()) {
+                available.push((
+                    entry.key.clone(),
+                    entry.display_name.clone(),
+                    entry.variants(),
+                ));
+            }
+            continue;
+        }
         let mut quants: Vec<&String> = entry.gguf_files.keys().collect();
         quants.sort();
         for quant in quants {

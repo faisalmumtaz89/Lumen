@@ -535,8 +535,8 @@ mod inner {
         Ok(())
     }
 
-    pub(crate) fn model_url(base_url: &str, repo: &str, url_path: &str) -> String {
-        format!("{base_url}/{repo}/resolve/main/{url_path}")
+    pub(crate) fn model_url(base_url: &str, repo: &str, revision: &str, url_path: &str) -> String {
+        format!("{base_url}/{repo}/resolve/{revision}/{url_path}")
     }
 
     /// Get the file size via a HEAD request. HF answers with a 302 to its
@@ -643,12 +643,53 @@ mod inner {
         )
     }
 
+    /// Download one file of a checkpoint pinned to a commit: `file.path` at
+    /// `revision` of `repo`, stored under its basename in `dest_dir` only when
+    /// the bytes received have the size and SHA-256 pinned, so an upload that
+    /// replaced the file is refused. The caller has confirmed the download.
+    pub fn download_pinned(
+        repo: &str,
+        revision: &str,
+        file: &crate::registry::CheckpointFile,
+        dest_dir: &Path,
+    ) -> Result<PathBuf, DownloadError> {
+        download_file(
+            &BaseUrl::hugging_face(),
+            repo,
+            revision,
+            &file.path,
+            dest_dir,
+            true,
+            Some(file),
+        )
+    }
+
     pub(crate) fn download_from(
         base_url: &BaseUrl,
         repo: &str,
         filename: &str,
         dest_dir: &Path,
         skip_confirm: bool,
+    ) -> Result<PathBuf, DownloadError> {
+        download_file(
+            base_url,
+            repo,
+            "main",
+            filename,
+            dest_dir,
+            skip_confirm,
+            None,
+        )
+    }
+
+    pub(crate) fn download_file(
+        base_url: &BaseUrl,
+        repo: &str,
+        revision: &str,
+        filename: &str,
+        dest_dir: &Path,
+        skip_confirm: bool,
+        pinned: Option<&crate::registry::CheckpointFile>,
     ) -> Result<PathBuf, DownloadError> {
         // Validate (traversal-safe) and split into URL path + local basename.
         let (url_path, local_name) =
@@ -680,7 +721,7 @@ mod inner {
 
         // The URL uses the full repo path, which may include a subdirectory;
         // the local file is the flat basename.
-        let url = model_url(base_url.as_str(), repo, &url_path);
+        let url = model_url(base_url.as_str(), repo, revision, &url_path);
 
         // The route every request of this download takes; an unusable proxy
         // setting fails here, before anything is fetched.
@@ -821,6 +862,17 @@ mod inner {
         let hash = sha256_of_reader(&mut partial.file)?;
         if !partial.holds_path() {
             return Err(partial.replaced());
+        }
+        if let Some(pinned) = pinned {
+            if partial.have != pinned.size || hash != pinned.sha256 {
+                let _ = partial.forget_source();
+                let _ = std::fs::remove_file(&partial.path);
+                return Err(DownloadError::Io(format!(
+                    "{url}: received {} bytes with SHA-256 {hash}, not the pinned {} bytes with \
+                     SHA-256 {}; nothing was stored",
+                    partial.have, pinned.size, pinned.sha256
+                )));
+            }
         }
 
         // Atomic rename FIRST: .partial -> final, then the sidecar, with the
@@ -1586,11 +1638,31 @@ mod inner {
             let entry = reg.resolve("qwen3.8-27b").expect("qwen3.8-27b");
             for (key, size) in [("Q4_K_M", 17_442_399_968u64), ("Q5_K_M", 20_923_877_088u64)] {
                 let src = &entry.gguf_files[key];
-                let url = model_url("https://huggingface.co", &src.repo, src.file());
+                let url = model_url("https://huggingface.co", &src.repo, "main", src.file());
                 let got = get_remote_size(&url, &None)
                     .expect("HEAD")
                     .expect("Content-Length");
                 assert_eq!(got, size, "{key}: {url}");
+            }
+        }
+
+        #[test]
+        #[ignore = "requires network access to huggingface.co"]
+        fn image_checkpoint_files_resolve_to_their_pinned_sizes() {
+            let reg = crate::registry::load_registry();
+            let entry = reg.resolve("qwen-image").expect("qwen-image");
+            let ckpt = entry.checkpoint.as_ref().expect("checkpoint");
+            for file in &ckpt.files {
+                let url = model_url(
+                    "https://huggingface.co",
+                    &ckpt.repo,
+                    &ckpt.revision,
+                    &file.path,
+                );
+                let got = get_remote_size(&url, &None)
+                    .expect("HEAD")
+                    .expect("Content-Length");
+                assert_eq!(got, file.size, "{}: {url}", file.path);
             }
         }
     }
@@ -3776,6 +3848,81 @@ mod tests {
         dir
     }
 
+    const BODY_SHA256: &str = "ed09a051f6ed65022ae62dc8c2c657896406047015a45c02cadb9ec4548b72b7";
+
+    #[cfg(feature = "download")]
+    fn pinned(size: u64, sha256: &str) -> crate::registry::CheckpointFile {
+        crate::registry::CheckpointFile {
+            path: "sub/m.gguf".to_string(),
+            size,
+            sha256: sha256.to_string(),
+        }
+    }
+
+    /// A pinned file is asked for at its revision and published under its
+    /// basename once the bytes received have the pinned size and hash.
+    #[cfg(feature = "download")]
+    #[test]
+    fn pinned_download_publishes_the_file_at_its_revision() {
+        let (base, server) = serve_like_hf(4, "", "", "200 OK");
+        let dir = scratch_dir("pinned-ok");
+        let file = pinned(BODY.len() as u64, BODY_SHA256);
+        let path = super::download_file(
+            &base,
+            "org/repo",
+            "abc123",
+            &file.path,
+            &dir,
+            true,
+            Some(&file),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BODY);
+        assert_eq!(entries(&dir), vec!["m.gguf", "m.gguf.sha256"]);
+        let heads = server.join().unwrap();
+        assert!(
+            heads
+                .iter()
+                .any(|h| h.starts_with("get /org/repo/resolve/abc123/sub/m.gguf http/1.1")),
+            "the file must be asked for at the pinned revision, got:\n{heads:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bytes with another hash or another size are not the pinned file:
+    /// refused, with nothing left in the directory.
+    #[cfg(feature = "download")]
+    #[test]
+    fn pinned_download_refuses_other_bytes() {
+        for (tag, file) in [
+            ("pinned-hash", pinned(BODY.len() as u64, &"0".repeat(64))),
+            ("pinned-size", pinned(BODY.len() as u64 + 1, BODY_SHA256)),
+        ] {
+            let (base, _server) = serve_like_hf(4, "", "", "200 OK");
+            let dir = scratch_dir(tag);
+            let err = super::download_file(
+                &base,
+                "org/repo",
+                "abc123",
+                &file.path,
+                &dir,
+                true,
+                Some(&file),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err}").contains("not the pinned"),
+                "{tag}: got {err}"
+            );
+            assert!(
+                entries(&dir).is_empty(),
+                "{tag}: nothing may be left behind, got {:?}",
+                entries(&dir)
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     /// The real download path against the stand-in: both hops of HEAD and
     /// GET ask for stored bytes, and the published file is byte-exact.
     #[cfg(feature = "download")]
@@ -3857,6 +4004,7 @@ mod tests {
             super::model_url(
                 super::BaseUrl::hugging_face().as_str(),
                 "org/repo",
+                "main",
                 "sub/m.gguf"
             ),
             "https://huggingface.co/org/repo/resolve/main/sub/m.gguf"
