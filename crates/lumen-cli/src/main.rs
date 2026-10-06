@@ -499,13 +499,14 @@ fn remove_image_sources(dir: &std::path::Path) -> Option<u64> {
 
 /// Hold `dir`'s pull lock for the rest of the pull, waiting while another
 /// lumen process pulls the same model into it: its downloads, conversion and
-/// cleanup must not interleave with this one's. The lock file is opened
-/// without truncation and must be a plain file with a single name, so a link
-/// planted in a shared cache is refused rather than written through, and a
-/// file system without locks is refused rather than pulled into unlocked.
+/// cleanup must not interleave with this one's. The lock file is never
+/// written: it is opened without truncation and must be a regular file, so a
+/// symbolic link planted in a shared cache is refused rather than followed
+/// (a hard link is the same file and the same lock), and a file system
+/// without locks is refused rather than pulled into unlocked.
 #[cfg(feature = "download")]
 fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let path = dir.join("pull.lock");
     let file = std::fs::OpenOptions::new()
@@ -522,11 +523,8 @@ fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File,
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err(format!(
-            "{} is not a plain file with a single name; remove it",
-            path.display()
-        ));
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
     }
     // SAFETY: flock on a descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -737,7 +735,7 @@ mod pull_image_tests {
     }
 
     #[test]
-    fn a_planted_link_at_the_lock_path_is_refused_and_left_whole() {
+    fn a_symbolic_link_at_the_lock_path_is_refused_and_a_hard_link_is_the_same_lock() {
         let dir = scratch("lock-link");
         let target = dir.join("victim");
         std::fs::write(&target, b"do not truncate").unwrap();
@@ -746,10 +744,29 @@ mod pull_image_tests {
         assert!(err.contains("symbolic link"), "{err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
         std::fs::remove_file(dir.join("pull.lock")).unwrap();
+        // A hard link (a backup made with `cp -al`, say) is the same file: the
+        // lock is taken through it, nothing is written, and a pull through
+        // the other name waits on the same lock.
         std::fs::hard_link(&target, dir.join("pull.lock")).unwrap();
-        let err = lock_pull(&dir, "Test").unwrap_err();
-        assert!(err.contains("single name"), "{err}");
+        let held = lock_pull(&dir, "Test").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::hard_link(&target, other.join("pull.lock")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let lock = lock_pull(&other, "Test");
+            tx.send(()).unwrap();
+            lock
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "the other name must wait on the same lock"
+        );
+        drop(held);
+        rx.recv().unwrap();
+        assert!(waiter.join().unwrap().is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
