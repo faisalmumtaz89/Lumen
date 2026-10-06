@@ -326,14 +326,19 @@ fn pull_image(
         eprintln!("Error: failed to create {}: {e}", dir.display());
         std::process::exit(1);
     });
-    let _lock = lock_pull(&dir, &entry.display_name);
+    let _lock = lock_pull(&dir, &entry.display_name).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    // A conversion that died left its staging files; no other pull holds
+    // the lock, so they are nobody's.
+    lumen_image::convert::remove_staging(&lbi_dir).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
     if cache::cached_image(&entry.key) {
         // An earlier pull may have stopped between publishing the conversion
-        // and removing what it converted, or its staging files.
-        lumen_image::convert::remove_staging(&lbi_dir).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        });
+        // and removing what it converted.
         if let Some(removed) = remove_image_sources(&dir) {
             eprintln!(
                 "Removed the downloaded checkpoint files ({}) an earlier pull left behind.",
@@ -493,47 +498,56 @@ fn remove_image_sources(dir: &std::path::Path) -> Option<u64> {
 }
 
 /// Hold `dir`'s pull lock for the rest of the pull, waiting while another
-/// lumen process pulls the same model into it (its downloads, conversion and
-/// cleanup must not interleave with this one's). On a file system without
-/// locks the pull goes ahead and says so. Exits on any other failure.
+/// lumen process pulls the same model into it: its downloads, conversion and
+/// cleanup must not interleave with this one's. The lock file is opened
+/// without truncation and must be a plain file with a single name, so a link
+/// planted in a shared cache is refused rather than written through, and a
+/// file system without locks is refused rather than pulled into unlocked.
 #[cfg(feature = "download")]
-fn lock_pull(dir: &std::path::Path, display_name: &str) -> Option<std::fs::File> {
+fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
     let path = dir.join("pull.lock");
-    let file = std::fs::File::create(&path).unwrap_or_else(|e| {
-        eprintln!("Error: failed to create {}: {e}", path.display());
-        std::process::exit(1);
-    });
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => format!("{} is a symbolic link; remove it", path.display()),
+            _ => format!("failed to open {}: {e}", path.display()),
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(format!(
+            "{} is not a plain file with a single name; remove it",
+            path.display()
+        ));
+    }
     // SAFETY: flock on a descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Some(file);
+        return Ok(file);
     }
     let e = std::io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::EWOULDBLOCK) => {}
-        Some(libc::ENOLCK | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP) => {
-            eprintln!(
-                "Note: {} does not support file locks, so another pull of {display_name} at the \
-                 same time is not held back.",
-                dir.display()
-            );
-            return None;
-        }
-        _ => {
-            eprintln!("Error: failed to lock {}: {e}", path.display());
-            std::process::exit(1);
-        }
+    if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(format!(
+            "cannot lock {}: {e}; a pull needs a file system with file locks",
+            path.display()
+        ));
     }
     eprintln!("Waiting for another pull of {display_name} to finish...");
     // SAFETY: as above; a signal ends the wait early, so wait again.
     while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
-            eprintln!("Error: failed to lock {}: {e}", path.display());
-            std::process::exit(1);
+            return Err(format!("failed to lock {}: {e}", path.display()));
         }
     }
-    Some(file)
+    Ok(file)
 }
 
 #[cfg(not(feature = "download"))]
@@ -694,6 +708,11 @@ mod pull_image_tests {
     fn a_second_pull_waits_for_the_first() {
         let dir = scratch("lock");
         let first = lock_pull(&dir, "Test").expect("locks are supported here");
+        assert_eq!(
+            std::fs::read(dir.join("pull.lock")).unwrap(),
+            b"",
+            "the lock file is empty"
+        );
         let dir2 = dir.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let second = std::thread::spawn(move || {
@@ -713,7 +732,24 @@ mod pull_image_tests {
             got >= released,
             "the second pull got the lock before the first released it"
         );
-        assert!(second.join().unwrap().is_some());
+        assert!(second.join().unwrap().is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_planted_link_at_the_lock_path_is_refused_and_left_whole() {
+        let dir = scratch("lock-link");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"do not truncate").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("pull.lock")).unwrap();
+        let err = lock_pull(&dir, "Test").unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
+        std::fs::remove_file(dir.join("pull.lock")).unwrap();
+        std::fs::hard_link(&target, dir.join("pull.lock")).unwrap();
+        let err = lock_pull(&dir, "Test").unwrap_err();
+        assert!(err.contains("single name"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

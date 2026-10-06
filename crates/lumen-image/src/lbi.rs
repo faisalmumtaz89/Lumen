@@ -244,17 +244,22 @@ impl LbiWriter {
     pub fn create(path: &Path, mut config: serde_json::Value) -> Result<Self, LbiError> {
         config.sort_all_objects();
         let (part, tmp) = staging_paths(path);
+        // The guard exists before either file, so a create that fails after
+        // the first leaves nothing behind.
+        let staging = Staging {
+            part,
+            tmp,
+            done: false,
+        };
+        // Truncating creates: any leftover from an interrupted run is
+        // discarded rather than appended to.
+        let out = BufWriter::new(File::create(&staging.part)?);
+        let blob = BufWriter::new(File::create(&staging.tmp)?);
         Ok(Self {
-            // Truncating creates: any leftover from an interrupted run is
-            // discarded rather than appended to.
-            out: BufWriter::new(File::create(&part)?),
-            blob: BufWriter::new(File::create(&tmp)?),
+            out,
+            blob,
             path: path.to_path_buf(),
-            staging: Staging {
-                part,
-                tmp,
-                done: false,
-            },
+            staging,
             config: serde_json::to_vec(&config)?,
             entries: Vec::new(),
             names: HashMap::new(),
