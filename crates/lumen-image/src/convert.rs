@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use lumen_format::QuantScheme;
 
-use crate::lbi::{LbiError, LbiFile, LbiWriter};
+use crate::lbi::{staging_paths, LbiError, LbiFile, LbiWriter};
 use crate::safetensors::{SafetensorsError, SafetensorsFile, DTYPE_BF16, DTYPE_F16, DTYPE_F32};
 use crate::shard_index::ShardIndex;
 
@@ -154,6 +154,7 @@ pub fn convert_checkpoint(
     out_dir: &Path,
 ) -> Result<Vec<ConvertReport>, ConvertError> {
     std::fs::create_dir_all(out_dir)?;
+    remove_staging(out_dir)?;
     let mut reports = Vec::with_capacity(COMPONENTS.len());
     for component in COMPONENTS {
         let comp_dir = checkpoint_dir.join(component);
@@ -175,6 +176,22 @@ pub fn convert_checkpoint(
         reports.push(report);
     }
     Ok(reports)
+}
+
+/// Remove the staging files a conversion into `out_dir` that died left
+/// behind, for every component.
+pub fn remove_staging(out_dir: &Path) -> Result<(), ConvertError> {
+    for component in COMPONENTS {
+        let (part, tmp) = staging_paths(&out_dir.join(format!("{component}.lbi")));
+        for stale in [part, tmp] {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ConvertError::Io(e)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The component's `config.json`, which the `.lbi` carries.

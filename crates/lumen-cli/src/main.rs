@@ -301,7 +301,8 @@ fn pull_download_gguf(_repo: &str, _filename: &str, _skip_confirm: bool) -> std:
 /// in `<cache>/<key>/lbi/`. Once the conversion has been read back, the
 /// component directories are removed: only `processor/` is read at run time.
 /// A later pull downloads only what is missing, so an interrupted one is
-/// continued, and a complete one is reported as cached.
+/// continued, and a complete one is reported as cached. One pull of the
+/// model runs at a time per cache: a second waits for the first.
 #[cfg(feature = "download")]
 fn pull_image(
     entry: &registry::ModelEntry,
@@ -321,7 +322,24 @@ fn pull_image(
     }
     let dir = cache::image_checkpoint_dir(&entry.key);
     let lbi_dir = cache::image_lbi_dir(&entry.key);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        eprintln!("Error: failed to create {}: {e}", dir.display());
+        std::process::exit(1);
+    });
+    let _lock = lock_pull(&dir, &entry.display_name);
     if cache::cached_image(&entry.key) {
+        // An earlier pull may have stopped between publishing the conversion
+        // and removing what it converted, or its staging files.
+        lumen_image::convert::remove_staging(&lbi_dir).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+        if let Some(removed) = remove_image_sources(&dir) {
+            eprintln!(
+                "Removed the downloaded checkpoint files ({}) an earlier pull left behind.",
+                cache::format_size(removed)
+            );
+        }
         println!("Already cached: {}", lbi_dir.display());
         return;
     }
@@ -345,16 +363,16 @@ fn pull_image(
     let bytes: u64 = to_download.iter().map(|f| f.size).sum();
     if !to_download.is_empty() && !skip_confirm {
         let disk = if converted {
-            cache::format_size(bytes)
+            format!("{} on disk", cache::format_size(bytes))
         } else {
-            // The .lbi hold the same tensor bytes the safetensors do.
             format!(
-                "{} after conversion",
-                cache::format_size(2 * checkpoint.total_bytes())
+                "up to {} free during the conversion, {} kept",
+                cache::format_size(conversion_peak_bytes(checkpoint)),
+                cache::format_size(checkpoint.total_bytes())
             )
         };
         eprint!(
-            "Download {} from {} ({}, {} on disk)? [Y/n] ",
+            "Download {} from {} ({}; {})? [Y/n] ",
             entry.display_name,
             checkpoint.repo,
             cache::format_size(bytes),
@@ -362,13 +380,14 @@ fn pull_image(
         );
         std::io::stderr().flush().ok();
         let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            std::process::exit(1);
-        }
+        // The end of the input is no answer: a pull with no terminal and no
+        // --yes must not download.
+        let answered = matches!(std::io::stdin().read_line(&mut input), Ok(n) if n > 0);
         let answer = input.trim();
-        if !(answer.is_empty()
-            || answer.eq_ignore_ascii_case("y")
-            || answer.eq_ignore_ascii_case("yes"))
+        if !answered
+            || !(answer.is_empty()
+                || answer.eq_ignore_ascii_case("y")
+                || answer.eq_ignore_ascii_case("yes"))
         {
             eprintln!("Download declined.");
             std::process::exit(1);
@@ -413,20 +432,8 @@ fn pull_image(
                 cache::format_size(report.total_bytes)
             );
         }
-        let mut removed = 0u64;
-        for component in lumen_image::convert::COMPONENTS {
-            removed += checkpoint
-                .files
-                .iter()
-                .filter(|f| f.path.starts_with(&format!("{component}/")))
-                .map(|f| f.size)
-                .sum::<u64>();
-            let comp_dir = dir.join(component);
-            std::fs::remove_dir_all(&comp_dir).unwrap_or_else(|e| {
-                eprintln!("Error: failed to remove {}: {e}", comp_dir.display());
-                std::process::exit(1);
-            });
-        }
+    }
+    if let Some(removed) = remove_image_sources(&dir) {
         eprintln!(
             "Removed the downloaded checkpoint files ({}); the converted files and processor/ are what the server reads.",
             cache::format_size(removed)
@@ -434,6 +441,99 @@ fn pull_image(
     }
     println!("\nReady: {}", lbi_dir.display());
     println!("Serve with: lumen-server {name}");
+}
+
+/// The most disk a pull of `checkpoint` holds at once: every downloaded file
+/// stays until the last component is converted, and a component's `.lbi` is
+/// assembled from a blob file of the same size before the two are joined.
+/// The `.lbi` hold the same tensor bytes the checkpoint does.
+#[cfg(feature = "download")]
+fn conversion_peak_bytes(checkpoint: &registry::Checkpoint) -> u64 {
+    let component_bytes = |component: &str| -> u64 {
+        checkpoint
+            .files
+            .iter()
+            .filter(|f| f.path.starts_with(component) && f.path[component.len()..].starts_with('/'))
+            .map(|f| f.size)
+            .sum()
+    };
+    let mut converted = 0u64;
+    let mut peak = 0u64;
+    for component in lumen_image::convert::COMPONENTS {
+        let bytes = component_bytes(component);
+        peak = peak.max(converted + 2 * bytes);
+        converted += bytes;
+    }
+    checkpoint.total_bytes() + peak
+}
+
+/// Remove the component directories a pull downloaded into `dir`, once their
+/// conversion is published; the bytes removed, or None when there were none.
+/// Exits on a failure to remove.
+#[cfg(feature = "download")]
+fn remove_image_sources(dir: &std::path::Path) -> Option<u64> {
+    let mut removed = None;
+    for component in lumen_image::convert::COMPONENTS {
+        let comp_dir = dir.join(component);
+        let Ok(entries) = std::fs::read_dir(&comp_dir) else {
+            continue;
+        };
+        let bytes: u64 = entries
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        std::fs::remove_dir_all(&comp_dir).unwrap_or_else(|e| {
+            eprintln!("Error: failed to remove {}: {e}", comp_dir.display());
+            std::process::exit(1);
+        });
+        removed = Some(removed.unwrap_or(0) + bytes);
+    }
+    removed
+}
+
+/// Hold `dir`'s pull lock for the rest of the pull, waiting while another
+/// lumen process pulls the same model into it (its downloads, conversion and
+/// cleanup must not interleave with this one's). On a file system without
+/// locks the pull goes ahead and says so. Exits on any other failure.
+#[cfg(feature = "download")]
+fn lock_pull(dir: &std::path::Path, display_name: &str) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let path = dir.join("pull.lock");
+    let file = std::fs::File::create(&path).unwrap_or_else(|e| {
+        eprintln!("Error: failed to create {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Some(file);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => {}
+        Some(libc::ENOLCK | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP) => {
+            eprintln!(
+                "Note: {} does not support file locks, so another pull of {display_name} at the \
+                 same time is not held back.",
+                dir.display()
+            );
+            return None;
+        }
+        _ => {
+            eprintln!("Error: failed to lock {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+    eprintln!("Waiting for another pull of {display_name} to finish...");
+    // SAFETY: as above; a signal ends the wait early, so wait again.
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            eprintln!("Error: failed to lock {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+    Some(file)
 }
 
 #[cfg(not(feature = "download"))]
@@ -545,5 +645,75 @@ fn models_cmd() {
             println!("  {:<20} {} {}", key, display, quant);
         }
         println!("\nDownload with: lumen pull <model-name> [--quant Q8_0]");
+    }
+}
+
+#[cfg(all(test, feature = "download"))]
+mod pull_image_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lumen-pull-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_disk_peak_counts_every_source_plus_the_finished_and_staged_lbi() {
+        // Qwen-Image-2.1 at the pinned commit: 33,120,164,845 bytes in all;
+        // transformer 14,230,315,061, vae 1,350,991,591, text_encoder
+        // 17,534,408,800. The peak is during the text encoder's conversion:
+        // every source, the two finished .lbi, and the text encoder's blob
+        // and part files, 83,770,289,097 bytes.
+        let reg = registry::load_registry();
+        let ckpt = reg
+            .resolve("qwen-image")
+            .unwrap()
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(conversion_peak_bytes(ckpt), 83_770_289_097);
+    }
+
+    #[test]
+    fn removing_sources_keeps_the_processor_and_reports_what_went() {
+        let dir = scratch("sources");
+        std::fs::create_dir_all(dir.join("transformer")).unwrap();
+        std::fs::write(dir.join("transformer/config.json"), b"12345").unwrap();
+        std::fs::create_dir_all(dir.join("processor")).unwrap();
+        std::fs::write(dir.join("processor/vocab.json"), b"{}").unwrap();
+        assert_eq!(remove_image_sources(&dir), Some(5));
+        assert!(!dir.join("transformer").exists());
+        assert!(dir.join("processor/vocab.json").is_file());
+        assert_eq!(remove_image_sources(&dir), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_pull_waits_for_the_first() {
+        let dir = scratch("lock");
+        let first = lock_pull(&dir, "Test").expect("locks are supported here");
+        let dir2 = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let lock = lock_pull(&dir2, "Test");
+            tx.send(std::time::Instant::now()).unwrap();
+            lock
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "the second pull must not get the lock while the first holds it"
+        );
+        let released = std::time::Instant::now();
+        drop(first);
+        let got = rx.recv().unwrap();
+        assert!(
+            got >= released,
+            "the second pull got the lock before the first released it"
+        );
+        assert!(second.join().unwrap().is_some());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

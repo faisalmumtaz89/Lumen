@@ -13,11 +13,13 @@ lumen pull qwen-image
 lumen-server qwen-image
 ```
 
-`lumen pull qwen-image` downloads the checkpoint from Hugging Face (33 GB, pinned to one
+`lumen pull qwen-image` downloads the checkpoint from Hugging Face (31 GB, pinned to one
 commit; every file is checked against its pinned size and SHA-256 and refused otherwise),
 converts it into the three `.lbi` containers under `~/.cache/lumen/qwen-image-2-1/lbi/`,
-and removes the downloaded weights, keeping the tokenizer files under `processor/`. A pull
-that stops continues where it stopped on the next run; a complete one reports the cache.
+and removes the downloaded weights, keeping the tokenizer files under `processor/`. The
+conversion needs up to about 78 GB free while it runs; 31 GB stays. A pull that stops
+continues its downloads where they stopped on the next run and converts again; one pull of
+the model runs at a time per cache, and a complete one reports the cache.
 It refuses on a `lumen` built without CUDA, since the model runs on CUDA only.
 `lumen-server qwen-image` serves what the pull cached; `LUMEN_IMAGE_MODEL_ID`,
 `LUMEN_IMAGE_DEVICE` and `LUMEN_IMAGE_PIN_TEXT_ENCODER` apply to it as below, while

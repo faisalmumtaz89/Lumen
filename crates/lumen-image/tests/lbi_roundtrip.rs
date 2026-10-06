@@ -312,3 +312,31 @@ fn config_is_stored_with_sorted_keys() {
     assert_eq!(LbiFile::open(&path).unwrap().config()["alpha"]["y"], 2);
     std::fs::remove_file(&path).ok();
 }
+
+/// A writer dropped before `finish` removes its staging files; one that
+/// finished leaves only the container.
+#[test]
+fn an_unfinished_writer_leaves_no_staging_files() {
+    use lumen_image::lbi::staging_paths;
+    let path = tmp_path("unfinished");
+    let _ = std::fs::remove_file(&path);
+    let (part, tmp) = staging_paths(&path);
+    {
+        let mut w = LbiWriter::create(&path, serde_json::json!({})).unwrap();
+        w.append("t", &[1], QuantScheme::F32, &[0u8; 4]).unwrap();
+        assert!(
+            part.is_file() && tmp.is_file(),
+            "staging files exist while writing"
+        );
+    }
+    assert!(
+        !part.exists() && !tmp.exists(),
+        "dropped unfinished: staging removed"
+    );
+    assert!(!path.exists(), "dropped unfinished: no container");
+    let mut w = LbiWriter::create(&path, serde_json::json!({})).unwrap();
+    w.append("t", &[1], QuantScheme::F32, &[0u8; 4]).unwrap();
+    w.finish().unwrap();
+    assert!(path.is_file() && !part.exists() && !tmp.exists());
+    std::fs::remove_file(&path).ok();
+}

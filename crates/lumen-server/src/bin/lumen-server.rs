@@ -380,9 +380,16 @@ fn cache_dir() -> PathBuf {
     }
     // Mirror `lumen-cli/src/cache.rs::cache_dir`: on macOS the CLI uses
     // `dirs::cache_dir()` which resolves to `~/Library/Caches/lumen/`, not
-    // `~/.cache/lumen/`. The server must look in the SAME place or
-    // operators have to symlink. Implemented inline (no `dirs` dep on the
-    // server crate) by matching the platform manually.
+    // `~/.cache/lumen/`, and elsewhere to `$XDG_CACHE_HOME/lumen/` when that
+    // is set. The server must look in the SAME place or operators have to
+    // symlink. Implemented inline (no `dirs` dep on the server crate) by
+    // matching the platform manually.
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if xdg.starts_with('/') {
+            return PathBuf::from(xdg).join("lumen");
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
         #[cfg(target_os = "macos")]
         {
@@ -1552,6 +1559,31 @@ mod tests {
         assert_eq!(super::registry_key("qwen3.5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("qwen3-5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("my.model"), "my-model");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_cache_dir_honours_xdg_cache_home_like_the_cli() {
+        // Process-global variables: set, read, restore before asserting.
+        let cache = std::env::var("LUMEN_CACHE_DIR").ok();
+        let xdg = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::remove_var("LUMEN_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", "/var/tmp/lumen-xdg-test");
+        let with_xdg = super::cache_dir();
+        std::env::set_var("XDG_CACHE_HOME", "relative/is/ignored");
+        let relative = super::cache_dir();
+        match xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        if let Some(v) = cache {
+            std::env::set_var("LUMEN_CACHE_DIR", v);
+        }
+        assert_eq!(
+            with_xdg,
+            std::path::PathBuf::from("/var/tmp/lumen-xdg-test/lumen")
+        );
+        assert!(relative.ends_with(".cache/lumen"), "{}", relative.display());
     }
 
     #[test]

@@ -53,7 +53,7 @@ EXAMPLES:
     lumen pull qwen3.5-9b:q8_0            Download Qwen3.5 9B (Q8_0)
     lumen pull qwen3.5-9b --quant Q4_0    Download Qwen3.5 9B (Q4_0)
     lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation
-    lumen pull qwen-image                 Download and convert Qwen-Image-2.1 (33 GB)"
+    lumen pull qwen-image                 Download and convert Qwen-Image-2.1 (31 GB)"
     );
 }
 

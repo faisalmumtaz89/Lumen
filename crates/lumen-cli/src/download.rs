@@ -593,9 +593,14 @@ mod inner {
         std::io::stderr().flush().ok();
 
         let mut input = String::new();
-        std::io::stdin()
+        let read = std::io::stdin()
             .read_line(&mut input)
             .map_err(|e| DownloadError::Io(format!("failed to read confirmation: {e}")))?;
+        // The end of the input is no answer: a pull with no terminal and no
+        // --yes must not download.
+        if read == 0 {
+            return Ok(false);
+        }
 
         let trimmed = input.trim();
         Ok(trimmed.is_empty()
