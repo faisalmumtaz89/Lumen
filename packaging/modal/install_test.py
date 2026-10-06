@@ -6,7 +6,8 @@ container has NO baked Lumen binary — the installer must detect CUDA, download
 released Linux x86_64 binary from the GitHub release (alias-first, API-tag
 fallback), verify its SHA-256, install it, pull a model, and run it on the GPU.
 It also exercises:
-  - the true NO-CONTROLLING-TERMINAL headless path (no --yes, no /dev/tty),
+  - the default path with NO CONTROLLING TERMINAL and no arguments: binaries only,
+    nothing asked, no model downloaded,
   - a Mixture-of-Experts pull + ``lumen-server`` boot (the model whose alias must
     round-trip through pull AND lumen-server — guards the canonical-alias fix),
   - and a GPU-less function that asserts the installer REFUSES on a no-NVIDIA box.
@@ -118,17 +119,23 @@ def install_e2e(ref: str):
         step("9B coherence (Paris)", (e is None) and ("paris" in ans.lower()), (ans or e or "")[:80])
     srv.kill()
 
-    # ── 3. headless path (M3): force NO controlling terminal via setsid -w. ──
+    # ── 3. default path, no arguments, NO controlling terminal (setsid -w). ──
     # The installer runs under `set -e`, so rc==0 is reached ONLY if it completed
-    # every step (detect, download, SHA, install, default-select, pull, print)
-    # with no error and — critically — no hang (a blocked read would never return).
-    # That rc==0 IS the never-hang-headless guarantee. We print the full output so
-    # the default-select path is auditable in the run log.
+    # every step (detect, download, SHA, install, print) with no error and no
+    # hang (a blocked read would never return). With no --model it asks nothing
+    # and downloads no model: the cache is left exactly as step 1 left it, and
+    # the closing lines name the commands that download on first use.
+    cache_before = sorted(os.listdir(CACHE))
     r3 = _sh(f"setsid -w bash -c 'curl -fsSL {url} | bash' < /dev/null", env=base_env)
     log3 = r3.stdout + r3.stderr
-    print("=== headless (setsid, no controlling tty) installer output ===", flush=True)
+    print("=== default path (setsid, no controlling tty, no arguments) installer output ===", flush=True)
     print(log3[-2500:], flush=True)
-    step("headless no-tty (setsid): installer completes cleanly, no hang", r3.returncode == 0, f"rc={r3.returncode}")
+    step("default path: installer completes cleanly, no hang", r3.returncode == 0, f"rc={r3.returncode}")
+    step("default path: no model downloaded",
+         "preparing" not in log3 and sorted(os.listdir(CACHE)) == cache_before,
+         f"cache entries {len(cache_before)} -> {len(os.listdir(CACHE))}")
+    step("default path: closing lines name the first-use commands",
+         "lumen run " in log3 and "downloaded on first use" in log3)
 
     # ── 4. MoE pull + serve (B1 canonical-alias guard) ──────────────────────
     rp = _sh("/usr/local/bin/lumen pull qwen3.5-moe-35b-a3b:q4_0 --yes", env=base_env)

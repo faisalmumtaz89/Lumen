@@ -8,17 +8,19 @@
 # CUDA), downloads the matching prebuilt binaries from the latest GitHub release,
 # checks their SHA-256 (integrity of the GitHub-hosted asset; authenticity comes
 # from HTTPS to github.com), installs `lumen` + `lumen-server` (and `lbi-convert`,
-# the image-checkpoint converter, when the release ships it), lets you pick a
-# model + quant, prepares it, and prints the exact command to start. No Rust
-# toolchain, no CUDA SDK.
+# the image-checkpoint converter, when the release ships it), and prints the
+# commands to start. It asks nothing and downloads no model: `lumen run` and
+# `lumen image` download theirs on first use. `--model` downloads one now. No
+# Rust toolchain, no CUDA SDK.
 #
 # Trust note: this pipes a script from the internet into your shell. To inspect
 # first:  curl -fsSL <url> -o install.sh && less install.sh && bash install.sh
 #
-# Non-interactive / overrides (flags after `bash -s --`, or env):
-#   --model <alias>   LUMEN_MODEL   (qwen3.5-9b | qwen3.5-moe | qwen3.8-27b; accepts name:quant)
+# Options (flags after `bash -s --`, or env):
+#   --model <alias>   LUMEN_MODEL   also download a model now (qwen3.5-9b | qwen3.5-moe | qwen3.8-27b,
+#                                   accepts name:quant; or qwen-image, NVIDIA only)
 #   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16, or q4_k_m | q5_k_m for qwen3.8-27b; default q8_0)
-#   --yes, -y                        non-interactive (accept defaults, no prompts)
+#   --yes, -y                        accepted for scripts; the installer asks nothing
 #   --prefix <dir>    LUMEN_PREFIX  (install dir; default = auto-selected, see below)
 #   LUMEN_TAG         pin a release tag (e.g. v0.1.0, or a v..-rc.N prerelease); default = latest
 #   LUMEN_CACHE_DIR   model cache location (passed through to lumen)
@@ -49,15 +51,14 @@ MOE_CANONICAL="qwen3.5-moe-35b-a3b"   # the alias that round-trips through pull,
 
 MODEL="${LUMEN_MODEL:-}"
 QUANT="${LUMEN_QUANT:-}"
-ASSUME_YES=0
 
 # ── Presentation ──────────────────────────────────────────────────────────────
 # Color ONLY when stdout is a real TTY and NO_COLOR is unset (CI/pipe-safe).
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
 else
-  C_RESET=''; C_BOLD=''; C_DIM=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_GREEN=''; C_YELLOW=''
 fi
 OK_MARK="${C_GREEN}✓${C_RESET}"
 
@@ -71,15 +72,17 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
   cat <<'EOF'
-Lumen installer — detects your platform, installs the prebuilt binaries, sets up a model.
+Lumen installer — detects your platform and installs the prebuilt binaries. Models
+download on first use (`lumen run`, `lumen image`); --model downloads one now.
 
   curl -fsSL https://servelumen.com/install.sh | bash
 
 Options (after `bash -s --`) / env:
   --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.8-27b  (accepts name:quant)
+                                  qwen-image: the text-to-image model, NVIDIA only
   --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16 | q4_k_m | q5_k_m   (default q8_0)
                                   q4_k_m / q5_k_m: qwen3.8-27b only, served as stored on CUDA
-  --yes, -y                       non-interactive (defaults, no prompts)
+  --yes, -y                       accepted for scripts; the installer asks nothing
   --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
   LUMEN_TAG=<tag>   install a specific release (e.g. v0.1.0, or a v..-rc.N prerelease)
 EOF
@@ -94,15 +97,21 @@ while [ $# -gt 0 ]; do
     --quant=*) QUANT="${1#*=}"; shift ;;
     --prefix)  [ $# -ge 2 ] || die "--prefix needs a value"; PREFIX="$2"; shift 2 ;;
     --prefix=*) PREFIX="${1#*=}"; shift ;;
-    --yes|-y)  ASSUME_YES=1; shift ;;
+    --yes|-y)  shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
 done
 
-# A name:quant in --model/LUMEN_MODEL sets the quant and skips the quant menu.
+# A name:quant in --model/LUMEN_MODEL sets the quant.
 case "$MODEL" in
   *:*) [ -n "$QUANT" ] || QUANT="${MODEL##*:}"; MODEL="${MODEL%%:*}" ;;
+esac
+IMAGE_MODEL=0
+case "$MODEL" in
+  qwen-image|qwen-image-2-1)
+    IMAGE_MODEL=1
+    [ -z "$QUANT" ] || die "qwen-image comes in one form and takes no quantization (got '$QUANT')." ;;
 esac
 
 # RELEASE_BASE must be an https GitHub origin (the .sha256 shares the asset's
@@ -183,6 +192,9 @@ case "$OS" in
   *) die "no prebuilt binary for $OS/$ARCH; build from source: https://github.com/$REPO" ;;
 esac
 field "Platform" "$PLAT_LABEL"
+if [ "$IMAGE_MODEL" = "1" ] && [ "$BACKEND" != "cuda" ]; then
+  die "qwen-image (Qwen-Image-2.1) runs on NVIDIA CUDA only; nothing was installed."
+fi
 
 for tool in curl tar; do have "$tool" || die "'$tool' is required but not found"; done
 sha256_of() { if have shasum; then shasum -a 256 "$1" | awk '{print $1}'; else sha256sum "$1" | awk '{print $1}'; fi; }
@@ -415,79 +427,63 @@ if on_path "$DEST" && [ -n "$r" ] && [ "$r" != "$DEST/lumen" ]; then
   err "  fix it:  rm \"$r\"   (or put $DEST earlier on PATH)"
 fi
 
-# ── Step 4 · pick a model + quant (interactive via /dev/tty; safe under pipe) ──
-INTERACTIVE=0
-if [ -z "$MODEL" ] && [ "$ASSUME_YES" != "1" ] && [ -r /dev/tty ]; then INTERACTIVE=1; fi
-if [ "$INTERACTIVE" = "1" ]; then
+# ── Step 4 · download the model asked for with --model, if any ────────────────
+# The installer asks nothing: without --model, models download on first use.
+if [ -n "$MODEL" ]; then
+  [ "$IMAGE_MODEL" = "1" ] || QUANT="${QUANT:-$DEFAULT_QUANT}"
+  # Canonicalize any MoE alias so pull, run AND lumen-server all agree on the cache stem.
+  case "$MODEL" in
+    qwen3.5-moe|qwen3-5-moe|qwen3.5-moe-35b-a3b|qwen3-5-moe-35b-a3b) MODEL="$MOE_CANONICAL" ;;
+  esac
+  SPEC="$MODEL${QUANT:+:$QUANT}"
+  cache="${LUMEN_CACHE_DIR:-}"
+  if [ -z "$cache" ]; then
+    case "$BACKEND" in metal) cache="$HOME/Library/Caches/lumen" ;; *) cache="${XDG_CACHE_HOME:-$HOME/.cache}/lumen" ;; esac
+  fi
+  mkdir -p "$cache" 2>/dev/null || true
+  # Rough peak-disk guard for a text model (GGUF + converted LBC coexist during
+  # convert; not a catalog). `lumen pull qwen-image` checks its own disk need.
+  if [ "$IMAGE_MODEL" != "1" ]; then
+    case "$QUANT" in
+      bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
+      q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
+      q4_k_m|q5_k_m) case "$MODEL" in *27b*) need=55 ;; *) need=16 ;; esac ;;
+      *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
+    esac
+    free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
+    if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
+      info "WARNING: ~${free_gb} GB free at $cache; $SPEC needs roughly ${need} GB peak while it is prepared."
+    fi
+  fi
   say ""
-  say "  ${C_BOLD}Choose a model${C_RESET}"
-  say "    1  Qwen3.5 9B    ${C_DIM}dense · ~10 GB @ Q8${C_RESET}        ${C_GREEN}(recommended)${C_RESET}"
-  say "    2  Qwen3.5 MoE   ${C_DIM}35B-A3B · mixture-of-experts${C_RESET}"
-  say "    3  Qwen3.8 27B   ${C_DIM}dense · largest${C_RESET}"
-  printf '  %s›%s ' "$C_CYAN" "$C_RESET"
-  read -r pick < /dev/tty || pick=""
-  case "$pick" in 2) MODEL="$MOE_CANONICAL" ;; 3) MODEL="qwen3.8-27b" ;; *) MODEL="$DEFAULT_MODEL" ;; esac
-  if [ -z "$QUANT" ]; then   # honor an explicit --quant; only prompt if unset
-    say ""
-    say "  ${C_BOLD}Choose a quant${C_RESET}"
-    say "    1  Q8    ${C_DIM}best quality/size${C_RESET}                  ${C_GREEN}(recommended)${C_RESET}"
-    say "    2  Q4    ${C_DIM}smaller · faster${C_RESET}"
-    say "    3  BF16  ${C_DIM}full precision · large${C_RESET}"
-    printf '  %s›%s ' "$C_CYAN" "$C_RESET"
-    read -r qpick < /dev/tty || qpick=""
-    case "$qpick" in 2) QUANT="q4_0" ;; 3) QUANT="bf16" ;; *) QUANT="$DEFAULT_QUANT" ;; esac
-  fi
-elif [ -z "$MODEL" ]; then
-  MODEL="$DEFAULT_MODEL"; QUANT="${QUANT:-$DEFAULT_QUANT}"
-  [ "$ASSUME_YES" = "1" ] || info "no terminal: using default $MODEL:$QUANT (pass --model/--quant to choose)"
+  info "preparing $SPEC (downloaded and converted once, then reused)"
+  # Strip the installer's own LUMEN_* input vars (model/quant/prefix/tag/release-base/
+  # insecure flags) from the child env — they configure the installer, not lumen, so
+  # lumen's env-var typo validator would otherwise warn about each one. LUMEN_CACHE_DIR
+  # IS a real lumen var and is passed through explicitly.
+  env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_BASE \
+      -u LUMEN_ALLOW_INSECURE_BASE -u LUMEN_INSECURE_SKIP_CHECKSUM \
+      LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$SPEC" --yes >/dev/null \
+    || die "model prepare failed for $SPEC. The binaries are installed at $DEST — re-run this installer, or run: $DEST/lumen pull $SPEC --yes"
+  say ""
+  say "  $OK_MARK  ${C_BOLD}$SPEC${C_RESET} ready in $cache"
+fi
+
+# ── Step 5 · print the commands to start ──────────────────────────────────────
+say ""
+if [ "$IMAGE_MODEL" = "1" ]; then
+  say "  ${C_BOLD}Picture${C_RESET}  lumen image \"A red apple on a wooden table\""
+  say "  ${C_BOLD}Serve${C_RESET}    lumen-server qwen-image          ${C_DIM}(OpenAI images API · :8000)${C_RESET}"
+elif [ -n "$MODEL" ]; then
+  say "  ${C_BOLD}Chat${C_RESET}     lumen run $SPEC \"Write a haiku about light\""
+  say "  ${C_BOLD}Serve${C_RESET}    lumen-server $SPEC          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"
 else
-  QUANT="${QUANT:-$DEFAULT_QUANT}"
-fi
-# Canonicalize any MoE alias so pull, run AND lumen-server all agree on the cache stem.
-case "$MODEL" in
-  qwen3.5-moe|qwen3-5-moe|qwen3.5-moe-35b-a3b|qwen3-5-moe-35b-a3b) MODEL="$MOE_CANONICAL" ;;
-esac
-
-# ── Step 5 · prepare the model (installer owns consent -> pull --yes) ─────────
-cache="${LUMEN_CACHE_DIR:-}"
-if [ -z "$cache" ]; then
-  case "$BACKEND" in metal) cache="$HOME/Library/Caches/lumen" ;; *) cache="${XDG_CACHE_HOME:-$HOME/.cache}/lumen" ;; esac
-fi
-mkdir -p "$cache" 2>/dev/null || true
-# Rough peak-disk guard (GGUF + converted LBC coexist during convert; not a catalog).
-need=12
-case "$QUANT" in
-  bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
-  q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
-  q4_k_m|q5_k_m) case "$MODEL" in *27b*) need=55 ;; *) need=16 ;; esac ;;
-  *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
-esac
-free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
-if [ -n "${free_gb:-}" ] && [ "$free_gb" -lt "$need" ]; then
-  info "WARNING: ~${free_gb} GB free at $cache; $MODEL:$QUANT needs roughly ${need} GB peak (source GGUF + converted LBC coexist)."
-  if [ "$INTERACTIVE" = "1" ]; then
-    printf '  Continue anyway? [y/N] '
-    read -r go < /dev/tty || go=""
-    case "$go" in y|Y|yes) ;; *) die "aborted (low disk)." ;; esac
+  say "  ${C_BOLD}Chat${C_RESET}     lumen run $DEFAULT_MODEL:$DEFAULT_QUANT \"Write a haiku about light\""
+  if [ "$BACKEND" = "cuda" ]; then
+    say "  ${C_BOLD}Picture${C_RESET}  lumen image \"A red apple on a wooden table\""
   fi
+  say "  ${C_BOLD}Models${C_RESET}   lumen models          ${C_DIM}(downloaded on first use)${C_RESET}"
 fi
-say ""
-info "preparing $MODEL:$QUANT (downloaded and converted once, then reused)"
-# Strip the installer's own LUMEN_* input vars (model/quant/prefix/tag/release-base/
-# insecure flags) from the child env — they configure the installer, not lumen, so
-# lumen's env-var typo validator would otherwise warn about each one. LUMEN_CACHE_DIR
-# IS a real lumen var and is passed through explicitly.
-env -u LUMEN_MODEL -u LUMEN_QUANT -u LUMEN_PREFIX -u LUMEN_TAG -u LUMEN_RELEASE_BASE \
-    -u LUMEN_ALLOW_INSECURE_BASE -u LUMEN_INSECURE_SKIP_CHECKSUM \
-    LUMEN_CACHE_DIR="$cache" "$LUMEN" pull "$MODEL:$QUANT" --yes >/dev/null \
-  || die "model prepare failed for $MODEL:$QUANT. The binaries are installed at $DEST — re-run this installer, or run: $DEST/lumen pull $MODEL:$QUANT --yes"
-
-# ── Step 6 · print the exact next steps (positional model:quant forms) ────────
-say ""
-say "  $OK_MARK  ${C_BOLD}$MODEL:$QUANT${C_RESET} ready in $cache"
-say ""
-say "  ${C_BOLD}Chat${C_RESET}     lumen run $MODEL:$QUANT \"Write a haiku about light\""
-say "  ${C_BOLD}Serve${C_RESET}    lumen-server $MODEL:$QUANT          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"
 say ""
 # PATH reminder only if $DEST isn't already on PATH (e.g. fresh ~/.local/bin).
 if ! on_path "$DEST"; then
