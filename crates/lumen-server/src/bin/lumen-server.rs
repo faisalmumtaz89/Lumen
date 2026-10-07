@@ -117,9 +117,10 @@ MODEL (positional or --model):
                            `--model qwen3.5-9b --quant q4_0`. A bare name uses
                            the model's default quant (`lumen models` marks it).
     --model <ID|PATH>      Registry name (e.g. qwen3.5-9b, qwen3.5-moe-35b-a3b)
-                           OR direct path to a .lbc file. Registry-name
-                           resolution requires the model to be cached (run
-                           `lumen pull <name>` first).
+                           OR direct path to a .lbc file. A registry model not
+                           downloaded yet is fetched at start with the `lumen`
+                           beside lumen-server (`lumen pull <name> --yes`); the
+                           port opens once it is loaded. A path is never fetched.
 
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
@@ -363,45 +364,19 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Model resolution: registry name -> ~/.cache/lumen/<key>-<QUANT>.lbc, or
-// direct file path. Mirrors `lumen-cli/src/cache.rs::lbc_path`. We
-// deliberately do NOT auto-download here — the production server should not
-// kick off a ~10 GB HuggingFace fetch on its first request. Operators run
-// `lumen pull <model>:<quant>` once at provisioning time.
+// Model resolution: registry name -> <cache>/<key>-<QUANT>.lbc in the cache
+// `lumen` uses (`lumen_cli::cache`), or direct file path. A registry
+// model not downloaded yet is fetched at start, before the port opens, with
+// the `lumen` installed beside this server; a direct file path never is.
 // ---------------------------------------------------------------------------
 
-fn cache_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("LUMEN_CACHE_DIR") {
-        if !val.is_empty() {
-            return PathBuf::from(val);
-        }
-    }
-    // Mirror `lumen-cli/src/cache.rs::cache_dir`: on macOS the CLI uses
-    // `dirs::cache_dir()` which resolves to `~/Library/Caches/lumen/`, not
-    // `~/.cache/lumen/`, and elsewhere to `$XDG_CACHE_HOME/lumen/` when that
-    // is set to an absolute path. The server must look in the SAME place or
-    // operators have to symlink. Implemented inline (no `dirs` dep on the
-    // server crate) by matching the platform manually.
-    #[cfg(not(target_os = "macos"))]
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if xdg.is_absolute() {
-            return xdg.join("lumen");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        #[cfg(target_os = "macos")]
-        {
-            let macos = PathBuf::from(&home)
-                .join("Library")
-                .join("Caches")
-                .join("lumen");
-            if macos.is_dir() {
-                return macos;
-            }
-        }
-        return PathBuf::from(home).join(".cache").join("lumen");
-    }
-    PathBuf::from(".cache").join("lumen")
+/// Where a `--model` value's `.lbc` is.
+#[derive(Debug, PartialEq)]
+enum ModelLocation {
+    /// The file to load.
+    Cached(PathBuf),
+    /// A registry model not downloaded yet; `lumen pull` takes this spec.
+    Missing(String),
 }
 
 /// Resolve a `--model` value to a concrete `.lbc` path.
@@ -409,15 +384,16 @@ fn cache_dir() -> PathBuf {
 /// File-path heuristic matches `lumen-cli/src/run.rs::resolve_model_path`:
 /// the value is treated as a path if it contains `/`, `\`, or ends with
 /// `.lbc`/`.gguf`. Otherwise it is taken as a registry name or alias and a
-/// cached LBC is looked up by `~/.cache/lumen/<key>-<QUANT>.lbc`, with the
-/// key [`registry_key`] gives.
-fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, String> {
+/// cached LBC is looked up by `<cache>/<key>-<QUANT>.lbc`, with the
+/// key [`registry_key`] gives; a registry model in a quant the registry has
+/// is [`ModelLocation::Missing`] until it is downloaded.
+fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<ModelLocation, String> {
     if looks_like_path(model) {
         let path = PathBuf::from(model);
         if !path.exists() {
             return Err(format!("model file not found: {model}"));
         }
-        return Ok(path);
+        return Ok(ModelLocation::Cached(path));
     }
 
     // Registry-style name. Strip any `:quant` tag the user might have passed
@@ -446,44 +422,91 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, S
     //      K-quant FFN experts must be upcast to Q8_0 for Metal (the
     //      generic LBC otherwise emits gibberish on the Metal backend).
     //   2. Fall back to `<key>-<QUANT>.lbc`.
-    let cache = cache_dir();
+    let cache = lumen_cli::cache::cache_dir();
     #[cfg(target_os = "macos")]
     {
         let metal_path = cache.join(format!("{key}-{quant}-metal.lbc"));
         if metal_path.is_file() {
-            return Ok(metal_path);
+            return Ok(ModelLocation::Cached(metal_path));
         }
     }
     let path = cache.join(format!("{key}-{quant}.lbc"));
-    if !path.is_file() {
-        let bare = quant_arg.is_none() && tag_quant.is_none();
-        let pull = if bare {
-            format!("lumen pull {name}")
-        } else {
-            format!("lumen pull {name}:{}", quant.to_lowercase())
-        };
-        let mut others: Vec<String> = entry
-            .map(|e| {
-                e.gguf_files
-                    .keys()
-                    .filter(|q| *q != &quant && cache.join(format!("{key}-{q}.lbc")).is_file())
-                    .map(|q| format!("`lumen-server {name}:{}`", q.to_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        others.sort();
-        let cached = if others.is_empty() {
-            String::new()
-        } else {
-            format!("; already downloaded: {}", others.join(", "))
-        };
-        return Err(format!(
-            "model not cached: {}\n\
-             Run `{pull}` first, or pass --model with a direct .lbc path{cached}.",
-            path.display(),
-        ));
+    if path.is_file() {
+        return Ok(ModelLocation::Cached(path));
     }
-    Ok(path)
+    let spec = if quant_arg.is_none() && tag_quant.is_none() {
+        name.to_owned()
+    } else {
+        format!("{name}:{}", quant.to_lowercase())
+    };
+    if entry.is_some_and(|e| e.gguf_files.contains_key(&quant)) {
+        return Ok(ModelLocation::Missing(spec));
+    }
+    Err(format!(
+        "model not cached: {}\n\
+         Run `lumen pull {spec}` first, or pass --model with a direct .lbc path.",
+        path.display(),
+    ))
+}
+
+/// Download `spec` with the `lumen` installed beside this server, as
+/// `lumen pull <spec> --yes`, checking CUDA device `cuda_device` when given;
+/// its output goes where this server's does. The server's own signals are
+/// left as they are. On Linux the download dies with the server, however it
+/// stops; elsewhere a Ctrl-C or a service manager stops the process group, so
+/// both. The next start resumes a stopped download.
+async fn fetch(spec: &str, cuda_device: Option<usize>) -> Result<(), String> {
+    let lumen = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("lumen")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "{spec} is not downloaded, and there is no `lumen` beside this lumen-server to \
+                 download it with; install lumen with lumen-server, or run `lumen pull {spec}` \
+                 first"
+            )
+        })?;
+    eprintln!("[lumen-server] {spec} is not downloaded; fetching it with `lumen pull`");
+    let mut command = tokio::process::Command::new(&lumen);
+    command
+        .args(["pull", spec, "--yes"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(device) = cuda_device.filter(|d| *d != 0) {
+        command.args(["--cuda-device", &device.to_string()]);
+    }
+    // The kernel kills the download when the thread that forked it ends.
+    // `main` drives `run`, and so this, with `block_on` on the main thread,
+    // which lives as long as the process; this must not be moved onto a
+    // spawned task or a blocking-pool thread. A server that died between the
+    // fork and the prctl is caught by comparing the parent's pid.
+    #[cfg(target_os = "linux")]
+    {
+        let server = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
+        // SAFETY: only async-signal-safe calls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != server {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    let status = command
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", lumen.display()))?
+        .wait()
+        .await
+        .map_err(|e| format!("lumen pull {spec}: {e}"))?;
+    if !status.success() {
+        return Err(format!("could not download {spec}"));
+    }
+    Ok(())
 }
 
 /// Whether a model argument names a file rather than a registry entry: it
@@ -890,15 +913,11 @@ async fn run(args: Args) -> Result<(), String> {
                 args.model
             ));
         }
-        let checkpoint_dir = cache_dir().join(key);
-        let lbi_dir = checkpoint_dir.join("lbi");
-        if !lbi_dir.is_dir() {
-            return Err(format!(
-                "model not cached: {}\nRun `lumen pull {}` first.",
-                lbi_dir.display(),
-                args.model.trim_end_matches(':')
-            ));
+        if !lumen_cli::cache::cached_image(key) {
+            fetch(args.model.trim_end_matches(':'), None).await?;
         }
+        let checkpoint_dir = lumen_cli::cache::image_checkpoint_dir(key);
+        let lbi_dir = lumen_cli::cache::image_lbi_dir(key);
         let config = image_config(lbi_dir, checkpoint_dir, image_settings)?;
         let state = build_image_state(config)?;
         let app = build_router_with_images(state, args.origins.clone());
@@ -920,7 +939,20 @@ async fn run(args: Args) -> Result<(), String> {
         return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
     }
 
-    let lbc_path = resolve_model_path(&args.model, args.quant.as_deref())?;
+    let lbc_path = match resolve_model_path(&args.model, args.quant.as_deref())? {
+        ModelLocation::Cached(path) => path,
+        ModelLocation::Missing(spec) => {
+            fetch(&spec, Some(args.backend_device)).await?;
+            match resolve_model_path(&args.model, args.quant.as_deref())? {
+                ModelLocation::Cached(path) => path,
+                ModelLocation::Missing(_) => {
+                    return Err(format!(
+                        "`lumen pull {spec}` finished, but {spec} is not cached"
+                    ))
+                }
+            }
+        }
+    };
     eprintln!("[lumen-server] model: {}", lbc_path.display());
 
     // Open weights + extract tokenizer from the LBC's embedded tokenizer
@@ -1589,44 +1621,9 @@ mod tests {
         assert_eq!(super::registry_key("my.model"), "my-model");
     }
 
-    /// Held by every test that sets the cache variables, which are
-    /// process-global while the tests run in parallel.
-    static CACHE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn the_cache_dir_honours_xdg_cache_home_like_the_cli() {
-        use std::os::unix::ffi::OsStrExt;
-        // Process-global variables: set, read, restore before asserting.
-        let _env = CACHE_ENV.lock().unwrap_or_else(|p| p.into_inner());
-        let cache = std::env::var("LUMEN_CACHE_DIR").ok();
-        let xdg = std::env::var("XDG_CACHE_HOME").ok();
-        std::env::remove_var("LUMEN_CACHE_DIR");
-        std::env::set_var("XDG_CACHE_HOME", "/var/tmp/lumen-xdg-test");
-        let with_xdg = super::cache_dir();
-        std::env::set_var("XDG_CACHE_HOME", "relative/is/ignored");
-        let relative = super::cache_dir();
-        let bytes = std::ffi::OsStr::from_bytes(b"/var/tmp/lumen-\xff");
-        std::env::set_var("XDG_CACHE_HOME", bytes);
-        let not_utf8 = super::cache_dir();
-        match xdg {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
-        if let Some(v) = cache {
-            std::env::set_var("LUMEN_CACHE_DIR", v);
-        }
-        assert_eq!(
-            with_xdg,
-            std::path::PathBuf::from("/var/tmp/lumen-xdg-test/lumen")
-        );
-        assert!(relative.ends_with(".cache/lumen"), "{}", relative.display());
-        assert_eq!(not_utf8, std::path::Path::new(bytes).join("lumen"));
-    }
-
-    #[test]
-    fn a_bare_name_means_the_default_quant_and_a_missing_one_names_both_remedies() {
-        let _env = CACHE_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn a_registry_model_not_downloaded_is_fetched_and_anything_else_is_refused() {
+        use super::ModelLocation::{Cached, Missing};
         let dir = std::env::temp_dir().join(format!("lumen-server-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1637,48 +1634,48 @@ mod tests {
         let other = super::resolve_model_path("qwen3.8-27b", None);
         let explicit = super::resolve_model_path("qwen3.8-27b:q8_0", None);
         let explicit_missing = super::resolve_model_path("qwen3.8-27b:q5_k_m", None);
+        let flag_over_tag = super::resolve_model_path("qwen3.8-27b:q8_0", Some("q4_k_m"));
+        let not_in_registry = super::resolve_model_path("qwen3.8-27b:q9", None);
         std::fs::write(dir.join("qwen3-8-27b-Q4_0.lbc"), b"x").unwrap();
         let default = super::resolve_model_path("qwen3.8-27b", None);
         std::fs::write(dir.join("my-model-Q8_0.lbc"), b"x").unwrap();
         let unknown = super::resolve_model_path("my-model", None);
+        let unknown_missing = super::resolve_model_path("other-model", None);
         let small = super::resolve_model_path("qwen3.5-9b", None);
         match cache {
             Some(v) => std::env::set_var("LUMEN_CACHE_DIR", v),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
         std::fs::remove_dir_all(&dir).ok();
-        let nothing = nothing.unwrap_err();
-        assert!(nothing.contains("qwen3-8-27b-Q4_0.lbc"), "{nothing}");
-        assert!(
-            nothing.contains("Run `lumen pull qwen3.8-27b` first"),
-            "{nothing}"
-        );
-        assert!(!nothing.contains("already downloaded"), "{nothing}");
-        let other = other.unwrap_err();
-        assert!(
-            other.contains("Run `lumen pull qwen3.8-27b` first"),
-            "{other}"
-        );
-        assert!(
-            other.contains("already downloaded: `lumen-server qwen3.8-27b:q8_0`"),
-            "{other}"
-        );
-        assert_eq!(explicit.unwrap(), dir.join("qwen3-8-27b-Q8_0.lbc"));
-        let explicit_missing = explicit_missing.unwrap_err();
-        assert!(
-            explicit_missing.contains("Run `lumen pull qwen3.8-27b:q5_k_m` first"),
-            "{explicit_missing}"
-        );
-        assert!(!explicit_missing.contains("default"), "{explicit_missing}");
-        assert_eq!(default.unwrap(), dir.join("qwen3-8-27b-Q4_0.lbc"));
+        assert_eq!(nothing, Ok(Missing("qwen3.8-27b".into())));
         assert_eq!(
-            unknown.unwrap(),
-            dir.join("my-model-Q8_0.lbc"),
+            other,
+            Ok(Missing("qwen3.8-27b".into())),
+            "a bare name fetches its default though another quant is cached"
+        );
+        assert_eq!(explicit, Ok(Cached(dir.join("qwen3-8-27b-Q8_0.lbc"))));
+        assert_eq!(explicit_missing, Ok(Missing("qwen3.8-27b:q5_k_m".into())));
+        assert_eq!(flag_over_tag, Ok(Missing("qwen3.8-27b:q4_k_m".into())));
+        let not_in_registry = not_in_registry.unwrap_err();
+        assert!(
+            not_in_registry.contains("Run `lumen pull qwen3.8-27b:q9` first"),
+            "{not_in_registry}"
+        );
+        assert_eq!(default, Ok(Cached(dir.join("qwen3-8-27b-Q4_0.lbc"))));
+        assert_eq!(
+            unknown,
+            Ok(Cached(dir.join("my-model-Q8_0.lbc"))),
             "a name the registry does not know keeps Q8_0"
         );
+        let unknown_missing = unknown_missing.unwrap_err();
         assert!(
-            small.unwrap_err().contains("qwen3-5-9b-Q8_0.lbc"),
-            "the 9B default is Q8_0"
+            unknown_missing.contains("other-model-Q8_0.lbc"),
+            "{unknown_missing}"
+        );
+        assert_eq!(
+            small,
+            Ok(Missing("qwen3.5-9b".into())),
+            "the 9B default is Q8_0, not cached here"
         );
     }
 

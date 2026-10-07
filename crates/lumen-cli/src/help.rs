@@ -44,14 +44,16 @@ ARGUMENTS:
                           qwen-image (Qwen-Image-2.1, NVIDIA CUDA only) takes no quant: its
                           checkpoint is downloaded and converted for `lumen-server qwen-image`.
                           On a CUDA build, a text model whose download shows its weights alone
-                          are bigger than CUDA device 0's memory is refused before its first
-                          byte.
+                          are bigger than the memory of CUDA device 0 (or --cuda-device) is
+                          refused before its first byte.
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;
                           Q4_K_M, Q5_K_M for qwen3.8-27b (served as stored on CUDA; on
                           Apple Silicon they convert to an artifact larger than the
                           Q8_0 one, as before)
+    --cuda-device <N>     The CUDA device whose memory a text model's download is checked
+                          against (default 0)
     --yes, -y             Skip download confirmation prompt
     -h, --help            Print this help message
 

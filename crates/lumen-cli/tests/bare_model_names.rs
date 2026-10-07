@@ -84,3 +84,22 @@ fn lumen_models_marks_each_default_with_models_cached() {
     );
     assert_eq!(out.matches("(default)").count(), 3, "{out}");
 }
+
+#[test]
+fn a_pull_takes_the_cuda_device_its_download_is_checked_against() {
+    let (code, out) = lumen(
+        &cache("device", &[]),
+        &["pull", "qwen3.5-9b", "--cuda-device", "1"],
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("Download failed"), "the pull goes on: {out}");
+    let (code, out) = lumen(
+        &cache("device-bad", &[]),
+        &["pull", "qwen3.5-9b", "--cuda-device", "x"],
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("--cuda-device must be a non-negative integer, got: x"),
+        "{out}"
+    );
+}

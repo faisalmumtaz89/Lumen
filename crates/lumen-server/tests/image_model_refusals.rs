@@ -20,6 +20,9 @@ fn server_in(
     let out: Output = Command::new(env!("CARGO_BIN_EXE_lumen-server"))
         .args(args)
         .env("LUMEN_CACHE_DIR", cache)
+        // A model the server fetches fails at once instead of downloading.
+        .env("https_proxy", "ftp://127.0.0.1:9")
+        .env("HTTPS_PROXY", "ftp://127.0.0.1:9")
         .envs(env.iter().copied())
         .output()
         .expect("run lumen-server");
@@ -43,7 +46,7 @@ fn server(args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String) {
 
 #[cfg(feature = "image")]
 #[test]
-fn the_image_model_by_name_is_refused_when_misused_or_not_downloaded() {
+fn the_image_model_by_name_is_refused_when_misused_and_fetched_when_not_downloaded() {
     for (args, env, expected) in [
         (
             &["qwen-image:q8_0"][..],
@@ -60,20 +63,16 @@ fn the_image_model_by_name_is_refused_when_misused_or_not_downloaded() {
             &[("LUMEN_IMAGE_LBI", "/x"), ("LUMEN_IMAGE_CKPT", "/y")][..],
             "pass one or the other",
         ),
-        (
-            &["qwen-image"][..],
-            &[][..],
-            "Run `lumen pull qwen-image` first.",
-        ),
+        (&["qwen-image"][..], &[][..], "qwen-image is not downloaded"),
         (
             &["qwen-image"][..],
             &[("LUMEN_IMAGE_MODEL_ID", "x")][..],
-            "Run `lumen pull qwen-image` first.",
+            "qwen-image is not downloaded",
         ),
         (
             &["--model", "qwen-image:"][..],
             &[][..],
-            "Run `lumen pull qwen-image` first.",
+            "qwen-image is not downloaded",
         ),
         (
             &["qwen3.5-9b"][..],
@@ -112,7 +111,11 @@ fn the_image_model_by_name_is_read_from_the_directory_lumen_pull_fills() {
     let cache =
         std::env::temp_dir().join(format!("lumen-server-image-cache-{}", std::process::id()));
     let lbi = cache.join("qwen-image-2-1/lbi");
-    std::fs::create_dir_all(&lbi).unwrap();
+    for file in lumen_cli::cache::IMAGE_SERVED_FILES {
+        let path = cache.join("qwen-image-2-1").join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
     let (code, stderr) = server_in(&cache, &["qwen-image"], &[("LUMEN_IMAGE_DEVICE", "cpu")]);
     let _ = std::fs::remove_dir_all(&cache);
     assert_ne!(code, Some(0), "{stderr}");

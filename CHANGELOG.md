@@ -9,6 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **`lumen-server` downloads a model it does not have.** `lumen-server <model>` with a
+  registry model not downloaded yet fetches and converts it at start with the `lumen` installed
+  beside it (`lumen pull <model> --yes`, with every check that makes), then loads it; it used to
+  refuse and say to run `lumen pull` first. The port opens once the model is loaded. Stopping
+  the server stops the download on Linux, and with Ctrl-C or the service manager on macOS;
+  the next start continues it. An `.lbc` path is never fetched. `lumen pull --cuda-device <n>`
+  sets the GPU a text model's download is checked against, which a server on
+  `--backend-device <n>` passes on. The server looks for models in the cache `lumen` uses in
+  every case: with `HOME` unset it now finds the home folder as `lumen` does, and on macOS
+  it no longer uses `~/.cache/lumen` while `~/Library/Caches/lumen` does not exist.
 - **The installer asks nothing and downloads no model by default.** Models download on
   first use; `--model <name>` still downloads one during the install, and now accepts
   `qwen-image` (NVIDIA only). The interactive model menu is gone.
@@ -19,14 +29,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   `model:quant`. With `lumen-server` on an RTX 5090 at the default 8192-token context and
   a 7019-token prompt they peaked at 17.3, 21.5 and 23.5 GiB of device memory.
   `lumen models` marks each default. A bare `lumen-server qwen3.8-27b` or
-  `lumen-server qwen3.5-moe` deployment that has only the Q8_0 artifact cached now refuses
-  until it names `:q8_0`; the refusal names both that command and `lumen pull`. `lumen run`
+  `lumen-server qwen3.5-moe` deployment that has only the Q8_0 artifact cached now fetches
+  the default, Q4_0, at start; naming `:q8_0` keeps it on Q8_0. `lumen run`
   no longer picks a sole cached quant for a bare name; when another quant is downloaded it
   says so before downloading the default.
 - **A download whose weights the GPU surely cannot hold is refused.** On a CUDA
   build, `lumen pull` and `lumen run` refuse a text model whose weights alone are bigger than
-  the memory of the GPU it would run on (CUDA device 0 for `lumen pull`, the run's
-  `--cuda-device` for `lumen run`), judged from its download size, before the first byte. The
+  the memory of the GPU their `--cuda-device` names (device 0 by default), judged from its
+  download size, before the first byte. The
   refusal names the model's quantizations this does not rule out. `lumen run`
   skips the check when it runs on another backend (`--simd`, `--metal`, or `--async` without
   `--cuda`), and so does a machine without a CUDA device. `lumen pull qwen-image` refuses a
