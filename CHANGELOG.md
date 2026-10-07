@@ -15,8 +15,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   removes the checkpoint's other files from the cache, keeping its tokenizer files;
   `lumen-server qwen-image` then serves it with no environment variables. The model's
   directory in the cache must be the user's alone, with real directories rather than
-  symbolic links; `LUMEN_CACHE_DIR` puts the cache elsewhere. `LUMEN_IMAGE_LBI` and
+  symbolic links; `LUMEN_CACHE_DIR` puts the cache elsewhere. A download the disk has no
+  room for is refused before its first byte. `LUMEN_IMAGE_LBI` and
   `LUMEN_IMAGE_CKPT` remain for a checkpoint converted by hand.
+- **`lumen image "<prompt>"`.** One picture from the cached image model without a server,
+  written as a PNG (`-o`, `--size`, `--steps`, `--seed`; the same request gives the same
+  bytes as the server). Its first run downloads and converts the model, without asking,
+  on a CUDA device with the 21.0 GiB a generation needs; any other machine is refused
+  before the download. CUDA builds only.
 
 ### Changed
 

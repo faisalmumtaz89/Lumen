@@ -9,9 +9,19 @@ release tarball and Docker image ship a `lumen-server` built with it and the `lb
 converter.
 
 ```sh
-lumen pull qwen-image
+lumen image "A red apple on a wooden table, studio lighting"
 lumen-server qwen-image
 ```
+
+`lumen image` makes one picture without a server and writes it as a PNG, by default to
+`image-<seed>.png` in the current directory, never overwriting a file already there; `-o`
+names the file and replaces it once the picture is complete. `--size WxH` (default
+1024x1024), `--steps` (default 40) and `--seed` (default random) take the same values and
+limits as the endpoint's request below, and the same prompt, size, steps and seed give the
+same bytes as the server does. Its first run downloads and converts the model, as
+`lumen pull qwen-image` below does, without asking first. It runs on CUDA only, like the
+server, and refuses a machine without a CUDA device of at least 21.0 GiB before the
+download.
 
 `lumen pull qwen-image` downloads the checkpoint from Hugging Face (30.8 GiB, pinned to one
 commit), converts it into the three `.lbi` containers under `qwen-image-2-1/lbi/` in the
@@ -26,12 +36,13 @@ pull of a model already cached says so, also on a cache mounted read-only. The m
 directory in the cache and everything in it must be yours alone: the pull creates it so,
 and refuses anything there another user owns and a directory there its group or other users
 can write, and a symbolic link in place of one of its directories; to keep the model on
-another disk, set `LUMEN_CACHE_DIR` there. It refuses on a `lumen` built without CUDA.
-The server reports and accepts the model as `Qwen-Image-2.1`.
-`lumen-server qwen-image` serves what the pull cached; `LUMEN_IMAGE_MODEL_ID`,
-`LUMEN_IMAGE_DEVICE` and `LUMEN_IMAGE_PIN_TEXT_ENCODER` apply to it as below, while
-`LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` are for a checkpoint converted by hand and are
-refused beside the name. The rest of this page covers that by-hand path and the endpoint.
+another disk, set `LUMEN_CACHE_DIR` there. A download the cache's disk has no room for is
+refused before its first byte. It refuses on a `lumen` built without CUDA. The server
+reports and accepts the model as `Qwen-Image-2.1`. `lumen-server qwen-image` serves what
+the pull cached; `LUMEN_IMAGE_MODEL_ID`, `LUMEN_IMAGE_DEVICE` and
+`LUMEN_IMAGE_PIN_TEXT_ENCODER` apply to it as below, while `LUMEN_IMAGE_LBI` and
+`LUMEN_IMAGE_CKPT` are for a checkpoint converted by hand and are refused beside the name.
+The rest of this page covers that by-hand path and the endpoint.
 
 ## Requirements
 
@@ -40,8 +51,8 @@ refused beside the name. The rest of this page covers that by-hand path and the 
 - Device memory: the text encoder's language tower (12.9 GiB of BF16 weights), the
   transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
   generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
-  2048×2048 one (the VAE decode). The server refuses to start on a device with less than
-  21.0 GiB in total, naming both amounts. The transformer and the VAE normally stay loaded
+  2048×2048 one (the VAE decode). The server refuses to start, and `lumen image` to run, on
+  a device with less than 21.0 GiB in total, naming both amounts. The transformer and the VAE normally stay loaded
   between generations, and the server uses spare room beside them: on a 32 GiB card,
   1024×1024 generations take up to about 30 GiB. See [Device memory](#device-memory).
 

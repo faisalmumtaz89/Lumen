@@ -9,6 +9,7 @@ USAGE:
 COMMANDS:
     run                   Run inference on a model (single-process; cold-loads every invocation)
     pull                  Download and convert a model from the registry (text, or the image model)
+    image                 Make a picture with the image model (NVIDIA CUDA), no server needed
     models                List cached and available models
     convert               Convert a GGUF model (or import an HF compressed-tensors
                           INT4 or ModelOpt NVFP4/FP8 checkpoint via --from-hf)
@@ -54,6 +55,35 @@ EXAMPLES:
     lumen pull qwen3.5-9b --quant Q4_0    Download Qwen3.5 9B (Q4_0)
     lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation
     lumen pull qwen-image                 Download and convert Qwen-Image-2.1 (30.8 GiB)"
+    );
+}
+
+pub(crate) fn print_image_usage() {
+    println!(
+        "\
+USAGE:
+    lumen image [OPTIONS] [--] \"<prompt>\"
+
+Makes one picture with Qwen-Image-2.1 and writes a PNG, on an NVIDIA CUDA device with
+at least 21 GB of memory. The first run downloads and converts the model (31 GB kept;
+up to 78 GB free while converting).
+A prompt that begins with `-` goes after `--`.
+
+OPTIONS:
+    -o, --output <file>   Where to write the PNG; an existing file is replaced once the
+                          picture is complete (default: image-<seed>.png in the current
+                          directory, never overwriting a file already there)
+    --size <WxH>          Image size, each side 32 to 4096 pixels, rounded down to a
+                          multiple of 32 (default: 1024x1024)
+    --steps <n>           Denoising steps, 1 to 200 (default: 40)
+    --seed <n>            Seed; the same prompt, size, steps and seed give the same
+                          picture (default: random)
+    -h, --help            Print this help message
+
+EXAMPLES:
+    lumen image \"A red apple on a wooden table, studio lighting\"
+    lumen image \"A misty alpine lake at dawn\" --size 1536x1024 -o lake.png
+    lumen image \"A red apple\" --seed 7 --steps 40 -o apple.png"
     );
 }
 

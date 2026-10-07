@@ -14,6 +14,7 @@ use crate::error::ServerError;
 use crate::sse::ReplyTools;
 
 pub mod anthropic;
+#[cfg(feature = "image")]
 pub mod image;
 pub mod openai;
 

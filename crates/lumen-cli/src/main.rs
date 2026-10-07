@@ -17,6 +17,7 @@ mod convert;
 #[allow(unused)]
 mod download;
 mod help;
+mod image;
 pub mod registry;
 mod run;
 pub mod tokenize;
@@ -58,6 +59,7 @@ fn main() {
     match args[1].as_str() {
         "run" => run::run_inference(&args[2..]),
         "pull" => pull_cmd(&args[2..]),
+        "image" => image::image_cmd(&args[2..]),
         "models" => models_cmd(),
         "generate-test-model" => bench::generate_test_model_cmd(&args[2..]),
         "bench" => bench::bench_cmd(&args[2..]),
@@ -321,7 +323,8 @@ fn pull_image(
         ),
         Ok(false) => {
             println!("\nReady: {}", cache::image_lbi_dir(&entry.key).display());
-            println!("Serve with: lumen-server {name}");
+            println!("Make a picture: lumen image \"A red apple on a wooden table\"");
+            println!("Serve it:       lumen-server {name}");
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -388,6 +391,7 @@ fn fetch_image(
         .iter()
         .filter(|f| !converted || f.path.starts_with("processor/"))
         .collect();
+    let needed_bytes: u64 = needed.iter().map(|f| f.size).sum();
     let mut to_download = Vec::new();
     for file in needed {
         if !reusable(dir, file)? {
@@ -424,14 +428,54 @@ fn fetch_image(
             cache::format_size(checkpoint.total_bytes())
         )
     };
-    let question = format!(
-        "Download {display_name} from {} ({}{disk})?",
+    let what = format!(
+        "{display_name} from {} ({}{disk})",
         checkpoint.repo,
         cache::format_size(bytes)
     );
+    let asked = answers.is_some();
     if let Some(mut answers) = answers.filter(|_| !to_download.is_empty()) {
-        if !download::confirm(&question, &mut answers).map_err(|e| e.to_string())? {
+        if !download::confirm(&format!("Download {what}?"), &mut answers)
+            .map_err(|e| e.to_string())?
+        {
             return Err(download::DownloadError::UserDeclined.to_string());
+        }
+    }
+    // The disk the download and the conversion need is checked before the
+    // first byte; the containers of a conversion the server would refuse are
+    // removed next, so their room counts as free.
+    let free_needed = if converted {
+        bytes
+    } else {
+        conversion_peak_bytes(checkpoint) - (needed_bytes - bytes)
+    };
+    let removable: u64 = if converted {
+        0
+    } else {
+        lumen_image::convert::COMPONENTS
+            .iter()
+            .filter_map(|c| std::fs::symlink_metadata(lbi_dir.join(format!("{c}.lbi"))).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    };
+    let available = available_bytes(dir)?.saturating_add(removable);
+    if available < free_needed {
+        return Err(format!(
+            "{display_name} needs {} free in {}; {} is available. Free some space or set \
+             LUMEN_CACHE_DIR to a larger disk",
+            cache::format_size(free_needed),
+            dir.display(),
+            cache::format_size(available)
+        ));
+    }
+    if !asked && !to_download.is_empty() {
+        eprintln!("Downloading {what}");
+    }
+    if !converted {
+        // A conversion the server would refuse is made again, as a whole set.
+        for component in lumen_image::convert::COMPONENTS {
+            remove_if_present(&lbi_dir.join(format!("{component}.lbi")))?;
         }
     }
     for file in to_download {
@@ -448,10 +492,6 @@ fn fetch_image(
     }
     if !converted {
         ensure_dir(&lbi_dir)?;
-        // A conversion the server would refuse is made again, as a whole set.
-        for component in lumen_image::convert::COMPONENTS {
-            remove_if_present(&lbi_dir.join(format!("{component}.lbi")))?;
-        }
         eprintln!(
             "Converting to LBI: {} -> {}",
             dir.display(),
@@ -583,6 +623,25 @@ fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// The bytes an unprivileged user may still write on the file system that
+/// holds `dir`.
+#[cfg(feature = "download")]
+fn available_bytes(dir: &std::path::Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("a path holds no NUL");
+    // SAFETY: a NUL-terminated path, and a statvfs the call fills in.
+    let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut fs) } != 0 {
+        return Err(format!(
+            "cannot read the free space of {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(fs.f_bavail).saturating_mul(u64::from(fs.f_frsize)))
+}
+
 /// The most disk a pull of `checkpoint` holds at once: every downloaded file
 /// stays until the last component is converted, and a component's `.lbi` is
 /// assembled from a blob file of the same size before the two are joined.
@@ -707,6 +766,19 @@ fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<Option<std::fs
         }
     }
     Ok(Some(file))
+}
+
+#[cfg(not(feature = "download"))]
+fn fetch_image(
+    _dir: &std::path::Path,
+    _checkpoint: &registry::Checkpoint,
+    _display_name: &str,
+    _answers: Option<&mut dyn std::io::BufRead>,
+) -> Result<bool, String> {
+    Err(
+        "download support is not compiled in; rebuild with: cargo build --release --features cuda"
+            .to_string(),
+    )
 }
 
 #[cfg(not(feature = "download"))]
@@ -1175,6 +1247,26 @@ mod pull_image_tests {
             !part.exists(),
             "a dead conversion's staging file is removed"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pull_refuses_a_download_the_disk_cannot_hold_before_its_first_byte() {
+        let root = scratch("pull-disk");
+        let dir = root.join("qwen-image-2-1");
+        let mut checkpoint = local_checkpoint(&dir);
+        checkpoint.files.push(registry::CheckpointFile {
+            path: "transformer/huge.safetensors".to_owned(),
+            size: 1 << 60,
+            sha256: "0".repeat(64),
+        });
+        let err = fetch_image(&dir, &checkpoint, "Test", None).unwrap_err();
+        assert!(
+            err.contains("free in") && err.contains("LUMEN_CACHE_DIR"),
+            "{err}"
+        );
+        assert!(!dir.join("transformer/huge.safetensors").exists());
+        assert!(!dir.join("lbi").exists(), "nothing converted");
         std::fs::remove_dir_all(&root).ok();
     }
 

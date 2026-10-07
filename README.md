@@ -90,7 +90,7 @@ compressed-tensors INT4 (group 32).
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 
-Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
+Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen image "<prompt>"` makes a picture, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
 
 `lumen models` lists what is available and disk-cached. Per-model, per-format status and verification: **[docs/support.md](docs/support.md)**.
 
