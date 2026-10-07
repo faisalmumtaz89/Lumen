@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.44.0] — 2026-10-07
+
 ### Added
 
 - **The image model in the registry.** `lumen pull qwen-image` downloads the
@@ -1991,7 +1993,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.42.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.44.0...HEAD
+[0.44.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.43.0...v0.44.0
 [0.43.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.40.0...v0.41.0
