@@ -284,3 +284,59 @@ fn rewriting_a_path_leaves_an_open_file_whole() {
     assert!(!path.with_extension("lbi.part").exists());
     std::fs::remove_file(path).unwrap();
 }
+
+/// The embedded config is stored with its keys sorted whatever order it was
+/// given in, so a checkpoint converts to the same bytes in every build
+/// (serde_json keeps insertion order when another crate in the build asks it
+/// to, as this test's build does).
+#[test]
+fn config_is_stored_with_sorted_keys() {
+    let path = tmp_path("config-order");
+    let _ = std::fs::remove_file(&path);
+    let config: serde_json::Value =
+        serde_json::from_str(r#"{"zeta":1,"alpha":{"y":2,"x":[3]},"mid":true}"#).unwrap();
+    assert_eq!(
+        serde_json::to_string(&config).unwrap(),
+        r#"{"zeta":1,"alpha":{"y":2,"x":[3]},"mid":true}"#,
+        "this build must keep insertion order, or the test proves nothing"
+    );
+    let mut w = LbiWriter::create(&path, config).unwrap();
+    w.append("t", &[2], QuantScheme::F32, &[0u8; 8]).unwrap();
+    w.finish().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let want = br#"{"alpha":{"x":[3],"y":2},"mid":true,"zeta":1}"#;
+    assert!(
+        bytes.windows(want.len()).any(|w| w == want),
+        "the sorted config bytes are not in the file"
+    );
+    assert_eq!(LbiFile::open(&path).unwrap().config()["alpha"]["y"], 2);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A writer dropped before `finish` removes its staging files; one that
+/// finished leaves only the container.
+#[test]
+fn an_unfinished_writer_leaves_no_staging_files() {
+    use lumen_image::lbi::staging_paths;
+    let path = tmp_path("unfinished");
+    let _ = std::fs::remove_file(&path);
+    let (part, tmp) = staging_paths(&path);
+    {
+        let mut w = LbiWriter::create(&path, serde_json::json!({})).unwrap();
+        w.append("t", &[1], QuantScheme::F32, &[0u8; 4]).unwrap();
+        assert!(
+            part.is_file() && tmp.is_file(),
+            "staging files exist while writing"
+        );
+    }
+    assert!(
+        !part.exists() && !tmp.exists(),
+        "dropped unfinished: staging removed"
+    );
+    assert!(!path.exists(), "dropped unfinished: no container");
+    let mut w = LbiWriter::create(&path, serde_json::json!({})).unwrap();
+    w.append("t", &[1], QuantScheme::F32, &[0u8; 4]).unwrap();
+    w.finish().unwrap();
+    assert!(path.is_file() && !part.exists() && !tmp.exists());
+    std::fs::remove_file(&path).ok();
+}

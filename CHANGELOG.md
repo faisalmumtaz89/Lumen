@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **The image model in the registry.** `lumen pull qwen-image` downloads the
+  Qwen-Image-2.1 checkpoint from Hugging Face, pinned to one commit with every file
+  checked against its size and SHA-256, converts it to `.lbi` and removes the downloaded
+  weights; `lumen-server qwen-image` then serves it with no environment variables.
+  `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` remain for a checkpoint converted by hand.
+
+### Fixed
+
+- **`.lbi` files are the same bytes from every build.** The converter stores a
+  component's config with its keys sorted; it used to keep the checkpoint's key order in
+  a binary that links the runtime (which keeps JSON insertion order) and sort them in a
+  standalone `lbi-convert`, so the same checkpoint converted to files that differed in
+  one header field.
+
 ## [0.43.0] — 2026-10-03
 
 ### Added

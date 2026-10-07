@@ -759,6 +759,7 @@ dependencies = [
  "lumen-bench",
  "lumen-convert",
  "lumen-format",
+ "lumen-image",
  "lumen-runtime",
  "mimalloc",
  "percent-encoding",

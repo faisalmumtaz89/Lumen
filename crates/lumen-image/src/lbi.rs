@@ -199,29 +199,67 @@ pub struct LbiWriter {
     out: BufWriter<File>,
     blob: BufWriter<File>,
     path: PathBuf,
-    part: PathBuf,
-    tmp: PathBuf,
+    staging: Staging,
     config: Vec<u8>,
     entries: Vec<TensorEntry>,
     names: HashMap<String, ()>,
     cursor: u64,
 }
 
+/// The two files a conversion to `path` is assembled in: the container
+/// being written and the blob region accumulating beside it.
+pub fn staging_paths(path: &Path) -> (PathBuf, PathBuf) {
+    (
+        path.with_extension("lbi.part"),
+        path.with_extension("lbi.blobs.tmp"),
+    )
+}
+
+/// A writer's staging files, removed when the writer goes away without
+/// having finished, so a failed or abandoned conversion leaves nothing
+/// behind (a process that dies leaves them for the next conversion to
+/// remove).
+struct Staging {
+    part: PathBuf,
+    tmp: PathBuf,
+    done: bool,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.part);
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 impl LbiWriter {
     /// Start a writer. The final path is not created until
     /// [`finish`](Self::finish); tensor bytes accumulate in a sibling
-    /// temporary file.
-    pub fn create(path: &Path, config: serde_json::Value) -> Result<Self, LbiError> {
-        let part = path.with_extension("lbi.part");
-        let tmp = path.with_extension("lbi.blobs.tmp");
-        Ok(Self {
-            // Truncating creates: any leftover from an interrupted run is
-            // discarded rather than appended to.
-            out: BufWriter::new(File::create(&part)?),
-            blob: BufWriter::new(File::create(&tmp)?),
-            path: path.to_path_buf(),
+    /// temporary file. The config is stored with its object keys sorted, so
+    /// the same checkpoint converts to the same bytes whether or not the
+    /// binary's serde_json keeps insertion order (a feature another crate in
+    /// the build can turn on).
+    pub fn create(path: &Path, mut config: serde_json::Value) -> Result<Self, LbiError> {
+        config.sort_all_objects();
+        let (part, tmp) = staging_paths(path);
+        // The guard exists before either file, so a create that fails after
+        // the first leaves nothing behind.
+        let staging = Staging {
             part,
             tmp,
+            done: false,
+        };
+        // Truncating creates: any leftover from an interrupted run is
+        // discarded rather than appended to.
+        let out = BufWriter::new(File::create(&staging.part)?);
+        let blob = BufWriter::new(File::create(&staging.tmp)?);
+        Ok(Self {
+            out,
+            blob,
+            path: path.to_path_buf(),
+            staging,
             config: serde_json::to_vec(&config)?,
             entries: Vec::new(),
             names: HashMap::new(),
@@ -350,7 +388,7 @@ impl LbiWriter {
         }
 
         // Stream the blob region across; never the whole file at once.
-        let mut src = File::open(&self.tmp)?;
+        let mut src = File::open(&self.staging.tmp)?;
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = src.read(&mut buf)?;
@@ -363,8 +401,9 @@ impl LbiWriter {
         self.out
             .into_inner()
             .map_err(|e| LbiError::Io(e.into_error()))?;
-        std::fs::rename(&self.part, &self.path)?;
-        std::fs::remove_file(&self.tmp)?;
+        std::fs::rename(&self.staging.part, &self.path)?;
+        std::fs::remove_file(&self.staging.tmp)?;
+        self.staging.done = true;
         Ok(())
     }
 

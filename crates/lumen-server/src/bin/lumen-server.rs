@@ -104,8 +104,10 @@ lumen-server - OpenAI / Anthropic-compatible HTTP server for Lumen
 USAGE:
     lumen-server [OPTIONS] [MODEL:QUANT]
     lumen-server [OPTIONS] --model <MODEL> [--quant <Q>]
+    lumen-server [OPTIONS] qwen-image
+                           (images only, from `lumen pull qwen-image`; a --features image build)
     LUMEN_IMAGE_LBI=<dir> LUMEN_IMAGE_CKPT=<dir> lumen-server [OPTIONS]
-                           (images only; a --features image build)
+                           (images only from a checkpoint converted by hand; a --features image build)
 
 MODEL (positional or --model):
     MODEL:QUANT            Registry name with an optional quant tag, e.g.
@@ -160,6 +162,8 @@ ENVIRONMENT VARIABLES (image endpoint, `--features image` builds):
                            vae.lbi, text_encoder.lbi). With LUMEN_IMAGE_CKPT
                            and no model, the server serves images only; a
                            model as well is refused (one model per process).
+                           Not needed for `lumen-server qwen-image`, which
+                           serves what `lumen pull qwen-image` cached.
     LUMEN_IMAGE_CKPT=<dir> The source checkpoint, for processor/vocab.json,
                            processor/merges.txt and processor/added_tokens.json.
     LUMEN_IMAGE_MODEL_ID=<id>
@@ -201,7 +205,10 @@ EXAMPLES:
     # Direct file path
     lumen-server --model /path/to/qwen3-5-9b-Q8_0.lbc --port 8080
 
-    # Images only (a --features image build), beside a text server on 8000
+    # Images only (a --features image build): the model `lumen pull qwen-image` cached
+    lumen-server qwen-image
+
+    # Images only from a checkpoint converted by hand, beside a text server on 8000
     LUMEN_IMAGE_LBI=/path/to/lbi LUMEN_IMAGE_CKPT=/path/to/ckpt lumen-server --port 8001
 
 ENDPOINTS (text server):
@@ -373,9 +380,16 @@ fn cache_dir() -> PathBuf {
     }
     // Mirror `lumen-cli/src/cache.rs::cache_dir`: on macOS the CLI uses
     // `dirs::cache_dir()` which resolves to `~/Library/Caches/lumen/`, not
-    // `~/.cache/lumen/`. The server must look in the SAME place or
-    // operators have to symlink. Implemented inline (no `dirs` dep on the
-    // server crate) by matching the platform manually.
+    // `~/.cache/lumen/`, and elsewhere to `$XDG_CACHE_HOME/lumen/` when that
+    // is set. The server must look in the SAME place or operators have to
+    // symlink. Implemented inline (no `dirs` dep on the server crate) by
+    // matching the platform manually.
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if xdg.starts_with('/') {
+            return PathBuf::from(xdg).join("lumen");
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
         #[cfg(target_os = "macos")]
         {
@@ -467,6 +481,16 @@ fn registry_key(name: &str) -> String {
     lumen_cli::registry::load_registry()
         .resolve(name)
         .map_or_else(|| name.replace('.', "-"), |entry| entry.key.clone())
+}
+
+/// The registry key of `name` when it names the image model (a registry entry
+/// with a checkpoint), which is served from `<cache>/<key>/` rather than from
+/// an `.lbc`.
+fn image_model_key(name: &str) -> Option<String> {
+    lumen_cli::registry::load_registry()
+        .resolve(name)
+        .filter(|entry| entry.checkpoint.is_some())
+        .map(|entry| entry.key.clone())
 }
 
 /// The model id reported on the wire (`/v1/models`, and echoed in responses).
@@ -767,8 +791,23 @@ async fn run(args: Args) -> Result<(), String> {
     // model load per attempt.
     #[cfg(feature = "fault-injection")]
     lumen_server::fault::validate()?;
+    // The registry key of the image model when `--model` names it (`lumen-server
+    // qwen-image`), whose files `lumen pull` put under `<cache>/<key>/`.
+    let image_key = (!args.model.is_empty())
+        .then(|| image_model_key(&args.model))
+        .flatten();
     #[cfg(feature = "image")]
-    let image_config = image_config_from_env()?;
+    let image_settings = image_settings_from_env()?;
+    #[cfg(feature = "image")]
+    let image_dirs = image_dirs_from_env()?;
+    #[cfg(feature = "image")]
+    if image_dirs.is_none() && image_key.is_none() {
+        if let Some(name) = image_settings.set.first() {
+            return Err(format!(
+                "{name} is set but LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are not"
+            ));
+        }
+    }
     #[cfg(not(feature = "image"))]
     for name in [
         "LUMEN_IMAGE_LBI",
@@ -784,17 +823,56 @@ async fn run(args: Args) -> Result<(), String> {
             ));
         }
     }
+    #[cfg(not(feature = "image"))]
+    if image_key.is_some() {
+        return Err(format!(
+            "{} makes images, and this lumen-server was built without the image endpoint \
+             (`--features image`)",
+            args.model
+        ));
+    }
     // One model per process. With the image endpoint configured and no `--model`, serve
     // images only: skip the text engine and serve just the image routes (plus `/v1/models`
     // for the image model). With `--model`, the text engine builds below — the image
     // endpoint cannot also run in that process. With neither, there is nothing to serve.
     #[cfg(feature = "image")]
     if args.model.is_empty() {
-        let config = image_config.ok_or_else(|| {
+        let (lbi_dir, checkpoint_dir) = image_dirs.ok_or_else(|| {
             "a model is required: pass `MODEL:QUANT` or --model, or set LUMEN_IMAGE_LBI and \
              LUMEN_IMAGE_CKPT to serve images only (try --help)"
                 .to_string()
         })?;
+        let config = image_config(lbi_dir, checkpoint_dir, image_settings)?;
+        let state = build_image_state(config)?;
+        let app = build_router_with_images(state, args.origins.clone());
+        return serve(app, &args.host, args.port).await;
+    }
+    // The image model by its registry name: what `lumen pull` cached, served the same way.
+    #[cfg(feature = "image")]
+    if let Some(key) = &image_key {
+        if image_dirs.is_some() {
+            return Err(format!(
+                "{} names the image model and LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are set as \
+                 well; pass one or the other",
+                args.model
+            ));
+        }
+        if let Some(quant) = &args.quant {
+            return Err(format!(
+                "{} comes in one form and takes no quantization (got {quant:?})",
+                args.model
+            ));
+        }
+        let checkpoint_dir = cache_dir().join(key);
+        let lbi_dir = checkpoint_dir.join("lbi");
+        if !lbi_dir.is_dir() {
+            return Err(format!(
+                "model not cached: {}\nRun `lumen pull {}` first.",
+                lbi_dir.display(),
+                args.model
+            ));
+        }
+        let config = image_config(lbi_dir, checkpoint_dir, image_settings)?;
         let state = build_image_state(config)?;
         let app = build_router_with_images(state, args.origins.clone());
         return serve(app, &args.host, args.port).await;
@@ -802,7 +880,7 @@ async fn run(args: Args) -> Result<(), String> {
     // A text model and the image endpoint cannot share one process: the two exceed the
     // card, so they run as separate servers.
     #[cfg(feature = "image")]
-    if image_config.is_some() {
+    if image_dirs.is_some() {
         return Err(
             "a text model and the image endpoint cannot run in one process; start two \
                     servers — one with --model, one with LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT \
@@ -1243,22 +1321,38 @@ fn build_image_state(
     }))
 }
 
-/// The image endpoint's configuration from `LUMEN_IMAGE_*`, `None` when the
-/// endpoint is not configured. Every value is checked here: an empty or
-/// unknown value is refused rather than silently defaulted, and the
-/// checkpoint's files are opened and checked once, the way a generation opens
-/// them.
+/// The image endpoint's settings from `LUMEN_IMAGE_MODEL_ID`, `LUMEN_IMAGE_DEVICE`
+/// and `LUMEN_IMAGE_PIN_TEXT_ENCODER`, with the names of those that are set. An
+/// empty or unknown value is refused rather than silently defaulted.
 #[cfg(feature = "image")]
-fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageConfig>, String> {
-    // A value is returned as set, with paths untouched (a directory name may
-    // end in a space); only the enumerated values are trimmed at their match.
-    let var = |name: &str| -> Result<Option<String>, String> {
-        match std::env::var(name) {
-            Ok(v) if v.trim().is_empty() => Err(format!("{name} is set but empty")),
-            Ok(v) => Ok(Some(v)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(e) => Err(format!("{name}: {e}")),
+struct ImageSettings {
+    model_id: String,
+    use_gpu: bool,
+    pin_text_encoder: bool,
+    set: Vec<&'static str>,
+}
+
+/// One `LUMEN_IMAGE_*` variable as set, with paths untouched (a directory name
+/// may end in a space); only the enumerated values are trimmed at their match.
+#[cfg(feature = "image")]
+fn image_var(name: &'static str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(v) if v.trim().is_empty() => Err(format!("{name} is set but empty")),
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+#[cfg(feature = "image")]
+fn image_settings_from_env() -> Result<ImageSettings, String> {
+    let mut set = Vec::new();
+    let mut var = |name: &'static str| -> Result<Option<String>, String> {
+        let value = image_var(name)?;
+        if value.is_some() {
+            set.push(name);
         }
+        Ok(value)
     };
     let model_id = var("LUMEN_IMAGE_MODEL_ID")?
         .map(|v| v.trim().to_string())
@@ -1288,26 +1382,39 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
             ))
         }
     };
-    let (lbi, ckpt) = match (var("LUMEN_IMAGE_LBI")?, var("LUMEN_IMAGE_CKPT")?) {
-        (None, None) => {
-            for name in [
-                "LUMEN_IMAGE_MODEL_ID",
-                "LUMEN_IMAGE_DEVICE",
-                "LUMEN_IMAGE_PIN_TEXT_ENCODER",
-            ] {
-                if var(name)?.is_some() {
-                    return Err(format!(
-                        "{name} is set but LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are not"
-                    ));
-                }
-            }
-            return Ok(None);
-        }
-        (Some(lbi), Some(ckpt)) => (lbi, ckpt),
-        (Some(_), None) => return Err("LUMEN_IMAGE_LBI is set but LUMEN_IMAGE_CKPT is not".into()),
-        (None, Some(_)) => return Err("LUMEN_IMAGE_CKPT is set but LUMEN_IMAGE_LBI is not".into()),
-    };
-    if use_gpu {
+    Ok(ImageSettings {
+        model_id,
+        use_gpu,
+        pin_text_encoder,
+        set,
+    })
+}
+
+/// The converted components' directory and the checkpoint directory from
+/// `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT`, which are set together or not at all.
+#[cfg(feature = "image")]
+fn image_dirs_from_env() -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
+    match (
+        image_var("LUMEN_IMAGE_LBI")?,
+        image_var("LUMEN_IMAGE_CKPT")?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(lbi), Some(ckpt)) => Ok(Some((lbi.into(), ckpt.into()))),
+        (Some(_), None) => Err("LUMEN_IMAGE_LBI is set but LUMEN_IMAGE_CKPT is not".into()),
+        (None, Some(_)) => Err("LUMEN_IMAGE_CKPT is set but LUMEN_IMAGE_LBI is not".into()),
+    }
+}
+
+/// The image endpoint's configuration for a converted checkpoint: the CUDA
+/// device is required when the endpoint runs on it, and the checkpoint's files
+/// are opened and checked once, the way a generation opens them.
+#[cfg(feature = "image")]
+fn image_config(
+    lbi_dir: std::path::PathBuf,
+    checkpoint_dir: std::path::PathBuf,
+    settings: ImageSettings,
+) -> Result<lumen_server::router_image::ImageConfig, String> {
+    if settings.use_gpu {
         match lumen_runtime::cuda::ffi::device_count() {
             Ok(0) => {
                 return Err(
@@ -1324,29 +1431,29 @@ fn image_config_from_env() -> Result<Option<lumen_server::router_image::ImageCon
             }
         }
     }
-    let lbi_dir = std::path::PathBuf::from(lbi);
-    let checkpoint_dir = std::path::PathBuf::from(ckpt);
     lumen_image::pipeline::PipelinePaths::from_roots(&lbi_dir, &checkpoint_dir)
-        .check(use_gpu)
+        .check(settings.use_gpu)
         .map_err(|e| {
             format!(
-                "the image endpoint cannot start: {e} (LUMEN_IMAGE_LBI must hold \
-                 transformer.lbi, vae.lbi and text_encoder.lbi; LUMEN_IMAGE_CKPT must hold \
+                "the image endpoint cannot start: {e} ({} must hold \
+                 transformer.lbi, vae.lbi and text_encoder.lbi; {} must hold \
                  processor/vocab.json, merges.txt and added_tokens.json{})",
-                if use_gpu {
+                lbi_dir.display(),
+                checkpoint_dir.display(),
+                if settings.use_gpu {
                     "; the CUDA device must have the memory a 2048x2048 generation uses"
                 } else {
                     ""
                 }
             )
         })?;
-    Ok(Some(lumen_server::router_image::ImageConfig {
+    Ok(lumen_server::router_image::ImageConfig {
         lbi_dir,
         checkpoint_dir,
-        model_id,
-        use_gpu,
-        pin_text_encoder,
-    }))
+        model_id: settings.model_id,
+        use_gpu: settings.use_gpu,
+        pin_text_encoder: settings.pin_text_encoder,
+    })
 }
 
 /// `--kv-precision` values: `f16` / `bf16` / `f32` (case-insensitive).
@@ -1452,6 +1559,46 @@ mod tests {
         assert_eq!(super::registry_key("qwen3.5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("qwen3-5-9b"), "qwen3-5-9b");
         assert_eq!(super::registry_key("my.model"), "my-model");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_cache_dir_honours_xdg_cache_home_like_the_cli() {
+        // Process-global variables: set, read, restore before asserting.
+        let cache = std::env::var("LUMEN_CACHE_DIR").ok();
+        let xdg = std::env::var("XDG_CACHE_HOME").ok();
+        std::env::remove_var("LUMEN_CACHE_DIR");
+        std::env::set_var("XDG_CACHE_HOME", "/var/tmp/lumen-xdg-test");
+        let with_xdg = super::cache_dir();
+        std::env::set_var("XDG_CACHE_HOME", "relative/is/ignored");
+        let relative = super::cache_dir();
+        match xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        if let Some(v) = cache {
+            std::env::set_var("LUMEN_CACHE_DIR", v);
+        }
+        assert_eq!(
+            with_xdg,
+            std::path::PathBuf::from("/var/tmp/lumen-xdg-test/lumen")
+        );
+        assert!(relative.ends_with(".cache/lumen"), "{}", relative.display());
+    }
+
+    #[test]
+    fn only_the_image_model_has_an_image_key() {
+        assert_eq!(
+            super::image_model_key("qwen-image").as_deref(),
+            Some("qwen-image-2-1")
+        );
+        assert_eq!(
+            super::image_model_key("qwen-image-2-1").as_deref(),
+            Some("qwen-image-2-1")
+        );
+        for text in ["qwen3.5-9b", "qwen3.8-27b", "qwen3.5-moe", "my.model"] {
+            assert_eq!(super::image_model_key(text), None, "{text}");
+        }
     }
 
     #[test]

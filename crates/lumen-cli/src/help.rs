@@ -8,7 +8,7 @@ USAGE:
 
 COMMANDS:
     run                   Run inference on a model (single-process; cold-loads every invocation)
-    pull                  Download and convert a model from the registry
+    pull                  Download and convert a model from the registry (text, or the image model)
     models                List cached and available models
     convert               Convert a GGUF model (or import an HF compressed-tensors
                           INT4 or ModelOpt NVFP4/FP8 checkpoint via --from-hf)
@@ -37,7 +37,9 @@ USAGE:
 
 ARGUMENTS:
     <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.8-27b, qwen3.5-moe.
-                          Append `:<quant>`, or pass --quant, unless the model has a single one
+                          Append `:<quant>`, or pass --quant, unless the model has a single one.
+                          qwen-image (Qwen-Image-2.1, NVIDIA CUDA only) takes no quant: its
+                          checkpoint is downloaded and converted for `lumen-server qwen-image`
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;
@@ -50,7 +52,8 @@ OPTIONS:
 EXAMPLES:
     lumen pull qwen3.5-9b:q8_0            Download Qwen3.5 9B (Q8_0)
     lumen pull qwen3.5-9b --quant Q4_0    Download Qwen3.5 9B (Q4_0)
-    lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation"
+    lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation
+    lumen pull qwen-image                 Download and convert Qwen-Image-2.1 (31 GB)"
     );
 }
 

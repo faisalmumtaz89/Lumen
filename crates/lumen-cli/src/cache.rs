@@ -99,6 +99,37 @@ pub fn gguf_path(filename: &str) -> PathBuf {
     cache_dir().join(filename)
 }
 
+/// The directory an image model's checkpoint is downloaded into, by its
+/// registry key: the checkpoint's own layout (`processor/` and, until they
+/// are converted, the component directories) beneath it.
+pub fn image_checkpoint_dir(key: &str) -> PathBuf {
+    cache_dir().join(key)
+}
+
+/// The directory an image model's converted `.lbi` files are written to.
+pub fn image_lbi_dir(key: &str) -> PathBuf {
+    image_checkpoint_dir(key).join("lbi")
+}
+
+/// The files the image-only server reads: the three `.lbi` and the
+/// tokenizer files under `processor/`, relative to the checkpoint directory.
+pub const IMAGE_SERVED_FILES: [&str; 6] = [
+    "lbi/transformer.lbi",
+    "lbi/vae.lbi",
+    "lbi/text_encoder.lbi",
+    "processor/vocab.json",
+    "processor/merges.txt",
+    "processor/added_tokens.json",
+];
+
+/// Whether every file the image-only server reads is cached for `key`.
+pub fn cached_image(key: &str) -> bool {
+    let dir = image_checkpoint_dir(key);
+    IMAGE_SERVED_FILES
+        .iter()
+        .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
 /// Ensure the cache directory exists.
 ///
 /// Creates all parent directories as needed. Returns the cache directory path.
@@ -247,6 +278,39 @@ mod tests {
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
         }
         assert_eq!(path, PathBuf::from("/tmp/lumen-test-cache/model.Q8_0.gguf"));
+    }
+
+    #[test]
+    fn an_image_model_is_cached_once_every_served_file_is_present_and_nonempty() {
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let original = std::env::var("LUMEN_CACHE_DIR").ok();
+        let root = std::env::temp_dir().join(format!("lumen-cache-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("LUMEN_CACHE_DIR", &root);
+        let dir = image_checkpoint_dir("qwen-image-2-1");
+        let lbi = image_lbi_dir("qwen-image-2-1");
+        let before = cached_image("qwen-image-2-1");
+        for f in IMAGE_SERVED_FILES {
+            let path = dir.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let complete = cached_image("qwen-image-2-1");
+        std::fs::write(dir.join("lbi/vae.lbi"), b"").unwrap();
+        let emptied = cached_image("qwen-image-2-1");
+        std::fs::remove_file(dir.join("processor/merges.txt")).unwrap();
+        let missing = cached_image("qwen-image-2-1");
+        match original {
+            Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
+            None => std::env::remove_var("LUMEN_CACHE_DIR"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(dir, root.join("qwen-image-2-1"));
+        assert_eq!(lbi, root.join("qwen-image-2-1/lbi"));
+        assert!(!before, "nothing cached yet");
+        assert!(complete, "all six files present and nonempty");
+        assert!(!emptied, "an empty .lbi is not cached");
+        assert!(!missing, "a missing tokenizer file is not cached");
     }
 
     #[test]
