@@ -56,64 +56,16 @@ fn default_output_format() -> String {
     "png".to_string()
 }
 
-/// The largest side a request may ask for.
-///
-/// This is a memory bound, not an aesthetic one: the pipeline allocates a
-/// `latents * channels` tensor per denoising step and a `latents * hidden`
-/// activation inside the transformer, so the cost is quadratic in the side. At
-/// 4096 the transformer's largest activation is 1.5 GiB and the decode runs in
-/// bands when the whole image does not fit. Without a cap, one request can ask
-/// for a tensor in the hundreds of gigabytes and the process dies rather than
-/// answering.
-pub const MAX_SIDE: usize = 4096;
-
-/// The most denoising steps a request may ask for.
-///
-/// Each step is a full forward pass, so this bounds the request's duration
-/// rather than its correctness; 200 is already generous beside the 40-50 the
-/// model is used at.
-pub const MAX_STEPS: usize = 200;
-
 impl ImageGenerationRequest {
-    /// Parse `"WxH"` into `(width, height)`, bounded.
+    /// Parse `"WxH"` into `(width, height)`, bounded as
+    /// [`lumen_image::pipeline::parse_size`] bounds it.
     pub fn dimensions(&self) -> Result<(usize, usize), String> {
-        let (w, h) = self
-            .size
-            .split_once(['x', 'X'])
-            .ok_or_else(|| format!("size {:?} is not WxH", self.size))?;
-        let w: usize = w
-            .trim()
-            .parse()
-            .map_err(|_| format!("size width {w:?} is not a number"))?;
-        let h: usize = h
-            .trim()
-            .parse()
-            .map_err(|_| format!("size height {h:?} is not a number"))?;
-        if w < 32 || h < 32 {
-            return Err(format!(
-                "size {w}x{h} is below the 32 pixel minimum side (one latent tile)"
-            ));
-        }
-        if w > MAX_SIDE || h > MAX_SIDE {
-            return Err(format!(
-                "size {w}x{h} exceeds the {MAX_SIDE} pixel maximum side"
-            ));
-        }
-        Ok((w, h))
+        lumen_image::pipeline::parse_size(&self.size)
     }
 
     /// Validate the step count.
     pub fn check_steps(&self) -> Result<(), String> {
-        if self.num_inference_steps == 0 {
-            return Err("num_inference_steps must be at least 1".to_string());
-        }
-        if self.num_inference_steps > MAX_STEPS {
-            return Err(format!(
-                "num_inference_steps {} exceeds the {MAX_STEPS} maximum",
-                self.num_inference_steps
-            ));
-        }
-        Ok(())
+        lumen_image::pipeline::check_steps(self.num_inference_steps)
     }
 
     /// Whether the request asks for the one image a generation produces.

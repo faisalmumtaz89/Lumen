@@ -61,6 +61,17 @@ fn lumen_run_suggests_only_text_models() {
 
 #[cfg(all(feature = "download", not(feature = "cuda")))]
 #[test]
+fn a_lumen_without_cuda_refuses_to_make_a_picture() {
+    let (code, stderr) = lumen_offline(&["image", "A red apple"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("makes images on NVIDIA CUDA, and this lumen was built without CUDA."),
+        "{stderr}"
+    );
+}
+
+#[cfg(all(feature = "download", not(feature = "cuda")))]
+#[test]
 fn a_lumen_without_cuda_refuses_to_pull_the_image_model() {
     // Without --yes and with standard input closed, a lumen that went on would
     // stop at the prompt rather than download.
@@ -117,13 +128,13 @@ fn the_image_model_is_listed_as_one_form_and_only_where_it_can_be_used() {
     assert!(!available.contains("qwen-image-2-1"), "{output}");
 }
 
-/// `lumen pull` with `args` from a CUDA build, standard input closed and a
-/// proxy setting the downloader refuses before any request, so a download,
-/// were one started, fails at once without reaching the network.
-#[cfg(all(feature = "download", feature = "cuda"))]
-fn pull_offline(args: &[&str]) -> (Option<i32>, String) {
+/// `lumen` with `args`, standard input closed and a proxy setting the
+/// downloader refuses before any request, so a download, were one started,
+/// fails at once without reaching the network.
+#[cfg(feature = "download")]
+fn lumen_offline(args: &[&str]) -> (Option<i32>, String) {
     let cache = std::env::temp_dir().join(format!(
-        "lumen-image-pull-{}-{}",
+        "lumen-image-offline-{}-{}",
         std::process::id(),
         args.len()
     ));
@@ -146,7 +157,7 @@ fn pull_offline(args: &[&str]) -> (Option<i32>, String) {
 #[cfg(all(feature = "download", feature = "cuda"))]
 #[test]
 fn a_lumen_with_cuda_asks_before_it_downloads_the_image_model() {
-    let (code, stderr) = pull_offline(&["pull", "qwen-image"]);
+    let (code, stderr) = lumen_offline(&["pull", "qwen-image"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
         stderr.contains("Download Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 ("),
@@ -161,11 +172,46 @@ fn a_lumen_with_cuda_asks_before_it_downloads_the_image_model() {
 #[cfg(all(feature = "download", feature = "cuda"))]
 #[test]
 fn a_lumen_with_cuda_downloads_without_asking_given_yes() {
-    let (code, stderr) = pull_offline(&["pull", "qwen-image", "--yes"]);
+    let (code, stderr) = lumen_offline(&["pull", "qwen-image", "--yes"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(!stderr.contains("[Y/n]"), "{stderr}");
+    // It goes on to the download, or, on a disk without room for the model,
+    // to the refusal that comes before it.
     assert!(
-        stderr.contains("download failed: https_proxy is not a proxy URL lumen can use"),
+        stderr.contains("Downloading Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 (")
+            || stderr.contains("Qwen-Image-2.1 needs"),
         "{stderr}"
     );
+}
+
+#[cfg(all(feature = "download", feature = "cuda"))]
+#[test]
+fn a_first_picture_downloads_without_asking_only_where_the_device_can_run_it() {
+    let device = lumen_image::pipeline::check_device();
+    let dir = std::env::temp_dir().join(format!("lumen-image-first-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("apple.png");
+    let (code, stderr) = lumen_offline(&["image", "A red apple", "-o", path.to_str().unwrap()]);
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!stderr.contains("[Y/n]"), "{stderr}");
+    match device {
+        Err(e) => {
+            assert!(stderr.contains(&e.to_string()), "{stderr}");
+            assert!(!stderr.contains("Downloading"), "{stderr}");
+        }
+        // It goes on to the download, or, on a disk without room for the
+        // model, to the refusal that comes before it.
+        Ok(()) => assert!(
+            stderr.contains("Downloading Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 (")
+                || stderr.contains("Qwen-Image-2.1 needs"),
+            "{stderr}"
+        ),
+    }
+    // A run that fails before it has a picture leaves nothing behind.
+    assert!(left.is_empty(), "{left:?}");
 }

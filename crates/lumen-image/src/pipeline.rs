@@ -151,12 +151,7 @@ impl PipelinePaths {
         }
         #[cfg(feature = "cuda")]
         if gpu {
-            let dev = lumen_runtime::cuda::ffi::CudaDevice::new(GPU_DEVICE)
-                .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
-            let total = dev
-                .total_memory()
-                .map_err(|e| PipelineError::Unsupported(format!("device memory query: {e}")))?;
-            check_device_memory(total as u64)?;
+            check_device()?;
         }
         Ok(())
     }
@@ -241,6 +236,68 @@ impl From<crate::lbi::LbiError> for PipelineError {
 
 /// The system message the reference's template opens with.
 pub const SYS_PROMPT: &str = "Comprehend and analyze the provided prompt.";
+
+/// The shortest side a request may ask for: one latent tile.
+pub const MIN_SIDE: usize = 32;
+
+/// The longest side a request may ask for.
+///
+/// This is a memory bound, not an aesthetic one: the pipeline allocates a
+/// `latents * channels` tensor per denoising step and a `latents * hidden`
+/// activation inside the transformer, so the cost is quadratic in the side. At
+/// 4096 the transformer's largest activation is 1.5 GiB and the decode runs in
+/// bands when the whole image does not fit. Without a cap, one request can ask
+/// for a tensor in the hundreds of gigabytes and the process dies rather than
+/// answering.
+pub const MAX_SIDE: usize = 4096;
+
+/// The most denoising steps a request may ask for.
+///
+/// Each step is a full forward pass, so this bounds the request's duration
+/// rather than its correctness; 200 is already generous beside the 40-50 the
+/// model is used at.
+pub const MAX_STEPS: usize = 200;
+
+/// Parse `"WxH"` into `(width, height)`, each side within
+/// [`MIN_SIDE`]..=[`MAX_SIDE`]. Sides are rounded down to a multiple of 32 by
+/// the generation itself.
+pub fn parse_size(size: &str) -> Result<(usize, usize), String> {
+    let (w, h) = size
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("size {size:?} is not WxH"))?;
+    let w: usize = w
+        .trim()
+        .parse()
+        .map_err(|_| format!("size width {w:?} is not a number"))?;
+    let h: usize = h
+        .trim()
+        .parse()
+        .map_err(|_| format!("size height {h:?} is not a number"))?;
+    if w < MIN_SIDE || h < MIN_SIDE {
+        return Err(format!(
+            "size {w}x{h} is below the {MIN_SIDE} pixel minimum side (one latent tile)"
+        ));
+    }
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err(format!(
+            "size {w}x{h} exceeds the {MAX_SIDE} pixel maximum side"
+        ));
+    }
+    Ok((w, h))
+}
+
+/// Whether a step count is within 1..=[`MAX_STEPS`].
+pub fn check_steps(steps: usize) -> Result<(), String> {
+    if steps == 0 {
+        return Err("num_inference_steps must be at least 1".to_string());
+    }
+    if steps > MAX_STEPS {
+        return Err(format!(
+            "num_inference_steps {steps} exceeds the {MAX_STEPS} maximum"
+        ));
+    }
+    Ok(())
+}
 
 /// Latent side length for a requested image side, given the VAE's 16x spatial
 /// compression: the pipeline rounds to a multiple of 32 pixels and then divides.
@@ -439,6 +496,18 @@ pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
         )));
     }
     Ok(())
+}
+
+/// Refuse a machine without CUDA device [`GPU_DEVICE`], or whose device has
+/// less memory than [`check_device_memory`] asks.
+#[cfg(feature = "cuda")]
+pub fn check_device() -> Result<(), PipelineError> {
+    let dev = lumen_runtime::cuda::ffi::CudaDevice::new(GPU_DEVICE)
+        .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
+    let total = dev
+        .total_memory()
+        .map_err(|e| PipelineError::Unsupported(format!("device memory query: {e}")))?;
+    check_device_memory(total as u64)
 }
 
 /// Generate one image on the GPU.
@@ -981,6 +1050,31 @@ fn decode_gpu(
         .decode_in_bands(&denorm, 1, lat_h, lat_w, bands)
         .map_err(|e| format!("{e}"))?;
     Ok(Rgba::from_planar_rgba(lat_w * 16, lat_h * 16, &decoded))
+}
+
+#[cfg(test)]
+mod request_limit_tests {
+    use super::{check_steps, parse_size};
+
+    #[test]
+    fn a_request_size_is_bounded_on_both_sides_and_steps_are_bounded() {
+        assert_eq!(parse_size("1024x1024"), Ok((1024, 1024)));
+        assert_eq!(parse_size(" 1536 X 1024 "), Ok((1536, 1024)));
+        assert_eq!(parse_size("32x32"), Ok((32, 32)));
+        assert_eq!(parse_size("4096x4096"), Ok((4096, 4096)));
+        assert!(parse_size("31x1024").unwrap_err().contains("minimum"));
+        assert!(parse_size("4097x100").unwrap_err().contains("maximum"));
+        assert!(parse_size("1024").unwrap_err().contains("not WxH"));
+        assert!(parse_size("ax1024").unwrap_err().contains("not a number"));
+        assert!(parse_size("1024x").unwrap_err().contains("not a number"));
+        assert!(parse_size("-1024x1024")
+            .unwrap_err()
+            .contains("not a number"));
+        assert_eq!(check_steps(1), Ok(()));
+        assert_eq!(check_steps(200), Ok(()));
+        assert!(check_steps(0).unwrap_err().contains("at least 1"));
+        assert!(check_steps(201).unwrap_err().contains("maximum"));
+    }
 }
 
 #[cfg(test)]

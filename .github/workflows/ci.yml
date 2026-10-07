@@ -94,7 +94,7 @@ jobs:
       # web pages are refused before they reach the GPU, so the integration
       # suite runs here with that feature, without one.
       - name: server integration tests (image feature)
-        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/image --release --test server_integration --test image_model_refusals
+        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/image --release --lib --test server_integration --test image_model_refusals
       # A CUDA-built lumen asks before it downloads the image model; reaching the
       # question needs no GPU.
       - name: cuda lumen pull tests

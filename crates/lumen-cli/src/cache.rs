@@ -10,7 +10,8 @@ use std::path::PathBuf;
 ///
 /// Priority:
 /// 1. `$LUMEN_CACHE_DIR` environment variable (if set and non-empty)
-/// 2. `$XDG_CACHE_HOME/lumen/` (via `dirs::cache_dir()` if `dirs` feature is available)
+/// 2. the platform's cache directory via `dirs::cache_dir()`: `$XDG_CACHE_HOME/lumen/`
+///    or `~/.cache/lumen/` on Linux, `~/Library/Caches/lumen/` on macOS
 /// 3. `~/.cache/lumen/` fallback
 pub fn cache_dir() -> PathBuf {
     if let Ok(val) = std::env::var("LUMEN_CACHE_DIR") {
@@ -19,11 +20,8 @@ pub fn cache_dir() -> PathBuf {
         }
     }
 
-    #[cfg(feature = "download")]
-    {
-        if let Some(base) = dirs::cache_dir() {
-            return base.join("lumen");
-        }
+    if let Some(base) = dirs::cache_dir() {
+        return base.join("lumen");
     }
 
     // Fallback: ~/.cache/lumen
