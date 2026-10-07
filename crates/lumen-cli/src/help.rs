@@ -38,7 +38,9 @@ USAGE:
 
 ARGUMENTS:
     <model-name>          Model name or alias from the registry: qwen3.5-9b, qwen3.8-27b, qwen3.5-moe.
-                          Append `:<quant>`, or pass --quant, unless the model has a single one.
+                          Append `:<quant>`, or pass --quant; a bare name takes the model's
+                          default quant (`lumen models` marks it: Q8_0 for qwen3.5-9b, Q4_0
+                          for qwen3.8-27b and qwen3.5-moe).
                           qwen-image (Qwen-Image-2.1, NVIDIA CUDA only) takes no quant: its
                           checkpoint is downloaded and converted for `lumen-server qwen-image`
 
@@ -51,6 +53,7 @@ OPTIONS:
     -h, --help            Print this help message
 
 EXAMPLES:
+    lumen pull qwen3.8-27b                Download Qwen3.8 27B (its default, Q4_0)
     lumen pull qwen3.5-9b:q8_0            Download Qwen3.5 9B (Q8_0)
     lumen pull qwen3.5-9b --quant Q4_0    Download Qwen3.5 9B (Q4_0)
     lumen pull qwen3.5-9b:q8_0 --yes      Download Qwen3.5 9B without confirmation
@@ -91,7 +94,7 @@ pub(crate) fn print_run_usage() {
     println!(
         "\
 USAGE:
-    lumen run <model>:<quant> \"your prompt\" [OPTIONS]
+    lumen run <model>[:<quant>] \"your prompt\" [OPTIONS]
     lumen run --model <name-or-path> --prompt \"Hello\" [OPTIONS]
     lumen run --model <path.lbc> --tokens \"0 1 2\" [OPTIONS]
 
@@ -101,14 +104,16 @@ CONFIGURATION PRECEDENCE:
     neither set, the per-backend default (Metal f16, CUDA/CPU f32) applies.
 
 EXAMPLES:
+    lumen run qwen3.8-27b \"Write a haiku about light\"   (the default quant, Q4_0)
     lumen run qwen3.5-9b:q8_0 \"What is the meaning of life?\"
     lumen run qwen3.5-9b:q4_0 \"Write a haiku about light\"
     lumen run qwen3.5-9b:bf16 \"Explain quantum computing\" --max-tokens 200
     lumen run --model qwen3-5-9b --prompt \"hello\" --temperature 0.7
 
 MODELS:
-    Run 'lumen models' to see available models.
-    Quantization tag: q8_0 (best quality / production default), q4_0 (smaller),
+    Run 'lumen models' to see available models; it marks each model's default quant,
+    which a bare name uses and downloads on first use.
+    Quantization tag: q8_0 (best quality), q4_0 (smaller),
                       bf16 (full precision, fastest prefill on supported GPUs),
                       q4_k_m / q5_k_m (qwen3.8-27b only, served as stored on CUDA;
                       on Apple Silicon they convert to an artifact larger than

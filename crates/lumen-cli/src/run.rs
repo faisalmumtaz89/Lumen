@@ -1608,57 +1608,31 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
             std::process::exit(1);
         }
         q.as_str().to_owned()
-    } else if entry.gguf_files.len() == 1 {
-        // Only one quant available — auto-select it.
-        entry.gguf_files.keys().next().unwrap().clone()
-    } else if entry.gguf_files.contains_key(reg.default_quant())
-        && crate::cache::cached_lbc(&entry.key, reg.default_quant()).is_some()
-    {
-        // Multiple quants, none specified, and the registry's declared
-        // default is already cached — use it (lumen-server resolves a bare
-        // model name to the same default quant, though unconditionally).
-        eprintln!(
-            "Using default quantization {} for {} (override with {}:<quant>)",
-            reg.default_quant().to_lowercase(),
-            entry.display_name,
-            model_name
-        );
-        reg.default_quant().to_owned()
     } else {
-        // Multiple quants, none cached as the default. If exactly one quant
-        // has a cached LBC, use it; otherwise require an explicit choice.
-        // A bare model name never starts a download — only an explicit
-        // `model:quant` does.
-        let mut cached: Vec<&String> = entry
-            .gguf_files
-            .keys()
-            .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
-            .collect();
-        if cached.len() == 1 {
-            let q = cached.remove(0).clone();
-            eprintln!(
-                "Using cached quantization {} for {} (override with {}:<quant>)",
-                q.to_lowercase(),
-                entry.display_name,
-                model_name
-            );
-            q
-        } else {
-            eprintln!(
-                "Multiple quantizations available for {}:\n",
-                entry.display_name
-            );
-            let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-            quants.sort();
-            for q in &quants {
-                eprintln!("  {}:{}", model_name, q.to_lowercase());
+        // A bare name means the model's default quant, always, downloaded on
+        // first use like any other; one rule says what a bare name loads.
+        let default = entry
+            .default_quant
+            .clone()
+            .expect("every text model has a default quant");
+        if crate::cache::cached_lbc(&entry.key, &default).is_none() {
+            let mut others: Vec<&String> = entry
+                .gguf_files
+                .keys()
+                .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
+                .collect();
+            others.sort();
+            for q in others {
+                eprintln!(
+                    "{model_name}:{} is already downloaded (run it with: lumen run {model_name}:{} \"…\"); \
+                     downloading the default, {model_name}:{}",
+                    q.to_lowercase(),
+                    q.to_lowercase(),
+                    default.to_lowercase()
+                );
             }
-            eprintln!(
-                "\nSpecify one: lumen run {}:<quant> \"your prompt\"",
-                model_name
-            );
-            std::process::exit(1);
         }
+        default
     };
     let quant = quant.as_str();
 
