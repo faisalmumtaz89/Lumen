@@ -12,6 +12,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **The installer asks nothing and downloads no model by default.** Models download on
   first use; `--model <name>` still downloads one during the install, and now accepts
   `qwen-image` (NVIDIA only). The interactive model menu is gone.
+- **A bare model name means that model's default quant.** `lumen run qwen3.8-27b "…"`,
+  `lumen pull qwen3.8-27b` and `lumen-server qwen3.8-27b` use the model's default from the
+  registry: Q8_0 for `qwen3.5-9b` (unchanged), Q4_0 for `qwen3.8-27b` and `qwen3.5-moe`
+  (was Q8_0 for `lumen-server`). `lumen run` downloads it on first use, like any
+  `model:quant`. With `lumen-server` on an RTX 5090 at the default 8192-token context and
+  a 7019-token prompt they peaked at 17.3, 21.5 and 23.5 GiB of device memory.
+  `lumen models` marks each default. A bare `lumen-server qwen3.8-27b` or
+  `lumen-server qwen3.5-moe` deployment that has only the Q8_0 artifact cached now refuses
+  until it names `:q8_0`; the refusal names both that command and `lumen pull`. `lumen run`
+  no longer picks a sole cached quant for a bare name; when another quant is downloaded it
+  says so before downloading the default.
 
 ## [0.44.0] — 2026-10-07
 

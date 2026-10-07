@@ -162,31 +162,14 @@ fn pull_cmd(args: &[String]) {
         return;
     }
 
-    // Quant priority: colon tag > --quant flag > auto-select (single) > error (multiple)
-    let quant_owned: String;
-    let quant: &str = if let Some(ref tq) = tag_quant {
-        quant_owned = tq.clone();
-        &quant_owned
-    } else if let Some(ref qo) = quant_override {
-        quant_owned = qo.clone();
-        &quant_owned
-    } else if entry.gguf_files.len() == 1 {
-        quant_owned = entry.gguf_files.keys().next().unwrap().clone();
-        &quant_owned
-    } else {
-        // Multiple quants — require explicit choice.
-        eprintln!(
-            "Multiple quantizations available for {}:\n",
-            entry.display_name
-        );
-        let mut quants: Vec<&str> = entry.gguf_files.keys().map(|s| s.as_str()).collect();
-        quants.sort();
-        for q in &quants {
-            eprintln!("  {}:{}", resolved_name, q.to_lowercase());
-        }
-        eprintln!("\nSpecify one: lumen pull {}:<quant>", resolved_name);
-        std::process::exit(1);
-    };
+    // Quant priority: colon tag > --quant flag > the model's default.
+    let quant_owned: String = tag_quant.or(quant_override).unwrap_or_else(|| {
+        entry
+            .default_quant
+            .clone()
+            .expect("every text model has a default quant")
+    });
+    let quant: &str = &quant_owned;
 
     // Check if LBC is already cached.
     if let Some(lbc_path) = cache::cached_lbc(&entry.key, quant) {
@@ -856,9 +839,22 @@ fn models_cmd() {
         return;
     }
 
+    let defaults: Vec<String> = reg
+        .list()
+        .into_iter()
+        .filter_map(|e| e.default_quant.as_ref().map(|q| format!("{}-{q}", e.key)))
+        .collect();
+    let mark = |stem: &str| {
+        if defaults.iter().any(|d| d == stem) {
+            " (default)"
+        } else {
+            ""
+        }
+    };
+
     println!("Cached models:\n");
     for (name, _path, size) in &cached {
-        println!("  {:<40} {}", name, cache::format_size(*size));
+        println!("  {:<40} {}{}", name, cache::format_size(*size), mark(name));
     }
 
     // Also show available (not yet cached) models.
@@ -880,7 +876,11 @@ fn models_cmd() {
         for quant in quants {
             let stem = format!("{}-{}", entry.key, quant);
             if !cached_stems.contains(&stem.as_str()) {
-                available.push((entry.key.clone(), entry.display_name.clone(), quant.clone()));
+                available.push((
+                    entry.key.clone(),
+                    entry.display_name.clone(),
+                    format!("{quant}{}", mark(&stem)),
+                ));
             }
         }
     }

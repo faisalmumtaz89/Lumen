@@ -18,6 +18,9 @@ pub struct ModelEntry {
     pub parameters: String,
     pub tokenizer: String,
     pub gguf_files: HashMap<String, GgufSource>,
+    /// The quant a bare name means, one of `gguf_files`; None for the image
+    /// model, which comes in one form.
+    pub default_quant: Option<String>,
     pub checkpoint: Option<Checkpoint>,
 }
 
@@ -47,14 +50,24 @@ impl Checkpoint {
 
 impl ModelEntry {
     /// What a listing shows after the name: the quantizations a text model
-    /// comes in, sorted, or what the image model is.
+    /// comes in, sorted, its default marked, or what the image model is.
     pub fn variants(&self) -> String {
         if self.checkpoint.is_some() {
             return "text to image".to_owned();
         }
         let mut quants: Vec<&str> = self.gguf_files.keys().map(|s| s.as_str()).collect();
         quants.sort_unstable();
-        quants.join(", ")
+        quants
+            .iter()
+            .map(|q| {
+                if self.default_quant.as_deref() == Some(*q) {
+                    format!("{q} (default)")
+                } else {
+                    (*q).to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The `name:quant` tags `lumen pull` takes for a text model, or the bare
@@ -121,15 +134,9 @@ impl GgufSource {
 pub struct Registry {
     models: HashMap<String, ModelEntry>,
     aliases: HashMap<String, String>,
-    default_quant: String,
 }
 
 impl Registry {
-    /// Get the default quantization (e.g. "Q8_0").
-    pub fn default_quant(&self) -> &str {
-        &self.default_quant
-    }
-
     /// Resolve a model name (canonical key or alias) to a ModelEntry.
     pub fn resolve(&self, name: &str) -> Option<&ModelEntry> {
         // Try direct lookup first.
@@ -168,16 +175,6 @@ pub fn load_registry() -> Registry {
     let table: toml::Table = REGISTRY_TOML
         .parse()
         .expect("embedded model_registry.toml must be valid TOML");
-
-    let meta = table
-        .get("meta")
-        .and_then(|v| v.as_table())
-        .expect("registry must have [meta]");
-    let default_quant = meta
-        .get("default_quant")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Q8_0")
-        .to_owned();
 
     // Parse models.
     let mut models = HashMap::new();
@@ -290,6 +287,11 @@ pub fn load_registry() -> Registry {
                     }
                 });
 
+            let default_quant = model_table
+                .get("default_quant")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
             models.insert(
                 key.clone(),
                 ModelEntry {
@@ -299,6 +301,7 @@ pub fn load_registry() -> Registry {
                     parameters,
                     tokenizer,
                     gguf_files,
+                    default_quant,
                     checkpoint,
                 },
             );
@@ -315,11 +318,7 @@ pub fn load_registry() -> Registry {
         }
     }
 
-    Registry {
-        models,
-        aliases,
-        default_quant,
-    }
+    Registry { models, aliases }
 }
 
 // ===========================================================================
@@ -337,7 +336,6 @@ mod tests {
             !reg.models.is_empty(),
             "registry must have at least one model"
         );
-        assert_eq!(reg.default_quant(), "Q8_0");
     }
 
     #[test]
@@ -423,6 +421,31 @@ mod tests {
                 arch,
             );
         }
+    }
+
+    #[test]
+    fn every_text_model_has_a_default_quant_among_its_quants_and_the_image_model_none() {
+        let reg = load_registry();
+        for entry in reg.list() {
+            match &entry.checkpoint {
+                Some(_) => assert_eq!(entry.default_quant, None, "{}", entry.key),
+                None => {
+                    let q = entry
+                        .default_quant
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{} has no default_quant", entry.key));
+                    assert!(entry.gguf_files.contains_key(q), "{}: {q}", entry.key);
+                }
+            }
+        }
+        let default = |name: &str| reg.resolve(name).unwrap().default_quant.clone();
+        assert_eq!(default("qwen3.5-9b").as_deref(), Some("Q8_0"));
+        assert_eq!(default("qwen3.8-27b").as_deref(), Some("Q4_0"));
+        assert_eq!(default("qwen3.5-moe").as_deref(), Some("Q4_0"));
+        assert_eq!(
+            reg.resolve("qwen3.8-27b").unwrap().variants(),
+            "BF16, Q4_0 (default), Q4_K_M, Q5_K_M, Q8_0"
+        );
     }
 
     #[test]

@@ -10,7 +10,6 @@
 [meta]
 schema_version = 1
 last_validated = "2026-08-14"
-default_quant = "Q8_0"
 
 supported_architectures = [
     "qwen35",     # Qwen3.5 (GatedDeltaNet, dense FFN)
@@ -30,6 +29,10 @@ display_name = "Qwen3.5 9B"
 architecture = "qwen35"
 parameters = "9B"
 tokenizer = "Qwen/Qwen3.5-9B"
+# The quant a bare name means (`lumen run qwen3.5-9b`). Peak device memory of the
+# defaults below was measured with lumen-server on an RTX 5090 at the default
+# 8192-token context and a 7019-token prompt; Q8_0 peaked at 17.3 GiB.
+default_quant = "Q8_0"
 
     [models.qwen3-5-9b.gguf_files]
     Q8_0 = { repo = "bartowski/Qwen_Qwen3.5-9B-GGUF", file = "Qwen_Qwen3.5-9B-Q8_0.gguf" }
@@ -50,6 +53,9 @@ display_name = "Qwen3.5 MoE 35B-A3B"
 architecture = "qwen35moe"
 parameters = "35B-A3B"
 tokenizer = "Qwen/Qwen3.5-35B-A3B"
+# The smallest quant this model comes in. Peaked at 23.5 GiB (measured as for
+# qwen3.5-9b above).
+default_quant = "Q4_0"
 
     [models.qwen3-5-moe-35b-a3b.gguf_files]
     Q8_0 = { repo = "bartowski/Qwen_Qwen3.5-35B-A3B-GGUF", file = "Qwen_Qwen3.5-35B-A3B-Q8_0.gguf" }
@@ -72,6 +78,9 @@ display_name = "Qwen3.8 27B"
 architecture = "qwen35"          # Qwen3.8-27B ships the qwen35 (GatedDeltaNet, dense) GGUF arch
 parameters = "27B"
 tokenizer = "Qwen/Qwen3.8-27B"
+# Q4_0 peaked at 21.5 GiB (measured as for qwen3.5-9b above). The K-quants run
+# as stored only on CUDA, so Q4_0 is the default on every backend.
+default_quant = "Q4_0"
 
     [models.qwen3-8-27b.gguf_files]
     Q8_0 = { repo = "unsloth/Qwen3.8-27B-GGUF", file = "Qwen3.8-27B-Q8_0.gguf" }
