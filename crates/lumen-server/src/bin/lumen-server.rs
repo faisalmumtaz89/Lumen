@@ -105,9 +105,11 @@ USAGE:
     lumen-server [OPTIONS] [MODEL:QUANT]
     lumen-server [OPTIONS] --model <MODEL> [--quant <Q>]
     lumen-server [OPTIONS] qwen-image
-                           (images only, from `lumen pull qwen-image`; a --features image build)
+                           (images only, from `lumen pull qwen-image`;
+                           a --features image build)
     LUMEN_IMAGE_LBI=<dir> LUMEN_IMAGE_CKPT=<dir> lumen-server [OPTIONS]
-                           (images only from a checkpoint converted by hand; a --features image build)
+                           (images only, from a checkpoint converted by
+                           hand; a --features image build)
 
 MODEL (positional or --model):
     MODEL:QUANT            Registry name with an optional quant tag, e.g.
@@ -116,8 +118,8 @@ MODEL (positional or --model):
                            `lumen-server qwen3.5-9b` uses the default quant.
     --model <ID|PATH>      Registry name (e.g. qwen3.5-9b, qwen3.5-moe-35b-a3b)
                            OR direct path to a .lbc file. Registry-name
-                           resolution requires the LBC to be cached under
-                           ~/.cache/lumen/ (run `lumen pull <name>` first).
+                           resolution requires the model to be cached (run
+                           `lumen pull <name>` first).
 
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
@@ -330,11 +332,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 // is taken verbatim and never split on an internal `:` — matching
                 // `lumen run` and `resolve_model_path`'s path-first rule. Only a
                 // registry-style `name:quant` token is split on the last `:`.
-                let looks_like_path = other.contains('/')
-                    || other.contains('\\')
-                    || other.ends_with(".lbc")
-                    || other.ends_with(".gguf");
-                if looks_like_path {
+                if looks_like_path(other) {
                     args.model = other.to_string();
                 } else {
                     match other.rfind(':') {
@@ -381,13 +379,13 @@ fn cache_dir() -> PathBuf {
     // Mirror `lumen-cli/src/cache.rs::cache_dir`: on macOS the CLI uses
     // `dirs::cache_dir()` which resolves to `~/Library/Caches/lumen/`, not
     // `~/.cache/lumen/`, and elsewhere to `$XDG_CACHE_HOME/lumen/` when that
-    // is set. The server must look in the SAME place or operators have to
-    // symlink. Implemented inline (no `dirs` dep on the server crate) by
-    // matching the platform manually.
+    // is set to an absolute path. The server must look in the SAME place or
+    // operators have to symlink. Implemented inline (no `dirs` dep on the
+    // server crate) by matching the platform manually.
     #[cfg(not(target_os = "macos"))]
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        if xdg.starts_with('/') {
-            return PathBuf::from(xdg).join("lumen");
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+        if xdg.is_absolute() {
+            return xdg.join("lumen");
         }
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -414,11 +412,7 @@ fn cache_dir() -> PathBuf {
 /// cached LBC is looked up by `~/.cache/lumen/<key>-<QUANT>.lbc`, with the
 /// key [`registry_key`] gives.
 fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, String> {
-    let looks_like_path = model.contains('/')
-        || model.contains('\\')
-        || model.ends_with(".lbc")
-        || model.ends_with(".gguf");
-    if looks_like_path {
+    if looks_like_path(model) {
         let path = PathBuf::from(model);
         if !path.exists() {
             return Err(format!("model file not found: {model}"));
@@ -474,6 +468,16 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<PathBuf, S
     Ok(path)
 }
 
+/// Whether a model argument names a file rather than a registry entry: it
+/// contains `/` or `\`, or ends with `.lbc` or `.gguf`, as `lumen run` decides.
+/// A path is taken verbatim, never split on a `:`.
+fn looks_like_path(model: &str) -> bool {
+    model.contains('/')
+        || model.contains('\\')
+        || model.ends_with(".lbc")
+        || model.ends_with(".gguf")
+}
+
 /// The cache key `lumen pull` stores a registry name or alias under
 /// (`qwen3.5-moe` -> `qwen3-5-moe-35b-a3b`). A name the registry does not know
 /// keeps the dot-to-dash normalization of its keys (`my.model` -> `my-model`).
@@ -483,10 +487,15 @@ fn registry_key(name: &str) -> String {
         .map_or_else(|| name.replace('.', "-"), |entry| entry.key.clone())
 }
 
-/// The registry key of `name` when it names the image model (a registry entry
-/// with a checkpoint), which is served from `<cache>/<key>/` rather than from
-/// an `.lbc`.
-fn image_model_key(name: &str) -> Option<String> {
+/// The registry key of `model` when it names the image model (a registry
+/// entry with a checkpoint), with or without a `:tag`, which is served from
+/// `<cache>/<key>/` rather than from an `.lbc`. A file path names no registry
+/// entry.
+fn image_model_key(model: &str) -> Option<String> {
+    if looks_like_path(model) {
+        return None;
+    }
+    let name = model.rsplit_once(':').map_or(model, |(name, _)| name);
     lumen_cli::registry::load_registry()
         .resolve(name)
         .filter(|entry| entry.checkpoint.is_some())
@@ -498,14 +507,9 @@ fn image_model_key(name: &str) -> Option<String> {
 /// to the file's name without its directory or extension, so a server launched
 /// by path does not expose the operator's home directory and user name (a
 /// request to `/v1/models` would otherwise return, e.g.,
-/// `/Users/alice/models/qwen3-5-9b-Q8_0.lbc`). Path detection matches the
-/// positional argument parser above.
+/// `/Users/alice/models/qwen3-5-9b-Q8_0.lbc`).
 fn model_public_id(model: &str) -> String {
-    let looks_like_path = model.contains('/')
-        || model.contains('\\')
-        || model.ends_with(".lbc")
-        || model.ends_with(".gguf");
-    if !looks_like_path {
+    if !looks_like_path(model) {
         return model.to_string();
     }
     std::path::Path::new(model)
@@ -793,18 +797,17 @@ async fn run(args: Args) -> Result<(), String> {
     lumen_server::fault::validate()?;
     // The registry key of the image model when `--model` names it (`lumen-server
     // qwen-image`), whose files `lumen pull` put under `<cache>/<key>/`.
-    let image_key = (!args.model.is_empty())
-        .then(|| image_model_key(&args.model))
-        .flatten();
+    let image_key = image_model_key(&args.model);
     #[cfg(feature = "image")]
     let image_settings = image_settings_from_env()?;
     #[cfg(feature = "image")]
     let image_dirs = image_dirs_from_env()?;
     #[cfg(feature = "image")]
     if image_dirs.is_none() && image_key.is_none() {
-        if let Some(name) = image_settings.set.first() {
+        if let Some(name) = image_settings.first_set {
             return Err(format!(
-                "{name} is set but LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT are not"
+                "{name} is set, but neither LUMEN_IMAGE_LBI and LUMEN_IMAGE_CKPT nor the image \
+                 model's name (lumen-server qwen-image) is"
             ));
         }
     }
@@ -857,7 +860,13 @@ async fn run(args: Args) -> Result<(), String> {
                 args.model
             ));
         }
-        if let Some(quant) = &args.quant {
+        // `--model` keeps its `:tag`; resolve_model_path splits it for a text model.
+        let tag = args
+            .model
+            .rsplit_once(':')
+            .map(|(_, tag)| tag)
+            .filter(|tag| !tag.is_empty());
+        if let Some(quant) = args.quant.as_deref().or(tag) {
             return Err(format!(
                 "{} comes in one form and takes no quantization (got {quant:?})",
                 args.model
@@ -869,7 +878,7 @@ async fn run(args: Args) -> Result<(), String> {
             return Err(format!(
                 "model not cached: {}\nRun `lumen pull {}` first.",
                 lbi_dir.display(),
-                args.model
+                args.model.trim_end_matches(':')
             ));
         }
         let config = image_config(lbi_dir, checkpoint_dir, image_settings)?;
@@ -1322,14 +1331,13 @@ fn build_image_state(
 }
 
 /// The image endpoint's settings from `LUMEN_IMAGE_MODEL_ID`, `LUMEN_IMAGE_DEVICE`
-/// and `LUMEN_IMAGE_PIN_TEXT_ENCODER`, with the names of those that are set. An
-/// empty or unknown value is refused rather than silently defaulted.
+/// and `LUMEN_IMAGE_PIN_TEXT_ENCODER`, with the name of the first that is set.
 #[cfg(feature = "image")]
 struct ImageSettings {
     model_id: String,
     use_gpu: bool,
     pin_text_encoder: bool,
-    set: Vec<&'static str>,
+    first_set: Option<&'static str>,
 }
 
 /// One `LUMEN_IMAGE_*` variable as set, with paths untouched (a directory name
@@ -1344,13 +1352,15 @@ fn image_var(name: &'static str) -> Result<Option<String>, String> {
     }
 }
 
+/// Read [`ImageSettings`]; an empty or unknown value is refused rather than
+/// silently defaulted.
 #[cfg(feature = "image")]
 fn image_settings_from_env() -> Result<ImageSettings, String> {
-    let mut set = Vec::new();
+    let mut first_set = None;
     let mut var = |name: &'static str| -> Result<Option<String>, String> {
         let value = image_var(name)?;
         if value.is_some() {
-            set.push(name);
+            first_set.get_or_insert(name);
         }
         Ok(value)
     };
@@ -1386,7 +1396,7 @@ fn image_settings_from_env() -> Result<ImageSettings, String> {
         model_id,
         use_gpu,
         pin_text_encoder,
-        set,
+        first_set,
     })
 }
 
@@ -1564,6 +1574,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_cache_dir_honours_xdg_cache_home_like_the_cli() {
+        use std::os::unix::ffi::OsStrExt;
         // Process-global variables: set, read, restore before asserting.
         let cache = std::env::var("LUMEN_CACHE_DIR").ok();
         let xdg = std::env::var("XDG_CACHE_HOME").ok();
@@ -1572,6 +1583,9 @@ mod tests {
         let with_xdg = super::cache_dir();
         std::env::set_var("XDG_CACHE_HOME", "relative/is/ignored");
         let relative = super::cache_dir();
+        let bytes = std::ffi::OsStr::from_bytes(b"/var/tmp/lumen-\xff");
+        std::env::set_var("XDG_CACHE_HOME", bytes);
+        let not_utf8 = super::cache_dir();
         match xdg {
             Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
             None => std::env::remove_var("XDG_CACHE_HOME"),
@@ -1584,6 +1598,7 @@ mod tests {
             std::path::PathBuf::from("/var/tmp/lumen-xdg-test/lumen")
         );
         assert!(relative.ends_with(".cache/lumen"), "{}", relative.display());
+        assert_eq!(not_utf8, std::path::Path::new(bytes).join("lumen"));
     }
 
     #[test]
@@ -1596,7 +1611,21 @@ mod tests {
             super::image_model_key("qwen-image-2-1").as_deref(),
             Some("qwen-image-2-1")
         );
-        for text in ["qwen3.5-9b", "qwen3.8-27b", "qwen3.5-moe", "my.model"] {
+        assert_eq!(
+            super::image_model_key("qwen-image:q8_0").as_deref(),
+            Some("qwen-image-2-1"),
+            "a tag is the image model's too, and refused"
+        );
+        for text in [
+            "qwen3.5-9b",
+            "qwen3.8-27b",
+            "qwen3.5-moe",
+            "my.model",
+            "qwen-image:v2.lbc",
+            "qwen-image:dir/m",
+            "qwen-image:a\\b",
+            "qwen-image:x.gguf",
+        ] {
             assert_eq!(super::image_model_key(text), None, "{text}");
         }
     }

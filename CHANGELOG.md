@@ -10,18 +10,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 ### Added
 
 - **The image model in the registry.** `lumen pull qwen-image` downloads the
-  Qwen-Image-2.1 checkpoint from Hugging Face, pinned to one commit with every file
-  checked against its size and SHA-256, converts it to `.lbi` and removes the downloaded
-  weights; `lumen-server qwen-image` then serves it with no environment variables.
-  `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` remain for a checkpoint converted by hand.
+  Qwen-Image-2.1 checkpoint from Hugging Face, pinned to one commit with every file it
+  downloads or reuses checked against its size and SHA-256, converts it to `.lbi` and
+  removes the checkpoint's other files from the cache, keeping its tokenizer files;
+  `lumen-server qwen-image` then serves it with no environment variables. The model's
+  directory in the cache must be the user's alone, with real directories rather than
+  symbolic links; `LUMEN_CACHE_DIR` puts the cache elsewhere. `LUMEN_IMAGE_LBI` and
+  `LUMEN_IMAGE_CKPT` remain for a checkpoint converted by hand.
 
-### Fixed
+### Changed
 
-- **`.lbi` files are the same bytes from every build.** The converter stores a
-  component's config with its keys sorted; it used to keep the checkpoint's key order in
-  a binary that links the runtime (which keeps JSON insertion order) and sort them in a
-  standalone `lbi-convert`, so the same checkpoint converted to files that differed in
-  one header field.
+- **A download prompt with no answer declines.** When standard input is closed, `lumen
+  pull` no longer takes the end of input as yes; it stops and asks for `--yes`. This
+  applies to text models as well.
+- **`lumen-server` finds models under `XDG_CACHE_HOME`.** On Linux, with
+  `LUMEN_CACHE_DIR` unset and `XDG_CACHE_HOME` set to an absolute path, the server looks
+  in `$XDG_CACHE_HOME/lumen`, where `lumen pull` stores them, instead of `~/.cache/lumen`.
+- **`lbi-convert` cleans up after a failed or interrupted conversion.** It removes a
+  file that does not read back whole and the staging files an interrupted conversion
+  left, and never writes through a symbolic link at a staging file's name.
 
 ## [0.43.0] — 2026-10-03
 

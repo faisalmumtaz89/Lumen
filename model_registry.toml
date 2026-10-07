@@ -94,13 +94,12 @@ tokenizer = "Qwen/Qwen3.8-27B"
 # The image model: a Hugging Face checkpoint, pinned to one commit, that
 # `lumen pull` downloads file by file and converts with lumen-image into the
 # three `.lbi` containers the image-only `lumen-server` serves. Every file
-# carries the size and SHA-256 the pinned commit publishes; a download that
-# differs is refused. The converter reads `transformer/`, `vae/` and
+# carries its size and SHA-256 at the pinned commit; a download that differs
+# is refused. The converter reads `transformer/`, `vae/` and
 # `text_encoder/`; the server reads `processor/` at run time.
 [models.qwen-image-2-1]
 display_name = "Qwen-Image-2.1"
 architecture = "qwen-image"
-parameters = "20B"
 
     [models.qwen-image-2-1.checkpoint]
     repo = "Qwen/Qwen-Image-2.1"

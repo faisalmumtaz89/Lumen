@@ -20,10 +20,10 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let ckpt = PathBuf::from(args.next().unwrap_or_else(|| usage()));
     let out = PathBuf::from(args.next().unwrap_or_else(|| usage()));
-    for report in convert_checkpoint(&ckpt, &out).map_err(|e| e.to_string())? {
+    convert_checkpoint(&ckpt, &out, |report| {
         let target = out.join(format!("{}.lbi", report.component));
         let bytes = std::fs::metadata(&target)
-            .map_err(|e| format!("{}: {e}", report.component))?
+            .expect("the converted file was just read back")
             .len();
         let dtypes: Vec<String> = report
             .dtypes
@@ -39,8 +39,8 @@ fn run() -> Result<(), String> {
             report.total_bytes as f64 / (1u64 << 30) as f64,
             target.display()
         );
-    }
-    Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn main() -> ExitCode {

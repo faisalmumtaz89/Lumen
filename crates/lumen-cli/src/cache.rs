@@ -1,7 +1,8 @@
 //! Model cache directory management.
 //!
 //! Manages a local cache at `~/.cache/lumen/` (or `$LUMEN_CACHE_DIR`) where
-//! downloaded GGUF files and converted LBC files are stored.
+//! downloaded GGUF files and converted LBC files are stored, and the image
+//! model's tokenizer files and converted `.lbi` files under its own directory.
 
 use std::path::PathBuf;
 
@@ -113,6 +114,8 @@ pub fn image_lbi_dir(key: &str) -> PathBuf {
 
 /// The files the image-only server reads: the three `.lbi` and the
 /// tokenizer files under `processor/`, relative to the checkpoint directory.
+/// Listed here because this module builds without lumen-image, which lists
+/// the components.
 pub const IMAGE_SERVED_FILES: [&str; 6] = [
     "lbi/transformer.lbi",
     "lbi/vae.lbi",
@@ -298,8 +301,14 @@ mod tests {
         let complete = cached_image("qwen-image-2-1");
         std::fs::write(dir.join("lbi/vae.lbi"), b"").unwrap();
         let emptied = cached_image("qwen-image-2-1");
+        std::fs::write(dir.join("lbi/vae.lbi"), b"x").unwrap();
         std::fs::remove_file(dir.join("processor/merges.txt")).unwrap();
         let missing = cached_image("qwen-image-2-1");
+        std::fs::write(dir.join("processor/merges.txt"), b"x").unwrap();
+        std::fs::remove_file(dir.join("processor/added_tokens.json")).unwrap();
+        let no_added_tokens = cached_image("qwen-image-2-1");
+        std::fs::create_dir(dir.join("processor/added_tokens.json")).unwrap();
+        let a_directory = cached_image("qwen-image-2-1");
         match original {
             Some(val) => std::env::set_var("LUMEN_CACHE_DIR", val),
             None => std::env::remove_var("LUMEN_CACHE_DIR"),
@@ -311,6 +320,8 @@ mod tests {
         assert!(complete, "all six files present and nonempty");
         assert!(!emptied, "an empty .lbi is not cached");
         assert!(!missing, "a missing tokenizer file is not cached");
+        assert!(!no_added_tokens, "every tokenizer file is needed");
+        assert!(!a_directory, "a directory is not a cached file");
     }
 
     #[test]

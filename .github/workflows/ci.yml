@@ -27,11 +27,11 @@ env:
 
 jobs:
   test-cpu:
-    # The CPU reference suite (lumen-format, lumen-convert, lumen-cli,
-    # lumen-runtime's CPU-side tests and lumen-server with its binary, so the
-    # server's start-up refusals are exercised) runs without a GPU — see README
-    # "Requirements". The lumen-runtime GPU paths are validated in the
-    # dedicated GPU workflows, not here.
+    # The CPU reference suite (lumen-format, lumen-convert, lumen-image,
+    # lumen-cli, lumen-runtime's CPU-side tests and lumen-server with its
+    # binary, so the server's start-up refusals are exercised) runs without a
+    # GPU — see README "Requirements". The lumen-runtime GPU paths are
+    # validated in the dedicated GPU workflows, not here.
     name: cpu tests + lint
     runs-on: ubuntu-latest
     steps:
@@ -50,7 +50,7 @@ jobs:
       - name: clippy (workspace)
         run: cargo clippy --locked --workspace --release
       - name: cpu test suite
-        run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-cli -p lumen-runtime -p lumen-server --features lumen-server/bin --release
+        run: cargo test --locked -p lumen-format -p lumen-convert -p lumen-image -p lumen-cli -p lumen-runtime -p lumen-server --features lumen-server/bin --release
       - name: detector self-test
         run: python3 quality/detectors.py --selftest
 
@@ -94,7 +94,11 @@ jobs:
       # web pages are refused before they reach the GPU, so the integration
       # suite runs here with that feature, without one.
       - name: server integration tests (image feature)
-        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/image --release --test server_integration
+        run: cargo test --locked -p lumen-server --features lumen-server/bin,lumen-server/image --release --test server_integration --test image_model_refusals
+      # A CUDA-built lumen asks before it downloads the image model; reaching the
+      # question needs no GPU.
+      - name: cuda lumen pull tests
+        run: cargo test --locked -p lumen-cli --features cuda --release --test image_model_refusals
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-runtime/test-prefill-dump,lumen-runtime/test-fault-injection,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

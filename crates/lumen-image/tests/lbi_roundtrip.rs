@@ -340,3 +340,46 @@ fn an_unfinished_writer_leaves_no_staging_files() {
     assert!(path.is_file() && !part.exists() && !tmp.exists());
     std::fs::remove_file(&path).ok();
 }
+
+/// The tensor bytes are read back through the file the writer wrote them to,
+/// never through whatever is at the staging name when it finishes.
+#[test]
+fn finish_reads_the_tensor_bytes_it_wrote_not_the_file_at_the_staging_name() {
+    use lumen_image::lbi::staging_paths;
+    let path = tmp_path("swapped");
+    let _ = std::fs::remove_file(&path);
+    let (_, tmp) = staging_paths(&path);
+    let mut w = LbiWriter::create(&path, serde_json::json!({})).unwrap();
+    w.append("t", &[4], QuantScheme::F32, &[1u8; 16]).unwrap();
+    let decoy = tmp_path("swapped-decoy");
+    std::fs::write(&decoy, [9u8; 16]).unwrap();
+    std::fs::rename(&decoy, &tmp).unwrap();
+    w.finish().unwrap();
+    let f = LbiFile::open(&path).unwrap();
+    assert_eq!(f.tensor_bytes("t").unwrap(), &[1u8; 16][..]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A symbolic link planted at a staging name is refused, and its target is
+/// left as it was.
+#[test]
+fn a_link_at_a_staging_name_is_not_written_through() {
+    use lumen_image::lbi::staging_paths;
+    let path = tmp_path("staging-link");
+    let target = tmp_path("staging-link-target");
+    std::fs::write(&target, b"keep me").unwrap();
+    let (part, tmp) = staging_paths(&path);
+    for stale in [&part, &tmp] {
+        let _ = std::fs::remove_file(stale);
+    }
+    for link in [&part, &tmp] {
+        std::os::unix::fs::symlink(&target, link).unwrap();
+        assert!(LbiWriter::create(&path, serde_json::json!({})).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(
+            std::fs::symlink_metadata(&part).is_err() && std::fs::symlink_metadata(&tmp).is_err(),
+            "a failed create leaves nothing at either staging name"
+        );
+    }
+    let _ = std::fs::remove_file(&target);
+}

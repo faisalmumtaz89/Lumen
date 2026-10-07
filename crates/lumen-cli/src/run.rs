@@ -182,8 +182,12 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
     let input_lower = input.to_lowercase();
     let mut candidates: Vec<(usize, String)> = Vec::new();
 
-    // Check canonical keys.
-    for entry in registry.list() {
+    // Check canonical keys. Only text models run.
+    for entry in registry
+        .list()
+        .into_iter()
+        .filter(|e| e.checkpoint.is_none())
+    {
         let key_lower = entry.key.to_lowercase();
         let dist = levenshtein(&input_lower, &key_lower);
         if dist <= 3 || key_lower.starts_with(&input_lower) || input_lower.starts_with(&key_lower) {
@@ -208,7 +212,7 @@ fn suggest_models(input: &str, registry: &crate::registry::Registry) -> Vec<Stri
             || input_lower.starts_with(&alias_lower)
         {
             // Resolve to display the canonical entry info.
-            if let Some(entry) = registry.resolve(alias) {
+            if let Some(entry) = registry.resolve(alias).filter(|e| e.checkpoint.is_none()) {
                 let line = format!(
                     "  {:<20} {} ({})",
                     alias,
@@ -755,7 +759,11 @@ pub(crate) fn run_inference(args: &[String]) {
                 eprintln!("Model name is required.\n");
                 let registry = crate::registry::load_registry();
                 eprintln!("Available models:");
-                for entry in registry.list() {
+                for entry in registry
+                    .list()
+                    .into_iter()
+                    .filter(|e| e.checkpoint.is_none())
+                {
                     eprintln!("  {}", entry.pull_tags().join(", "));
                 }
                 eprintln!("\nUsage: lumen run <model>:<quant> \"your prompt\"");
@@ -1545,7 +1553,7 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
             } else {
                 eprintln!("Error: unknown model '{}'\n", model_name);
                 eprintln!("Available models:");
-                for entry in reg.list() {
+                for entry in reg.list().into_iter().filter(|e| e.checkpoint.is_none()) {
                     eprintln!(
                         "  {:<20} {} ({})",
                         entry.key,

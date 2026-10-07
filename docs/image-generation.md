@@ -13,14 +13,21 @@ lumen pull qwen-image
 lumen-server qwen-image
 ```
 
-`lumen pull qwen-image` downloads the checkpoint from Hugging Face (31 GB, pinned to one
-commit; every file is checked against its pinned size and SHA-256 and refused otherwise),
-converts it into the three `.lbi` containers under `~/.cache/lumen/qwen-image-2-1/lbi/`,
-and removes the downloaded weights, keeping the tokenizer files under `processor/`. The
-conversion needs up to about 78 GB free while it runs; 31 GB stays. A pull that stops
-continues its downloads where they stopped on the next run and converts again; one pull of
-the model runs at a time per cache, and a complete one reports the cache.
-It refuses on a `lumen` built without CUDA, since the model runs on CUDA only.
+`lumen pull qwen-image` downloads the checkpoint from Hugging Face (30.8 GiB, pinned to one
+commit), converts it into the three `.lbi` containers under `qwen-image-2-1/lbi/` in the
+cache (`$XDG_CACHE_HOME/lumen` or `~/.cache/lumen` by default; see `LUMEN_CACHE_DIR`), and
+removes the checkpoint's other files from the cache, keeping the tokenizer files under
+`processor/`. Every file it downloads or reuses is checked against its pinned size and
+SHA-256, and converted files are reused only when they pass the checks the server starts
+with on CUDA. A pull uses about 78 GiB of disk at its peak, the download included; 30.8 GiB
+stays. After a pull stops, the next one resumes its downloads where they stopped and makes
+an unfinished conversion again; one pull of the model writes to a cache at a time, and a
+pull of a model already cached says so, also on a cache mounted read-only. The model's
+directory in the cache and everything in it must be yours alone: the pull creates it so,
+and refuses anything there another user owns and a directory there its group or other users
+can write, and a symbolic link in place of one of its directories; to keep the model on
+another disk, set `LUMEN_CACHE_DIR` there. It refuses on a `lumen` built without CUDA.
+The server reports and accepts the model as `Qwen-Image-2.1`.
 `lumen-server qwen-image` serves what the pull cached; `LUMEN_IMAGE_MODEL_ID`,
 `LUMEN_IMAGE_DEVICE` and `LUMEN_IMAGE_PIN_TEXT_ENCODER` apply to it as below, while
 `LUMEN_IMAGE_LBI` and `LUMEN_IMAGE_CKPT` are for a checkpoint converted by hand and are

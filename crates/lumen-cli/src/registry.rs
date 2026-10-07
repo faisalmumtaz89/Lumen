@@ -22,7 +22,7 @@ pub struct ModelEntry {
 }
 
 /// A Hugging Face checkpoint pinned to one commit: the files `lumen pull`
-/// downloads, each with the size and SHA-256 that commit publishes.
+/// downloads, each with its size and SHA-256 at that commit.
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     pub repo: String,
@@ -262,7 +262,7 @@ pub fn load_registry() -> Registry {
                             let f = f.as_table().unwrap_or_else(|| {
                                 panic!("checkpoint file of {key} must be a table")
                             });
-                            let text = |name: &str| {
+                            let field = |name: &str| {
                                 f.get(name)
                                     .and_then(|v| v.as_str())
                                     .unwrap_or_else(|| {
@@ -271,7 +271,7 @@ pub fn load_registry() -> Registry {
                                     .to_owned()
                             };
                             CheckpointFile {
-                                path: text("path"),
+                                path: field("path"),
                                 size: f
                                     .get("size")
                                     .and_then(|v| v.as_integer())
@@ -279,7 +279,7 @@ pub fn load_registry() -> Registry {
                                     .unwrap_or_else(|| {
                                         panic!("checkpoint file of {key} must have size")
                                     }),
-                                sha256: text("sha256"),
+                                sha256: field("sha256"),
                             }
                         })
                         .collect();

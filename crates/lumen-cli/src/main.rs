@@ -294,15 +294,8 @@ fn pull_download_gguf(_repo: &str, _filename: &str, _skip_confirm: bool) -> std:
     std::process::exit(1);
 }
 
-/// Download the image model's pinned checkpoint and convert it into the
-/// `.lbi` files the image-only `lumen-server` serves. Exits on failure.
-///
-/// The checkpoint lands in `<cache>/<key>/` in its own layout and the `.lbi`
-/// in `<cache>/<key>/lbi/`. Once the conversion has been read back, the
-/// component directories are removed: only `processor/` is read at run time.
-/// A later pull downloads only what is missing, so an interrupted one is
-/// continued, and a complete one is reported as cached. One pull of the
-/// model runs at a time per cache: a second waits for the first.
+/// `lumen pull` for the image model: [`fetch_image`], then where the model is
+/// and what to run. Exits on failure.
 #[cfg(feature = "download")]
 fn pull_image(
     entry: &registry::ModelEntry,
@@ -310,142 +303,284 @@ fn pull_image(
     name: &str,
     skip_confirm: bool,
 ) {
-    use std::io::Write;
-
     if !cfg!(feature = "cuda") {
         eprintln!(
-            "{} makes images on NVIDIA CUDA, and this lumen was built without CUDA; nothing was \
-             downloaded.",
+            "Error: {} makes images on NVIDIA CUDA, and this lumen was built without CUDA; \
+             nothing was downloaded.",
             entry.display_name
         );
         std::process::exit(1);
     }
     let dir = cache::image_checkpoint_dir(&entry.key);
-    let lbi_dir = cache::image_lbi_dir(&entry.key);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-        eprintln!("Error: failed to create {}: {e}", dir.display());
-        std::process::exit(1);
-    });
-    let _lock = lock_pull(&dir, &entry.display_name).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    });
-    // A conversion that died left its staging files; no other pull holds
-    // the lock, so they are nobody's.
-    lumen_image::convert::remove_staging(&lbi_dir).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
-    });
-    if cache::cached_image(&entry.key) {
-        // An earlier pull may have stopped between publishing the conversion
-        // and removing what it converted.
-        if let Some(removed) = remove_image_sources(&dir) {
-            eprintln!(
-                "Removed the downloaded checkpoint files ({}) an earlier pull left behind.",
-                cache::format_size(removed)
-            );
+    let mut stdin = std::io::stdin().lock();
+    let answers = (!skip_confirm).then_some(&mut stdin as &mut dyn std::io::BufRead);
+    match fetch_image(&dir, checkpoint, &entry.display_name, answers) {
+        Ok(true) => println!(
+            "Already cached: {}",
+            cache::image_lbi_dir(&entry.key).display()
+        ),
+        Ok(false) => {
+            println!("\nReady: {}", cache::image_lbi_dir(&entry.key).display());
+            println!("Serve with: lumen-server {name}");
         }
-        println!("Already cached: {}", lbi_dir.display());
-        return;
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
-    let converted = cache::IMAGE_SERVED_FILES
-        .iter()
-        .filter(|f| f.starts_with("lbi/"))
-        .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0));
-    // With the conversion done, only the tokenizer files can be missing.
+}
+
+/// Download the image model's pinned checkpoint into `dir`, its directory in
+/// the cache, and convert it into the `.lbi` files the image-only
+/// `lumen-server` serves; true when it was cached already. With `answers`,
+/// the user confirms a download first, answering from it.
+///
+/// The checkpoint keeps its own layout under `dir` and the `.lbi` go in
+/// `dir/lbi/`. `dir` and everything in it must be this user's alone (see
+/// [`yours_alone`]). Every file the pull downloads or reuses is checked
+/// against its pinned size and SHA-256, and a conversion is reused only when
+/// it passes the checks the image server starts with. Once the conversion is
+/// published, the checkpoint's files outside `processor/`, the only part read
+/// at run time, are removed. A later pull downloads only what is missing, so
+/// an interrupted one is continued. One pull of the model writes to a cache at
+/// a time: a second waits for the first. On a cache mounted read-only, a pull
+/// only reports a model that is cached there.
+#[cfg(feature = "download")]
+fn fetch_image(
+    dir: &std::path::Path,
+    checkpoint: &registry::Checkpoint,
+    display_name: &str,
+    answers: Option<&mut dyn std::io::BufRead>,
+) -> Result<bool, String> {
+    let lbi_dir = dir.join("lbi");
+    let root = dir
+        .parent()
+        .expect("a model's directory is inside the cache");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(root)
+            .map_err(|e| format!("failed to create {}: {e}", root.display()))?;
+    }
+    ensure_dir(dir)?;
+    yours_alone(dir)?;
+    let lock = lock_pull(dir, display_name)?;
+    // Under the lock: another pull adds and removes files here as it goes.
+    all_yours_alone(dir)?;
+    for sub in ["lbi", "processor"]
+        .into_iter()
+        .chain(lumen_image::convert::COMPONENTS)
+    {
+        only_dir(&dir.join(sub))?;
+    }
+    // A conversion that died left its staging files; no other pull holds
+    // the lock, so they are nobody's. A pull that cannot write leaves them,
+    // and what follows, to the next one that can.
+    if lock.is_some() {
+        lumen_image::convert::remove_staging(&lbi_dir).map_err(|e| e.to_string())?;
+    }
+    let converted = converted(dir, &lbi_dir);
+    // With the conversion done, only the tokenizer files are needed.
     let needed: Vec<&registry::CheckpointFile> = checkpoint
         .files
         .iter()
         .filter(|f| !converted || f.path.starts_with("processor/"))
         .collect();
-    let to_download: Vec<&registry::CheckpointFile> = needed
-        .iter()
-        .copied()
-        .filter(|f| {
-            !std::fs::metadata(dir.join(&f.path)).is_ok_and(|m| m.is_file() && m.len() == f.size)
-        })
-        .collect();
+    let mut to_download = Vec::new();
+    for file in needed {
+        if !reusable(dir, file)? {
+            to_download.push(file);
+        }
+    }
+    if converted && to_download.is_empty() {
+        // An earlier pull may have stopped between publishing the conversion
+        // and removing what it converted.
+        if lock.is_some() {
+            if let Some(removed) = remove_image_sources(dir, checkpoint)? {
+                eprintln!(
+                    "Removed the downloaded checkpoint files ({}) an earlier pull left behind.",
+                    cache::format_size(removed)
+                );
+            }
+        }
+        return Ok(true);
+    }
+    if lock.is_none() {
+        return Err(format!(
+            "{} is on a file system mounted read-only and does not hold the image model; \
+             set LUMEN_CACHE_DIR to a directory you can write",
+            dir.display()
+        ));
+    }
     let bytes: u64 = to_download.iter().map(|f| f.size).sum();
-    if !to_download.is_empty() && !skip_confirm {
-        let disk = if converted {
-            format!("{} on disk", cache::format_size(bytes))
-        } else {
-            format!(
-                "up to {} free during the conversion, {} kept",
-                cache::format_size(conversion_peak_bytes(checkpoint)),
-                cache::format_size(checkpoint.total_bytes())
-            )
-        };
-        eprint!(
-            "Download {} from {} ({}; {})? [Y/n] ",
-            entry.display_name,
-            checkpoint.repo,
-            cache::format_size(bytes),
-            disk
-        );
-        std::io::stderr().flush().ok();
-        let mut input = String::new();
-        // The end of the input is no answer: a pull with no terminal and no
-        // --yes must not download.
-        let answered = matches!(std::io::stdin().read_line(&mut input), Ok(n) if n > 0);
-        let answer = input.trim();
-        if !answered
-            || !(answer.is_empty()
-                || answer.eq_ignore_ascii_case("y")
-                || answer.eq_ignore_ascii_case("yes"))
-        {
-            eprintln!("Download declined.");
-            std::process::exit(1);
+    let disk = if converted {
+        String::new()
+    } else {
+        format!(
+            "; about {} of disk at the peak, {} kept",
+            cache::format_size(conversion_peak_bytes(checkpoint)),
+            cache::format_size(checkpoint.total_bytes())
+        )
+    };
+    let question = format!(
+        "Download {display_name} from {} ({}{disk})?",
+        checkpoint.repo,
+        cache::format_size(bytes)
+    );
+    if let Some(mut answers) = answers.filter(|_| !to_download.is_empty()) {
+        if !download::confirm(&question, &mut answers).map_err(|e| e.to_string())? {
+            return Err(download::DownloadError::UserDeclined.to_string());
         }
     }
     for file in to_download {
-        let dest_dir = dir.join(file.path.rsplit_once('/').map_or("", |(d, _)| d));
-        std::fs::create_dir_all(&dest_dir).unwrap_or_else(|e| {
-            eprintln!("Error: failed to create {}: {e}", dest_dir.display());
-            std::process::exit(1);
-        });
-        let path = dir.join(&file.path);
-        if path.exists() {
-            // A file of another size is not the pinned one.
-            std::fs::remove_file(&path).unwrap_or_else(|e| {
-                eprintln!("Error: failed to remove {}: {e}", path.display());
-                std::process::exit(1);
-            });
-        }
+        let (sub, _) = file
+            .path
+            .split_once('/')
+            .expect("checkpoint paths name a directory");
+        let dest_dir = dir.join(sub);
+        ensure_dir(&dest_dir)?;
+        // A file there is not the pinned one.
+        remove_if_present(&dir.join(&file.path))?;
         download::download_pinned(&checkpoint.repo, &checkpoint.revision, file, &dest_dir)
-            .unwrap_or_else(|e| {
-                eprintln!("Download failed: {e}");
-                std::process::exit(1);
-            });
+            .map_err(|e| format!("download failed: {e}"))?;
     }
     if !converted {
+        ensure_dir(&lbi_dir)?;
+        // A conversion the server would refuse is made again, as a whole set.
+        for component in lumen_image::convert::COMPONENTS {
+            remove_if_present(&lbi_dir.join(format!("{component}.lbi")))?;
+        }
         eprintln!(
             "Converting to LBI: {} -> {}",
             dir.display(),
             lbi_dir.display()
         );
-        let reports =
-            lumen_image::convert::convert_checkpoint(&dir, &lbi_dir).unwrap_or_else(|e| {
-                eprintln!("Conversion failed: {e}");
-                std::process::exit(1);
-            });
-        for report in &reports {
+        lumen_image::convert::convert_checkpoint(dir, &lbi_dir, |report| {
             eprintln!(
                 "  {:14} {:4} tensors  {}",
                 report.component,
                 report.tensor_count,
                 cache::format_size(report.total_bytes)
             );
-        }
+        })
+        .map_err(|e| format!("conversion failed: {e}"))?;
     }
-    if let Some(removed) = remove_image_sources(&dir) {
+    if let Some(removed) = remove_image_sources(dir, checkpoint)? {
         eprintln!(
-            "Removed the downloaded checkpoint files ({}); the converted files and processor/ are what the server reads.",
+            "Removed the downloaded checkpoint files ({}); the converted files and \
+             processor/ are what the server reads.",
             cache::format_size(removed)
         );
     }
-    println!("\nReady: {}", lbi_dir.display());
-    println!("Serve with: lumen-server {name}");
+    Ok(false)
+}
+
+/// `path` as a directory of the image cache, created writable by its owner
+/// alone when missing, also when another pull creates it at the same moment;
+/// see [`only_dir`].
+#[cfg(feature = "download")]
+fn ensure_dir(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o755).create(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            Err(format!("failed to create {}: {e}", path.display()))
+        }
+        _ => only_dir(path),
+    }
+}
+
+/// Refuse anything but a directory at `path`, if there is something: a
+/// symbolic link there would send the pull's writes and removals elsewhere.
+#[cfg(feature = "download")]
+fn only_dir(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_dir() => Err(format!(
+            "{} is not a directory (a symbolic link or a file); to keep the image model \
+             elsewhere, set LUMEN_CACHE_DIR there instead of linking",
+            path.display()
+        )),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("failed to inspect {}: {e}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse `path` when another user owns it, or can write it as a directory:
+/// they could otherwise plant or swap, while a pull runs, what sends its
+/// writes and removals outside the cache or what it converts. A link is
+/// judged by itself, not by its target.
+#[cfg(feature = "download")]
+fn yours_alone(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
+    // SAFETY: geteuid has no failure mode.
+    if m.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "{} belongs to another user; the image model's cache directory must be yours alone",
+            path.display()
+        ));
+    }
+    if m.is_dir() && m.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} can be written by its group or by others; make it yours alone: chmod go-w {}",
+            path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// [`yours_alone`] for `path` and everything in it, links not followed.
+#[cfg(feature = "download")]
+fn all_yours_alone(path: &std::path::Path) -> Result<(), String> {
+    yours_alone(path)?;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        for entry in std::fs::read_dir(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?
+        {
+            let entry = entry.map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            all_yours_alone(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `file` is at its path under `dir` as pinned: a regular file of
+/// its size and SHA-256.
+#[cfg(feature = "download")]
+fn reusable(dir: &std::path::Path, file: &registry::CheckpointFile) -> Result<bool, String> {
+    let path = dir.join(&file.path);
+    Ok(
+        std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == file.size)
+            && download::compute_sha256(&path).map_err(|e| e.to_string())? == file.sha256,
+    )
+}
+
+/// Whether `lbi_dir` holds a conversion the image server on CUDA accepts: the
+/// three converted files, regular files, pass the checks it starts with.
+#[cfg(feature = "download")]
+fn converted(dir: &std::path::Path, lbi_dir: &std::path::Path) -> bool {
+    lumen_image::convert::COMPONENTS.iter().all(|component| {
+        std::fs::symlink_metadata(lbi_dir.join(format!("{component}.lbi")))
+            .is_ok_and(|m| m.is_file())
+    }) && lumen_image::pipeline::PipelinePaths::from_roots(lbi_dir, dir)
+        .check_components(true)
+        .is_ok()
+}
+
+/// Remove the file or link at `path`, if there is one.
+#[cfg(feature = "download")]
+fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("failed to remove {}: {e}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The most disk a pull of `checkpoint` holds at once: every downloaded file
@@ -472,54 +607,80 @@ fn conversion_peak_bytes(checkpoint: &registry::Checkpoint) -> u64 {
     checkpoint.total_bytes() + peak
 }
 
-/// Remove the component directories a pull downloaded into `dir`, once their
-/// conversion is published; the bytes removed, or None when there were none.
-/// Exits on a failure to remove.
+/// Remove the checkpoint files a pull downloads into `dir` outside
+/// `processor/`, once their conversion is published, then each component
+/// directory if that leaves it empty; the bytes removed, or None when there
+/// were none. Nothing else is touched.
 #[cfg(feature = "download")]
-fn remove_image_sources(dir: &std::path::Path) -> Option<u64> {
+fn remove_image_sources(
+    dir: &std::path::Path,
+    checkpoint: &registry::Checkpoint,
+) -> Result<Option<u64>, String> {
     let mut removed = None;
-    for component in lumen_image::convert::COMPONENTS {
-        let comp_dir = dir.join(component);
-        let Ok(entries) = std::fs::read_dir(&comp_dir) else {
-            continue;
-        };
-        let bytes: u64 = entries
-            .flatten()
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum();
-        std::fs::remove_dir_all(&comp_dir).unwrap_or_else(|e| {
-            eprintln!("Error: failed to remove {}: {e}", comp_dir.display());
-            std::process::exit(1);
-        });
-        removed = Some(removed.unwrap_or(0) + bytes);
+    for file in checkpoint
+        .files
+        .iter()
+        .filter(|f| !f.path.starts_with("processor/"))
+    {
+        let path = dir.join(&file.path);
+        if let Ok(m) = std::fs::symlink_metadata(&path) {
+            remove_if_present(&path)?;
+            removed = Some(removed.unwrap_or(0) + m.len());
+        }
     }
-    removed
+    for component in lumen_image::convert::COMPONENTS {
+        // A directory holding anything else stays.
+        let _ = std::fs::remove_dir(dir.join(component));
+    }
+    Ok(removed)
+}
+
+/// Whether the file system holding `dir` is mounted read-only.
+#[cfg(feature = "download")]
+fn mounted_read_only(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("a path holds no NUL");
+    // SAFETY: a NUL-terminated path, and a statvfs the call fills in.
+    let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::statvfs(path.as_ptr(), &mut fs) };
+    status == 0 && fs.f_flag & libc::ST_RDONLY != 0
 }
 
 /// Hold `dir`'s pull lock for the rest of the pull, waiting while another
 /// lumen process pulls the same model into it: its downloads, conversion and
-/// cleanup must not interleave with this one's. The lock file is never
-/// written: it is opened without truncation and must be a regular file, so a
-/// symbolic link planted in a shared cache is refused rather than followed
-/// (a hard link is the same file and the same lock), and a file system
-/// without locks is refused rather than pulled into unlocked.
+/// cleanup must not interleave with this one's. The lock file is created
+/// readable by its owner alone. It is never written: it is opened without
+/// truncation and must be a regular file, so a symbolic link there is refused
+/// rather than followed (a hard link is the same file and the same lock), and
+/// a file system without locks is refused rather than pulled into unlocked.
+/// On a file system mounted read-only there is no lock to take, and the pull
+/// writes nothing there: it reports a model that is cached and otherwise stops
+/// before downloading. A lock file that alone refuses writing is refused.
 #[cfg(feature = "download")]
-fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File, String> {
+fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<Option<std::fs::File>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let path = dir.join("pull.lock");
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .map_err(|e| match e.raw_os_error() {
-            Some(libc::ELOOP) => format!("{} is a symbolic link; remove it", path.display()),
-            _ => format!("failed to open {}: {e}", path.display()),
-        })?;
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return match e.raw_os_error() {
+                Some(libc::EROFS) if mounted_read_only(dir) => Ok(None),
+                Some(libc::ELOOP) => {
+                    Err(format!("{} is a symbolic link; remove it", path.display()))
+                }
+                _ => Err(format!("failed to open {}: {e}", path.display())),
+            }
+        }
+    };
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?;
@@ -528,7 +689,7 @@ fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File,
     }
     // SAFETY: flock on a descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(file);
+        return Ok(Some(file));
     }
     let e = std::io::Error::last_os_error();
     if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
@@ -545,7 +706,7 @@ fn lock_pull(dir: &std::path::Path, display_name: &str) -> Result<std::fs::File,
             return Err(format!("failed to lock {}: {e}", path.display()));
         }
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 #[cfg(not(feature = "download"))]
@@ -556,7 +717,7 @@ fn pull_image(
     _skip_confirm: bool,
 ) {
     eprintln!("Error: download support is not compiled in.");
-    eprintln!("Rebuild with: cargo build --release --features download");
+    eprintln!("Rebuild with: cargo build --release --features cuda");
     std::process::exit(1);
 }
 
@@ -664,6 +825,25 @@ fn models_cmd() {
 mod pull_image_tests {
     use super::*;
 
+    /// `path` and its missing parents, as the pull creates them whatever the
+    /// umask.
+    fn mkdirs(path: &std::path::Path) {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(path)
+            .unwrap();
+    }
+
+    fn no_files() -> registry::Checkpoint {
+        registry::Checkpoint {
+            repo: "org/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: Vec::new(),
+        }
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("lumen-pull-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -689,28 +869,415 @@ mod pull_image_tests {
     }
 
     #[test]
-    fn removing_sources_keeps_the_processor_and_reports_what_went() {
+    fn removing_sources_takes_only_the_checkpoint_files_outside_the_tokenizer() {
         let dir = scratch("sources");
-        std::fs::create_dir_all(dir.join("transformer")).unwrap();
+        let checkpoint = registry::Checkpoint {
+            repo: "org/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files: [
+                "transformer/config.json",
+                "vae/config.json",
+                "processor/vocab.json",
+            ]
+            .iter()
+            .map(|path| registry::CheckpointFile {
+                path: (*path).to_owned(),
+                size: 5,
+                sha256: String::new(),
+            })
+            .collect(),
+        };
+        for d in ["transformer", "vae", "processor"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
         std::fs::write(dir.join("transformer/config.json"), b"12345").unwrap();
-        std::fs::create_dir_all(dir.join("processor")).unwrap();
+        std::fs::write(dir.join("vae/config.json"), b"123").unwrap();
+        std::fs::write(dir.join("vae/notes.txt"), b"mine").unwrap();
         std::fs::write(dir.join("processor/vocab.json"), b"{}").unwrap();
-        assert_eq!(remove_image_sources(&dir), Some(5));
-        assert!(!dir.join("transformer").exists());
+
+        assert_eq!(remove_image_sources(&dir, &checkpoint), Ok(Some(8)));
+        assert!(!dir.join("transformer").exists(), "emptied, so removed");
+        assert_eq!(std::fs::read(dir.join("vae/notes.txt")).unwrap(), b"mine");
+        assert!(!dir.join("vae/config.json").exists());
         assert!(dir.join("processor/vocab.json").is_file());
-        assert_eq!(remove_image_sources(&dir), None);
+        assert_eq!(remove_image_sources(&dir, &checkpoint), Ok(None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_directory_is_created_or_accepted_but_never_a_link() {
+        let dir = scratch("cache-dir");
+        let made = dir.join("made");
+        assert_eq!(ensure_dir(&made), Ok(()));
+        assert!(made.is_dir());
+        assert_eq!(
+            ensure_dir(&made),
+            Ok(()),
+            "an existing directory is accepted"
+        );
+        assert_eq!(
+            only_dir(&dir.join("absent")),
+            Ok(()),
+            "nothing there is fine"
+        );
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(ensure_dir(&link).unwrap_err().contains("not a directory"));
+        assert!(only_dir(&link).unwrap_err().contains("not a directory"));
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        assert!(only_dir(&dir.join("file"))
+            .unwrap_err()
+            .contains("not a directory"));
+        // Two pulls creating the same directory at once both go on.
+        let race = dir.join("race");
+        let other = race.clone();
+        let t = std::thread::spawn(move || ensure_dir(&other));
+        assert_eq!(ensure_dir(&race), Ok(()));
+        assert_eq!(t.join().unwrap(), Ok(()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_model_directory_others_can_write_or_with_a_linked_subdirectory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let root = scratch("owner");
+        let dir = root.join("model");
+        assert_eq!(ensure_dir(&dir), Ok(()));
+        assert_eq!(
+            yours_alone(&dir),
+            Ok(()),
+            "created writable by its owner alone"
+        );
+        set(&dir, 0o775);
+        assert!(yours_alone(&dir).unwrap_err().contains("chmod go-w"));
+        set(&dir, 0o757);
+        assert!(yours_alone(&dir).unwrap_err().contains("chmod go-w"));
+        assert!(fetch_image(&dir, &no_files(), "Test", None)
+            .unwrap_err()
+            .contains("chmod go-w"));
+        assert!(
+            !dir.join("pull.lock").exists(),
+            "no lock file is made in a directory others can write"
+        );
+        set(&dir, 0o755);
+        for sub in [
+            "lbi",
+            "processor",
+            "transformer",
+            "vae",
+            "text_encoder",
+            "vae/work",
+        ] {
+            mkdirs(&dir.join(sub));
+            set(&dir.join(sub), 0o775);
+            assert!(
+                fetch_image(&dir, &no_files(), "Test", None)
+                    .unwrap_err()
+                    .contains("chmod go-w"),
+                "{sub}"
+            );
+            set(&dir.join(sub), 0o755);
+        }
+        std::fs::remove_dir(dir.join("vae/work")).unwrap();
+        for sub in ["lbi", "processor", "transformer", "vae", "text_encoder"] {
+            std::fs::remove_dir(dir.join(sub)).unwrap();
+        }
+        // A link in place of the model's directory itself.
+        let target = root.join("elsewhere-model");
+        mkdirs(&target);
+        let linked = root.join("linked-model");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(fetch_image(&linked, &no_files(), "Test", None)
+            .unwrap_err()
+            .contains("not a directory"));
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing written through the link"
+        );
+        for sub in ["lbi", "processor", "transformer", "vae", "text_encoder"] {
+            let elsewhere = root.join(format!("elsewhere-{sub}"));
+            mkdirs(&elsewhere);
+            std::fs::write(elsewhere.join("vae.lbi"), b"not the cache's").unwrap();
+            std::fs::write(elsewhere.join("vae.lbi.part"), b"not the cache's").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, dir.join(sub)).unwrap();
+            assert!(fetch_image(&dir, &no_files(), "Test", None)
+                .unwrap_err()
+                .contains("not a directory"));
+            assert!(
+                elsewhere.join("vae.lbi").is_file() && elsewhere.join("vae.lbi.part").is_file(),
+                "nothing removed through the link at {sub}"
+            );
+            std::fs::remove_file(dir.join(sub)).unwrap();
+        }
+        // SAFETY: geteuid has no failure mode.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(yours_alone(std::path::Path::new("/"))
+                .unwrap_err()
+                .contains("belongs to another user"));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A small checkpoint pinned to its own bytes: one F32 tensor per
+    /// component and tokenizer files, every one already downloaded, so the
+    /// pull converts without the network.
+    fn local_checkpoint(dir: &std::path::Path) -> registry::Checkpoint {
+        let mut files = Vec::new();
+        let mut add = |path: &str, bytes: &[u8]| {
+            let full = dir.join(path);
+            mkdirs(full.parent().unwrap());
+            std::fs::write(&full, bytes).unwrap();
+            files.push(registry::CheckpointFile {
+                path: path.to_owned(),
+                size: bytes.len() as u64,
+                sha256: download::compute_sha256(&full).unwrap(),
+            });
+        };
+        for component in lumen_image::convert::COMPONENTS {
+            add(&format!("{component}/config.json"), br#"{"probe":true}"#);
+            let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header);
+            bytes.extend_from_slice(&[1, 2, 3, 4]);
+            add(&format!("{component}/model.safetensors"), &bytes);
+        }
+        for name in ["vocab.json", "merges.txt", "added_tokens.json"] {
+            add(&format!("processor/{name}"), b"{}");
+        }
+        registry::Checkpoint {
+            repo: "org/repo".to_owned(),
+            revision: "abc".to_owned(),
+            files,
+        }
+    }
+
+    #[test]
+    fn a_pull_with_every_file_present_converts_and_keeps_only_what_the_server_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("pull");
+        // A cache directory the user's group can write, as umask 002 leaves it.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let dir = root.join("qwen-image-2-1");
+        let checkpoint = local_checkpoint(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A file the user's group can write, as umask 002 leaves it, and a
+        // link of the user's to a directory of root's.
+        std::fs::set_permissions(
+            dir.join("processor/vocab.json"),
+            std::fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/", dir.join("root")).unwrap();
+        // What an earlier, dead conversion and the user left there.
+        let lbi = dir.join("lbi");
+        mkdirs(&lbi);
+        std::fs::write(lbi.join("vae.lbi"), b"garbage").unwrap();
+        let (part, tmp) = lumen_image::lbi::staging_paths(&lbi.join("text_encoder.lbi"));
+        std::fs::write(&part, b"stale").unwrap();
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::write(dir.join("vae/notes.txt"), b"mine").unwrap();
+
+        // Every file is there, so nothing is asked: a "no" is never read.
+        let mut no = &b"n\n"[..];
+        assert_eq!(
+            fetch_image(&dir, &checkpoint, "Test", Some(&mut no)),
+            Ok(false)
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&lbi)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["text_encoder.lbi", "transformer.lbi", "vae.lbi"]);
+        for component in lumen_image::convert::COMPONENTS {
+            let file = lumen_image::lbi::LbiFile::open(&lbi.join(format!("{component}.lbi")));
+            assert_eq!(file.unwrap().len(), 1, "{component} converted again");
+        }
+        assert!(!dir.join("transformer").exists() && !dir.join("text_encoder").exists());
+        assert_eq!(std::fs::read(dir.join("vae/notes.txt")).unwrap(), b"mine");
+        assert!(!dir.join("vae/model.safetensors").exists());
+        assert!(dir.join("processor/vocab.json").is_file());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_failed_conversion_leaves_no_converted_file_from_before() {
+        let root = scratch("pull-fails");
+        let dir = root.join("qwen-image-2-1");
+        let mut checkpoint = local_checkpoint(&dir);
+        let source = dir.join("transformer/model.safetensors");
+        std::fs::write(&source, b"not safetensors").unwrap();
+        let pin = checkpoint
+            .files
+            .iter_mut()
+            .find(|f| f.path == "transformer/model.safetensors")
+            .unwrap();
+        pin.size = std::fs::metadata(&source).unwrap().len();
+        pin.sha256 = download::compute_sha256(&source).unwrap();
+        mkdirs(&dir.join("lbi"));
+        std::fs::write(dir.join("lbi/vae.lbi"), b"garbage").unwrap();
+
+        let err = fetch_image(&dir, &checkpoint, "Test", None).unwrap_err();
+        assert!(err.contains("conversion failed"), "{err}");
+        assert!(!dir.join("lbi/vae.lbi").exists());
+        assert!(source.is_file(), "sources stay for the next pull");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_first_pull_creates_the_cache_and_the_model_directory() {
+        let root = scratch("fresh");
+        let dir = root.join("home/.cache/lumen/qwen-image-2-1");
+        let err = fetch_image(&dir, &no_files(), "Test", None).unwrap_err();
+        assert!(err.contains("conversion failed"), "{err}");
+        assert!(dir.join("lbi").is_dir());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pull_asks_before_downloading_what_is_missing_or_not_as_pinned() {
+        let root = scratch("pull-asks");
+        let dir = root.join("qwen-image-2-1");
+        let checkpoint = local_checkpoint(&dir);
+        let declined = Err(download::DownloadError::UserDeclined.to_string());
+        mkdirs(&dir.join("lbi"));
+        std::fs::write(dir.join("lbi/vae.lbi"), b"refused by the server").unwrap();
+        let (part, _) = lumen_image::lbi::staging_paths(&dir.join("lbi/text_encoder.lbi"));
+        std::fs::write(&part, b"a dead conversion's").unwrap();
+        let mut no = &b"n\n"[..];
+        std::fs::write(dir.join("processor/vocab.json"), b"[]").unwrap();
+        assert_eq!(
+            fetch_image(&dir, &checkpoint, "Test", Some(&mut no)),
+            declined,
+            "a file with other bytes"
+        );
+        std::fs::write(dir.join("processor/vocab.json"), b"{}").unwrap();
+        std::fs::remove_file(dir.join("transformer/model.safetensors")).unwrap();
+        let mut no = &b"n\n"[..];
+        assert_eq!(
+            fetch_image(&dir, &checkpoint, "Test", Some(&mut no)),
+            declined,
+            "a missing file"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("lbi/vae.lbi")).unwrap(),
+            b"refused by the server",
+            "a declined pull keeps the conversion"
+        );
+        assert!(
+            !part.exists(),
+            "a dead conversion's staging file is removed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pull_waits_while_another_pull_of_the_model_runs() {
+        let root = scratch("pull-waits");
+        let dir = root.join("qwen-image-2-1");
+        let checkpoint = local_checkpoint(&dir);
+        let other = lock_pull(&dir, "Test").expect("locks are supported here");
+        // The holder's work in progress, which the waiting pull must not judge.
+        mkdirs(&dir.join("vae/work"));
+        std::fs::set_permissions(
+            dir.join("vae/work"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .unwrap();
+        let waiting = dir.clone();
+        let pull = std::thread::spawn(move || fetch_image(&waiting, &checkpoint, "Test", None));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !pull.is_finished() && !dir.join("lbi").exists(),
+            "the pull must not start while another holds the model"
+        );
+        std::fs::remove_dir(dir.join("vae/work")).unwrap();
+        drop(other);
+        assert_eq!(pull.join().unwrap(), Ok(false));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_file_is_reused_only_with_its_pinned_size_and_hash() {
+        let dir = scratch("reusable");
+        std::fs::create_dir_all(dir.join("processor")).unwrap();
+        let pinned = registry::CheckpointFile {
+            path: "processor/vocab.json".to_owned(),
+            size: 18,
+            sha256: download::sha256_of_reader(&mut &b"stored model bytes"[..]).unwrap(),
+        };
+        let path = dir.join(&pinned.path);
+        assert_eq!(reusable(&dir, &pinned), Ok(false), "absent");
+        std::fs::write(&path, b"stored model bytes").unwrap();
+        assert_eq!(reusable(&dir, &pinned), Ok(true));
+        std::fs::write(&path, b"stored model bytez").unwrap();
+        assert_eq!(reusable(&dir, &pinned), Ok(false), "same size, other bytes");
+        std::fs::write(&path, b"stored model bytes!").unwrap();
+        assert_eq!(reusable(&dir, &pinned), Ok(false), "other size");
+        // A link of the file's length to a file with its bytes.
+        std::fs::write(
+            dir.join("processor/abcdefghijklmnopqr"),
+            b"stored model bytes",
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("abcdefghijklmnopqr", &path).unwrap();
+        assert_eq!(reusable(&dir, &pinned), Ok(false), "a link is not the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_conversion_is_reused_only_when_the_server_would_accept_it() {
+        let dir = scratch("converted");
+        let lbi = dir.join("lbi");
+        std::fs::create_dir_all(&lbi).unwrap();
+        assert!(!converted(&dir, &lbi), "nothing converted");
+        for component in lumen_image::convert::COMPONENTS {
+            std::fs::write(lbi.join(format!("{component}.lbi")), b"garbage").unwrap();
+        }
+        assert!(!converted(&dir, &lbi), "files that do not open");
+        for component in lumen_image::convert::COMPONENTS {
+            let path = lbi.join(format!("{component}.lbi"));
+            lumen_image::lbi::LbiWriter::create(&path, serde_json::json!({}))
+                .unwrap()
+                .finish()
+                .unwrap();
+        }
+        assert!(
+            !converted(&dir, &lbi),
+            "containers that open but hold no model"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_second_pull_waits_for_the_first() {
         let dir = scratch("lock");
+        assert!(
+            !mounted_read_only(&dir),
+            "a scratch directory can be written"
+        );
         let first = lock_pull(&dir, "Test").expect("locks are supported here");
         assert_eq!(
             std::fs::read(dir.join("pull.lock")).unwrap(),
             b"",
             "the lock file is empty"
         );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("pull.lock"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "no other user can open it to hold it");
+        }
         let dir2 = dir.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let second = std::thread::spawn(move || {
@@ -739,9 +1306,21 @@ mod pull_image_tests {
         let dir = scratch("lock-link");
         let target = dir.join("victim");
         std::fs::write(&target, b"do not truncate").unwrap();
+        // Readable by others, as an existing lock file may be.
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
         std::os::unix::fs::symlink(&target, dir.join("pull.lock")).unwrap();
         let err = lock_pull(&dir, "Test").unwrap_err();
-        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains("is a symbolic link; remove it"), "{err}");
+        // A named pipe there neither blocks the open nor passes for the lock.
+        let pipe_dir = dir.join("pipe");
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        let fifo = std::ffi::CString::new(pipe_dir.join("pull.lock").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(lock_pull(&pipe_dir, "Test")
+            .unwrap_err()
+            .contains("not a regular file"));
         assert_eq!(std::fs::read(&target).unwrap(), b"do not truncate");
         std::fs::remove_file(dir.join("pull.lock")).unwrap();
         // A hard link (a backup made with `cp -al`, say) is the same file: the

@@ -32,7 +32,7 @@ Reference: top-level [`README.md`](../README.md) § Build.
 
 ## 2. Pull a model
 
-The registry currently lists the v1 cells (Qwen3.5 family plus the Qwen3.8-27B dense model). Future model families will appear here as they ship.
+The registry currently lists the v1 cells (Qwen3.5 family plus the Qwen3.8-27B dense model) and the Qwen-Image-2.1 image model ([image generation](image-generation.md)). Future model families will appear here as they ship.
 
 ```bash
 # Default: Qwen3.5-9B at Q8_0 (~10 GB GGUF download, converts to LBC on first use)
