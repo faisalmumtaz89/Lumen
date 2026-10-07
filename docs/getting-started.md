@@ -6,11 +6,13 @@ This page is the 5-minute path: install, pull a model, run inference. The Qwen3.
 
 ## 1. Install
 
-**Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs `lumen` + `lumen-server`, and helps you set up a model:
+**Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA) and installs `lumen` + `lumen-server`. It asks nothing and downloads no model: `lumen run` and `lumen image` download theirs on first use.
 
 ```bash
 curl -fsSL https://servelumen.com/install.sh | bash
 ```
+
+To download a model during the install, name it: `... | bash -s -- --model qwen3.8-27b:q4_0`, or `--model qwen-image` for the text-to-image model (NVIDIA only).
 
 **Or build from source** (needs the Rust toolchain):
 

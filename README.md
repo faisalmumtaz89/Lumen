@@ -29,7 +29,7 @@ That one command downloads the model on first use, converts it, picks your backe
 
 Get Lumen one of two ways, then run.
 
-**Option A — pre-built binary** (no Rust toolchain). One command detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA), installs the matching validated binary, and helps you set up a model:
+**Option A — pre-built binary** (no Rust toolchain). One command detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA) and installs the matching validated binary; models download on first use (`--model <name>` downloads one during the install):
 
 ```bash
 curl -fsSL https://servelumen.com/install.sh | bash

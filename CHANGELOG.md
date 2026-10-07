@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **The installer asks nothing and downloads no model by default.** Models download on
+  first use; `--model <name>` still downloads one during the install, and now accepts
+  `qwen-image` (NVIDIA only). The interactive model menu is gone.
+
 ## [0.44.0] — 2026-10-07
 
 ### Added
