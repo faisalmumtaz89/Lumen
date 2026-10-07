@@ -15,7 +15,8 @@ lumen-runtime     CUDA backend (200+ NVRTC kernels across ~34 families), Metal b
                   GDN recurrent state, sampling, sessions, suffix prefill
 lumen-server      axum HTTP server: OpenAI + Anthropic SSE endpoints, tool calling
 lumen-bench       benchmark harness with JSON + table output
-lumen-cli         CLI: built-in BPE tokenizer, model registry, HuggingFace downloader
+lumen-cli         CLI: built-in BPE tokenizer, model registry, HuggingFace downloader,
+                  image model pull and conversion
 lumen-image       Qwen-Image-2.1 text-to-image (CUDA) and the lbi-convert converter
 ```
 

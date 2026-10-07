@@ -203,7 +203,7 @@ fn run() -> Result<(), String> {
     let dir = PathBuf::from(args.next().unwrap_or_else(usage));
 
     let mut total = 0usize;
-    for component in ["transformer", "vae", "text_encoder"] {
+    for component in lumen_image::convert::COMPONENTS {
         let (n, bytes) = verify_component(&ckpt, component, &dir.join(format!("{component}.lbi")))?;
         total += n;
         println!(

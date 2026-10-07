@@ -41,9 +41,13 @@ pub enum ConvertError {
     ShardIndexMismatch(Box<ShardIndexMismatch>),
     /// A written `.lbi`, opened again, does not hold the tensors written.
     ReadBack {
-        component: String,
         written: usize,
         read: usize,
+    },
+    /// Converting one component of a checkpoint failed.
+    Component {
+        component: String,
+        error: Box<ConvertError>,
     },
 }
 
@@ -74,14 +78,10 @@ impl std::fmt::Display for ConvertError {
                  duplicated={:?} misplaced={:?} unindexed shard files={:?}",
                 m.component, m.missing, m.unexpected, m.duplicated, m.misplaced, m.unreferenced
             ),
-            Self::ReadBack {
-                component,
-                written,
-                read,
-            } => write!(
-                f,
-                "{component}: wrote {written} tensors but read back {read}"
-            ),
+            Self::ReadBack { written, read } => {
+                write!(f, "wrote {written} tensors but read back {read}")
+            }
+            Self::Component { component, error } => write!(f, "convert {component}: {error}"),
         }
     }
 }
@@ -147,35 +147,59 @@ pub const COMPONENTS: [&str; 3] = ["transformer", "vae", "text_encoder"];
 /// Convert `<checkpoint_dir>/{transformer,vae,text_encoder}` into
 /// `<out_dir>/{transformer,vae,text_encoder}.lbi`, each from its shard index
 /// when it has one and from its single file otherwise, then open every file
-/// written and check it holds the tensors written. One report per component,
-/// in [`COMPONENTS`] order.
+/// written and check it holds the tensors written; a file that does not is
+/// removed. `converted` is called with each component's report, in
+/// [`COMPONENTS`] order, as soon as that component is done.
 pub fn convert_checkpoint(
     checkpoint_dir: &Path,
     out_dir: &Path,
-) -> Result<Vec<ConvertReport>, ConvertError> {
-    std::fs::create_dir_all(out_dir)?;
+    mut converted: impl FnMut(&ConvertReport),
+) -> Result<(), ConvertError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        ConvertError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", out_dir.display()),
+        ))
+    })?;
     remove_staging(out_dir)?;
-    let mut reports = Vec::with_capacity(COMPONENTS.len());
     for component in COMPONENTS {
-        let comp_dir = checkpoint_dir.join(component);
-        let config = component_config(&comp_dir)?;
         let target = out_dir.join(format!("{component}.lbi"));
-        let report = if has_shard_index(&comp_dir) {
-            convert_component(checkpoint_dir, component, &target, config)?
-        } else {
-            convert_single_file(&single_shard(&comp_dir)?, component, &target, config)?
-        };
-        let read = LbiFile::open(&target)?.len();
-        if read != report.tensor_count {
-            return Err(ConvertError::ReadBack {
+        let report = convert_one(checkpoint_dir, component, &target).map_err(|e| {
+            ConvertError::Component {
                 component: component.to_string(),
+                error: Box::new(e),
+            }
+        })?;
+        converted(&report);
+    }
+    Ok(())
+}
+
+/// Convert one component into `target` and check it reads back whole.
+fn convert_one(
+    checkpoint_dir: &Path,
+    component: &str,
+    target: &Path,
+) -> Result<ConvertReport, ConvertError> {
+    let comp_dir = checkpoint_dir.join(component);
+    let config = component_config(&comp_dir)?;
+    let report = if has_shard_index(&comp_dir) {
+        convert_component(checkpoint_dir, component, target, config)?
+    } else {
+        convert_single_file(&single_shard(&comp_dir)?, component, target, config)?
+    };
+    let read = LbiFile::open(target).map(|f| f.len());
+    if read.as_ref().ok() != Some(&report.tensor_count) {
+        let _ = std::fs::remove_file(target);
+        return Err(match read {
+            Ok(read) => ConvertError::ReadBack {
                 written: report.tensor_count,
                 read,
-            });
-        }
-        reports.push(report);
+            },
+            Err(e) => e.into(),
+        });
     }
-    Ok(reports)
+    Ok(report)
 }
 
 /// Remove the staging files a conversion into `out_dir` that died left

@@ -55,15 +55,9 @@ impl PipelinePaths {
         }
     }
 
-    /// Open every required file the way a generation will, without reading
-    /// weights: the text encoder's whole tensor manifest (and, when `gpu`,
-    /// everything the device text tower would refuse to load), the
-    /// transformer's and the VAE's configuration plus the tensors that
-    /// identify each container as that component at the expected shapes
-    /// (stored as bf16 when `gpu`, which is what the device transformer
-    /// multiplies), and the tokenizer with the chat template's markers as
-    /// whole tokens. A checkpoint that fails here would fail every request.
-    pub fn check(&self, gpu: bool) -> Result<(), PipelineError> {
+    /// The part of [`check`](Self::check) that concerns the three converted
+    /// components: whether a conversion is usable, the tokenizer files aside.
+    pub fn check_components(&self, gpu: bool) -> Result<(), PipelineError> {
         let named = |path: &Path, e: &dyn std::fmt::Display| {
             PipelineError::Unsupported(format!("{}: {e}", path.display()))
         };
@@ -123,6 +117,19 @@ impl PipelinePaths {
             expect_tensor(&file, name, &shape, false).map_err(|e| named(&self.vae, &e))?;
         }
 
+        Ok(())
+    }
+
+    /// Open every required file the way a generation will, without reading
+    /// weights: the text encoder's whole tensor manifest (and, when `gpu`,
+    /// everything the device text tower would refuse to load), the
+    /// transformer's and the VAE's configuration plus the tensors that
+    /// identify each container as that component at the expected shapes
+    /// (stored as bf16 when `gpu`, which is what the device transformer
+    /// multiplies), and the tokenizer with the chat template's markers as
+    /// whole tokens. A checkpoint that fails here would fail every request.
+    pub fn check(&self, gpu: bool) -> Result<(), PipelineError> {
+        self.check_components(gpu)?;
         let tokenizer = Tokenizer::from_files_with_added(
             &self.vocab,
             &self.merges,

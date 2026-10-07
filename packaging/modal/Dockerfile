@@ -33,7 +33,7 @@
 # registry lookup that does NOT auto-download in the container. To fetch a model
 # into a mounted cache first:
 #   docker run --rm -v lumen-models:/cache -e LUMEN_CACHE_DIR=/cache \
-#     --entrypoint /opt/lumen/bin/lumen lumen-cuda:phase1 pull qwen3.5-9b:q8_0
+#     --entrypoint /opt/lumen/bin/lumen lumen-cuda:phase1 pull qwen3.5-9b:q8_0 --yes
 # then run the server with --model <the .lbc path under /cache>.
 
 FROM nvidia/cuda:12.2.2-devel-ubuntu22.04

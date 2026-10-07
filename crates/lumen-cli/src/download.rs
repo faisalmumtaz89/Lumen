@@ -577,29 +577,27 @@ mod inner {
         Ok(values.first().and_then(|cl| cl.parse::<u64>().ok()))
     }
 
-    /// Prompt the user for [Y/n] confirmation.
-    ///
-    /// Returns `true` if the user accepts (Enter or Y/y), `false` otherwise.
-    fn confirm_download(
-        repo: &str,
-        filename: &str,
-        size: Option<u64>,
+    /// Ask `question` with `[Y/n]` on stderr and read the reply from
+    /// `answers`; Enter, `y` or `yes` accepts.
+    /// The end of the input is no answer: a pull whose input is closed and
+    /// has no `--yes` must not download, and says why.
+    pub(crate) fn confirm(
+        question: &str,
+        answers: &mut impl std::io::BufRead,
     ) -> Result<bool, DownloadError> {
-        let size_str = match size {
-            Some(s) => crate::cache::format_size(s),
-            None => "unknown size".to_owned(),
-        };
-        eprint!("Download {filename} from {repo} ({size_str})? [Y/n] ");
+        eprint!("{question} [Y/n] ");
         std::io::stderr().flush().ok();
 
         let mut input = String::new();
-        let read = std::io::stdin()
+        let read = answers
             .read_line(&mut input)
             .map_err(|e| DownloadError::Io(format!("failed to read confirmation: {e}")))?;
-        // The end of the input is no answer: a pull with no terminal and no
-        // --yes must not download.
         if read == 0 {
-            return Ok(false);
+            eprintln!();
+            return Err(DownloadError::Io(
+                "no answer: standard input is closed; pass --yes to download without asking"
+                    .to_owned(),
+            ));
         }
 
         let trimmed = input.trim();
@@ -650,8 +648,10 @@ mod inner {
 
     /// Download one file of a checkpoint pinned to a commit: `file.path` at
     /// `revision` of `repo`, stored under its basename in `dest_dir` only when
-    /// the bytes received have the size and SHA-256 pinned, so an upload that
-    /// replaced the file is refused. The caller has confirmed the download.
+    /// the bytes received have the size and SHA-256 pinned, so a damaged
+    /// transfer or a partial file holding other bytes is refused. A file
+    /// already at that name is taken as downloaded, so the caller removes one
+    /// it has not checked. The caller has confirmed the download.
     pub fn download_pinned(
         repo: &str,
         revision: &str,
@@ -736,7 +736,13 @@ mod inner {
         let size = get_remote_size(&url, &route)?;
 
         // Confirm with user unless --yes was passed.
-        if !skip_confirm && !confirm_download(repo, filename, size)? {
+        let shown = size.map_or_else(|| "unknown size".to_owned(), crate::cache::format_size);
+        if !skip_confirm
+            && !confirm(
+                &format!("Download {filename} from {repo} ({shown})?"),
+                &mut std::io::stdin().lock(),
+            )?
+        {
             return Err(DownloadError::UserDeclined);
         }
 
@@ -898,10 +904,13 @@ mod inner {
         let _ = partial.forget_source();
         drop(partial);
 
-        // Write SHA-256 sidecar (shared name, last-writer-wins by design).
-        std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
-            DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
-        })?;
+        // Write SHA-256 sidecar (shared name, last-writer-wins by design). A
+        // pinned file's hash is the registry's, so it has none.
+        if pinned.is_none() {
+            std::fs::write(&sha_path, format!("{hash}  {filename}\n")).map_err(|e| {
+                DownloadError::Io(format!("failed to write {}: {e}", sha_path.display()))
+            })?;
+        }
         // What other downloads of the file kept is of no use from now on.
         reclaim_stale_parts(dest_dir, filename);
 
@@ -3883,7 +3892,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), BODY);
-        assert_eq!(entries(&dir), vec!["m.gguf", "m.gguf.sha256"]);
+        assert_eq!(
+            entries(&dir),
+            vec!["m.gguf"],
+            "a pinned file gets no record"
+        );
         let heads = server.join().unwrap();
         assert!(
             heads
@@ -3892,6 +3905,29 @@ mod tests {
             "the file must be asked for at the pinned revision, got:\n{heads:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Enter, `y` and `yes` accept and anything else declines; a closed
+    /// input is no answer.
+    #[cfg(feature = "download")]
+    #[test]
+    fn a_prompt_accepts_only_yes_and_takes_a_closed_input_as_no_answer() {
+        for (reply, accepted) in [
+            ("\n", true),
+            ("y\n", true),
+            ("Y\n", true),
+            ("YES\n", true),
+            ("n\n", false),
+            ("sure\n", false),
+        ] {
+            assert_eq!(
+                confirm("Download?", &mut reply.as_bytes()).unwrap(),
+                accepted,
+                "{reply:?}"
+            );
+        }
+        let err = confirm("Download?", &mut &b""[..]).unwrap_err();
+        assert!(err.to_string().contains("pass --yes"), "{err}");
     }
 
     /// Bytes with another hash or another size are not the pinned file:
@@ -3903,7 +3939,9 @@ mod tests {
             ("pinned-hash", pinned(BODY.len() as u64, &"0".repeat(64))),
             ("pinned-size", pinned(BODY.len() as u64 + 1, BODY_SHA256)),
         ] {
-            let (base, _server) = serve_like_hf(4, "", "", "200 OK");
+            // With an ETag the download keeps a resume record, which must go too.
+            let etag = "ETag: \"v1\"\r\n";
+            let (base, _server) = serve_like_hf(4, etag, etag, "200 OK");
             let dir = scratch_dir(tag);
             let err = super::download_file(
                 &base,

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use lumen_format::QuantScheme;
@@ -215,22 +215,33 @@ pub fn staging_paths(path: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-/// A writer's staging files, removed when the writer goes away without
-/// having finished, so a failed or abandoned conversion leaves nothing
-/// behind (a process that dies leaves them for the next conversion to
-/// remove).
+/// Create a staging file, emptying one an interrupted run left, and never
+/// through a symbolic link: in a directory others can write to, a link
+/// planted at a staging name would otherwise have the writer empty its target.
+fn create_staging(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// A writer's staging files, removed when the writer goes away, so a failed
+/// or abandoned conversion leaves nothing behind (a finished one has renamed
+/// and removed them already; a process that dies leaves them for the next
+/// conversion to remove).
 struct Staging {
     part: PathBuf,
     tmp: PathBuf,
-    done: bool,
 }
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        if !self.done {
-            let _ = std::fs::remove_file(&self.part);
-            let _ = std::fs::remove_file(&self.tmp);
-        }
+        let _ = std::fs::remove_file(&self.part);
+        let _ = std::fs::remove_file(&self.tmp);
     }
 }
 
@@ -246,15 +257,9 @@ impl LbiWriter {
         let (part, tmp) = staging_paths(path);
         // The guard exists before either file, so a create that fails after
         // the first leaves nothing behind.
-        let staging = Staging {
-            part,
-            tmp,
-            done: false,
-        };
-        // Truncating creates: any leftover from an interrupted run is
-        // discarded rather than appended to.
-        let out = BufWriter::new(File::create(&staging.part)?);
-        let blob = BufWriter::new(File::create(&staging.tmp)?);
+        let staging = Staging { part, tmp };
+        let out = BufWriter::new(create_staging(&staging.part)?);
+        let blob = BufWriter::new(create_staging(&staging.tmp)?);
         Ok(Self {
             out,
             blob,
@@ -350,9 +355,6 @@ impl LbiWriter {
         let blob_start = align_up(
             HEADER_BYTES + names.len() as u64 + 4 + self.config.len() as u64 + index_bytes,
         );
-        // Flush the tensor bytes before the blob region is appended.
-        self.blob.flush()?;
-
         self.out.write_all(&LBI_MAGIC)?;
         self.out.write_all(&LBI_VERSION.to_le_bytes())?;
         self.out
@@ -387,8 +389,13 @@ impl LbiWriter {
             self.out.write_all(&[0u8])?;
         }
 
-        // Stream the blob region across; never the whole file at once.
-        let mut src = File::open(&self.staging.tmp)?;
+        // Stream the blob region across, through the handle that wrote it;
+        // never the whole file at once.
+        let mut src = self
+            .blob
+            .into_inner()
+            .map_err(|e| LbiError::Io(e.into_error()))?;
+        src.seek(SeekFrom::Start(0))?;
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = src.read(&mut buf)?;
@@ -397,13 +404,14 @@ impl LbiWriter {
             }
             self.out.write_all(&buf[..n])?;
         }
-        self.out.flush()?;
+        // On disk before the rename publishes it: a caller may delete the
+        // source as soon as this returns.
         self.out
             .into_inner()
-            .map_err(|e| LbiError::Io(e.into_error()))?;
+            .map_err(|e| LbiError::Io(e.into_error()))?
+            .sync_all()?;
         std::fs::rename(&self.staging.part, &self.path)?;
         std::fs::remove_file(&self.staging.tmp)?;
-        self.staging.done = true;
         Ok(())
     }
 

@@ -14,7 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["download"]
 download = ["ureq", "url", "percent-encoding", "indicatif", "dirs", "sha2", "dep:lumen-image"]
-cuda = ["lumen-runtime/cuda"]
+cuda = ["lumen-runtime/cuda", "lumen-image?/cuda"]
 
 [dependencies]
 libc = "0.2"
@@ -22,7 +22,8 @@ lumen-format.workspace = true
 lumen-runtime.workspace = true
 lumen-convert.workspace = true
 lumen-bench.workspace = true
-# The image checkpoint converter `lumen pull` runs; no CUDA feature, the conversion is file to file.
+# The image checkpoint converter `lumen pull` runs; with `cuda`, it also
+# checks a conversion as the CUDA server does at start-up.
 lumen-image = { workspace = true, optional = true }
 regex = "1"
 fancy-regex = "0.14"
