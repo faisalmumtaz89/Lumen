@@ -29,8 +29,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **`lumen image "<prompt>"`.** One picture from the cached image model without a server,
   written as a PNG (`-o`, `--size`, `--steps`, `--seed`; the same request gives the same
   bytes as the server). Its first run downloads and converts the model, without asking,
-  on a CUDA device with the 21.0 GiB a generation needs; any other machine is refused
-  before the download. CUDA builds only.
+  when the first visible CUDA device has at least 21.0 GiB of memory, the peak of a
+  2048×2048 generation; otherwise it is refused before the download. CUDA builds only.
 
 ### Changed
 
