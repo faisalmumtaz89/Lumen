@@ -20,8 +20,8 @@ names the file and replaces it once the picture is complete. `--size WxH` (defau
 limits as the endpoint's request below, and the same prompt, size, steps and seed give the
 same bytes as the server does. Its first run downloads and converts the model, as
 `lumen pull qwen-image` below does, without asking first. It runs on CUDA only, like the
-server, and refuses a machine without a CUDA device of at least 21.0 GiB before the
-download.
+server, on the first visible CUDA device, and is refused before the download unless that
+device has at least 21.0 GiB of memory.
 
 `lumen pull qwen-image` downloads the checkpoint from Hugging Face (30.8 GiB, pinned to one
 commit), converts it into the three `.lbi` containers under `qwen-image-2-1/lbi/` in the
