@@ -195,7 +195,7 @@ pub fn format_size(bytes: u64) -> String {
 // ===========================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -208,7 +208,7 @@ mod tests {
     /// the prior value *before* asserting so a failed assertion cannot leak
     /// state to a sibling. Poison-tolerant, mirroring the per-crate `SERIAL`
     /// pattern used elsewhere in the workspace. Test-only.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cache_dir_returns_valid_path() {

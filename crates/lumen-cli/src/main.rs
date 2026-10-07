@@ -16,6 +16,7 @@ pub mod cache;
 mod convert;
 #[allow(unused)]
 mod download;
+mod fit;
 mod help;
 mod image;
 pub mod registry;
@@ -186,6 +187,12 @@ fn pull_cmd(args: &[String]) {
         std::process::exit(1);
     });
 
+    #[cfg(all(feature = "download", feature = "cuda"))]
+    if let Err(e) = fit::check(entry, resolved_name, quant, 0) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
     // Download GGUF -- every shard for multi-shard sources, the single file
     // for legacy single-shard. The primary (first) shard path is what the
     // converter is pointed at; the multi-shard reader auto-discovers siblings
@@ -295,6 +302,17 @@ fn pull_image(
             entry.display_name
         );
         std::process::exit(1);
+    }
+    // A machine that cannot run the model is refused before it downloads.
+    #[cfg(feature = "cuda")]
+    if !cache::cached_image(&entry.key) {
+        if let Err(e) = lumen_image::pipeline::check_device() {
+            eprintln!(
+                "Error: {} cannot run here: {e}; nothing was downloaded.",
+                entry.display_name
+            );
+            std::process::exit(1);
+        }
     }
     let dir = cache::image_checkpoint_dir(&entry.key);
     let mut stdin = std::io::stdin().lock();

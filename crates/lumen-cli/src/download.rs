@@ -554,27 +554,40 @@ mod inner {
     /// the prompt shows an unknown size, and the GET must carry its own
     /// Content-Length, since there is no HEAD size to fall back on.
     fn get_remote_size(url: &str, route: &Route) -> Result<Option<u64>, DownloadError> {
+        Ok(head_size(url, route).unwrap_or_else(|why| {
+            eprintln!("Size unknown before download ({why}); the GET's own length decides.");
+            None
+        }))
+    }
+
+    /// The size a HEAD of `url` reports, as [`get_remote_size`] asks for it,
+    /// printing nothing: `Ok(None)` through a proxy or without a usable
+    /// Content-Length, and why the size is unknown when the HEAD fails.
+    fn head_size(url: &str, route: &Route) -> Result<Option<u64>, String> {
         if route.is_some() {
             return Ok(None);
         }
-        let unknown = |why: String| {
-            eprintln!("Size unknown before download ({why}); the GET's own length decides.");
-            Ok(None)
-        };
         let request = stored_bytes_request("HEAD", url, route);
         let resp = match fenced(|| request.call()) {
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return unknown(format!("HEAD failed: {e}")),
-            Err(()) => return unknown("HEAD response could not be read safely".to_string()),
+            Ok(Err(e)) => return Err(format!("HEAD failed: {e}")),
+            Err(()) => return Err("HEAD response could not be read safely".to_string()),
         };
-        if let Err(e) = reject_unusable_response(&resp, false) {
-            return unknown(format!("HEAD unusable: {e}"));
-        }
-        let values = match header_values(&resp, "content-length") {
-            Ok(values) => values,
-            Err(e) => return unknown(format!("HEAD unusable: {e}")),
-        };
+        reject_unusable_response(&resp, false).map_err(|e| format!("HEAD unusable: {e}"))?;
+        let values =
+            header_values(&resp, "content-length").map_err(|e| format!("HEAD unusable: {e}"))?;
         Ok(values.first().and_then(|cl| cl.parse::<u64>().ok()))
+    }
+
+    /// The size of `filename` in `repo` on Hugging Face, from a HEAD that
+    /// prints nothing; `None` when a HEAD cannot tell it (see
+    /// [`get_remote_size`]) or the proxy setting is unusable, which the
+    /// download itself then reports.
+    pub fn remote_size(repo: &str, filename: &str) -> Option<u64> {
+        let (url_path, _) = super::split_repo_path(filename).ok()?;
+        let url = model_url(BaseUrl::hugging_face().as_str(), repo, "main", &url_path);
+        let route = env_route(&url).ok()?;
+        head_size(&url, &route).ok().flatten()
     }
 
     /// Ask `question` with `[Y/n]` on stderr and read the reply from

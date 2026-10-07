@@ -23,6 +23,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   until it names `:q8_0`; the refusal names both that command and `lumen pull`. `lumen run`
   no longer picks a sole cached quant for a bare name; when another quant is downloaded it
   says so before downloading the default.
+- **A download whose weights the GPU surely cannot hold is refused.** On a CUDA
+  build, `lumen pull` and `lumen run` refuse a text model whose weights alone are bigger than
+  the memory of the GPU it would run on (CUDA device 0 for `lumen pull`, the run's
+  `--cuda-device` for `lumen run`), judged from its download size, before the first byte. The
+  refusal names the model's quantizations this does not rule out. `lumen run`
+  skips the check when it runs on another backend (`--simd`, `--metal`, or `--async` without
+  `--cuda`), and so does a machine without a CUDA device. `lumen pull qwen-image` refuses a
+  machine whose first visible CUDA device lacks the 21.0 GiB the model needs before it
+  downloads, as `lumen image` does.
 
 ## [0.44.0] — 2026-10-07
 

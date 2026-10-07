@@ -42,7 +42,10 @@ ARGUMENTS:
                           default quant (`lumen models` marks it: Q8_0 for qwen3.5-9b, Q4_0
                           for qwen3.8-27b and qwen3.5-moe).
                           qwen-image (Qwen-Image-2.1, NVIDIA CUDA only) takes no quant: its
-                          checkpoint is downloaded and converted for `lumen-server qwen-image`
+                          checkpoint is downloaded and converted for `lumen-server qwen-image`.
+                          On a CUDA build, a text model whose download shows its weights alone
+                          are bigger than CUDA device 0's memory is refused before its first
+                          byte.
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;

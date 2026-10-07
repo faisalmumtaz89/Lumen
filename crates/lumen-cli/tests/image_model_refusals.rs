@@ -157,31 +157,49 @@ fn lumen_offline(args: &[&str]) -> (Option<i32>, String) {
 #[cfg(all(feature = "download", feature = "cuda"))]
 #[test]
 fn a_lumen_with_cuda_asks_before_it_downloads_the_image_model() {
+    let device = lumen_image::pipeline::check_device();
     let (code, stderr) = lumen_offline(&["pull", "qwen-image"]);
     assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("Download Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 ("),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("no answer: standard input is closed; pass --yes"),
-        "{stderr}"
-    );
+    match device {
+        // A machine that cannot run the model is refused before the question.
+        Err(e) => {
+            assert!(stderr.contains(&e.to_string()), "{stderr}");
+            assert!(stderr.contains("nothing was downloaded"), "{stderr}");
+            assert!(!stderr.contains("[Y/n]"), "{stderr}");
+        }
+        Ok(()) => {
+            assert!(
+                stderr.contains("Download Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 ("),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("no answer: standard input is closed; pass --yes"),
+                "{stderr}"
+            );
+        }
+    }
 }
 
 #[cfg(all(feature = "download", feature = "cuda"))]
 #[test]
 fn a_lumen_with_cuda_downloads_without_asking_given_yes() {
+    let device = lumen_image::pipeline::check_device();
     let (code, stderr) = lumen_offline(&["pull", "qwen-image", "--yes"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(!stderr.contains("[Y/n]"), "{stderr}");
-    // It goes on to the download, or, on a disk without room for the model,
-    // to the refusal that comes before it.
-    assert!(
-        stderr.contains("Downloading Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 (")
-            || stderr.contains("Qwen-Image-2.1 needs"),
-        "{stderr}"
-    );
+    match device {
+        Err(e) => {
+            assert!(stderr.contains(&e.to_string()), "{stderr}");
+            assert!(!stderr.contains("Downloading"), "{stderr}");
+        }
+        // It goes on to the download, or, on a disk without room for the
+        // model, to the refusal that comes before it.
+        Ok(()) => assert!(
+            stderr.contains("Downloading Qwen-Image-2.1 from Qwen/Qwen-Image-2.1 (")
+                || stderr.contains("Qwen-Image-2.1 needs"),
+            "{stderr}"
+        ),
+    }
 }
 
 #[cfg(all(feature = "download", feature = "cuda"))]

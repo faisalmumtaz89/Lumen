@@ -35,6 +35,19 @@ pub fn device_count() -> Result<usize, RuntimeError> {
     Ok(count as usize)
 }
 
+/// Total memory of CUDA device `ordinal` in bytes, read from the driver
+/// without creating a context; `None` when the CUDA libraries or the driver
+/// cannot be loaded or there is no such device.
+pub fn device_total_memory(ordinal: usize) -> Option<u64> {
+    if ordinal >= device_count().ok()? {
+        return None;
+    }
+    let dev = cudarc::driver::result::device::get(i32::try_from(ordinal).ok()?).ok()?;
+    // SAFETY: `dev` is a device handle cuDeviceGet returned after cuInit.
+    let total = unsafe { cudarc::driver::result::device::total_mem(dev) }.ok()?;
+    Some(total as u64)
+}
+
 /// Fail with an error that names the CUDA libraries that cannot be loaded.
 /// cudarc panics on the first use of a missing library, so the entry points
 /// check them before any driver, cuBLAS or NVRTC call.
