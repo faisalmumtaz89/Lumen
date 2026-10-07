@@ -940,7 +940,11 @@ pub(crate) fn run_inference(args: &[String]) {
     // Dual-mode --model: if the value looks like a file path (contains / or \,
     // or ends with .lbc/.gguf), treat it as a direct path. Otherwise, try to
     // resolve it as a preset name from the model registry.
-    let model_path = resolve_model_path(&model_path, verbose);
+    // The CUDA device a download is checked against: the one this run uses,
+    // unless it runs on another backend: one chosen explicitly, or the async
+    // engine, which picks CUDA only when told to.
+    let gpu = (use_cuda || !(explicitly_chose_backend || use_async)).then_some(cuda_device);
+    let model_path = resolve_model_path(&model_path, verbose, gpu);
 
     let path = Path::new(&model_path);
     if !path.exists() {
@@ -1522,7 +1526,7 @@ fn effective_max_seq_len(
 /// - Preset with quant tag: `qwen3.5-9b:q4_0` (downloads specific quant)
 /// - Preset without tag: `qwen3.5-9b` (errors with available quants if multiple exist,
 ///   or auto-selects if only one quant is available)
-fn resolve_model_path(value: &str, verbose: bool) -> String {
+fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String {
     // Heuristic: looks like a file path if it contains path separators or
     // ends with a known model file extension.
     let looks_like_path = value.contains('/')
@@ -1667,6 +1671,15 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
                 value, entry.display_name
             );
         }
+        #[cfg(feature = "cuda")]
+        if let Some(ordinal) = gpu {
+            if let Err(e) = crate::fit::check(&entry, model_name, quant, ordinal) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = gpu;
         let gguf_path = resolve_download_gguf_shards(&gguf_source, verbose);
         let lbc_out = crate::cache::lbc_path(&entry.key, quant);
         resolve_convert_to_lbc(&gguf_path, &lbc_out, verbose);
@@ -1678,7 +1691,7 @@ fn resolve_model_path(value: &str, verbose: bool) -> String {
 
     #[cfg(not(feature = "download"))]
     {
-        let _ = gguf_source; // suppress unused warning
+        let _ = (gguf_source, gpu);
         eprintln!("Error: model '{}' is not cached.", value);
         eprintln!("Download it first with: lumen pull {}", value);
         eprintln!("Or pass a direct file path: --model /path/to/model.lbc");

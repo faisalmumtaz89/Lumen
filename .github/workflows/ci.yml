@@ -98,7 +98,7 @@ jobs:
       # A CUDA-built lumen asks before it downloads the image model; reaching the
       # question needs no GPU.
       - name: cuda lumen pull tests
-        run: cargo test --locked -p lumen-cli --features cuda --release --test image_model_refusals
+        run: cargo test --locked -p lumen-cli --features cuda --release --test image_model_refusals --test download_fit
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-runtime/test-prefill-dump,lumen-runtime/test-fault-injection,lumen-server/cuda --release --no-run
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
