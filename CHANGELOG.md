@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **The installer's `--model` uses the model's default quant.** `--model qwen3.8-27b` and
+  `--model qwen3.5-moe` now download Q4_0, their default, as `lumen pull` does; they used to
+  download Q8_0. `--quant` or `name:quant` still names one. The installer's closing hint reads
+  `lumen run qwen3.5-9b`.
+
 ## [0.45.0] — 2026-10-09
 
 ### Changed

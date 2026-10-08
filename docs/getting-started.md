@@ -12,7 +12,7 @@ This page is the 5-minute path: install, pull a model, run inference. The Qwen3.
 curl -fsSL https://servelumen.com/install.sh | bash
 ```
 
-To download a model during the install, name it: `... | bash -s -- --model qwen3.8-27b:q4_0`, or `--model qwen-image` for the text-to-image model (NVIDIA only).
+To download a model during the install, name it: `... | bash -s -- --model qwen3.8-27b` (the model's default quant; `qwen3.8-27b:q8_0` names one), or `--model qwen-image` for the text-to-image model (NVIDIA only).
 
 **Or build from source** (needs the Rust toolchain):
 

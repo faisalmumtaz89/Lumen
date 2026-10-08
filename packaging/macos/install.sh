@@ -19,7 +19,7 @@
 # Options (flags after `bash -s --`, or env):
 #   --model <alias>   LUMEN_MODEL   also download a model now (qwen3.5-9b | qwen3.5-moe | qwen3.8-27b,
 #                                   accepts name:quant; or qwen-image, NVIDIA only)
-#   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16, or q4_k_m | q5_k_m for qwen3.8-27b; default q8_0)
+#   --quant <tag>     LUMEN_QUANT   (q8_0 | q4_0 | bf16, or q4_k_m | q5_k_m for qwen3.8-27b; default: the model's own)
 #   --yes, -y                        accepted for scripts; the installer asks nothing
 #   --prefix <dir>    LUMEN_PREFIX  (install dir; default = auto-selected, see below)
 #   LUMEN_TAG         pin a release tag (e.g. v0.1.0, or a v..-rc.N prerelease); default = latest
@@ -46,7 +46,6 @@ TAG="${LUMEN_TAG:-latest}"
 # only runs when this is empty, so an explicit prefix always wins.
 PREFIX="${LUMEN_PREFIX:-}"
 DEFAULT_MODEL="qwen3.5-9b"
-DEFAULT_QUANT="q8_0"
 MOE_CANONICAL="qwen3.5-moe-35b-a3b"   # the alias that round-trips through pull, run AND lumen-server
 
 MODEL="${LUMEN_MODEL:-}"
@@ -80,7 +79,7 @@ download on first use (`lumen run`, `lumen image`); --model downloads one now.
 Options (after `bash -s --`) / env:
   --model <alias>   LUMEN_MODEL   qwen3.5-9b | qwen3.5-moe | qwen3.8-27b  (accepts name:quant)
                                   qwen-image: the text-to-image model, NVIDIA only
-  --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16 | q4_k_m | q5_k_m   (default q8_0)
+  --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16 | q4_k_m | q5_k_m   (default: the model's own)
                                   q4_k_m / q5_k_m: qwen3.8-27b only, served as stored on CUDA
   --yes, -y                       accepted for scripts; the installer asks nothing
   --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
@@ -430,7 +429,6 @@ fi
 # ── Step 4 · download the model asked for with --model, if any ────────────────
 # The installer asks nothing: without --model, models download on first use.
 if [ -n "$MODEL" ]; then
-  [ "$IMAGE_MODEL" = "1" ] || QUANT="${QUANT:-$DEFAULT_QUANT}"
   # Canonicalize any MoE alias so pull, run AND lumen-server all agree on the cache stem.
   case "$MODEL" in
     qwen3.5-moe|qwen3-5-moe|qwen3.5-moe-35b-a3b|qwen3-5-moe-35b-a3b) MODEL="$MOE_CANONICAL" ;;
@@ -448,6 +446,9 @@ if [ -n "$MODEL" ]; then
       bf16) case "$MODEL" in *moe*|*27b*) need=150 ;; *) need=40 ;; esac ;;
       q8_0) case "$MODEL" in *moe*) need=85 ;; *27b*) need=70 ;; *) need=24 ;; esac ;;
       q4_k_m|q5_k_m) case "$MODEL" in *27b*) need=55 ;; *) need=16 ;; esac ;;
+      # No quant named: the peaks of the models' defaults. model_registry.toml's
+      # default_quant decides the quant, so update this row if a default changes.
+      "")   case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=24 ;; esac ;;
       *)    case "$MODEL" in *moe*) need=48 ;; *27b*) need=40 ;; *) need=14 ;; esac ;;
     esac
     free_gb="$(df -Pk "$cache" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}' || true)"
@@ -478,7 +479,7 @@ elif [ -n "$MODEL" ]; then
   say "  ${C_BOLD}Chat${C_RESET}     lumen run $SPEC \"Write a haiku about light\""
   say "  ${C_BOLD}Serve${C_RESET}    lumen-server $SPEC          ${C_DIM}(OpenAI/Anthropic API · :8000)${C_RESET}"
 else
-  say "  ${C_BOLD}Chat${C_RESET}     lumen run $DEFAULT_MODEL:$DEFAULT_QUANT \"Write a haiku about light\""
+  say "  ${C_BOLD}Chat${C_RESET}     lumen run $DEFAULT_MODEL \"Write a haiku about light\""
   if [ "$BACKEND" = "cuda" ]; then
     say "  ${C_BOLD}Picture${C_RESET}  lumen image \"A red apple on a wooden table\""
   fi
