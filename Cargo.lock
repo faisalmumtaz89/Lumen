@@ -833,6 +833,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "lumen-cli",
  "lumen-convert",
  "lumen-format",

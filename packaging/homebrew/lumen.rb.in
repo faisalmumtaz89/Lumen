@@ -37,7 +37,7 @@ class Lumen < Formula
       Or run the OpenAI-compatible server:
         lumen-server --model qwen3.5-9b --quant q8_0 --port 8000
 
-      Models cache under ~/.cache/lumen (override with LUMEN_CACHE_DIR).
+      Models cache under ~/Library/Caches/lumen (override with LUMEN_CACHE_DIR).
     EOS
   end
 

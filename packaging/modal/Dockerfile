@@ -29,9 +29,10 @@
 #     lumen-cuda:phase1 \
 #     --model /models/qwen3-5-9b-Q8_0.lbc --backend cuda --host 0.0.0.0 --port 8000
 #
-# NOTE: --model takes an LBC *path* here; a bare model NAME ("qwen3.5-9b") is a
-# registry lookup that does NOT auto-download in the container. To fetch a model
-# into a mounted cache first:
+# NOTE: --model takes an LBC *path* here, which is never fetched. A model NAME
+# ("qwen3.5-9b") is fetched at start by /opt/lumen/bin/lumen into
+# LUMEN_CACHE_DIR, so mount a cache volume to keep it. To fetch a model into a
+# mounted cache beforehand:
 #   docker run --rm -v lumen-models:/cache -e LUMEN_CACHE_DIR=/cache \
 #     --entrypoint /opt/lumen/bin/lumen lumen-cuda:phase1 pull qwen3.5-9b:q8_0 --yes
 # then run the server with --model <the .lbc path under /cache>.

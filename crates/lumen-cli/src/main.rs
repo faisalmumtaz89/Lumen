@@ -87,9 +87,11 @@ fn main() {
 fn pull_cmd(args: &[String]) {
     let reg = registry::load_registry();
 
-    // Parse arguments: positional model name, optional --quant and --yes.
+    // Parse arguments: positional model name, optional --quant, --cuda-device
+    // and --yes.
     let mut model_name: Option<&str> = None;
     let mut quant_override: Option<String> = None;
+    let mut cuda_device: usize = 0;
     let mut skip_confirm = false;
 
     let mut i = 0;
@@ -105,6 +107,17 @@ fn pull_cmd(args: &[String]) {
                         })
                         .clone(),
                 );
+            }
+            "--cuda-device" => {
+                i += 1;
+                let value = args.get(i).unwrap_or_else(|| {
+                    eprintln!("Error: --cuda-device requires a device ordinal (e.g. 0, 1)");
+                    std::process::exit(1);
+                });
+                cuda_device = value.parse().unwrap_or_else(|_| {
+                    eprintln!("Error: --cuda-device must be a non-negative integer, got: {value}");
+                    std::process::exit(1);
+                });
             }
             "--yes" | "-y" => {
                 skip_confirm = true;
@@ -163,6 +176,9 @@ fn pull_cmd(args: &[String]) {
         return;
     }
 
+    #[cfg(not(all(feature = "download", feature = "cuda")))]
+    let _ = cuda_device;
+
     // Quant priority: colon tag > --quant flag > the model's default.
     let quant_owned: String = tag_quant.or(quant_override).unwrap_or_else(|| {
         entry
@@ -188,7 +204,7 @@ fn pull_cmd(args: &[String]) {
     });
 
     #[cfg(all(feature = "download", feature = "cuda"))]
-    if let Err(e) = fit::check(entry, resolved_name, quant, 0) {
+    if let Err(e) = fit::check(entry, resolved_name, quant, cuda_device) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

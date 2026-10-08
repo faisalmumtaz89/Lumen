@@ -1294,8 +1294,8 @@ start_server() {
 
   # Build the server argv. Two model forms (both verified against
   # lumen-server.rs::resolve_model_path):
-  #   - registry name + --quant: the server resolves it to the cached LBC
-  #     (it never auto-downloads).
+  #   - registry name + --quant: the server resolves it to the cached LBC,
+  #     downloading it with the `lumen` beside it when it is not cached.
   #   - direct .lbc path: passed verbatim, with NO --quant (the server reads
   #     quant + tokenizer from the file header; --quant is meaningless here).
   # Backend is explicit to match what we built/detected.
