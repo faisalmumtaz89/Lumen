@@ -36,12 +36,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **A download whose weights the GPU surely cannot hold is refused.** On a CUDA
   build, `lumen pull` and `lumen run` refuse a text model whose weights alone are bigger than
   the memory of the GPU their `--cuda-device` names (device 0 by default), judged from its
-  download size, before the first byte. The
-  refusal names the model's quantizations this does not rule out. `lumen run`
+  download size, before the first byte. The refusal names the model's quantizations this
+  does not rule out. `lumen run`
   skips the check when it runs on another backend (`--simd`, `--metal`, or `--async` without
   `--cuda`), and so does a machine without a CUDA device. `lumen pull qwen-image` refuses a
   machine whose first visible CUDA device lacks the 21.0 GiB the model needs before it
   downloads, as `lumen image` does.
+
+### Fixed
+
+- **A conversion stopped by a signal no longer leaves its temp file for good.** A
+  conversion to `.lbc` writes into `<name>.lbc.tmp.<pid>` beside it, which it could not
+  remove when killed, as a stopped `lumen-server` start or `lumen pull` is; a model's
+  temp file is as large as the model. The next conversion to the same file now removes
+  the temp files of conversions that are no longer running.
 
 ## [0.44.0] — 2026-10-07
 

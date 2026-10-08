@@ -128,6 +128,48 @@ fn outputs_differing_after_a_dot_do_not_share_a_temp_path() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A conversion stopped by a signal cannot remove its temp file. The next conversion to
+/// the same output removes the temp files of processes that are gone, however recent,
+/// and any a minute old that no conversion holds; it keeps one a live conversion holds
+/// locked, a fresh one of a running process (a conversion yet to lock its file), and
+/// another output's.
+#[test]
+fn the_next_conversion_removes_what_a_killed_one_left() {
+    let (gguf, out) = case("killed");
+    let name = out.file_name().unwrap().to_string_lossy().into_owned();
+    let now = std::time::SystemTime::now();
+    let hour_ago = now - std::time::Duration::from_secs(3600);
+    let file = |name: &str, modified| {
+        let file = std::fs::File::create(out.with_file_name(name)).unwrap();
+        file.set_modified(modified).unwrap();
+        file
+    };
+    file(&format!("{name}.tmp.2147483646"), hour_ago);
+    file(&format!("{name}.tmp.2147483644"), now);
+    let live = file(&format!("{name}.tmp.2147483645"), hour_ago);
+    // SAFETY: flock on a descriptor `live` owns.
+    let held = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&live), libc::LOCK_EX) };
+    assert_eq!(held, 0, "{}", std::io::Error::last_os_error());
+    let running = format!("{name}.tmp.{}", std::os::unix::process::parent_id());
+    file(&running, now);
+    let other = out.with_file_name(format!("other-{name}.tmp.2147483646"));
+    file(&other.file_name().unwrap().to_string_lossy(), hour_ago);
+
+    convert_gguf_bytes_to_lbc(&gguf, &out, &common::generic()).unwrap();
+    let mut left = siblings(&out);
+    left.sort();
+    for name in &left {
+        std::fs::remove_file(out.with_file_name(name)).ok();
+    }
+    let other_kept = other.exists();
+    std::fs::remove_file(&other).ok();
+    std::fs::remove_file(&out).ok();
+    let mut kept = vec![format!("{name}.tmp.2147483645"), running];
+    kept.sort();
+    assert_eq!(left, kept);
+    assert!(other_kept, "another output's temp file was removed");
+}
+
 /// And a conversion that succeeds leaves the artifact at the output path with no temp
 /// file beside it.
 #[test]
