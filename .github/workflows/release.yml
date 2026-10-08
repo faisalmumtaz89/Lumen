@@ -31,16 +31,25 @@ jobs:
   # ── 1. Build the shippable binaries ONCE, upload as workflow artifacts ────────
   build-linux:
     name: build linux/cuda binaries
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04, the base of the published image (packaging/modal/Dockerfile).
+    # A binary linked against a newer glibc can require it, so this label sets the
+    # oldest glibc the Linux binaries start on; packaging/ci/glibc_floor.sh checks it.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
+      # Its key carries no Ubuntu version: a cache from a newer one holds build
+      # scripts that need that one's glibc.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ubuntu-22.04
       - name: build
         run: |
           cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda,image
           cargo build --release --locked -p lumen-image --bin lbi-convert
+      - name: glibc the binaries need
+        run: packaging/ci/glibc_floor.sh target/release/lumen target/release/lumen-server target/release/lbi-convert
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-cuda-bins
