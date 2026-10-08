@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **The Linux binaries also load NVRTC and cuBLAS from `lib/lumen` beside them.** `lumen`
+  and `lumen-server` look for the CUDA libraries they load in `../lib/lumen` next to
+  themselves as well as on the system's library paths; `LD_LIBRARY_PATH` still comes first.
 - **The installer's `--model` uses the model's default quant.** `--model qwen3.8-27b` and
   `--model qwen3.5-moe` now download Q4_0, their default, as `lumen pull` does; they used to
   download Q8_0. `--quant` or `name:quant` still names one. The installer's closing hint reads
