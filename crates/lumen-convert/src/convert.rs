@@ -444,10 +444,90 @@ impl Drop for TmpGuard {
 /// publishes it stays within one filesystem, and unique per process. The suffix extends
 /// the whole file name — replacing its extension would map every output whose name
 /// differs only after a dot onto one temp path.
-pub(crate) fn tmp_artifact_path(lbc_path: &Path) -> PathBuf {
+fn tmp_artifact_path(lbc_path: &Path) -> PathBuf {
     let mut name = lbc_path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp.{}", std::process::id()));
     lbc_path.with_file_name(name)
+}
+
+/// Creates the temp file a conversion to `lbc_path` writes into, locked while it is
+/// open, after removing the temp files of conversions to `lbc_path` that died: one
+/// stopped by a signal cannot remove its own. `create_new` refuses a pre-existing path
+/// (a symlink or a concurrent conversion's file).
+pub(crate) fn create_tmp_artifact(lbc_path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    remove_dead_tmp_artifacts(lbc_path);
+    let tmp_path = tmp_artifact_path(lbc_path);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    // On a file system without locks every temp file is kept, as it was before.
+    lock(&file);
+    Ok((tmp_path, file))
+}
+
+/// Takes `file`'s exclusive lock without waiting; whether it was taken. A lock held
+/// elsewhere, or a file system without locks, is false.
+fn lock(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a descriptor `file` owns.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Removes the temp files beside `lbc_path` (`<name>.tmp.<pid>`, regular files) that
+/// no process holds the lock on, once the process their name gives is gone or they are
+/// a minute old. The system releases a conversion's lock when the process ends, however
+/// it ends; a live conversion is without its lock only between creating its file and
+/// locking it, which the process check covers, and the minute covers a process another
+/// pid namespace names, or a pid reused since.
+fn remove_dead_tmp_artifacts(lbc_path: &Path) {
+    let dir = match lbc_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut prefix = lbc_path.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".tmp.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .as_encoded_bytes()
+            .strip_prefix(prefix.as_encoded_bytes())
+        else {
+            continue;
+        };
+        if pid.is_empty() || !pid.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 60);
+        let gone = std::str::from_utf8(pid)
+            .ok()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .is_some_and(|pid| {
+                // SAFETY: signal 0 sends nothing; it only checks the process exists.
+                let sent = unsafe { libc::kill(pid, 0) };
+                sent == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            });
+        if meta.is_file()
+            && (gone || old)
+            && std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .is_ok_and(|file| lock(&file))
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn do_convert_from_reader<R: Read + Seek>(
@@ -855,14 +935,9 @@ fn do_convert_from_reader<R: Read + Seek>(
 
     // Write to a unique sibling temp file and rename into place at the end,
     // so a failed conversion never destroys an existing artifact and a
-    // partial file never carries the final name. `create_new` refuses to
-    // follow a pre-existing path (symlink or a concurrent conversion's
-    // file); the guard removes the multi-GB partial on any error exit.
-    let tmp_path = tmp_artifact_path(lbc_path);
-    let output_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)?;
+    // partial file never carries the final name; the guard removes the
+    // multi-GB partial on any error exit.
+    let (tmp_path, output_file) = create_tmp_artifact(lbc_path)?;
     let mut tmp_guard = TmpGuard(Some(tmp_path.clone()));
     let writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
@@ -946,10 +1021,9 @@ fn do_convert_from_reader<R: Read + Seek>(
     // silently ignored and the command could report success on a short file.
     let mut writer = streaming.finish()?;
     std::io::Write::flush(&mut writer)?;
-    writer
-        .into_inner()
-        .map_err(|e| e.into_error())?
-        .sync_all()?;
+    // The file stays open, and so locked, until it carries the final name.
+    let output_file = writer.into_inner().map_err(|e| e.into_error())?;
+    output_file.sync_all()?;
     std::fs::rename(&tmp_path, lbc_path)?;
     tmp_guard.0 = None;
 
@@ -1032,6 +1106,21 @@ mod tests {
         );
 
         builder.build()
+    }
+
+    /// A conversion holds its temp file locked while it is open, which keeps the file
+    /// from another conversion's removal of dead ones; closing it releases the lock.
+    #[test]
+    fn a_conversion_holds_its_temp_file_locked_while_it_is_open() {
+        let dir = temp_dir();
+        let (path, file) = create_tmp_artifact(&dir.join("held.lbc")).unwrap();
+        let other = std::fs::File::open(&path).unwrap();
+        let held = !lock(&other);
+        drop(file);
+        let released = lock(&other);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(held, "the temp file is not locked");
+        assert!(released, "closing the temp file did not release its lock");
     }
 
     /// A real tensor read must go through the production MultiShardReader

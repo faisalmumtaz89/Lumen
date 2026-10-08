@@ -33,7 +33,7 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use crate::arch::qwen35_moe::is_qwen35moe_full_attention_layer;
-use crate::convert::{tmp_artifact_path, ConvertError, ConvertStats, TmpGuard};
+use crate::convert::{create_tmp_artifact, ConvertError, ConvertStats, TmpGuard};
 use crate::ct_planes::{
     permute_col_blocks, permute_k_blocks, permute_rows, permute_zero_point_rows,
 };
@@ -1418,14 +1418,9 @@ pub fn convert_hf_ct_to_lbc(
 
     // Write to a unique sibling temp file and rename into place at the end,
     // so a failed conversion never destroys an existing artifact and a
-    // partial file never carries the final name. `create_new` refuses to
-    // follow a pre-existing path (symlink or a concurrent conversion's
-    // file); the guard removes the multi-GB partial on any error exit.
-    let tmp_path = tmp_artifact_path(lbc_path);
-    let output_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)?;
+    // partial file never carries the final name; the guard removes the
+    // multi-GB partial on any error exit.
+    let (tmp_path, output_file) = create_tmp_artifact(lbc_path)?;
     let mut tmp_guard = TmpGuard(Some(tmp_path.clone()));
     let writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
     let global_tensors = GlobalTensors {
@@ -1472,10 +1467,9 @@ pub fn convert_hf_ct_to_lbc(
     // silently ignored and the command could report success on a short file.
     let mut writer = streaming.finish()?;
     std::io::Write::flush(&mut writer)?;
-    writer
-        .into_inner()
-        .map_err(|e| e.into_error())?
-        .sync_all()?;
+    // The file stays open, and so locked, until it carries the final name.
+    let output_file = writer.into_inner().map_err(|e| e.into_error())?;
+    output_file.sync_all()?;
     std::fs::rename(&tmp_path, lbc_path)?;
     tmp_guard.0 = None;
 
