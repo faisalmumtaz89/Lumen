@@ -59,14 +59,23 @@ jobs:
     # links against NOTHING at build time (libcuda/libnvrtc/libcublas are dlopen'd
     # at runtime) — a GitHub-hosted runner with no CUDA SDK builds it fine.
     name: build linux/cuda (sm_80 target)
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04, the base of the published image (packaging/modal/Dockerfile).
+    # A binary linked against a newer glibc can require it, so this label sets the
+    # oldest glibc the Linux binaries start on; packaging/ci/glibc_floor.sh checks it.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
+      # Its key carries no Ubuntu version: a cache from a newer one holds build
+      # scripts that need that one's glibc.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ubuntu-22.04
       - name: build server (cuda)
         run: cargo build --release --locked -p lumen-server -p lumen-cli --features bin,cuda
+      - name: glibc the binaries need
+        run: packaging/ci/glibc_floor.sh target/release/lumen target/release/lumen-server
       # The workspace clippy gate above runs without the cuda feature, so the
       # CUDA backend's lints are checked here, in the job that already compiles it.
       - name: clippy (cuda feature)
