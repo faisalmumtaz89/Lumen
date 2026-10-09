@@ -26,6 +26,13 @@ fn main() {
 
     println!("cargo:rustc-env=LUMEN_BUILD_VERSION={version}");
 
+    // On Linux the binaries also look for the CUDA libraries they load (NVRTC
+    // and cuBLAS) in ../lib/lumen beside themselves, where the installer puts
+    // NVIDIA's copies when the system has none.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib/lumen");
+    }
+
     // Re-run when the stamp's inputs move. HEAD is a symbolic ref that a
     // same-branch commit never rewrites, so the whole refs directory of the
     // common dir is watched (loose refs, tags, and refs re-created after a
