@@ -3102,15 +3102,14 @@ mod tests {
         );
     }
 
-    // --- F8: CLI strips <tool_call> blocks from stdout via the shared
-    // `parse_final`, byte-identical for tool-free text. These assert the exact
-    // text the CLI prints (`parse_final(...).content`) on the default
-    // (thinking-off) answer path.
+    // --- F8: `parse_final`, the batch tool-call parse the streaming answer in
+    // `answer.rs` is checked against, keeps tool-free text byte-identical and
+    // strips <tool_call> blocks from the content.
 
     #[test]
     fn f8_parse_final_plain_text_is_byte_identical() {
         // The load-bearing F8 invariant: text with NO <tool_call> round-trips
-        // verbatim, so the historical `println!("{text}")` output is unchanged.
+        // verbatim.
         for s in [
             "Hello, world.",
             "multi\nline\noutput",
