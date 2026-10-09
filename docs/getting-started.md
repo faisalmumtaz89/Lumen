@@ -6,7 +6,7 @@ This page is the 5-minute path: install, pull a model, run inference. The Qwen3.
 
 ## 1. Install
 
-**Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA) and installs `lumen` + `lumen-server`. It asks nothing and downloads no model: `lumen run` and `lumen image` download theirs on first use.
+**Fastest — pre-built binary (no toolchain).** Detects your platform (macOS → Metal, Linux x86_64 + NVIDIA → CUDA) and installs `lumen` + `lumen-server`. It asks nothing and downloads no model: `lumen run` and `lumen image` download theirs on first use. On NVIDIA it needs only the driver (535 or newer, 570 or newer for RTX 50 cards): when the machine has no CUDA libraries, it fetches NVIDIA's NVRTC and cuBLAS (670 MB) into `lib/lumen` beside the binaries. To use a CUDA toolkit you install later instead, put its libraries on `LD_LIBRARY_PATH` or delete that `lib/lumen` directory.
 
 ```bash
 curl -fsSL https://servelumen.com/install.sh | bash
