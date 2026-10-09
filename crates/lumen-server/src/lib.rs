@@ -53,7 +53,7 @@ pub mod origins;
 pub mod router;
 pub mod router_image;
 pub mod sse;
-pub mod tokenstop;
+pub use lumen_runtime::tokenstop;
 pub mod wire;
 
 pub use engine::{

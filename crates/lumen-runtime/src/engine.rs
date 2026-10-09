@@ -220,6 +220,21 @@ impl InferenceEngine {
         stop: &StopCondition,
         sampling: &SamplingParams,
     ) -> Result<GenerationResult, RuntimeError> {
+        self.generate_streaming(prompt_tokens, weights, backend, stop, sampling, &mut |_| {})
+    }
+
+    /// [`Self::generate`], calling `on_token` with each generated token as soon
+    /// as it is sampled, in order (the stop token included), so a caller can
+    /// show the answer while it is produced.
+    pub fn generate_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        weights: &dyn WeightProvider,
+        backend: &dyn ComputeBackend,
+        stop: &StopCondition,
+        sampling: &SamplingParams,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<GenerationResult, RuntimeError> {
         let num_layers = self.hyperparams.num_layers as usize;
         if num_layers == 0 {
             return Err(RuntimeError::Config("model has 0 layers".into()));
@@ -332,6 +347,7 @@ impl InferenceEngine {
         let mut next_token =
             sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
+        on_token(next_token);
 
         // GPU-argmax fast path requires NO active penalty (it
         // returns 4-byte argmax, the CPU never sees logits). With a penalty
@@ -346,6 +362,7 @@ impl InferenceEngine {
                 next_token = backend.decode_token_greedy(next_token, weights, &mut kv)?;
                 sampler_state.record(next_token);
                 generated_tokens.push(next_token);
+                on_token(next_token);
             }
         } else if caps.gpu_resident && backend.supports_gpu_sampler(sampling) {
             // [Option A] GPU temperature sampler -> lean GPU-sampled pipeline
@@ -378,6 +395,7 @@ impl InferenceEngine {
                 // owns the authoritative freq array during the loop.
                 sampler_state.record(next_token);
                 generated_tokens.push(next_token);
+                on_token(next_token);
             }
         } else if caps.gpu_resident {
             // GPU-RESIDENT fast path: single command buffer per token.
@@ -387,6 +405,7 @@ impl InferenceEngine {
                 next_token =
                     sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
+                on_token(next_token);
             }
         } else {
             // Streaming/CPU path: per-layer forward_pass + compute_final.
@@ -406,6 +425,7 @@ impl InferenceEngine {
                 next_token =
                     sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
                 generated_tokens.push(next_token);
+                on_token(next_token);
             }
         }
 
@@ -478,6 +498,30 @@ impl InferenceEngine {
         accel: &mut AccelerateBatchBackend,
         stop: &StopCondition,
         sampling: &SamplingParams,
+    ) -> Result<GenerationResult, RuntimeError> {
+        self.generate_with_prefill_streaming(
+            prompt_tokens,
+            weights,
+            backend,
+            accel,
+            stop,
+            sampling,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::generate_with_prefill`], calling `on_token` with each generated
+    /// token as soon as it is sampled, in order (the stop token included).
+    #[cfg(target_os = "macos")]
+    pub fn generate_with_prefill_streaming(
+        &self,
+        prompt_tokens: &[u32],
+        weights: &dyn WeightProvider,
+        backend: &dyn ComputeBackend,
+        accel: &mut AccelerateBatchBackend,
+        stop: &StopCondition,
+        sampling: &SamplingParams,
+        on_token: &mut dyn FnMut(u32),
     ) -> Result<GenerationResult, RuntimeError> {
         let num_layers = self.hyperparams.num_layers as usize;
         if num_layers == 0 {
@@ -554,6 +598,7 @@ impl InferenceEngine {
         let mut next_token =
             sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
         generated_tokens.push(next_token);
+        on_token(next_token);
 
         while !stop.should_stop(next_token, generated_tokens.len()) {
             current_x = self.forward_pass(
@@ -570,6 +615,7 @@ impl InferenceEngine {
             next_token =
                 sample_token_with_state(&mut logits, sampling, &mut sampler_state, &mut rng);
             generated_tokens.push(next_token);
+            on_token(next_token);
         }
 
         let decode_time = decode_start.elapsed();
@@ -760,6 +806,27 @@ impl InferenceEngine {
         backend: &dyn ComputeBackend,
         stop: &StopCondition,
     ) -> Result<GenerationResult, RuntimeError> {
+        self.generate_with_session_streaming(
+            session,
+            prompt_tokens,
+            weights,
+            backend,
+            stop,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::generate_with_session`], calling `on_token` with each generated
+    /// token as soon as it is sampled, in order (the stop token included).
+    pub fn generate_with_session_streaming(
+        &self,
+        session: &mut crate::session::Session,
+        prompt_tokens: &[u32],
+        weights: &dyn WeightProvider,
+        backend: &dyn ComputeBackend,
+        stop: &StopCondition,
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<GenerationResult, RuntimeError> {
         let total_start = Instant::now();
 
         // Validate KV precision once at top of generation, mirroring the
@@ -828,7 +895,9 @@ impl InferenceEngine {
         // the prompt.
         let prompt_len = session.token_count();
         for r in session.stream(backend, weights, max_tokens, &eos_tokens) {
-            generated_tokens.push(r?);
+            let token = r?;
+            generated_tokens.push(token);
+            on_token(token);
         }
         // The stream wrapper appends generated tokens to the session's
         // `tokens` vec via `next_token`; the local `generated_tokens` vec

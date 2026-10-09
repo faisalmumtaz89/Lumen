@@ -9,6 +9,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod answer;
 mod bench;
 #[cfg(test)]
 mod build_script_tests;

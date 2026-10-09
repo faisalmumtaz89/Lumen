@@ -36,11 +36,16 @@ static REPETITION_PENALTY_EXPLICIT: std::sync::atomic::AtomicBool =
 
 /// F4: caller-supplied textual stop sequences (`--stop`), recorded once during
 /// arg parsing. Process-global (same set-once rationale as
-/// `REPETITION_PENALTY_EXPLICIT`) so `print_generated_text` can truncate the
-/// answer at the first matched stop string WITHOUT threading a `Vec<String>`
+/// `REPETITION_PENALTY_EXPLICIT`) so the answer printer can cut the answer at
+/// the first stop sequence to complete WITHOUT threading a `Vec<String>`
 /// through every `run_with_*` / `run_engine` signature. Empty / unset → the
-/// answer prints verbatim (byte-identical to pre-F4).
+/// answer prints verbatim.
 static STOP_SEQUENCES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The `--stop` sequences, empty when none were passed.
+fn stops() -> Vec<String> {
+    STOP_SEQUENCES.get().cloned().unwrap_or_default()
+}
 
 /// Returns the sampling params to actually run with. Identical to `base` except
 /// that, when the operator did NOT pass `--repeat-penalty` explicitly, the
@@ -390,10 +395,9 @@ pub(crate) fn run_inference(args: &[String]) {
                 // F4 CLI parity with the server `stop` / `stop_sequences`. The
                 // flag is REPEATABLE and also accepts a comma-separated list, so
                 // `--stop A --stop B` and `--stop A,B` are equivalent. The
-                // truncation is applied at the print layer (see
-                // `print_generated_text`): the decoded answer is cut at the first
-                // matched stop string, matching the server's user-visible
-                // semantics. Empty entries are ignored.
+                // cut is applied at the print layer (see `answer::AnswerPrinter`):
+                // the answer ends at the first stop sequence to complete, matching
+                // the server's semantics. Empty entries are ignored.
                 i += 1;
                 let val = args.get(i).unwrap_or_else(|| {
                     eprintln!("Error: --stop requires a stop string");
@@ -783,7 +787,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // CLI honours `--think` / `--no-think` (explicit) then
     // `LUMEN_CHAT_ENABLE_THINKING` (env) then the default — identically to the
     // server. Used both for the chat-template `<think>` tail and to drive the
-    // shared ReasoningExtractor in `print_generated_text`.
+    // shared ReasoningExtractor in `answer::AnswerPrinter`.
     let enable_thinking = lumen_runtime::runtime_defaults::resolve_enable_thinking(think_flag);
 
     // F4: record the parsed `--stop` list process-globally so the answer printer
@@ -1786,112 +1790,6 @@ fn resolve_convert_to_lbc(gguf_path: &std::path::Path, lbc_out: &std::path::Path
     }
 }
 
-/// Decode and print generated tokens as text when a tokenizer is available.
-/// Only the generated ANSWER goes to stdout (for piping). When
-/// `enable_thinking` is set, the model's `<think>...</think>` reasoning trace
-/// is split off via the SAME shared [`lumen_runtime::tooling::ReasoningExtractor`]
-/// the server uses and routed to stderr under a `[reasoning]` label, so it
-/// never pollutes the piped answer. No headers or decoration on the answer.
-///
-/// With `enable_thinking == false` (the default) the extractor is a pure
-/// passthrough, so this is byte-identical to the prior `println!("{text}")`.
-fn print_generated_text(
-    tokens: &[u32],
-    tokenizer: Option<&crate::tokenize::BpeTokenizer>,
-    enable_thinking: bool,
-) {
-    // Diagnostic (default OFF, GATE-2 spec-decode acceptance measurement): dump
-    // the RAW generated token ids BEFORE any tokenizer/stop filtering. This fires
-    // in BOTH `--prompt` (text) and `--tokens` (raw-id) modes, so a prefix can be
-    // fed via raw ids (no re-tokenization drift) and the model's next-token argmax
-    // read back exactly. `LUMEN_SPEC_DUMP_IDS=1`. No-op when unset → byte-identical
-    // default output. Goes to stderr; stdout answer path is untouched.
-    if std::env::var("LUMEN_SPEC_DUMP_IDS").as_deref() == Ok("1") {
-        eprintln!("[SPEC_DUMP_IDS] raw_count={} ids={tokens:?}", tokens.len());
-    }
-    if let Some(tok) = tokenizer {
-        let stop_ids = &tok.stop_token_ids;
-        let clean: Vec<u32> = tokens
-            .iter()
-            .copied()
-            .filter(|t| !stop_ids.contains(t))
-            .collect();
-        let text = tok.decode(&clean);
-        if !enable_thinking {
-            // F8: strip `<tool_call>...</tool_call>` blocks from stdout via the
-            // SAME shared parser both server surfaces use, so the CLI answer
-            // matches the server `content`. BYTE-IDENTITY: `parse_final` on text
-            // with no `<tool_call>` returns `content == input` verbatim, so plain
-            // (non-tool) output is identical to the historical `println!("{text}")`.
-            let parsed = lumen_runtime::tooling::parse_final(&text);
-            print_parsed_tool_calls(&parsed.tool_calls);
-            // F4: truncate the answer at the first `--stop` match (no-op when no
-            // `--stop` was passed → byte-identical).
-            println!("{}", apply_stop_truncation(&parsed.content));
-            return;
-        }
-        // Split reasoning from answer with the shared extractor (batch decode,
-        // so one feed + finish reconstructs the full split).
-        let mut extractor = lumen_runtime::tooling::ReasoningExtractor::new(true);
-        let mut delta = extractor.feed(&text);
-        let tail = extractor.finish();
-        delta.reasoning.push_str(&tail.reasoning);
-        delta.content.push_str(&tail.content);
-        if !delta.reasoning.is_empty() {
-            eprintln!("[reasoning] {}", delta.reasoning);
-        }
-        // F8: strip tool-call blocks from the ANSWER content too (the reasoning
-        // trace already went to stderr above). Same byte-identity guarantee for
-        // tool-free content.
-        let parsed = lumen_runtime::tooling::parse_final(&delta.content);
-        print_parsed_tool_calls(&parsed.tool_calls);
-        // F4: stop truncation applies to the answer, not the reasoning trace.
-        println!("{}", apply_stop_truncation(&parsed.content));
-    }
-}
-
-/// F4: truncate `content` at the earliest occurrence of any process-global
-/// `--stop` string (the matched bytes and everything after are dropped, exactly
-/// like the server's "emit up-to-but-excluding the stop" rule). Because the CLI
-/// prints the FULL generated answer in one batch, a simple earliest-substring
-/// search is sufficient (no cross-chunk straddle to handle). Returns `content`
-/// UNCHANGED when no `--stop` was passed, so non-stop output is byte-identical.
-fn apply_stop_truncation(content: &str) -> &str {
-    match STOP_SEQUENCES.get() {
-        Some(stops) => truncate_at_first_stop(content, stops),
-        None => content,
-    }
-}
-
-/// Pure earliest-stop truncation over an explicit stop list, factored out so it
-/// is unit-testable without the process-global `STOP_SEQUENCES` OnceLock. Empty
-/// list (or no match) → `content` returned verbatim (byte-identity guarantee).
-fn truncate_at_first_stop<'a>(content: &'a str, stops: &[String]) -> &'a str {
-    let mut cut: Option<usize> = None;
-    for s in stops {
-        if s.is_empty() {
-            continue;
-        }
-        if let Some(pos) = content.find(s.as_str()) {
-            cut = Some(cut.map_or(pos, |c: usize| c.min(pos)));
-        }
-    }
-    match cut {
-        Some(pos) => &content[..pos],
-        None => content,
-    }
-}
-
-/// F8: surface parsed tool calls to STDERR (mirroring the `[reasoning]`
-/// channel), so stdout carries only the assistant's plain-text answer — the
-/// same split both server wire surfaces apply. No-op when there are no calls,
-/// so tool-free output is byte-identical.
-fn print_parsed_tool_calls(calls: &[lumen_runtime::tooling::ParsedToolCall]) {
-    for call in calls {
-        eprintln!("[tool_call] {}({})", call.name, call.arguments_json);
-    }
-}
-
 /// Print the Lumen ASCII banner with inference metrics.
 ///
 /// Only prints when stderr is a TTY (not piped or redirected), so scripted
@@ -2632,6 +2530,7 @@ fn run_with_mmap(
         // when the operator did not pass `--repeat-penalty`).
         let resolved_sampling = effective_sampling(sampling);
         let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
+        let mut printer = crate::answer::AnswerPrinter::new(tokenizer, enable_thinking, stops());
         let gen_result = run_generation(
             &engine,
             &provider,
@@ -2642,10 +2541,11 @@ fn run_with_mmap(
             session_flags,
             &live,
             verbose,
+            &mut |id| printer.token(id),
         );
         match gen_result {
             Ok(result) => {
-                print_generated_text(&result.tokens, tokenizer, enable_thinking);
+                printer.finish(&result.tokens);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -2839,16 +2739,18 @@ fn run_engine(
                 std::process::exit(1);
             }
         };
-        match engine.generate_with_prefill(
+        let mut printer = crate::answer::AnswerPrinter::new(tokenizer, enable_thinking, stops());
+        match engine.generate_with_prefill_streaming(
             prompt_tokens,
             weights,
             backend,
             &mut accel,
             stop,
             sampling,
+            &mut |id| printer.token(id),
         ) {
             Ok(result) => {
-                print_generated_text(&result.tokens, tokenizer, enable_thinking);
+                printer.finish(&result.tokens);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -2875,6 +2777,7 @@ fn run_engine(
         eprintln!("Running inference...\n");
     }
 
+    let mut printer = crate::answer::AnswerPrinter::new(tokenizer, enable_thinking, stops());
     let gen_result = run_generation(
         engine,
         weights,
@@ -2885,10 +2788,11 @@ fn run_engine(
         session_flags,
         live,
         verbose,
+        &mut |id| printer.token(id),
     );
     match gen_result {
         Ok(result) => {
-            print_generated_text(&result.tokens, tokenizer, enable_thinking);
+            printer.finish(&result.tokens);
             if verbose {
                 eprintln!("Generated tokens: {:?}", result.tokens);
                 eprintln!("\n--- Metrics ---");
@@ -2908,8 +2812,8 @@ fn run_engine(
 /// session-driven path (when `--session-resume` / `--session-save` is set)
 /// or the legacy direct-KV path (otherwise).
 ///
-/// Both branches produce a [`GenerationResult`] of the same shape; callers
-/// can pipe the output the same way regardless of which branch ran.
+/// Both branches produce a [`GenerationResult`] of the same shape and call
+/// `on_token` with each generated token as it is sampled.
 ///
 /// Session lifecycle for the session-driven branch:
 /// 1. If `--session-resume` is set, [`Session::load_from_disk`] is called
@@ -2936,10 +2840,18 @@ fn run_generation(
     session_flags: &SessionFlags,
     live: &LiveModel,
     verbose: bool,
+    on_token: &mut dyn FnMut(u32),
 ) -> Result<GenerationResult, lumen_runtime::error::RuntimeError> {
     if !session_flags.is_active() {
         // Legacy path — bit-exact when disabled.
-        return engine.generate(prompt_tokens, weights, backend, stop, sampling);
+        return engine.generate_streaming(
+            prompt_tokens,
+            weights,
+            backend,
+            stop,
+            sampling,
+            on_token,
+        );
     }
 
     // Session-driven path: compute the fingerprint once, then construct
@@ -2981,8 +2893,14 @@ fn run_generation(
         )?
     };
 
-    let result =
-        engine.generate_with_session(&mut session, prompt_tokens, weights, backend, stop)?;
+    let result = engine.generate_with_session_streaming(
+        &mut session,
+        prompt_tokens,
+        weights,
+        backend,
+        stop,
+        on_token,
+    )?;
 
     if let Some(ref p) = session_flags.save_path {
         if verbose {
@@ -3216,42 +3134,5 @@ mod tests {
         assert!(parsed.content.contains("Done."));
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "get_weather");
-    }
-
-    // --- F4: CLI `--stop` truncation (batch). Tested through the pure
-    // `truncate_at_first_stop` helper so the process-global OnceLock is not
-    // disturbed.
-
-    #[test]
-    fn f4_cli_empty_stop_list_is_byte_identical() {
-        // No --stop (empty list) → content returned verbatim, byte-identical.
-        let full = "alpha STOP beta";
-        assert_eq!(truncate_at_first_stop(full, &[]), full);
-        assert_eq!(
-            truncate_at_first_stop(full, &["".to_string()]),
-            full,
-            "empty stop entries are ignored"
-        );
-        assert_eq!(
-            truncate_at_first_stop(full, &["ZZZ".to_string()]),
-            full,
-            "no match → verbatim"
-        );
-    }
-
-    #[test]
-    fn f4_cli_stop_truncates_at_first_match() {
-        let full = "keep this STOP drop this";
-        assert_eq!(
-            truncate_at_first_stop(full, &["STOP".to_string()]),
-            "keep this "
-        );
-        // Earliest of multiple stops wins.
-        let two = "aaa END bbb STOP ccc";
-        assert_eq!(
-            truncate_at_first_stop(two, &["STOP".to_string(), "END".to_string()]),
-            "aaa ",
-            "the earliest-starting stop string must win"
-        );
     }
 }
