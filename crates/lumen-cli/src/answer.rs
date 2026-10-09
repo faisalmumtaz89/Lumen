@@ -4,8 +4,8 @@
 //! incremental stages the server streams with: the reasoning split (thinking
 //! on), the tool-call parser and the `--stop` matcher. The answer goes to
 //! stdout and is flushed per token; reasoning and tool calls go to stderr.
-//! Concatenated, the output is what decoding the whole token list at once
-//! gives.
+//! With the byte-level (gpt2) tokenizers of the models Lumen runs, the output
+//! concatenated is what decoding the whole token list at once gives.
 
 use std::io::Write;
 
@@ -28,6 +28,9 @@ pub(crate) struct AnswerPrinter<'a, O: Write, E: Write> {
     stop: StopMatcher,
     /// A `--stop` sequence matched; nothing more of the answer is printed.
     stopped: bool,
+    /// The first failure writing the answer; nothing more is written after it.
+    /// A reader that closed early (`lumen run … | head -1`) is not a failure.
+    write_error: Option<std::io::Error>,
 }
 
 impl<'a> AnswerPrinter<'a, std::io::Stdout, std::io::Stderr> {
@@ -64,6 +67,7 @@ impl<'a, O: Write, E: Write> AnswerPrinter<'a, O, E> {
             tools: StreamingParser::new(),
             stop: StopMatcher::new(stops),
             stopped: false,
+            write_error: None,
         }
     }
 
@@ -84,8 +88,9 @@ impl<'a, O: Write, E: Write> AnswerPrinter<'a, O, E> {
 
     /// Print what is left once generation has ended, then the final newline.
     /// `tokens` is the whole generated list, dumped to stderr under
-    /// `LUMEN_SPEC_DUMP_IDS=1`.
-    pub(crate) fn finish(mut self, tokens: &[u32]) {
+    /// `LUMEN_SPEC_DUMP_IDS=1`. Fails with the first error writing the answer,
+    /// unless the reader of stdout had closed.
+    pub(crate) fn finish(mut self, tokens: &[u32]) -> std::io::Result<()> {
         if std::env::var("LUMEN_SPEC_DUMP_IDS").as_deref() == Ok("1") {
             let _ = writeln!(
                 self.err,
@@ -94,7 +99,7 @@ impl<'a, O: Write, E: Write> AnswerPrinter<'a, O, E> {
             );
         }
         if self.tokenizer.is_none() {
-            return;
+            return Ok(());
         }
         if !self.pending.is_empty() {
             let rest = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
@@ -114,8 +119,11 @@ impl<'a, O: Write, E: Write> AnswerPrinter<'a, O, E> {
             self.write_answer(&held);
         }
         self.end_reasoning();
-        let _ = writeln!(self.out);
-        let _ = self.out.flush();
+        self.write_answer("\n");
+        match self.write_error {
+            Some(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e),
+            _ => Ok(()),
+        }
     }
 
     fn text(&mut self, text: &str) {
@@ -151,11 +159,16 @@ impl<'a, O: Write, E: Write> AnswerPrinter<'a, O, E> {
     }
 
     fn write_answer(&mut self, text: &str) {
-        if text.is_empty() {
+        if text.is_empty() || self.write_error.is_some() {
             return;
         }
-        let _ = self.out.write_all(text.as_bytes());
-        let _ = self.out.flush();
+        if let Err(e) = self
+            .out
+            .write_all(text.as_bytes())
+            .and_then(|()| self.out.flush())
+        {
+            self.write_error = Some(e);
+        }
     }
 
     fn reason(&mut self, text: &str) {
@@ -316,7 +329,7 @@ mod tests {
         for &id in tokens {
             printer.token(id);
         }
-        printer.finish(tokens);
+        printer.finish(tokens).unwrap();
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -425,6 +438,71 @@ mod tests {
             out, b"Hi",
             "the completed text is out; the half character is held"
         );
+    }
+
+    /// Accepts `budget` bytes, then fails every write with `error`.
+    struct FailingOut {
+        budget: usize,
+        error: std::io::ErrorKind,
+        written: Vec<u8>,
+        attempts_after_failure: usize,
+    }
+
+    impl Write for FailingOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.budget == 0 {
+                self.attempts_after_failure += 1;
+                return Err(self.error.into());
+            }
+            let n = buf.len().min(self.budget);
+            self.budget -= n;
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Feeds "Hello, world." to an stdout that takes 3 bytes and then fails
+    /// with `error`; returns what `finish` gave, what was written, and how
+    /// many writes were attempted after the failure.
+    fn write_failing_with(error: std::io::ErrorKind) -> (std::io::Result<()>, Vec<u8>, usize) {
+        let tok = byte_tokenizer();
+        let mut out = FailingOut {
+            budget: 3,
+            error,
+            written: Vec::new(),
+            attempts_after_failure: 0,
+        };
+        let mut err = Vec::new();
+        let mut printer =
+            AnswerPrinter::with_writers(Some(&tok), false, Vec::new(), &mut out, &mut err);
+        let tokens = ids(b"Hello, world.");
+        for &id in &tokens {
+            printer.token(id);
+        }
+        let result = printer.finish(&tokens);
+        (result, out.written, out.attempts_after_failure)
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_and_nothing_more_is_written() {
+        let (result, written, attempts) = write_failing_with(std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            result.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::StorageFull)
+        );
+        assert_eq!(written, b"Hel");
+        assert_eq!(attempts, 1, "no write after the first failure");
+    }
+
+    #[test]
+    fn a_reader_that_closed_early_ends_the_answer_quietly() {
+        let (result, written, attempts) = write_failing_with(std::io::ErrorKind::BrokenPipe);
+        assert!(result.is_ok());
+        assert_eq!(written, b"Hel");
+        assert_eq!(attempts, 1, "no write after the reader closed");
     }
 
     #[test]

@@ -47,6 +47,18 @@ fn stops() -> Vec<String> {
     STOP_SEQUENCES.get().cloned().unwrap_or_default()
 }
 
+/// Print the rest of the answer; a failure writing it to stdout ends the run
+/// with an error, as an unwritable answer is a failed run.
+fn finish_answer(
+    printer: crate::answer::AnswerPrinter<'_, std::io::Stdout, std::io::Stderr>,
+    tokens: &[u32],
+) {
+    if let Err(e) = printer.finish(tokens) {
+        eprintln!("Error: could not write the answer: {e}");
+        std::process::exit(1);
+    }
+}
+
 /// Returns the sampling params to actually run with. Identical to `base` except
 /// that, when the operator did NOT pass `--repeat-penalty` explicitly, the
 /// `repetition_penalty` is resolved model-aware via
@@ -2545,7 +2557,7 @@ fn run_with_mmap(
         );
         match gen_result {
             Ok(result) => {
-                printer.finish(&result.tokens);
+                finish_answer(printer, &result.tokens);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -2750,7 +2762,7 @@ fn run_engine(
             &mut |id| printer.token(id),
         ) {
             Ok(result) => {
-                printer.finish(&result.tokens);
+                finish_answer(printer, &result.tokens);
                 if verbose {
                     eprintln!("Generated tokens: {:?}", result.tokens);
                     eprintln!("\n--- Metrics ---");
@@ -2792,7 +2804,7 @@ fn run_engine(
     );
     match gen_result {
         Ok(result) => {
-            printer.finish(&result.tokens);
+            finish_answer(printer, &result.tokens);
             if verbose {
                 eprintln!("Generated tokens: {:?}", result.tokens);
                 eprintln!("\n--- Metrics ---");
