@@ -340,6 +340,53 @@ fn s5_generate_with_session_matches_generate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The streaming entry points report every generated token once, in order,
+/// as it is sampled, and generate exactly the tokens the plain ones do.
+#[test]
+fn streaming_generation_reports_each_token_in_order_and_changes_nothing() {
+    let (dir, model_path) = synthetic_model_path();
+    let provider = SyncWeightProvider::open(&model_path).unwrap();
+    let backend = make_backend(&provider);
+    let hp = provider.lbc().header.hyperparams;
+    let prompt: Vec<u32> = vec![5, 6, 7, 8, 9, 10];
+    let engine = InferenceEngine::new(make_config(), hp);
+    let stop = StopCondition::MaxTokens(8);
+    let sampling = greedy_sampling();
+
+    let plain = engine
+        .generate(&prompt, &provider, &backend, &stop, &sampling)
+        .unwrap();
+    let mut seen = Vec::new();
+    let streamed = engine
+        .generate_streaming(&prompt, &provider, &backend, &stop, &sampling, &mut |t| {
+            seen.push(t)
+        })
+        .unwrap();
+    assert_eq!(streamed.tokens, plain.tokens);
+    assert_eq!(seen, streamed.tokens);
+
+    let mut session = Session::new(make_config(), hp, sampling.clone()).unwrap();
+    let plain_session = engine
+        .generate_with_session(&mut session, &prompt, &provider, &backend, &stop)
+        .unwrap();
+    let mut session = Session::new(make_config(), hp, sampling.clone()).unwrap();
+    let mut seen = Vec::new();
+    let streamed_session = engine
+        .generate_with_session_streaming(
+            &mut session,
+            &prompt,
+            &provider,
+            &backend,
+            &stop,
+            &mut |t| seen.push(t),
+        )
+        .unwrap();
+    assert_eq!(streamed_session.tokens, plain_session.tokens);
+    assert_eq!(seen, streamed_session.tokens);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// empty prompt on a resumed session continues generation
 /// from the cached state without re-prefilling.
 ///
