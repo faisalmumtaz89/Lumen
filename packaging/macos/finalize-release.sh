@@ -35,9 +35,10 @@ Build: ${TAG}
 PREREQUISITES
   - NVIDIA GPU with compute capability 8.0 or newer, and its driver: 535 or newer
     with CUDA 12, 580 or newer with CUDA 13.
-  - cuBLAS and NVRTC loadable at run time (no build-time CUDA SDK): from CUDA 12
-    (for example NVIDIA's cuda-nvrtc-12-X and libcublas-12-X packages) or a full
-    CUDA 13 toolkit — or just run the published Docker image:
+  - cuBLAS and NVRTC loadable at run time (no build-time CUDA SDK): on the system's
+    library paths from CUDA 12 or 13, or in lib/lumen beside bin/, where the
+    installer (https://servelumen.com/install.sh) puts NVIDIA's copies when the
+    system has none — or just run the published Docker image:
     ${IMAGE}
   - Kernels compile at the first run via NVRTC and are cached, so later launches
     skip the compile.

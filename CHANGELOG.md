@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **On NVIDIA the installer needs only the driver.** When the machine has no CUDA libraries,
+  the installer fetches NVIDIA's NVRTC and cuBLAS 12.9 wheels from PyPI (670 MB, pinned and
+  checked) into `lib/lumen` beside the binaries; it used to warn that inference would fail
+  without a CUDA toolkit. It refuses a driver older than 535 (RTX 50 cards need 570 or
+  newer). A machine whose loader already finds NVRTC and cuBLAS downloads nothing.
+
 ## [0.46.0] — 2026-10-09
 
 ### Changed

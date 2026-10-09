@@ -134,18 +134,23 @@ has_nvidia() {
   return 1
 }
 
-# The prebuilt CUDA binary loads the driver and toolkit userland dynamically
-# at first inference (`lumen --version` succeeds without them), so a missing
-# library would otherwise surface as a confusing failure on the first run.
+# The prebuilt CUDA binary loads the driver's libcuda and the CUDA libraries
+# NVRTC and cuBLAS at run time (`lumen --version` succeeds without them). They
+# are looked for where the dynamic loader looks: LD_LIBRARY_PATH, the ld.so
+# cache and the default directories. NVRTC and cuBLAS found in none of them are
+# fetched in step 3b; libcuda comes only with the NVIDIA driver.
 cuda_lib_present() {  # $1 = library name prefix, e.g. libnvrtc.so
-  local d f
+  local d f l
   # Not `ldconfig -p | grep -q`: grep stops at its first match, ldconfig then
-  # dies of SIGPIPE, and pipefail reports the library as missing.
-  if have ldconfig; then
-    case "$(ldconfig -p 2>/dev/null)" in *"$1"*) return 0 ;; esac
-  fi
-  local -a dirs=(/usr/lib/x86_64-linux-gnu /usr/lib /usr/lib64 /usr/lib/wsl/lib
-                 /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib)
+  # dies of SIGPIPE, and pipefail reports the library as missing. ldconfig is
+  # often outside a user's PATH, so its usual homes are tried too.
+  for l in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+    if have "$l"; then
+      case "$("$l" -p 2>/dev/null)" in *"$1"*) return 0 ;; esac
+      break
+    fi
+  done
+  local -a dirs=(/lib /usr/lib /lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
   local IFS=':'
   for d in ${LD_LIBRARY_PATH:-}; do dirs+=("$d"); done
   for d in "${dirs[@]}"; do
@@ -154,17 +159,18 @@ cuda_lib_present() {  # $1 = library name prefix, e.g. libnvrtc.so
   return 1
 }
 
+# The oldest NVIDIA driver the CUDA 12 libraries run on.
+DRIVER_FLOOR=535
+CUDA_LIBS_MISSING=""
 check_cuda_userland() {
-  local missing=""
-  cuda_lib_present libcuda.so   || missing="$missing libcuda"
-  cuda_lib_present libnvrtc.so  || missing="$missing libnvrtc"
-  cuda_lib_present libcublas.so || missing="$missing libcublas"
-  if [ -n "$missing" ]; then
-    err "CUDA libraries not found on the loader paths this probe checked:$missing"
-    err "The install will complete, but inference will fail unless the NVIDIA"
-    err "driver plus cuBLAS and NVRTC from CUDA 12, or a full CUDA 13 toolkit,"
-    err "are loadable at run time (or LD_LIBRARY_PATH points at them)."
+  local v
+  v="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+  if [ -n "$v" ] && [ "${v%%.*}" -lt "$DRIVER_FLOOR" ] 2>/dev/null; then
+    die "NVIDIA driver $v is older than $DRIVER_FLOOR, the oldest Lumen's CUDA libraries run on (RTX 50 cards need 570 or newer); update the driver and run this again."
   fi
+  cuda_lib_present libcuda.so || err "the NVIDIA driver's libcuda was not found; Lumen needs the NVIDIA driver to run."
+  cuda_lib_present libnvrtc.so  || CUDA_LIBS_MISSING="$CUDA_LIBS_MISSING libnvrtc"
+  cuda_lib_present libcublas.so || CUDA_LIBS_MISSING="$CUDA_LIBS_MISSING libcublas"
 }
 
 OS="$(uname -s)"; ARCH="$(uname -m)"
@@ -424,6 +430,81 @@ if on_path "$DEST" && [ -n "$r" ] && [ "$r" != "$DEST/lumen" ]; then
   err "    on PATH:   $r"
   err "    installed: $DEST/lumen"
   err "  fix it:  rm \"$r\"   (or put $DEST earlier on PATH)"
+fi
+
+# ── Step 3b · NVIDIA's CUDA libraries, when the system has none ───────────────
+# NVIDIA's own NVRTC and cuBLAS wheels, pinned and verified, go into lib/lumen
+# beside the binaries, which the binaries also search (their RUNPATH). They are
+# assembled in a staging directory and renamed into place, so an interrupted run
+# never leaves a partial lib/lumen; a run that finds this pin there downloads
+# nothing.
+CUDA_LIBS_PIN="nvrtc-12.9.86 cublas-12.9.2.10"
+NVRTC_WHEEL="https://files.pythonhosted.org/packages/b8/85/e4af82cc9202023862090bfca4ea827d533329e925c758f0cde964cb54b7/nvidia_cuda_nvrtc_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+NVRTC_SHA256="210cf05005a447e29214e9ce50851e83fc5f4358df8b453155d5e1918094dcb4"
+CUBLAS_WHEEL="https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl"
+CUBLAS_SHA256="e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702"
+
+# Download wheel $1 to $3 and check it against the sha256 $2.
+fetch_wheel() {
+  local progress="-s" got
+  [ -t 2 ] && progress="--progress-bar"
+  curl -fL "$progress" --retry 3 "$1" -o "$3" || die "download failed: $1"
+  got="$(sha256_of "$3")"
+  [ "$got" = "$2" ] || die "checksum mismatch for $1 (want $2, got $got); installing no CUDA libraries."
+}
+
+# Copy the named members of wheel $1 into directory $2.
+unpack_wheel() {
+  local whl="$1" out="$2"; shift 2
+  if have unzip; then
+    unzip -q -j -o "$whl" "$@" -d "$out"
+  elif have python3; then
+    python3 - "$whl" "$out" "$@" <<'PY'
+import os, shutil, sys, zipfile
+whl, out, *names = sys.argv[1:]
+with zipfile.ZipFile(whl) as z:
+    for name in names:
+        with z.open(name) as src, open(os.path.join(out, os.path.basename(name)), "wb") as dst:
+            shutil.copyfileobj(src, dst)
+PY
+  else
+    return 1
+  fi
+}
+
+if [ -n "$CUDA_LIBS_MISSING" ]; then
+  LIBDIR="$(dirname -- "$DEST")/lib/lumen"
+  # shellcheck disable=SC2016  # the literal $ORIGIN is what the binary carries
+  if ! grep -qaF '$ORIGIN/../lib/lumen' "$LUMEN"; then
+    err "CUDA libraries not found:$CUDA_LIBS_MISSING. This release does not load them from"
+    err "$LIBDIR; install NVRTC and cuBLAS from CUDA 12 or 13, or use a newer release."
+  elif [ "$(cat "$LIBDIR/PIN" 2>/dev/null)" = "$CUDA_LIBS_PIN" ]; then
+    field "CUDA libs" "NVRTC + cuBLAS 12.9 ${C_DIM}·${C_RESET} $LIBDIR"
+  else
+    S=""
+    writable_nosudo "$LIBDIR" || S="sudo"
+    if [ -n "$S" ] && ! have sudo; then
+      die "cannot write $LIBDIR for the CUDA libraries and 'sudo' is unavailable; pick a writable --prefix."
+    fi
+    info "fetching NVIDIA's CUDA libraries (NVRTC and cuBLAS, 670 MB), which this machine lacks"
+    fetch_wheel "$NVRTC_WHEEL" "$NVRTC_SHA256" "$TMP/NVRTC.whl"
+    fetch_wheel "$CUBLAS_WHEEL" "$CUBLAS_SHA256" "$TMP/CUBLAS.whl"
+    mkdir -p "$TMP/cudalibs"
+    unpack_wheel "$TMP/NVRTC.whl" "$TMP/cudalibs" \
+        nvidia/cuda_nvrtc/lib/libnvrtc.so.12 nvidia/cuda_nvrtc/lib/libnvrtc-builtins.so.12.9 \
+      && unpack_wheel "$TMP/CUBLAS.whl" "$TMP/cudalibs" \
+        nvidia/cublas/lib/libcublas.so.12 nvidia/cublas/lib/libcublasLt.so.12 \
+      || die "Lumen is installed, but unpacking its CUDA libraries needs 'unzip' or 'python3'; install one (e.g. sudo apt install unzip) and run this again."
+    printf '%s\n' "$CUDA_LIBS_PIN" > "$TMP/cudalibs/PIN"
+    $S mkdir -p "$(dirname -- "$LIBDIR")" \
+      && $S rm -rf "$LIBDIR.new" \
+      && $S mkdir "$LIBDIR.new" \
+      && $S install -m 0644 "$TMP/cudalibs/"* "$LIBDIR.new/" \
+      && $S rm -rf "$LIBDIR" \
+      && $S mv "$LIBDIR.new" "$LIBDIR" \
+      || die "could not write the CUDA libraries to $LIBDIR."
+    field "CUDA libs" "NVRTC + cuBLAS 12.9 → $LIBDIR ${C_DIM}·${C_RESET} $OK_MARK verified"
+  fi
 fi
 
 # ── Step 4 · download the model asked for with --model, if any ────────────────
