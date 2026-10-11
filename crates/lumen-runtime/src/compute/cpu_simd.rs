@@ -19,8 +19,9 @@
 //!
 //! The Qwen3.5-family layers (GatedDeltaNet, gated full attention, MoE) run
 //! through [`cpu_qwen35`](super::cpu_qwen35) with this backend's threaded
-//! matrix-vector product: the Q8_0 and F32 kernels above, and for every other
-//! stored format rows decoded per thread and dotted with `dot_product_simd`.
+//! matrix-vector product: the Q8_0 kernel (for rows its stack buffers hold)
+//! and the F32 kernel, and otherwise rows decoded per thread and dotted with
+//! `dot_product_simd`.
 
 use crate::compute::cpu_qwen35::{MatVec, Qwen35};
 use crate::compute::simd_kernels;
@@ -665,7 +666,7 @@ impl MatVec for SimdF32Backend {
         }
         let x = &x[..cols];
         match scheme {
-            QuantScheme::Q8_0 => {
+            QuantScheme::Q8_0 if cols <= simd_kernels::Q8_0_MAX_IN_DIM => {
                 simd_kernels::matmul_q8_0_simd_parallel(out, w, x, rows, cols, &self.pool)
             }
             QuantScheme::F32 => {
