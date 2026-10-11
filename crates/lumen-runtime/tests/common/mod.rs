@@ -1,4 +1,4 @@
-//! Shared fixtures for the CUDA integration tests.
+//! Shared fixtures for the integration tests.
 #![allow(dead_code)]
 
 pub mod gdn_hybrid;

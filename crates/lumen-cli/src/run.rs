@@ -2942,8 +2942,64 @@ fn run_generation(
 // ---- --kv-precision parsing tests ------------------------------
 
 #[cfg(test)]
+#[path = "../../lumen-runtime/tests/common/gdn_hybrid.rs"]
+#[allow(dead_code)]
+mod gdn_hybrid;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `run_with_sync`, `run_with_mmap` and `run_with_async` each hand their
+    /// provider to `create_backend`, which prepares a CPU backend: on a GDN
+    /// model it reports GDN state before the first forward pass.
+    #[test]
+    fn create_backend_prepares_cpu_backends_from_every_provider() {
+        use super::gdn_hybrid::{build_qwen35_cpu_lbc, Qwen35Fixture};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.lbc");
+        std::fs::write(&path, build_qwen35_cpu_lbc(&Qwen35Fixture::default(), 64)).unwrap();
+        let sync = SyncWeightProvider::open(&path).unwrap();
+        let mmap = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+        let asyn = AsyncWeightProvider::open(&path).unwrap();
+        macro_rules! backend {
+            ($p:expr, $simd:expr) => {
+                create_backend(
+                    &$p,
+                    $p.lbc().header.quantization.scheme,
+                    $simd,
+                    false,
+                    false,
+                    0,
+                    KvPrecision::F32,
+                    2,
+                    false,
+                    false,
+                    $p.embedding.clone(),
+                    $p.final_norm.clone(),
+                    $p.output_proj.clone(),
+                    &$p.lbc().header.hyperparams,
+                    $p.output_proj_raw.clone(),
+                    $p.output_proj_quant,
+                    $p.embedding_raw.clone(),
+                    $p.embedding_quant,
+                    $p.weight_tying,
+                )
+            };
+        }
+        for simd in [false, true] {
+            for (name, b) in [
+                ("sync", backend!(sync, simd)),
+                ("mmap", backend!(mmap, simd)),
+                ("async", backend!(asyn, simd)),
+            ] {
+                assert!(
+                    b.caps().gdn && b.gdn_layout().is_some(),
+                    "{name}, simd={simd}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parse_kv_precision_accepts_f16_variants() {

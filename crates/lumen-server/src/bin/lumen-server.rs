@@ -651,6 +651,23 @@ fn select_backend(choice: BackendChoice) -> BackendChoice {
     }
 }
 
+/// The CPU backend: the threaded SIMD one on every core, as `lumen run` picks
+/// on a machine without a GPU, initialised and prepared on `provider`.
+fn cpu_backend(
+    provider: &ServerWeights,
+    hyperparams: &lumen_format::hyperparams::ModelHyperparams,
+) -> Result<SimdF32Backend, String> {
+    let mut cpu = SimdF32Backend::new();
+    // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
+    // directly and does not build a GPU buffer from the raw.
+    wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
+    cpu.init(hyperparams)
+        .map_err(|e| format!("CPU init: {e}"))?;
+    cpu.preload_weights(provider.as_dyn())
+        .map_err(|e| format!("the CPU backend cannot run this model: {e}"))?;
+    Ok(cpu)
+}
+
 /// Provider-agnostic view of the global tensors the backend wiring needs.
 /// Borrowed from whichever concrete provider the server opened. `SyncWeightProvider`
 /// and `MmapWeightProvider` expose the exact same public global fields; this
@@ -1231,19 +1248,9 @@ async fn run(args: Args) -> Result<(), String> {
             }
         }
         BackendChoice::Cpu => {
-            // The threaded SIMD backend on every core, as `lumen run` picks on a
-            // machine without a GPU.
-            let mut cpu = SimdF32Backend::new();
-            // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
-            // directly and does not build a GPU buffer from the raw.
-            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
-            cpu.init(&hyperparams_capped)
-                .map_err(|e| format!("CPU init: {e}"))?;
-            cpu.preload_weights(provider.as_dyn())
-                .map_err(|e| format!("the CPU backend cannot run this model: {e}"))?;
             // The CPU cache stores F32 or F16; the engine refuses any other precision.
             (
-                Box::new(cpu),
+                Box::new(cpu_backend(&provider, &hyperparams_capped)?),
                 resolve_kv_precision(args.kv_precision, KvPrecision::F32),
             )
         }
@@ -1603,8 +1610,42 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../../../lumen-runtime/tests/common/gdn_hybrid.rs"]
+#[allow(dead_code)]
+mod gdn_hybrid;
+
+#[cfg(test)]
 mod tests {
     use super::parse_args;
+
+    /// The server's CPU backend is prepared when it is made: on a GDN model it
+    /// reports GDN and MoE state before the first forward pass, from either
+    /// provider the server opens.
+    #[test]
+    fn cpu_backend_is_prepared_on_both_providers() {
+        use super::gdn_hybrid::{build_qwen35_cpu_lbc, Qwen35Fixture};
+        use super::{cpu_backend, ServerWeights};
+        use lumen_runtime::compute::ComputeBackend;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.lbc");
+        std::fs::write(&path, build_qwen35_cpu_lbc(&Qwen35Fixture::default(), 64)).unwrap();
+        let sync = lumen_runtime::SyncWeightProvider::open(&path).unwrap();
+        let hp = sync.lbc().header.hyperparams;
+        let mmap = lumen_runtime::MmapWeightProvider::open(
+            &path,
+            lumen_runtime::storage::MmapConfig::default(),
+        )
+        .unwrap();
+        for provider in [
+            ServerWeights::Sync(Arc::new(sync)),
+            ServerWeights::Mmap(Arc::new(mmap)),
+        ] {
+            let backend = cpu_backend(&provider, &hp).unwrap();
+            let caps = backend.caps();
+            assert!(caps.gdn && caps.moe && backend.gdn_layout().is_some());
+        }
+    }
 
     /// Build the `&[String]` `parse_args` expects from string literals.
     fn argv(items: &[&str]) -> Vec<String> {
