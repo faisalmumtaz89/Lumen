@@ -86,7 +86,7 @@ compressed-tensors INT4 (group 32).
 
 | Backend | Hardware | Formats |
 |---------|----------|--------|
-| **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) | Every format above; Q4_K_M, Q5_K_M and INT4 need compute capability 8.0+; the BF16 27B and MoE need an 80 GB H100-class GPU |
+| **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) | Every format above on compute capability 8.0+; on 7.5 the 9B at Q8_0 and Q4_0 is verified, Q4_K_M, Q5_K_M and INT4 are refused, and the rest is untested ([Model support](docs/support.md)); the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 
