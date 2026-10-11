@@ -9,6 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
+- **`lumen run` prints its answer as it is generated.** Each piece of text is written and
+  flushed the moment the model produces it, instead of all at once at the end; the printed
+  answer is the same. Reasoning (with thinking on) and tool calls still go to stderr, now as
+  they arrive. `--stop` now cuts the answer at the first stop sequence to complete, as the
+  server does; it used to cut at the earliest-starting one, which differs only when one stop
+  sequence ends inside another. A failure writing the answer, such as a full disk, now ends
+  the run with an error and exit status 1 instead of a panic, and a reader that closes early,
+  as with `| head -1`, ends it quietly with exit status 0.
 - **On NVIDIA the installer needs only the driver.** When the machine has no CUDA libraries,
   the installer fetches NVIDIA's NVRTC and cuBLAS 12.9 wheels from PyPI (670 MB, pinned and
   checked) into `lib/lumen` beside the binaries; it used to warn that inference would fail

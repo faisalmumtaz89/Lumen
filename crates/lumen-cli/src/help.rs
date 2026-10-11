@@ -139,8 +139,8 @@ OPTIONS:
                           the Qwen3.5 chat template opens a <think>...</think> block that may
                           consume the budget before producing the answer in the target language.
     --stop <text>         Textual stop sequence (mirrors the server OpenAI `stop` /
-                          Anthropic `stop_sequences`). The answer is cut at the first matched
-                          stop string; the match and everything after it are dropped. Repeatable
+                          Anthropic `stop_sequences`). The answer is cut at the first stop
+                          string to complete; the match and everything after it are dropped. Repeatable
                           and accepts a comma-separated list, so `--stop A --stop B` and
                           `--stop A,B` are equivalent. Default: none (answer prints to EOS).
     --temperature <f>     Sampling temperature (default: 0.7, 0=greedy)

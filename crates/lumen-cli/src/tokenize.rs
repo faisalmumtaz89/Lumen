@@ -16,7 +16,7 @@ use unicode_normalization::UnicodeNormalization;
 /// Build the GPT-2 byte-to-unicode mapping.
 /// Maps each byte value (0..256) to a unicode character.
 /// Printable bytes map to themselves; others map to U+0100..U+013F.
-fn build_byte_to_unicode() -> [char; 256] {
+pub(crate) fn build_byte_to_unicode() -> [char; 256] {
     let mut b2u = ['\0'; 256];
     let mut n: u32 = 0;
     // First pass: printable ranges map to themselves.
