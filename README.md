@@ -61,7 +61,7 @@ More on installing, pulling and running: **[Getting started](docs/getting-starte
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
 - **Text to image** with Qwen-Image-2.1 on CUDA, from a separate image-only server.
-- **Runs on NVIDIA cc 8.0+ (Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
+- **Runs on NVIDIA cc 8.0+ (Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**, and, much more slowly, on the CPU of a machine with neither.
 - **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
 ## Supported models & hardware
@@ -88,7 +88,7 @@ compressed-tensors INT4 (group 32).
 |---------|----------|--------|
 | **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100, RTX 5090) | Every format above; the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
-| **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
+| **CPU** | Any machine: chosen when there is no GPU, or with `--simd` | Every format above except the CUDA-only checkpoint imports; measured end to end on `qwen3.5-9b` Q8_0 only ([details](docs/support.md#cpu-no-gpu)) |
 
 Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen image "<prompt>"` makes a picture, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
 

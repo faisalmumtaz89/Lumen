@@ -79,6 +79,24 @@ Benchmarked on an M3 Ultra; see [`bench/RESULTS.md`](../bench/RESULTS.md) for th
 | Qwen3.8-27B dense | Q4_0 | Production-ready | **1.30× (beats llama.cpp)** | — | All quality gates pristine + DET-001 50/50 (2026-08-14); ratio from the 2026-08-24 board (40.17 vs 30.57 = 1.314, published conservatively): same GGUF, sequential per-engine runs on the strictly-serial M3 Ultra — not co-resident processes; prefill row pending |
 | Qwen3.8-27B dense | BF16 | N/A on Metal | — | — | ~50 GiB weights sit inside the capacity margin policy on the 96 GB test rig; validated on CUDA H100 instead |
 
+### CPU (no GPU)
+
+The CPU backends run the three registry models' layers (GatedDeltaNet, gated full attention,
+dense and MoE FFNs) from every stored format except NVFP4, FP8 and INT4, which are refused as on
+Metal. `lumen run` picks the threaded SIMD backend on a machine without a GPU (or with `--simd`);
+`lumen-server --backend cpu` uses it too. A run is refused, naming both numbers, when the memory
+it needs is more than the machine has available (on Linux, within its cgroup limits). The CPU is
+not verified against llama.cpp. What was measured, on 2026-10-11:
+
+| Model | Quant | Run | Result |
+|-------|-------|-----|--------|
+| Qwen3.5-9B dense | Q8_0 (Metal-converted, sha256 `072c9fb6…`) | `lumen run --simd --temperature 0 --repeat-penalty 1.0 --max-tokens 64`, M3 Ultra, 28 threads, 512-token context, F32 KV | Coherent answer; decode 8.5 tok/s, prefill 3.5 tok/s (23 tokens fed one at a time); peak RSS 21.7 GiB (`/usr/bin/time -l`). With `--sync` the same 64 tokens at 0.72 tok/s, peak RSS 15.6 GiB |
+| Qwen3.5-9B dense | Q8_0 (same file) | 128 greedy tokens decoded by Metal, the same history fed to the CPU | First token equal; argmax agreement 124/128; logits cosine ≥ 0.987 (mean 0.9965). The scalar reference backend shows the same distance to Metal (124/128, ≥ 0.988), and the SIMD backend is within cosine 0.9995 of it (126/128) |
+| Qwen3.5-9B dense | Q8_0 (same file) | A Metal session saved right after prefill, restored on the CPU | Its 24 greedy tokens equal those of a CPU session that prefilled the prompt itself |
+
+The 27B, the MoE and the K-quant formats are covered by tests on synthetic models only; their
+speed and memory on the CPU were not measured.
+
 ## What is not (yet) supported
 
 | Class | Status | Why |

@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Added
+
+- **The CPU backends run the registry models.** On a machine without a GPU (or with
+  `--simd`), `lumen run` now runs Qwen3.5-9B, Qwen3.8-27B and Qwen3.5-MoE — GatedDeltaNet,
+  gated full attention, dense and MoE FFNs — from every stored format except NVFP4, FP8 and
+  INT4; it used to panic on the first layer. `lumen-server --backend cpu` (and a server with
+  no GPU) runs them on the threaded SIMD backend instead of the single-threaded scalar one.
+  A CPU run is refused, with both numbers, when the memory it needs is more than the machine
+  has available (on Linux, within its cgroup limits): before the download and again before the
+  weights load. A CPU session saves and restores its recurrent state in Metal's layout. A
+  server request whose forward pass fails now leaves the next request a fresh session.
+  Measured on an M3 Ultra (28 threads): `qwen3.5-9b` Q8_0 decodes 8.5 tok/s, peak RSS
+  21.7 GiB.
+
 ### Changed
 
 - **`lumen run` prints its answer as it is generated.** Each piece of text is written and
