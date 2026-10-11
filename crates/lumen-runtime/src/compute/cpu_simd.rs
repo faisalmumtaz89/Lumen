@@ -652,7 +652,7 @@ impl MatVec for SimdF32Backend {
         check_matvec(out, w, x, rows, cols, scheme)?;
         let x = &x[..cols];
         match scheme {
-            QuantScheme::Q8_0 if cols <= simd_kernels::Q8_0_MAX_IN_DIM => {
+            QuantScheme::Q8_0 if simd_kernels::q8_0_takes_in_dim(cols) => {
                 simd_kernels::matmul_q8_0_simd_parallel(out, w, x, rows, cols, &self.pool)
             }
             QuantScheme::F32 => {

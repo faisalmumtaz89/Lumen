@@ -1434,12 +1434,16 @@ fn vec_dot_q8_0_q8_0(w_q8: &[u8], x_q8: &[u8], num_blocks: usize) -> f32 {
 #[cfg(target_arch = "aarch64")]
 const MAX_X_SCALE_BLOCKS: usize = 256;
 
-/// The widest input the Q8_0 matvec kernels take: on aarch64 they hold the
-/// input's block scales in a `MAX_X_SCALE_BLOCKS` stack array.
+/// Whether the Q8_0 matvec kernels take an input of `in_dim` elements: on
+/// aarch64 they hold its block scales in a `MAX_X_SCALE_BLOCKS` stack array.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const Q8_0_MAX_IN_DIM: usize = MAX_X_SCALE_BLOCKS * Q8_0_GROUP_SIZE;
+pub(crate) fn q8_0_takes_in_dim(in_dim: usize) -> bool {
+    in_dim <= MAX_X_SCALE_BLOCKS * Q8_0_GROUP_SIZE
+}
 #[cfg(not(target_arch = "aarch64"))]
-pub(crate) const Q8_0_MAX_IN_DIM: usize = usize::MAX;
+pub(crate) fn q8_0_takes_in_dim(_in_dim: usize) -> bool {
+    true
+}
 
 /// Precompute x_q8 scales as f32 into a stack buffer.
 /// Avoids repeated f16 decode in the inner row loop.
