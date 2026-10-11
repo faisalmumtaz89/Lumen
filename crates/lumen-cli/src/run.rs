@@ -953,6 +953,62 @@ pub(crate) fn run_inference(args: &[String]) {
         }
     }
 
+    // Backend auto-detection: if no backend flag was provided, pick the best
+    // available backend for this platform.
+    //
+    // `--sync` selects the weight *I/O provider* (sync pread vs mmap), NOT the
+    // compute backend. It must NOT suppress compute-backend auto-detection:
+    // doing so left `--sync` (with no explicit backend) falling through to the
+    // single-threaded CPU `NaiveF32Backend`. The provider choice is honoured
+    // separately by the `run_with_sync` / `run_with_mmap` dispatch below, and
+    // `run_with_sync` performs the GPU-resident preload that GDN requires.
+    //
+    // `--async` is intentionally STILL excluded here: `run_with_async` does not
+    // perform the GPU-resident preload, and Metal's decode drivers require
+    // GPU-resident weights, so auto-selecting Metal for it would fail at the
+    // first decode step.
+    if !explicitly_chose_backend && !use_async {
+        #[cfg(target_os = "macos")]
+        {
+            use_metal = true;
+            if verbose {
+                eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)");
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Check for NVIDIA GPU presence.
+            if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
+                #[cfg(feature = "cuda")]
+                {
+                    use_cuda = true;
+                    if verbose {
+                        eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)");
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    use_simd = true;
+                    if verbose {
+                        eprintln!("NVIDIA GPU detected but CUDA support not compiled in.");
+                        eprintln!("Falling back to CPU (SIMD) backend.");
+                        eprintln!("Rebuild with: cargo build --release --features cuda");
+                    }
+                }
+            } else {
+                use_simd = true;
+                if verbose {
+                    eprintln!("No GPU detected. Using CPU (SIMD) backend.");
+                    eprintln!("For faster inference:");
+                    eprintln!("  macOS:  rebuild and use --metal");
+                    eprintln!("  NVIDIA: rebuild with --features cuda");
+                    eprintln!("  Modal:  modal run examples/cuda_inference.py");
+                }
+            }
+        }
+    }
+
     // Dual-mode --model: if the value looks like a file path (contains / or \,
     // or ends with .lbc/.gguf), treat it as a direct path. Otherwise, try to
     // resolve it as a preset name from the model registry.
@@ -960,7 +1016,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // unless it runs on another backend: one chosen explicitly, or the async
     // engine, which picks CUDA only when told to.
     let gpu = (use_cuda || !(explicitly_chose_backend || use_async)).then_some(cuda_device);
-    let model_path = resolve_model_path(&model_path, verbose, gpu);
+    let model_path = resolve_model_path(&model_path, verbose, gpu, !use_metal && !use_cuda);
 
     let path = Path::new(&model_path);
     if !path.exists() {
@@ -1058,62 +1114,6 @@ pub(crate) fn run_inference(args: &[String]) {
         eprintln!("  lumen run --model {} --prompt \"Hello\"", model_str);
         std::process::exit(1);
     };
-
-    // Backend auto-detection: if no backend flag was provided, pick the best
-    // available backend for this platform.
-    //
-    // `--sync` selects the weight *I/O provider* (sync pread vs mmap), NOT the
-    // compute backend. It must NOT suppress compute-backend auto-detection:
-    // doing so left `--sync` (with no explicit backend) falling through to the
-    // single-threaded CPU `NaiveF32Backend`. The provider choice is honoured
-    // separately by the `run_with_sync` / `run_with_mmap` dispatch below, and
-    // `run_with_sync` performs the GPU-resident preload that GDN requires.
-    //
-    // `--async` is intentionally STILL excluded here: `run_with_async` does not
-    // perform the GPU-resident preload, and Metal's decode drivers require
-    // GPU-resident weights, so auto-selecting Metal for it would fail at the
-    // first decode step.
-    if !explicitly_chose_backend && !use_async {
-        #[cfg(target_os = "macos")]
-        {
-            use_metal = true;
-            if verbose {
-                eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)");
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Check for NVIDIA GPU presence.
-            if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
-                #[cfg(feature = "cuda")]
-                {
-                    use_cuda = true;
-                    if verbose {
-                        eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)");
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    use_simd = true;
-                    if verbose {
-                        eprintln!("NVIDIA GPU detected but CUDA support not compiled in.");
-                        eprintln!("Falling back to CPU (SIMD) backend.");
-                        eprintln!("Rebuild with: cargo build --release --features cuda");
-                    }
-                }
-            } else {
-                use_simd = true;
-                if verbose {
-                    eprintln!("No GPU detected. Using CPU (SIMD) backend.");
-                    eprintln!("For faster inference:");
-                    eprintln!("  macOS:  rebuild and use --metal");
-                    eprintln!("  NVIDIA: rebuild with --features cuda");
-                    eprintln!("  Modal:  modal run examples/cuda_inference.py");
-                }
-            }
-        }
-    }
 
     // A backend this build cannot construct is refused for that reason first,
     // with the message `create_backend` gives and in its order (CUDA is taken
@@ -1254,7 +1254,30 @@ pub(crate) fn run_inference(args: &[String]) {
             }
         }
     }
-    // The check above is the last use of the parsed file: in `--tokens` mode
+    // A CPU run whose whole need (weights, globals, KV cache at the context
+    // the run_with_* paths size, recurrent state, scratch) exceeds the memory
+    // this machine has available is refused before any provider opens.
+    if !use_metal && !use_cuda {
+        let model_max = lbc.header.hyperparams.max_seq_len as usize;
+        let max_gen = match &stop {
+            StopCondition::MaxTokens(n) => *n,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::EosTokens(_) => model_max,
+        };
+        let max_seq_len =
+            effective_max_seq_len(model_max, context_len, prompt_tokens.len(), max_gen, false);
+        if let Err(e) = lumen_runtime::compute::check_cpu_memory(
+            &lbc,
+            max_seq_len,
+            kv_precision,
+            use_simd,
+            session_resume_path.is_some(),
+        ) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+    // The checks above are the last use of the parsed file: in `--tokens` mode
     // its tokenizer section is still held, and it is not kept through the run.
     drop(lbc);
 
@@ -1541,7 +1564,7 @@ fn effective_max_seq_len(
 /// - Preset with quant tag: `qwen3.5-9b:q4_0` (downloads specific quant)
 /// - Preset without tag: `qwen3.5-9b` (errors with available quants if multiple exist,
 ///   or auto-selects if only one quant is available)
-fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String {
+fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>, cpu: bool) -> String {
     // Heuristic: looks like a file path if it contains path separators or
     // ends with a known model file extension.
     let looks_like_path = value.contains('/')
@@ -1695,6 +1718,12 @@ fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String 
         }
         #[cfg(not(feature = "cuda"))]
         let _ = gpu;
+        if cpu {
+            if let Err(e) = crate::fit::check_host(&entry, model_name, quant) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         let gguf_path = resolve_download_gguf_shards(&gguf_source, verbose);
         let lbc_out = crate::cache::lbc_path(&entry.key, quant);
         resolve_convert_to_lbc(&gguf_path, &lbc_out, verbose);
@@ -1706,7 +1735,7 @@ fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String 
 
     #[cfg(not(feature = "download"))]
     {
-        let _ = (gguf_source, gpu);
+        let _ = (gguf_source, gpu, cpu);
         eprintln!("Error: model '{}' is not cached.", value);
         eprintln!("Download it first with: lumen pull {}", value);
         eprintln!("Or pass a direct file path: --model /path/to/model.lbc");

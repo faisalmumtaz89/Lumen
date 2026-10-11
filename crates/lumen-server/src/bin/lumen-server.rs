@@ -1071,6 +1071,21 @@ async fn run(args: Args) -> Result<(), String> {
     // `--sync`, other CUDA quants, and CPU keep `SyncWeightProvider` (the guarded
     // fallback). Mmap and sync are proven byte-identical on the Metal path by
     // `metal_sync_mmap_argmax_parity_test`.
+    // A CPU backend whose whole need at this context exceeds the memory this
+    // machine has available is refused before the provider reads any weights.
+    if matches!(backend_choice, BackendChoice::Cpu) {
+        let context = args
+            .context_len
+            .min(lbc.header.hyperparams.max_seq_len as usize);
+        lumen_runtime::compute::check_cpu_memory(
+            &lbc,
+            context,
+            resolve_kv_precision(args.kv_precision, KvPrecision::F32),
+            true,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let cuda_nvfp4 = matches!(backend_choice, BackendChoice::Cuda)
         && lbc.uses_quant(lumen_format::quantization::QuantScheme::Nvfp4);
     let use_mmap_provider =

@@ -664,3 +664,340 @@ pub fn process_rss_bytes() -> u64 {
 pub fn process_rss_bytes() -> u64 {
     0
 }
+
+/// The host memory a CPU backend needs to run `lbc` with a `max_seq_len`-token
+/// KV cache stored as `kv`: the layer weights as stored and the raw global
+/// planes the provider keeps; the KV cache, allocated for every layer (twice
+/// while a session restores, with `restoring`); the F32 embedding, final norm
+/// and head, one copy in the provider and one in the backend; with `simd`, the
+/// SIMD backend's Q8_0 head on aarch64; the GDN recurrent state; RoPE tables and
+/// scratch; and headroom for the allocator, thread stacks and the tokenizer.
+pub fn cpu_memory_required(
+    lbc: &lumen_format::reader::LbcFile,
+    max_seq_len: usize,
+    kv: KvPrecision,
+    simd: bool,
+    restoring: bool,
+) -> u64 {
+    let hp = &lbc.header.hyperparams;
+    let (vocab, hidden) = (hp.vocab_size as u64, hp.hidden_dim as u64);
+    let (head_dim, seq) = (hp.head_dim as u64, max_seq_len as u64);
+    let layers: u64 = lbc.layer_indices.iter().map(|l| l.layer_length_bytes).sum();
+    let globals =
+        lbc.header.embedding.length + lbc.header.output_proj.length + lbc.header.final_norm.length;
+    let kv_cache = hp.num_layers as u64
+        * 2
+        * hp.num_kv_heads as u64
+        * seq
+        * head_dim
+        * kv.bytes_per_element() as u64
+        * if restoring { 2 } else { 1 };
+    let f32_globals = 2 * (2 * vocab * hidden + hidden) * 4;
+    let q8_head = if simd && cfg!(target_arch = "aarch64") && hidden % 32 == 0 {
+        vocab * hidden / 32 * 34
+    } else {
+        0
+    };
+    let g = hp.gdn_dims();
+    let gdn_layers = lbc
+        .layer_indices
+        .iter()
+        .filter(|l| l.subtensors.layer_type == Some(1))
+        .count() as u64;
+    let recurrent = gdn_layers
+        * (g.num_v_heads as u64 * g.head_dim as u64 * g.head_dim as u64
+            + (g.conv_kernel as u64).saturating_sub(1) * g.qkv_dim() as u64)
+        * 4;
+    let scratch = (seq * head_dim + hp.num_heads as u64 * seq + vocab) * 4;
+    let need = layers + globals + kv_cache + f32_globals + q8_head + recurrent + scratch;
+    need + need / 16 + (256 << 20)
+}
+
+/// The refusal when `need` bytes at a `max_seq_len`-token context exceed the
+/// `available` ones; `None` when they fit.
+fn cpu_memory_refusal(need: u64, max_seq_len: usize, available: u64) -> Option<String> {
+    let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+    (need > available).then(|| {
+        format!(
+            "this model needs about {} of memory on the CPU backend at a {max_seq_len}-token \
+             context, but {} is available; free memory, choose a smaller quantization or a \
+             shorter --context-len",
+            gib(need),
+            gib(available)
+        )
+    })
+}
+
+/// Refuse to run `lbc` on a CPU backend when [`cpu_memory_required`] exceeds
+/// [`host_available_bytes`]; nothing is refused where the platform reports no
+/// available memory.
+pub fn check_cpu_memory(
+    lbc: &lumen_format::reader::LbcFile,
+    max_seq_len: usize,
+    kv: KvPrecision,
+    simd: bool,
+    restoring: bool,
+) -> Result<(), RuntimeError> {
+    let Some(available) = host_available_bytes() else {
+        return Ok(());
+    };
+    let need = cpu_memory_required(lbc, max_seq_len, kv, simd, restoring);
+    match cpu_memory_refusal(need, max_seq_len, available) {
+        Some(message) => Err(RuntimeError::Unsupported(message)),
+        None => Ok(()),
+    }
+}
+
+/// Bytes of memory this process can still claim, or `None` where the platform
+/// reports nothing.
+///
+/// - Linux: the smaller of `MemAvailable` and the room under every cgroup
+///   memory limit from the process's cgroup up to the root (see
+///   [`cgroup_room`]).
+/// - macOS: physical memory times the kernel's memorystatus level, the
+///   percentage of memory it can make available without terminating
+///   processes (what `memory_pressure` reports as the free percentage).
+#[cfg(target_os = "linux")]
+pub fn host_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    let host = kib.saturating_mul(1024);
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    Some(cgroup_room(&cgroups, root).map_or(host, |room| room.min(host)))
+}
+
+#[cfg(target_os = "macos")]
+pub fn host_available_bytes() -> Option<u64> {
+    fn sysctl<T: Copy + Default>(name: &std::ffi::CStr) -> Option<T> {
+        let mut value = T::default();
+        let mut len = std::mem::size_of::<T>();
+        // SAFETY: `value` is a writable `T` and `len` its size; sysctlbyname
+        // writes at most `len` bytes and reports the size it wrote.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut T as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == std::mem::size_of::<T>()).then_some(value)
+    }
+    let total: u64 = sysctl(c"hw.memsize")?;
+    let percent: u32 = sysctl(c"kern.memorystatus_level")?;
+    Some(total / 100 * percent as u64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn host_available_bytes() -> Option<u64> {
+    None
+}
+
+/// The least room under any cgroup memory limit on the path from the process's
+/// cgroup up to the root of the hierarchy mounted at `root`, given
+/// `proc_self_cgroup` (the content of `/proc/self/cgroup`); `None` when no
+/// level sets a limit. At each level the room is the limit less the usage that
+/// is not reclaimable file cache: cgroup v2 `memory.max - (memory.current -
+/// inactive_file - active_file)`, v1 the same from `memory.limit_in_bytes`,
+/// `memory.usage_in_bytes` and `total_inactive_file` / `total_active_file`.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_room(proc_self_cgroup: &str, root: &std::path::Path) -> Option<u64> {
+    let number = |p: std::path::PathBuf| -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.trim().parse().ok()
+    };
+    let mut room: Option<u64> = None;
+    for line in proc_self_cgroup.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (base, limit, usage, cache) = if controllers.is_empty() {
+            (
+                root.to_path_buf(),
+                "memory.max",
+                "memory.current",
+                ["inactive_file", "active_file"],
+            )
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (
+                root.join("memory"),
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+                ["total_inactive_file", "total_active_file"],
+            )
+        } else {
+            continue;
+        };
+        let mut level = std::path::PathBuf::from(path.trim_start_matches('/'));
+        loop {
+            let dir = base.join(&level);
+            if let (Some(limit), Some(usage)) = (number(dir.join(limit)), number(dir.join(usage))) {
+                let reclaimable: u64 = std::fs::read_to_string(dir.join("memory.stat"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| l.split_once(' '))
+                    .filter(|(k, _)| cache.contains(k))
+                    .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+                    .sum();
+                let left = limit.saturating_sub(usage.saturating_sub(reclaimable));
+                room = Some(room.map_or(left, |r| r.min(left)));
+            }
+            if !level.pop() {
+                break;
+            }
+        }
+    }
+    room
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::path::Path;
+
+    const GIB: u64 = 1 << 30;
+
+    fn write(dir: &Path, rel: &str, files: &[(&str, String)]) {
+        let d = dir.join(rel);
+        std::fs::create_dir_all(&d).unwrap();
+        for (name, body) in files {
+            std::fs::write(d.join(name), body).unwrap();
+        }
+    }
+
+    /// cgroup v2: the room is the tightest level's limit less its usage that
+    /// is not file cache; an unlimited level and the root count for nothing.
+    #[test]
+    fn cgroup_v2_room_is_the_tightest_level_less_unreclaimable_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let stat = |inactive: u64, active: u64| {
+            format!("anon 1\ninactive_file {inactive}\nactive_file {active}\nshmem 7\n")
+        };
+        // 32 GiB limit with 24 GiB in use, 2 GiB of it file cache: 10 GiB left.
+        write(
+            root.path(),
+            "pod",
+            &[
+                ("memory.max", format!("{}\n", 32 * GIB)),
+                ("memory.current", format!("{}\n", 24 * GIB)),
+                ("memory.stat", stat(GIB, GIB)),
+            ],
+        );
+        // no limit of its own
+        write(
+            root.path(),
+            "pod/app",
+            &[
+                ("memory.max", "max\n".into()),
+                ("memory.current", format!("{}\n", 20 * GIB)),
+                ("memory.stat", stat(0, 0)),
+            ],
+        );
+        assert_eq!(cgroup_room("0::/pod/app\n", root.path()), Some(10 * GIB));
+        // a tighter inner limit wins: 12 GiB less (11 - 3) GiB in use
+        write(
+            root.path(),
+            "pod/app",
+            &[
+                ("memory.max", format!("{}\n", 12 * GIB)),
+                ("memory.current", format!("{}\n", 11 * GIB)),
+                ("memory.stat", stat(2 * GIB, GIB)),
+            ],
+        );
+        assert_eq!(cgroup_room("0::/pod/app\n", root.path()), Some(4 * GIB));
+        // usage past the limit leaves no room rather than wrapping
+        write(
+            root.path(),
+            "pod/app",
+            &[
+                ("memory.max", format!("{}\n", GIB)),
+                ("memory.current", format!("{}\n", 3 * GIB)),
+                ("memory.stat", stat(0, 0)),
+            ],
+        );
+        assert_eq!(cgroup_room("0::/pod/app\n", root.path()), Some(0));
+        // nothing limited anywhere
+        assert_eq!(cgroup_room("0::/elsewhere\n", root.path()), None);
+    }
+
+    #[test]
+    fn cgroup_v1_room_reads_the_memory_controller() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "memory/docker/abc",
+            &[
+                ("memory.limit_in_bytes", format!("{}\n", 16 * GIB)),
+                ("memory.usage_in_bytes", format!("{}\n", 9 * GIB)),
+                (
+                    "memory.stat",
+                    format!("cache 5\ntotal_inactive_file {GIB}\ntotal_active_file {GIB}\n"),
+                ),
+            ],
+        );
+        write(
+            root.path(),
+            "memory",
+            &[
+                ("memory.limit_in_bytes", "9223372036854771712\n".into()),
+                ("memory.usage_in_bytes", format!("{}\n", 40 * GIB)),
+            ],
+        );
+        let proc = "12:cpu,cpuacct:/docker/abc\n11:memory:/docker/abc\n";
+        assert_eq!(cgroup_room(proc, root.path()), Some(9 * GIB));
+    }
+
+    /// The need counts the weights, the F32 globals twice and a KV cache that a
+    /// restore holds twice.
+    #[test]
+    fn cpu_memory_counts_the_weights_globals_and_kv_cache() {
+        use lumen_format::test_model::{generate_test_model, TestModelConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.lbc");
+        std::fs::write(&path, generate_test_model(&TestModelConfig::default())).unwrap();
+        let lbc = lumen_format::reader::LbcFile::open(&path).unwrap();
+        let hp = lbc.header.hyperparams;
+        let h = &lbc.header;
+        let layers: u64 = lbc.layer_indices.iter().map(|l| l.layer_length_bytes).sum();
+        let weights = layers + h.embedding.length + h.output_proj.length + h.final_norm.length;
+        let f32_globals = 2 * (2 * hp.vocab_size as u64 + 1) * hp.hidden_dim as u64 * 4;
+        let kv = hp.num_layers as u64 * 2 * hp.num_kv_heads as u64 * 64 * hp.head_dim as u64 * 4;
+        let need = cpu_memory_required(&lbc, 64, KvPrecision::F32, false, false);
+        assert!(need >= weights + f32_globals + kv + (256 << 20), "{need}");
+        let restoring = cpu_memory_required(&lbc, 64, KvPrecision::F32, false, true);
+        assert!(restoring - need >= kv, "{restoring} vs {need}");
+        let f16 = cpu_memory_required(&lbc, 64, KvPrecision::F16, false, false);
+        assert!(need - f16 >= kv / 2, "{need} vs {f16}");
+    }
+
+    #[test]
+    fn the_refusal_names_the_need_and_what_is_available() {
+        assert_eq!(cpu_memory_refusal(27 * GIB, 4096, 27 * GIB), None);
+        let message = cpu_memory_refusal(27 * GIB, 4096, 27 * GIB - GIB / 2).unwrap();
+        assert!(
+            message.starts_with(
+                "this model needs about 27.0 GiB of memory on the CPU backend at a 4096-token \
+                 context, but 26.5 GiB is available"
+            ),
+            "{message}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn this_host_reports_its_available_memory() {
+        let available = host_available_bytes().expect("the platform reports memory");
+        assert!(available > 0);
+    }
+}
