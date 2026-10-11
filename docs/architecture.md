@@ -54,7 +54,7 @@ Each `Session` records its prompt history. On the next turn, `Session::extend_wi
 
 ## Per-backend status
 
-Both backends (CUDA on NVIDIA compute-capability 8.0+, Metal on Apple Silicon M-series) are validated end-to-end against llama.cpp. The live verification matrix is in [`docs/support.md`](support.md); the benchmark rigs (an A100-80GB and an M3 Ultra) are recorded in [`bench/RESULTS.md`](../bench/RESULTS.md).
+Both backends (CUDA on NVIDIA compute-capability 7.5+, Metal on Apple Silicon M-series) are validated end-to-end against llama.cpp. The live verification matrix is in [`docs/support.md`](support.md); the benchmark rigs (an A100-80GB and an M3 Ultra) are recorded in [`bench/RESULTS.md`](../bench/RESULTS.md).
 
 ## Further reading
 
