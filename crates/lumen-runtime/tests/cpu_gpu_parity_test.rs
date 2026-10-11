@@ -1,0 +1,365 @@
+//! The SIMD CPU backend against a GPU backend on a real Qwen3.5 LBC (`#[ignore]`): Metal on
+//! Apple Silicon, CUDA in a build with the `cuda` feature.
+//!
+//! ```text
+//! LUMEN_CPU_PARITY_LBC=$HOME/Library/Caches/lumen/qwen3-5-9b-Q8_0.lbc \
+//!   cargo test --release -p lumen-runtime --test cpu_gpu_parity_test -- --ignored --nocapture
+//! LUMEN_CPU_PARITY_LBC=/path/to/qwen3-5-9b-Q8_0.lbc cargo test --release -p lumen-runtime \
+//!   --features cuda --test cpu_gpu_parity_test -- --ignored --nocapture
+//! ```
+//!
+//! - The GPU (weights resident) decodes `STEPS` greedy tokens; the CPU backend reads the same
+//!   prompt and tokens and gives its logits at every one of those positions. Its first token
+//!   must be the GPU's, its logits within cosine 0.999 of the GPU's at every position, and its
+//!   argmax the GPU's at 98% of them or more.
+//! - On Metal, a session saved right after prefill and loaded into a fresh CPU backend
+//!   continues as a CPU session that prefilled the prompt itself does, up to a near-tie.
+//!
+//! The artifact's SHA-256, header scheme and the backend settings are printed with the results.
+
+#![cfg(any(target_os = "macos", feature = "cuda"))]
+
+use lumen_format::QuantScheme;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
+use lumen_runtime::kv::disk::{serialize_hyperparams_le, ModelFingerprint};
+use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
+use lumen_runtime::session::BenchTop2;
+use lumen_runtime::storage::MmapConfig;
+use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
+use lumen_runtime::{ComputeBackend, RuntimeConfig, SamplingParams, Session, WeightProvider};
+use std::path::{Path, PathBuf};
+
+/// The 9B's chat template around "Explain in one paragraph why the sky is blue.", thinking off.
+const PROMPT: &[u32] = &[
+    248045, 846, 198, 814, 20139, 303, 799, 13901, 3069, 279, 12515, 369, 6105, 13, 248046, 198,
+    248045, 74455, 198, 248068, 271, 248069, 271,
+];
+const STEPS: usize = 128;
+const CONTEXT: usize = 512;
+
+fn lbc() -> PathBuf {
+    PathBuf::from(
+        std::env::var("LUMEN_CPU_PARITY_LBC").expect("set LUMEN_CPU_PARITY_LBC to an LBC"),
+    )
+}
+
+fn describe(path: &Path, provider: &MmapWeightProvider) {
+    let sha = std::process::Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let h = &provider.lbc().header;
+    eprintln!(
+        "artifact {sha}\n  scheme {:?}, output_proj {:?}, embedding {:?}, {} layers",
+        h.quantization.scheme,
+        provider.output_proj_quant,
+        provider.embedding_quant,
+        h.hyperparams.num_layers
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn metal(provider: &MmapWeightProvider, max_seq_len: usize) -> lumen_runtime::MetalF32Backend {
+    if std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
+        std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
+    }
+    let mut m = lumen_runtime::MetalF32Backend::new().expect("Metal");
+    m.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    let raw = [
+        QuantScheme::Q8_0,
+        QuantScheme::Q4_0,
+        QuantScheme::F16,
+        QuantScheme::Bf16,
+    ];
+    if raw.contains(&provider.output_proj_quant) && !provider.output_proj_raw.is_empty() {
+        m.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
+    }
+    if raw[..3].contains(&provider.embedding_quant) && !provider.embedding_raw.is_empty() {
+        m.set_embedding_raw(provider.embedding_raw.clone(), provider.embedding_quant);
+    }
+    if provider.weight_tying {
+        m.set_weight_tying(true);
+    }
+    let mut hp = provider.lbc().header.hyperparams;
+    hp.max_seq_len = max_seq_len as u32;
+    m.init(&hp).unwrap();
+    m.preload_weights(provider).unwrap();
+    m
+}
+
+/// The GPU backend this platform has, ready to decode, and its KV cache.
+#[cfg(target_os = "macos")]
+fn gpu(provider: &MmapWeightProvider) -> (Box<dyn ComputeBackend>, KvCache) {
+    eprintln!("  GPU: Metal, weights resident, F16 KV");
+    (
+        Box::new(metal(provider, CONTEXT)),
+        kv(provider, KvPrecision::F16),
+    )
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+fn gpu(provider: &MmapWeightProvider) -> (Box<dyn ComputeBackend>, KvCache) {
+    let mut c = lumen_runtime::CudaBackend::new(0).expect("CUDA device 0");
+    c.set_kv_precision(KvPrecision::F32).unwrap();
+    c.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    if [
+        QuantScheme::Q8_0,
+        QuantScheme::Q4_0,
+        QuantScheme::F16,
+        QuantScheme::Bf16,
+        QuantScheme::Q6_K,
+    ]
+    .contains(&provider.output_proj_quant)
+        && !provider.output_proj_raw.is_empty()
+    {
+        c.set_output_proj_raw(provider.output_proj_raw.clone(), provider.output_proj_quant);
+    }
+    if [
+        QuantScheme::Q8_0,
+        QuantScheme::Q4_0,
+        QuantScheme::F16,
+        QuantScheme::Bf16,
+        QuantScheme::Q4_K,
+        QuantScheme::Q5_K,
+        QuantScheme::Q6_K,
+    ]
+    .contains(&provider.embedding_quant)
+        && !provider.embedding_raw.is_empty()
+    {
+        c.set_embedding_raw(provider.embedding_raw.clone(), provider.embedding_quant);
+    }
+    if provider.weight_tying {
+        c.set_weight_tying(true);
+    }
+    let mut hp = provider.lbc().header.hyperparams;
+    hp.max_seq_len = CONTEXT as u32;
+    c.init(&hp).unwrap();
+    c.preload_weights(provider).unwrap();
+    eprintln!("  GPU: CUDA device 0, weights resident, F32 KV");
+    let hp = provider.lbc().header.hyperparams;
+    let kv = KvCache::new_without_host_mirror(KvCacheConfig {
+        max_seq_len: CONTEXT,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision: KvPrecision::F32,
+    })
+    .unwrap();
+    (Box::new(c), kv)
+}
+
+fn cpu(provider: &MmapWeightProvider, max_seq_len: usize) -> SimdF32Backend {
+    let mut c = SimdF32Backend::new();
+    c.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    let mut hp = provider.lbc().header.hyperparams;
+    hp.max_seq_len = max_seq_len as u32;
+    c.init(&hp).unwrap();
+    c.preload_weights(provider).unwrap();
+    eprintln!("  CPU: SIMD, {} threads", c.thread_count());
+    c
+}
+
+fn kv(provider: &MmapWeightProvider, precision: KvPrecision) -> KvCache {
+    let hp = provider.lbc().header.hyperparams;
+    KvCache::new(KvCacheConfig {
+        max_seq_len: CONTEXT,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision,
+    })
+    .unwrap()
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap()
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+    let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+    dot / (na * nb)
+}
+
+/// One token through every layer on the CPU backend; the logits.
+fn step(
+    backend: &dyn ComputeBackend,
+    w: &dyn WeightProvider,
+    kv: &mut KvCache,
+    token: u32,
+) -> Vec<f32> {
+    let mut x = backend.embed_token(token).unwrap();
+    let pos = kv.seq_len();
+    for layer in 0..w.num_layers() {
+        let view = w.get_layer_raw(layer).unwrap();
+        let mut v = kv.view_mut(layer).unwrap();
+        backend
+            .compute_layer(layer, &mut x, &view, Some(&mut v), pos)
+            .unwrap();
+        kv.commit_view(v).unwrap();
+    }
+    kv.advance_seq_len().unwrap();
+    backend.compute_final(&x).unwrap().data
+}
+
+#[test]
+#[ignore = "needs a GPU and a real Qwen3.5 LBC in LUMEN_CPU_PARITY_LBC"]
+fn cpu_logits_track_the_gpu_over_one_history() {
+    let path = lbc();
+    let provider = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+    describe(&path, &provider);
+
+    let (m, mut mkv) = gpu(&provider);
+    m.reset_recurrent_state();
+    let hidden = m.prefill(PROMPT, &provider, &mut mkv).unwrap();
+    let mut x = lumen_runtime::compute::ActivationBuffer::zeros(
+        hidden.len(),
+        lumen_runtime::compute::ComputeDtype::F32,
+    );
+    x.write_f32_from(&hidden);
+    let mut logits = m.compute_final(&x).unwrap().data;
+    let (mut tokens, mut gpu_logits) = (Vec::new(), Vec::new());
+    for _ in 0..STEPS {
+        let t = argmax(&logits);
+        tokens.push(t);
+        gpu_logits.push(logits);
+        logits = m.decode_token(t, &provider, &mut mkv).unwrap().data;
+    }
+    drop(m);
+
+    let c = cpu(&provider, CONTEXT);
+    let mut ckv = kv(&provider, KvPrecision::F32);
+    let mut cpu_logits = Vec::new();
+    let mut last = Vec::new();
+    for &t in PROMPT {
+        last = step(&c, &provider, &mut ckv, t);
+    }
+    for &t in &tokens {
+        cpu_logits.push(std::mem::take(&mut last));
+        last = step(&c, &provider, &mut ckv, t);
+    }
+
+    let cos: Vec<f64> = cpu_logits
+        .iter()
+        .zip(&gpu_logits)
+        .map(|(a, b)| cosine(a, b))
+        .collect();
+    let agree = cpu_logits
+        .iter()
+        .zip(&tokens)
+        .filter(|(l, &t)| argmax(l) == t)
+        .count();
+    let min_cos = cos.iter().cloned().fold(f64::MAX, f64::min);
+    let mean_cos = cos.iter().sum::<f64>() / cos.len() as f64;
+    eprintln!(
+        "  {STEPS} positions: top-1 agreement {agree}/{STEPS}, cosine min {min_cos:.6} mean \
+         {mean_cos:.6}, first mismatch {:?}",
+        cpu_logits
+            .iter()
+            .zip(&tokens)
+            .position(|(l, &t)| argmax(l) != t)
+    );
+    assert_eq!(argmax(&cpu_logits[0]), tokens[0], "first token");
+    assert!(min_cos >= 0.999, "cosine {min_cos:.6}");
+    assert!(agree * 100 >= STEPS * 98, "agreement {agree}/{STEPS}");
+}
+
+fn greedy() -> SamplingParams {
+    SamplingParams {
+        temperature: 0.0,
+        repetition_penalty: Some(1.0),
+        seed: Some(1),
+        ..Default::default()
+    }
+}
+
+fn config() -> RuntimeConfig {
+    RuntimeConfig {
+        pipeline_mode: lumen_runtime::pipeline::PipelineMode::MinMem,
+        prefetch_distance: 1,
+        kv_precision: KvPrecision::F16,
+        max_seq_len: CONTEXT,
+        collect_per_layer_timings: false,
+    }
+}
+
+fn continue_greedy(
+    s: &mut Session,
+    backend: &dyn ComputeBackend,
+    w: &dyn WeightProvider,
+    n: usize,
+) -> Vec<BenchTop2> {
+    s.set_bench_top2(true);
+    for _ in 0..n {
+        s.next_token(backend, w).unwrap();
+    }
+    s.take_bench_top2()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs Apple Silicon and a real Qwen3.5 LBC in LUMEN_CPU_PARITY_LBC"]
+fn a_metal_session_saved_after_prefill_continues_on_the_cpu() {
+    const N: usize = 24;
+    let path = lbc();
+    let provider = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+    describe(&path, &provider);
+    let mut hp = provider.lbc().header.hyperparams;
+    hp.max_seq_len = CONTEXT as u32;
+    let fp = ModelFingerprint::from_live_model(
+        &serialize_hyperparams_le(&provider.lbc().header.hyperparams),
+        &[],
+        provider.output_proj_quant.to_u8() as u32,
+        lumen_format::LBC_VERSION,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metal.kv");
+
+    let m = metal(&provider, CONTEXT);
+    let mut s = Session::new(config(), hp, greedy()).unwrap();
+    s.extend(PROMPT, &m, &provider).unwrap();
+    s.save_to_disk(&file, &m, &fp).unwrap();
+    drop(s);
+    drop(m);
+
+    let c = cpu(&provider, CONTEXT);
+    let mut restored = Session::load_from_disk(&file, config(), hp, greedy(), &c, &fp).unwrap();
+    let from_metal = continue_greedy(&mut restored, &c, &provider, N);
+    let mut cold = Session::new(config(), hp, greedy()).unwrap();
+    cold.extend(PROMPT, &c, &provider).unwrap();
+    let from_cpu = continue_greedy(&mut cold, &c, &provider, N);
+
+    let parted = from_metal
+        .iter()
+        .zip(&from_cpu)
+        .position(|(a, b)| a.argmax != b.argmax);
+    eprintln!("  restored vs cold CPU continuation: first parting {parted:?} of {N}");
+    if let Some(i) = parted {
+        // a parting is a near-tie: each route's runner-up is the other's choice
+        let (a, b) = (from_metal[i], from_cpu[i]);
+        eprintln!("  at {i}: restored {a:?}, cold {b:?}");
+        assert!(
+            a.runner_up == b.argmax && b.runner_up == a.argmax,
+            "position {i} is not a near-tie: restored {a:?}, cold {b:?}"
+        );
+    }
+}
