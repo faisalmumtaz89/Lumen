@@ -1050,8 +1050,24 @@ async fn run(args: Args) -> Result<(), String> {
             .into());
     }
 
-    // Provider selection: the Metal GPU-resident path and CUDA NVFP4 both use
-    // the zero-copy `MmapWeightProvider`.
+    // A CPU backend whose whole need at this context exceeds the memory this
+    // machine has available is refused before the provider reads any weights.
+    if matches!(backend_choice, BackendChoice::Cpu) {
+        let context = args
+            .context_len
+            .min(lbc.header.hyperparams.max_seq_len as usize);
+        lumen_runtime::compute::check_cpu_memory(
+            &lbc,
+            context,
+            resolve_kv_precision(args.kv_precision, KvPrecision::F32),
+            true,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Provider selection: the Metal GPU-resident path, CUDA NVFP4 and the CPU
+    // backend use the zero-copy `MmapWeightProvider`.
     //
     // Metal engages the no-copy unified-buffer path (`LUMEN_METAL_MMAP_ONLY=1`),
     // avoiding the ~10 GB redundant CPU copy + GPU private weight copy that
@@ -1068,28 +1084,17 @@ async fn run(args: Args) -> Result<(), String> {
     // identical by the same mechanism, verified end-to-end (generated images are
     // byte-identical).
     //
-    // `--sync`, other CUDA quants, and CPU keep `SyncWeightProvider` (the guarded
+    // The CPU backend reads every layer as stored on every token
+    // (`reads_raw_layers`): mapped pages serve that from the page cache, where
+    // `SyncWeightProvider` would pread the whole model again per token.
+    //
+    // `--sync` and other CUDA quants keep `SyncWeightProvider` (the guarded
     // fallback). Mmap and sync are proven byte-identical on the Metal path by
     // `metal_sync_mmap_argmax_parity_test`.
-    // A CPU backend whose whole need at this context exceeds the memory this
-    // machine has available is refused before the provider reads any weights.
-    if matches!(backend_choice, BackendChoice::Cpu) {
-        let context = args
-            .context_len
-            .min(lbc.header.hyperparams.max_seq_len as usize);
-        lumen_runtime::compute::check_cpu_memory(
-            &lbc,
-            context,
-            resolve_kv_precision(args.kv_precision, KvPrecision::F32),
-            true,
-            false,
-        )
-        .map_err(|e| e.to_string())?;
-    }
     let cuda_nvfp4 = matches!(backend_choice, BackendChoice::Cuda)
         && lbc.uses_quant(lumen_format::quantization::QuantScheme::Nvfp4);
-    let use_mmap_provider =
-        !args.sync_provider && (matches!(backend_choice, BackendChoice::Metal) || cuda_nvfp4);
+    let use_mmap_provider = !args.sync_provider
+        && (matches!(backend_choice, BackendChoice::Metal | BackendChoice::Cpu) || cuda_nvfp4);
     let provider: ServerWeights = if use_mmap_provider {
         // Enable Metal's no-copy unified-buffer residency path. Metal only: it is
         // that backend's zero-copy GPU-resident route (gpu_resident.rs probe),
