@@ -393,6 +393,7 @@ fn e2e_f32_matches_cpu() {
         provider.output_proj.clone(),
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     // CUDA backend
     let mut cuda = match try_cuda_backend() {
@@ -731,6 +732,7 @@ fn e2e_f32_stress_20_tokens() {
         provider.output_proj.clone(),
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     let mut cuda = match try_cuda_backend() {
         Some(b) => b,
@@ -789,6 +791,7 @@ fn e2e_f32_single_token_prompt() {
         provider.output_proj.clone(),
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     let mut cuda = match try_cuda_backend() {
         Some(b) => b,

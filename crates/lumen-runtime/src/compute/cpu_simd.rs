@@ -16,13 +16,21 @@
 //! - attention scale       -> precomputed once in `init()` (practice 4.3)
 //!
 //! RoPE uses NEON vld2q/vst2q for paired rotation on aarch64.
+//!
+//! The Qwen3.5-family layers (GatedDeltaNet, gated full attention, MoE) run
+//! through [`cpu_qwen35`](super::cpu_qwen35) with this backend's threaded
+//! matrix-vector product: the Q8_0 and F32 kernels above, and for every other
+//! stored format rows decoded per thread and dotted with `dot_product_simd`.
 
+use crate::compute::cpu_qwen35::{MatVec, Qwen35};
 use crate::compute::simd_kernels;
-use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
+use crate::compute::{ActivationBuffer, BackendCaps, ComputeBackend, ComputeDtype, Logits};
 use crate::error::RuntimeError;
-use crate::kv::{KvCacheView, KvPrecision};
+use crate::kv::disk::{GdnLayout, RecurrentState};
+use crate::kv::{KvCache, KvCacheView, KvPrecision};
 use crate::thread_pool::ThreadPool;
-use crate::weight::cache::LayerView;
+use crate::weight::cache::{LayerView, WeightProvider};
+use crate::weight::kquant::{dequant_row_into, row_bytes};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::cell::UnsafeCell;
@@ -564,6 +572,8 @@ pub struct SimdF32Backend {
     /// Wrapped in UnsafeCell for the same single-threaded safety reason as scratch.
     profile_enabled: bool,
     profile: UnsafeCell<ComputeProfile>,
+    /// The Qwen3.5-family layers and their recurrent state.
+    qwen35: Qwen35,
 }
 
 // SAFETY: SimdF32Backend is accessed single-threaded from the engine's generate()
@@ -618,12 +628,69 @@ impl SimdF32Backend {
             pool,
             profile_enabled: false,
             profile: UnsafeCell::new(ComputeProfile::default()),
+            qwen35: Qwen35::new(),
         }
     }
 
     /// Returns the total thread count (workers + caller thread).
     pub fn thread_count(&self) -> usize {
         self.pool.total_threads()
+    }
+}
+
+impl MatVec for SimdF32Backend {
+    fn matvec(
+        &self,
+        out: &mut [f32],
+        w: &[u8],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        scheme: QuantScheme,
+    ) -> Result<(), RuntimeError> {
+        let rb = row_bytes(scheme, cols).ok_or_else(|| {
+            RuntimeError::Compute(format!(
+                "SimdF32Backend: cannot read a {scheme:?} matrix with rows of {cols}"
+            ))
+        })?;
+        if out.len() < rows || x.len() < cols || w.len() < rows * rb {
+            return Err(RuntimeError::Compute(format!(
+                "SimdF32Backend: {scheme:?} matvec [{rows} x {cols}] given {} weight bytes \
+                 (needs {}), {} inputs, {} outputs",
+                w.len(),
+                rows * rb,
+                x.len(),
+                out.len()
+            )));
+        }
+        let x = &x[..cols];
+        match scheme {
+            QuantScheme::Q8_0 => {
+                simd_kernels::matmul_q8_0_simd_parallel(out, w, x, rows, cols, &self.pool)
+            }
+            QuantScheme::F32 => {
+                simd_kernels::matmul_bytes_simd_parallel(out, w, x, rows, cols, &self.pool)
+            }
+            _ => {
+                let out_addr = out.as_mut_ptr() as usize;
+                self.pool.parallel_for(rows, |start, end| {
+                    // SAFETY: parallel_for hands each chunk a disjoint row range of `out`.
+                    let chunk = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
+                    };
+                    let mut row = vec![0.0f32; cols];
+                    for (i, o) in chunk.iter_mut().enumerate() {
+                        dequant_row_into(&mut row, w, start + i, cols, scheme)
+                            .expect("scheme and extents checked above");
+                        *o = simd_kernels::dot_product_simd(&row, x);
+                    }
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -641,6 +708,7 @@ impl ComputeBackend for SimdF32Backend {
 
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.hyperparams = Some(*hyperparams);
+        self.qwen35 = Qwen35::new();
         self.cached_hidden_dim = hyperparams.hidden_dim as usize;
         self.cached_vocab_size = hyperparams.vocab_size as usize;
 
@@ -742,12 +810,17 @@ impl ComputeBackend for SimdF32Backend {
     #[allow(clippy::needless_range_loop)]
     fn compute_layer(
         &self,
-        _layer_idx: usize,
+        layer_idx: usize,
         x: &mut ActivationBuffer,
         weights: &LayerView,
         kv: Option<&mut KvCacheView>,
         seq_pos: usize,
     ) -> Result<(), RuntimeError> {
+        if self.qwen35.runs(layer_idx)? {
+            return self
+                .qwen35
+                .compute_layer(layer_idx, x, weights, kv, seq_pos, self);
+        }
         // SAFETY: compute_layer is only called from the engine's single-threaded
         // generate() loop. No concurrent access to scratch or profile is possible.
         let s = unsafe { &mut *self.scratch.get() }
@@ -1832,6 +1905,80 @@ impl ComputeBackend for SimdF32Backend {
         // Write result back to activation buffer (reuse existing allocation)
         x.write_f32_from(&s.attn_proj);
         Ok(())
+    }
+
+    /// Read and check every layer (see [`Qwen35::prepare`]); the plain path
+    /// reads F32 and Q8_0 tensors, with the gate and up projections in one
+    /// scheme.
+    fn preload_weights(&mut self, weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
+        let hp = self.hyperparams.ok_or_else(|| {
+            RuntimeError::Compute("backend not initialized: call init() first".into())
+        })?;
+        self.qwen35.prepare(&hp, weights, &|st| {
+            for (name, s) in [
+                ("attn_norm", &st.attn_norm),
+                ("wq", &st.wq),
+                ("wk", &st.wk),
+                ("wv", &st.wv),
+                ("wo", &st.wo),
+                ("ffn_norm", &st.ffn_norm),
+                ("w_gate", &st.w_gate),
+                ("w_up", &st.w_up),
+                ("w_down", &st.w_down),
+            ] {
+                if !matches!(s.quant, QuantScheme::F32 | QuantScheme::Q8_0) {
+                    return Err(format!(
+                        "{name} is {:?}; this path reads F32 and Q8_0 tensors",
+                        s.quant
+                    ));
+                }
+            }
+            if st.w_gate.quant != st.w_up.quant {
+                return Err(format!(
+                    "w_gate is {:?} and w_up {:?}; this path reads both in one scheme",
+                    st.w_gate.quant, st.w_up.quant
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn reads_raw_layers(&self) -> bool {
+        true
+    }
+
+    fn caps(&self) -> BackendCaps {
+        BackendCaps {
+            batched_prefill: false,
+            gpu_resident: false,
+            gdn: self.qwen35.has_gdn(),
+            moe: self.qwen35.has_moe(),
+            gpu_argmax: false,
+        }
+    }
+
+    fn reset_recurrent_state(&self) {
+        self.qwen35.reset();
+    }
+
+    fn sync_kv_to_cpu(
+        &self,
+        _kv: &mut KvCache,
+        recurrent: Option<&mut RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        self.qwen35.save_state(recurrent)
+    }
+
+    fn sync_kv_from_cpu(
+        &self,
+        _kv: &KvCache,
+        recurrent: Option<&RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        self.qwen35.restore_state(recurrent)
+    }
+
+    fn gdn_layout(&self) -> Option<GdnLayout> {
+        self.qwen35.gdn_layout()
     }
 
     fn compute_final(&self, x: &ActivationBuffer) -> Result<Logits, RuntimeError> {

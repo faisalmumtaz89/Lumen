@@ -48,6 +48,7 @@ fn setup_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBackend)
         provider.output_proj.clone(),
     );
     cpu.init(&hp)?;
+    cpu.preload_weights(&provider)?;
 
     // CUDA backend
     let mut cuda = CudaBackend::new(0)?;

@@ -581,6 +581,7 @@ mod tests {
         sync_backend
             .init(&sync_provider.lbc().header.hyperparams)
             .unwrap();
+        sync_backend.preload_weights(&sync_provider).unwrap();
 
         let rt_config = RuntimeConfig {
             pipeline_mode: PipelineMode::MinMem,
@@ -614,6 +615,7 @@ mod tests {
         async_backend
             .init(&async_provider.lbc().header.hyperparams)
             .unwrap();
+        async_backend.preload_weights(&async_provider).unwrap();
 
         let engine = InferenceEngine::new(rt_config, async_provider.lbc().header.hyperparams);
         let async_result = engine

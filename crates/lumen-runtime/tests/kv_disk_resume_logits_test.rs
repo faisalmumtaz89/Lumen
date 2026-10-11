@@ -51,6 +51,7 @@ fn make_cpu_session(provider: &SyncWeightProvider, seed: u64) -> (Session, Naive
         provider.output_proj.clone(),
     );
     backend.init(&hp).unwrap();
+    backend.preload_weights(provider).unwrap();
     let config = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
         prefetch_distance: 1,
@@ -156,6 +157,7 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
         provider.output_proj.clone(),
     );
     backend_r.init(&hp).unwrap();
+    backend_r.preload_weights(&provider).unwrap();
     let config_r = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
         prefetch_distance: 1,

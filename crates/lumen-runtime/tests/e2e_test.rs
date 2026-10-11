@@ -45,6 +45,7 @@ fn setup_test_model() -> (SyncWeightProvider, NaiveF32Backend) {
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    backend.preload_weights(&provider).unwrap();
 
     (provider, backend)
 }
@@ -71,6 +72,7 @@ fn setup_test_model_simd() -> (SyncWeightProvider, SimdF32Backend) {
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    backend.preload_weights(&provider).unwrap();
 
     (provider, backend)
 }
@@ -235,6 +237,7 @@ fn e2e_mmap_deterministic() {
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    backend.preload_weights(&provider).unwrap();
 
     let engine = InferenceEngine::new(
         RuntimeConfig {
@@ -521,6 +524,7 @@ fn e2e_async_matches_sync() {
     sync_backend
         .init(&sync_provider.lbc().header.hyperparams)
         .unwrap();
+    sync_backend.preload_weights(&sync_provider).unwrap();
 
     let rt_config = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
@@ -552,6 +556,7 @@ fn e2e_async_matches_sync() {
     async_backend
         .init(&async_provider.lbc().header.hyperparams)
         .unwrap();
+    async_backend.preload_weights(&async_provider).unwrap();
 
     let async_engine = InferenceEngine::new(rt_config, async_provider.lbc().header.hyperparams);
     let async_result = async_engine

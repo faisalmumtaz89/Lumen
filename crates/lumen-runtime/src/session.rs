@@ -1,7 +1,10 @@
 //! `Session` -- owns one generation's state and exposes the per-token loop.
 //!
 //! Architecturally, a `Session` is the single object that owns the
-//! `(tokens, KV cache, sampler, recurrent state)` tuple. It exists for two
+//! `(tokens, KV cache, sampler)` tuple. A GatedDeltaNet model's recurrent
+//! state is owned by the backend (Metal, CUDA and the CPU backends alike), so
+//! a backend serves one live hybrid sequence at a time: two sessions sharing a
+//! backend must not interleave a hybrid model's tokens. It exists for two
 //! reasons:
 //!
 //! 1. **Code consolidation.** Both former `generate()` and
@@ -1563,9 +1566,15 @@ fn forward_pass(
         } else {
             None
         };
-        let (layer_view, weight_cache_hit) = match weights.try_get_layer(layer) {
-            Some(view) => (view, true),
-            None => (weights.get_layer_blocking(layer)?, false),
+        // A backend that decodes stored formats itself reads every layer as
+        // stored, never a provider's cached (possibly dequantised) view.
+        let (layer_view, weight_cache_hit) = if backend.reads_raw_layers() {
+            (weights.get_layer_raw(layer)?, false)
+        } else {
+            match weights.try_get_layer(layer) {
+                Some(view) => (view, true),
+                None => (weights.get_layer_blocking(layer)?, false),
+            }
         };
         let weight_load_time = load_start.map(|t| t.elapsed());
 
@@ -1576,7 +1585,8 @@ fn forward_pass(
         } else {
             None
         };
-        backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos)?;
+        let computed =
+            backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos);
         let compute_time = compute_start.map(|t| t.elapsed());
 
         // Commit KV updates.
@@ -1585,7 +1595,10 @@ fn forward_pass(
         } else {
             None
         };
+        // The view owns the layer's KV buffers: hand them back before
+        // surfacing a compute error, so the cache stays whole.
         kv.commit_view(kv_view)?;
+        computed?;
         let kv_save_time = kv_save_start.map(|t| t.elapsed());
 
         // Release weight hint in MinMem mode.
@@ -1661,6 +1674,7 @@ mod tests {
             provider.output_proj.clone(),
         );
         backend.init(&provider.lbc().header.hyperparams).unwrap();
+        backend.preload_weights(&provider).unwrap();
         let hp = provider.lbc().header.hyperparams;
         (provider, backend, hp)
     }

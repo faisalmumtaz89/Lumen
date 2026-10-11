@@ -5,6 +5,7 @@
 //! (matmul, attention, MLP, normalization, sampling).
 
 pub mod cpu_naive;
+mod cpu_qwen35;
 pub mod cpu_simd;
 pub mod simd_kernels;
 
@@ -383,9 +384,22 @@ pub trait ComputeBackend: Send + Sync {
         self.prefill(suffix_tokens, weights, kv)
     }
 
-    /// Preload weights to GPU memory.
+    /// Prepare the backend for the model's weights; called once after `init`.
+    ///
+    /// The GPU backends upload the layers to device memory. The CPU backends
+    /// read every layer, check it against what their compute reads and record
+    /// each layer's kind; they refuse to compute, save or restore before this
+    /// has succeeded.
     fn preload_weights(&mut self, _weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    /// Whether the forward loop hands this backend layers exactly as stored
+    /// (`WeightProvider::get_layer_raw`) instead of the provider's cached
+    /// views. The CPU backends decode stored formats themselves and return
+    /// `true`; the default keeps every other backend on the cached views.
+    fn reads_raw_layers(&self) -> bool {
+        false
     }
 
     /// GPU-resident decode returning logits for a single token.
@@ -453,6 +467,9 @@ pub trait ComputeBackend: Send + Sync {
     }
 
     /// Reset recurrent state (GDN h_state, conv_state).
+    ///
+    /// Every backend with GDN layers (Metal, CUDA and the CPU backends) owns
+    /// that state itself: a backend serves one live hybrid sequence at a time.
     fn reset_recurrent_state(&self) {}
 
     /// Reconcile speculative decode-ahead with the host KV cursor before a
@@ -487,8 +504,10 @@ pub trait ComputeBackend: Send + Sync {
     /// from `KvCache.keys[layer]` / `KvCache.values[layer]` and from the
     /// caller-supplied [`RecurrentState`]; on GPU backends those CPU
     /// mirrors only contain useful data after this method runs. The default
-    /// implementation is a no-op so the CPU backends (which already own the
-    /// authoritative buffers in `KvCache`) compile unchanged.
+    /// implementation is a no-op for a backend whose KV already lives in
+    /// `KvCache` and which has no recurrent state. The CPU backends own their
+    /// KV in `KvCache` and override this only to copy their GDN state and to
+    /// refuse before `preload_weights` has prepared them.
     ///
     /// Backends overriding this MUST:
     /// - synchronously wait for any in-flight command buffers (Metal:
@@ -496,7 +515,7 @@ pub trait ComputeBackend: Send + Sync {
     /// - populate `KvCache.set_layer_raw_bytes` for each layer in the
     ///   storage layout declared by `validate_kv_precision`;
     /// - populate the supplied `RecurrentState` when `Some` and the backend
-    ///   has GDN state (Metal Qwen3.5-9B); on backends without GDN, leave
+    ///   has GDN state (Metal, the CPU backends); on backends without GDN, leave
     ///   the recurrent argument untouched and return `Ok(())`.
     ///
     /// Errors are surfaced verbatim — a partial sync MUST leave the CPU
@@ -536,7 +555,8 @@ pub trait ComputeBackend: Send + Sync {
     /// `RecurrentState` layout matches what the backend has allocated, and
     /// MUST leave their buffers in a known state on error.
     ///
-    /// The default impl is a no-op so the CPU backends compile unchanged.
+    /// The default impl is a no-op; the CPU backends restore their GDN state
+    /// here and refuse before `preload_weights` has prepared them.
     fn sync_kv_from_cpu(
         &self,
         _kv: &KvCache,
@@ -547,7 +567,8 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Describe the GDN layout this backend uses, if any. Returns `None`
     /// when the backend either has no GDN state or has not yet allocated
-    /// it (e.g. a non-GDN model on the Metal backend). The disk-save path
+    /// it (e.g. a non-GDN model on the Metal backend, or a CPU backend before
+    /// `preload_weights`). The disk-save path
     /// uses this to size and tag the optional recurrent section.
     fn gdn_layout(&self) -> Option<crate::kv::disk::GdnLayout> {
         None

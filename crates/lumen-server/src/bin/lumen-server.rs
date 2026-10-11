@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lumen_format::reader::LbcFile;
 use lumen_format::QuantScheme;
-use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::kv::KvPrecision;
 use lumen_runtime::pipeline::PipelineMode;
@@ -711,8 +711,7 @@ impl ServerWeights {
         }
     }
 
-    /// Borrow as `&dyn WeightProvider` for `preload_weights` (the CUDA and Metal backends).
-    #[cfg(any(feature = "cuda", target_os = "macos"))]
+    /// Borrow as `&dyn WeightProvider` for `preload_weights`.
     fn as_dyn(&self) -> &dyn WeightProvider {
         match self {
             ServerWeights::Sync(p) => &**p,
@@ -1232,12 +1231,16 @@ async fn run(args: Args) -> Result<(), String> {
             }
         }
         BackendChoice::Cpu => {
-            let mut cpu = NaiveF32Backend::new();
+            // The threaded SIMD backend on every core, as `lumen run` picks on a
+            // machine without a GPU.
+            let mut cpu = SimdF32Backend::new();
             // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
             // directly and does not build a GPU buffer from the raw.
             wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
             cpu.init(&hyperparams_capped)
                 .map_err(|e| format!("CPU init: {e}"))?;
+            cpu.preload_weights(provider.as_dyn())
+                .map_err(|e| format!("the CPU backend cannot run this model: {e}"))?;
             // The CPU cache stores F32 or F16; the engine refuses any other precision.
             (
                 Box::new(cpu),
@@ -1481,7 +1484,7 @@ fn image_config(
                     "the image endpoint runs on CUDA (LUMEN_IMAGE_DEVICE) but no CUDA device \
                      is available; set LUMEN_IMAGE_DEVICE=cpu for the CPU reference"
                         .to_string(),
-                )
+                );
             }
             Ok(_) => {}
             Err(e) => {

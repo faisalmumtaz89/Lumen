@@ -143,6 +143,7 @@ async fn boot() -> (
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    backend.preload_weights(&provider).unwrap();
     let hyperparams = provider.lbc().header.hyperparams;
     let runtime_cfg = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,

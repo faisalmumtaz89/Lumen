@@ -719,9 +719,15 @@ impl InferenceEngine {
             } else {
                 None
             };
-            let (layer_view, weight_cache_hit) = match weights.try_get_layer(layer) {
-                Some(view) => (view, true),
-                None => (weights.get_layer_blocking(layer)?, false),
+            // A backend that decodes stored formats itself reads every layer as
+            // stored, never a provider's cached (possibly dequantised) view.
+            let (layer_view, weight_cache_hit) = if backend.reads_raw_layers() {
+                (weights.get_layer_raw(layer)?, false)
+            } else {
+                match weights.try_get_layer(layer) {
+                    Some(view) => (view, true),
+                    None => (weights.get_layer_blocking(layer)?, false),
+                }
             };
             // Snapshot weight_load_time immediately to get accurate duration.
             let weight_load_time = load_start.map(|t| t.elapsed());
@@ -733,7 +739,8 @@ impl InferenceEngine {
             } else {
                 None
             };
-            backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos)?;
+            let computed =
+                backend.compute_layer(layer, &mut x, &layer_view, Some(&mut kv_view), seq_pos);
             let compute_time = compute_start.map(|t| t.elapsed());
 
             // Commit KV updates.
@@ -742,7 +749,10 @@ impl InferenceEngine {
             } else {
                 None
             };
+            // The view owns the layer's KV buffers: hand them back before
+            // surfacing a compute error, so the cache stays whole.
             kv.commit_view(kv_view)?;
+            computed?;
             let kv_save_time = kv_save_start.map(|t| t.elapsed());
 
             // Release weight hint in MinMem mode.

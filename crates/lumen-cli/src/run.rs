@@ -1065,8 +1065,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // `--sync` selects the weight *I/O provider* (sync pread vs mmap), NOT the
     // compute backend. It must NOT suppress compute-backend auto-detection:
     // doing so left `--sync` (with no explicit backend) falling through to the
-    // CPU `NaiveF32Backend`, which cannot run this model's GatedDeltaNet layers
-    // (zero-length wq sentinel -> matmul panic). The provider choice is honoured
+    // single-threaded CPU `NaiveF32Backend`. The provider choice is honoured
     // separately by the `run_with_sync` / `run_with_mmap` dispatch below, and
     // `run_with_sync` performs the GPU-resident preload that GDN requires.
     //
@@ -1883,12 +1882,15 @@ fn create_cpu_or_metal_backend(
 /// Create and initialize the appropriate compute backend.
 ///
 /// All backends are configured through the `ComputeBackend` trait after boxing,
-/// so the setup logic (global tensors, quant data, init, profile) is shared.
+/// so the setup logic (global tensors, quant data, init, profile) is shared. A
+/// CPU backend is also prepared here from `weights`: it reads and checks every
+/// layer before it computes, saves or restores anything.
 ///
 /// `threads` controls the SIMD backend thread pool size:
 ///   0 = auto-detect (all available cores), N = use exactly N threads.
 #[allow(clippy::too_many_arguments)]
 fn create_backend(
+    weights: &dyn WeightProvider,
     primary_quant: QuantScheme,
     use_simd: bool,
     #[allow(unused_variables)] use_metal: bool,
@@ -2016,6 +2018,12 @@ fn create_backend(
         eprintln!("Error: backend initialization failed: {e}");
         std::process::exit(1);
     });
+    if !use_metal && !use_cuda {
+        backend.preload_weights(weights).unwrap_or_else(|e| {
+            eprintln!("Error: the CPU backend cannot run this model: {e}");
+            std::process::exit(1);
+        });
+    }
     if profile {
         backend.set_profile(true);
     }
@@ -2095,6 +2103,7 @@ fn run_with_async(
     hyperparams_capped.max_seq_len = max_seq_len as u32;
 
     let backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
@@ -2222,6 +2231,7 @@ fn run_with_sync(
     // flagged unused-mut without this allow. Mirrors `run_with_async`.
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
@@ -2251,9 +2261,8 @@ fn run_with_sync(
     // (`gdn_h_states` / `gdn_conv_states`) inside the GPU-resident preload, and
     // the batched-prefill GDN kernel indexes them unconditionally. Without the
     // preload the sync path errors ("GDN layers require GPU-resident weights" on
-    // CUDA; `gdn.rs` panic on Metal) on the first GDN layer. `preload_weights`
-    // is a no-op on the CPU/SIMD backends, so it is only consequential when a
-    // GPU backend (Metal on macOS, CUDA with --features cuda) was selected.
+    // CUDA; `gdn.rs` panic on Metal) on the first GDN layer. The CPU backends
+    // were prepared by `create_backend`.
     if use_metal || use_cuda {
         backend.preload_weights(&provider).unwrap_or_else(|e| {
             eprintln!("Error: GPU-resident preload failed: {e}");
@@ -2629,6 +2638,7 @@ fn run_with_mmap(
 
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
