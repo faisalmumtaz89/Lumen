@@ -88,7 +88,7 @@ compressed-tensors INT4 (group 32).
 |---------|----------|--------|
 | **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100, RTX 5090) | Every format above; the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
-| **CPU** | Any machine: chosen when there is no GPU, or with `--simd` | Every format above except the CUDA-only checkpoint imports; measured end to end on `qwen3.5-9b` Q8_0 only ([details](docs/support.md#cpu-no-gpu)) |
+| **CPU** | Any machine: chosen when there is no GPU, or with `--simd` | Every format above except the CUDA-only checkpoint imports; much slower than a GPU ([measured](docs/support.md#cpu-no-gpu)) |
 
 Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen image "<prompt>"` makes a picture, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
 

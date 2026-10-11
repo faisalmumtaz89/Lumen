@@ -86,16 +86,26 @@ dense and MoE FFNs) from every stored format except NVFP4, FP8 and INT4, which a
 Metal. `lumen run` picks the threaded SIMD backend on a machine without a GPU (or with `--simd`);
 `lumen-server --backend cpu` uses it too. A run is refused, naming both numbers, when the memory
 it needs is more than the machine has available (on Linux, within its cgroup limits). The CPU is
-not verified against llama.cpp. What was measured, on 2026-10-11:
+not verified against llama.cpp. What was measured, on 2026-10-11 and 2026-10-12, with
+`lumen run <model> "Explain in one paragraph why the sky is blue." --temperature 0
+--repeat-penalty 1.0 --max-tokens 64` (512-token context, F32 KV), peak RSS from `/usr/bin/time`:
 
-| Model | Quant | Run | Result |
-|-------|-------|-----|--------|
-| Qwen3.5-9B dense | Q8_0 (Metal-converted, sha256 `072c9fb6…`) | `lumen run --simd --temperature 0 --repeat-penalty 1.0 --max-tokens 64`, M3 Ultra, 28 threads, 512-token context, F32 KV | Coherent answer; decode 8.5 tok/s, prefill 3.5 tok/s (23 tokens fed one at a time); peak RSS 21.7 GiB (`/usr/bin/time -l`). With `--sync` the same 64 tokens at 0.72 tok/s, peak RSS 15.6 GiB |
-| Qwen3.5-9B dense | Q8_0 (same file) | 128 greedy tokens decoded by Metal, the same history fed to the CPU | First token equal; argmax agreement 124/128; logits cosine ≥ 0.987 (mean 0.9965). The scalar reference backend shows the same distance to Metal (124/128, ≥ 0.988), and the SIMD backend is within cosine 0.9995 of it (126/128) |
-| Qwen3.5-9B dense | Q8_0 (same file) | A Metal session saved right after prefill, restored on the CPU | Its 24 greedy tokens equal those of a CPU session that prefilled the prompt itself |
+| Model | Quant | Machine | Result |
+|-------|-------|---------|--------|
+| Qwen3.5-9B dense | Q8_0 | M3 Ultra, 28 threads, `--simd` | Coherent; decode 8.5 tok/s, prefill 3.5 tok/s (23 tokens fed one at a time); peak RSS 21.7 GiB. With `--sync`, 0.72 tok/s |
+| Qwen3.5-9B dense | Q8_0 | Linux x86-64, 32 vCPU, no GPU (picked automatically) | Coherent; decode 0.98 tok/s, prefill 1.0 tok/s; peak RSS 28.4 GiB |
+| Qwen3.8-27B dense | Q4_0 | same | Coherent; decode 0.43 tok/s, prefill 0.5 tok/s; peak RSS 38.6 GiB |
+| Qwen3.8-27B dense | Q4_K_M | same | Coherent; decode 0.41 tok/s, prefill 0.4 tok/s; peak RSS 38.7 GiB |
+| Qwen3.5-MoE-35B-A3B | Q4_0 | same | Coherent; decode 1.29 tok/s, prefill 1.3 tok/s; peak RSS 28.7 GiB |
 
-The 27B, the MoE and the K-quant formats are covered by tests on synthetic models only; their
-speed and memory on the CPU were not measured.
+The 9B Q8_0 artifact (sha256 `072c9fb6…`, byte-identical converted on macOS and on Linux) was also
+held to the GPU backends over one 128-token greedy history, the CPU fed the same tokens:
+
+| Against | Result |
+|---------|--------|
+| CUDA (L4, driver 610.57) | Argmax agreement 127/128; logits cosine ≥ 0.99987 (mean 0.99993). On x86 the SIMD backend equals the scalar reference bit for bit |
+| Metal (M3 Ultra) | Argmax agreement 120/128; logits cosine ≥ 0.989 (mean 0.9965). Metal is as far from CUDA (119/128, ≥ 0.988): it re-quantizes this artifact's output head and GDN `ssm_out` to Q4_0 at load |
+| A Metal session saved right after prefill, restored on the CPU | Its 24 greedy tokens equal those of a CPU session that prefilled the prompt itself |
 
 ## What is not (yet) supported
 

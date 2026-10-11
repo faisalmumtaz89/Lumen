@@ -18,8 +18,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   has available (on Linux, within its cgroup limits): before the download and again before the
   weights load. A CPU session saves and restores its recurrent state in Metal's layout. A
   server request whose forward pass fails now leaves the next request a fresh session.
-  Measured on an M3 Ultra (28 threads): `qwen3.5-9b` Q8_0 decodes 8.5 tok/s, peak RSS
-  21.7 GiB.
+  `qwen3.5-9b` Q8_0 decodes 8.5 tok/s on an M3 Ultra (28 threads) and 0.98 tok/s on a 32-vCPU
+  x86-64 Linux machine.
 
 ### Changed
 
