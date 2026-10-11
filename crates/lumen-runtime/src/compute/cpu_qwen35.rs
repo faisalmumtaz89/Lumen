@@ -21,7 +21,7 @@
 //! ring as `[physical slot][Q | K | V channel]` holding the raw projection
 //! inputs; the ring position is the next slot to overwrite.
 
-use crate::compute::ActivationBuffer;
+use crate::compute::{ActivationBuffer, BackendCaps};
 use crate::error::RuntimeError;
 use crate::kv::disk::{GdnLayout, RecurrentState, RECURRENT_DTYPE_F32};
 use crate::kv::KvCacheView;
@@ -35,7 +35,7 @@ use std::sync::Mutex;
 
 /// The matrix-vector product a backend supplies: `out[..rows] = W x` for the
 /// row-major `rows x cols` matrix `w` stored as `scheme`. Short storage, input
-/// or output is an error.
+/// or output is an error ([`check_matvec`]).
 pub(crate) trait MatVec {
     fn matvec(
         &self,
@@ -46,6 +46,34 @@ pub(crate) trait MatVec {
         cols: usize,
         scheme: QuantScheme,
     ) -> Result<(), RuntimeError>;
+}
+
+/// Refuse a matvec whose scheme the host cannot decode in rows of `cols`, or
+/// whose storage, input or output is shorter than the shape.
+pub(crate) fn check_matvec(
+    out: &[f32],
+    w: &[u8],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    scheme: QuantScheme,
+) -> Result<(), RuntimeError> {
+    let rb = row_bytes(scheme, cols).ok_or_else(|| {
+        RuntimeError::Compute(format!(
+            "cannot read a {scheme:?} matrix with rows of {cols}"
+        ))
+    })?;
+    if out.len() < rows || x.len() < cols || w.len() < rows * rb {
+        return Err(RuntimeError::Compute(format!(
+            "{scheme:?} matvec [{rows} x {cols}] given {} weight bytes (needs {}), {} inputs, \
+             {} outputs",
+            w.len(),
+            rows * rb,
+            x.len(),
+            out.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The attention block of a layer.
@@ -184,12 +212,6 @@ impl Qwen35 {
         self.plan = None;
         let dims = Dims::new(hp);
         let num_layers = hp.num_layers as usize;
-        if weights.num_layers() != num_layers {
-            return Err(RuntimeError::Unsupported(format!(
-                "the model has {} layers but its header says {num_layers}",
-                weights.num_layers()
-            )));
-        }
         let mut layers = Vec::with_capacity(num_layers);
         let mut gdn_slot = Vec::with_capacity(num_layers);
         let mut num_gdn = 0;
@@ -233,14 +255,22 @@ impl Qwen35 {
         Ok(*kind != (Attention::Plain, Ffn::Dense))
     }
 
-    pub(crate) fn has_gdn(&self) -> bool {
+    fn has_gdn(&self) -> bool {
         self.plan.as_ref().is_some_and(|p| p.num_gdn > 0)
     }
 
-    pub(crate) fn has_moe(&self) -> bool {
-        self.plan
-            .as_ref()
-            .is_some_and(|p| p.layers.iter().any(|l| l.1 == Ffn::Moe))
+    /// The CPU backends' capabilities: GDN and MoE as the prepared model has them.
+    pub(crate) fn caps(&self) -> BackendCaps {
+        BackendCaps {
+            batched_prefill: false,
+            gpu_resident: false,
+            gdn: self.has_gdn(),
+            moe: self
+                .plan
+                .as_ref()
+                .is_some_and(|p| p.layers.iter().any(|l| l.1 == Ffn::Moe)),
+            gpu_argmax: false,
+        }
     }
 
     /// The recurrent-state layout of a prepared GDN model; `None` otherwise.
@@ -339,25 +369,7 @@ impl Qwen35 {
         let want = self.gdn_layout().ok_or_else(|| {
             RuntimeError::Compute("recurrent state given for a model without GDN layers".into())
         })?;
-        rec.validate_layout_matches(&want)?;
-        let n = want.num_gdn_layers as usize;
-        if rec.h_states.len() != n
-            || rec.conv_states.len() != n
-            || rec.conv_positions.len() != n
-            || rec
-                .h_states
-                .iter()
-                .any(|h| h.len() != want.h_state_bytes_per_layer())
-            || rec
-                .conv_states
-                .iter()
-                .any(|c| c.len() != want.conv_state_bytes_per_layer())
-        {
-            return Err(RuntimeError::Compute(
-                "recurrent state buffers do not match their layout".into(),
-            ));
-        }
-        Ok(())
+        rec.validate_layout_matches(&want)
     }
 
     /// Run `layer` (one this module [`runs`](Self::runs)) on the hidden state `x`.
@@ -375,13 +387,6 @@ impl Qwen35 {
         let (attn, ffn) = plan.layers[layer];
         let st = &w.subtensors;
         let mut h = x.as_f32_slice().to_vec();
-        if h.len() != d.hidden {
-            return Err(RuntimeError::Compute(format!(
-                "layer {layer}: hidden state has {} elements, the model {}",
-                h.len(),
-                d.hidden
-            )));
-        }
 
         let normed = rmsnorm(&h, &vector(w, &st.attn_norm, d.hidden)?, d.eps);
         let attn_out = match attn {
@@ -397,18 +402,14 @@ impl Qwen35 {
                 })?;
                 gated_attention(d, mv, w, &normed, kv, seq_pos)?
             }
-            Attention::Plain => {
-                return Err(RuntimeError::Unsupported(format!(
-                    "layer {layer}: plain attention runs on the backend's own path"
-                )))
-            }
+            Attention::Plain => unreachable!("plain attention with a MoE FFN is refused"),
         };
         add(&mut h, &attn_out);
 
         let ffn_norm = ffn_norm_slice(st).expect("checked at preparation");
         let normed = rmsnorm(&h, &vector(w, ffn_norm, d.hidden)?, d.eps);
         let ffn_out = match ffn {
-            Ffn::Dense => swiglu(mv, w, &st.w_gate, &st.w_up, &st.w_down, &normed, d.inter, d)?,
+            Ffn::Dense => swiglu(mv, w, (&st.w_gate, &st.w_up, &st.w_down), &normed, d)?,
             Ffn::Moe => moe(d, mv, w, &normed)?,
         };
         add(&mut h, &ffn_out);
@@ -640,14 +641,10 @@ fn check_layer(
 // ---------------------------------------------------------------------------
 // Compute.
 
-fn bytes<'a>(w: &'a LayerView, s: &TensorSlice) -> Result<&'a [u8], RuntimeError> {
-    w.subtensor_bytes(s)
-}
-
 /// A whole tensor of `n` elements decoded to f32.
 fn vector(w: &LayerView, s: &TensorSlice, n: usize) -> Result<Vec<f32>, RuntimeError> {
     let mut out = vec![0.0f32; n];
-    dequant_row_into(&mut out, bytes(w, s)?, 0, n, s.quant)?;
+    dequant_row_into(&mut out, w.subtensor_bytes(s)?, 0, n, s.quant)?;
     Ok(out)
 }
 
@@ -659,8 +656,13 @@ fn project(
     rows: usize,
 ) -> Result<Vec<f32>, RuntimeError> {
     let mut out = vec![0.0f32; rows];
-    mv.matvec(&mut out, bytes(w, s)?, x, rows, x.len(), s.quant)?;
+    mv.matvec(&mut out, w.subtensor_bytes(s)?, x, rows, x.len(), s.quant)?;
     Ok(out)
+}
+
+/// An optional tensor of the layer kind, present since preparation.
+fn checked(s: &Option<TensorSlice>) -> &TensorSlice {
+    s.as_ref().expect("checked at preparation")
 }
 
 fn add(dst: &mut [f32], src: &[f32]) {
@@ -700,20 +702,16 @@ fn softplus(x: f32) -> f32 {
     }
 }
 
-/// `down(silu(gate x) * up x)` with an `inter`-wide hidden layer.
-#[allow(clippy::too_many_arguments)]
+/// `down(silu(gate x) * up x)` for the `(gate, up, down)` projections.
 fn swiglu(
     mv: &dyn MatVec,
     w: &LayerView,
-    gate: &TensorSlice,
-    up: &TensorSlice,
-    down: &TensorSlice,
+    (gate, up, down): (&TensorSlice, &TensorSlice, &TensorSlice),
     x: &[f32],
-    inter: usize,
     d: &Dims,
 ) -> Result<Vec<f32>, RuntimeError> {
-    let mut g = project(mv, w, gate, x, inter)?;
-    let u = project(mv, w, up, x, inter)?;
+    let mut g = project(mv, w, gate, x, d.inter)?;
+    let u = project(mv, w, up, x, d.inter)?;
     for (a, b) in g.iter_mut().zip(&u) {
         *a = silu(*a) * b;
     }
@@ -809,15 +807,14 @@ fn gdn_attention(
     gs: &mut GdnState,
 ) -> Result<Vec<f32>, RuntimeError> {
     let st = &w.subtensors;
-    let opt = |s: &Option<TensorSlice>| s.expect("checked at preparation");
     let qkv = project(mv, w, &st.wq, normed, d.qkv())?;
-    let z = project(mv, w, &opt(&st.attn_gate), normed, d.v())?;
-    let a_raw = project(mv, w, &opt(&st.ssm_alpha), normed, d.hv)?;
-    let b_raw = project(mv, w, &opt(&st.ssm_beta), normed, d.hv)?;
-    let conv_w = vector(w, &opt(&st.ssm_conv1d), d.qkv() * d.kernel)?;
-    let ssm_a = vector(w, &opt(&st.ssm_a), d.hv)?;
-    let dt_bias = vector(w, &opt(&st.ssm_dt), d.hv)?;
-    let norm_w = vector(w, &opt(&st.ssm_norm), d.d)?;
+    let z = project(mv, w, checked(&st.attn_gate), normed, d.v())?;
+    let a_raw = project(mv, w, checked(&st.ssm_alpha), normed, d.hv)?;
+    let b_raw = project(mv, w, checked(&st.ssm_beta), normed, d.hv)?;
+    let conv_w = vector(w, checked(&st.ssm_conv1d), d.qkv() * d.kernel)?;
+    let ssm_a = vector(w, checked(&st.ssm_a), d.hv)?;
+    let dt_bias = vector(w, checked(&st.ssm_dt), d.hv)?;
+    let norm_w = vector(w, checked(&st.ssm_norm), d.d)?;
     let core = gdn_core(
         d,
         gs,
@@ -831,7 +828,7 @@ fn gdn_attention(
         },
     );
     let gated = gdn_output(d, &core, &z, &norm_w);
-    project(mv, w, &opt(&st.ssm_out), &gated, d.hidden)
+    project(mv, w, checked(&st.ssm_out), &gated, d.hidden)
 }
 
 /// NeoX RoPE over the first `d.rotary` dimensions of each `head_dim` head:
@@ -868,12 +865,11 @@ fn gated_attention(
 ) -> Result<Vec<f32>, RuntimeError> {
     let st = &w.subtensors;
     let (hd, qd, kvd) = (d.head_dim, d.heads * d.head_dim, d.kv_heads * d.head_dim);
-    let opt = |s: &Option<TensorSlice>| s.expect("checked at preparation");
     let qg = project(mv, w, &st.wq, normed, 2 * qd)?;
     let mut k = project(mv, w, &st.wk, normed, kvd)?;
     let v = project(mv, w, &st.wv, normed, kvd)?;
-    let q_norm = vector(w, &opt(&st.attn_q_norm), hd)?;
-    let k_norm = vector(w, &opt(&st.attn_k_norm), hd)?;
+    let q_norm = vector(w, checked(&st.attn_q_norm), hd)?;
+    let k_norm = vector(w, checked(&st.attn_k_norm), hd)?;
 
     let mut q = vec![0.0f32; qd];
     let mut gate = vec![0.0f32; qd];
@@ -947,13 +943,13 @@ fn route(logits: &mut [f32], top_k: usize) -> Vec<(usize, f32)> {
 /// `sigmoid(ffn_gate_inp_shexp . x)` (by 1 without that gate).
 fn moe(d: &Dims, mv: &dyn MatVec, w: &LayerView, x: &[f32]) -> Result<Vec<f32>, RuntimeError> {
     let st = &w.subtensors;
-    let router = st.router_weight.expect("checked at preparation");
+    let router = checked(&st.router_weight);
     let experts = st.experts.as_ref().expect("checked at preparation");
-    let mut logits = project(mv, w, &router, x, d.experts)?;
+    let mut logits = project(mv, w, router, x, d.experts)?;
     let mut out = vec![0.0f32; d.hidden];
     for (e, weight) in route(&mut logits, d.top_k) {
         let ex = &experts[e];
-        let y = swiglu(mv, w, &ex.gate, &ex.up, &ex.down, x, d.inter, d)?;
+        let y = swiglu(mv, w, (&ex.gate, &ex.up, &ex.down), x, d)?;
         for (o, v) in out.iter_mut().zip(&y) {
             *o += weight * v;
         }
@@ -963,7 +959,7 @@ fn moe(d: &Dims, mv: &dyn MatVec, w: &LayerView, x: &[f32]) -> Result<Vec<f32>, 
         &st.shared_expert_up,
         &st.shared_expert_down,
     ) {
-        let y = swiglu(mv, w, g, u, dn, x, d.inter, d)?;
+        let y = swiglu(mv, w, (g, u, dn), x, d)?;
         let gate = match &st.ffn_gate_inp_shexp {
             Some(s) => {
                 let gw = vector(w, s, d.hidden)?;

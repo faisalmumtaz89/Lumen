@@ -23,7 +23,7 @@
 //! and the F32 kernel, and otherwise rows decoded per thread and dotted with
 //! `dot_product_simd`.
 
-use crate::compute::cpu_qwen35::{MatVec, Qwen35};
+use crate::compute::cpu_qwen35::{check_matvec, MatVec, Qwen35};
 use crate::compute::simd_kernels;
 use crate::compute::{ActivationBuffer, BackendCaps, ComputeBackend, ComputeDtype, Logits};
 use crate::error::RuntimeError;
@@ -31,7 +31,7 @@ use crate::kv::disk::{GdnLayout, RecurrentState};
 use crate::kv::{KvCache, KvCacheView, KvPrecision};
 use crate::thread_pool::ThreadPool;
 use crate::weight::cache::{LayerView, WeightProvider};
-use crate::weight::kquant::{dequant_row_into, row_bytes};
+use crate::weight::kquant::dequant_row_into;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::cell::UnsafeCell;
@@ -649,21 +649,7 @@ impl MatVec for SimdF32Backend {
         cols: usize,
         scheme: QuantScheme,
     ) -> Result<(), RuntimeError> {
-        let rb = row_bytes(scheme, cols).ok_or_else(|| {
-            RuntimeError::Compute(format!(
-                "SimdF32Backend: cannot read a {scheme:?} matrix with rows of {cols}"
-            ))
-        })?;
-        if out.len() < rows || x.len() < cols || w.len() < rows * rb {
-            return Err(RuntimeError::Compute(format!(
-                "SimdF32Backend: {scheme:?} matvec [{rows} x {cols}] given {} weight bytes \
-                 (needs {}), {} inputs, {} outputs",
-                w.len(),
-                rows * rb,
-                x.len(),
-                out.len()
-            )));
-        }
+        check_matvec(out, w, x, rows, cols, scheme)?;
         let x = &x[..cols];
         match scheme {
             QuantScheme::Q8_0 if cols <= simd_kernels::Q8_0_MAX_IN_DIM => {
@@ -1949,13 +1935,7 @@ impl ComputeBackend for SimdF32Backend {
     }
 
     fn caps(&self) -> BackendCaps {
-        BackendCaps {
-            batched_prefill: false,
-            gpu_resident: false,
-            gdn: self.qwen35.has_gdn(),
-            moe: self.qwen35.has_moe(),
-            gpu_argmax: false,
-        }
+        self.qwen35.caps()
     }
 
     fn reset_recurrent_state(&self) {

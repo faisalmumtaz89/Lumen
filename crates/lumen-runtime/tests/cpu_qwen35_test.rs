@@ -12,12 +12,15 @@
 //! - Session save right after prefill and load into a fresh backend continue like the
 //!   uninterrupted session; a file without recurrent state is refused.
 //! - Preparation: a bad last layer fails preparation before anything changes; an unprepared
-//!   backend refuses to compute, save and restore.
+//!   backend refuses to compute, save and restore; the SIMD Llama path refuses a tensor it
+//!   cannot read, which the naive one decodes.
 
 mod common;
 
-use common::gdn_hybrid::{build_qwen35_cpu_lbc, qwen35_cpu_hyperparams, Qwen35Fixture};
-use lumen_format::test_model::{generate_test_model, TestModelConfig};
+use common::gdn_hybrid::{build_qwen35_cpu_lbc, Qwen35Fixture};
+use lumen_format::test_model::{
+    generate_test_model, generate_test_model_q4_0, TestModelConfig, TestModelQ4Config,
+};
 use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::kv::disk::{save_atomic, serialize_hyperparams_le, ModelFingerprint};
 use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
@@ -436,14 +439,12 @@ fn a_bad_last_layer_fails_preparation_before_any_change() {
 /// ones), saves nothing and restores nothing, whatever the file holds.
 #[test]
 fn an_unprepared_backend_refuses_compute_save_and_restore() {
-    let fx = Qwen35Fixture {
+    let path = fixture(Qwen35Fixture {
         plain_first: true,
         ..Default::default()
-    };
-    let path = fixture(fx);
+    });
     let provider = SyncWeightProvider::open(&path).unwrap();
     let hp = provider.lbc().header.hyperparams;
-    assert_eq!(hp, qwen35_cpu_hyperparams(&fx, MAX_SEQ));
     let fp = fingerprint(&provider);
     let file = path.with_file_name("pending.kv");
 
@@ -483,4 +484,45 @@ fn an_unprepared_backend_refuses_compute_save_and_restore() {
             .expect("restore into an unprepared backend is refused");
         assert!(err.to_string().contains("preload_weights"), "{err}");
     }
+}
+
+/// On the Llama path the naive backend decodes a Q4_0 model's stored rows to the same logits
+/// as the sync provider's F32 dequantisation of them; the SIMD path, which reads only F32
+/// and Q8_0 there, refuses the model at preparation instead of misreading it.
+#[test]
+fn the_llama_path_decodes_or_refuses_a_q4_0_model() {
+    let path = write_lbc(&generate_test_model_q4_0(&TestModelQ4Config::default()));
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let naive = ready(NaiveF32Backend::new(), &provider, true);
+    let forward = |raw: bool| {
+        let mut kv = kv_cache(&provider, KvPrecision::F32);
+        let mut logits = Vec::new();
+        for token in [3u32, 1, 4] {
+            let mut x = naive.embed_token(token).unwrap();
+            let pos = kv.seq_len();
+            for layer in 0..provider.num_layers() {
+                let view = if raw {
+                    provider.get_layer_raw(layer).unwrap()
+                } else {
+                    provider.get_layer_blocking(layer).unwrap()
+                };
+                let mut v = kv.view_mut(layer).unwrap();
+                naive
+                    .compute_layer(layer, &mut x, &view, Some(&mut v), pos)
+                    .unwrap();
+                kv.commit_view(v).unwrap();
+            }
+            kv.advance_seq_len().unwrap();
+            logits.push(naive.compute_final(&x).unwrap().data);
+        }
+        logits
+    };
+    assert_eq!(forward(true), forward(false));
+
+    let mut simd = ready(SimdF32Backend::new(), &provider, false);
+    let err = simd.preload_weights(&provider).unwrap_err().to_string();
+    assert!(
+        err.contains("is Q4_0; this path reads F32 and Q8_0"),
+        "{err}"
+    );
 }

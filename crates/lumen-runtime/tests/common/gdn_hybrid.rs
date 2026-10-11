@@ -272,14 +272,14 @@ pub struct Qwen35Fixture {
     pub bad_last_layer: bool,
 }
 
-pub const CPU_HEAD_DIM: u32 = 256;
-pub const CPU_ROTARY_DIM: u32 = 64;
-pub const CPU_EXPERTS: usize = 4;
+const CPU_HEAD_DIM: u32 = 256;
+const CPU_ROTARY_DIM: u32 = 64;
+const CPU_EXPERTS: usize = 4;
 
 /// Hyperparams of [`build_qwen35_cpu_lbc`]: GDN 4 V heads / 2 K heads x 128,
 /// gated attention 4 heads / 2 KV heads x 256 with 64 rotary dims, 4 experts
 /// with 2 active.
-pub fn qwen35_cpu_hyperparams(fx: &Qwen35Fixture, max_seq_len: u32) -> ModelHyperparams {
+fn qwen35_cpu_hyperparams(fx: &Qwen35Fixture, max_seq_len: u32) -> ModelHyperparams {
     ModelHyperparams {
         num_layers: 4 + fx.plain_first as u32,
         num_heads: 4,
@@ -308,7 +308,7 @@ pub fn qwen35_cpu_hyperparams(fx: &Qwen35Fixture, max_seq_len: u32) -> ModelHype
 }
 
 /// Deterministic values in `[-scale, scale)`, distinct per `seed`.
-pub fn rand_vals(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+fn rand_vals(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..n)
         .map(|_| {

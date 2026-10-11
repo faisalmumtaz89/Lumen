@@ -22,14 +22,14 @@
 //!
 //! Output is bit-identical to the original allocating implementation.
 
-use crate::compute::cpu_qwen35::{MatVec, Qwen35};
+use crate::compute::cpu_qwen35::{check_matvec, MatVec, Qwen35};
 use crate::compute::{ActivationBuffer, BackendCaps, ComputeBackend, ComputeDtype, Logits};
 use crate::engine::softmax_inplace;
 use crate::error::RuntimeError;
 use crate::kv::disk::{GdnLayout, RecurrentState};
 use crate::kv::{KvCache, KvCacheView};
 use crate::weight::cache::{LayerView, WeightProvider};
-use crate::weight::kquant::{dequant_row_into, host_f16_to_f32, row_bytes};
+use crate::weight::kquant::{dequant_row_into, host_f16_to_f32};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
@@ -272,21 +272,7 @@ fn matmul_dispatch(
     in_dim: usize,
     quant: QuantScheme,
 ) -> Result<(), RuntimeError> {
-    let rb = row_bytes(quant, in_dim).ok_or_else(|| {
-        RuntimeError::Compute(format!(
-            "NaiveF32Backend: cannot read a {quant:?} matrix with rows of {in_dim}"
-        ))
-    })?;
-    if out.len() < out_dim || x.len() < in_dim || w_bytes.len() < out_dim * rb {
-        return Err(RuntimeError::Compute(format!(
-            "NaiveF32Backend: {quant:?} matvec [{out_dim} x {in_dim}] given {} weight bytes \
-             (needs {}), {} inputs, {} outputs",
-            w_bytes.len(),
-            out_dim * rb,
-            x.len(),
-            out.len()
-        )));
-    }
+    check_matvec(out, w_bytes, x, out_dim, in_dim, quant)?;
     match quant {
         QuantScheme::F32 => matmul_bytes(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::F16 => matmul_bytes_f16(out, w_bytes, x, out_dim, in_dim),
@@ -693,13 +679,7 @@ impl ComputeBackend for NaiveF32Backend {
     }
 
     fn caps(&self) -> BackendCaps {
-        BackendCaps {
-            batched_prefill: false,
-            gpu_resident: false,
-            gdn: self.qwen35.has_gdn(),
-            moe: self.qwen35.has_moe(),
-            gpu_argmax: false,
-        }
+        self.qwen35.caps()
     }
 
     fn reset_recurrent_state(&self) {
