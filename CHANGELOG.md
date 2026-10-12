@@ -22,6 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   checked) into `lib/lumen` beside the binaries; it used to warn that inference would fail
   without a CUDA toolkit. It refuses a driver older than 535 (RTX 50 cards need 570 or
   newer). A machine whose loader already finds NVRTC and cuBLAS downloads nothing.
+- **NVIDIA support is stated from compute capability 7.5 (Turing).** The docs and the
+  installer used to say 8.0. The 9B at Q8_0 and Q4_0 is verified on a Tesla T4; Q4_K_M,
+  Q5_K_M and compressed-tensors INT4 still need 8.0 and are refused at load on a 7.5 GPU,
+  and image generation still needs 8.0.
 
 ## [0.46.0] — 2026-10-09
 

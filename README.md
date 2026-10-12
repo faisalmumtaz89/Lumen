@@ -23,7 +23,7 @@ lumen run qwen3.5-9b:q8_0 "Write a haiku about light"
 
 That one command downloads the model on first use, converts it, picks your backend (Metal on Apple Silicon, CUDA on NVIDIA), and streams tokens.
 
-> **Status:** Serves the Qwen3.5 / Qwen3.8 models (dense 9B, dense 27B, and MoE-35B-A3B) on NVIDIA CUDA (compute capability 8.0+) and Apple Silicon (M-series); each model, format and GPU's status is in [Model support](docs/support.md). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
+> **Status:** Serves the Qwen3.5 / Qwen3.8 models (dense 9B, dense 27B, and MoE-35B-A3B) on NVIDIA CUDA (compute capability 7.5+) and Apple Silicon (M-series); each model, format and GPU's status is in [Model support](docs/support.md). The public API and the binary `.lbc` format are not yet stable — **read [Production deployment](docs/production.md) before deploying.**
 
 ## Quick start
 
@@ -57,11 +57,11 @@ More on installing, pulling and running: **[Getting started](docs/getting-starte
 ## What it is
 
 - **One self-contained binary, zero ML dependencies** — native CUDA C and Metal MSL kernels, a native BPE tokenizer, and the native `.lbc` model format, all in Rust. No PyTorch, no ONNX, no Python runtime.
-- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-8.0+ device.
+- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-7.5+ device (the K-quant and INT4 formats and image generation need 8.0+).
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
 - **Text to image** with Qwen-Image-2.1 on CUDA, from a separate image-only server.
-- **Runs on NVIDIA cc 8.0+ (Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
+- **Runs on NVIDIA cc 7.5+ (Turing, Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
 - **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
 ## Supported models & hardware
@@ -86,7 +86,7 @@ compressed-tensors INT4 (group 32).
 
 | Backend | Hardware | Formats |
 |---------|----------|--------|
-| **CUDA** | NVIDIA, compute capability 8.0+ (e.g. A100, H100, RTX 5090) | Every format above; the BF16 27B and MoE need an 80 GB H100-class GPU |
+| **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) | Every format above on compute capability 8.0+; on 7.5 the 9B at Q8_0 and Q4_0 is verified, Q4_K_M, Q5_K_M and INT4 are refused, and the rest is untested ([Model support](docs/support.md)); the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
 

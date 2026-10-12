@@ -33,8 +33,9 @@ Lumen — LLM and image inference for Linux x86_64 / NVIDIA CUDA
 Build: ${TAG}
 
 PREREQUISITES
-  - NVIDIA GPU with compute capability 8.0 or newer, and its driver: 535 or newer
-    with CUDA 12, 580 or newer with CUDA 13.
+  - NVIDIA GPU with compute capability 7.5 or newer (8.0 or newer for image
+    generation and the Q4_K_M, Q5_K_M and INT4 formats), and its driver: 535 or
+    newer with CUDA 12, 580 or newer with CUDA 13.
   - cuBLAS and NVRTC loadable at run time (no build-time CUDA SDK): on the system's
     library paths from CUDA 12 or 13, or in lib/lumen beside bin/, where the
     installer (https://servelumen.com/install.sh) puts NVIDIA's copies when the
