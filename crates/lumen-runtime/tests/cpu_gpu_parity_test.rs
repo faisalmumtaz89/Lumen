@@ -383,16 +383,17 @@ mod metal {
         assert_eq!(from_cpu.conv_positions, from_metal.conv_positions);
         let (mut worst_h, mut worst_conv) = (0f64, 0f64);
         for i in 0..from_metal.h_states.len() {
-            worst_h = worst_h.max(rel_l2(&from_cpu.h_states[i], &from_metal.h_states[i]));
-            worst_conv =
-                worst_conv.max(rel_l2(&from_cpu.conv_states[i], &from_metal.conv_states[i]));
+            let h = rel_l2(&from_cpu.h_states[i], &from_metal.h_states[i]);
+            let conv = rel_l2(&from_cpu.conv_states[i], &from_metal.conv_states[i]);
+            assert!(
+                h <= 0.05 && conv <= 0.05,
+                "GDN layer {i}: h {h:.3e}, conv {conv:.3e}"
+            );
+            worst_h = worst_h.max(h);
+            worst_conv = worst_conv.max(conv);
         }
         eprintln!(
             "  CPU prefill vs Metal: worst relative L2 h {worst_h:.3e}, conv {worst_conv:.3e}"
-        );
-        assert!(
-            worst_h <= 0.05 && worst_conv <= 0.05,
-            "h {worst_h:.3e}, conv {worst_conv:.3e}"
         );
     }
 }
