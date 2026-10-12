@@ -1172,7 +1172,16 @@ pub(crate) fn run_inference(args: &[String]) {
         // LUMEN_ANTI_RESTATE; this base literal just satisfies the field.
         anti_restate: false,
     };
-    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal, context_len);
+    // CUDA is taken before Metal when both are asked for.
+    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal && !use_cuda, context_len);
+    // A resumed session keeps the cache capacity it was saved with, which the
+    // loader requires; without `--context-len` the capacity would follow this
+    // run's prompt and answer lengths.
+    let context_len = context_len.or_else(|| {
+        let path = session_resume_path.as_deref()?;
+        let header = lumen_runtime::kv::disk::read_header(Path::new(path)).ok()?;
+        Some(header.max_seq_len as usize)
+    });
     let stop = if let Some(ref tok) = tokenizer {
         let eos_ids = tok.stop_token_ids.clone();
         if eos_ids.is_empty() {

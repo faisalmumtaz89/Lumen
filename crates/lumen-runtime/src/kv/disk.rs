@@ -1550,8 +1550,8 @@ pub fn load_into(
 }
 
 /// Inspect the header without loading the payload. Cheap stat-and-read for
-/// the eviction loop.
-fn read_header(path: &Path) -> Result<DiskKvHeader, RuntimeError> {
+/// the eviction loop and for sizing a resumed session's cache.
+pub fn read_header(path: &Path) -> Result<DiskKvHeader, RuntimeError> {
     let mut f = File::open(path).map_err(RuntimeError::StorageIo)?;
     let mut header_buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_buf)

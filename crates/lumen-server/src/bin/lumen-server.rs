@@ -688,9 +688,10 @@ struct WeightGlobals<'a> {
 /// The server's weight provider — either the legacy full-copy `SyncWeightProvider`
 /// or the zero-copy `MmapWeightProvider`. Both implement `WeightProvider`
 /// (`Send + Sync`), so either can back the engine's `Arc<dyn WeightProvider>`.
-/// The Metal default is `Mmap` (no-copy residency, ~10 GB lighter); `--sync`,
-/// CUDA, and CPU use `Sync`. Both are proven byte-identical on the Metal
-/// GPU-resident path by `metal_sync_mmap_argmax_parity_test`.
+/// The Metal and CPU default is `Mmap` (on Metal, no-copy residency, ~10 GB
+/// lighter); `--sync` and CUDA, except for NVFP4 weights, use `Sync`. Both
+/// are proven byte-identical on the Metal GPU-resident path by
+/// `metal_sync_mmap_argmax_parity_test`.
 #[derive(Clone)]
 enum ServerWeights {
     Sync(Arc<SyncWeightProvider>),
