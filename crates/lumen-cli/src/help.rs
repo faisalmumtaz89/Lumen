@@ -187,7 +187,8 @@ OPTIONS:
                           CUDA only: Metal decode requires resident weights
     --option-a            MoE: dispatch only top-K experts per token (streaming + GPU-resident)
     --routing-bias <f>    MoE: cache-conditional routing bias lambda (default: 0.0 = disabled)
-    --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom).
+    --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom;
+                          a resumed session keeps the size it was saved with, and another size is refused).
                           Memory: roughly `context_len * num_layers * num_kv_heads * head_dim * 4 bytes * 2`
                           per session (F32 KV, K+V doubled; F16 halves the CPU mirror).
                           Qwen3.5-9B example: 32768 * 32 * 8 * 128 * 4 * 2 = ~8.6 GB at full context.
