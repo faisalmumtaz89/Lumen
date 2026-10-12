@@ -214,8 +214,9 @@ OPTIONS:
                           have been written by a prior `--session-save <p>` against the
                           SAME model (a fingerprint mismatch is rejected with a clear
                           error). Reuses any cached prefix with the new prompt; falls back
-                          to a cold prefill on divergence. Metal-only today; CUDA returns
-                          an error (the CPU↔GPU sync path is not yet implemented).
+                          to a cold prefill on divergence. Metal and the CPU backends;
+                          CUDA returns an error (its CPU↔GPU sync path is not yet
+                          implemented).
     --session-save <p>    Persist the live Session to <p> after generation completes.
                           Atomically published via `.tmp.<pid>` -> rename so concurrent
                           readers never see a partial write. Captures K/V bytes, the

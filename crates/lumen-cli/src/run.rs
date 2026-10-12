@@ -332,7 +332,7 @@ pub(crate) fn run_inference(args: &[String]) {
     let mut kv_disk_dir: Option<String> = None;
     let mut kv_disk_space_mb: Option<u64> = None;
     // `--session-resume <path>` opts a CLI invocation into
-    // restoring a previously-persisted Session from `<path>` (Metal-only,
+    // restoring a previously-persisted Session from `<path>` (Metal and CPU,
     // default OFF — see Session::load_from_disk for the safety contract).
     let mut session_resume_path: Option<String> = None;
     // `--session-save <path>` opts the invocation into
@@ -669,7 +669,7 @@ pub(crate) fn run_inference(args: &[String]) {
                 // opt-in restore of a previously-persisted
                 // Session. The path must point at a file produced by an
                 // earlier `--session-save` (or programmatic
-                // `Session::save_to_disk`) run on the SAME model. Metal-only
+                // `Session::save_to_disk`) run on the SAME model. Metal and CPU
                 // — CUDA returns an error from `Session::load_from_disk`
                 // via the backend's stubbed `sync_kv_from_cpu`.
                 i += 1;
