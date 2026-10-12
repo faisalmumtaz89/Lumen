@@ -124,26 +124,27 @@ fn cli_resolve_repeat_last_n(parsed: Option<usize>, explicit: bool) -> Option<us
     lumen_runtime::runtime_defaults::repeat_last_n_resolved()
 }
 
-/// The answer length on CUDA when neither `--max-tokens` nor `--context-len`
-/// is given, the size of `lumen-server`'s default context. CUDA reserves the KV
-/// cache in device memory for the prompt plus the answer, and an unbounded
+/// The answer length on CUDA and the CPU when neither `--max-tokens` nor
+/// `--context-len` is given, the size of `lumen-server`'s default context.
+/// Both reserve the KV cache for the prompt plus the answer, and an unbounded
 /// answer would reserve the model's whole window: 262,144 positions of
 /// Qwen3.8-27B's 16 attention layers are 32 GB in F32, more than a 32 GB card
-/// holds beside the weights.
-const CUDA_DEFAULT_MAX_TOKENS: usize = 8192;
+/// holds beside the weights, and a CPU run whose cache does not fit the
+/// memory available is refused.
+const DEFAULT_MAX_TOKENS: usize = 8192;
 
 /// Resolves the CLI-effective `max_tokens`: `--max-tokens` when passed,
-/// otherwise unlimited (the answer stops at EOS), except on CUDA with no
-/// `--context-len` to size the cache, where the answer stops at
-/// [`CUDA_DEFAULT_MAX_TOKENS`].
+/// otherwise unlimited (the answer stops at EOS) on Metal, and on CUDA and the
+/// CPU too when `--context-len` sizes the cache; without it the answer stops at
+/// [`DEFAULT_MAX_TOKENS`].
 fn cli_resolve_max_tokens(
     parsed: Option<usize>,
-    use_cuda: bool,
+    use_metal: bool,
     context_len: Option<usize>,
 ) -> usize {
     match parsed {
         Some(n) => n,
-        None if use_cuda && context_len.is_none() => CUDA_DEFAULT_MAX_TOKENS,
+        None if !use_metal && context_len.is_none() => DEFAULT_MAX_TOKENS,
         None => usize::MAX,
     }
 }
@@ -1171,7 +1172,7 @@ pub(crate) fn run_inference(args: &[String]) {
         // LUMEN_ANTI_RESTATE; this base literal just satisfies the field.
         anti_restate: false,
     };
-    let max_tokens = cli_resolve_max_tokens(max_tokens, use_cuda, context_len);
+    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal, context_len);
     let stop = if let Some(ref tok) = tokenizer {
         let eos_ids = tok.stop_token_ids.clone();
         if eos_ids.is_empty() {
@@ -3177,22 +3178,28 @@ mod tests {
     }
 
     #[test]
-    fn cli_max_tokens_defaults_to_a_bounded_answer_on_cuda_only() {
-        let cuda = cli_resolve_max_tokens(None, true, None);
-        assert_eq!(cuda, CUDA_DEFAULT_MAX_TOKENS);
-        assert_eq!(cli_resolve_max_tokens(None, false, None), usize::MAX);
+    fn cli_max_tokens_defaults_to_a_bounded_answer_off_metal() {
+        let bounded = cli_resolve_max_tokens(None, false, None);
+        assert_eq!(bounded, DEFAULT_MAX_TOKENS);
+        assert_eq!(cli_resolve_max_tokens(None, true, None), usize::MAX);
         // `--context-len` sizes the cache itself, so the answer stays unlimited.
-        assert_eq!(cli_resolve_max_tokens(None, true, Some(32_768)), usize::MAX);
-        assert_eq!(cli_resolve_max_tokens(Some(64), true, None), 64);
-        assert_eq!(cli_resolve_max_tokens(Some(64), false, None), 64);
-        assert_eq!(cli_resolve_max_tokens(Some(64), true, Some(32_768)), 64);
-
-        // The CUDA default sizes Qwen3.8-27B's cache to the prompt plus the
-        // answer, not to the model's 262,144-token window.
-        assert_eq!(effective_max_seq_len(262_144, None, 20, cuda, false), 8468);
-        let other = cli_resolve_max_tokens(None, false, None);
         assert_eq!(
-            effective_max_seq_len(262_144, None, 20, other, false),
+            cli_resolve_max_tokens(None, false, Some(32_768)),
+            usize::MAX
+        );
+        assert_eq!(cli_resolve_max_tokens(Some(64), false, None), 64);
+        assert_eq!(cli_resolve_max_tokens(Some(64), true, None), 64);
+        assert_eq!(cli_resolve_max_tokens(Some(64), false, Some(32_768)), 64);
+
+        // The default sizes Qwen3.8-27B's cache to the prompt plus the answer,
+        // not to the model's 262,144-token window.
+        assert_eq!(
+            effective_max_seq_len(262_144, None, 20, bounded, false),
+            8468
+        );
+        let metal = cli_resolve_max_tokens(None, true, None);
+        assert_eq!(
+            effective_max_seq_len(262_144, None, 20, metal, false),
             262_144
         );
     }

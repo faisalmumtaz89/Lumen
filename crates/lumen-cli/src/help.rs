@@ -45,7 +45,9 @@ ARGUMENTS:
                           checkpoint is downloaded and converted for `lumen-server qwen-image`.
                           On a CUDA build, a text model whose download shows its weights alone
                           are bigger than the memory of CUDA device 0 (or --cuda-device) is
-                          refused before its first byte.
+                          refused before its first byte. Outside macOS, with no NVIDIA GPU or
+                          a build without CUDA, the check is made against the memory this
+                          machine has available.
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;
@@ -134,7 +136,7 @@ OPTIONS:
                           (overrides LUMEN_CHAT_ENABLE_THINKING).
     --tokens <ids>        Space-separated token IDs (--prompt and --tokens are mutually exclusive)
     --max-tokens <n>      Max tokens to generate (default: unlimited, stops at EOS;
-                          8192 on CUDA when --context-len is not given)
+                          8192 on CUDA and the CPU when --context-len is not given)
                           PRODUCTION: pass --max-tokens 512 (minimum) for multilingual prompts;
                           the Qwen3.5 chat template opens a <think>...</think> block that may
                           consume the budget before producing the answer in the target language.

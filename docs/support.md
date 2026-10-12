@@ -92,7 +92,7 @@ not verified against llama.cpp. What was measured, on 2026-10-11 and 2026-10-12,
 
 | Model | Quant | Machine | Result |
 |-------|-------|---------|--------|
-| Qwen3.5-9B dense | Q8_0 | M3 Ultra, 28 threads, `--simd` | Coherent; decode 8.5 tok/s, prefill 3.5 tok/s (23 tokens fed one at a time); peak RSS 21.7 GiB. With `--sync`, 0.72 tok/s |
+| Qwen3.5-9B dense | Q8_0 | M3 Ultra, 28 threads, `--simd` | Coherent; decode 8.5 tok/s, prefill 8.3 tok/s with the weights in the page cache (23 tokens fed one at a time); peak RSS 28.2 GiB, the mapped weights included. With `--sync`, 0.72 tok/s |
 | Qwen3.5-9B dense | Q8_0 | Linux x86-64, 32 vCPU, no GPU (picked automatically) | Coherent; decode 0.98 tok/s, prefill 1.0 tok/s; peak RSS 28.4 GiB |
 | Qwen3.8-27B dense | Q4_0 | same | Coherent; decode 0.43 tok/s, prefill 0.5 tok/s; peak RSS 38.6 GiB |
 | Qwen3.8-27B dense | Q4_K_M | same | Coherent; decode 0.41 tok/s, prefill 0.4 tok/s; peak RSS 38.7 GiB |

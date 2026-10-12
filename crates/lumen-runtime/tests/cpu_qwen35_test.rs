@@ -4,7 +4,7 @@
 //!
 //! - SIMD against the naive reference under one forced token history, within a tolerance set
 //!   from the gap the two backends already show on the Llama path.
-//! - Determinism: two naive runs, and SIMD with one and with many threads, bit for bit.
+//! - Determinism: two naive runs, and SIMD with two and with seven threads, bit for bit.
 //! - Providers: sync (after its rebuilding cache was filled), mmap and async give the same
 //!   tokens and logits through the session's forward loop.
 //! - Prompt cache: warm append (below and across the suffix threshold), exact match, a shorter

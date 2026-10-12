@@ -73,7 +73,8 @@ struct Args {
     /// path. Default `false` → mmap/no-copy residency (drops the ~10 GB
     /// redundant GPU private weight copy). The sync path is the guarded
     /// fallback; both are proven byte-identical on Metal by
-    /// `metal_sync_mmap_argmax_parity_test`. CUDA/CPU always use sync.
+    /// `metal_sync_mmap_argmax_parity_test`. The CPU uses mmap too; CUDA uses
+    /// sync, except for NVFP4 weights.
     sync_provider: bool,
 }
 
@@ -125,7 +126,7 @@ MODEL (positional or --model):
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
                            (q8_0, q4_0, bf16; q4_k_m, q5_k_m for qwen3.8-27b,
-                           served as stored on CUDA only — on Apple Silicon the
+                           served as stored on CUDA and the CPU — on Apple Silicon the
                            cached artifact is larger than the q8_0 one).
                            Default: the model's default quant
     --host <HOST>          Listen host. Default: 127.0.0.1
@@ -153,10 +154,11 @@ OPTIONS:
     --log-level <LEVEL>    error | warn | info | debug. Default: info
     --sync                 Use the legacy SyncWeightProvider (full CPU weight
                            copy) instead of the default zero-copy mmap provider
-                           on Metal. Default is mmap/no-copy residency, which
-                           drops the ~10 GB redundant GPU private weight copy.
-                           --sync is the guarded fallback (both paths
-                           are byte-identical on Metal). CUDA/CPU always use sync.
+                           on Metal and the CPU. Default is mmap/no-copy residency,
+                           which on Metal drops the ~10 GB redundant GPU private
+                           weight copy. --sync is the guarded fallback (both paths
+                           are byte-identical on Metal). CUDA uses sync, except
+                           for NVFP4 weights.
     -h, --help             Print this help
     -V, --version          Print version
 
