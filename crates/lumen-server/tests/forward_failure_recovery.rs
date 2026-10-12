@@ -154,14 +154,23 @@ fn lbc(dir: &tempfile::TempDir) -> std::path::PathBuf {
     path
 }
 
-async fn drain(handle: &EngineHandle, req: JobRequest) -> (Vec<u32>, Result<FinishReason, String>) {
+/// What a job produced: its tokens, the prompt prefix its prefill reused (`None` when prefill
+/// did not finish), and how it ended.
+type Drained = (Vec<u32>, Option<usize>, Result<FinishReason, String>);
+
+async fn drain(handle: &EngineHandle, req: JobRequest) -> Drained {
     let mut rx = handle.submit(req, 256).await.expect("submit");
-    let mut ids = Vec::new();
+    let (mut ids, mut reused) = (Vec::new(), None);
     loop {
         match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Some(TokenEvent::PrefillDone {
+                reused_prefix_len, ..
+            })) => reused = Some(reused_prefix_len),
             Ok(Some(TokenEvent::Token { token_id, .. })) => ids.push(token_id),
-            Ok(Some(TokenEvent::Done { finish_reason, .. })) => return (ids, Ok(finish_reason)),
-            Ok(Some(TokenEvent::Error(e))) => return (ids, Err(e)),
+            Ok(Some(TokenEvent::Done { finish_reason, .. })) => {
+                return (ids, reused, Ok(finish_reason))
+            }
+            Ok(Some(TokenEvent::Error(e))) => return (ids, reused, Err(e)),
             Ok(Some(_)) => {}
             Ok(None) => panic!("channel closed without Done or Error"),
             Err(_) => panic!("timed out draining the job"),
@@ -177,21 +186,22 @@ async fn a_request_after_a_failed_forward_pass_matches_a_fresh_worker() {
     let handle = boot(&path, Arc::clone(&reads_left));
 
     let first = [5u32, 9, 2, 7];
-    let (gen, end) = drain(&handle, job(&first)).await;
+    let (gen, _, end) = drain(&handle, job(&first)).await;
     assert!(end.is_ok(), "{end:?}");
     // A warm append whose prefill fails at a later layer, after the earlier
     // GDN layers have advanced.
     let mut extended: Vec<u32> = first.iter().copied().chain(gen).collect();
     extended.extend_from_slice(&[11, 13]);
     reads_left.store(0, Ordering::SeqCst);
-    let (_, end) = drain(&handle, job(&extended)).await;
+    let (_, _, end) = drain(&handle, job(&extended)).await;
     let err = end.expect_err("the failing prefill is answered with an error");
     assert!(err.contains("injected read failure"), "{err}");
 
-    let (after, end) = drain(&handle, job(&extended)).await;
+    let (after, reused, end) = drain(&handle, job(&extended)).await;
     assert!(end.is_ok(), "{end:?}");
+    assert_eq!(reused, Some(0), "the request after the failure starts cold");
     let fresh = boot(&path, never());
-    let (want, end) = drain(&fresh, job(&extended)).await;
+    let (want, _, end) = drain(&fresh, job(&extended)).await;
     assert!(end.is_ok(), "{end:?}");
     assert_eq!(after, want);
 }
@@ -204,13 +214,14 @@ async fn a_conversation_after_a_failed_decode_step_matches_a_fresh_worker() {
     let handle = boot(&path, Arc::clone(&reads_left));
 
     let first = [5u32, 9, 2, 7];
-    let (gen, end) = drain(&handle, job(&first)).await;
+    let (gen, _, end) = drain(&handle, job(&first)).await;
     assert!(end.is_ok(), "{end:?}");
     // A warm append whose prefill succeeds and whose decode fails part-way.
     let mut extended: Vec<u32> = first.iter().copied().chain(gen).collect();
     extended.extend_from_slice(&[11, 13]);
     reads_left.store(DECODE_FAILURE_READS, Ordering::SeqCst);
-    let (partial, end) = drain(&handle, job(&extended)).await;
+    let (partial, reused, end) = drain(&handle, job(&extended)).await;
+    assert!(reused > Some(0), "the failing request is a warm append");
     let err = end.expect_err("the failing decode step is answered with an error");
     assert!(err.contains("injected read failure"), "{err}");
     assert!(
@@ -222,10 +233,11 @@ async fn a_conversation_after_a_failed_decode_step_matches_a_fresh_worker() {
     // extension of the failed request: a kept session would reuse it.
     let mut next: Vec<u32> = extended.iter().copied().chain(partial).collect();
     next.extend_from_slice(&[17, 19]);
-    let (after, end) = drain(&handle, job(&next)).await;
+    let (after, reused, end) = drain(&handle, job(&next)).await;
     assert!(end.is_ok(), "{end:?}");
+    assert_eq!(reused, Some(0), "the request after the failure starts cold");
     let fresh = boot(&path, never());
-    let (want, end) = drain(&fresh, job(&next)).await;
+    let (want, _, end) = drain(&fresh, job(&next)).await;
     assert!(end.is_ok(), "{end:?}");
     assert_eq!(after, want);
 }
