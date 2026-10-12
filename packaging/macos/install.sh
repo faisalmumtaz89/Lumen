@@ -190,7 +190,7 @@ case "$OS" in
       check_cuda_userland
     else
       err "no NVIDIA GPU detected — the prebuilt Linux binary is CUDA-only."
-      err "Lumen on Linux needs an NVIDIA GPU with compute capability 8.0 or newer (Ampere onward)."
+      err "Lumen on Linux needs an NVIDIA GPU with compute capability 7.5 or newer (Turing onward)."
       exit 1
     fi
     ;;
