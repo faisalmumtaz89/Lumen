@@ -15,8 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   INT4; it used to panic on the first layer. `lumen-server --backend cpu` (and a server with
   no GPU) runs them on the threaded SIMD backend instead of the single-threaded scalar one.
   A CPU run is refused, with both numbers, when the memory it needs is more than the machine
-  has available (on Linux, within its cgroup limits): before the download and again before the
-  weights load. A CPU session saves and restores its recurrent state in Metal's layout. A
+  has available (on Linux, within its cgroup limits), before the weights load; a download whose
+  weights alone would not fit is refused before it starts. A CPU session saves and restores its recurrent state in Metal's layout. A
   server request whose forward pass fails now leaves the next request a fresh session.
   `qwen3.5-9b` Q8_0 decodes 8.5 tok/s on an M3 Ultra (28 threads) and 0.98 tok/s on a 32-vCPU
   x86-64 Linux machine.
