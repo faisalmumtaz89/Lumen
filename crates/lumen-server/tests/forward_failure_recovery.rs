@@ -1,13 +1,13 @@
 //! A forward pass that fails part-way leaves KV and recurrent state partly advanced; the worker
 //! must not continue from it. On a GDN model served by the CPU backend, a request whose prefill
-//! fails at a later layer is answered with the error, and the next request then produces what a
-//! fresh worker produces.
+//! or decode step fails at a later layer is answered with the error, and the next request then
+//! produces what a fresh worker produces.
 
 #[path = "../../lumen-runtime/tests/common/gdn_hybrid.rs"]
 #[allow(dead_code)]
 mod gdn_hybrid;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,11 +29,14 @@ use lumen_server::{
 
 const MAX_SEQ_LEN: usize = 96;
 const FAILING_LAYER: usize = 2;
+/// Reads of `FAILING_LAYER` in the decode test's warm append before the one that fails.
+const DECODE_FAILURE_READS: usize = 4;
 
-/// A provider whose `FAILING_LAYER` cannot be read while `fail` is set.
+/// A provider that fails one read of `FAILING_LAYER`: the one made when `reads_left` is 0
+/// (`usize::MAX`: none).
 struct FlakyLayer {
     inner: SyncWeightProvider,
-    fail: Arc<AtomicBool>,
+    reads_left: Arc<AtomicUsize>,
 }
 
 impl WeightProvider for FlakyLayer {
@@ -48,11 +51,18 @@ impl WeightProvider for FlakyLayer {
         self.inner.get_layer_blocking(layer)
     }
     fn get_layer_raw(&self, layer: usize) -> Result<LayerView, RuntimeError> {
-        if layer == FAILING_LAYER && self.fail.load(Ordering::SeqCst) {
-            return Err(RuntimeError::LayerUnavailable {
-                layer,
-                reason: "injected read failure".into(),
-            });
+        if layer == FAILING_LAYER {
+            match self.reads_left.load(Ordering::SeqCst) {
+                0 => {
+                    self.reads_left.store(usize::MAX, Ordering::SeqCst);
+                    return Err(RuntimeError::LayerUnavailable {
+                        layer,
+                        reason: "injected read failure".into(),
+                    });
+                }
+                usize::MAX => {}
+                n => self.reads_left.store(n - 1, Ordering::SeqCst),
+            }
         }
         self.inner.get_layer_raw(layer)
     }
@@ -70,7 +80,7 @@ impl WeightProvider for FlakyLayer {
     }
 }
 
-fn boot(path: &std::path::Path, fail: Arc<AtomicBool>) -> EngineHandle {
+fn boot(path: &std::path::Path, reads_left: Arc<AtomicUsize>) -> EngineHandle {
     let provider = SyncWeightProvider::open(path).unwrap();
     let mut backend = NaiveF32Backend::new();
     backend.set_global_tensors(
@@ -102,7 +112,7 @@ fn boot(path: &std::path::Path, fail: Arc<AtomicBool>) -> EngineHandle {
         Box::new(backend),
         Arc::new(FlakyLayer {
             inner: provider,
-            fail,
+            reads_left,
         }),
         tokenizer,
         model_info,
@@ -130,6 +140,20 @@ fn job(prompt: &[u32]) -> JobRequest {
     }
 }
 
+fn never() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(usize::MAX))
+}
+
+fn lbc(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("model.lbc");
+    std::fs::write(
+        &path,
+        build_qwen35_cpu_lbc(&Qwen35Fixture::default(), MAX_SEQ_LEN as u32),
+    )
+    .unwrap();
+    path
+}
+
 async fn drain(handle: &EngineHandle, req: JobRequest) -> (Vec<u32>, Result<FinishReason, String>) {
     let mut rx = handle.submit(req, 256).await.expect("submit");
     let mut ids = Vec::new();
@@ -148,14 +172,9 @@ async fn drain(handle: &EngineHandle, req: JobRequest) -> (Vec<u32>, Result<Fini
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_after_a_failed_forward_pass_matches_a_fresh_worker() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("model.lbc");
-    std::fs::write(
-        &path,
-        build_qwen35_cpu_lbc(&Qwen35Fixture::default(), MAX_SEQ_LEN as u32),
-    )
-    .unwrap();
-    let fail = Arc::new(AtomicBool::new(false));
-    let handle = boot(&path, Arc::clone(&fail));
+    let path = lbc(&dir);
+    let reads_left = never();
+    let handle = boot(&path, Arc::clone(&reads_left));
 
     let first = [5u32, 9, 2, 7];
     let (gen, end) = drain(&handle, job(&first)).await;
@@ -164,16 +183,49 @@ async fn a_request_after_a_failed_forward_pass_matches_a_fresh_worker() {
     // GDN layers have advanced.
     let mut extended: Vec<u32> = first.iter().copied().chain(gen).collect();
     extended.extend_from_slice(&[11, 13]);
-    fail.store(true, Ordering::SeqCst);
+    reads_left.store(0, Ordering::SeqCst);
     let (_, end) = drain(&handle, job(&extended)).await;
     let err = end.expect_err("the failing prefill is answered with an error");
     assert!(err.contains("injected read failure"), "{err}");
-    fail.store(false, Ordering::SeqCst);
 
     let (after, end) = drain(&handle, job(&extended)).await;
     assert!(end.is_ok(), "{end:?}");
-    let fresh = boot(&path, Arc::new(AtomicBool::new(false)));
+    let fresh = boot(&path, never());
     let (want, end) = drain(&fresh, job(&extended)).await;
+    assert!(end.is_ok(), "{end:?}");
+    assert_eq!(after, want);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversation_after_a_failed_decode_step_matches_a_fresh_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = lbc(&dir);
+    let reads_left = never();
+    let handle = boot(&path, Arc::clone(&reads_left));
+
+    let first = [5u32, 9, 2, 7];
+    let (gen, end) = drain(&handle, job(&first)).await;
+    assert!(end.is_ok(), "{end:?}");
+    // A warm append whose prefill succeeds and whose decode fails part-way.
+    let mut extended: Vec<u32> = first.iter().copied().chain(gen).collect();
+    extended.extend_from_slice(&[11, 13]);
+    reads_left.store(DECODE_FAILURE_READS, Ordering::SeqCst);
+    let (partial, end) = drain(&handle, job(&extended)).await;
+    let err = end.expect_err("the failing decode step is answered with an error");
+    assert!(err.contains("injected read failure"), "{err}");
+    assert!(
+        !partial.is_empty(),
+        "the failure came before any token was decoded"
+    );
+
+    // The client continues the conversation from the partial reply, a strict
+    // extension of the failed request: a kept session would reuse it.
+    let mut next: Vec<u32> = extended.iter().copied().chain(partial).collect();
+    next.extend_from_slice(&[17, 19]);
+    let (after, end) = drain(&handle, job(&next)).await;
+    assert!(end.is_ok(), "{end:?}");
+    let fresh = boot(&path, never());
+    let (want, end) = drain(&fresh, job(&next)).await;
     assert!(end.is_ok(), "{end:?}");
     assert_eq!(after, want);
 }
