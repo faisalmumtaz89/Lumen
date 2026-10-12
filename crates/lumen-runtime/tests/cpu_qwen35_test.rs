@@ -199,7 +199,7 @@ fn simd_tracks_the_naive_reference_on_one_history() {
 }
 
 /// Two naive runs over the same history, the recurrent state reset in between, and SIMD with
-/// one and with every thread, agree bit for bit.
+/// two and with seven threads, agree bit for bit.
 #[test]
 fn runs_are_deterministic() {
     for mixed_quant in [false, true] {
@@ -215,12 +215,12 @@ fn runs_are_deterministic() {
             logits_of(&naive, &provider, &tokens),
             "naive, mixed_quant={mixed_quant}"
         );
-        let one = ready(SimdF32Backend::with_threads(1), &provider, true);
-        let many = ready(SimdF32Backend::new(), &provider, true);
-        assert!(many.thread_count() > one.thread_count());
+        let two = ready(SimdF32Backend::with_threads(2), &provider, true);
+        let seven = ready(SimdF32Backend::with_threads(7), &provider, true);
+        assert_eq!((two.thread_count(), seven.thread_count()), (2, 7));
         assert_eq!(
-            logits_of(&one, &provider, &tokens),
-            logits_of(&many, &provider, &tokens),
+            logits_of(&two, &provider, &tokens),
+            logits_of(&seven, &provider, &tokens),
             "SIMD threads, mixed_quant={mixed_quant}"
         );
     }
