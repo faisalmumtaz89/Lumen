@@ -105,7 +105,7 @@ held to the GPU backends over one 128-token greedy history, the CPU fed the same
 |---------|--------|
 | CUDA (L4, driver 610.57) | Argmax agreement 127/128; logits cosine ≥ 0.99987 (mean 0.99993). On x86 the SIMD backend equals the scalar reference bit for bit |
 | Metal (M3 Ultra) | Argmax agreement 120/128; logits cosine ≥ 0.989 (mean 0.9965). Metal is as far from CUDA (119/128, ≥ 0.988): it re-quantizes this artifact's output head and GDN `ssm_out` to Q4_0 at load |
-| A Metal session saved right after prefill, restored on the CPU | Its 24 greedy tokens equal those of a CPU session that prefilled the prompt itself |
+| A Metal session saved right after prefill, restored on the CPU | Saved again from the CPU, its recurrent state is Metal's byte for byte. The CPU's own prefill saves the same conv positions, and h and conv states within 2.4% (relative L2) of Metal's in every GDN layer |
 
 ## What is not (yet) supported
 

@@ -12,8 +12,10 @@
 //!   of those positions. Its first token must be the GPU's, its logits within cosine 0.999 of
 //!   the GPU's at every position, and its argmax the GPU's at 98% of them or more. Metal is not
 //!   held to this: it re-quantizes a Q8_0 model's output head and GDN `ssm_out` to Q4_0 at load.
-//! - Metal: a session saved right after prefill and loaded into a fresh CPU backend continues
-//!   as a CPU session that prefilled the prompt itself does, up to a near-tie.
+//! - Metal: a session saved right after prefill, loaded into the CPU backend and saved again
+//!   carries Metal's recurrent state byte for byte; the CPU's own prefill of the prompt saves
+//!   the same conv ring positions, and h and conv states within 0.05 relative L2 of Metal's in
+//!   every GDN layer (the same ring read one slot off is about 0.7 away).
 //!
 //! The artifact's SHA-256, header scheme and the backend settings are printed with the results.
 
@@ -22,7 +24,7 @@
 use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::storage::MmapConfig;
 use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
-use lumen_runtime::{ComputeBackend, WeightProvider};
+use lumen_runtime::ComputeBackend;
 use std::path::{Path, PathBuf};
 
 /// The 9B's chat template around "Explain in one paragraph why the sky is blue.", thinking off.
@@ -75,6 +77,7 @@ mod cuda {
     use super::*;
     use lumen_format::QuantScheme;
     use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
+    use lumen_runtime::WeightProvider;
 
     const STEPS: usize = 128;
 
@@ -249,9 +252,10 @@ mod cuda {
 mod metal {
     use super::*;
     use lumen_format::QuantScheme;
-    use lumen_runtime::kv::disk::{serialize_hyperparams_le, ModelFingerprint};
+    use lumen_runtime::kv::disk::{
+        load_into, serialize_hyperparams_le, ModelFingerprint, RecurrentState,
+    };
     use lumen_runtime::kv::KvPrecision;
-    use lumen_runtime::session::BenchTop2;
     use lumen_runtime::{RuntimeConfig, SamplingParams, Session};
 
     fn metal(provider: &MmapWeightProvider, max_seq_len: usize) -> lumen_runtime::MetalF32Backend {
@@ -305,23 +309,30 @@ mod metal {
         }
     }
 
-    fn continue_greedy(
-        s: &mut Session,
-        backend: &dyn ComputeBackend,
-        w: &dyn WeightProvider,
-        n: usize,
-    ) -> Vec<BenchTop2> {
-        s.set_bench_top2(true);
-        for _ in 0..n {
-            s.next_token(backend, w).unwrap();
-        }
-        s.take_bench_top2()
+    /// The recurrent section of the session file at `path`.
+    fn recurrent(path: &Path) -> RecurrentState {
+        load_into(path, None, None, None, None)
+            .unwrap()
+            .recurrent
+            .expect("a GDN model saves its recurrent state")
+    }
+
+    /// Relative L2 distance of the f32 buffer `a` from `b`.
+    fn rel_l2(a: &[u8], b: &[u8]) -> f64 {
+        let f = |v: &[u8]| -> Vec<f64> {
+            v.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .collect()
+        };
+        let (a, b) = (f(a), f(b));
+        let diff: f64 = a.iter().zip(&b).map(|(x, y)| (x - y).powi(2)).sum();
+        let norm: f64 = b.iter().map(|y| y.powi(2)).sum();
+        (diff / norm).sqrt()
     }
 
     #[test]
     #[ignore = "needs Apple Silicon and a real Qwen3.5 LBC in LUMEN_CPU_PARITY_LBC"]
-    fn a_metal_session_saved_after_prefill_continues_on_the_cpu() {
-        const N: usize = 24;
+    fn the_cpu_restores_and_saves_metals_recurrent_state() {
         let path = lbc();
         let provider = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
         describe(&path, &provider);
@@ -334,35 +345,54 @@ mod metal {
             lumen_format::LBC_VERSION,
         );
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("metal.kv");
+        let (metal_file, resaved_file, cpu_file) = (
+            dir.path().join("metal.kv"),
+            dir.path().join("resaved.kv"),
+            dir.path().join("cpu.kv"),
+        );
 
         let m = metal(&provider, CONTEXT);
         let mut s = Session::new(config(), hp, greedy()).unwrap();
         s.extend(PROMPT, &m, &provider).unwrap();
-        s.save_to_disk(&file, &m, &fp).unwrap();
+        s.save_to_disk(&metal_file, &m, &fp).unwrap();
         drop(s);
         drop(m);
 
         let c = cpu(&provider, CONTEXT);
-        let mut restored = Session::load_from_disk(&file, config(), hp, greedy(), &c, &fp).unwrap();
-        let from_metal = continue_greedy(&mut restored, &c, &provider, N);
+        let mut restored =
+            Session::load_from_disk(&metal_file, config(), hp, greedy(), &c, &fp).unwrap();
+        restored.save_to_disk(&resaved_file, &c, &fp).unwrap();
         let mut cold = Session::new(config(), hp, greedy()).unwrap();
         cold.extend(PROMPT, &c, &provider).unwrap();
-        let from_cpu = continue_greedy(&mut cold, &c, &provider, N);
+        cold.save_to_disk(&cpu_file, &c, &fp).unwrap();
 
-        let parted = from_metal
-            .iter()
-            .zip(&from_cpu)
-            .position(|(a, b)| a.argmax != b.argmax);
-        eprintln!("  restored vs cold CPU continuation: first parting {parted:?} of {N}");
-        if let Some(i) = parted {
-            // a parting is a near-tie: each route's runner-up is the other's choice
-            let (a, b) = (from_metal[i], from_cpu[i]);
-            eprintln!("  at {i}: restored {a:?}, cold {b:?}");
-            assert!(
-                a.runner_up == b.argmax && b.runner_up == a.argmax,
-                "position {i} is not a near-tie: restored {a:?}, cold {b:?}"
-            );
+        let (from_metal, resaved, from_cpu) = (
+            recurrent(&metal_file),
+            recurrent(&resaved_file),
+            recurrent(&cpu_file),
+        );
+        assert_eq!(resaved.conv_positions, from_metal.conv_positions);
+        assert!(
+            resaved.h_states == from_metal.h_states,
+            "h changed through the CPU"
+        );
+        assert!(
+            resaved.conv_states == from_metal.conv_states,
+            "conv changed through the CPU"
+        );
+        assert_eq!(from_cpu.conv_positions, from_metal.conv_positions);
+        let (mut worst_h, mut worst_conv) = (0f64, 0f64);
+        for i in 0..from_metal.h_states.len() {
+            worst_h = worst_h.max(rel_l2(&from_cpu.h_states[i], &from_metal.h_states[i]));
+            worst_conv =
+                worst_conv.max(rel_l2(&from_cpu.conv_states[i], &from_metal.conv_states[i]));
         }
+        eprintln!(
+            "  CPU prefill vs Metal: worst relative L2 h {worst_h:.3e}, conv {worst_conv:.3e}"
+        );
+        assert!(
+            worst_h <= 0.05 && worst_conv <= 0.05,
+            "h {worst_h:.3e}, conv {worst_conv:.3e}"
+        );
     }
 }
