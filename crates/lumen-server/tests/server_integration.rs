@@ -87,6 +87,7 @@ async fn boot_server_allowing(
         provider.output_proj.clone(),
     );
     backend.init(&provider.lbc().header.hyperparams).unwrap();
+    backend.preload_weights(&provider).unwrap();
     let hyperparams = provider.lbc().header.hyperparams;
     let runtime_cfg = RuntimeConfig {
         pipeline_mode: PipelineMode::MinMem,
@@ -1370,6 +1371,7 @@ async fn boot_server_with_panic_backend() -> (
         provider.output_proj.clone(),
     );
     inner.init(&provider.lbc().header.hyperparams).unwrap();
+    inner.preload_weights(&provider).unwrap();
     let (backend, armed, panics) = PanicArmedBackend::new(inner);
     let hyperparams = provider.lbc().header.hyperparams;
     let runtime_cfg = RuntimeConfig {
@@ -2589,6 +2591,7 @@ async fn boot_server_scripted(
         provider.output_proj.clone(),
     );
     inner.init(&provider.lbc().header.hyperparams).unwrap();
+    inner.preload_weights(&provider).unwrap();
     let backend = ScriptedBackend::new(inner, script, vocab);
     let hyperparams = provider.lbc().header.hyperparams;
     let runtime_cfg = RuntimeConfig {

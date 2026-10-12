@@ -6,9 +6,9 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 
 | Command | Purpose |
 |---------|---------|
-| `lumen run <model:quant> "<prompt>"` | Pull (if needed), convert (if needed), run inference, print text. On a CUDA build, a text model whose weights alone are bigger than the memory of the GPU the run would use (`--cuda-device`, else device 0), judged from its download size, is refused before its first byte, naming the model's quants this does not rule out; `--simd`, `--metal`, or `--async` without `--cuda` skips the check |
+| `lumen run <model:quant> "<prompt>"` | Pull (if needed), convert (if needed), run inference, print text. On a CUDA build, a text model whose weights alone are bigger than the memory of the GPU the run would use (`--cuda-device`, else device 0), judged from its download size, is refused before its first byte, naming the model's quants this does not rule out; `--simd`, `--metal`, or `--async` without `--cuda` skips the check. A run on a CPU backend is refused the same way when the weights alone are bigger than the memory this machine has available |
 | `lumen run <model> "<prompt>"` | Bare name: the model's default quant (Q8_0 for `qwen3.5-9b`, Q4_0 for `qwen3.8-27b` and `qwen3.5-moe`; `lumen models` marks it), downloaded on first use like any `model:quant`. When another quant of the model is already downloaded, it says so before downloading the default |
-| `lumen pull <model:quant>` | Download GGUF, convert to LBC, cache; do not run. On a CUDA build, a text model whose weights alone are bigger than the memory of CUDA device 0 (or `--cuda-device <n>`), judged from its download size, is refused before its first byte; with no device it goes ahead |
+| `lumen pull <model:quant>` | Download GGUF, convert to LBC, cache; do not run. On a CUDA build, a text model whose weights alone are bigger than the memory of CUDA device 0 (or `--cuda-device <n>`), judged from its download size, is refused before its first byte. Outside macOS, with no NVIDIA GPU or a build without CUDA, the check is made against the memory this machine has available |
 | `lumen pull qwen-image` | Download the Qwen-Image-2.1 checkpoint (30.8 GiB, pinned to one Hugging Face commit, every file checked by size and SHA-256), convert it to `.lbi` for `lumen-server qwen-image` (about 78 GiB of disk at the peak, the download included), and remove the checkpoint's other files from the cache; the model's directory in the cache must be yours alone; CUDA builds only, refused before any download unless the first visible CUDA device has at least 21.0 GiB. An interrupted pull's downloads resume where they stopped, and an unfinished conversion is made again |
 | `lumen image "<prompt>" [-o file.png] [--size WxH] [--steps n] [--seed n]` | Make one picture with Qwen-Image-2.1 and write a PNG (default `image-<seed>.png`, never overwriting; 1024x1024, 40 steps, random seed); the first run downloads and converts the model as `lumen pull qwen-image` does, without asking, as `lumen run` fetches a text model, when the first visible CUDA device has at least 21.0 GiB (otherwise it is refused before the download); CUDA builds only |
 | `lumen models` | List all registry entries, the disk-cached LBCs and a cached image model |
@@ -21,7 +21,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | Flag | Description |
 |------|-------------|
 | `--system <text>` | System prompt |
-| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS; 8192 on CUDA when `--context-len` is not given) |
+| `--max-tokens <n>` | Tokens to generate (default: unlimited, stops at EOS; 8192 on CUDA and the CPU when `--context-len` is not given) |
 | `--temperature <f>` | Sampling temperature (0 = greedy, default 0.7) |
 | `--top-p` / `--top-k` / `--min-p` | Nucleus / top-K / min-prob cutoffs |
 | `--repetition-penalty` / `--presence-penalty` / `--frequency-penalty` | Sampling penalties |
@@ -32,7 +32,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--kv-precision f16\|bf16\|f32` | KV cache storage (per-backend default: Metal f16, CUDA / CPU f32). On CUDA `f16` and `bf16` halve the cache's bytes and its decode-attention reads; the model's keys and values are rounded to half or to bfloat16 on the way in. `bf16` is CUDA only (see `docs/environment-variables.md`, `LUMEN_KV_PRECISION`) |
 | `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
 | `--kv-disk-space-mb <n>` | KV cache space budget on disk |
-| `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal today) |
+| `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal and the CPU backends); a resumed session keeps the cache size it was saved with, and a `--context-len` of another size is refused |
 | `--no-gpu-resident` | Stream weights from disk instead of GPU memory (CUDA only: Metal decode requires resident weights) |
 | `--gpu-resident` | Force GPU-resident weights |
 | `--verbose` | Show diagnostics and metrics |

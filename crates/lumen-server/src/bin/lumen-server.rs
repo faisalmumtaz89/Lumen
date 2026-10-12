@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lumen_format::reader::LbcFile;
 use lumen_format::QuantScheme;
-use lumen_runtime::compute::cpu_naive::NaiveF32Backend;
+use lumen_runtime::compute::cpu_simd::SimdF32Backend;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::kv::KvPrecision;
 use lumen_runtime::pipeline::PipelineMode;
@@ -73,7 +73,8 @@ struct Args {
     /// path. Default `false` → mmap/no-copy residency (drops the ~10 GB
     /// redundant GPU private weight copy). The sync path is the guarded
     /// fallback; both are proven byte-identical on Metal by
-    /// `metal_sync_mmap_argmax_parity_test`. CUDA/CPU always use sync.
+    /// `metal_sync_mmap_argmax_parity_test`. The CPU uses mmap too; CUDA uses
+    /// sync, except for NVFP4 weights.
     sync_provider: bool,
 }
 
@@ -125,7 +126,7 @@ MODEL (positional or --model):
 OPTIONS:
     --quant <Q>            Quantization tag when --model is a registry name
                            (q8_0, q4_0, bf16; q4_k_m, q5_k_m for qwen3.8-27b,
-                           served as stored on CUDA only — on Apple Silicon the
+                           served as stored on CUDA and the CPU — on Apple Silicon the
                            cached artifact is larger than the q8_0 one).
                            Default: the model's default quant
     --host <HOST>          Listen host. Default: 127.0.0.1
@@ -153,10 +154,11 @@ OPTIONS:
     --log-level <LEVEL>    error | warn | info | debug. Default: info
     --sync                 Use the legacy SyncWeightProvider (full CPU weight
                            copy) instead of the default zero-copy mmap provider
-                           on Metal. Default is mmap/no-copy residency, which
-                           drops the ~10 GB redundant GPU private weight copy.
-                           --sync is the guarded fallback (both paths
-                           are byte-identical on Metal). CUDA/CPU always use sync.
+                           on Metal and the CPU. Default is mmap/no-copy residency,
+                           which on Metal drops the ~10 GB redundant GPU private
+                           weight copy. --sync is the guarded fallback (both paths
+                           are byte-identical on Metal). CUDA uses sync, except
+                           for NVFP4 weights.
     -h, --help             Print this help
     -V, --version          Print version
 
@@ -651,6 +653,23 @@ fn select_backend(choice: BackendChoice) -> BackendChoice {
     }
 }
 
+/// The CPU backend: the threaded SIMD one on every core, as `lumen run` picks
+/// on a machine without a GPU, initialised and prepared on `provider`.
+fn cpu_backend(
+    provider: &ServerWeights,
+    hyperparams: &lumen_format::hyperparams::ModelHyperparams,
+) -> Result<SimdF32Backend, String> {
+    let mut cpu = SimdF32Backend::new();
+    // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
+    // directly and does not build a GPU buffer from the raw.
+    wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
+    cpu.init(hyperparams)
+        .map_err(|e| format!("CPU init: {e}"))?;
+    cpu.preload_weights(provider.as_dyn())
+        .map_err(|e| format!("the CPU backend cannot run this model: {e}"))?;
+    Ok(cpu)
+}
+
 /// Provider-agnostic view of the global tensors the backend wiring needs.
 /// Borrowed from whichever concrete provider the server opened. `SyncWeightProvider`
 /// and `MmapWeightProvider` expose the exact same public global fields; this
@@ -669,9 +688,10 @@ struct WeightGlobals<'a> {
 /// The server's weight provider — either the legacy full-copy `SyncWeightProvider`
 /// or the zero-copy `MmapWeightProvider`. Both implement `WeightProvider`
 /// (`Send + Sync`), so either can back the engine's `Arc<dyn WeightProvider>`.
-/// The Metal default is `Mmap` (no-copy residency, ~10 GB lighter); `--sync`,
-/// CUDA, and CPU use `Sync`. Both are proven byte-identical on the Metal
-/// GPU-resident path by `metal_sync_mmap_argmax_parity_test`.
+/// The Metal and CPU default is `Mmap` (on Metal, no-copy residency, ~10 GB
+/// lighter); `--sync` and CUDA, except for NVFP4 weights, use `Sync`. Both
+/// are proven byte-identical on the Metal GPU-resident path by
+/// `metal_sync_mmap_argmax_parity_test`.
 #[derive(Clone)]
 enum ServerWeights {
     Sync(Arc<SyncWeightProvider>),
@@ -711,8 +731,7 @@ impl ServerWeights {
         }
     }
 
-    /// Borrow as `&dyn WeightProvider` for `preload_weights` (the CUDA and Metal backends).
-    #[cfg(any(feature = "cuda", target_os = "macos"))]
+    /// Borrow as `&dyn WeightProvider` for `preload_weights`.
     fn as_dyn(&self) -> &dyn WeightProvider {
         match self {
             ServerWeights::Sync(p) => &**p,
@@ -1034,8 +1053,24 @@ async fn run(args: Args) -> Result<(), String> {
             .into());
     }
 
-    // Provider selection: the Metal GPU-resident path and CUDA NVFP4 both use
-    // the zero-copy `MmapWeightProvider`.
+    // A CPU backend whose whole need at this context exceeds the memory this
+    // machine has available is refused before the provider reads any weights.
+    if matches!(backend_choice, BackendChoice::Cpu) {
+        let context = args
+            .context_len
+            .min(lbc.header.hyperparams.max_seq_len as usize);
+        lumen_runtime::compute::check_cpu_memory(
+            &lbc,
+            context,
+            resolve_kv_precision(args.kv_precision, KvPrecision::F32),
+            true,
+            false,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Provider selection: the Metal GPU-resident path, CUDA NVFP4 and the CPU
+    // backend use the zero-copy `MmapWeightProvider`.
     //
     // Metal engages the no-copy unified-buffer path (`LUMEN_METAL_MMAP_ONLY=1`),
     // avoiding the ~10 GB redundant CPU copy + GPU private weight copy that
@@ -1052,13 +1087,17 @@ async fn run(args: Args) -> Result<(), String> {
     // identical by the same mechanism, verified end-to-end (generated images are
     // byte-identical).
     //
-    // `--sync`, other CUDA quants, and CPU keep `SyncWeightProvider` (the guarded
+    // The CPU backend reads every layer as stored on every token
+    // (`reads_raw_layers`): mapped pages serve that from the page cache, where
+    // `SyncWeightProvider` would pread the whole model again per token.
+    //
+    // `--sync` and other CUDA quants keep `SyncWeightProvider` (the guarded
     // fallback). Mmap and sync are proven byte-identical on the Metal path by
     // `metal_sync_mmap_argmax_parity_test`.
     let cuda_nvfp4 = matches!(backend_choice, BackendChoice::Cuda)
         && lbc.uses_quant(lumen_format::quantization::QuantScheme::Nvfp4);
-    let use_mmap_provider =
-        !args.sync_provider && (matches!(backend_choice, BackendChoice::Metal) || cuda_nvfp4);
+    let use_mmap_provider = !args.sync_provider
+        && (matches!(backend_choice, BackendChoice::Metal | BackendChoice::Cpu) || cuda_nvfp4);
     let provider: ServerWeights = if use_mmap_provider {
         // Enable Metal's no-copy unified-buffer residency path. Metal only: it is
         // that backend's zero-copy GPU-resident route (gpu_resident.rs probe),
@@ -1232,15 +1271,9 @@ async fn run(args: Args) -> Result<(), String> {
             }
         }
         BackendChoice::Cpu => {
-            let mut cpu = NaiveF32Backend::new();
-            // CPU: keep the F32 dequant (skip=false) — the CPU backend reads it
-            // directly and does not build a GPU buffer from the raw.
-            wire_global_tensors_and_raw(&mut cpu, &provider.globals(), RawAcceptance::default());
-            cpu.init(&hyperparams_capped)
-                .map_err(|e| format!("CPU init: {e}"))?;
             // The CPU cache stores F32 or F16; the engine refuses any other precision.
             (
-                Box::new(cpu),
+                Box::new(cpu_backend(&provider, &hyperparams_capped)?),
                 resolve_kv_precision(args.kv_precision, KvPrecision::F32),
             )
         }
@@ -1481,7 +1514,7 @@ fn image_config(
                     "the image endpoint runs on CUDA (LUMEN_IMAGE_DEVICE) but no CUDA device \
                      is available; set LUMEN_IMAGE_DEVICE=cpu for the CPU reference"
                         .to_string(),
-                )
+                );
             }
             Ok(_) => {}
             Err(e) => {
@@ -1600,8 +1633,42 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../../../lumen-runtime/tests/common/gdn_hybrid.rs"]
+#[allow(dead_code)]
+mod gdn_hybrid;
+
+#[cfg(test)]
 mod tests {
     use super::parse_args;
+
+    /// The server's CPU backend is prepared when it is made: on a GDN model it
+    /// reports GDN and MoE state before the first forward pass, from either
+    /// provider the server opens.
+    #[test]
+    fn cpu_backend_is_prepared_on_both_providers() {
+        use super::gdn_hybrid::{build_qwen35_cpu_lbc, Qwen35Fixture};
+        use super::{cpu_backend, ServerWeights};
+        use lumen_runtime::compute::ComputeBackend;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.lbc");
+        std::fs::write(&path, build_qwen35_cpu_lbc(&Qwen35Fixture::default(), 64)).unwrap();
+        let sync = lumen_runtime::SyncWeightProvider::open(&path).unwrap();
+        let hp = sync.lbc().header.hyperparams;
+        let mmap = lumen_runtime::MmapWeightProvider::open(
+            &path,
+            lumen_runtime::storage::MmapConfig::default(),
+        )
+        .unwrap();
+        for provider in [
+            ServerWeights::Sync(Arc::new(sync)),
+            ServerWeights::Mmap(Arc::new(mmap)),
+        ] {
+            let backend = cpu_backend(&provider, &hp).unwrap();
+            let caps = backend.caps();
+            assert!(caps.gdn && caps.moe && backend.gdn_layout().is_some());
+        }
+    }
 
     /// Build the `&[String]` `parse_args` expects from string literals.
     fn argv(items: &[&str]) -> Vec<String> {

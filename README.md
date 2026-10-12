@@ -61,7 +61,7 @@ More on installing, pulling and running: **[Getting started](docs/getting-starte
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
 - **Text to image** with Qwen-Image-2.1 on CUDA, from a separate image-only server.
-- **Runs on NVIDIA cc 7.5+ (Turing, Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**; a scalar + SIMD CPU path is the correctness reference.
+- **Runs on NVIDIA cc 7.5+ (Turing, Ampere, Hopper, Blackwell RTX 5090) and Apple Silicon (M-series)**, and, much more slowly, on the CPU of a machine with neither.
 - **Tuned for interactive serving** — single-stream, GPU-resident decode latency, not large-batch throughput.
 
 ## Supported models & hardware
@@ -74,7 +74,7 @@ v1 (current) verifies the Qwen3.5 family and the Qwen3.8-27B dense model end-to-
 | `qwen3.8-27b` | Dense GDN-hybrid | 27B | Q8_0, Q4_0, BF16, Q4_K_M (16.2 GiB download), Q5_K_M (19.5 GiB download) |
 | `qwen3.5-moe` | MoE GDN-hybrid | 35B total / 3B active | Q8_0, Q4_0, BF16 |
 
-The two K-quant cells are served as stored on CUDA only. On Apple Silicon (the Metal
+The two K-quant cells are served as stored on CUDA and the CPU. On Apple Silicon (the Metal
 conversion target) the converter converts them exactly as it always has — every K-quant
 layer plane upcast to Q8_0, the head re-quantised, a K-quant embedding dequantised to F32 —
 so the artifact comes out larger than the `Q8_0` one while carrying the source's coarser
@@ -88,7 +88,7 @@ compressed-tensors INT4 (group 32).
 |---------|----------|--------|
 | **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) | Every format above on compute capability 8.0+; on 7.5 the 9B at Q8_0 and Q4_0 is verified, Q4_K_M, Q5_K_M and INT4 are refused, and the rest is untested ([Model support](docs/support.md)); the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
-| **CPU** | Scalar reference + SIMD NEON | Correctness reference, not throughput-optimized |
+| **CPU** | Any machine: chosen when there is no GPU, or with `--simd` | Every format above except the CUDA-only checkpoint imports; much slower than a GPU ([measured](docs/support.md#cpu-no-gpu)) |
 
 Image: Qwen-Image-2.1 on CUDA — `lumen pull qwen-image` downloads and converts it, `lumen image "<prompt>"` makes a picture, `lumen-server qwen-image` serves it — **[docs/image-generation.md](docs/image-generation.md)**.
 

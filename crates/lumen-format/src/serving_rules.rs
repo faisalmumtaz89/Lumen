@@ -543,7 +543,8 @@ pub enum ServingBackend {
     Cuda,
     /// Metal, which has no kernel for these schemes.
     Metal,
-    /// SIMD or naive CPU, which read f32 and have no kernel for these schemes.
+    /// SIMD or naive CPU, which decode the block formats to f32 on the host and have no decoder for
+    /// these schemes.
     Cpu,
 }
 

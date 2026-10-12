@@ -22,25 +22,24 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Create and initialize the appropriate compute backend based on config.
+/// Create, initialize and prepare the appropriate compute backend based on config.
 fn create_backend(
+    weights: &dyn lumen_runtime::WeightProvider,
     use_simd: bool,
     embedding: Vec<f32>,
     final_norm: Vec<f32>,
     output_proj: Vec<f32>,
     hyperparams: &ModelHyperparams,
 ) -> Result<Box<dyn ComputeBackend>, BenchError> {
-    if use_simd {
-        let mut backend = SimdF32Backend::new();
-        backend.set_global_tensors(embedding, final_norm, output_proj);
-        backend.init(hyperparams)?;
-        Ok(Box::new(backend))
+    let mut backend: Box<dyn ComputeBackend> = if use_simd {
+        Box::new(SimdF32Backend::new())
     } else {
-        let mut backend = NaiveF32Backend::new();
-        backend.set_global_tensors(embedding, final_norm, output_proj);
-        backend.init(hyperparams)?;
-        Ok(Box::new(backend))
-    }
+        Box::new(NaiveF32Backend::new())
+    };
+    backend.set_global_tensors(embedding, final_norm, output_proj);
+    backend.init(hyperparams)?;
+    backend.preload_weights(weights)?;
+    Ok(backend)
 }
 
 /// Errors from the benchmark runner.
@@ -341,6 +340,7 @@ fn run_iteration_with_provider(
     initial_residency: f64,
 ) -> Result<BenchResult, BenchError> {
     let backend = create_backend(
+        provider,
         config.use_simd,
         embedding,
         final_norm,

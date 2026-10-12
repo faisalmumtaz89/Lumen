@@ -124,26 +124,27 @@ fn cli_resolve_repeat_last_n(parsed: Option<usize>, explicit: bool) -> Option<us
     lumen_runtime::runtime_defaults::repeat_last_n_resolved()
 }
 
-/// The answer length on CUDA when neither `--max-tokens` nor `--context-len`
-/// is given, the size of `lumen-server`'s default context. CUDA reserves the KV
-/// cache in device memory for the prompt plus the answer, and an unbounded
+/// The answer length on CUDA and the CPU when neither `--max-tokens` nor
+/// `--context-len` is given, the size of `lumen-server`'s default context.
+/// Both reserve the KV cache for the prompt plus the answer, and an unbounded
 /// answer would reserve the model's whole window: 262,144 positions of
 /// Qwen3.8-27B's 16 attention layers are 32 GB in F32, more than a 32 GB card
-/// holds beside the weights.
-const CUDA_DEFAULT_MAX_TOKENS: usize = 8192;
+/// holds beside the weights, and a CPU run whose cache does not fit the
+/// memory available is refused.
+const DEFAULT_MAX_TOKENS: usize = 8192;
 
 /// Resolves the CLI-effective `max_tokens`: `--max-tokens` when passed,
-/// otherwise unlimited (the answer stops at EOS), except on CUDA with no
-/// `--context-len` to size the cache, where the answer stops at
-/// [`CUDA_DEFAULT_MAX_TOKENS`].
+/// otherwise unlimited (the answer stops at EOS) on Metal, and on CUDA and the
+/// CPU too when `--context-len` sizes the cache; without it the answer stops at
+/// [`DEFAULT_MAX_TOKENS`].
 fn cli_resolve_max_tokens(
     parsed: Option<usize>,
-    use_cuda: bool,
+    use_metal: bool,
     context_len: Option<usize>,
 ) -> usize {
     match parsed {
         Some(n) => n,
-        None if use_cuda && context_len.is_none() => CUDA_DEFAULT_MAX_TOKENS,
+        None if !use_metal && context_len.is_none() => DEFAULT_MAX_TOKENS,
         None => usize::MAX,
     }
 }
@@ -332,7 +333,7 @@ pub(crate) fn run_inference(args: &[String]) {
     let mut kv_disk_dir: Option<String> = None;
     let mut kv_disk_space_mb: Option<u64> = None;
     // `--session-resume <path>` opts a CLI invocation into
-    // restoring a previously-persisted Session from `<path>` (Metal-only,
+    // restoring a previously-persisted Session from `<path>` (Metal and CPU,
     // default OFF — see Session::load_from_disk for the safety contract).
     let mut session_resume_path: Option<String> = None;
     // `--session-save <path>` opts the invocation into
@@ -669,7 +670,7 @@ pub(crate) fn run_inference(args: &[String]) {
                 // opt-in restore of a previously-persisted
                 // Session. The path must point at a file produced by an
                 // earlier `--session-save` (or programmatic
-                // `Session::save_to_disk`) run on the SAME model. Metal-only
+                // `Session::save_to_disk`) run on the SAME model. Metal and CPU
                 // — CUDA returns an error from `Session::load_from_disk`
                 // via the backend's stubbed `sync_kv_from_cpu`.
                 i += 1;
@@ -953,6 +954,62 @@ pub(crate) fn run_inference(args: &[String]) {
         }
     }
 
+    // Backend auto-detection: if no backend flag was provided, pick the best
+    // available backend for this platform.
+    //
+    // `--sync` selects the weight *I/O provider* (sync pread vs mmap), NOT the
+    // compute backend. It must NOT suppress compute-backend auto-detection:
+    // doing so left `--sync` (with no explicit backend) falling through to the
+    // single-threaded CPU `NaiveF32Backend`. The provider choice is honoured
+    // separately by the `run_with_sync` / `run_with_mmap` dispatch below, and
+    // `run_with_sync` performs the GPU-resident preload that GDN requires.
+    //
+    // `--async` is intentionally STILL excluded here: `run_with_async` does not
+    // perform the GPU-resident preload, and Metal's decode drivers require
+    // GPU-resident weights, so auto-selecting Metal for it would fail at the
+    // first decode step.
+    if !explicitly_chose_backend && !use_async {
+        #[cfg(target_os = "macos")]
+        {
+            use_metal = true;
+            if verbose {
+                eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)");
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Check for NVIDIA GPU presence.
+            if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
+                #[cfg(feature = "cuda")]
+                {
+                    use_cuda = true;
+                    if verbose {
+                        eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)");
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    use_simd = true;
+                    if verbose {
+                        eprintln!("NVIDIA GPU detected but CUDA support not compiled in.");
+                        eprintln!("Falling back to CPU (SIMD) backend.");
+                        eprintln!("Rebuild with: cargo build --release --features cuda");
+                    }
+                }
+            } else {
+                use_simd = true;
+                if verbose {
+                    eprintln!("No GPU detected. Using CPU (SIMD) backend.");
+                    eprintln!("For faster inference:");
+                    eprintln!("  macOS:  rebuild and use --metal");
+                    eprintln!("  NVIDIA: rebuild with --features cuda");
+                    eprintln!("  Modal:  modal run examples/cuda_inference.py");
+                }
+            }
+        }
+    }
+
     // Dual-mode --model: if the value looks like a file path (contains / or \,
     // or ends with .lbc/.gguf), treat it as a direct path. Otherwise, try to
     // resolve it as a preset name from the model registry.
@@ -960,7 +1017,7 @@ pub(crate) fn run_inference(args: &[String]) {
     // unless it runs on another backend: one chosen explicitly, or the async
     // engine, which picks CUDA only when told to.
     let gpu = (use_cuda || !(explicitly_chose_backend || use_async)).then_some(cuda_device);
-    let model_path = resolve_model_path(&model_path, verbose, gpu);
+    let model_path = resolve_model_path(&model_path, verbose, gpu, !use_metal && !use_cuda);
 
     let path = Path::new(&model_path);
     if !path.exists() {
@@ -1059,63 +1116,6 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     };
 
-    // Backend auto-detection: if no backend flag was provided, pick the best
-    // available backend for this platform.
-    //
-    // `--sync` selects the weight *I/O provider* (sync pread vs mmap), NOT the
-    // compute backend. It must NOT suppress compute-backend auto-detection:
-    // doing so left `--sync` (with no explicit backend) falling through to the
-    // CPU `NaiveF32Backend`, which cannot run this model's GatedDeltaNet layers
-    // (zero-length wq sentinel -> matmul panic). The provider choice is honoured
-    // separately by the `run_with_sync` / `run_with_mmap` dispatch below, and
-    // `run_with_sync` performs the GPU-resident preload that GDN requires.
-    //
-    // `--async` is intentionally STILL excluded here: `run_with_async` does not
-    // perform the GPU-resident preload, and Metal's decode drivers require
-    // GPU-resident weights, so auto-selecting Metal for it would fail at the
-    // first decode step.
-    if !explicitly_chose_backend && !use_async {
-        #[cfg(target_os = "macos")]
-        {
-            use_metal = true;
-            if verbose {
-                eprintln!("Auto-detected backend: Metal (Apple Silicon GPU)");
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Check for NVIDIA GPU presence.
-            if lumen_runtime::runtime_defaults::nvidia_gpu_present() {
-                #[cfg(feature = "cuda")]
-                {
-                    use_cuda = true;
-                    if verbose {
-                        eprintln!("Auto-detected backend: CUDA (NVIDIA GPU)");
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    use_simd = true;
-                    if verbose {
-                        eprintln!("NVIDIA GPU detected but CUDA support not compiled in.");
-                        eprintln!("Falling back to CPU (SIMD) backend.");
-                        eprintln!("Rebuild with: cargo build --release --features cuda");
-                    }
-                }
-            } else {
-                use_simd = true;
-                if verbose {
-                    eprintln!("No GPU detected. Using CPU (SIMD) backend.");
-                    eprintln!("For faster inference:");
-                    eprintln!("  macOS:  rebuild and use --metal");
-                    eprintln!("  NVIDIA: rebuild with --features cuda");
-                    eprintln!("  Modal:  modal run examples/cuda_inference.py");
-                }
-            }
-        }
-    }
-
     // A backend this build cannot construct is refused for that reason first,
     // with the message `create_backend` gives and in its order (CUDA is taken
     // before Metal), before any weight provider opens and before the scheme
@@ -1172,7 +1172,16 @@ pub(crate) fn run_inference(args: &[String]) {
         // LUMEN_ANTI_RESTATE; this base literal just satisfies the field.
         anti_restate: false,
     };
-    let max_tokens = cli_resolve_max_tokens(max_tokens, use_cuda, context_len);
+    // CUDA is taken before Metal when both are asked for.
+    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal && !use_cuda, context_len);
+    // A resumed session keeps the cache capacity it was saved with, which the
+    // loader requires; without `--context-len` the capacity would follow this
+    // run's prompt and answer lengths.
+    let context_len = context_len.or_else(|| {
+        let path = session_resume_path.as_deref()?;
+        let header = lumen_runtime::kv::disk::read_header(Path::new(path)).ok()?;
+        Some(header.max_seq_len as usize)
+    });
     let stop = if let Some(ref tok) = tokenizer {
         let eos_ids = tok.stop_token_ids.clone();
         if eos_ids.is_empty() {
@@ -1255,7 +1264,30 @@ pub(crate) fn run_inference(args: &[String]) {
             }
         }
     }
-    // The check above is the last use of the parsed file: in `--tokens` mode
+    // A CPU run whose whole need (weights, globals, KV cache at the context
+    // the run_with_* paths size, recurrent state, scratch) exceeds the memory
+    // this machine has available is refused before any provider opens.
+    if !use_metal && !use_cuda {
+        let model_max = lbc.header.hyperparams.max_seq_len as usize;
+        let max_gen = match &stop {
+            StopCondition::MaxTokens(n) => *n,
+            StopCondition::MaxTokensOrEos { max_tokens, .. } => *max_tokens,
+            StopCondition::EosTokens(_) => model_max,
+        };
+        let max_seq_len =
+            effective_max_seq_len(model_max, context_len, prompt_tokens.len(), max_gen, false);
+        if let Err(e) = lumen_runtime::compute::check_cpu_memory(
+            &lbc,
+            max_seq_len,
+            kv_precision,
+            use_simd,
+            session_resume_path.is_some(),
+        ) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+    // The checks above are the last use of the parsed file: in `--tokens` mode
     // its tokenizer section is still held, and it is not kept through the run.
     drop(lbc);
 
@@ -1542,7 +1574,7 @@ fn effective_max_seq_len(
 /// - Preset with quant tag: `qwen3.5-9b:q4_0` (downloads specific quant)
 /// - Preset without tag: `qwen3.5-9b` (errors with available quants if multiple exist,
 ///   or auto-selects if only one quant is available)
-fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String {
+fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>, cpu: bool) -> String {
     // Heuristic: looks like a file path if it contains path separators or
     // ends with a known model file extension.
     let looks_like_path = value.contains('/')
@@ -1696,6 +1728,12 @@ fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String 
         }
         #[cfg(not(feature = "cuda"))]
         let _ = gpu;
+        if cpu {
+            if let Err(e) = crate::fit::check_host(&entry, model_name, quant) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         let gguf_path = resolve_download_gguf_shards(&gguf_source, verbose);
         let lbc_out = crate::cache::lbc_path(&entry.key, quant);
         resolve_convert_to_lbc(&gguf_path, &lbc_out, verbose);
@@ -1707,7 +1745,7 @@ fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>) -> String 
 
     #[cfg(not(feature = "download"))]
     {
-        let _ = (gguf_source, gpu);
+        let _ = (gguf_source, gpu, cpu);
         eprintln!("Error: model '{}' is not cached.", value);
         eprintln!("Download it first with: lumen pull {}", value);
         eprintln!("Or pass a direct file path: --model /path/to/model.lbc");
@@ -1883,12 +1921,15 @@ fn create_cpu_or_metal_backend(
 /// Create and initialize the appropriate compute backend.
 ///
 /// All backends are configured through the `ComputeBackend` trait after boxing,
-/// so the setup logic (global tensors, quant data, init, profile) is shared.
+/// so the setup logic (global tensors, quant data, init, profile) is shared. A
+/// CPU backend is also prepared here from `weights`: it reads and checks every
+/// layer before it computes, saves or restores anything.
 ///
 /// `threads` controls the SIMD backend thread pool size:
 ///   0 = auto-detect (all available cores), N = use exactly N threads.
 #[allow(clippy::too_many_arguments)]
 fn create_backend(
+    weights: &dyn WeightProvider,
     primary_quant: QuantScheme,
     use_simd: bool,
     #[allow(unused_variables)] use_metal: bool,
@@ -2016,6 +2057,12 @@ fn create_backend(
         eprintln!("Error: backend initialization failed: {e}");
         std::process::exit(1);
     });
+    if !use_metal && !use_cuda {
+        backend.preload_weights(weights).unwrap_or_else(|e| {
+            eprintln!("Error: the CPU backend cannot run this model: {e}");
+            std::process::exit(1);
+        });
+    }
     if profile {
         backend.set_profile(true);
     }
@@ -2095,6 +2142,7 @@ fn run_with_async(
     hyperparams_capped.max_seq_len = max_seq_len as u32;
 
     let backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
@@ -2222,6 +2270,7 @@ fn run_with_sync(
     // flagged unused-mut without this allow. Mirrors `run_with_async`.
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
@@ -2251,9 +2300,8 @@ fn run_with_sync(
     // (`gdn_h_states` / `gdn_conv_states`) inside the GPU-resident preload, and
     // the batched-prefill GDN kernel indexes them unconditionally. Without the
     // preload the sync path errors ("GDN layers require GPU-resident weights" on
-    // CUDA; `gdn.rs` panic on Metal) on the first GDN layer. `preload_weights`
-    // is a no-op on the CPU/SIMD backends, so it is only consequential when a
-    // GPU backend (Metal on macOS, CUDA with --features cuda) was selected.
+    // CUDA; `gdn.rs` panic on Metal) on the first GDN layer. The CPU backends
+    // were prepared by `create_backend`.
     if use_metal || use_cuda {
         backend.preload_weights(&provider).unwrap_or_else(|e| {
             eprintln!("Error: GPU-resident preload failed: {e}");
@@ -2629,6 +2677,7 @@ fn run_with_mmap(
 
     #[allow(unused_mut)]
     let mut backend = create_backend(
+        &provider,
         provider.lbc().header.quantization.scheme,
         use_simd,
         use_metal,
@@ -2932,8 +2981,64 @@ fn run_generation(
 // ---- --kv-precision parsing tests ------------------------------
 
 #[cfg(test)]
+#[path = "../../lumen-runtime/tests/common/gdn_hybrid.rs"]
+#[allow(dead_code)]
+mod gdn_hybrid;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `run_with_sync`, `run_with_mmap` and `run_with_async` each hand their
+    /// provider to `create_backend`, which prepares a CPU backend: on a GDN
+    /// model it reports GDN state before the first forward pass.
+    #[test]
+    fn create_backend_prepares_cpu_backends_from_every_provider() {
+        use super::gdn_hybrid::{build_qwen35_cpu_lbc, Qwen35Fixture};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.lbc");
+        std::fs::write(&path, build_qwen35_cpu_lbc(&Qwen35Fixture::default(), 64)).unwrap();
+        let sync = SyncWeightProvider::open(&path).unwrap();
+        let mmap = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+        let asyn = AsyncWeightProvider::open(&path).unwrap();
+        macro_rules! backend {
+            ($p:expr, $simd:expr) => {
+                create_backend(
+                    &$p,
+                    $p.lbc().header.quantization.scheme,
+                    $simd,
+                    false,
+                    false,
+                    0,
+                    KvPrecision::F32,
+                    2,
+                    false,
+                    false,
+                    $p.embedding.clone(),
+                    $p.final_norm.clone(),
+                    $p.output_proj.clone(),
+                    &$p.lbc().header.hyperparams,
+                    $p.output_proj_raw.clone(),
+                    $p.output_proj_quant,
+                    $p.embedding_raw.clone(),
+                    $p.embedding_quant,
+                    $p.weight_tying,
+                )
+            };
+        }
+        for simd in [false, true] {
+            for (name, b) in [
+                ("sync", backend!(sync, simd)),
+                ("mmap", backend!(mmap, simd)),
+                ("async", backend!(asyn, simd)),
+            ] {
+                assert!(
+                    b.caps().gdn && b.gdn_layout().is_some(),
+                    "{name}, simd={simd}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parse_kv_precision_accepts_f16_variants() {
@@ -3082,22 +3187,28 @@ mod tests {
     }
 
     #[test]
-    fn cli_max_tokens_defaults_to_a_bounded_answer_on_cuda_only() {
-        let cuda = cli_resolve_max_tokens(None, true, None);
-        assert_eq!(cuda, CUDA_DEFAULT_MAX_TOKENS);
-        assert_eq!(cli_resolve_max_tokens(None, false, None), usize::MAX);
+    fn cli_max_tokens_defaults_to_a_bounded_answer_off_metal() {
+        let bounded = cli_resolve_max_tokens(None, false, None);
+        assert_eq!(bounded, DEFAULT_MAX_TOKENS);
+        assert_eq!(cli_resolve_max_tokens(None, true, None), usize::MAX);
         // `--context-len` sizes the cache itself, so the answer stays unlimited.
-        assert_eq!(cli_resolve_max_tokens(None, true, Some(32_768)), usize::MAX);
-        assert_eq!(cli_resolve_max_tokens(Some(64), true, None), 64);
-        assert_eq!(cli_resolve_max_tokens(Some(64), false, None), 64);
-        assert_eq!(cli_resolve_max_tokens(Some(64), true, Some(32_768)), 64);
-
-        // The CUDA default sizes Qwen3.8-27B's cache to the prompt plus the
-        // answer, not to the model's 262,144-token window.
-        assert_eq!(effective_max_seq_len(262_144, None, 20, cuda, false), 8468);
-        let other = cli_resolve_max_tokens(None, false, None);
         assert_eq!(
-            effective_max_seq_len(262_144, None, 20, other, false),
+            cli_resolve_max_tokens(None, false, Some(32_768)),
+            usize::MAX
+        );
+        assert_eq!(cli_resolve_max_tokens(Some(64), false, None), 64);
+        assert_eq!(cli_resolve_max_tokens(Some(64), true, None), 64);
+        assert_eq!(cli_resolve_max_tokens(Some(64), false, Some(32_768)), 64);
+
+        // The default sizes Qwen3.8-27B's cache to the prompt plus the answer,
+        // not to the model's 262,144-token window.
+        assert_eq!(
+            effective_max_seq_len(262_144, None, 20, bounded, false),
+            8468
+        );
+        let metal = cli_resolve_max_tokens(None, true, None);
+        assert_eq!(
+            effective_max_seq_len(262_144, None, 20, metal, false),
             262_144
         );
     }

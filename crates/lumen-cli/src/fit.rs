@@ -1,10 +1,13 @@
 //! A text model whose download shows its weights alone are bigger than the
-//! memory of the GPU it would run on is refused before the first byte. The
+//! memory it would run in is refused before the first byte: the memory of the
+//! CUDA device, or for a CPU run the memory this machine has available. The
 //! CUDA backend holds the converted weights on the device (all but one norm
-//! vector per dense layer, at most 1.3 MB per model), and for every model in
-//! the registry the converted weights fall short of the download by at most
-//! [`CONVERSION_SHRINK`] (the MTP layer the converter drops, the tensors it
-//! re-quantizes, and the file's metadata). The tests below hold that census.
+//! vector per dense layer, at most 1.3 MB per model), a CPU backend reads all of
+//! them from host memory, and for every model in the registry the converted
+//! weights fall short of the download by at most [`CONVERSION_SHRINK`] (the MTP
+//! layer the converter drops, the tensors it re-quantizes, and the file's
+//! metadata). The tests below hold that census. Once the model is converted,
+//! `lumen_runtime::compute::check_cpu_memory` checks a CPU run's whole need.
 #![cfg_attr(not(all(feature = "download", feature = "cuda")), allow(dead_code))]
 
 use std::collections::BTreeMap;
@@ -22,16 +25,41 @@ fn may_fit(size: u64, memory: u64) -> bool {
     size.saturating_sub(CONVERSION_SHRINK) <= memory
 }
 
+/// Where a model would run: a CUDA device, or this machine's memory for a CPU
+/// backend.
+#[derive(Clone, Copy)]
+pub(crate) enum Target {
+    Cuda(usize),
+    Host,
+}
+
+impl Target {
+    /// Who has the memory, as the refusal names it.
+    fn holder(self) -> String {
+        match self {
+            Target::Cuda(ordinal) => format!("CUDA device {ordinal} has"),
+            Target::Host => "this machine has available".into(),
+        }
+    }
+
+    fn there(self) -> &'static str {
+        match self {
+            Target::Cuda(_) => "on that GPU",
+            Target::Host => "on this machine",
+        }
+    }
+}
+
 /// The refusal for `quant` of `entry`, which the user named `name`, when its
-/// weights are more than `memory`, the bytes CUDA device `ordinal` has;
-/// `None` when they may not be. `sizes` holds the download size of each of the
-/// model's quants known, including `quant`'s, and `cached` the quants already
-/// downloaded and converted.
+/// weights are more than `memory`, the bytes `target` has; `None` when they
+/// may not be. `sizes` holds the download size of each of the model's quants
+/// known, including `quant`'s, and `cached` the quants already downloaded and
+/// converted.
 pub(crate) fn refusal(
     entry: &ModelEntry,
     name: &str,
     quant: &str,
-    ordinal: usize,
+    target: Target,
     memory: u64,
     sizes: &BTreeMap<String, u64>,
     cached: &[String],
@@ -43,10 +71,11 @@ pub(crate) fn refusal(
     let gib = |bytes: u64| format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64);
     let mut message = format!(
         "{} {quant} is a {} download whose weights alone are more than the {} of \
-         memory CUDA device {ordinal} has, so it cannot run there; nothing was downloaded.",
+         memory {}, so it cannot run there; nothing was downloaded.",
         entry.display_name,
         gib(size),
-        gib(memory)
+        gib(memory),
+        target.holder()
     );
     let mut fit: Vec<(&String, u64)> = sizes
         .iter()
@@ -56,11 +85,12 @@ pub(crate) fn refusal(
     fit.sort_by(|a, b| b.1.cmp(&a.1));
     if fit.is_empty() {
         message.push_str(&format!(
-            "\nEvery quantization of {} is ruled out on that GPU.",
-            entry.display_name
+            "\nEvery quantization of {} is ruled out {}.",
+            entry.display_name,
+            target.there()
         ));
     } else {
-        message.push_str("\nNot ruled out on that GPU:");
+        message.push_str(&format!("\nNot ruled out {}:", target.there()));
         for (q, s) in fit {
             let default = if entry.default_quant.as_deref() == Some(q.as_str()) {
                 ", the default"
@@ -93,13 +123,42 @@ pub(crate) fn check(
     quant: &str,
     ordinal: usize,
 ) -> Result<(), String> {
+    check_against(entry, name, quant, Target::Cuda(ordinal), || {
+        lumen_runtime::cuda::ffi::device_total_memory(ordinal)
+    })
+}
+
+/// Refuse a download of `quant` of `entry` for a CPU run when its weights
+/// alone could not fit the memory this machine has available. Nothing is
+/// checked when no file is left to download or when a size or the available
+/// memory cannot be learnt.
+#[cfg(feature = "download")]
+pub(crate) fn check_host(entry: &ModelEntry, name: &str, quant: &str) -> Result<(), String> {
+    check_against(
+        entry,
+        name,
+        quant,
+        Target::Host,
+        lumen_runtime::compute::host_available_bytes,
+    )
+}
+
+/// The download check against `target`, whose memory `memory` reports.
+#[cfg(feature = "download")]
+fn check_against(
+    entry: &ModelEntry,
+    name: &str,
+    quant: &str,
+    target: Target,
+    memory: impl FnOnce() -> Option<u64>,
+) -> Result<(), String> {
     let Some(src) = entry.gguf_files.get(quant) else {
         return Ok(());
     };
     if src.files.iter().all(|f| downloaded(f).is_some()) {
         return Ok(());
     }
-    let Some(memory) = lumen_runtime::cuda::ffi::device_total_memory(ordinal) else {
+    let Some(memory) = memory() else {
         return Ok(());
     };
     let Some(size) = download_size(entry, quant) else {
@@ -120,7 +179,7 @@ pub(crate) fn check(
         .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
         .cloned()
         .collect();
-    match refusal(entry, name, quant, ordinal, memory, &sizes, &cached) {
+    match refusal(entry, name, quant, target, memory, &sizes, &cached) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -129,7 +188,7 @@ pub(crate) fn check(
 /// The bytes `quant` of `entry` downloads: each file's size on disk when it
 /// is downloaded already, else the size Hugging Face reports; `None` when one
 /// is unknown.
-#[cfg(all(feature = "download", feature = "cuda"))]
+#[cfg(feature = "download")]
 fn download_size(entry: &ModelEntry, quant: &str) -> Option<u64> {
     let src = entry.gguf_files.get(quant)?;
     src.files
@@ -212,7 +271,15 @@ mod tests {
         let at = 24 * GIB + CONVERSION_SHRINK;
         let s = sizes(&[("Q8_0", at)]);
         assert_eq!(
-            refusal(&entry(), "qwen3.8-27b", "Q8_0", 0, 24 * GIB, &s, &[]),
+            refusal(
+                &entry(),
+                "qwen3.8-27b",
+                "Q8_0",
+                Target::Cuda(0),
+                24 * GIB,
+                &s,
+                &[]
+            ),
             None
         );
         assert_eq!(
@@ -220,7 +287,7 @@ mod tests {
                 &entry(),
                 "qwen3.8-27b",
                 "Q8_0",
-                0,
+                Target::Cuda(0),
                 24 * GIB,
                 &BTreeMap::new(),
                 &[]
@@ -239,7 +306,16 @@ mod tests {
             ("BF16", 51 * GIB),
         ]);
         let cached = vec!["Q4_0".to_string()];
-        let message = refusal(&entry(), "qwen3.8-27b", "Q8_0", 1, 24 * GIB, &s, &cached).unwrap();
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q8_0",
+            Target::Cuda(1),
+            24 * GIB,
+            &s,
+            &cached,
+        )
+        .unwrap();
         assert!(
             message.starts_with(
                 "Qwen3.8 27B Q8_0 is a 26.20 GiB download whose weights alone are more than \
@@ -261,12 +337,48 @@ mod tests {
     #[test]
     fn a_gpu_every_quant_is_ruled_out_on_is_told_so() {
         let s = sizes(&[("Q8_0", 27 * GIB), ("Q4_0", 15 * GIB)]);
-        let message = refusal(&entry(), "qwen3.8-27b", "Q8_0", 0, 12 * GIB, &s, &[]).unwrap();
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q8_0",
+            Target::Cuda(0),
+            12 * GIB,
+            &s,
+            &[],
+        )
+        .unwrap();
         assert!(
             message.contains("\nEvery quantization of Qwen3.8 27B is ruled out on that GPU."),
             "{message}"
         );
         assert!(!message.contains("Not ruled out"), "{message}");
+    }
+
+    #[test]
+    fn a_cpu_run_names_the_memory_this_machine_has_available() {
+        let s = sizes(&[("Q8_0", 27 * GIB), ("Q4_0", 15 * GIB)]);
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q8_0",
+            Target::Host,
+            16 * GIB,
+            &s,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            message.starts_with(
+                "Qwen3.8 27B Q8_0 is a 27.00 GiB download whose weights alone are more than \
+                 the 16.00 GiB of memory this machine has available"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("\nNot ruled out on this machine:"),
+            "{message}"
+        );
+        assert!(message.contains("lumen run qwen3.8-27b:q4_0"), "{message}");
     }
 
     #[cfg(feature = "download")]

@@ -56,6 +56,7 @@ fn setup_cpu_and_cuda(
         provider.output_proj.clone(),
     );
     cpu.init(&hp)?;
+    cpu.preload_weights(&provider)?;
 
     let mut cuda = CudaBackend::new(0)?;
     cuda.set_global_tensors(

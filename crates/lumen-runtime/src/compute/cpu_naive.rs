@@ -3,7 +3,10 @@
 //! All future optimized backends MUST match the output of this implementation.
 //! Flat, straightforward functions, no SIMD, no unsafe. Correct first.
 //!
-//! Implements a standard LLaMA-style transformer:
+//! Implements a standard LLaMA-style transformer, and runs the Qwen3.5-family
+//! layers (GatedDeltaNet, gated full attention, MoE) through
+//! [`cpu_qwen35`](super::cpu_qwen35) with this backend's matrix-vector product,
+//! which makes it the reference for those layers too:
 //! - RMSNorm (eps inside sqrt, best practice 4.2)
 //! - Multi-head attention with GQA and RoPE
 //! - SwiGLU MLP
@@ -19,11 +22,14 @@
 //!
 //! Output is bit-identical to the original allocating implementation.
 
-use crate::compute::{ActivationBuffer, ComputeBackend, ComputeDtype, Logits};
+use crate::compute::cpu_qwen35::{check_matvec, MatVec, Qwen35};
+use crate::compute::{ActivationBuffer, BackendCaps, ComputeBackend, ComputeDtype, Logits};
 use crate::engine::softmax_inplace;
 use crate::error::RuntimeError;
-use crate::kv::KvCacheView;
-use crate::weight::cache::LayerView;
+use crate::kv::disk::{GdnLayout, RecurrentState};
+use crate::kv::{KvCache, KvCacheView};
+use crate::weight::cache::{LayerView, WeightProvider};
+use crate::weight::kquant::{dequant_row_into, host_f16_to_f32};
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
 use std::sync::Mutex;
@@ -109,6 +115,8 @@ pub struct NaiveF32Backend {
     /// Mutex for interior mutability (compute_layer takes &self).
     /// Uncontended lock is ~20ns, negligible vs. compute cost.
     scratch: Mutex<Option<ComputeScratch>>,
+    /// The Qwen3.5-family layers and their recurrent state.
+    qwen35: Qwen35,
 }
 
 impl Default for NaiveF32Backend {
@@ -125,6 +133,7 @@ impl NaiveF32Backend {
             final_norm: Vec::new(),
             output_proj: Vec::new(),
             scratch: Mutex::new(None),
+            qwen35: Qwen35::new(),
         }
     }
 
@@ -173,39 +182,6 @@ fn matmul_bytes(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, in_d
     }
 }
 
-/// Convert f16 bits to f32 (software implementation, no external dependency).
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 1;
-    let exp = (bits >> 10) & 0x1f;
-    let frac = bits & 0x3ff;
-    if exp == 0 {
-        if frac == 0 {
-            return if sign == 1 { -0.0 } else { 0.0 };
-        }
-        let f = frac as f32 / 1024.0;
-        let v = f * 2.0f32.powi(-14);
-        return if sign == 1 { -v } else { v };
-    }
-    if exp == 31 {
-        return if frac == 0 {
-            if sign == 1 {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            }
-        } else {
-            f32::NAN
-        };
-    }
-    let exp_f32 = ((exp as u32 - 15 + 127) << 23) | ((frac as u32) << 13);
-    let v = f32::from_bits(exp_f32);
-    if sign == 1 {
-        -v
-    } else {
-        v
-    }
-}
-
 /// Matrix-vector multiply reading F16 weights from bytes.
 /// Weight layout: row-major [out_dim, in_dim], each element is 2 bytes (LE f16 bits).
 #[allow(clippy::needless_range_loop)]
@@ -216,7 +192,7 @@ fn matmul_bytes_f16(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize, 
         for j in 0..in_dim {
             let offset = row_byte_start + j * 2;
             let bits = u16::from_le_bytes(w_bytes[offset..offset + 2].try_into().unwrap());
-            let w_val = f16_bits_to_f32(bits);
+            let w_val = host_f16_to_f32(bits);
             sum += w_val * x[j];
         }
         out[i] = sum;
@@ -237,7 +213,7 @@ fn matmul_bytes_q8_0(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize,
         for b in 0..blocks_per_row {
             let block_start = row_start + b * 34;
             let scale_bits = u16::from_le_bytes([w_bytes[block_start], w_bytes[block_start + 1]]);
-            let scale = f16_bits_to_f32(scale_bits);
+            let scale = host_f16_to_f32(scale_bits);
             for k in 0..32 {
                 let q = w_bytes[block_start + 2 + k] as i8;
                 sum += (scale * q as f32) * x[x_idx];
@@ -263,7 +239,7 @@ fn matmul_bytes_q4_0(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize,
         for b in 0..blocks_per_row {
             let block_start = row_start + b * 18;
             let scale_bits = u16::from_le_bytes([w_bytes[block_start], w_bytes[block_start + 1]]);
-            let scale = f16_bits_to_f32(scale_bits);
+            let scale = host_f16_to_f32(scale_bits);
             // First 16 elements: lo nibbles (indices 0-15)
             for k in 0..16 {
                 let byte = w_bytes[block_start + 2 + k];
@@ -284,6 +260,10 @@ fn matmul_bytes_q4_0(out: &mut [f32], w_bytes: &[u8], x: &[f32], out_dim: usize,
 }
 
 /// Dispatch matrix-vector multiply based on the tensor's quantization scheme.
+///
+/// F32, F16, Q8_0 and Q4_0 have dedicated loops; every other scheme the host
+/// decodes is dequantised row by row and dotted in f32. Storage, input or
+/// output shorter than the shape is an error, never an out-of-bounds read.
 fn matmul_dispatch(
     out: &mut [f32],
     w_bytes: &[u8],
@@ -291,16 +271,35 @@ fn matmul_dispatch(
     out_dim: usize,
     in_dim: usize,
     quant: QuantScheme,
-) {
+) -> Result<(), RuntimeError> {
+    check_matvec(out, w_bytes, x, out_dim, in_dim, quant)?;
     match quant {
         QuantScheme::F32 => matmul_bytes(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::F16 => matmul_bytes_f16(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::Q8_0 => matmul_bytes_q8_0(out, w_bytes, x, out_dim, in_dim),
         QuantScheme::Q4_0 => matmul_bytes_q4_0(out, w_bytes, x, out_dim, in_dim),
-        _ => panic!(
-            "NaiveF32Backend: unsupported weight quant scheme {:?}",
-            quant
-        ),
+        _ => {
+            let mut row = vec![0.0f32; in_dim];
+            for (i, o) in out[..out_dim].iter_mut().enumerate() {
+                dequant_row_into(&mut row, w_bytes, i, in_dim, quant)?;
+                *o = row.iter().zip(x).map(|(&w, &x)| w * x).sum();
+            }
+        }
+    }
+    Ok(())
+}
+
+impl MatVec for NaiveF32Backend {
+    fn matvec(
+        &self,
+        out: &mut [f32],
+        w: &[u8],
+        x: &[f32],
+        rows: usize,
+        cols: usize,
+        scheme: QuantScheme,
+    ) -> Result<(), RuntimeError> {
+        matmul_dispatch(out, w, x, rows, cols, scheme)
     }
 }
 
@@ -403,6 +402,7 @@ impl ComputeBackend for NaiveF32Backend {
 
     fn init(&mut self, hyperparams: &ModelHyperparams) -> Result<(), RuntimeError> {
         self.hyperparams = Some(*hyperparams);
+        self.qwen35 = Qwen35::new();
 
         let hidden_dim = hyperparams.hidden_dim as usize;
         let num_heads = hyperparams.num_heads as usize;
@@ -456,12 +456,17 @@ impl ComputeBackend for NaiveF32Backend {
     #[allow(clippy::needless_range_loop)] // t indexes both scores[] and KV cache byte offsets
     fn compute_layer(
         &self,
-        _layer_idx: usize,
+        layer_idx: usize,
         x: &mut ActivationBuffer,
         weights: &LayerView,
         kv: Option<&mut KvCacheView>,
         seq_pos: usize,
     ) -> Result<(), RuntimeError> {
+        if self.qwen35.runs(layer_idx)? {
+            return self
+                .qwen35
+                .compute_layer(layer_idx, x, weights, kv, seq_pos, self);
+        }
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
         let num_heads = hp.num_heads as usize;
@@ -513,7 +518,7 @@ impl ComputeBackend for NaiveF32Backend {
             q_dim,
             hidden_dim,
             st.wq.quant,
-        );
+        )?;
         matmul_dispatch(
             &mut s.k,
             wk_bytes,
@@ -521,7 +526,7 @@ impl ComputeBackend for NaiveF32Backend {
             kv_dim,
             hidden_dim,
             st.wk.quant,
-        );
+        )?;
         matmul_dispatch(
             &mut s.v,
             wv_bytes,
@@ -529,7 +534,7 @@ impl ComputeBackend for NaiveF32Backend {
             kv_dim,
             hidden_dim,
             st.wv.quant,
-        );
+        )?;
 
         // 3. Apply RoPE (pre-computed tables)
         apply_rope_precomputed(
@@ -601,7 +606,7 @@ impl ComputeBackend for NaiveF32Backend {
             hidden_dim,
             q_dim,
             st.wo.quant,
-        );
+        )?;
 
         // 7. Residual connection (in-place into attn_proj to reuse buffer)
         // x_f32 is the zero-copy view of the original input activation
@@ -620,7 +625,7 @@ impl ComputeBackend for NaiveF32Backend {
             inter_dim,
             hidden_dim,
             st.w_gate.quant,
-        );
+        )?;
         matmul_dispatch(
             &mut s.up,
             w_up_bytes,
@@ -628,7 +633,7 @@ impl ComputeBackend for NaiveF32Backend {
             inter_dim,
             hidden_dim,
             st.w_up.quant,
-        );
+        )?;
         swiglu_inplace(&mut s.gate, &s.up); // gate now holds silu(gate)*up
         matmul_dispatch(
             &mut s.down,
@@ -637,7 +642,7 @@ impl ComputeBackend for NaiveF32Backend {
             hidden_dim,
             inter_dim,
             st.w_down.quant,
-        );
+        )?;
 
         // 10. Residual connection
         for i in 0..hidden_dim {
@@ -650,6 +655,55 @@ impl ComputeBackend for NaiveF32Backend {
         // Write result back to activation buffer (reuse existing allocation)
         x.write_f32_from(&s.attn_proj);
         Ok(())
+    }
+
+    /// Read and check every layer (see [`Qwen35::prepare`]); the plain path
+    /// reads its norms as F32.
+    fn preload_weights(&mut self, weights: &dyn WeightProvider) -> Result<(), RuntimeError> {
+        let hp = *self.hp()?;
+        self.qwen35.prepare(&hp, weights, &|st| {
+            for (name, s) in [("attn_norm", &st.attn_norm), ("ffn_norm", &st.ffn_norm)] {
+                if s.quant != QuantScheme::F32 {
+                    return Err(format!(
+                        "{name} is {:?}; this path reads F32 norms",
+                        s.quant
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn reads_raw_layers(&self) -> bool {
+        true
+    }
+
+    fn caps(&self) -> BackendCaps {
+        self.qwen35.caps()
+    }
+
+    fn reset_recurrent_state(&self) {
+        self.qwen35.reset();
+    }
+
+    fn sync_kv_to_cpu(
+        &self,
+        _kv: &mut KvCache,
+        recurrent: Option<&mut RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        self.qwen35.save_state(recurrent)
+    }
+
+    fn sync_kv_from_cpu(
+        &self,
+        _kv: &KvCache,
+        recurrent: Option<&RecurrentState>,
+    ) -> Result<(), RuntimeError> {
+        self.qwen35.restore_state(recurrent)
+    }
+
+    fn gdn_layout(&self) -> Option<GdnLayout> {
+        self.qwen35.gdn_layout()
     }
 
     fn compute_final(&self, x: &ActivationBuffer) -> Result<Logits, RuntimeError> {

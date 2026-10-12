@@ -289,6 +289,7 @@ fn setup_q8_backends() -> Result<(SyncWeightProvider, NaiveF32Backend, CudaBacke
         provider.output_proj.clone(),
     );
     cpu.init(&hp)?;
+    cpu.preload_weights(&provider)?;
 
     // CUDA backend uses F32 global tensors + Q8_0 layer weights via upload_layer_weights.
     let mut cuda = CudaBackend::new(0)?;
@@ -459,6 +460,7 @@ fn test_cuda_q8_0_compute_final_with_q8_output_proj() {
         deq_output_proj,
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     // CUDA backend with Q8_0 output_proj
     let mut cuda = match CudaBackend::new(0) {

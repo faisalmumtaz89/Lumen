@@ -45,7 +45,9 @@ ARGUMENTS:
                           checkpoint is downloaded and converted for `lumen-server qwen-image`.
                           On a CUDA build, a text model whose download shows its weights alone
                           are bigger than the memory of CUDA device 0 (or --cuda-device) is
-                          refused before its first byte.
+                          refused before its first byte. Outside macOS, with no NVIDIA GPU or
+                          a build without CUDA, the check is made against the memory this
+                          machine has available.
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;
@@ -134,7 +136,7 @@ OPTIONS:
                           (overrides LUMEN_CHAT_ENABLE_THINKING).
     --tokens <ids>        Space-separated token IDs (--prompt and --tokens are mutually exclusive)
     --max-tokens <n>      Max tokens to generate (default: unlimited, stops at EOS;
-                          8192 on CUDA when --context-len is not given)
+                          8192 on CUDA and the CPU when --context-len is not given)
                           PRODUCTION: pass --max-tokens 512 (minimum) for multilingual prompts;
                           the Qwen3.5 chat template opens a <think>...</think> block that may
                           consume the budget before producing the answer in the target language.
@@ -185,7 +187,8 @@ OPTIONS:
                           CUDA only: Metal decode requires resident weights
     --option-a            MoE: dispatch only top-K experts per token (streaming + GPU-resident)
     --routing-bias <f>    MoE: cache-conditional routing bias lambda (default: 0.0 = disabled)
-    --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom).
+    --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom;
+                          a resumed session keeps the size it was saved with, and another size is refused).
                           Memory: roughly `context_len * num_layers * num_kv_heads * head_dim * 4 bytes * 2`
                           per session (F32 KV, K+V doubled; F16 halves the CPU mirror).
                           Qwen3.5-9B example: 32768 * 32 * 8 * 128 * 4 * 2 = ~8.6 GB at full context.
@@ -214,8 +217,9 @@ OPTIONS:
                           have been written by a prior `--session-save <p>` against the
                           SAME model (a fingerprint mismatch is rejected with a clear
                           error). Reuses any cached prefix with the new prompt; falls back
-                          to a cold prefill on divergence. Metal-only today; CUDA returns
-                          an error (the CPU↔GPU sync path is not yet implemented).
+                          to a cold prefill on divergence. Metal and the CPU backends;
+                          CUDA returns an error (its CPU↔GPU sync path is not yet
+                          implemented).
     --session-save <p>    Persist the live Session to <p> after generation completes.
                           Atomically published via `.tmp.<pid>` -> rename so concurrent
                           readers never see a partial write. Captures K/V bytes, the

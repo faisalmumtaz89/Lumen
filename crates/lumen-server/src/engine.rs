@@ -1122,58 +1122,68 @@ impl EngineWorker {
             let request = job.request;
             let cancel = Arc::clone(&job.cancel);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                self.process_job(&mut session, request, job.tokens_tx, job.cancel);
+                self.process_job(&mut session, request, job.tokens_tx, job.cancel)
             }));
-            if let Err(payload) = result {
-                // Per-job panic.  Notify the in-flight client first so
-                // it doesn't hang on `recv().await`, then decide
-                // whether to recover or shut down.
-                let msg = panic_payload_message(payload.as_ref());
-                let _ = self.send_event_polling_cancel(
-                    &reply_tx,
-                    &cancel,
-                    TokenEvent::Error(format!("engine recovered from panic: {msg}")),
-                );
-                drop(reply_tx);
-                let now = Instant::now();
-                // Drop timestamps older than the rolling window.
-                while let Some(&ts) = recent_panics.front() {
-                    if now.duration_since(ts) > panic_window_dur {
-                        recent_panics.pop_front();
-                    } else {
-                        break;
+            // A failed forward pass can leave the session's KV and the
+            // backend's recurrent state partly advanced; the session is rebuilt
+            // after one exactly as after a panic.
+            let forward_failed = match result {
+                Ok(failed) => failed,
+                Err(payload) => {
+                    // Per-job panic.  Notify the in-flight client first so
+                    // it doesn't hang on `recv().await`, then decide
+                    // whether to recover or shut down.
+                    let msg = panic_payload_message(payload.as_ref());
+                    let _ = self.send_event_polling_cancel(
+                        &reply_tx,
+                        &cancel,
+                        TokenEvent::Error(format!("engine recovered from panic: {msg}")),
+                    );
+                    drop(reply_tx);
+                    let now = Instant::now();
+                    // Drop timestamps older than the rolling window.
+                    while let Some(&ts) = recent_panics.front() {
+                        if now.duration_since(ts) > panic_window_dur {
+                            recent_panics.pop_front();
+                        } else {
+                            break;
+                        }
                     }
-                }
-                recent_panics.push_back(now);
-                eprintln!(
-                    "[server engine] worker recovered from panic ({} in last {}s): {msg}",
-                    recent_panics.len(),
-                    panic_window_dur.as_secs(),
-                );
-                if recent_panics.len() > panic_budget {
+                    recent_panics.push_back(now);
                     eprintln!(
-                        "[server engine] panic budget exhausted ({} > {} in {}s); marking \
-                         engine UNHEALTHY and draining inbox",
+                        "[server engine] worker recovered from panic ({} in last {}s): {msg}",
                         recent_panics.len(),
-                        panic_budget,
                         panic_window_dur.as_secs(),
                     );
-                    self.drain_unhealthy("engine unhealthy: too many panics; restart required");
-                    return;
+                    if recent_panics.len() > panic_budget {
+                        eprintln!(
+                            "[server engine] panic budget exhausted ({} > {} in {}s); marking \
+                             engine UNHEALTHY and draining inbox",
+                            recent_panics.len(),
+                            panic_budget,
+                            panic_window_dur.as_secs(),
+                        );
+                        self.drain_unhealthy("engine unhealthy: too many panics; restart required");
+                        return;
+                    }
+                    true
                 }
+            };
+            if forward_failed {
                 // Rebuild the per-worker `Session` because its KV
                 // scratch may have been left mid-write by the failed
                 // kernel.  Weights are shared `Arc`s — only KV
                 // buffers + sampler state are reallocated; the cost
                 // is bounded and dominated by `Vec::with_capacity` on
-                // recovery, not by re-staging weights.
+                // recovery, not by re-staging weights. Its first job
+                // starts cold, which resets the recurrent state.
                 match self.fresh_session() {
                     Ok(s) => {
                         session = s;
                         if let Err(e) = session.validate_backend(self.backend()) {
                             eprintln!(
-                                "[server engine] re-validate_backend after panic failed: {e}; \
-                                 draining inbox"
+                                "[server engine] re-validate_backend after a failed job failed: \
+                                 {e}; draining inbox"
                             );
                             self.drain_unhealthy(&format!(
                                 "engine unhealthy: backend revalidation failed: {e}"
@@ -1183,7 +1193,7 @@ impl EngineWorker {
                     }
                     Err(e) => {
                         eprintln!(
-                            "[server engine] Session::new after panic failed: {e}; \
+                            "[server engine] Session::new after a failed job failed: {e}; \
                              draining inbox"
                         );
                         self.drain_unhealthy(&format!(
@@ -1192,9 +1202,9 @@ impl EngineWorker {
                         return;
                     }
                 }
-                // Skip the post-job housekeeping for the panicking
-                // job — session was rebuilt; nothing useful to
-                // breakdown / evict against the dead state.
+                // Skip the post-job housekeeping for the failed job —
+                // session was rebuilt; nothing useful to breakdown /
+                // evict against the dead state.
                 continue;
             }
             // After every job, run a cheap eviction sweep so a long-running
@@ -1455,7 +1465,7 @@ impl EngineWorker {
         request: JobRequest,
         tokens_tx: mpsc::Sender<TokenEvent>,
         cancel: CancellationFlag,
-    ) {
+    ) -> bool {
         // Move the per-request sampling params (temperature / seed) onto the
         // long-lived per-worker session for this job and re-seed its RNG.
         // The session is constructed once in `run()` with
@@ -1485,7 +1495,7 @@ impl EngineWorker {
                     self.config.max_seq_len,
                 )),
             );
-            return;
+            return false;
         }
 
         #[cfg(feature = "fault-injection")]
@@ -1507,7 +1517,7 @@ impl EngineWorker {
                     &cancel,
                     TokenEvent::Error(format!("prefill failed: {e}")),
                 );
-                return;
+                return true;
             }
         };
 
@@ -1538,7 +1548,7 @@ impl EngineWorker {
             )
             .is_err()
         {
-            return; // client gave up or worker shutting down
+            return false; // client gave up or worker shutting down
         }
 
         if !request.response_prefix.is_empty()
@@ -1553,7 +1563,7 @@ impl EngineWorker {
                 )
                 .is_err()
         {
-            return;
+            return false;
         }
 
         // Decode loop.
@@ -1637,7 +1647,7 @@ impl EngineWorker {
             // (default 0, max documented 50µs).  The cancel check
             // dominates the delay so the wedge-detection bound stays tight.
             if cancel.load(Ordering::Relaxed) {
-                return;
+                return false;
             }
             // `max_tokens == 0`: fall out emitting nothing (`{stop,
             // completion=0}`). For `max_tokens >= 1` this never fires (the
@@ -1681,7 +1691,7 @@ impl EngineWorker {
                                     )
                                     .is_err()
                             {
-                                return;
+                                return false;
                             }
                         }
                         Err(e) => {
@@ -1695,7 +1705,7 @@ impl EngineWorker {
                                 &cancel,
                                 TokenEvent::Error(format!("forced-close inject: {e}")),
                             );
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -1780,7 +1790,7 @@ impl EngineWorker {
                         &cancel,
                         TokenEvent::Error(format!("decode: {e}")),
                     );
-                    return;
+                    return true;
                 }
             };
             generated += 1;
@@ -1856,7 +1866,7 @@ impl EngineWorker {
                         )
                         .is_err()
                 {
-                    return;
+                    return false;
                 }
                 if hit_stop {
                     // The matched stop bytes (and anything after) are dropped
@@ -1878,7 +1888,7 @@ impl EngineWorker {
                 )
                 .is_err()
             {
-                return;
+                return false;
             }
 
             // Token limit: every generated token counts, reasoning included.
@@ -1936,6 +1946,7 @@ impl EngineWorker {
         // Suppress unused-warning for prior_tokens; we keep the read in
         // case future logging instrumentation wants it.
         let _ = prior_tokens;
+        false
     }
 
     /// A session with the worker's per-session hooks installed: the top-2

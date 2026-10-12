@@ -137,6 +137,7 @@ fn test_cuda_q4_0_compute_layer_matches_cpu_dequant() {
         provider.output_proj.clone(),
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     // CUDA backend uses native Q4_0 weights, GPU-resident (repacked) via preload.
     let mut cuda = match CudaBackend::new(0) {
@@ -264,6 +265,7 @@ fn test_cuda_q4_0_compute_final_with_q4_output_proj() {
         provider.output_proj.clone(),
     );
     cpu.init(&hp).unwrap();
+    cpu.preload_weights(&provider).unwrap();
 
     // CUDA backend with native Q4_0 output_proj (raw), repacked during preload.
     let mut cuda = match CudaBackend::new(0) {

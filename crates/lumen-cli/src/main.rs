@@ -209,6 +209,15 @@ fn pull_cmd(args: &[String]) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
+    // Without a GPU `lumen run` picks, the model runs on a CPU backend from
+    // this machine's memory.
+    #[cfg(all(feature = "download", not(target_os = "macos")))]
+    if !(cfg!(feature = "cuda") && lumen_runtime::runtime_defaults::nvidia_gpu_present()) {
+        if let Err(e) = fit::check_host(entry, resolved_name, quant) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
 
     // Download GGUF -- every shard for multi-shard sources, the single file
     // for legacy single-shard. The primary (first) shard path is what the

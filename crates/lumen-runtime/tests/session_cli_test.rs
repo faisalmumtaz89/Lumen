@@ -60,6 +60,7 @@ fn make_backend(provider: &SyncWeightProvider) -> NaiveF32Backend {
         provider.output_proj.clone(),
     );
     backend.init(&hp).unwrap();
+    backend.preload_weights(provider).unwrap();
     backend
 }
 

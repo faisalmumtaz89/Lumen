@@ -13,7 +13,7 @@
 use crate::error::RuntimeError;
 use crate::runtime_defaults::kquant_artifact;
 use crate::weight::cache::LayerView;
-use crate::weight::kquant::{dequant_kquant_to_f32, host_f16_to_f32};
+use crate::weight::kquant::{dequant_kquant_to_f32, dequant_row_into};
 use cudarc::driver::CudaSlice;
 use lumen_format::hyperparams::ModelHyperparams;
 use lumen_format::quantization::QuantScheme;
@@ -310,37 +310,6 @@ fn estimate_quant_elements(byte_len: usize, scheme: QuantScheme) -> usize {
     n_blocks * bs_elem
 }
 
-/// Dequantize a Q5_0 plane (22-byte blocks of 32 elements: f16 scale +
-/// 4 bytes of packed high bits + 16 bytes of packed low nibbles) to F32.
-fn dequant_q5_0_to_f32(raw: &[u8]) -> Vec<f32> {
-    let n_blocks = raw.len() / 22;
-    let mut f32_data = vec![0.0f32; n_blocks * 32];
-    for b in 0..n_blocks {
-        let bp = &raw[b * 22..];
-        let scale = host_f16_to_f32((bp[0] as u16) | ((bp[1] as u16) << 8));
-        let qh = (bp[2] as u32)
-            | ((bp[3] as u32) << 8)
-            | ((bp[4] as u32) << 16)
-            | ((bp[5] as u32) << 24);
-        let qs = &bp[6..]; // 16 nibble-pair bytes
-                           // GGML Q5_0 element order: low nibbles fill elements 0..16, high
-                           // nibbles fill 16..32 (de-interleaved — NOT pairwise), and qh bit j
-                           // is the high bit of element j.
-        for i in 0..16 {
-            let byte = qs[i];
-            let lo_nibble = (byte & 0x0F) as u32;
-            let hi_nibble = ((byte >> 4) & 0x0F) as u32;
-            let lo_hi = (qh >> i) & 1;
-            let hi_hi = (qh >> (i + 16)) & 1;
-            let lo_val = (lo_nibble | (lo_hi << 4)) as f32 - 16.0;
-            let hi_val = (hi_nibble | (hi_hi << 4)) as f32 - 16.0;
-            f32_data[b * 32 + i] = scale * lo_val;
-            f32_data[b * 32 + 16 + i] = scale * hi_val;
-        }
-    }
-    f32_data
-}
-
 /// Host f32 -> IEEE f16 bits, round-to-nearest-even (matches the GPU
 /// `f32_to_f16_vec` kernel's cvt.rn behavior). Used to build F16 weight
 /// images for tensors kept in their source K-quant/Q4_1 form.
@@ -621,27 +590,9 @@ fn upload_tensor(
             // decode fallback (HGEMV) consume F16Raw natively. Decode's fast
             // path reads the raw Q4_1 sibling (`q4_1_w_down`) via dp4a.
             // Q4_1 block: 20 bytes = f16 scale (2B) + f16 min (2B) + 16 nibble-pair bytes (32 elements).
-            let n_blocks = raw.len() / 20;
-            let n_elements = n_blocks * 32;
+            let n_elements = raw.len() / 20 * 32;
             let mut f32_data = vec![0.0f32; n_elements];
-
-            for b in 0..n_blocks {
-                let bp = &raw[b * 20..];
-                let scale = host_f16_to_f32((bp[0] as u16) | ((bp[1] as u16) << 8));
-                let min = host_f16_to_f32((bp[2] as u16) | ((bp[3] as u16) << 8));
-                for i in 0..16 {
-                    let byte = bp[4 + i];
-                    let lo = (byte & 0x0F) as f32;
-                    let hi = ((byte >> 4) & 0x0F) as f32;
-                    // GGML Q4_1 element order: low nibbles fill elements
-                    // 0..16, high nibbles fill 16..32 (de-interleaved — NOT
-                    // pairwise). The pairwise `2*i / 2*i+1` this used to do
-                    // permuted 30 of every 32 columns; dormant while no
-                    // artifact stored Q4_1, load-bearing for source fidelity.
-                    f32_data[b * 32 + i] = scale * lo + min;
-                    f32_data[b * 32 + 16 + i] = scale * hi + min;
-                }
-            }
+            dequant_row_into(&mut f32_data, raw, 0, n_elements, QuantScheme::Q4_1)?;
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&x| f32_to_f16_bits(x).to_le_bytes())
@@ -650,7 +601,9 @@ fn upload_tensor(
             Ok(GpuWeightBuf::F16Raw(gpu_buf))
         }
         QuantScheme::Q5_0 => {
-            let f32_data = dequant_q5_0_to_f32(raw);
+            let n_elements = raw.len() / 22 * 32;
+            let mut f32_data = vec![0.0f32; n_elements];
+            dequant_row_into(&mut f32_data, raw, 0, n_elements, QuantScheme::Q5_0)?;
             eprintln!(
                 "[CUDA] upload {name}: Q5_0 dequant to F32 ({} elements)",
                 f32_data.len()
@@ -1894,6 +1847,7 @@ pub fn repack_layer_q4_to_aligned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::weight::kquant::host_f16_to_f32;
 
     /// A K-quant artifact's K-quant planes are refused while the kernels are switched off;
     /// a Q4_0 artifact's occasional K-quant plane (the 9B/MoE `attn_q`) and every Q5_0/Q2_K/Q3_K
@@ -2065,45 +2019,6 @@ mod tests {
             (false, 70),
         ];
         assert_eq!(f16_cache_bytes_of(f32_wq_and_wo), 2 * (10 + 40));
-    }
-
-    #[test]
-    fn dequant_q5_0_matches_ggml_reference_layout() {
-        // GGML Q5_0: element j < 16 reads the LOW nibble of qs[j]; element
-        // j >= 16 reads the HIGH nibble of qs[j - 16]; qh bit j is the high
-        // bit of element j; value = scale * (code - 16).
-        //
-        // The codes are a scrambled permutation of 0..=31 (NOT the identity:
-        // any affine code sequence has code[i+16] == code[i] + 16 (mod 32),
-        // which makes both nibbles of every qs byte equal and hides
-        // nibble-misrouting bugs).
-        const CODES: [u8; 32] = [
-            28, 9, 19, 10, 29, 5, 7, 22, 0, 14, 8, 15, 23, 24, 21, 13, 25, 27, 6, 16, 26, 18, 11,
-            3, 17, 2, 1, 31, 12, 4, 30, 20,
-        ];
-        // Two blocks with different scales so the 22-byte source / 32-element
-        // destination strides are exercised, not just block 0.
-        let scales_f16: [u16; 2] = [0x3C00, 0x4000]; // 1.0, 2.0
-        let mut raw = [0u8; 44];
-        for (b, block) in raw.chunks_exact_mut(22).enumerate() {
-            block[0..2].copy_from_slice(&scales_f16[b].to_le_bytes());
-            let mut qh: u32 = 0;
-            for (j, &code) in CODES.iter().enumerate() {
-                qh |= (((code >> 4) & 1) as u32) << j;
-            }
-            block[2..6].copy_from_slice(&qh.to_le_bytes());
-            for i in 0..16 {
-                block[6 + i] = (CODES[i] & 0x0F) | ((CODES[i + 16] & 0x0F) << 4);
-            }
-        }
-
-        let out = dequant_q5_0_to_f32(&raw);
-        assert_eq!(out.len(), 64);
-        for (j, &v) in out.iter().enumerate() {
-            let scale = if j < 32 { 1.0 } else { 2.0 };
-            let expected = scale * (CODES[j % 32] as f32 - 16.0);
-            assert_eq!(v, expected, "element {j}: got {v}, expected {expected}");
-        }
     }
 
     #[test]
