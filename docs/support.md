@@ -10,7 +10,7 @@ Each backend (CUDA + Metal) is validated end-to-end against llama.cpp per the ma
 
 Turing (7.5) is verified on a Tesla T4 with Qwen3.5-9B Q8_0 and Q4_0 (greedy output identical across
 runs, correct factual answers); Q8_0 is checked on a T4 by every release. Q4_K_M, Q5_K_M and
-compressed-tensors INT4 need compute capability 8.0+: their kernels are built for it, and on a 7.5 GPU
+compressed-tensors INT4 need compute capability 8.0+: they use kernels built for it, and on a 7.5 GPU
 the model is refused at load. BF16 and the larger models on 7.5 are untested (a T4 has 16 GB).
 
 The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.

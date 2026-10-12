@@ -57,7 +57,7 @@ More on installing, pulling and running: **[Getting started](docs/getting-starte
 ## What it is
 
 - **One self-contained binary, zero ML dependencies** — native CUDA C and Metal MSL kernels, a native BPE tokenizer, and the native `.lbc` model format, all in Rust. No PyTorch, no ONNX, no Python runtime.
-- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-7.5+ device (the K-quant and INT4 formats need 8.0+).
+- **No build-time CUDA SDK** — kernels JIT-compile at runtime via NVRTC, so one CUDA build runs on any compute-capability-7.5+ device (the K-quant and INT4 formats and image generation need 8.0+).
 - **Download → convert → run** in a single command; weights stay GPU-resident for fast batch-1 decode.
 - **OpenAI- and Anthropic-compatible HTTP server** with SSE streaming and template-driven tool calls; optional per-request reasoning / extended thinking.
 - **Text to image** with Qwen-Image-2.1 on CUDA, from a separate image-only server.
