@@ -1,14 +1,17 @@
-//! The f16 header (`d`, `s`) of the Q8_1 blocks the decode quantizers write, checked against
-//! values computed on the host, for each quantizer compiled both ways production compiles it:
-//! to PTX that the driver JIT-compiles, and to a cubin for the device's own architecture, the
-//! route `ffi::sass_arch_for` takes when NVRTC is newer than the driver. Some ptxas versions
-//! lowered a byte store of an f16 register as an f16-to-integer conversion, which zeroed the
-//! low byte of every scale below 1 and truncated the sums.
+//! The f16 header (`d`, `s`) of the Q8_1 blocks the quantizers write, checked against the
+//! values the kernel quantized, for each quantizer helper's file compiled both ways production
+//! compiles it: to PTX that the driver JIT-compiles, and to a cubin for the device's own
+//! architecture, the route `ffi::sass_arch_for` takes when NVRTC is newer than the driver.
+//! ptxas 12.2 through 13.0 lowered a byte store of a 16-bit f16 register as an f16-to-integer
+//! conversion, which replaced the low byte of every scale and sum.
 //!
 //!   * `quantize_f32_to_q8_1` (`matvec_dp4a_q8_1.cu`, compute_80, fast math): `s = d * sum(q)`;
+//!   * `quantize_q8_1_rawsum` (`mmv_q.cu`) and `quantize_q8_1_moe` (`mmv_q_moe.cu`), on the
+//!     dp4a target `ffi::dp4a_arch_for` picks: `s = sum(x)`;
 //!   * `rmsnorm_to_q8_1` (`rmsnorm_q8_1.cu`, NVRTC's default target): `s = d * sum(q)` over
 //!     the normalized vector;
-//!   * `quantize_q8_1_rawsum` (`mmv_q.cu`, the dp4a target): `s = sum(x)`.
+//!   * `gdn_prefill_norm_gate_q8` (`gdn.cu`, NVRTC's default target): `s = sum(x)` over the
+//!     gated vector it also writes in F32.
 //!
 //! Requires a CUDA GPU:
 //!
@@ -28,57 +31,90 @@ enum Route {
     Cubin,
 }
 
+/// The PTX target production compiles a module for.
+enum Target {
+    Default,
+    Compute80,
+    Dp4a,
+}
+
 fn create_context() -> (Arc<CudaContext>, Arc<CudaStream>) {
     let ctx = CudaContext::new(0).expect("No CUDA GPU available");
     let stream = ctx.default_stream();
     (ctx, stream)
 }
 
-/// `name` from `src`, compiled for `arch` (PTX route) or for the device's own `sm_XY` (cubin
-/// route), with the production options.
+/// `ffi::dp4a_arch_for` over the loaded NVRTC's targets: compute_61 when listed, else the
+/// highest listed target at or below the device.
+fn dp4a_target(cc: i32) -> i32 {
+    use cudarc::nvrtc::sys;
+    let mut count = 0;
+    // SAFETY: the buffer is sized to the reported count before the second call writes it.
+    let archs = unsafe {
+        sys::nvrtcGetNumSupportedArchs(&mut count).result().unwrap();
+        let mut archs = vec![0; count as usize];
+        sys::nvrtcGetSupportedArchs(archs.as_mut_ptr())
+            .result()
+            .unwrap();
+        archs
+    };
+    if archs.contains(&61) {
+        return 61;
+    }
+    archs
+        .into_iter()
+        .filter(|&a| (61..=cc).contains(&a))
+        .max()
+        .expect("no dp4a target for this device")
+}
+
+/// `name` from `src`, compiled for its production `target` (PTX route) or for the device's own
+/// `sm_XY` (cubin route), with the production options.
 fn load(
     ctx: &Arc<CudaContext>,
     src: &str,
     name: &str,
-    arch: Option<&'static str>,
+    target: Target,
     fast_math: bool,
     route: Route,
 ) -> CudaFunction {
+    let (major, minor) = ctx.compute_capability().unwrap();
+    let arch = match (route, target) {
+        (Route::Cubin, _) => Some(format!("sm_{major}{minor}")),
+        (Route::Ptx, Target::Default) => None,
+        (Route::Ptx, Target::Compute80) => Some("compute_80".to_string()),
+        (Route::Ptx, Target::Dp4a) => Some(format!("compute_{}", dp4a_target(major * 10 + minor))),
+    };
+    let mut options: Vec<String> = arch
+        .map(|a| format!("--gpu-architecture={a}"))
+        .into_iter()
+        .collect();
+    if fast_math {
+        options.push("--use_fast_math".to_string());
+    }
     let image = match route {
         Route::Ptx => compile_ptx_with_opts(
             src,
             CompileOptions {
-                arch,
-                options: if fast_math {
-                    vec!["--use_fast_math".to_string()]
-                } else {
-                    Vec::new()
-                },
+                options,
                 ..Default::default()
             },
         )
         .unwrap_or_else(|e| panic!("NVRTC PTX compile of {name} failed: {e:?}")),
-        Route::Cubin => {
-            let (major, minor) = ctx.compute_capability().unwrap();
-            Ptx::from_binary(cubin(src, &format!("sm_{major}{minor}"), fast_math))
-        }
+        Route::Cubin => Ptx::from_binary(cubin(src, &options)),
     };
     ctx.load_module(image)
         .and_then(|m| m.load_function(name))
         .unwrap_or_else(|e| panic!("load {name} ({route:?}): {e:?}"))
 }
 
-fn cubin(src: &str, arch: &str, fast_math: bool) -> Vec<u8> {
+fn cubin(src: &str, options: &[String]) -> Vec<u8> {
     use cudarc::nvrtc::{result, sys};
     let source = std::ffi::CString::new(src).unwrap();
-    let mut options = vec![format!("--gpu-architecture={arch}")];
-    if fast_math {
-        options.push("--use_fast_math".to_string());
-    }
     let program = result::create_program(&source, None).unwrap();
     // SAFETY: `program` is live until the destroy below; the buffer is sized by the size query.
     unsafe {
-        result::compile_program(program, &options).expect("NVRTC cubin compile");
+        result::compile_program(program, options).expect("NVRTC cubin compile");
         let mut size = 0usize;
         sys::nvrtcGetCUBINSize(program, &mut size).result().unwrap();
         let mut bytes = vec![0u8; size];
@@ -99,6 +135,11 @@ fn rng_next(state: &mut u64) -> u64 {
 
 fn rand_unit(s: &mut u64) -> f32 {
     ((rng_next(s) & 0xff_ffff) as f32 / 8_388_608.0) - 1.0
+}
+
+fn input(seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    (0..DIM).map(|_| rand_unit(&mut s) * 0.5).collect()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -137,32 +178,17 @@ fn check(kernel: &str, route: Route, out: &[u8], values: &[f64], raw_sum: bool) 
     }
 }
 
-fn input(seed: u64) -> Vec<f32> {
-    let mut s = seed;
-    (0..DIM).map(|_| rand_unit(&mut s) * 0.5).collect()
-}
-
-fn quantize_case(route: Route, raw_sum: bool) {
+/// A one-warp-per-block quantizer `(x, vy, dim)` over `input(7)`.
+fn quantize_case(
+    src: &str,
+    name: &str,
+    target: Target,
+    fast_math: bool,
+    raw_sum: bool,
+    route: Route,
+) {
     let (ctx, stream) = create_context();
-    let (src, name, arch, fast_math) = if raw_sum {
-        let (major, minor) = ctx.compute_capability().unwrap();
-        let cc = major * 10 + minor;
-        assert!(cc >= 61, "dp4a needs compute capability 6.1");
-        (
-            shaders::MMV_Q_DP4A_KERNEL_SOURCE,
-            "quantize_q8_1_rawsum",
-            Some("compute_61"),
-            false,
-        )
-    } else {
-        (
-            shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
-            "quantize_f32_to_q8_1",
-            Some("compute_80"),
-            true,
-        )
-    };
-    let f = load(&ctx, src, name, arch, fast_math, route);
+    let f = load(&ctx, src, name, target, fast_math, route);
     let x = input(7);
     let x_gpu = stream.clone_htod(&x).unwrap();
     let mut out = stream.alloc_zeros::<u8>(DIM / 32 * 36).unwrap();
@@ -197,7 +223,7 @@ fn rmsnorm_case(route: Route) {
         &ctx,
         shaders::RMSNORM_Q8_1_KERNEL_SOURCE,
         "rmsnorm_to_q8_1",
-        None,
+        Target::Default,
         false,
         route,
     );
@@ -241,24 +267,125 @@ fn rmsnorm_case(route: Route) {
     );
 }
 
+/// `gdn_prefill_norm_gate_q8` at the launch production uses: one CTA per head; the header is
+/// checked against the F32 vector the kernel writes beside the blocks.
+fn gdn_case(route: Route) {
+    let (ctx, stream) = create_context();
+    let f = load(
+        &ctx,
+        shaders::GDN_KERNEL_SOURCE,
+        "gdn_prefill_norm_gate_q8",
+        Target::Default,
+        false,
+        route,
+    );
+    let (heads, head_dim) = (32u32, 128u32);
+    let raw = input(17);
+    let gate = input(19);
+    let mut s = 23;
+    let scale: Vec<f32> = (0..DIM).map(|_| 0.5 + rand_unit(&mut s).abs()).collect();
+    let raw_gpu = stream.clone_htod(&raw).unwrap();
+    let gate_gpu = stream.clone_htod(&gate).unwrap();
+    let scale_gpu = stream.clone_htod(&scale).unwrap();
+    let mut gated = stream.alloc_zeros::<f32>(DIM).unwrap();
+    let mut out = stream.alloc_zeros::<u8>(DIM / 32 * 36).unwrap();
+    let eps = 1e-6f32;
+    let cfg = LaunchConfig {
+        grid_dim: (heads, 1, 1),
+        block_dim: (head_dim, 1, 1),
+        shared_mem_bytes: (head_dim.div_ceil(32) + 1) * 4,
+    };
+    unsafe {
+        stream
+            .launch_builder(&f)
+            .arg(&raw_gpu)
+            .arg(&gate_gpu)
+            .arg(&scale_gpu)
+            .arg(&mut gated)
+            .arg(&mut out)
+            .arg(&heads)
+            .arg(&head_dim)
+            .arg(&eps)
+            .arg(&heads)
+            .launch(cfg)
+            .unwrap();
+    }
+    let values: Vec<f64> = stream
+        .clone_dtoh(&gated)
+        .unwrap()
+        .iter()
+        .map(|&v| v as f64)
+        .collect();
+    check(
+        "gdn_prefill_norm_gate_q8",
+        route,
+        &stream.clone_dtoh(&out).unwrap(),
+        &values,
+        true,
+    );
+}
+
+fn dp4a_q8_1(route: Route) {
+    quantize_case(
+        shaders::MATVEC_DP4A_Q8_1_KERNEL_SOURCE,
+        "quantize_f32_to_q8_1",
+        Target::Compute80,
+        true,
+        false,
+        route,
+    );
+}
+
+fn rawsum(route: Route) {
+    quantize_case(
+        shaders::MMV_Q_DP4A_KERNEL_SOURCE,
+        "quantize_q8_1_rawsum",
+        Target::Dp4a,
+        false,
+        true,
+        route,
+    );
+}
+
+fn moe(route: Route) {
+    quantize_case(
+        shaders::MMV_Q_MOE_DP4A_KERNEL_SOURCE,
+        "quantize_q8_1_moe",
+        Target::Dp4a,
+        false,
+        true,
+        route,
+    );
+}
+
 #[test]
 fn quantize_f32_to_q8_1_writes_its_header_via_ptx() {
-    quantize_case(Route::Ptx, false);
+    dp4a_q8_1(Route::Ptx);
 }
 
 #[test]
 fn quantize_f32_to_q8_1_writes_its_header_via_cubin() {
-    quantize_case(Route::Cubin, false);
+    dp4a_q8_1(Route::Cubin);
 }
 
 #[test]
 fn quantize_q8_1_rawsum_writes_its_header_via_ptx() {
-    quantize_case(Route::Ptx, true);
+    rawsum(Route::Ptx);
 }
 
 #[test]
 fn quantize_q8_1_rawsum_writes_its_header_via_cubin() {
-    quantize_case(Route::Cubin, true);
+    rawsum(Route::Cubin);
+}
+
+#[test]
+fn quantize_q8_1_moe_writes_its_header_via_ptx() {
+    moe(Route::Ptx);
+}
+
+#[test]
+fn quantize_q8_1_moe_writes_its_header_via_cubin() {
+    moe(Route::Cubin);
 }
 
 #[test]
@@ -269,4 +396,14 @@ fn rmsnorm_to_q8_1_writes_its_header_via_ptx() {
 #[test]
 fn rmsnorm_to_q8_1_writes_its_header_via_cubin() {
     rmsnorm_case(Route::Cubin);
+}
+
+#[test]
+fn gdn_prefill_norm_gate_q8_writes_its_header_via_ptx() {
+    gdn_case(Route::Ptx);
+}
+
+#[test]
+fn gdn_prefill_norm_gate_q8_writes_its_header_via_cubin() {
+    gdn_case(Route::Cubin);
 }

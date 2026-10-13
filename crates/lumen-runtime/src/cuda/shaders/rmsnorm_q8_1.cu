@@ -47,11 +47,11 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 
 // Hardware f32->f16 conversion via PTX.
 __device__ __forceinline__ unsigned short f32_to_f16_bits(float val) {
-    // The bits leave the asm in an integer register: a byte store of the f16
-    // register itself is lowered by some ptxas versions (NVRTC 12.9, driver
-    // 580) as an f16-to-integer conversion instead of a copy of its low byte.
+    // The conversion writes a 32-bit register, zero-extended: ptxas 12.2 through
+    // 13.0 lowers a byte store of a 16-bit f16 register as an f16-to-integer
+    // conversion instead of a copy of its low byte.
     unsigned int result;
-    asm("{ .reg .b16 h; cvt.rn.f16.f32 h, %1; cvt.u32.u16 %0, h; }" : "=r"(result) : "f"(val));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=r"(result) : "f"(val));
     return (unsigned short)result;
 }
 

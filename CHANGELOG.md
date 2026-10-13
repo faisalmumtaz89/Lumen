@@ -9,15 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
-- **CUDA decode quantizes its activations correctly whichever compiler builds the kernels.**
-  The kernels that quantize an activation to Q8_1 for the int8 matvecs wrote each block's f16
-  scale and sum one byte at a time, and some ptxas versions (NVIDIA driver 580.95, and NVRTC
-  12.9 when it compiles for the GPU directly because the driver is older) turned those byte
-  stores into a float-to-integer conversion: every scale below 1 lost its low byte, up to 20%
-  of its value. On those setups Q8_0 and Q4_0 decode drifted from the reference (Qwen3.5-9B
-  Q8_0 on an L4: 121 of 128 greedy tokens agreed with the CPU instead of 127, logits cosine
-  0.925 instead of 0.9999). The scale and sum now leave the conversion as integers, and the
-  output no longer depends on the driver.
+- **CUDA quantizes activations to Q8_1 correctly whichever ptxas compiles the kernels.** The
+  kernels that quantize an activation to Q8_1 for the int8 matvecs (Q8_0, Q4_0, the K-quants,
+  INT4, the MoE experts) and in the GDN prefill wrote each block's f16 scale and sum one byte at
+  a time, and ptxas from CUDA 12.2 through 13.0 turned those byte stores into a float-to-integer
+  conversion that replaced the low byte of every scale and sum. That ptxas is the driver's when
+  it compiles Lumen's PTX (seen with driver 580.95) and NVRTC's when NVRTC 12.9 compiles for the
+  GPU because the driver is older. Measured on Qwen3.5-9B Q8_0 on an L4 with driver 580.95, the
+  CPU fed CUDA's tokens agreed with CUDA's top token at 121 of 128 positions (logits cosine at
+  least 0.925); with the fix, at 127 of 128 (at least 0.9999), as with driver 610.
 
 ## [0.47.0] — 2026-10-12
 
