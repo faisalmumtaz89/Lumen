@@ -57,9 +57,12 @@ __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
 }
 
 __device__ __forceinline__ unsigned short f32_to_f16_bits(float v) {
-    unsigned short bits;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(v));
-    return bits;
+    // The conversion writes a 32-bit register, zero-extended: ptxas 12.2 through
+    // 13.0 lowers a byte store of a 16-bit f16 register as an f16-to-integer
+    // conversion instead of a copy of its low byte.
+    unsigned int bits;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=r"(bits) : "f"(v));
+    return (unsigned short)bits;
 }
 
 // SIMD dp4a (4-element signed int8 dot product + accumulate).
