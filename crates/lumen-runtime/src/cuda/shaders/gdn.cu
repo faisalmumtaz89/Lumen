@@ -803,9 +803,12 @@ __device__ __forceinline__ float gdn_warp_reduce_max(float val) {
 }
 
 __device__ __forceinline__ unsigned short gdn_f32_to_f16_bits(float v) {
-    unsigned short bits;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(v));
-    return bits;
+    // The bits leave the asm in an integer register: a byte store of the f16
+    // register itself is lowered by some ptxas versions (NVRTC 12.9, driver
+    // 580) as an f16-to-integer conversion instead of a copy of its low byte.
+    unsigned int bits;
+    asm("{ .reg .b16 h; cvt.rn.f16.f32 h, %1; cvt.u32.u16 %0, h; }" : "=r"(bits) : "f"(v));
+    return (unsigned short)bits;
 }
 
 extern "C" __global__ void gdn_prefill_norm_gate_q8(
