@@ -610,8 +610,10 @@ impl MetalF32Backend {
     /// convert is appended to `enc` BEFORE the recurrence dispatch that consumes
     /// it, so serial-encoder ordering guarantees convert-then-read. Subsequent
     /// tokens find the mirror already populated and skip the convert (the F16
-    /// recurrence reads/writes the mirror in place). A no-op when the flag is OFF,
-    /// the converter pipeline is unavailable, or the mirror already exists.
+    /// recurrence reads/writes the mirror in place). A no-op when the converter
+    /// pipeline, the high-occupancy tier (the only one with an F16 recurrence) or
+    /// the chosen F16 recurrence kernel is unavailable, or the mirror already
+    /// exists.
     pub(crate) fn ensure_gdn_f16_state_decode(
         device: &super::ffi::MetalDevice,
         pipelines: &MetalPipelines,
@@ -624,6 +626,13 @@ impl MetalF32Backend {
         // lazily; fall back to the f32 path when the converter / f16 kernels are absent.
         let want_v4 = crate::metal::gdn_f16_state_h1_v4_enabled();
         if pipelines.gdn_state_f32_to_f16.is_none() {
+            return Ok(());
+        }
+        // Only the high-occupancy tier runs the F16 recurrence; the fused
+        // fallbacks update the F32 state, so a mirror there would never be live
+        // and a session save (which exports the mirror when present) would
+        // write a stale state.
+        if pipelines.gdn_state_output_l2_sg.is_none() || pipelines.gdn_decode_norm_scale.is_none() {
             return Ok(());
         }
         if want_v4 {

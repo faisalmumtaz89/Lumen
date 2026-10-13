@@ -156,7 +156,7 @@ fn s5_save_to_disk_writes_valid_v2_file() {
 
     let save_path = dir.join("session.kv");
     session
-        .save_to_disk(&save_path, &backend, &fingerprint)
+        .save_to_disk(&save_path, &backend, &provider, &fingerprint)
         .expect("save_to_disk must succeed on CPU naive");
     assert!(save_path.exists(), "save_to_disk must create the file");
 
@@ -215,7 +215,7 @@ fn s5_session_resume_save_round_trip_argmax_identical() {
     sess_a.extend(&prompt, &backend, &provider).unwrap();
     let save_path = dir.join("round_trip.kv");
     sess_a
-        .save_to_disk(&save_path, &backend, &fingerprint)
+        .save_to_disk(&save_path, &backend, &provider, &fingerprint)
         .unwrap();
     drop(sess_a);
 
@@ -235,7 +235,7 @@ fn s5_session_resume_save_round_trip_argmax_identical() {
     }
     // Re-save after generation — this is the realistic CLI flow.
     sess_r
-        .save_to_disk(&save_path, &backend, &fingerprint)
+        .save_to_disk(&save_path, &backend, &provider, &fingerprint)
         .expect("re-save must succeed");
 
     assert_eq!(
@@ -249,19 +249,8 @@ fn s5_session_resume_save_round_trip_argmax_identical() {
     f.read_exact(&mut buf).unwrap();
     let h = DiskKvHeader::from_bytes(&buf).unwrap();
     assert_eq!(h.version, 2);
-    // After full generation the saved seq_len equals `kv.seq_len`, which is
-    // `prompt + generated - 1` because the LAST `next_token` call was a
-    // Path A (samples pending_logits and pushes the token, defers the
-    // K/V write to the next decode step). The Session::save_to_disk
-    // invariant repair trims tokens to match. The deferred
-    // token IS recoverable on resume via the saved pending_logits.
-    let expected_kv_seq = (prompt.len() + 16 - 1) as u64;
-    assert!(
-        h.seq_len == expected_kv_seq || h.seq_len == (prompt.len() + 16) as u64,
-        "header.seq_len must be either {expected_kv_seq} (Path-A-tail) or {} (Path B tail), got {}",
-        prompt.len() + 16,
-        h.seq_len,
-    );
+    // The save feeds the last generated token, so the file holds every token.
+    assert_eq!(h.seq_len, (prompt.len() + 16) as u64);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -284,7 +273,8 @@ fn s5_fingerprint_mismatch_rejected_on_load() {
     let mut sess = Session::new(make_config(), hp, greedy_sampling()).unwrap();
     sess.extend(&[1u32, 2, 3, 4], &backend, &provider).unwrap();
     let path = dir.join("fp_mismatch.kv");
-    sess.save_to_disk(&path, &backend, &fp_a).unwrap();
+    sess.save_to_disk(&path, &backend, &provider, &fp_a)
+        .unwrap();
 
     // Load with a different fingerprint.
     let fp_b = ModelFingerprint {
@@ -410,7 +400,7 @@ fn s5_resume_continues_from_cache_on_empty_prompt() {
     sess_a.extend(&prompt, &backend, &provider).unwrap();
     let save_path = dir.join("continue.kv");
     sess_a
-        .save_to_disk(&save_path, &backend, &fingerprint)
+        .save_to_disk(&save_path, &backend, &provider, &fingerprint)
         .unwrap();
     // Sample 8 tokens continuously for the baseline.
     let mut continuous: Vec<u32> = Vec::with_capacity(8);
@@ -446,6 +436,63 @@ fn s5_resume_continues_from_cache_on_empty_prompt() {
         r_result.tokens, continuous,
         "empty-prompt resume must continue from cache and match continuous"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Saved after eight generated tokens (the last two differ), a session resumed with an
+/// empty prompt continues exactly where the unsaved one does.
+#[test]
+fn resume_after_generated_tokens_continues_on_empty_prompt() {
+    let (dir, model_path) = synthetic_model_path();
+    let provider = SyncWeightProvider::open(&model_path).unwrap();
+    let backend = make_backend(&provider);
+    let hp = provider.lbc().header.hyperparams;
+    let fingerprint = live_fingerprint(&provider);
+    let prompt: Vec<u32> = vec![10, 20, 25, 30];
+
+    let mut sess_u = Session::new(make_config(), hp, greedy_sampling()).unwrap();
+    sess_u.extend(&prompt, &backend, &provider).unwrap();
+    let unsaved: Vec<u32> = (0..16)
+        .map(|_| sess_u.next_token(&backend, &provider).unwrap())
+        .collect();
+    let (first, continuous) = unsaved.split_at(8);
+    assert_ne!(first[6], first[7]);
+    drop(sess_u);
+
+    let mut sess_a = Session::new(make_config(), hp, greedy_sampling()).unwrap();
+    sess_a.extend(&prompt, &backend, &provider).unwrap();
+    for _ in 0..8 {
+        sess_a.next_token(&backend, &provider).unwrap();
+    }
+    let save_path = dir.join("after8.kv");
+    sess_a
+        .save_to_disk(&save_path, &backend, &provider, &fingerprint)
+        .unwrap();
+    drop(sess_a);
+
+    let mut sess_r = Session::load_from_disk(
+        &save_path,
+        make_config(),
+        hp,
+        greedy_sampling(),
+        &backend,
+        &fingerprint,
+    )
+    .unwrap();
+    let want_history: Vec<u32> = prompt.iter().chain(first).copied().collect();
+    assert_eq!(sess_r.tokens(), &want_history[..]);
+    let engine = InferenceEngine::new(make_config(), hp);
+    let r_result = engine
+        .generate_with_session(
+            &mut sess_r,
+            &[],
+            &provider,
+            &backend,
+            &StopCondition::MaxTokens(8),
+        )
+        .unwrap();
+    assert_eq!(r_result.tokens, continuous);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -551,7 +598,9 @@ fn s5_multi_quant_hardware_gate() {
         );
         let mut sess_a = Session::new(config.clone(), hp, sampling.clone()).unwrap();
         sess_a.extend(&prompt, &metal, &provider).unwrap();
-        sess_a.save_to_disk(&path, &metal, &fingerprint).unwrap();
+        sess_a
+            .save_to_disk(&path, &metal, &provider, &fingerprint)
+            .unwrap();
 
         let mut sess_r = Session::load_from_disk(
             &path,

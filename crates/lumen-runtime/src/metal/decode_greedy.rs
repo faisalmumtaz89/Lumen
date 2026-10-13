@@ -3082,6 +3082,37 @@ impl MetalF32Backend {
         s.pipe_step = 0;
     }
 
+    /// `decode_token_greedy_logits`: the greedy core's logits for `token_id` at
+    /// `kv.seq_len()`. After the lean driver returns a token, its one remaining
+    /// in-flight CB is already decoding that token at that position, so that
+    /// CB's logits are read once it completes; with nothing in flight the
+    /// sequential core decodes `token_id`. Either way `logits_buf` then holds
+    /// them and no CB is left in flight.
+    pub(crate) fn decode_token_greedy_logits_impl(
+        &self,
+        token_id: u32,
+        weights: &dyn crate::weight::cache::WeightProvider,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<crate::compute::Logits, RuntimeError> {
+        if <Self as crate::compute::ComputeBackend>::reconcile_speculative_tail(self, kv)? {
+            kv.advance_seq_len()?;
+        } else {
+            // The sequential core, not the lean driver: it commits, waits and
+            // leaves nothing in flight.
+            MetalF32Backend::decode_token_greedy(self, token_id, weights, kv)?;
+        }
+        let guard = self
+            .scratch
+            .lock()
+            .map_err(|_| RuntimeError::Compute("Metal scratch lock poisoned".into()))?;
+        let s = guard
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("Metal scratch not initialized".into()))?;
+        let mut data = vec![0.0f32; s.vocab_size];
+        s.logits_buf.read_f32(&mut data);
+        Ok(crate::compute::Logits { data })
+    }
+
     /// Greedy decode driver: the single lean GPU-pipelined path (the one greedy decode path).
     ///
     /// Byte-identical GPU token-chaining + one-token-lag overlap, with the

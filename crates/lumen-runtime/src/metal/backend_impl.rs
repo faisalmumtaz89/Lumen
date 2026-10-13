@@ -3184,6 +3184,17 @@ impl ComputeBackend for MetalF32Backend {
         autoreleasepool(|| MetalF32Backend::decode_token_greedy_lean(self, token_id, weights, kv))
     }
 
+    fn decode_token_greedy_logits(
+        &self,
+        token_id: u32,
+        weights: &dyn WeightProvider,
+        kv: &mut KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        autoreleasepool(|| {
+            MetalF32Backend::decode_token_greedy_logits_impl(self, token_id, weights, kv)
+        })
+    }
+
     fn decode_token_sampled(
         &self,
         prev_token: u32,

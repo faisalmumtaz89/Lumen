@@ -1098,11 +1098,10 @@ fn layer_payload_bytes(cfg: &KvCacheConfig) -> usize {
 /// recurrent state is zeroed on the destination session.
 ///
 /// `pending_logits`, when `Some`, persists the cached logits the next
-/// `Session::next_token` call should sample from — without it, the loaded
-/// session falls into the forward-pass path on the first decode and
-/// produces a different argmax than the continuous session would have.
-/// Pass `None` only when you know the caller won't resume into
-/// `Session::next_token` (e.g. a tooling consumer that only reads tokens).
+/// `Session::next_token` call should sample from. `Session::load_from_disk`
+/// refuses a file that holds tokens but no logits, so pass `None` only for an
+/// empty history or a consumer that only reads the file (e.g. tooling that
+/// reads tokens).
 ///
 /// On ENOSPC or any other write error the tmp file is cleaned up before the
 /// error propagates. Successful saves leave only the published

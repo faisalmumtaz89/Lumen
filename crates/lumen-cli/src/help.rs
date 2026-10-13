@@ -222,10 +222,14 @@ OPTIONS:
                           implemented).
     --session-save <p>    Persist the live Session to <p> after generation completes.
                           Atomically published via `.tmp.<pid>` -> rename so concurrent
-                          readers never see a partial write. Captures K/V bytes, the
-                          GDN recurrent state, the token history, and the pending logits
-                          so a subsequent `--session-resume <p>` is argmax-identical to a
-                          continuous session.
+                          readers never see a partial write. Captures the full token
+                          history, K/V bytes, the GDN recurrent state and the next token's
+                          logits, so a resumed run on the same backend whose --tokens start
+                          with the saved history continues token for token as if it had
+                          never stopped (with --temperature 0 and the same sampling flags;
+                          a sampled run restarts its random numbers from its seed). A file
+                          an earlier version saved after generation is refused; delete it
+                          to start again.
                           `LUMEN_SUFFIX_THRESHOLD=<n>` (positive integer) is the suffix
                           length at which a resumed session would switch from the decode
                           loop to the batched prefill; no current backend makes that switch.

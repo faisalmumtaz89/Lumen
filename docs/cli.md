@@ -32,7 +32,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--kv-precision f16\|bf16\|f32` | KV cache storage (per-backend default: Metal f16, CUDA / CPU f32). On CUDA `f16` and `bf16` halve the cache's bytes and its decode-attention reads; the model's keys and values are rounded to half or to bfloat16 on the way in. `bf16` is CUDA only (see `docs/environment-variables.md`, `LUMEN_KV_PRECISION`) |
 | `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
 | `--kv-disk-space-mb <n>` | KV cache space budget on disk |
-| `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal and the CPU backends); a resumed session keeps the cache size it was saved with, and a `--context-len` of another size is refused |
+| `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal and the CPU backends). The file holds the full history and the next token's logits, so a resumed run on the same backend whose `--tokens` start with the saved history continues token for token as if it had never stopped (with `--temperature 0` and the same sampling flags; a sampled run restarts its random numbers from its seed). A resumed session keeps the cache size it was saved with, and a `--context-len` of another size is refused; a file an earlier version saved after generation is refused |
 | `--no-gpu-resident` | Stream weights from disk instead of GPU memory (CUDA only: Metal decode requires resident weights) |
 | `--gpu-resident` | Force GPU-resident weights |
 | `--verbose` | Show diagnostics and metrics |

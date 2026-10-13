@@ -383,7 +383,7 @@ fn session_save_after_prefill_restores_on_a_fresh_backend() {
     let backend = ready(NaiveF32Backend::new(), &provider, true);
     let mut s = session(hp, KvPrecision::F16);
     s.extend(&prompt, &backend, &provider).unwrap();
-    s.save_to_disk(&file, &backend, &fp).unwrap();
+    s.save_to_disk(&file, &backend, &provider, &fp).unwrap();
     let uninterrupted = generate(&mut s, &backend, &provider, 10);
 
     let fresh = ready(NaiveF32Backend::new(), &provider, true);
@@ -476,7 +476,7 @@ fn an_unprepared_backend_refuses_compute_save_and_restore() {
         );
 
         let saved = path.with_file_name("unprepared.kv");
-        assert!(s.save_to_disk(&saved, b, &fp).is_err());
+        assert!(s.save_to_disk(&saved, b, &provider, &fp).is_err());
         assert!(!saved.exists(), "a refused save writes no file");
 
         let err = Session::load_from_disk(&file, config(KvPrecision::F32), hp, greedy(), b, &fp)

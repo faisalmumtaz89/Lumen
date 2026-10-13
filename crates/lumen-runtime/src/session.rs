@@ -1100,29 +1100,40 @@ impl Session {
     /// [`Session::load_from_disk`].
     ///
     /// The save path:
-    /// 1. Calls `backend.sync_kv_to_cpu` to drain pending GPU work and
+    /// 1. Settles the sampled tail: after `next_token` the last token is
+    ///    sampled but not yet fed, and no logits are held. It is decoded
+    ///    now, on the route the next `next_token` would take, and its logits
+    ///    are kept unsampled, so the file holds the full history and the
+    ///    logits of the next token. With its sampling settings unchanged,
+    ///    the live session continues exactly as it would have. (After a later
+    ///    switch off the greedy route it samples these logits, where an
+    ///    unsaved session re-prefills its history, so the two may round
+    ///    differently.) A session whose last generated token no longer
+    ///    fits in the context, or that holds a fed history but no logits
+    ///    (after `truncate_to`), is refused before anything changes.
+    /// 2. Calls `backend.sync_kv_to_cpu` to drain pending GPU work and
     ///    mirror the live K/V (and recurrent state, if the backend has any)
     ///    into the CPU-side buffers the disk format expects.
-    /// 2. Streams the K/V buffers and the optional recurrent section
-    ///    through `kv::disk::save_atomic`, which uses a `.tmp.<pid>` →
-    ///    `rename` atomic publish and fsync-for-durability.
-    /// 3. Surfaces any backend or IO error verbatim. On Metal-only models
-    ///    without GDN this still produces a valid file (the recurrent
-    ///    section is simply omitted via the v2 `has_recurrent_state` flag).
+    /// 3. Streams the K/V buffers, the optional recurrent section and the
+    ///    logits through `kv::disk::save_atomic`, which uses a `.tmp.<pid>`
+    ///    → `rename` atomic publish and fsync-for-durability.
     ///
     /// `fingerprint` MUST be the live model's fingerprint (compute it once
     /// at engine init via `kv::disk::compute_model_hash`). On load, the
     /// loader rejects any file whose fingerprint differs.
     ///
-    /// On backends that do not yet support `sync_kv_to_cpu` (CUDA today,
-    /// see `backend_impl.rs::sync_kv_to_cpu`) the call returns
-    /// `RuntimeError::Unsupported` immediately, before any disk I/O.
+    /// On backends that do not support `sync_kv_to_cpu` (CUDA today, see
+    /// `backend_impl.rs::sync_kv_to_cpu`) the call returns
+    /// `RuntimeError::Unsupported` before any disk I/O.
     pub fn save_to_disk(
         &mut self,
         path: &Path,
         backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
         fingerprint: &ModelFingerprint,
     ) -> Result<(), RuntimeError> {
+        self.settle_tail(backend, weights)?;
+
         // Allocate a CPU-side recurrent buffer only when the backend
         // actually has GDN state. Allocating zero-sized layouts would
         // produce an empty section but cost extra heap traffic.
@@ -1131,49 +1142,121 @@ impl Session {
         // Pull live GPU state into CPU mirrors. This blocks on GPU drain.
         backend.sync_kv_to_cpu(&mut self.kv, recurrent.as_mut())?;
 
-        // Persist `pending_logits` if present so the loaded session's
-        // first `next_token` call uses Path A (sample from cached logits)
-        // bit-exactly like a continuous session would. Without this, the
-        // resumed session falls into Path B (an extra forward pass at the
-        // last prompt token's position) which corrupts the KV at the
-        // boundary and diverges immediately.
         let pending_logits_data: Option<Vec<f32>> =
             self.pending_logits.as_ref().map(|l| l.data.clone());
-        let pending_slice = pending_logits_data.as_deref();
-
-        // Invariant repair: after the last
-        // `next_token` call (Path A), `tokens.len() == kv.seq_len() + 1`
-        // because Path A pushes the sampled token but defers the K/V
-        // write to the next decode call. `save_atomic` requires
-        // `tokens.len() == kv.seq_len()` as a hard precondition (the
-        // disk format encodes both). To preserve the invariant WITHOUT
-        // losing data, save the `tokens` slice up to `kv.seq_len()` and
-        // rely on `pending_logits` to re-emit the pending token on
-        // resume. The save-time pending_logits + load-time Path A
-        // sampling round-trip guarantees the resumed session emits the
-        // same token deterministically. Skip this
-        // trim when the invariant is already balanced (the "save right
-        // after extend" case).
-        let kv_seq = self.kv.seq_len();
-        let tokens_for_save: &[u32] = if self.tokens.len() == kv_seq + 1 {
-            // Path-A-tail case: trim the trailing token; resume will
-            // re-sample it from pending_logits.
-            &self.tokens[..kv_seq]
-        } else {
-            &self.tokens
-        };
-
-        // Hand off to the atomic-write path. The invariant is now
-        // `tokens_for_save.len() == kv.seq_len()`.
         crate::kv::disk::save_atomic(
             &self.kv,
-            tokens_for_save,
+            &self.tokens,
             path,
             /* hits */ 0,
             fingerprint,
             recurrent.as_ref(),
-            pending_slice,
+            pending_logits_data.as_deref(),
         )
+    }
+
+    /// Bring the session to the state `extend` leaves: every token fed and
+    /// the logits of the next one held (see [`Session::save_to_disk`]).
+    fn settle_tail(
+        &mut self,
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+    ) -> Result<(), RuntimeError> {
+        if self.pending_logits.is_some() || self.tokens.is_empty() {
+            return Ok(());
+        }
+        let fed = self.kv.seq_len();
+        if self.tokens.len() != fed + 1 {
+            return Err(RuntimeError::Compute(format!(
+                "session holds {} fed tokens and no logits for the next one; \
+                 extend it before saving",
+                self.tokens.len()
+            )));
+        }
+        if fed >= self.kv.max_seq_len() {
+            return Err(RuntimeError::Compute(format!(
+                "session fills its {}-token context; a saved copy could not continue",
+                self.kv.max_seq_len()
+            )));
+        }
+        // A greedy step left in flight already fed the tail; off the greedy
+        // route this rebuilds cold, as the next `next_token` would.
+        self.reconcile_route_switch(backend, weights)?;
+        if self.pending_logits.is_some() {
+            return Ok(());
+        }
+        let tail = self.tokens[fed];
+        let logits = if self.on_gpu_greedy_route(backend) {
+            backend.decode_token_greedy_logits(tail, weights, &mut self.kv)?
+        } else {
+            self.decode_logits(tail, backend, weights)?
+        };
+        self.pending_logits = Some(logits);
+        Ok(())
+    }
+
+    /// Route-switch guard: a prior pipelined-greedy generation may have
+    /// left one speculative decode step in flight covering the un-sampled
+    /// tail (`pending_logits == None`, `kv.seq_len() == tokens.len() - 1`).
+    /// Continuing on the pipelined route is fine — it manages its own
+    /// speculation — but a switch to the sequential/logits route (e.g. the
+    /// server reusing this session with different sampling) would decode
+    /// the tail a second time and advance GDN recurrent state twice.
+    /// Recurrent state cannot rewind, so rebuild cold: one batched
+    /// re-prefill of the full history, which leaves `pending_logits` at the
+    /// position the next token is sampled from.
+    fn reconcile_route_switch(
+        &mut self,
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+    ) -> Result<(), RuntimeError> {
+        if self.pending_logits.is_none() && !self.tokens.is_empty() {
+            if !self.on_gpu_greedy_route(backend)
+                && backend.reconcile_speculative_tail(&mut self.kv)?
+            {
+                let history = std::mem::take(&mut self.tokens);
+                self.truncate_to(0);
+                backend.reset_recurrent_state();
+                self.extend(&history, backend, weights)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the next decode step takes the pipelined GPU-argmax greedy
+    /// route. A penalty must be applied on the host before the argmax, and the
+    /// top-2 bench surface needs the logits on the host, so either takes the
+    /// logits route even for a greedy request (same kernels, one copy per token).
+    fn on_gpu_greedy_route(&self, backend: &dyn ComputeBackend) -> bool {
+        let caps = backend.caps();
+        crate::engine::use_gpu_greedy_predicate(&self.sampling, caps.gpu_resident, caps.gpu_argmax)
+            && self.bench_top2.is_none()
+    }
+
+    /// One decode step of `token` at the next position on the logits route:
+    /// advances the KV once and returns the logits of the token after it.
+    fn decode_logits(
+        &mut self,
+        token: u32,
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+    ) -> Result<Logits, RuntimeError> {
+        if backend.caps().gpu_resident {
+            // GPU returns logits; KV advanced inside.
+            return backend.decode_token(token, weights, &mut self.kv);
+        }
+        // CPU streaming path: per-layer forward + compute_final.
+        let x = forward_pass(
+            token,
+            self.hyperparams.num_layers as usize,
+            &self.config,
+            weights,
+            backend,
+            &mut self.kv,
+            &mut self.timings,
+        )?;
+        self.kv.advance_seq_len()?;
+        backend.compute_final(&x)
     }
 
     /// Recover a session previously saved by [`Session::save_to_disk`].
@@ -1183,14 +1266,17 @@ impl Session {
     /// 1. Validates the backend's KV precision matches the session config
     ///    (this catches a Metal-vs-CUDA precision mismatch up front).
     /// 2. Loads the file, validating the model fingerprint, KV shape, and
-    ///    optional GDN layout against the live backend's `gdn_layout()`.
+    ///    optional GDN layout against the live backend's `gdn_layout()`, and
+    ///    refuses a file that holds tokens but no next-token logits (for
+    ///    example an earlier version's save after generation).
     /// 3. Calls `backend.sync_kv_from_cpu` to upload the restored CPU
     ///    buffers (K/V + optional recurrent state) into the backend's
     ///    GPU-resident storage.
     ///
-    /// On any validation or IO failure, returns the error verbatim —
-    /// callers (typically the CLI `--session-resume` path) should fall
-    /// back to a cold prefill of the same conversation.
+    /// The loaded session's first `next_token` samples the saved logits; the
+    /// sampler is seeded from `sampling.seed` as in [`Session::new`], so a
+    /// sampled continuation restarts that random stream rather than resuming
+    /// it. On any validation or IO failure, returns the error verbatim.
     pub fn load_from_disk(
         path: &Path,
         config: RuntimeConfig,
@@ -1216,6 +1302,19 @@ impl Session {
             expected_gdn_layout.as_ref(),
             Some(expected_vocab),
         )?;
+        // Every non-empty save holds the next token's logits. A file without
+        // them was saved after generation by an earlier version, which dropped
+        // the last generated token: asked for its next token, such a session
+        // feeds the token before it a second time, and on Metal its GDN state
+        // is the one from before generation.
+        if !loaded.tokens.is_empty() && loaded.pending_logits.is_none() {
+            return Err(RuntimeError::StorageIo(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "disk KV load: the file holds tokens but not the logits of the next \
+                 one (as an earlier Lumen version saved after generation); delete the \
+                 file to start the conversation again",
+            )));
+        }
 
         // Replace the freshly-allocated empty KV with the loaded one. We
         // keep the same `KvCache` instance reference style (move the
@@ -1345,33 +1444,7 @@ impl Session {
         // tokens regardless of which extend path was taken.
         Self::sync_sampler_state(&self.tokens, &mut self.sampler_state);
 
-        // Route-switch guard: a prior pipelined-greedy generation may have
-        // left one speculative decode step in flight covering the un-sampled
-        // tail (`pending_logits == None`, `kv.seq_len() == tokens.len() - 1`).
-        // Continuing on the pipelined route is fine — it manages its own
-        // speculation — but a switch to the sequential/logits route (e.g. the
-        // server reusing this session with different sampling) would decode
-        // the tail a second time and advance GDN recurrent state twice. The
-        // speculative step kept only the argmax, not the full logits this
-        // route needs, and recurrent state cannot rewind — so rebuild cold:
-        // one batched re-prefill of the full history, which leaves
-        // `pending_logits` at exactly the position this call must sample.
-        if self.pending_logits.is_none() && !self.tokens.is_empty() {
-            let caps = backend.caps();
-            // An armed top-2 bench surface takes the logits route too, so it counts as a
-            // switch off the pipelined-greedy route for the same reconciliation.
-            let switching_off_greedy = !crate::engine::use_gpu_greedy_predicate(
-                &self.sampling,
-                caps.gpu_resident,
-                caps.gpu_argmax,
-            ) || self.bench_top2.is_some();
-            if switching_off_greedy && backend.reconcile_speculative_tail(&mut self.kv)? {
-                let history = std::mem::take(&mut self.tokens);
-                self.truncate_to(0);
-                backend.reset_recurrent_state();
-                self.extend(&history, backend, weights)?;
-            }
-        }
+        self.reconcile_route_switch(backend, weights)?;
 
         let last = match self.pending_logits.take() {
             Some(mut logits) => {
@@ -1397,16 +1470,7 @@ impl Session {
                         "next_token called with no tokens -- call extend first".into(),
                     )
                 })?;
-                let caps = backend.caps();
-                // disable GPU-argmax fast path when a penalty is
-                // active (must apply penalty on CPU before argmax).
-                // The top-2 bench surface needs the logits on the host, so it takes the
-                // logits route even for a greedy request (same kernels, one copy per token).
-                let use_gpu_greedy = crate::engine::use_gpu_greedy_predicate(
-                    &self.sampling,
-                    caps.gpu_resident,
-                    caps.gpu_argmax,
-                ) && self.bench_top2.is_none();
+                let use_gpu_greedy = self.on_gpu_greedy_route(backend);
 
                 let start = Instant::now();
                 let token = if use_gpu_greedy {
@@ -1414,29 +1478,8 @@ impl Session {
                     let t = backend.decode_token_greedy(prev, weights, &mut self.kv)?;
                     self.sampler_state.record(t);
                     t
-                } else if caps.gpu_resident {
-                    // GPU returns logits; sample on CPU. KV advanced inside.
-                    let mut logits = backend.decode_token(prev, weights, &mut self.kv)?;
-                    self.record_top2(&logits);
-                    sample_token_with_state(
-                        &mut logits,
-                        &self.sampling,
-                        &mut self.sampler_state,
-                        &mut self.rng,
-                    )
                 } else {
-                    // CPU streaming path: per-layer forward + compute_final.
-                    let x = forward_pass(
-                        prev,
-                        self.hyperparams.num_layers as usize,
-                        &self.config,
-                        weights,
-                        backend,
-                        &mut self.kv,
-                        &mut self.timings,
-                    )?;
-                    self.kv.advance_seq_len()?;
-                    let mut logits = backend.compute_final(&x)?;
+                    let mut logits = self.decode_logits(prev, backend, weights)?;
                     self.record_top2(&logits);
                     sample_token_with_state(
                         &mut logits,
@@ -2303,6 +2346,9 @@ mod tests {
         prefill_calls: std::sync::atomic::AtomicU64,
         decode_calls: std::sync::atomic::AtomicU64,
         speculative_tail: std::sync::Mutex<Option<u32>>,
+        /// Refuse `sync_kv_to_cpu`, as CUDA does.
+        no_host_sync: bool,
+        gpu_argmax: bool,
     }
 
     impl MockGpuBackend {
@@ -2313,6 +2359,8 @@ mod tests {
                 prefill_calls: std::sync::atomic::AtomicU64::new(0),
                 decode_calls: std::sync::atomic::AtomicU64::new(0),
                 speculative_tail: std::sync::Mutex::new(None),
+                no_host_sync: false,
+                gpu_argmax: false,
             }
         }
 
@@ -2368,7 +2416,7 @@ mod tests {
                 gpu_resident: true,
                 gdn: self.gdn,
                 moe: false,
-                gpu_argmax: false,
+                gpu_argmax: self.gpu_argmax,
             }
         }
         fn prefill(
@@ -2399,6 +2447,16 @@ mod tests {
             // Model a true GDN cold restart: recurrent state is rebuilt from
             // scratch by the subsequent prefill.
             self.state.store(0, Ordering::SeqCst);
+        }
+        fn sync_kv_to_cpu(
+            &self,
+            _kv: &mut crate::kv::KvCache,
+            _recurrent: Option<&mut RecurrentState>,
+        ) -> Result<(), RuntimeError> {
+            if self.no_host_sync {
+                return Err(RuntimeError::Unsupported("no host sync".into()));
+            }
+            Ok(())
         }
         fn reconcile_speculative_tail(
             &self,
@@ -2438,6 +2496,159 @@ mod tests {
         let mut extended = session.tokens().to_vec();
         extended.extend((0..40).map(|i| (i % 4) as u32));
         (session, extended)
+    }
+
+    /// On a backend that cannot sync its state to the host (CUDA), a save after
+    /// generation is refused without writing a file, and the live session then
+    /// continues exactly like one that was never saved.
+    #[test]
+    fn a_save_refused_for_lack_of_host_sync_leaves_the_continuation_unchanged() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let reference = MockGpuBackend::new(true);
+        let (mut a, _) = mock_warm_lagging_session(&reference, &provider, hp);
+        let want: Vec<u32> = (0..5)
+            .map(|_| a.next_token(&reference, &provider).unwrap())
+            .collect();
+
+        let mut backend = MockGpuBackend::new(true);
+        backend.no_host_sync = true;
+        let (mut s, _) = mock_warm_lagging_session(&backend, &provider, hp);
+        let path =
+            std::env::temp_dir().join(format!("lumen_session_no_sync_{}.kv", std::process::id()));
+        let err = s
+            .save_to_disk(&path, &backend, &provider, &ModelFingerprint::test_zero())
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Unsupported(_)), "{err}");
+        assert!(!path.exists(), "a refused save wrote {path:?}");
+        let got: Vec<u32> = (0..5)
+            .map(|_| s.next_token(&backend, &provider).unwrap())
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(backend.state_val(), reference.state_val());
+    }
+
+    /// A greedy save on a backend with GPU argmax but without
+    /// `decode_token_greedy_logits` (CUDA) is refused as unsupported by the
+    /// default method before anything changes.
+    #[test]
+    fn a_greedy_save_without_greedy_logits_is_unsupported_and_changes_nothing() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let mut backend = MockGpuBackend::new(true);
+        let (mut s, _) = mock_warm_lagging_session(&backend, &provider, hp);
+        backend.gpu_argmax = true;
+        let before = (s.tokens().to_vec(), s.kv().seq_len(), backend.state_val());
+        let path = std::env::temp_dir().join(format!(
+            "lumen_session_greedy_no_logits_{}.kv",
+            std::process::id()
+        ));
+        let err = s
+            .save_to_disk(&path, &backend, &provider, &ModelFingerprint::test_zero())
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Unsupported(_)), "{err}");
+        assert!(!path.exists(), "a refused save wrote {path:?}");
+        assert_eq!(
+            (s.tokens().to_vec(), s.kv().seq_len(), backend.state_val()),
+            before
+        );
+    }
+
+    /// On a backend with GPU argmax, an armed top-2 surface takes the logits
+    /// route, so a save settles there and the run continues like an unsaved one.
+    #[test]
+    fn a_save_with_top2_armed_takes_the_logits_route() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let run = |saved: bool| {
+            let mut backend = MockGpuBackend::new(true);
+            backend.gpu_argmax = true;
+            let sampling = SamplingParams {
+                temperature: 0.0,
+                seed: Some(42),
+                ..Default::default()
+            };
+            let mut s = Session::new(baseline_config(128), hp, sampling).unwrap();
+            s.set_bench_top2(true);
+            s.extend(&[0u32, 1, 2, 3], &backend, &provider).unwrap();
+            let mut tokens: Vec<u32> = (0..2)
+                .map(|_| s.next_token(&backend, &provider).unwrap())
+                .collect();
+            if saved {
+                let path = std::env::temp_dir()
+                    .join(format!("lumen_session_top2_{}.kv", std::process::id()));
+                s.save_to_disk(&path, &backend, &provider, &ModelFingerprint::test_zero())
+                    .unwrap();
+                let _ = std::fs::remove_file(&path);
+            }
+            tokens.extend((0..5).map(|_| s.next_token(&backend, &provider).unwrap()));
+            (tokens, s.take_bench_top2(), backend.state_val())
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    /// With a greedy step in flight that already fed the tail, a save on another
+    /// route rebuilds cold as `next_token` would, instead of feeding the tail again.
+    #[test]
+    fn a_save_after_a_route_switch_does_not_feed_the_speculative_tail_twice() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let reference = MockGpuBackend::new(true);
+        let (mut a, _) = mock_warm_lagging_session(&reference, &provider, hp);
+        *reference.speculative_tail.lock().unwrap() = a.tokens().last().copied();
+        let want: Vec<u32> = (0..5)
+            .map(|_| a.next_token(&reference, &provider).unwrap())
+            .collect();
+
+        let backend = MockGpuBackend::new(true);
+        let (mut s, _) = mock_warm_lagging_session(&backend, &provider, hp);
+        *backend.speculative_tail.lock().unwrap() = s.tokens().last().copied();
+        let path = std::env::temp_dir().join(format!(
+            "lumen_session_route_switch_{}.kv",
+            std::process::id()
+        ));
+        s.save_to_disk(&path, &backend, &provider, &ModelFingerprint::test_zero())
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The state a save exports: the device's, with any step still in flight landed.
+        assert!(!backend.reconcile_speculative_tail(&mut s.kv).unwrap());
+        assert_eq!(backend.state_val(), cold_state(true, s.tokens()));
+        let got: Vec<u32> = (0..5)
+            .map(|_| s.next_token(&backend, &provider).unwrap())
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(backend.state_val(), reference.state_val());
+    }
+
+    /// At a full context the save is refused before the route-switch rebuild
+    /// could empty the session: history, KV, state and the in-flight step stay.
+    #[test]
+    fn a_full_context_save_is_refused_before_the_route_switch_rebuild() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let backend = MockGpuBackend::new(true);
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut s = Session::new(baseline_config(5), hp, sampling).unwrap();
+        s.extend(&[0u32, 1, 2, 3], &backend, &provider).unwrap();
+        for _ in 0..2 {
+            s.next_token(&backend, &provider).unwrap();
+        }
+        assert_eq!(s.kv().seq_len(), s.kv().max_seq_len());
+        *backend.speculative_tail.lock().unwrap() = s.tokens().last().copied();
+        let before = (s.tokens().to_vec(), s.kv().seq_len(), backend.state_val());
+        let path = std::env::temp_dir().join(format!(
+            "lumen_session_full_switch_{}.kv",
+            std::process::id()
+        ));
+        let err = s
+            .save_to_disk(&path, &backend, &provider, &ModelFingerprint::test_zero())
+            .unwrap_err();
+        assert!(err.to_string().contains("context"), "{err}");
+        assert!(!path.exists(), "a refused save wrote {path:?}");
+        assert_eq!(
+            (s.tokens().to_vec(), s.kv().seq_len(), backend.state_val()),
+            before
+        );
+        assert!(backend.speculative_tail.lock().unwrap().is_some());
     }
 
     /// Cold-reference state: fold the full extended sequence once, in order.
@@ -2793,7 +3004,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.kv");
         let fp = ModelFingerprint::test_zero();
-        session.save_to_disk(&path, &backend, &fp).unwrap();
+        session
+            .save_to_disk(&path, &backend, &provider, &fp)
+            .unwrap();
         assert!(path.exists(), "saved file must exist");
 
         // Snapshot the before-bytes for layer 0 and the token history.
@@ -2847,7 +3060,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.kv");
         let saved_fp = ModelFingerprint::test_zero();
-        session.save_to_disk(&path, &backend, &saved_fp).unwrap();
+        session
+            .save_to_disk(&path, &backend, &provider, &saved_fp)
+            .unwrap();
 
         let wrong_fp = crate::kv::disk::ModelFingerprint {
             model_hash: [0xABu8; 32],
@@ -2901,9 +3116,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.kv");
         let fp = ModelFingerprint::test_zero();
-        session.save_to_disk(&path, &backend, &fp).unwrap();
+        session
+            .save_to_disk(&path, &backend, &provider, &fp)
+            .unwrap();
         let bytes1 = std::fs::read(&path).unwrap();
-        session.save_to_disk(&path, &backend, &fp).unwrap();
+        session
+            .save_to_disk(&path, &backend, &provider, &fp)
+            .unwrap();
         let bytes2 = std::fs::read(&path).unwrap();
 
         // K/V payload (after the 96-byte header, after the token section)
