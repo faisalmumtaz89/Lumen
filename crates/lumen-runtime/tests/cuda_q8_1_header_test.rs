@@ -13,7 +13,7 @@
 //!   * `gdn_prefill_norm_gate_q8` (`gdn.cu`, NVRTC's default target): `s = sum(x)` over the
 //!     gated vector it also writes in F32.
 //!
-//! Requires a CUDA GPU:
+//! Requires a CUDA GPU of compute capability 8.0 or newer:
 //!
 //!   cargo test --release -p lumen-runtime --features cuda --test cuda_q8_1_header_test
 #![cfg(feature = "cuda")]
@@ -154,7 +154,8 @@ fn f16_to_f32(h: u16) -> f32 {
 
 /// Every block's header against the host's values: `d` within f16 rounding of
 /// `amax / 127` of `values` (the vector the kernel quantized), `s` within f16 rounding of
-/// `sum(block)` (`raw_sum`) or of `d * sum(q)`.
+/// `sum(block)` (`raw_sum`) or of `d * sum(q)`. No fixture block is zero, so a block the
+/// kernel never wrote fails even where `values` is the kernel's own output.
 fn check(kernel: &str, route: Route, out: &[u8], values: &[f64], raw_sum: bool) {
     let tol = 2f64.powi(-10);
     for (b, (blk, vals)) in out.chunks(36).zip(values.chunks(32)).enumerate() {
@@ -162,6 +163,10 @@ fn check(kernel: &str, route: Route, out: &[u8], values: &[f64], raw_sum: bool) 
         let s = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])) as f64;
         let amax = vals.iter().fold(0f64, |m, v| m.max(v.abs()));
         let want_d = amax / 127.0;
+        assert!(
+            want_d > 0.0,
+            "{kernel} ({route:?}) block {b}: nothing to quantize"
+        );
         assert!(
             (d - want_d).abs() <= want_d * tol,
             "{kernel} ({route:?}) block {b}: d {d} != amax/127 {want_d}"

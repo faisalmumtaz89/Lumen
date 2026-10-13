@@ -11,13 +11,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **CUDA quantizes activations to Q8_1 correctly whichever ptxas compiles the kernels.** The
   kernels that quantize an activation to Q8_1 for the int8 matvecs (Q8_0, Q4_0, the K-quants,
-  INT4, the MoE experts) and in the GDN prefill wrote each block's f16 scale and sum one byte at
+  INT4, the MoE experts) and in the GDN layers wrote each block's f16 scale and sum one byte at
   a time, and ptxas from CUDA 12.2 through 13.0 turned those byte stores into a float-to-integer
   conversion that replaced the low byte of every scale and sum. That ptxas is the driver's when
   it compiles Lumen's PTX (seen with driver 580.95) and NVRTC's when NVRTC 12.9 compiles for the
   GPU because the driver is older. Measured on Qwen3.5-9B Q8_0 on an L4 with driver 580.95, the
   CPU fed CUDA's tokens agreed with CUDA's top token at 121 of 128 positions (logits cosine at
-  least 0.925); with the fix, at 127 of 128 (at least 0.9999), as with driver 610.
+  least 0.925); with the fix, at 127 of 128 (at least 0.9998), as with driver 610.
 
 ## [0.47.0] — 2026-10-12
 
