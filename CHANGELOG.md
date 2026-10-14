@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.48.0] — 2026-10-14
+
 ### Changed
 
 - **Library API.** `Session::save_to_disk` takes the weights, and `ComputeBackend` has a
@@ -2120,7 +2122,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.47.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.45.0...v0.46.0
 [0.45.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.44.0...v0.45.0
