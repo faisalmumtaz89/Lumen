@@ -1601,7 +1601,7 @@ fn nvidia_gpu_present_under(root: &std::path::Path) -> bool {
             .flatten()
             .any(|entry| is_nvidia_gpu_node(&entry.file_name().to_string_lossy()))
     });
-    // `/dev/dxg` exposes any WDDM GPU; libcuda here comes with the NVIDIA driver.
+    // `/dev/dxg` is not NVIDIA-specific; libcuda here comes with the NVIDIA driver.
     native || (dev.join("dxg").exists() && root.join("usr/lib/wsl/lib/libcuda.so.1").exists())
 }
 
