@@ -35,6 +35,8 @@ Get Lumen one of two ways, then run.
 curl -fsSL https://servelumen.com/install.sh | bash
 ```
 
+On Windows 11, set up WSL first: in an administrator PowerShell run `wsl --install -d Ubuntu-24.04` and restart (if Ubuntu 24.04 is then not in the Start menu, run it again), then open Ubuntu 24.04 from the Start menu and run this command, and Lumen, there. Install the NVIDIA driver on Windows only, never inside Ubuntu.
+
 **Option B — build from source** (Rust toolchain):
 
 ```bash
@@ -86,7 +88,7 @@ compressed-tensors INT4 (group 32).
 
 | Backend | Hardware | Formats |
 |---------|----------|--------|
-| **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) | Every format above on compute capability 8.0+; on 7.5 the 9B at Q8_0 and Q4_0 is verified, Q4_K_M, Q5_K_M and INT4 are refused, and the rest is untested ([Model support](docs/support.md)); the BF16 27B and MoE need an 80 GB H100-class GPU |
+| **CUDA** | NVIDIA, compute capability 7.5+ (e.g. T4, A100, H100, RTX 5090) on Linux; on Windows 11 under WSL with a GeForce card, verified on an RTX 5090 | Every format above on compute capability 8.0+; on 7.5 the 9B at Q8_0 and Q4_0 is verified, Q4_K_M, Q5_K_M and INT4 are refused, and the rest is untested ([Model support](docs/support.md)); the BF16 27B and MoE need an 80 GB H100-class GPU |
 | **Metal** | Apple Silicon (M-series) | Q8_0 and Q4_0 for every model, BF16 for the 9B |
 | **CPU** | Any machine: chosen when there is no GPU, or with `--simd` | Every format above except the CUDA-only checkpoint imports; much slower than a GPU ([measured](docs/support.md#cpu-no-gpu)) |
 
