@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.48.1] — 2026-10-14
+
 ### Fixed
 
 - **CUDA is auto-selected under WSL2.** WSL2 exposes an NVIDIA GPU through `/dev/dxg` and the
@@ -2130,7 +2132,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.1...HEAD
+[0.48.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.0...v0.48.1
 [0.48.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.46.0...v0.47.0
 [0.46.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.45.0...v0.46.0
