@@ -27,12 +27,12 @@
 #   LUMEN_RELEASE_BASE / LUMEN_ALLOW_INSECURE_BASE / LUMEN_INSECURE_SKIP_CHECKSUM  (advanced/testing)
 #   NO_COLOR          set to disable colored output (color is also off when stdout isn't a TTY)
 #
-# Install location (no --prefix/LUMEN_PREFIX): the first directory that is both
-# already on $PATH AND writable without sudo is chosen — typically
-# ~/.local/bin (Linux), /opt/homebrew/bin (Apple-Silicon Homebrew), or
-# /usr/local/bin. No sudo, no profile edits in that case. Failing that, it uses
-# /usr/local/bin via sudo (with a clear heads-up), or finally ~/.local/bin with
-# a one-line, idempotent PATH addition to your shell profile.
+# Install location (no --prefix/LUMEN_PREFIX): the first of ~/.local/bin,
+# /opt/homebrew/bin (Apple-Silicon Homebrew) and /usr/local/bin that is both
+# already on $PATH AND writable without sudo is chosen. No sudo, no profile
+# edits in that case. Failing that, it uses /usr/local/bin via sudo (with a
+# clear heads-up), or finally ~/.local/bin with a one-line, idempotent PATH
+# addition to your shell profile.
 #
 # (Path note: this script lives under packaging/macos/ for URL stability but is
 #  cross-platform — it serves both the macOS Metal and Linux CUDA binaries.)
@@ -82,7 +82,7 @@ Options (after `bash -s --`) / env:
   --quant <tag>     LUMEN_QUANT   q8_0 | q4_0 | bf16 | q4_k_m | q5_k_m   (default: the model's own)
                                   q4_k_m / q5_k_m: qwen3.8-27b only, served as stored on CUDA
   --yes, -y                       accepted for scripts; the installer asks nothing
-  --prefix <dir>    LUMEN_PREFIX  install dir   (default: auto — first writable $PATH dir)
+  --prefix <dir>    LUMEN_PREFIX  install dir   (default: ~/.local/bin, /opt/homebrew/bin or /usr/local/bin)
   LUMEN_TAG=<tag>   install a specific release (e.g. v0.1.0, or a v..-rc.N prerelease)
 EOF
 }
@@ -275,8 +275,8 @@ tar -C "$TMP" -xzf "$TMP/pkg.tar.gz"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name "lumen-*-$PLAT" | head -1)"
 [ -n "$SRC" ] && [ -d "$SRC/bin" ] || die "unexpected tarball layout under $TMP"
 
-# True if $1 is a literal entry on $PATH.
-on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
+# True if $1 is an entry on $PATH, written with or without a trailing slash.
+on_path() { case ":$PATH:" in *":$1:"*|*":$1/:"*) return 0 ;; *) return 1 ;; esac; }
 # True if $1 can be written WITHOUT sudo: it exists and is writable, OR it does
 # not exist but the nearest existing ancestor is writable (so `mkdir -p` would
 # succeed without sudo). Walks up the same way `mkdir -p` does.
@@ -334,26 +334,18 @@ if [ -n "$PREFIX" ]; then
     die "cannot write $PREFIX and 'sudo' is unavailable. Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
   fi
 else
-  # (2) Auto-select: FIRST dir that is BOTH on $PATH AND writable without sudo.
-  # Preference order: ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, then any
-  # other writable $PATH entry. (No sudo, no profile edit in this branch.)
-  CANDIDATES="$HOME/.local/bin /opt/homebrew/bin /usr/local/bin"
-  # Append remaining $PATH entries (split on ':') not already named above.
-  _oldifs="$IFS"; IFS=':'
-  for p in $PATH; do
-    [ -n "$p" ] || continue
-    case " $CANDIDATES " in *" $p "*) ;; *) CANDIDATES="$CANDIDATES $p" ;; esac
-  done
-  IFS="$_oldifs"
-  for d in $CANDIDATES; do
+  # (2) Auto-select: FIRST dir that is BOTH on $PATH AND writable without sudo,
+  # in this order. Other $PATH entries are never chosen: under WSL2 they include
+  # the Windows PATH, whose folders appear writable. (No sudo, no profile edit.)
+  for d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
     if on_path "$d" && writable_nosudo "$d" && install_to "$d" ""; then
       DEST="$d"; break
     fi
   done
 
   if [ -z "$DEST" ]; then
-    # (3) Nothing on-PATH-and-writable. If /usr/local/bin is on $PATH and sudo is
-    # available, install there with sudo (after a clear heads-up).
+    # (3) None of those is on $PATH and writable. If /usr/local/bin is on $PATH
+    # and sudo is available, install there with sudo (after a clear heads-up).
     if on_path "/usr/local/bin" && have sudo; then
       info "Admin access is needed to write /usr/local/bin — you'll be asked for your password."
       install_to "/usr/local/bin" "sudo" && DEST="/usr/local/bin"
@@ -401,9 +393,9 @@ else
   fi
 fi
 
-# Normalize a trailing slash on the chosen dir (e.g. a $PATH entry like
-# /opt/homebrew/bin/) so the shadow check below compares the same text the shell
-# returns and does not falsely flag the binary it just installed.
+# Normalize a trailing slash on the chosen dir (e.g. --prefix /opt/tools/bin/)
+# so the shadow check below compares the same text the shell returns and does
+# not falsely flag the binary it just installed.
 DEST="${DEST%/}"
 
 # Strip macOS quarantine so Gatekeeper doesn't block the unsigned binaries.
