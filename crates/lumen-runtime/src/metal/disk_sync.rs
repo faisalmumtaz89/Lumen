@@ -19,11 +19,14 @@
 //! - `gpu_v_cache[layer]` -- transposed `[kv_head*head_dim + d][pos]`,
 //!   F16, same byte count.
 //! - `gdn_h_states[gdn_idx]` -- contiguous F32, identical CPU/GPU layout.
+//!   Once the F16 decode recurrence has touched a layer, its live state is
+//!   the mirror `gdn_h_states_f16[gdn_idx]` (same element order).
 //! - `gdn_conv_states[gdn_idx]` -- contiguous F32, identical layout.
 //!
 //! K and V must therefore be element-wise transposed to/from the CPU
 //! mirror — a byte blit would corrupt every read. Recurrent buffers are
-//! transferred verbatim.
+//! copied element for element: export widens an F16 h mirror to F32 where
+//! one exists, and restore writes the F32 buffers and drops the mirrors.
 //!
 //! # Synchronisation
 //!
@@ -265,7 +268,8 @@ impl MetalF32Backend {
             );
         }
 
-        // Recurrent state — copy GPU F32 → CPU F32 verbatim (same layout).
+        // Recurrent state — the live h (the F16 mirror widened, else F32) and
+        // the F32 conv state, in the CPU layout.
         if let Some(rec) = recurrent {
             let layout = rec.layout;
             let scratch_guard = self.scratch.lock().map_err(|_| {
@@ -313,8 +317,20 @@ impl MetalF32Backend {
                         c_floats * 4,
                     )));
                 }
+                // After the first decode the F16 mirror holds the live state and
+                // the F32 buffer is dormant; widen the mirror (exact) when present.
                 let mut h_floats_vec = vec![0.0f32; h_floats];
-                h_buf.read_f32(&mut h_floats_vec);
+                let mirror = s.gdn_h_states_f16.get(gdn_idx).map(|c| c.borrow());
+                match mirror.as_ref().and_then(|m| m.as_ref()) {
+                    Some(h16) => {
+                        let mut halves = vec![0u16; h_floats];
+                        h16.read_u16(&mut halves);
+                        for (f, h) in h_floats_vec.iter_mut().zip(&halves) {
+                            *f = super::repack_q4::f16_to_f32(*h);
+                        }
+                    }
+                    None => h_buf.read_f32(&mut h_floats_vec),
+                }
                 // Pack F32 → LE bytes into the CPU mirror.
                 let h_bytes = &mut rec.h_states[gdn_idx];
                 for (i, f) in h_floats_vec.iter().enumerate() {
@@ -354,6 +370,18 @@ impl MetalF32Backend {
             )));
         }
         self.drain_gpu_work()?;
+        // A greedy pipeline left in flight by an earlier run would continue
+        // from the state being replaced.
+        if let Some(s) = self
+            .scratch
+            .lock()
+            .map_err(|_| {
+                RuntimeError::Compute("Metal sync_kv_from_cpu: scratch lock poisoned".into())
+            })?
+            .as_mut()
+        {
+            Self::pipe_drain_locked(s);
+        }
 
         let num_layers = cfg.num_layers;
         let num_kv_heads = cfg.num_kv_heads;
@@ -456,6 +484,11 @@ impl MetalF32Backend {
                     ]);
                 }
                 s.gdn_h_states[gdn_idx].write_f32(&h_floats_vec);
+                // The next decode converts the restored F32 state into a fresh
+                // F16 mirror on first touch.
+                if let Some(mirror) = s.gdn_h_states_f16.get(gdn_idx) {
+                    *mirror.borrow_mut() = None;
+                }
                 s.gdn_conv_states[gdn_idx].write_f32(&c_floats_vec);
                 s.gdn_conv_positions[gdn_idx] = rec.conv_positions[gdn_idx];
             }

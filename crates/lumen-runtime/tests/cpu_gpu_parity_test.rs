@@ -354,17 +354,19 @@ mod metal {
         let m = metal(&provider, CONTEXT);
         let mut s = Session::new(config(), hp, greedy()).unwrap();
         s.extend(PROMPT, &m, &provider).unwrap();
-        s.save_to_disk(&metal_file, &m, &fp).unwrap();
+        s.save_to_disk(&metal_file, &m, &provider, &fp).unwrap();
         drop(s);
         drop(m);
 
         let c = cpu(&provider, CONTEXT);
         let mut restored =
             Session::load_from_disk(&metal_file, config(), hp, greedy(), &c, &fp).unwrap();
-        restored.save_to_disk(&resaved_file, &c, &fp).unwrap();
+        restored
+            .save_to_disk(&resaved_file, &c, &provider, &fp)
+            .unwrap();
         let mut cold = Session::new(config(), hp, greedy()).unwrap();
         cold.extend(PROMPT, &c, &provider).unwrap();
-        cold.save_to_disk(&cpu_file, &c, &fp).unwrap();
+        cold.save_to_disk(&cpu_file, &c, &provider, &fp).unwrap();
 
         let (from_metal, resaved, from_cpu) = (
             recurrent(&metal_file),

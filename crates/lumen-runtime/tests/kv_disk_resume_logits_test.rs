@@ -89,13 +89,14 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
     let (dir, model_path) = synthetic_model_path();
     let provider = SyncWeightProvider::open(&model_path).unwrap();
 
-    // Continuous session: prefill + 16 tokens, all in one go.
-    let (mut sess_cont, backend) = make_cpu_session(&provider, 42);
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    sess_cont.extend(&prompt, &backend, &provider).unwrap();
+
+    // Continuous session: prefill + 16 tokens, all in one go.
+    let (mut sess_cont, backend_cont) = make_cpu_session(&provider, 42);
+    sess_cont.extend(&prompt, &backend_cont, &provider).unwrap();
     let mut continuous_tokens: Vec<u32> = Vec::with_capacity(16);
     for _ in 0..16 {
-        let t = sess_cont.next_token(&backend, &provider).unwrap();
+        let t = sess_cont.next_token(&backend_cont, &provider).unwrap();
         continuous_tokens.push(t);
     }
 
@@ -113,42 +114,11 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
         weight_quant_tag: 0,
         lumen_format_version: 0,
     };
-    // Drive the KV cache forward one more decode call so kv.seq_len catches
-    // up with tokens.len (the deferred-advance pattern that Session uses).
-    // Saving directly after pushing-the-pending-logits-token leaves the
-    // KV cache one position behind; we need them aligned for `save_atomic`.
-    // The cleanest approach is to call `next_token` once more — but we want
-    // the save to capture exactly the "8 tokens generated" state. The
-    // Session API exposes the invariant via `kv().seq_len() == tokens.len()`
-    // after EVERY full decode cycle. We sample a 9th token to align, then
-    // pop it from the resumed-side history (it would re-sample from the
-    // resumed pending_logits regardless).
-    //
-    // Simpler: just save after `extend` (prefill only), then sample 16
-    // tokens on both sides. The first 16 on the continuous session vs the
-    // first 16 after load on the resumed session must match.
-
-    // Restart with save-immediately-after-extend semantics.
-    drop(sess_a);
-    drop(sess_cont);
-
-    let (mut sess_a, backend_a) = make_cpu_session(&provider, 42);
-    sess_a.extend(&prompt, &backend_a, &provider).unwrap();
-    // Invariant: kv.seq_len() == tokens.len() after `extend`.
-    assert_eq!(sess_a.kv().seq_len(), sess_a.tokens().len());
     sess_a
-        .save_to_disk(&save_path, &backend_a, &fingerprint)
+        .save_to_disk(&save_path, &backend_a, &provider, &fingerprint)
         .unwrap();
 
-    let (mut sess_cont, backend_cont) = make_cpu_session(&provider, 42);
-    sess_cont.extend(&prompt, &backend_cont, &provider).unwrap();
-    let mut continuous_tokens: Vec<u32> = Vec::with_capacity(16);
-    for _ in 0..16 {
-        let t = sess_cont.next_token(&backend_cont, &provider).unwrap();
-        continuous_tokens.push(t);
-    }
-
-    // Resumed session: load from disk and sample 16 tokens.
+    // Resumed session, phase B: load from disk and sample 8 more tokens.
     let hp = provider.lbc().header.hyperparams;
     let mut backend_r = NaiveF32Backend::new();
     backend_r.set_global_tensors(
@@ -179,12 +149,13 @@ fn s5_argmax_token_bit_identity_cpu_naive() {
         &fingerprint,
     )
     .unwrap();
-    // After load, tokens MUST equal prompt and kv.seq_len() MUST equal prompt.len().
-    assert_eq!(sess_r.tokens(), prompt.as_slice());
-    assert_eq!(sess_r.kv().seq_len(), prompt.len());
+    // After load, tokens MUST equal prompt + phase A, every one of them fed.
+    let history: Vec<u32> = prompt.iter().chain(&phase_a_tokens).copied().collect();
+    assert_eq!(sess_r.tokens(), history.as_slice());
+    assert_eq!(sess_r.kv().seq_len(), history.len());
 
-    let mut resumed_tokens: Vec<u32> = Vec::with_capacity(16);
-    for _ in 0..16 {
+    let mut resumed_tokens = phase_a_tokens;
+    for _ in 0..8 {
         let t = sess_r.next_token(&backend_r, &provider).unwrap();
         resumed_tokens.push(t);
     }
@@ -275,7 +246,9 @@ fn s5_metal_hardware_gate() {
     };
     let mut sess_a = Session::new(config.clone(), hp, sampling.clone()).unwrap();
     sess_a.extend(&prompt, &backend, &provider).unwrap();
-    sess_a.save_to_disk(&path, &backend, &fingerprint).unwrap();
+    sess_a
+        .save_to_disk(&path, &backend, &provider, &fingerprint)
+        .unwrap();
 
     let mut sess_r =
         Session::load_from_disk(&path, config, hp, sampling, &backend, &fingerprint).unwrap();

@@ -436,6 +436,21 @@ pub trait ComputeBackend: Send + Sync {
         ))
     }
 
+    /// [`Self::decode_token_greedy`]'s computation for `token_id`, returning the
+    /// full logits instead of their argmax and leaving no decode step in flight,
+    /// so a session can save the state its greedy continuation reaches. Advances
+    /// `kv.seq_len()` once, like `decode_token_greedy`.
+    fn decode_token_greedy_logits(
+        &self,
+        _token_id: u32,
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "this backend cannot save a session".into(),
+        ))
+    }
+
     /// [Option A] GPU temperature-sampled decode returning the token id directly
     /// (Metal only; `LUMEN_METAL_GPU_SAMPLER=1`). The token is SAMPLED on the GPU
     /// (parity-matched to the CPU `sample_logits`) and chained through the lean

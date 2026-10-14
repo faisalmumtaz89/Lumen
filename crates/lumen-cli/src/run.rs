@@ -2968,7 +2968,7 @@ fn run_generation(
             eprintln!("[session] saving to {p}");
         }
         let path = std::path::Path::new(p);
-        if let Err(e) = session.save_to_disk(path, backend, &fingerprint) {
+        if let Err(e) = session.save_to_disk(path, backend, weights, &fingerprint) {
             return Err(lumen_runtime::error::RuntimeError::Compute(format!(
                 "--session-save {p}: {e}"
             )));

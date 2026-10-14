@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **Library API.** `Session::save_to_disk` takes the weights, and `ComputeBackend` has a
+  `decode_token_greedy_logits` method (a save on the GPU-argmax greedy route uses it; the
+  default refuses as unsupported).
+
 ### Fixed
 
 - **CUDA quantizes activations to Q8_1 correctly whichever ptxas compiles the kernels.** The
@@ -18,6 +24,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   GPU because the driver is older. Measured on Qwen3.5-9B Q8_0 on an L4 with driver 580.95, the
   CPU fed CUDA's tokens agreed with CUDA's top token at 121 of 128 positions (logits cosine at
   least 0.925); with the fix, at 127 of 128 (at least 0.9998), as with driver 610.
+
+- **A saved session resumes from its last generated token.** A session saved after generation
+  (`--session-save`, `Session::save_to_disk`) dropped its last generated token, so a loaded
+  session asked for its next token fed the token before it a second time; on Metal the file
+  also held the GDN state from before the first generated token. A save now feeds the last
+  token, keeps the next token's logits and, on Metal, the GDN state decode actually updates; a
+  session loaded on the backend that saved it, with the same sampling settings, then continues
+  token for token like one that never stopped (temperature 0, on the CPU backends and Metal),
+  and a sampled one restarts its random numbers from its seed. A save is refused when the last
+  generated token no longer fits in the context, or when every token the session holds has
+  already been fed and no logits were kept for the next one (as after `truncate_to`); a file an
+  earlier version saved after generation is refused on load.
 
 ## [0.47.0] — 2026-10-12
 
