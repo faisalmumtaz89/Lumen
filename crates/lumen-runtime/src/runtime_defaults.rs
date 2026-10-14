@@ -1584,16 +1584,25 @@ pub fn publish_cuda_nvfp4_admission() {
     lumen_format::serving_rules::set_cuda_planar_kernels_enabled(cuda_nvfp4_enabled());
 }
 
-/// True when the machine exposes an NVIDIA GPU device node: `/dev/nvidia0`,
-/// `/dev/nvidia1`, and so on. A container given one GPU of a multi-GPU host
-/// sees only that GPU's node, which need not be `/dev/nvidia0`. The CLI and
-/// the server auto-select CUDA from it.
+/// True when the machine exposes an NVIDIA GPU: a device node `/dev/nvidia0`,
+/// `/dev/nvidia1`, and so on, or, under WSL2, which has no such nodes, the
+/// paravirtual GPU device `/dev/dxg` together with the CUDA driver library the
+/// Windows NVIDIA driver provides. A container given one GPU of a multi-GPU
+/// host sees only that GPU's node, which need not be `/dev/nvidia0`. The CLI
+/// and the server auto-select CUDA from it.
 pub fn nvidia_gpu_present() -> bool {
-    std::fs::read_dir("/dev").is_ok_and(|entries| {
+    nvidia_gpu_present_under(std::path::Path::new("/"))
+}
+
+fn nvidia_gpu_present_under(root: &std::path::Path) -> bool {
+    let dev = root.join("dev");
+    let native = std::fs::read_dir(&dev).is_ok_and(|entries| {
         entries
             .flatten()
             .any(|entry| is_nvidia_gpu_node(&entry.file_name().to_string_lossy()))
-    })
+    });
+    // `/dev/dxg` exposes any WDDM GPU; libcuda here comes with the NVIDIA driver.
+    native || (dev.join("dxg").exists() && root.join("usr/lib/wsl/lib/libcuda.so.1").exists())
 }
 
 /// `nvidia` followed by a device number. `nvidiactl`, `nvidia-uvm` and
@@ -2944,6 +2953,28 @@ mod tests {
         ] {
             assert!(!is_nvidia_gpu_node(other), "{other}");
         }
+    }
+
+    #[test]
+    fn nvidia_gpu_presence_by_filesystem_layout() {
+        let layout = |files: &[&str]| {
+            let root = tempfile::tempdir().unwrap();
+            for f in files {
+                let path = root.path().join(f);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"").unwrap();
+            }
+            nvidia_gpu_present_under(root.path())
+        };
+        let wsl_libcuda = "usr/lib/wsl/lib/libcuda.so.1";
+        assert!(layout(&["dev/nvidia0", "dev/nvidiactl"]));
+        assert!(layout(&["dev/nvidia3"]));
+        assert!(layout(&["dev/dxg", wsl_libcuda]));
+        assert!(!layout(&["dev/nvidiactl", "dev/nvidia-uvm"]));
+        assert!(!layout(&["dev/dxg"]));
+        assert!(!layout(&[wsl_libcuda]));
+        assert!(!layout(&["dev/null"]));
+        assert!(!layout(&[]));
     }
 
     #[test]

@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **CUDA is auto-selected under WSL2.** WSL2 exposes an NVIDIA GPU through `/dev/dxg` and the
+  Windows driver's `libcuda`, with no `/dev/nvidiaN` node, so `lumen run` and `lumen-server`
+  ran the model on the CPU unless given `--cuda` (`--backend cuda` for `lumen-server`), and
+  `lumen pull` also checked the download against host memory, as for a CPU run. `/dev/dxg`
+  together with `/usr/lib/wsl/lib/libcuda.so.1` now counts as an NVIDIA GPU.
+
 ## [0.48.0] — 2026-10-14
 
 ### Changed
