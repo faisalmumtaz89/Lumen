@@ -11,8 +11,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **The one-line installer could install into Windows folders under WSL2.** When none of
   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` was on PATH and writable, it took any
-  other writable PATH entry, and WSL2 appends the Windows PATH, whose folders appear writable. It
-  now installs only into those three, or else into `/usr/local/bin` with sudo or `~/.local/bin`.
+  other writable PATH entry, and WSL2 appends the Windows PATH, whose folders appear writable. Its
+  automatic choice is now one of those three, or else `/usr/local/bin` with sudo or
+  `~/.local/bin`, and a PATH entry written with a trailing slash counts. A `lumen`,
+  `lumen-server` or `lbi-convert` an earlier installer put in a Windows folder stays there:
+  delete it, and a `lib/lumen` folder in that folder's parent if the installer made one.
 
 ## [0.48.1] — 2026-10-14
 

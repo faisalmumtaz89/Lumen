@@ -275,8 +275,8 @@ tar -C "$TMP" -xzf "$TMP/pkg.tar.gz"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name "lumen-*-$PLAT" | head -1)"
 [ -n "$SRC" ] && [ -d "$SRC/bin" ] || die "unexpected tarball layout under $TMP"
 
-# True if $1 is a literal entry on $PATH.
-on_path() { case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac; }
+# True if $1 is an entry on $PATH, written with or without a trailing slash.
+on_path() { case ":$PATH:" in *":$1:"*|*":$1/:"*) return 0 ;; *) return 1 ;; esac; }
 # True if $1 can be written WITHOUT sudo: it exists and is writable, OR it does
 # not exist but the nearest existing ancestor is writable (so `mkdir -p` would
 # succeed without sudo). Walks up the same way `mkdir -p` does.
@@ -393,9 +393,9 @@ else
   fi
 fi
 
-# Normalize a trailing slash on the chosen dir (e.g. a $PATH entry like
-# /opt/homebrew/bin/) so the shadow check below compares the same text the shell
-# returns and does not falsely flag the binary it just installed.
+# Normalize a trailing slash on the chosen dir (e.g. --prefix /opt/tools/bin/)
+# so the shadow check below compares the same text the shell returns and does
+# not falsely flag the binary it just installed.
 DEST="${DEST%/}"
 
 # Strip macOS quarantine so Gatekeeper doesn't block the unsigned binaries.
