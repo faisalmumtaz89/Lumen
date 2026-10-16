@@ -16,9 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   same pair each time: the lowest rank, and the leftmost among equals. Splitting off the special
   tokens was quadratic in their number as well; each occurrence of a special token is now
   searched for once. The tokens are unchanged. Counting tokens on a Qwen3.5-9B server: 16,000
-  unbroken Chinese characters took 33 s and now 0.02 s; 16,000 chat turns 48 s and now 0.15 s;
+  unbroken Chinese characters took 33 s and now 0.06 s; 16,000 chat turns 48 s and now 0.16 s;
   a 1.6 MB request with 60,000-character runs, which held a Qwen3.8-27B server for more than 13
-  minutes, now counts in 0.18 s.
+  minutes, now counts in 0.23 s.
 
 ## [0.48.2] — 2026-10-16
 
