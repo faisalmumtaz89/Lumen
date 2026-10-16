@@ -41,7 +41,7 @@ fn tiled_attention_scores_are_causal_at_any_start_position() {
         // Filled with ones, so a score the kernel never writes shows up.
         let scores_buf = backend
             .device
-            .new_buffer_with_bytes(&vec![0x00, 0x3c].repeat(batch * num_q_heads * stride))
+            .new_buffer_with_bytes(&[0x00u8, 0x3c].repeat(batch * num_q_heads * stride))
             .unwrap();
 
         let cmd = backend.queue.new_command_buffer().unwrap();
