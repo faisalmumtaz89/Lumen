@@ -766,13 +766,15 @@ enum Segment {
     Text(String),
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
-/// A merge score ordered by `f32::total_cmp`; never NaN.
-#[derive(Clone, Copy, PartialEq)]
+/// A merge score ordered by `f32::total_cmp`, equality included.
+#[derive(Clone, Copy)]
 struct Score(f32);
+
+impl PartialEq for Score {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
 
 impl Eq for Score {}
 
@@ -791,8 +793,8 @@ impl Ord for Score {
 /// Merge adjacent symbols until no pair has a priority, always the pair with the
 /// lowest priority and, among equals, the leftmost: the order a rescan of every
 /// pair after each merge takes. The pairs wait in a heap; an entry whose symbols
-/// changed since it was pushed is skipped, so a run of n symbols merges in
-/// O(n log n) instead of O(n^2).
+/// changed since it was pushed is skipped, so with tokens of bounded length a run of
+/// n symbols merges in O(n log n) instead of O(n^2).
 fn merge_lowest_first<P: Ord>(
     symbols: &[String],
     priority: impl Fn(&str, &str) -> Option<P>,
@@ -817,7 +819,8 @@ fn merge_lowest_first<P: Ord>(
         push(&mut heap, &sym, &version, i, i + 1);
     }
     while let Some(Reverse((_, l, vl, r, vr))) = heap.pop() {
-        if version[l] != vl || version[r] != vr || next[l] != r {
+        // `next[l]` moves only when `l` changes, so a current `l` still has `r` beside it.
+        if version[l] != vl || version[r] != vr {
             continue;
         }
         let right = std::mem::take(&mut sym[r]);
@@ -844,6 +847,10 @@ fn merge_lowest_first<P: Ord>(
     }
     out
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -907,25 +914,47 @@ mod tests {
     }
 
     #[test]
-    fn heap_merge_takes_the_rescan_order() {
+    fn tiktoken_merge_takes_the_rescan_order_in_linear_lookups() {
         let mut rng = Lcg(7);
+        let mut tok = minimal_qwen35_tokenizer();
         for case in 0..3000 {
-            // Few letters, short merged strings and four priority levels, so overlapping
-            // pairs and equal priorities are common.
-            let mut table = HashMap::new();
-            for _ in 0..1 + rng.below(40) {
-                let len = 2 + rng.below(5);
-                let s: String = (0..len).map(|_| b"abcd"[rng.below(4)] as char).collect();
-                table.insert(s, rng.below(4));
-            }
+            // Ranks for pairs of short strings over few letters, four rank levels, so
+            // overlapping pairs and equal ranks are common; ("ab", "c") and ("a", "bc")
+            // are ranked independently.
+            tok.merge_ranks = (0..1 + rng.below(40))
+                .map(|_| {
+                    let len = 2 + rng.below(5);
+                    let s: String = (0..len).map(|_| b"abcd"[rng.below(4)] as char).collect();
+                    let cut = 1 + rng.below(len - 1);
+                    ((s[..cut].to_string(), s[cut..].to_string()), rng.below(4))
+                })
+                .collect();
             let symbols: Vec<String> = (0..rng.below(60))
                 .map(|_| (b"abcd"[rng.below(4)] as char).to_string())
                 .collect();
-            let priority = |a: &str, b: &str| table.get(&format!("{a}{b}")).copied();
+            let rank = |a: &str, b: &str| {
+                tok.merge_ranks
+                    .get(&(a.to_string(), b.to_string()))
+                    .copied()
+            };
+            let want = rescan_merge(&symbols, rank);
             assert_eq!(
-                merge_lowest_first(&symbols, priority),
-                rescan_merge(&symbols, priority),
-                "case {case}: {symbols:?} with {table:?}"
+                tok.bpe_merge_tiktoken(&symbols),
+                want,
+                "case {case}: {symbols:?} with {:?}",
+                tok.merge_ranks
+            );
+            // One lookup per starting pair and at most two per merge.
+            let lookups = std::cell::Cell::new(0usize);
+            let counted = |a: &str, b: &str| {
+                lookups.set(lookups.get() + 1);
+                rank(a, b)
+            };
+            assert_eq!(merge_lowest_first(&symbols, counted), want);
+            assert!(
+                lookups.get() <= 3 * symbols.len(),
+                "case {case}: {} lookups",
+                lookups.get()
             );
         }
     }
@@ -933,14 +962,30 @@ mod tests {
     #[test]
     fn spm_merge_takes_the_highest_score_then_the_leftmost() {
         let mut rng = Lcg(11);
-        let scores = [-1.5f32, -0.0, 0.0, 2.0, f32::NAN, f32::NEG_INFINITY];
+        let scores = [
+            -1.5f32,
+            -0.0,
+            0.0,
+            2.0,
+            f32::INFINITY,
+            f32::NAN,
+            f32::NEG_INFINITY,
+        ];
         for case in 0..2000 {
             let mut tokens: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
             for _ in 0..1 + rng.below(20) {
                 let len = 2 + rng.below(4);
                 tokens.push((0..len).map(|_| b"abc"[rng.below(3)] as char).collect());
             }
-            let token_scores: Vec<f32> = tokens.iter().map(|_| scores[rng.below(6)]).collect();
+            // Sometimes fewer scores than tokens: a token without one never merges.
+            let scored = if rng.below(2) == 0 {
+                tokens.len()
+            } else {
+                rng.below(tokens.len() + 1)
+            };
+            let token_scores: Vec<f32> = (0..scored)
+                .map(|_| scores[rng.below(scores.len())])
+                .collect();
             let data = lumen_convert::tokenizer_data::TokenizerData {
                 model_type: "llama".into(),
                 pre_tokenizer: "default".into(),
@@ -967,7 +1012,11 @@ mod tests {
                 let mut best = (f32::NEG_INFINITY, usize::MAX);
                 for i in 0..want.len().saturating_sub(1) {
                     if let Some(&id) = tok.token_to_id.get(&format!("{}{}", want[i], want[i + 1])) {
-                        let score = tok.scores[id as usize];
+                        let score = tok
+                            .scores
+                            .get(id as usize)
+                            .copied()
+                            .unwrap_or(f32::NEG_INFINITY);
                         if score > best.0 {
                             best = (score, i);
                         }
