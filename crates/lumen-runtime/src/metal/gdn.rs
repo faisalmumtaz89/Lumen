@@ -625,8 +625,7 @@ impl MetalF32Backend {
         // F16 mirror (the default v4 kernel; plain-F16 fallback). Build the mirror
         // lazily; fall back to the f32 path when the converter / f16 kernels are absent.
         let want_v4 = crate::metal::gdn_f16_state_h1_v4_enabled();
-        // Both converters: a batched prefill widens a live mirror back to F32.
-        if pipelines.gdn_state_f32_to_f16.is_none() || pipelines.gdn_state_f16_to_f32.is_none() {
+        if pipelines.gdn_state_f32_to_f16.is_none() {
             return Ok(());
         }
         // Only the high-occupancy tier runs the F16 recurrence; the fused
@@ -692,16 +691,12 @@ impl MetalF32Backend {
         if live.is_empty() {
             return Ok(());
         }
-        let pso = pipelines
-            .gdn_state_f16_to_f32
-            .as_ref()
-            .expect("a mirror is built only when both converters compiled");
         let enc = cmd.new_compute_encoder().ok_or_else(|| {
             RuntimeError::Compute("Failed to create encoder for the GDN h_state widen".into())
         })?;
         let h_state_size = s.gdn_num_v_heads * s.gdn_head_dim * s.gdn_head_dim;
         let tg = 256u64;
-        enc.set_pipeline_state(pso);
+        enc.set_pipeline_state(&pipelines.gdn_state_f16_to_f32);
         enc.set_bytes(&(h_state_size as u32).to_le_bytes(), 2);
         for (gdn_idx, mirror) in &live {
             enc.set_buffer(mirror.as_ref().unwrap(), 0, 0); // src f16

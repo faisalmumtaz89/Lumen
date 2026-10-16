@@ -487,7 +487,7 @@ pub(crate) struct MetalPipelines {
     // One-time F32->F16 converter for the GDN h_state decode mirror
     pub(crate) gdn_state_f32_to_f16: Option<MetalPipelineState>,
     // Its exact reverse, handing the live decode state to a batched prefill
-    pub(crate) gdn_state_f16_to_f32: Option<MetalPipelineState>,
+    pub(crate) gdn_state_f16_to_f32: MetalPipelineState,
     // RMSNorm + scale on raw GDN decode output (pairs with gdn_state_output_l2_sg)
     pub(crate) gdn_decode_norm_scale: Option<MetalPipelineState>,
     // Fused Conv1D+SiLU + L2-normalize + state-update + output + RMSNorm (eliminates conv1d dispatch + barrier)
