@@ -836,7 +836,7 @@ pub(crate) struct MetalScratch {
     pub(crate) batch_gate_buf: Option<MetalBuffer>, // [batch, inter_dim]
     pub(crate) batch_up_buf: Option<MetalBuffer>, // [batch, inter_dim]
     pub(crate) batch_down_buf: Option<MetalBuffer>, // [batch, hidden_dim]
-    pub(crate) batch_scores_buf: Option<MetalBuffer>, // [batch, num_heads, max_seq_len]
+    pub(crate) batch_scores_buf: Option<MetalBuffer>, // [attention slice rows, num_heads, pad8(attend)] f16
     pub(crate) splitk_partial_buf: Option<MetalBuffer>, // [K_SPLITS * max_M * max_N] floats for Split-K
 
     // ====================================================================
