@@ -671,10 +671,10 @@ kernel void attention_scores_tiled(
     if (q_head >= num_q_heads) return;
 
     // Early exit: if the entire tile is above the causal diagonal, write zeros
-    // The minimum attend_len in this tile = start_pos + tile_m_start + 1
-    // If tile_n_start >= min_attend_len, the whole tile is masked
-    uint min_attend_in_tile = start_pos + tile_m_start + 1;
-    if (tile_n_start >= min_attend_in_tile) {
+    // The tile's last valid row attends furthest: start_pos + min(tile_m_start + TILE_M, batch_size)
+    // If tile_n_start is at or past that, every row of the tile is masked
+    uint max_attend_in_tile = start_pos + min(tile_m_start + TILE_M, batch_size);
+    if (tile_n_start >= max_attend_in_tile) {
         // Write zeros for the entire tile
         uint score_stride = num_q_heads * max_seq_len;
         for (ushort idx = tiitg; idx < TILE_M * TILE_N; idx += 128) {
