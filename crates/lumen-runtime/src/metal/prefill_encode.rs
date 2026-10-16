@@ -9,7 +9,9 @@ use super::graph_reorder::{
 use super::{CachedLayerMeta, MetalF32Backend, MetalPipelines, MetalScratch};
 use crate::error::RuntimeError;
 use crate::kv::KvCacheView;
-use crate::metal::ffi::{MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder};
+use crate::metal::ffi::{
+    MTLSize, MetalBuffer, MetalCommandBuffer, MetalComputeEncoder, MetalPipelineState,
+};
 use crate::weight::cache::LayerView;
 use lumen_format::quantization::QuantScheme;
 
@@ -178,6 +180,41 @@ impl BatchedAttention<'_> {
             }
             first += slice;
         }
+    }
+}
+
+/// Rotary position embedding over a batch's Q or K rows, in place.
+#[derive(Clone, Copy)]
+pub(super) struct BatchedRope<'a> {
+    pub(super) pipeline: &'a MetalPipelineState,
+    pub(super) cos: &'a MetalBuffer,
+    pub(super) sin: &'a MetalBuffer,
+    pub(super) head_dim: usize,
+    pub(super) rope_half_dim: usize,
+    pub(super) start_pos: usize,
+    pub(super) batch_size: usize,
+}
+
+impl BatchedRope<'_> {
+    /// Rotates `rows`: `batch_size` tokens of `num_heads` heads each, one thread per rotated pair.
+    pub(super) fn encode(&self, enc: &MetalComputeEncoder, rows: &MetalBuffer, num_heads: usize) {
+        let u = |v: usize| (v as u32).to_le_bytes();
+        let pairs = (self.batch_size * num_heads * self.rope_half_dim) as u64;
+        let tg = 256u64.min(pairs).max(1);
+        enc.set_pipeline_state(self.pipeline);
+        enc.set_buffer(rows, 0, 0);
+        enc.set_buffer(self.cos, 0, 1);
+        enc.set_buffer(self.sin, 0, 2);
+        enc.set_bytes(&u(num_heads), 3);
+        enc.set_bytes(&u(self.head_dim), 4);
+        enc.set_bytes(&u(self.rope_half_dim), 5);
+        enc.set_bytes(&u(self.start_pos), 6);
+        enc.set_bytes(&u(num_heads * self.head_dim), 7);
+        enc.set_bytes(&u(self.batch_size), 8);
+        enc.dispatch_threadgroups(
+            MTLSize::new(pairs.div_ceil(tg), 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
     }
 }
 
@@ -1237,49 +1274,25 @@ impl MetalF32Backend {
                         );
                     }
 
-                    // Q RoPE dispatch (partial rotation: rope_half_dim, not head_dim/2)
-                    let total_q_elems = (batch_size * num_heads * rope_half_dim) as u32;
-                    let total_k_elems = (batch_size * num_kv_heads * rope_half_dim) as u32;
-                    let head_dim_u32 = head_dim as u32;
-                    let rope_half_dim_u32 = rope_half_dim as u32;
-                    let pos_start_u32 = seq_pos_start as u32;
-                    let total_dim_u32 = q_dim as u32;
-                    let total_kv_dim_u32 = kv_dim as u32;
-
                     // NeoX-style (half-offset) RoPE for Qwen2/Qwen3.5 models
-                    let rope_b_pipe = if scratch.rope_neox {
-                        pipelines
-                            .rope_batched_neox
-                            .as_ref()
-                            .unwrap_or(&pipelines.rope_batched)
-                    } else {
-                        &pipelines.rope_batched
+                    let rope = BatchedRope {
+                        pipeline: if scratch.rope_neox {
+                            pipelines
+                                .rope_batched_neox
+                                .as_ref()
+                                .unwrap_or(&pipelines.rope_batched)
+                        } else {
+                            &pipelines.rope_batched
+                        },
+                        cos: &scratch.rope_cos_buf,
+                        sin: &scratch.rope_sin_buf,
+                        head_dim,
+                        rope_half_dim,
+                        start_pos: seq_pos_start,
+                        batch_size,
                     };
-                    enc.set_pipeline_state(rope_b_pipe);
-                    enc.set_buffer(q_buf, 0, 0);
-                    enc.set_buffer(&scratch.rope_cos_buf, 0, 1);
-                    enc.set_buffer(&scratch.rope_sin_buf, 0, 2);
-                    enc.set_bytes(&(num_heads as u32).to_le_bytes(), 3);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&rope_half_dim_u32.to_le_bytes(), 5);
-                    enc.set_bytes(&pos_start_u32.to_le_bytes(), 6);
-                    enc.set_bytes(&total_dim_u32.to_le_bytes(), 7);
-                    let tg_q = 256u64.min(total_q_elems as u64).max(1);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((total_q_elems as u64).div_ceil(tg_q), 1, 1),
-                        MTLSize::new(tg_q, 1, 1),
-                    );
-
-                    // K RoPE dispatch
-                    enc.set_pipeline_state(rope_b_pipe);
-                    enc.set_buffer(k_buf, 0, 0);
-                    enc.set_bytes(&(num_kv_heads as u32).to_le_bytes(), 3);
-                    enc.set_bytes(&total_kv_dim_u32.to_le_bytes(), 7);
-                    let tg_k = 256u64.min(total_k_elems as u64).max(1);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((total_k_elems as u64).div_ceil(tg_k), 1, 1),
-                        MTLSize::new(tg_k, 1, 1),
-                    );
+                    rope.encode(&enc, q_buf, num_heads);
+                    rope.encode(&enc, k_buf, num_kv_heads);
                     enc.end_encoding();
                 } else {
                     // Standard fused QKV path (non-Qwen3.5 models).
@@ -1460,51 +1473,26 @@ impl MetalF32Backend {
                         enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
                     }
 
-                    // Q RoPE dispatch (use rope_half_dim for partial rotation support)
-                    let total_q_elems = (batch_size * num_heads * rope_half_dim) as u32;
-                    let total_k_elems = (batch_size * num_kv_heads * rope_half_dim) as u32;
-                    let head_dim_u32 = head_dim as u32;
-                    let rope_half_dim_u32 = rope_half_dim as u32;
-                    let pos_start_u32 = seq_pos_start as u32;
-                    let total_dim_u32 = q_dim as u32;
-                    let total_kv_dim_u32 = kv_dim as u32;
-                    let num_heads_u32 = num_heads as u32;
-                    let num_kv_heads_u32_rope = num_kv_heads as u32;
-
                     // NeoX-style (half-offset) RoPE for Qwen2/Qwen3.5 models
-                    let rope_b_pipe = if scratch.rope_neox {
-                        pipelines
-                            .rope_batched_neox
-                            .as_ref()
-                            .unwrap_or(&pipelines.rope_batched)
-                    } else {
-                        &pipelines.rope_batched
+                    let rope = BatchedRope {
+                        pipeline: if scratch.rope_neox {
+                            pipelines
+                                .rope_batched_neox
+                                .as_ref()
+                                .unwrap_or(&pipelines.rope_batched)
+                        } else {
+                            &pipelines.rope_batched
+                        },
+                        cos: &scratch.rope_cos_buf,
+                        sin: &scratch.rope_sin_buf,
+                        head_dim,
+                        rope_half_dim,
+                        start_pos: seq_pos_start,
+                        batch_size,
                     };
-                    enc.set_pipeline_state(rope_b_pipe);
-                    enc.set_buffer(q_buf, 0, 0);
-                    enc.set_buffer(&scratch.rope_cos_buf, 0, 1);
-                    enc.set_buffer(&scratch.rope_sin_buf, 0, 2);
-                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&rope_half_dim_u32.to_le_bytes(), 5);
-                    enc.set_bytes(&pos_start_u32.to_le_bytes(), 6);
-                    enc.set_bytes(&total_dim_u32.to_le_bytes(), 7);
-                    let tg_q = 256u64.min(total_q_elems as u64).max(1);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((total_q_elems as u64).div_ceil(tg_q), 1, 1),
-                        MTLSize::new(tg_q, 1, 1),
-                    );
-
-                    // K RoPE dispatch (concurrent with Q RoPE -- different output buffer)
-                    enc.set_pipeline_state(rope_b_pipe);
-                    enc.set_buffer(k_buf, 0, 0);
-                    enc.set_bytes(&num_kv_heads_u32_rope.to_le_bytes(), 3);
-                    enc.set_bytes(&total_kv_dim_u32.to_le_bytes(), 7);
-                    let tg_k = 256u64.min(total_k_elems as u64).max(1);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new((total_k_elems as u64).div_ceil(tg_k), 1, 1),
-                        MTLSize::new(tg_k, 1, 1),
-                    );
+                    rope.encode(&enc, q_buf, num_heads);
+                    // K is a different buffer: the two run concurrently.
+                    rope.encode(&enc, k_buf, num_kv_heads);
                     enc.end_encoding();
                 } // end standard fused QKV path
             }
@@ -3603,42 +3591,28 @@ impl MetalF32Backend {
 
         // Op 8: RoPE Q (in-place on q_buf, ReadWrite)
         // Op 9: RoPE K (in-place on k_buf, ReadWrite)
-        let rope_pipe = if rope_neox {
-            pipelines
-                .rope_batched_neox
-                .as_ref()
-                .unwrap_or(&pipelines.rope_batched)
-        } else {
-            &pipelines.rope_batched
+        let rope = BatchedRope {
+            pipeline: if rope_neox {
+                pipelines
+                    .rope_batched_neox
+                    .as_ref()
+                    .unwrap_or(&pipelines.rope_batched)
+            } else {
+                &pipelines.rope_batched
+            },
+            cos: rope_cos,
+            sin: rope_sin,
+            head_dim,
+            rope_half_dim,
+            start_pos: seq_pos_start,
+            batch_size,
         };
-        let rope_half_dim_u32 = rope_half_dim as u32;
-        let pos_start_u32 = seq_pos_start as u32;
-        let q_dim_u32 = q_dim as u32;
-        let kv_dim_u32 = kv_dim as u32;
-        let num_heads_u32 = num_heads as u32;
-        let num_kv_heads_u32 = num_kv_heads as u32;
-        let total_q_elems = (batch_size * num_heads * rope_half_dim) as u64;
-        let total_k_elems = (batch_size * num_kv_heads * rope_half_dim) as u64;
-        let tg_q_rope = 256u64.min(total_q_elems).max(1);
-        let tg_k_rope = 256u64.min(total_k_elems).max(1);
         plan.push(LayerOp {
             label: "rope_q",
             accesses: AccessList::from_iter_inline([Access::read_write(BufferId::Q)]),
             order_class: OrderClass::Free,
             emit: Box::new(move |enc| {
-                enc.set_pipeline_state(rope_pipe);
-                enc.set_buffer(q_buf, 0, 0);
-                enc.set_buffer(rope_cos, 0, 1);
-                enc.set_buffer(rope_sin, 0, 2);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 3);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 4);
-                enc.set_bytes(&rope_half_dim_u32.to_le_bytes(), 5);
-                enc.set_bytes(&pos_start_u32.to_le_bytes(), 6);
-                enc.set_bytes(&q_dim_u32.to_le_bytes(), 7);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(total_q_elems.div_ceil(tg_q_rope), 1, 1),
-                    MTLSize::new(tg_q_rope, 1, 1),
-                );
+                rope.encode(enc, q_buf, num_heads);
                 Ok(())
             }),
         });
@@ -3647,25 +3621,14 @@ impl MetalF32Backend {
             accesses: AccessList::from_iter_inline([Access::read_write(BufferId::K)]),
             order_class: OrderClass::Free,
             emit: Box::new(move |enc| {
-                enc.set_pipeline_state(rope_pipe);
-                enc.set_buffer(k_buf, 0, 0);
-                enc.set_buffer(rope_cos, 0, 1);
-                enc.set_buffer(rope_sin, 0, 2);
-                enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 3);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 4);
-                enc.set_bytes(&rope_half_dim_u32.to_le_bytes(), 5);
-                enc.set_bytes(&pos_start_u32.to_le_bytes(), 6);
-                enc.set_bytes(&kv_dim_u32.to_le_bytes(), 7);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(total_k_elems.div_ceil(tg_k_rope), 1, 1),
-                    MTLSize::new(tg_k_rope, 1, 1),
-                );
+                rope.encode(enc, k_buf, num_kv_heads);
                 Ok(())
             }),
         });
 
         // Op 10: K cache write
         // Op 11: V cache write
+        let kv_dim_u32 = kv_dim as u32;
         let start_pos_u32 = seq_pos_start as u32;
         let batch_size_u32 = batch_size as u32;
         let kv_total_elems = (batch_size * kv_dim) as u64;
