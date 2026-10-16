@@ -2508,7 +2508,7 @@ mod tests {
                     {"type": "thinking", "thinking": "Reasoning R", "signature": "s"},
                     {"type": "redacted_thinking", "data": "opaque"},
                     {"type": "text", "text": "Let me look."},
-                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {}},
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {"path": "/tmp/kept.png"}},
                 ]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": false, "content": [{"type": "text", "text": "Shot taken"}]}]},
             ]),
@@ -2519,7 +2519,7 @@ mod tests {
                 "Be brief.",
                 "Hello there",
                 "Let me look.",
-                "\"name\": \"shot\"",
+                "/tmp/kept.png",
                 "Shot taken",
             ] {
                 assert!(

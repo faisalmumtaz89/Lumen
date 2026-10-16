@@ -14,8 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   the model was not told it had been sent one, and `/v1/messages/count_tokens` counted it as
   nothing. Such a part now reaches the prompt as a note naming it (`[image omitted: this model
   reads text only]`), on `/v1/messages` (in `system`, a message or a `tool_result`) and on
-  `/v1/chat/completions`, and a conversation holding one goes on. An OpenAI assistant `refusal`
-  part, which was dropped too, is now read as its text.
+  `/v1/chat/completions`. An OpenAI assistant `refusal` part, which was dropped too, is now read
+  as its text.
 
 ## [0.48.3] — 2026-10-16
 
