@@ -143,8 +143,9 @@ fn sliced_batched_attention_equals_one_pass_over_the_batch() {
         .new_buffer(batch * num_heads * stride * 2)
         .unwrap();
 
+    // A concurrent encoder, as the prefill uses: only the slices' barriers order their passes.
     let cmd = backend.queue.new_command_buffer().unwrap();
-    let enc = cmd.new_compute_encoder().unwrap();
+    let enc = cmd.new_concurrent_compute_encoder().unwrap();
     BatchedAttention {
         q: &q_buf,
         k_cache: &k_buf,

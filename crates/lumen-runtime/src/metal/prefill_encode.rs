@@ -54,7 +54,7 @@ fn dispatch_q8_0_or_orig(
 /// Attention scores the batched prefill holds at once. The batch's attention runs in slices of
 /// query rows that reuse one score scratch, so its size and the kernels' 32-bit score indices
 /// stay bounded however long the prompt. A slice is at least one 32-row tile, which fits while
-/// heads x attended positions <= 2^23: every Qwen3.5/3.8 model at its full context.
+/// heads x padded attended positions <= 2^23: every Qwen3.5/3.8 model at its full context.
 const ATTENTION_SLICE_SCORES: usize = 1 << 28;
 
 /// Query rows per attention slice: whole 32-row score tiles, at least one, at most the batch.
