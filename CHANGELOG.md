@@ -31,11 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   length, and the result is the unsliced one bit for bit. The buffer no longer grows with the
   square of the prompt: 16,384 tokens on the 9B used 8.6 GB for it.
 - **On Metal, the prefill's rotary embedding wrote past the batch.** Its kernels had no bound on
-  the token, and their thread count is rounded up to whole groups of 256, so when the batch's
-  heads × rotated pairs was not a multiple of 256 (K at any odd batch on Qwen3.5-9B and
-  Qwen3.8-27B, at any batch not a multiple of 4 on Qwen3.5-35B-A3B) they rotated a row past the
-  last token, read the rotation table one position further, and wrote past the end of a K buffer
-  the batch had just sized. They now stop at the batch. Its own rows are unchanged bit for bit.
+  the token, and their thread count is rounded up to whole groups of 256, so when the batch held
+  more than 256 rotated pairs and not a multiple of 256 (K at an odd batch of 3 or more on
+  Qwen3.5-9B and Qwen3.8-27B, at a batch of 5 or more that is not a multiple of 4 on
+  Qwen3.5-35B-A3B) they rotated up to three rows past the last token, read the rotation table at
+  those positions, and wrote past the end of a K buffer the batch had just sized. They now stop
+  at the batch. Its own rows are unchanged bit for bit.
 - **The one-line installer could install into Windows folders under WSL2.** When none of
   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` was on PATH and writable, it took any
   other writable PATH entry, and WSL2 appends the Windows PATH, whose folders appear writable. Its

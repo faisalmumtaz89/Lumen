@@ -4,15 +4,15 @@ use crate::metal::prefill_encode::BatchedRope;
 use crate::metal::*;
 
 /// The batched RoPE kernels, launched as the prefill launches them, rotate exactly the batch's
-/// rows: Qwen3.5's K has 4 heads of 32 rotated pairs, 128 threads per token, so an odd batch
-/// fills only half of its last 256-thread group. Each rotated pair matches the rotation by its
-/// position's angle, and the floats past the batch keep their values.
+/// rows. K has 32 rotated pairs per head over 4 heads on Qwen3.5-9B and Qwen3.8-27B (128
+/// threads per token) and over 2 on Qwen3.5-35B-A3B (64), so most batches leave their last
+/// 256-thread group part empty. Each rotated pair matches the rotation by its position's angle,
+/// and every float past the batch keeps its bits.
 #[test]
 fn batched_rope_rotates_the_batch_and_nothing_past_it() {
     let backend = MetalF32Backend::new().unwrap();
     let pipelines = backend.compile_pipelines().unwrap();
-    let (num_heads, head_dim, rope_half_dim) = (4usize, 256usize, 32usize);
-    let row = num_heads * head_dim;
+    let (head_dim, rope_half_dim) = (256usize, 32usize);
     let start_pos = 5usize;
     let positions = 64usize;
     let angle = |pos: usize, i: usize| pos as f32 * 0.01 * (i + 1) as f32;
@@ -27,9 +27,10 @@ fn batched_rope_rotates_the_batch_and_nothing_past_it() {
     let neox = pipelines.rope_batched_neox.as_ref().unwrap();
 
     for (pipeline, neox_pairs) in [(&pipelines.rope_batched, false), (neox, true)] {
-        for batch_size in [1usize, 3, 7] {
-            // Two rows past the batch, as a buffer sized for a larger batch has.
-            let before: Vec<f32> = (0..(batch_size + 2) * row)
+        for (num_heads, batch_size) in (1..=8).flat_map(|b| [(4usize, b), (2, b)]) {
+            let row = num_heads * head_dim;
+            // Four rows past the batch, as a buffer sized for a larger batch has.
+            let before: Vec<f32> = (0..(batch_size + 4) * row)
                 .map(|i| (i % 97) as f32 * 0.25 - 12.0)
                 .collect();
             let rows = backend.upload_f32(&before).unwrap();
@@ -68,9 +69,15 @@ fn batched_rope_rotates_the_batch_and_nothing_past_it() {
                 }
             }
             for (k, (got, want)) in after.iter().zip(&want).enumerate() {
+                let close = if k < batch_size * row {
+                    (got - want).abs() <= 1e-5 * want.abs().max(1.0)
+                } else {
+                    got.to_bits() == want.to_bits()
+                };
                 assert!(
-                    (got - want).abs() <= 1e-5 * want.abs().max(1.0),
-                    "neox {neox_pairs}, batch {batch_size}: float {k} (token {}): {got} != {want}",
+                    close,
+                    "neox {neox_pairs}, {num_heads} heads, batch {batch_size}: float {k} \
+                     (token {}): {got} != {want}",
                     k / row
                 );
             }
