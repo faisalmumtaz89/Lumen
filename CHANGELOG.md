@@ -16,10 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   reads text only]`), on `/v1/messages` (in `system`, a message or a `tool_result`) and on
   `/v1/chat/completions`. An OpenAI assistant `refusal` part, which was dropped too, is now read
   as its text.
-- **Text after a run of about a million letters, spaces or symbols was dropped.** The pre-tokenizer's
-  pattern engine ran out of room on a run that long and the rest of that text never reached the
-  model: `hi`, a million `a`, then `and` became one token, with no error. The pre-tokenizer now
-  uses a linear-time engine with no such limit and splits every other input exactly as before.
+- **A run of about a million letters, spaces or symbols was dropped with the text after it.** The
+  pre-tokenizer's pattern engine ran out of room on a run that long and the rest of that text never
+  reached the model: `hi`, a million `a`, then `and` became one token, with no error. The
+  pre-tokenizer now uses a linear-time engine with no such limit and splits every other input
+  exactly as before.
 
 ## [0.48.3] — 2026-10-16
 

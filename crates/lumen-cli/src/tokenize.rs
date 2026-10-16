@@ -105,10 +105,10 @@ pub struct BpeTokenizer {
 /// [`next_pre_token`], since the linear-time engine has no lookahead.
 const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
-/// Pre-tokenizer regex for qwen35. This is the `Split` `pattern.Regex`
-/// from the Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split
-/// "Isolated" -> ByteLevel use_regex=false). It differs from the llama/qwen2
-/// pattern in three ways that its reference mandates:
+/// Pre-tokenizer regex for qwen35: the `Split` `pattern.Regex` from the
+/// Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split "Isolated" ->
+/// ByteLevel use_regex=false), less the alternative noted below. It differs
+/// from the llama/qwen2 pattern in three ways that its reference mandates:
 ///   * letter runs include combining marks — `[\p{L}\p{M}]+` (not `\p{L}+`) —
 ///     so scripts like Thai keep a base character and its following marks in
 ///     one pre-token (fixes CORR-007: Thai over-segmentation).
@@ -1127,8 +1127,8 @@ mod tests {
         }
     }
 
-    /// Every character reaches a token, around a run of letters or symbols too long for a
-    /// backtracking regex to hold (a tokenizer with one token per character and no merges).
+    /// Every character reaches a token, around a run of letters, spaces or symbols too long
+    /// for a backtracking regex to hold (a tokenizer with one token per character and no merges).
     #[test]
     fn pre_tokenizer_keeps_every_character_of_a_long_run() {
         let symbols: Vec<String> = "hia=dn"
