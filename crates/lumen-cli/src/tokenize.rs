@@ -105,7 +105,7 @@ pub struct BpeTokenizer {
 /// [`next_pre_token`], since the linear-time engine has no lookahead.
 const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
-/// Pre-tokenizer regex for qwen35. This is the EXACT `Split` `pattern.Regex`
+/// Pre-tokenizer regex for qwen35. This is the `Split` `pattern.Regex`
 /// from the Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split
 /// "Isolated" -> ByteLevel use_regex=false). It differs from the llama/qwen2
 /// pattern in three ways that its reference mandates:
@@ -120,7 +120,7 @@ const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}
 const PRETOKENIZER_REGEX_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
 /// The byte range of the pre-token of `chunk` that starts at `start`, or `None` at
-/// the end. A whitespace match without a line break can only come from the final
+/// the end. A whitespace match without CR or LF can only come from the final
 /// `\s+`; when it is two or more characters long and more text follows, the
 /// reference pattern's `\s+(?!\S)` would have stopped one character short, leaving
 /// the last whitespace character to the next pre-token, so that is done here.
@@ -1097,7 +1097,7 @@ mod tests {
         }
     }
 
-    /// A whitespace run without a line break gives its last character to what follows,
+    /// A whitespace run without CR or LF gives its last character to what follows,
     /// as the reference pattern's `\s+(?!\S)` does, unless it ends the text.
     #[test]
     fn pre_tokenizer_leaves_the_last_space_to_what_follows() {
