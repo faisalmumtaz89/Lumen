@@ -17,8 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   than 13 minutes. The merge now keeps its candidate pairs in a heap and takes the same pair each
   time: the lowest rank, and the leftmost among equals. Splitting off the special tokens was
   quadratic in their number as well (counting 16,000 chat turns took 48 s); each occurrence of a
-  special token is now searched for once. The tokens are unchanged; on Qwen3.5-9B
-  that request now counts in 0.18 s, 16,000 characters in 0.02 s and 16,000 turns in 0.15 s.
+  special token is now searched for once. The tokens are unchanged; on Qwen3.5-9B that request
+  now counts in 0.18 s, 16,000 characters in 0.02 s and 16,000 turns in 0.15 s.
 
 ## [0.48.2] — 2026-10-16
 
