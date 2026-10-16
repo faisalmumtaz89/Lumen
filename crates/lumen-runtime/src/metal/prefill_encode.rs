@@ -53,7 +53,8 @@ fn dispatch_q8_0_or_orig(
 
 /// Attention scores the batched prefill holds at once. The batch's attention runs in slices of
 /// query rows that reuse one score scratch, so its size and the kernels' 32-bit score indices
-/// stay bounded at any prompt and context length.
+/// stay bounded however long the prompt. A slice is at least one 32-row tile, which fits while
+/// heads x attended positions <= 2^23: every Qwen3.5/3.8 model at its full context.
 const ATTENTION_SLICE_SCORES: usize = 1 << 28;
 
 /// Query rows per attention slice: whole 32-row score tiles, at least one, at most the batch.
@@ -68,26 +69,26 @@ pub(crate) fn attention_slice_rows(
 }
 
 /// One layer's full attention over a batch whose K and V are already in the cache.
-struct BatchedAttention<'a> {
-    q: &'a MetalBuffer,
-    k_cache: &'a MetalBuffer,
-    v_cache: &'a MetalBuffer,
-    scores: &'a MetalBuffer,
-    out: &'a MetalBuffer,
-    head_dim: usize,
-    kv_dim: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    scale: f32,
-    start_pos: usize,
-    batch_size: usize,
-    max_seq_len: usize,
+pub(super) struct BatchedAttention<'a> {
+    pub(super) q: &'a MetalBuffer,
+    pub(super) k_cache: &'a MetalBuffer,
+    pub(super) v_cache: &'a MetalBuffer,
+    pub(super) scores: &'a MetalBuffer,
+    pub(super) out: &'a MetalBuffer,
+    pub(super) head_dim: usize,
+    pub(super) kv_dim: usize,
+    pub(super) num_heads: usize,
+    pub(super) num_kv_heads: usize,
+    pub(super) scale: f32,
+    pub(super) start_pos: usize,
+    pub(super) batch_size: usize,
+    pub(super) max_seq_len: usize,
 }
 
 impl BatchedAttention<'_> {
     /// Scores, softmax and output for each slice of query rows. A row's result does not depend
     /// on the slice it runs in.
-    fn encode(&self, enc: &MetalComputeEncoder, pipelines: &MetalPipelines) {
+    pub(super) fn encode(&self, enc: &MetalComputeEncoder, pipelines: &MetalPipelines) {
         let q_dim = self.num_heads * self.head_dim;
         let max_attend_len = self.start_pos + self.batch_size;
         // Padded to a multiple of 8 for the output kernel's half4 row reads.
@@ -3716,8 +3717,8 @@ impl MetalF32Backend {
             }),
         });
 
-        // Op 12: Attention scores, softmax and output in slices of query rows (Strict —
-        // depends on KCache + Q; produces attn_out)
+        // Ops 12-14: Attention scores, softmax and output in slices of query rows (Strict —
+        // depends on KCache + VCache + Q; produces attn_out)
         let attention = BatchedAttention {
             q: q_buf,
             k_cache,

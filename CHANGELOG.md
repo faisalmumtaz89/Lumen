@@ -26,9 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   query's attention scores at once and indexed them in 32 bits, so a prefill holding more than
   2^32 of them (more than 16,384 tokens in one call on Qwen3.5-9B, fewer on wider models or
   after a long prefix) wrapped and read the wrong scores. Its attention now runs in slices of
-  query rows that share one score buffer of at most 2^28 scores (512 MiB), so the indices stay
-  in range at any length, and the result is the unsliced one bit for bit. The buffer no longer
-  grows with the square of the prompt: 16,384 tokens on the 9B used 8.6 GB for it.
+  query rows that share one score buffer of at most 2^28 scores (512 MiB) up to these models'
+  full context, so the indices stay in range at any prompt length, and the result is the
+  unsliced one bit for bit. The buffer no longer grows with the square of the prompt: 16,384
+  tokens on the 9B used 8.6 GB for it.
 - **The one-line installer could install into Windows folders under WSL2.** When none of
   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` was on PATH and writable, it took any
   other writable PATH entry, and WSL2 appends the Windows PATH, whose folders appear writable. Its

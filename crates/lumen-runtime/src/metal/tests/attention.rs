@@ -96,3 +96,139 @@ fn tiled_attention_scores_are_causal_at_any_start_position() {
         }
     }
 }
+
+/// The batched prefill's attention in slices of query rows gives each query the same output,
+/// bit for bit, as one pass over the whole batch: 4,097 queries from position 3 over 16 heads
+/// run as slices of 4,064 and 33 rows, both starting at positions that are not multiples of 32.
+#[test]
+fn sliced_batched_attention_equals_one_pass_over_the_batch() {
+    use crate::metal::prefill_encode::{attention_slice_rows, BatchedAttention};
+
+    let backend = MetalF32Backend::new().unwrap();
+    let pipelines = backend.compile_pipelines().unwrap();
+    let (head_dim, num_heads, num_kv_heads) = (64usize, 16usize, 2usize);
+    let (start_pos, batch) = (3usize, 4097usize);
+    let (q_dim, kv_dim) = (num_heads * head_dim, num_kv_heads * head_dim);
+    let attend = start_pos + batch;
+    let stride = (attend + 7) & !7;
+    let max_seq_len = stride;
+    let scale = 0.125f32;
+    assert_eq!(attention_slice_rows(batch, num_heads, stride), 4064);
+
+    let half = |v: f32| f32_to_f16_bits_rne(v).to_le_bytes();
+    let q: Vec<f32> = (0..batch * q_dim)
+        .map(|i| ((17 * i % 127) as f32 - 63.0) / 64.0)
+        .collect();
+    let k: Vec<u8> = (0..max_seq_len * kv_dim)
+        .flat_map(|i| half(((13 * i % 113) as f32 - 56.0) / 64.0))
+        .collect();
+    let v: Vec<u8> = (0..kv_dim * max_seq_len)
+        .flat_map(|i| {
+            let (d, t) = (i / max_seq_len, i % max_seq_len);
+            half(((19 * d + 7 * t) % 101) as f32 / 64.0 - 50.0 / 64.0)
+        })
+        .collect();
+    let q_buf = backend.upload_f32(&q).unwrap();
+    let k_buf = backend.device.new_buffer_with_bytes(&k).unwrap();
+    let v_buf = backend.device.new_buffer_with_bytes(&v).unwrap();
+    let out_bytes = batch * q_dim * 4;
+    let sliced_out = backend.device.new_buffer(out_bytes).unwrap();
+    let whole_out = backend.device.new_buffer(out_bytes).unwrap();
+    let sliced_scores = backend
+        .device
+        .new_buffer(4064 * num_heads * stride * 2)
+        .unwrap();
+    let whole_scores = backend
+        .device
+        .new_buffer(batch * num_heads * stride * 2)
+        .unwrap();
+
+    let cmd = backend.queue.new_command_buffer().unwrap();
+    let enc = cmd.new_compute_encoder().unwrap();
+    BatchedAttention {
+        q: &q_buf,
+        k_cache: &k_buf,
+        v_cache: &v_buf,
+        scores: &sliced_scores,
+        out: &sliced_out,
+        head_dim,
+        kv_dim,
+        num_heads,
+        num_kv_heads,
+        scale,
+        start_pos,
+        batch_size: batch,
+        max_seq_len,
+    }
+    .encode(&enc, &pipelines);
+    enc.end_encoding();
+
+    // The whole batch in one pass of each kernel.
+    let u = |x: usize| (x as u32).to_le_bytes();
+    let enc = cmd.new_compute_encoder().unwrap();
+    enc.set_pipeline_state(&pipelines.attention_scores_tiled);
+    enc.set_buffer(&q_buf, 0, 0);
+    enc.set_buffer(&k_buf, 0, 1);
+    enc.set_buffer(&whole_scores, 0, 2);
+    enc.set_bytes(&u(head_dim), 3);
+    enc.set_bytes(&u(kv_dim), 4);
+    enc.set_bytes(&u(num_heads), 5);
+    enc.set_bytes(&u(num_kv_heads), 6);
+    enc.set_bytes(&scale.to_le_bytes(), 7);
+    enc.set_bytes(&u(start_pos), 8);
+    enc.set_bytes(&u(stride), 9);
+    enc.set_bytes(&u(batch), 10);
+    enc.dispatch_threadgroups(
+        MTLSize::new(
+            (attend as u64).div_ceil(32),
+            (batch as u64).div_ceil(32),
+            num_heads as u64,
+        ),
+        MTLSize::new(128, 1, 1),
+    );
+    enc.memory_barrier_with_scope(1);
+    enc.set_pipeline_state(&pipelines.softmax_batched);
+    enc.set_buffer(&whole_scores, 0, 0);
+    enc.set_bytes(&u(stride), 1);
+    enc.set_bytes(&u(num_heads), 2);
+    enc.set_bytes(&u(start_pos), 3);
+    enc.set_bytes(&u(batch), 4);
+    enc.dispatch_threadgroups(
+        MTLSize::new(num_heads as u64, batch as u64, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.memory_barrier_with_scope(1);
+    enc.set_pipeline_state(&pipelines.attention_output_tiled);
+    enc.set_buffer(&whole_scores, 0, 0);
+    enc.set_buffer(&v_buf, 0, 1);
+    enc.set_buffer(&whole_out, 0, 2);
+    enc.set_bytes(&u(head_dim), 3);
+    enc.set_bytes(&u(kv_dim), 4);
+    enc.set_bytes(&u(num_heads), 5);
+    enc.set_bytes(&u(num_kv_heads), 6);
+    enc.set_bytes(&u(start_pos), 7);
+    enc.set_bytes(&u(stride), 8);
+    enc.set_bytes(&u(batch), 9);
+    enc.set_bytes(&u(max_seq_len), 10);
+    enc.dispatch_threadgroups(
+        MTLSize::new(
+            (head_dim as u64).div_ceil(32),
+            (batch as u64).div_ceil(32),
+            num_heads as u64,
+        ),
+        MTLSize::new(128, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit_and_wait();
+
+    let mut sliced = vec![0f32; batch * q_dim];
+    let mut whole = vec![0f32; batch * q_dim];
+    sliced_out.read_f32(&mut sliced);
+    whole_out.read_f32(&mut whole);
+    assert!(whole.iter().all(|x| x.is_finite()) && whole.iter().any(|&x| x != 0.0));
+    let first_difference = sliced
+        .iter()
+        .zip(&whole)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert_eq!(first_difference, None);
+}
