@@ -56,8 +56,10 @@ impl MetalF32Backend {
     // Batched prefill methods
     // ========================================================================
 
-    /// Ensure batch scratch buffers are allocated for at least `batch_size` tokens.
-    /// Lazily (re-)allocates if `batch_size > current_max_batch`.
+    /// Ensure batch scratch buffers are allocated for at least `batch_size` tokens
+    /// attending to `attend_len` positions (the cached prefix plus the batch).
+    /// Lazily (re-)allocates if `batch_size > current_max_batch`, and the scores
+    /// buffer whenever it is smaller than this call needs.
     ///
     /// The Split-K partial buffer is sized based on the actual GEMM dimensions that
     /// trigger Split-K at this batch_size. This avoids over-allocating for models
@@ -67,6 +69,7 @@ impl MetalF32Backend {
         &self,
         scratch: &mut MetalScratch,
         batch_size: usize,
+        attend_len: usize,
     ) -> Result<(), RuntimeError> {
         let hidden_dim = scratch.hidden_dim;
         let q_dim = scratch.q_dim;
@@ -74,7 +77,6 @@ impl MetalF32Backend {
         let qkv_dim = scratch.qkv_dim;
         let inter_dim = scratch.inter_dim;
         let num_heads = scratch.num_heads;
-        let max_seq_len = scratch.max_seq_len;
 
         // Check if activation buffers need (re-)allocation
         if batch_size > scratch.current_max_batch {
@@ -130,19 +132,6 @@ impl MetalF32Backend {
             scratch.batch_gate_buf = Some(make(batch_size * gate_buf_elems)?);
             scratch.batch_up_buf = Some(make(batch_size * inter_dim)?);
             scratch.batch_down_buf = Some(make(batch_size * hidden_dim)?);
-            // Scores buffer for batched attention (f16). The scores stride is padded
-            // to a multiple of 8 for half4-aligned vectorized reads in the tiled
-            // attention output kernel. Allocation uses the padded stride.
-            let scores_max_attend = max_seq_len.min(batch_size);
-            let scores_stride_padded = (scores_max_attend + 7) & !7; // match runtime padding
-            let scores_bytes = (batch_size * num_heads * scores_stride_padded).max(1) * 2; // f16 = 2 bytes
-            scratch.batch_scores_buf =
-                Some(self.device.new_buffer(scores_bytes).ok_or_else(|| {
-                    RuntimeError::Compute(format!(
-                        "Failed to allocate batch_scores_buf of {scores_bytes} bytes"
-                    ))
-                })?);
-
             // De-aliased GDN scratch buffers. Allocated when the GDN
             // concurrent-encoder path is enabled so the GDN prefill chain can issue
             // resource-scoped barriers per role (vs whole-MTLBuffer
@@ -224,6 +213,25 @@ impl MetalF32Backend {
             }
 
             scratch.current_max_batch = batch_size;
+        }
+
+        // Scores buffer for batched attention (f16): a row per query token and
+        // head over every attended position, the cached prefix included. The row
+        // stride is padded to a multiple of 8 for half4-aligned vectorized reads in
+        // the tiled attention output kernel, as at dispatch.
+        let scores_stride_padded = (attend_len + 7) & !7;
+        let scores_bytes = (batch_size * num_heads * scores_stride_padded).max(1) * 2; // f16 = 2 bytes
+        if scratch
+            .batch_scores_buf
+            .as_ref()
+            .map_or(true, |b| (b.length() as usize) < scores_bytes)
+        {
+            scratch.batch_scores_buf =
+                Some(self.device.new_buffer(scores_bytes).ok_or_else(|| {
+                    RuntimeError::Compute(format!(
+                        "Failed to allocate batch_scores_buf of {scores_bytes} bytes"
+                    ))
+                })?);
         }
 
         // Split-K partial buffer: sized for the ACTUAL maximum N that triggers

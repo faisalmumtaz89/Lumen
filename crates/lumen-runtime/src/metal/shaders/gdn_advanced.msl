@@ -1024,6 +1024,27 @@ kernel void gdn_state_f32_to_f16(
 }
 
 // ============================================================================
+// gdn_state_f16_to_f32: the exact reverse of gdn_state_f32_to_f16.
+//
+// Widens a live F16 decode h_state back into its layer's F32 h_state before a
+// batched prefill, which reads and writes the F32 state.
+//
+// buffer(0): src  [n] half   -- F16 decode h_state (read-only)
+// buffer(1): dst  [n] float  -- F32 h_state (write)
+// buffer(2): n    (uint)     -- element count (n_v_heads * head_dim * head_dim)
+// grid: ceil(n / tg) threadgroups, threadgroup: (tg,1,1)
+// ============================================================================
+kernel void gdn_state_f16_to_f32(
+    device const half*  src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant     uint&  n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    dst[gid] = (float)src[gid];
+}
+
+// ============================================================================
 // gdn_decode_norm_scale: RMSNorm + learned scale on raw GDN decode output
 //
 // Applied after gdn_state_output_l2_sg to produce the final normed output.

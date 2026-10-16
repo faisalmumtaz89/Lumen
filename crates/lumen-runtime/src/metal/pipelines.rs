@@ -646,6 +646,10 @@ impl MetalF32Backend {
             gdn_state_f32_to_f16: lib
                 .get_function("gdn_state_f32_to_f16")
                 .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
+            // Its exact reverse, handing the live decode state to a batched prefill
+            gdn_state_f16_to_f32: lib
+                .get_function("gdn_state_f16_to_f32")
+                .and_then(|f| self.device.new_compute_pipeline_state(&f).ok()),
             // RMSNorm + scale for decode (pairs with gdn_state_output_l2_sg)
             gdn_decode_norm_scale: lib
                 .get_function("gdn_decode_norm_scale")

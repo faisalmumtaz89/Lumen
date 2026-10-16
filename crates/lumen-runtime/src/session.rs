@@ -444,23 +444,13 @@ impl Session {
         }
 
         let start = Instant::now();
-        let logits = if caps.batched_prefill && !(warm && caps.gdn) {
-            // Backend handles KV advance internally.
+        let logits = if caps.batched_prefill {
+            // Backend handles KV advance internally, and continues the live
+            // recurrent state on a warm append.
             let last_hidden = backend.prefill(prompt, weights, &mut self.kv)?;
             let mut x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
             x.write_f32_from(&last_hidden);
             backend.compute_final(&x)?
-        } else if caps.batched_prefill {
-            // Warm GDN append: the batched prefill does not continue the live
-            // recurrent state mid-stream (same reason the warm-append suffix
-            // dispatch in `extend_with_cache` routes GDN through the decode
-            // loop); advance token-by-token instead. Only the server's short
-            // forced-close injection reaches this arm today.
-            let mut logits: Option<Logits> = None;
-            for &token_id in prompt {
-                logits = Some(backend.decode_token(token_id, weights, &mut self.kv)?);
-            }
-            logits.expect("non-empty prompt produced logits")
         } else {
             // Token-at-a-time path: forward_pass does NOT advance kv.seq_len,
             // so we step it after each token.
@@ -860,17 +850,8 @@ impl Session {
 
         // Case 4: tiny suffix -- single-token decode path. Cheaper than a
         // batched prefill dispatch for short tails.
-        //
-        // GDN backends take this path for EVERY warm-append suffix, not just
-        // tiny ones: the batched prefill dispatch resumes positional KV
-        // correctly but does not continue the recurrent state (h_state /
-        // conv_state) from the live mid-stream values, so its logits diverge
-        // from a cold prefill of the same tokens (observed: warm batched
-        // append produced off-context text while this per-token loop is
-        // byte-identical to cold). The decode loop advances the recurrent
-        // state token-by-token, exactly like generation itself.
         let start = Instant::now();
-        if suffix_len < suffix_threshold.max(1) || backend.caps().gdn {
+        if suffix_len < suffix_threshold.max(1) {
             // For each suffix token, run one forward pass. Use the same loop
             // as the token-at-a-time prefill branch so the result is exact.
             let caps = backend.caps();
@@ -920,7 +901,7 @@ impl Session {
         }
 
         // Case 2/3 with large suffix: dispatch the batched prefill kernel
-        // starting at position `common`.
+        // starting at position `common`, continuing the live recurrent state.
         let caps = backend.caps();
         let num_layers = self.hyperparams.num_layers as usize;
         let logits = if caps.batched_prefill {
@@ -2660,63 +2641,40 @@ mod tests {
         cold.state_val()
     }
 
-    /// Warm GDN append must route through the per-token decode loop (never the
-    /// batched prefill, which cannot continue recurrent state mid-stream), and
-    /// the repaired stream must fold every token exactly once — byte-equal to
-    /// a cold prefill of the same tokens.
+    /// A warm append takes the batched suffix dispatch, GDN or not: the
+    /// catch-up must leave `start_pos == kv.seq_len()` so `prefill_from`
+    /// accepts it, and the folded state must equal cold.
     #[test]
-    fn warm_append_gdn_decode_loop_matches_cold_state() {
-        let (provider, _nb, hp) = synthetic_setup();
-        let backend = MockGpuBackend::new(true);
-        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
-        let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
-        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
-        session
-            .extend_with_cache(
-                &extended,
-                &backend,
-                &provider,
-                Session::DEFAULT_SUFFIX_THRESHOLD,
-            )
-            .unwrap();
-        assert_eq!(
-            backend.prefill_calls.load(Ordering::SeqCst),
-            prefills_before,
-            "GDN warm append must not dispatch batched prefill"
-        );
-        // 1 catch-up + 40 suffix tokens, each exactly once.
-        assert_eq!(
-            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
-            41
-        );
-        assert_eq!(session.kv().seq_len(), extended.len());
-        assert_eq!(backend.state_val(), cold_state(true, &extended));
-    }
-
-    /// Non-GDN warm append keeps the batched suffix dispatch; the catch-up
-    /// must leave `start_pos == kv.seq_len()` so `prefill_from` accepts it,
-    /// and the folded state must equal cold.
-    #[test]
-    fn warm_append_non_gdn_batched_matches_cold_state() {
-        let (provider, _nb, hp) = synthetic_setup();
-        let backend = MockGpuBackend::new(false);
-        let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
-        let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
-        session
-            .extend_with_cache(
-                &extended,
-                &backend,
-                &provider,
-                Session::DEFAULT_SUFFIX_THRESHOLD,
-            )
-            .unwrap();
-        // Exactly the catch-up decode; the suffix went through batched prefill.
-        assert_eq!(
-            backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
-            1
-        );
-        assert_eq!(session.kv().seq_len(), extended.len());
-        assert_eq!(backend.state_val(), cold_state(false, &extended));
+    fn warm_append_batched_matches_cold_state() {
+        for gdn in [false, true] {
+            let (provider, _nb, hp) = synthetic_setup();
+            let backend = MockGpuBackend::new(gdn);
+            let (mut session, extended) = mock_warm_lagging_session(&backend, &provider, hp);
+            let prefills_before = backend.prefill_calls.load(Ordering::SeqCst);
+            let decodes_before = backend.decode_calls.load(Ordering::SeqCst);
+            let r = session
+                .extend_with_cache(
+                    &extended,
+                    &backend,
+                    &provider,
+                    Session::DEFAULT_SUFFIX_THRESHOLD,
+                )
+                .unwrap();
+            assert!(!r.used_single_token_path, "gdn={gdn}");
+            assert_eq!(
+                backend.prefill_calls.load(Ordering::SeqCst) - prefills_before,
+                1,
+                "gdn={gdn}: one batched suffix prefill"
+            );
+            // Exactly the catch-up decode; the suffix went through batched prefill.
+            assert_eq!(
+                backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
+                1,
+                "gdn={gdn}"
+            );
+            assert_eq!(session.kv().seq_len(), extended.len());
+            assert_eq!(backend.state_val(), cold_state(gdn, &extended));
+        }
     }
 
     /// When the backend reports the tail token was already processed by a
@@ -2739,10 +2697,11 @@ mod tests {
                 Session::DEFAULT_SUFFIX_THRESHOLD,
             )
             .unwrap();
-        // Suffix decodes only — the tail was reconciled, not re-fed.
+        // No decode — the tail was reconciled, not re-fed, and the suffix went
+        // through batched prefill.
         assert_eq!(
             backend.decode_calls.load(Ordering::SeqCst) - decodes_before,
-            40
+            0
         );
         assert_eq!(session.kv().seq_len(), extended.len());
         assert_eq!(backend.state_val(), cold_state(true, &extended));

@@ -9,6 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **A request that continued the conversation the server held fed its new tokens one at a
+  time.** When a request began with the previous request's prompt and reply, as Claude Code's
+  every turn does, the server kept that state but fed the rest through the decode loop on
+  every model Lumen serves, so a turn adding a few thousand tokens took about a minute. It now
+  prefills the rest in one batch from that state. On an RTX 5090 with Qwen3.8-27B NVFP4
+  (140,000-token context, BF16 KV), adding 3,988 tokens to a 35,470-token conversation took
+  0.73 s instead of 63.9 s, 46,149 tokens 10.6 s instead of 784 s, and 4,034 tokens to a
+  103,183-token conversation 1.4 s instead of 77 s. Two Metal defects the batched route then
+  met are fixed with it: a prefill that followed generated tokens started from the recurrent
+  state as it was before them (the decode keeps its own half-precision copy) and the next
+  token continued from that copy, and the prefill's attention scores were sized for the new
+  tokens only, so a long continuation wrote past them.
 - **The one-line installer could install into Windows folders under WSL2.** When none of
   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` was on PATH and writable, it took any
   other writable PATH entry, and WSL2 appends the Windows PATH, whose folders appear writable. Its
