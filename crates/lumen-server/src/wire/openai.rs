@@ -3137,10 +3137,10 @@ mod tests {
         }
     }
 
-    /// A content part carrying input the text model cannot see is refused, under both
-    /// prompt renderers.
+    /// A content part carrying input the text model cannot read becomes a note naming it, and
+    /// an assistant `refusal` part is read as its text, under both prompt renderers.
     #[test]
-    fn render_chat_prompt_refuses_input_the_model_cannot_see() {
+    fn render_chat_prompt_notes_input_the_model_cannot_read() {
         let template =
             include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
         let parts = [
@@ -3158,24 +3158,23 @@ mod tests {
             let mut msg = user_msg("");
             msg.content = json!([part, {"type": "text", "text": "What is this?"}]);
             for tpl in [None, Some(template)] {
-                match render_chat_prompt(std::slice::from_ref(&msg), &[], false, tpl, None) {
-                    Err(ServerError::BadRequest {
-                        message,
-                        param: Some(p),
-                        ..
-                    }) => {
-                        assert!(message.contains(&format!("`{kind}`")), "{message}");
-                        assert_eq!(p, "messages.content");
-                    }
-                    other => panic!("`{kind}` under template {}: {other:?}", tpl.is_some()),
-                }
+                let prompt =
+                    render_chat_prompt(std::slice::from_ref(&msg), &[], false, tpl, None).unwrap();
+                let noted = format!("[{kind} omitted: this model reads text only]\nWhat is this?");
+                assert!(
+                    prompt.contains(&noted),
+                    "`{kind}` under template {}: {prompt}",
+                    tpl.is_some()
+                );
             }
         }
-        let mut text = user_msg("");
-        text.content = json!([{"type": "text", "text": "Say ok."}]);
-        assert!(render_chat_prompt(&[text], &[], false, None, None)
-            .unwrap()
-            .contains("Say ok."));
+        let mut refused = assistant_msg("");
+        refused.content = json!([{"type": "refusal", "refusal": "I cannot answer that."}]);
+        let messages = [user_msg("Q1"), refused, user_msg("Then say hello.")];
+        for tpl in [None, Some(template)] {
+            let prompt = render_chat_prompt(&messages, &[], false, tpl, None).unwrap();
+            assert!(prompt.contains("I cannot answer that."), "{prompt}");
+        }
     }
 
     #[test]

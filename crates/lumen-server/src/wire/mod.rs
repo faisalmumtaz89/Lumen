@@ -3,6 +3,7 @@
 //! Each submodule owns the request DTO, the SSE state machine, and the
 //! non-streaming response shape for one external API.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,8 +58,11 @@ pub(crate) fn bench_token_ids_guard(stream: bool, stop_text: &[String]) -> Resul
 /// - `Null` → empty string (an absent/optional content field).
 /// - `Array` → each element flattened and concatenated: a bare string element
 ///   is appended as-is; a content-part object contributes ONLY its `text`
-///   field (the single recognized key). Any other element kind (number, bool,
-///   nested array, object without `text`) contributes nothing.
+///   field (the single recognized key), an assistant `refusal` part its
+///   `refusal`, and a typed part the text model cannot read (an image, a
+///   document, audio, a file) a note naming it, from [`part_text`]. Any other
+///   element kind (number, bool, nested array, untyped object without `text`)
+///   contributes nothing.
 ///
 /// ROBUST-007 numeric-type-guard: a bare number/bool (or any non
 /// string/array/null scalar) at the top level is REJECTED as a 400 rather
@@ -83,8 +87,8 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
                 if let Some(s) = piece.as_str() {
                     out.push_str(s);
                 } else if let Some(obj) = piece.as_object() {
-                    if let Some(text) = part_text(obj, param)? {
-                        out.push_str(text);
+                    if let Some(text) = part_text(obj) {
+                        out.push_str(&text);
                     }
                 }
             }
@@ -99,19 +103,23 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
     }
 }
 
-/// The text of a content part. A typed part other than `text` that carries no text holds
-/// input this text model cannot see (an image, a document, audio, a file, a search result,
-/// a server tool's call or result), so dropping it would change the answer: it is refused.
-pub(crate) fn part_text<'a>(
-    part: &'a serde_json::Map<String, Value>,
-    param: &str,
-) -> Result<Option<&'a str>, ServerError> {
+/// The text a content part gives the prompt. A typed part other than `text` that carries no
+/// text holds input this text model cannot read (an image, a document, audio, a file, a search
+/// result, a server tool's call or result); it becomes a note naming it, so the model knows
+/// something was left out and a conversation that holds one can go on.
+pub(crate) fn part_text(part: &serde_json::Map<String, Value>) -> Option<Cow<'_, str>> {
     if let Some(text) = part.get("text").and_then(Value::as_str) {
-        return Ok(Some(text));
+        return Some(Cow::Borrowed(text));
     }
     match part.get("type").and_then(Value::as_str) {
-        None | Some("text") => Ok(None),
-        Some(kind) => Err(unsupported(param, &format!("`{kind}` content"))),
+        None | Some("text") => None,
+        Some("refusal") => part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(Cow::Borrowed),
+        Some(kind) => Some(Cow::Owned(format!(
+            "[{kind} omitted: this model reads text only]\n"
+        ))),
     }
 }
 
