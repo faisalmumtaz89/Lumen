@@ -1005,8 +1005,8 @@ mod tests {
             let symbols: Vec<String> = (0..rng.below(40))
                 .map(|_| (b"abc"[rng.below(3)] as char).to_string())
                 .collect();
-            // The score rule the SPM merge has always applied: the first pair with the
-            // highest score above -inf, comparing with `>`.
+            // Reference SPM merge: the first pair with the highest score above -inf,
+            // comparing with `>`.
             let mut want = symbols.clone();
             loop {
                 let mut best = (f32::NEG_INFINITY, usize::MAX);
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn special_token_split_takes_the_rescan_order() {
-        // The split as it scanned every special token at every segment.
+        // Reference split: every special token searched for at every segment.
         fn rescan(specials: &[(String, u32)], text: &str) -> Vec<Segment> {
             let mut segments = Vec::new();
             let mut remaining = text;
