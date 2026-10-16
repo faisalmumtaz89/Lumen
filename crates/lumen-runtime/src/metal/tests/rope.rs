@@ -5,9 +5,10 @@ use crate::metal::*;
 
 /// The batched RoPE kernels, launched as the prefill launches them, rotate exactly the batch's
 /// rows. K has 32 rotated pairs per head over 4 heads on Qwen3.5-9B and Qwen3.8-27B (128
-/// threads per token) and over 2 on Qwen3.5-35B-A3B (64), so most batches leave their last
-/// 256-thread group part empty. Each rotated pair matches the rotation by its position's angle,
-/// and every float past the batch keeps its bits.
+/// threads per token) and over 2 on Qwen3.5-35B-A3B (64): on 4 heads an odd batch of 3 or more,
+/// and on 2 heads a batch of 5 or more that is not a multiple of 4, leaves its last 256-thread
+/// group part empty. Each rotated pair matches the rotation by its position's angle, and every
+/// float past the batch keeps its bits.
 #[test]
 fn batched_rope_rotates_the_batch_and_nothing_past_it() {
     let backend = MetalF32Backend::new().unwrap();
