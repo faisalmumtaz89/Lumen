@@ -118,6 +118,7 @@ kernel void rope_batched(
     constant uint&      half_dim     [[buffer(5)]],
     constant uint&      pos_start    [[buffer(6)]],
     constant uint&      total_dim    [[buffer(7)]],   // num_heads * head_dim per token
+    constant uint&      batch_size   [[buffer(8)]],
     uint gid                         [[thread_position_in_grid]])
 {
     // gid ranges over batch_size * num_heads * half_dim
@@ -127,7 +128,8 @@ kernel void rope_batched(
     uint head = within_token / half_dim;
     uint i = within_token % half_dim;
 
-    if (head >= num_heads) return;
+    // The grid is rounded up to whole threadgroups.
+    if (token_idx >= batch_size) return;
 
     uint base = token_idx * total_dim + head * head_dim;
     uint idx0 = base + 2 * i;
@@ -163,6 +165,7 @@ kernel void rope_batched_neox(
     constant uint&      half_dim     [[buffer(5)]],
     constant uint&      pos_start    [[buffer(6)]],
     constant uint&      total_dim    [[buffer(7)]],   // num_heads * head_dim per token
+    constant uint&      batch_size   [[buffer(8)]],
     uint gid                         [[thread_position_in_grid]])
 {
     // gid ranges over batch_size * num_heads * half_dim
@@ -172,7 +175,8 @@ kernel void rope_batched_neox(
     uint head = within_token / half_dim;
     uint i = within_token % half_dim;
 
-    if (head >= num_heads) return;
+    // The grid is rounded up to whole threadgroups.
+    if (token_idx >= batch_size) return;
 
     uint base = token_idx * total_dim + head * head_dim;
     uint idx0 = base + i;            // first half: [0, half_dim)
