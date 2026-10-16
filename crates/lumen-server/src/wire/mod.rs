@@ -58,7 +58,7 @@ pub(crate) fn bench_token_ids_guard(stream: bool, stop_text: &[String]) -> Resul
 /// - `Null` → empty string (an absent/optional content field).
 /// - `Array` → each element flattened and concatenated: a bare string element
 ///   is appended as-is; a content-part object contributes what [`part_text`]
-///   gives it (its `text`, an assistant `refusal` part's `refusal`, or a note
+///   gives it (its `text`, a `refusal` part's `refusal`, or a note
 ///   naming a part the text model cannot read). Any other element kind
 ///   (number, bool, nested array, untyped object without `text`) contributes
 ///   nothing.
@@ -102,11 +102,11 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
     }
 }
 
-/// The text a content part gives the prompt: its `text`, or an assistant `refusal` part's
-/// `refusal`. A typed part of another kind that carries no text holds input this text model
-/// cannot read (an image, a document, audio, a file, a search result, a server tool's call or
-/// result); it becomes a note naming it, so the model knows something was left out and a
-/// conversation that holds one can go on.
+/// The text a content part gives the prompt: its `text`, or a `refusal` part's `refusal`. A
+/// typed part of another kind that carries no text holds input this text model cannot read (an
+/// image, a document, audio, a file, a search result, a server tool's call or result); it
+/// becomes a note naming it, so the model knows something was left out and a conversation that
+/// holds one can go on.
 pub(crate) fn part_text(part: &serde_json::Map<String, Value>) -> Option<Cow<'_, str>> {
     if let Some(text) = part.get("text").and_then(Value::as_str) {
         return Some(Cow::Borrowed(text));
