@@ -6,7 +6,8 @@
 //! -**SentencePiece BPE**(model="llama"): TinyLlama
 //!   Uses scores as merge priorities, non-legacy prefix space, byte fallback.
 
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------------------
@@ -511,88 +512,54 @@ impl BpeTokenizer {
         all_ids
     }
 
-    /// Split text into segments of special tokens and normal text.
+    /// Split text into segments of special tokens and normal text. At each position the
+    /// first special token in list order (the longest) that starts there is taken;
+    /// otherwise the text runs to the nearest special token. Each token's next occurrence
+    /// is searched for again only once the position has passed it, so the text is scanned
+    /// once per special token rather than once per segment.
     fn split_on_special_tokens(&self, text: &str) -> Vec<Segment> {
         if self.special_tokens.is_empty() {
             return vec![Segment::Text(text.to_string())];
         }
-
+        let find = |tok: &str, from: usize| text[from..].find(tok).map_or(usize::MAX, |p| from + p);
+        let mut next: Vec<usize> = self
+            .special_tokens
+            .iter()
+            .map(|(tok, _)| find(tok, 0))
+            .collect();
         let mut segments = Vec::new();
-        let mut remaining = text;
-
-        while !remaining.is_empty() {
-            // Try to match a special token at the current position.
-            let mut found = false;
-            for (tok_str, tok_id) in &self.special_tokens {
-                if remaining.starts_with(tok_str.as_str()) {
-                    segments.push(Segment::Special(*tok_id));
-                    remaining = &remaining[tok_str.len()..];
-                    found = true;
-                    break;
+        let mut pos = 0;
+        while pos < text.len() {
+            for (at, (tok, _)) in next.iter_mut().zip(&self.special_tokens) {
+                if *at < pos {
+                    *at = find(tok, pos);
                 }
             }
-            if found {
+            if let Some(i) = next.iter().position(|&at| at == pos) {
+                let (tok, id) = &self.special_tokens[i];
+                segments.push(Segment::Special(*id));
+                pos += tok.len();
                 continue;
             }
-
-            // Find the next special token occurrence.
-            let mut next_pos = remaining.len();
-            for (tok_str, _) in &self.special_tokens {
-                if let Some(pos) = remaining.find(tok_str.as_str()) {
-                    if pos < next_pos {
-                        next_pos = pos;
-                    }
-                }
-            }
-
-            let normal = &remaining[..next_pos];
-            if !normal.is_empty() {
-                segments.push(Segment::Text(normal.to_string()));
-            }
-            remaining = &remaining[next_pos..];
+            let end = next
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX)
+                .min(text.len());
+            segments.push(Segment::Text(text[pos..end].to_string()));
+            pos = end;
         }
-
         segments
     }
 
     /// Apply BPE merges using ranked merge pairs (lower rank = higher priority).
     fn bpe_merge_tiktoken(&self, symbols: &[String]) -> Vec<String> {
-        if symbols.len() <= 1 {
-            return symbols.to_vec();
-        }
-
-        let mut work: Vec<String> = symbols.to_vec();
-
-        loop {
-            if work.len() <= 1 {
-                break;
-            }
-
-            // Find the pair with the lowest merge rank.
-            let mut best_rank = usize::MAX;
-            let mut best_idx = usize::MAX;
-
-            for i in 0..work.len() - 1 {
-                let key = (work[i].clone(), work[i + 1].clone());
-                if let Some(&rank) = self.merge_ranks.get(&key) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = i;
-                    }
-                }
-            }
-
-            if best_idx == usize::MAX {
-                break;
-            }
-
-            // Merge the pair.
-            let merged = format!("{}{}", work[best_idx], work[best_idx + 1]);
-            work[best_idx] = merged;
-            work.remove(best_idx + 1);
-        }
-
-        work
+        merge_lowest_first(symbols, |a, b| {
+            self.merge_ranks
+                .get(&(a.to_string(), b.to_string()))
+                .copied()
+        })
     }
 
     fn decode_tiktoken(&self, ids: &[u32]) -> String {
@@ -719,47 +686,19 @@ impl BpeTokenizer {
 
     /// Apply BPE merges for SentencePiece: repeatedly merge the adjacent pair
     /// whose merged token has the highest score. All vocab-present merges are
-    /// valid; the score only determines priority (higher = merge first).
+    /// valid; the score only determines priority (higher = merge first). A pair
+    /// whose merged token is not in the vocab or scores -inf or NaN never merges.
     fn bpe_merge_spm(&self, symbols: &[String]) -> Vec<String> {
-        if symbols.len() <= 1 {
-            return symbols.to_vec();
-        }
-
-        let mut work = symbols.to_vec();
-
-        loop {
-            if work.len() <= 1 {
-                break;
-            }
-
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_idx = usize::MAX;
-
-            for i in 0..work.len() - 1 {
-                let merged_str = format!("{}{}", work[i], work[i + 1]);
-                if let Some(&id) = self.token_to_id.get(&merged_str) {
-                    let score = self
-                        .scores
-                        .get(id as usize)
-                        .copied()
-                        .unwrap_or(f32::NEG_INFINITY);
-                    if score > best_score {
-                        best_score = score;
-                        best_idx = i;
-                    }
-                }
-            }
-
-            if best_idx == usize::MAX {
-                break;
-            }
-
-            let merged = format!("{}{}", work[best_idx], work[best_idx + 1]);
-            work[best_idx] = merged;
-            work.remove(best_idx + 1);
-        }
-
-        work
+        merge_lowest_first(symbols, |a, b| {
+            let id = *self.token_to_id.get(&format!("{a}{b}"))?;
+            let score = self
+                .scores
+                .get(id as usize)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
+            // `+ 0.0` turns -0.0 into 0.0, so equal scores tie as `==` has them.
+            (score > f32::NEG_INFINITY).then_some(Reverse(Score(score + 0.0)))
+        })
     }
 
     fn decode_spm(&self, ids: &[u32]) -> String {
@@ -821,6 +760,7 @@ impl BpeTokenizer {
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum Segment {
     Special(u32),
     Text(String),
@@ -829,6 +769,81 @@ enum Segment {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// A merge score ordered by `f32::total_cmp`; never NaN.
+#[derive(Clone, Copy, PartialEq)]
+struct Score(f32);
+
+impl Eq for Score {}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Merge adjacent symbols until no pair has a priority, always the pair with the
+/// lowest priority and, among equals, the leftmost: the order a rescan of every
+/// pair after each merge takes. The pairs wait in a heap; an entry whose symbols
+/// changed since it was pushed is skipped, so a run of n symbols merges in
+/// O(n log n) instead of O(n^2).
+fn merge_lowest_first<P: Ord>(
+    symbols: &[String],
+    priority: impl Fn(&str, &str) -> Option<P>,
+) -> Vec<String> {
+    let n = symbols.len();
+    if n <= 1 {
+        return symbols.to_vec();
+    }
+    let mut sym = symbols.to_vec();
+    // `next[i] == n` and `prev[i] == usize::MAX` mark the ends of the list.
+    let mut next: Vec<usize> = (1..=n).collect();
+    let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+    // Bumped whenever a symbol changes or is merged away.
+    let mut version = vec![0u32; n];
+    let mut heap = BinaryHeap::new();
+    let push = |heap: &mut BinaryHeap<_>, sym: &[String], version: &[u32], l: usize, r: usize| {
+        if let Some(p) = priority(&sym[l], &sym[r]) {
+            heap.push(Reverse((p, l, version[l], r, version[r])));
+        }
+    };
+    for i in 0..n - 1 {
+        push(&mut heap, &sym, &version, i, i + 1);
+    }
+    while let Some(Reverse((_, l, vl, r, vr))) = heap.pop() {
+        if version[l] != vl || version[r] != vr || next[l] != r {
+            continue;
+        }
+        let right = std::mem::take(&mut sym[r]);
+        sym[l].push_str(&right);
+        version[l] += 1;
+        version[r] += 1;
+        next[l] = next[r];
+        if next[l] < n {
+            prev[next[l]] = l;
+        }
+        if prev[l] != usize::MAX {
+            push(&mut heap, &sym, &version, prev[l], l);
+        }
+        if next[l] < n {
+            push(&mut heap, &sym, &version, l, next[l]);
+        }
+    }
+    // The first symbol is never merged away.
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        out.push(std::mem::take(&mut sym[i]));
+        i = next[i];
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -854,6 +869,169 @@ mod tests {
             chat_template: None,
         };
         BpeTokenizer::from_tokenizer_data(&data)
+    }
+
+    /// Small deterministic generator for the merge tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    /// The merge order `merge_lowest_first` must reproduce: after every merge, scan every
+    /// adjacent pair and merge the leftmost one of lowest priority.
+    fn rescan_merge<P: Ord>(
+        symbols: &[String],
+        priority: impl Fn(&str, &str) -> Option<P>,
+    ) -> Vec<String> {
+        let mut work = symbols.to_vec();
+        loop {
+            let mut best: Option<(P, usize)> = None;
+            for i in 0..work.len().saturating_sub(1) {
+                if let Some(p) = priority(&work[i], &work[i + 1]) {
+                    if best.as_ref().map_or(true, |(b, _)| p < *b) {
+                        best = Some((p, i));
+                    }
+                }
+            }
+            let Some((_, i)) = best else { return work };
+            let right = work.remove(i + 1);
+            work[i].push_str(&right);
+        }
+    }
+
+    #[test]
+    fn heap_merge_takes_the_rescan_order() {
+        let mut rng = Lcg(7);
+        for case in 0..3000 {
+            // Few letters, short merged strings and four priority levels, so overlapping
+            // pairs and equal priorities are common.
+            let mut table = HashMap::new();
+            for _ in 0..1 + rng.below(40) {
+                let len = 2 + rng.below(5);
+                let s: String = (0..len).map(|_| b"abcd"[rng.below(4)] as char).collect();
+                table.insert(s, rng.below(4));
+            }
+            let symbols: Vec<String> = (0..rng.below(60))
+                .map(|_| (b"abcd"[rng.below(4)] as char).to_string())
+                .collect();
+            let priority = |a: &str, b: &str| table.get(&format!("{a}{b}")).copied();
+            assert_eq!(
+                merge_lowest_first(&symbols, priority),
+                rescan_merge(&symbols, priority),
+                "case {case}: {symbols:?} with {table:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spm_merge_takes_the_highest_score_then_the_leftmost() {
+        let mut rng = Lcg(11);
+        let scores = [-1.5f32, -0.0, 0.0, 2.0, f32::NAN, f32::NEG_INFINITY];
+        for case in 0..2000 {
+            let mut tokens: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+            for _ in 0..1 + rng.below(20) {
+                let len = 2 + rng.below(4);
+                tokens.push((0..len).map(|_| b"abc"[rng.below(3)] as char).collect());
+            }
+            let token_scores: Vec<f32> = tokens.iter().map(|_| scores[rng.below(6)]).collect();
+            let data = lumen_convert::tokenizer_data::TokenizerData {
+                model_type: "llama".into(),
+                pre_tokenizer: "default".into(),
+                token_types: vec![1; tokens.len()],
+                tokens,
+                scores: token_scores,
+                merges: Vec::new(),
+                bos_token_id: 0,
+                eos_token_id: 1,
+                pad_token_id: None,
+                add_bos_token: false,
+                add_eos_token: false,
+                add_space_prefix: false,
+                chat_template: None,
+            };
+            let tok = BpeTokenizer::from_tokenizer_data(&data);
+            let symbols: Vec<String> = (0..rng.below(40))
+                .map(|_| (b"abc"[rng.below(3)] as char).to_string())
+                .collect();
+            // The score rule the SPM merge has always applied: the first pair with the
+            // highest score above -inf, comparing with `>`.
+            let mut want = symbols.clone();
+            loop {
+                let mut best = (f32::NEG_INFINITY, usize::MAX);
+                for i in 0..want.len().saturating_sub(1) {
+                    if let Some(&id) = tok.token_to_id.get(&format!("{}{}", want[i], want[i + 1])) {
+                        let score = tok.scores[id as usize];
+                        if score > best.0 {
+                            best = (score, i);
+                        }
+                    }
+                }
+                if best.1 == usize::MAX {
+                    break;
+                }
+                let right = want.remove(best.1 + 1);
+                want[best.1].push_str(&right);
+            }
+            assert_eq!(
+                tok.bpe_merge_spm(&symbols),
+                want,
+                "case {case}: {symbols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_token_split_takes_the_rescan_order() {
+        // The split as it scanned every special token at every segment.
+        fn rescan(specials: &[(String, u32)], text: &str) -> Vec<Segment> {
+            let mut segments = Vec::new();
+            let mut remaining = text;
+            'outer: while !remaining.is_empty() {
+                for (tok, id) in specials {
+                    if remaining.starts_with(tok.as_str()) {
+                        segments.push(Segment::Special(*id));
+                        remaining = &remaining[tok.len()..];
+                        continue 'outer;
+                    }
+                }
+                let next = specials
+                    .iter()
+                    .filter_map(|(tok, _)| remaining.find(tok.as_str()))
+                    .min()
+                    .unwrap_or(remaining.len());
+                segments.push(Segment::Text(remaining[..next].to_string()));
+                remaining = &remaining[next..];
+            }
+            segments
+        }
+        let mut rng = Lcg(5);
+        let mut tok = minimal_qwen35_tokenizer();
+        for case in 0..3000 {
+            // Overlapping specials over three letters, in any order and of any length.
+            tok.special_tokens = (0..1 + rng.below(6))
+                .map(|id| {
+                    let len = 1 + rng.below(4);
+                    let tok = (0..len).map(|_| "<a>é".chars().nth(rng.below(4)).unwrap());
+                    (tok.collect(), id as u32)
+                })
+                .collect();
+            let text: String = (0..rng.below(50))
+                .map(|_| "<a>é".chars().nth(rng.below(4)).unwrap())
+                .collect();
+            assert_eq!(
+                tok.split_on_special_tokens(&text),
+                rescan(&tok.special_tokens, &text),
+                "case {case}: {text:?} with {:?}",
+                tok.special_tokens
+            );
+        }
     }
 
     #[test]
