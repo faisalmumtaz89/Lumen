@@ -231,8 +231,9 @@ OPTIONS:
                           an earlier version saved after generation is refused; delete it
                           to start again.
                           `LUMEN_SUFFIX_THRESHOLD=<n>` (positive integer) is the suffix
-                          length at which a resumed session would switch from the decode
-                          loop to the batched prefill; no current backend makes that switch.
+                          length at which a resumed session switches from the decode loop
+                          to the batched prefill (on Metal; the CPU backends always use the
+                          decode loop).
     --profile             Print per-operation timing breakdown after inference (implies --verbose)
     --verbose, -v         Show diagnostics, metrics, and banner (default: quiet, text only)
     --verbose-routing     Print per-layer MoE router diagnostics (entropy, expert selection)

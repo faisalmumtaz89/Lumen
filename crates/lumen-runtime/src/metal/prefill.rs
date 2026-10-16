@@ -156,7 +156,7 @@ impl MetalF32Backend {
             .ok_or_else(|| RuntimeError::Compute("Metal scratch not initialized".into()))?;
 
         // Ensure batch buffers are large enough
-        self.ensure_batch_buffers(s, batch_size)?;
+        self.ensure_batch_buffers(s, batch_size, kv.seq_len() + batch_size)?;
 
         let num_layers = s.num_layers;
 
@@ -215,6 +215,10 @@ impl MetalF32Backend {
         super::profile::record_section_end();
         // Now IN_FLIGHT_SECTION = "prefill/embed"; restart the timer for it.
         super::profile::mark_section_start();
+
+        // A prefill continuing a decoded sequence starts from the live decode
+        // state, which the F16 decode mirrors hold.
+        Self::encode_gdn_f16_state_widen(pipelines, &cmd, s)?;
 
         // Embed all tokens as first encoder in the prefill command buffer
         self.encode_embed_batched(&cmd, prompt_tokens, pipelines, s)?;
@@ -358,6 +362,12 @@ impl MetalF32Backend {
         // (the one that did not get a follow-up `new_compute_encoder` call
         // to split it). No-op when profiling is OFF.
         super::profile::record_section_end();
+
+        // The widened mirrors are stale now; the next decode converts the F32
+        // state this prefill left.
+        for mirror in &s.gdn_h_states_f16 {
+            *mirror.borrow_mut() = None;
+        }
 
         // LayerViews are dropped here, after GPU has finished.
         // This is the key safety guarantee: backing memory was alive

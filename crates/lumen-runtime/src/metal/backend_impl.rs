@@ -602,7 +602,7 @@ impl ComputeBackend for MetalF32Backend {
             let default_batch = max_seq_len.min(512);
             let mut scratch_guard = self.scratch.lock().unwrap();
             let s = scratch_guard.as_mut().unwrap();
-            self.ensure_batch_buffers(s, default_batch)?;
+            self.ensure_batch_buffers(s, default_batch, default_batch)?;
         }
 
         // Initialize MoE expert caching infrastructure.

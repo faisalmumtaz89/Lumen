@@ -670,6 +670,46 @@ impl MetalF32Backend {
         Ok(())
     }
 
+    /// Hands the live GDN h_state back to the F32 buffers a batched prefill
+    /// reads and writes: each layer whose F16 decode mirror is live gets a
+    /// `gdn_state_f16_to_f32` dispatch on `cmd`, ahead of the prefill's own
+    /// encoders, that widens the mirror (exactly) into its F32 `gdn_h_states`
+    /// entry. The caller drops the mirrors once `cmd` has completed, so the next
+    /// decode converts the state the prefill leaves, as after a cold prefill.
+    pub(crate) fn encode_gdn_f16_state_widen(
+        pipelines: &MetalPipelines,
+        cmd: &MetalCommandBuffer,
+        s: &MetalScratch,
+    ) -> Result<(), RuntimeError> {
+        let live: Vec<(usize, std::cell::Ref<'_, Option<MetalBuffer>>)> = s
+            .gdn_h_states_f16
+            .iter()
+            .map(|cell| cell.borrow())
+            .enumerate()
+            .filter(|(_, mirror)| mirror.is_some())
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let enc = cmd.new_compute_encoder().ok_or_else(|| {
+            RuntimeError::Compute("Failed to create encoder for the GDN h_state widen".into())
+        })?;
+        let h_state_size = s.gdn_num_v_heads * s.gdn_head_dim * s.gdn_head_dim;
+        let tg = 256u64;
+        enc.set_pipeline_state(&pipelines.gdn_state_f16_to_f32);
+        enc.set_bytes(&(h_state_size as u32).to_le_bytes(), 2);
+        for (gdn_idx, mirror) in &live {
+            enc.set_buffer(mirror.as_ref().unwrap(), 0, 0); // src f16
+            enc.set_buffer(&s.gdn_h_states[*gdn_idx], 0, 1); // dst f32
+            enc.dispatch_threadgroups(
+                MTLSize::new((h_state_size as u64).div_ceil(tg), 1, 1),
+                MTLSize::new(tg, 1, 1),
+            );
+        }
+        enc.end_encoding();
+        Ok(())
+    }
+
     pub(crate) fn encode_gdn_layer_decode_fused(
         mut enc: MetalComputeEncoder,
         cmd: &MetalCommandBuffer,
