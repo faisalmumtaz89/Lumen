@@ -649,9 +649,10 @@ fn partition_tool_use_blocks(
                             let t = obj.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
                             reasoning.get_or_insert_with(String::new).push_str(t);
                         }
-                        // text part (or any other block that carries `text`).
+                        // Reasoning the model can no longer read; it adds nothing.
+                        Some("redacted_thinking") => {}
                         _ => {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                            if let Some(t) = super::part_text(obj, param)? {
                                 text.push_str(t);
                             }
                         }
@@ -698,7 +699,7 @@ fn partition_tool_result_blocks(
                             tool_results.push(inner);
                         }
                         _ => {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                            if let Some(t) = super::part_text(obj, param)? {
                                 text.push_str(t);
                             }
                         }
@@ -2428,6 +2429,104 @@ mod tests {
                 }
                 other => panic!("{bad}: expected a 400, got {other:?}"),
             }
+        }
+    }
+
+    /// A part carrying input the text model cannot see is refused on every route a message
+    /// takes, under both prompt renderers; the parts the renderers use are kept.
+    #[test]
+    fn input_the_model_cannot_see_is_refused_not_dropped() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+        let request = |system: Value, messages: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "system": system, "messages": messages,
+                "tools": [{"name": "shot", "input_schema": {"type": "object"}}],
+            }))
+            .unwrap()
+        };
+        let refused = [
+            (
+                "image",
+                Value::Null,
+                json!([{"role": "user", "content": [image, {"type": "text", "text": "What colour?"}]}]),
+                "messages.content",
+            ),
+            (
+                "document",
+                Value::Null,
+                json!([{"role": "user", "content": [{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "x"}}]}]),
+                "messages.content",
+            ),
+            (
+                "search_result",
+                Value::Null,
+                json!([{"role": "user", "content": [{"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]}]}]),
+                "messages.content",
+            ),
+            (
+                "image",
+                Value::Null,
+                json!([
+                    {"role": "user", "content": "take a screenshot"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "shot", "input": {}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [image]}]},
+                ]),
+                "messages.content",
+            ),
+            (
+                "server_tool_use",
+                Value::Null,
+                json!([
+                    {"role": "user", "content": "search"},
+                    {"role": "assistant", "content": [{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}}]},
+                ]),
+                "messages.content",
+            ),
+            (
+                "image",
+                json!([image]),
+                json!([{"role": "user", "content": "hi"}]),
+                "system",
+            ),
+        ];
+        for (kind, system, messages, param) in refused {
+            let req = request(system, messages);
+            for tpl in [None, Some(template)] {
+                match req.prompt(tpl) {
+                    Err(ServerError::BadRequest {
+                        message,
+                        param: Some(p),
+                        ..
+                    }) => {
+                        assert!(message.contains(&format!("`{kind}`")), "{message}");
+                        assert_eq!(p, param, "{message}");
+                    }
+                    other => panic!("`{kind}` under template {}: {other:?}", tpl.is_some()),
+                }
+            }
+        }
+        let kept = request(
+            json!([{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}]),
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "R", "signature": "s"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "Let me look."},
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {}},
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "ok"}]}]},
+            ]),
+        );
+        for tpl in [None, Some(template)] {
+            let (prompt, _) = kept.prompt(tpl).unwrap();
+            assert!(
+                prompt.contains("Be brief.")
+                    && prompt.contains("Let me look.")
+                    && prompt.contains("ok")
+            );
         }
     }
 

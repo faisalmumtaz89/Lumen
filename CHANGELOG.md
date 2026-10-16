@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **An image or other non-text content part was dropped and the request answered without it.**
+  The server reads text only, but a request with an image (a red square asked "What colour?"
+  got "Gray"), a PDF document, a search result or audio was answered as if it had none, and
+  `/v1/messages/count_tokens` counted it as nothing. Such a part is now refused with a 400 naming
+  its type, on `/v1/messages` (in `system`, a message or a `tool_result`) and on
+  `/v1/chat/completions`. Text, tool calls and results and earlier reasoning are read as before.
+
 ## [0.48.3] — 2026-10-16
 
 ### Fixed

@@ -3137,6 +3137,47 @@ mod tests {
         }
     }
 
+    /// A content part carrying input the text model cannot see is refused, under both
+    /// prompt renderers.
+    #[test]
+    fn render_chat_prompt_refuses_input_the_model_cannot_see() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let parts = [
+            (
+                "image_url",
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}),
+            ),
+            (
+                "input_audio",
+                json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}),
+            ),
+            ("file", json!({"type": "file", "file": {"file_id": "f"}})),
+        ];
+        for (kind, part) in parts {
+            let mut msg = user_msg("");
+            msg.content = json!([part, {"type": "text", "text": "What is this?"}]);
+            for tpl in [None, Some(template)] {
+                match render_chat_prompt(std::slice::from_ref(&msg), &[], false, tpl, None) {
+                    Err(ServerError::BadRequest {
+                        message,
+                        param: Some(p),
+                        ..
+                    }) => {
+                        assert!(message.contains(&format!("`{kind}`")), "{message}");
+                        assert_eq!(p, "messages.content");
+                    }
+                    other => panic!("`{kind}` under template {}: {other:?}", tpl.is_some()),
+                }
+            }
+        }
+        let mut text = user_msg("");
+        text.content = json!([{"type": "text", "text": "Say ok."}]);
+        assert!(render_chat_prompt(&[text], &[], false, None, None)
+            .unwrap()
+            .contains("Say ok."));
+    }
+
     #[test]
     fn render_chat_prompt_keeps_later_system_where_it_was_sent() {
         let messages = vec![

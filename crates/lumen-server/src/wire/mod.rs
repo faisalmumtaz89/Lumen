@@ -83,7 +83,7 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
                 if let Some(s) = piece.as_str() {
                     out.push_str(s);
                 } else if let Some(obj) = piece.as_object() {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                    if let Some(text) = part_text(obj, param)? {
                         out.push_str(text);
                     }
                 }
@@ -96,6 +96,22 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
             param,
             "invalid_type",
         )),
+    }
+}
+
+/// The text of a content part. A typed part other than `text` that carries no text holds
+/// input this text model cannot see (an image, a document, audio, a file, a search result,
+/// a server tool's call or result), so dropping it would change the answer: it is refused.
+pub(crate) fn part_text<'a>(
+    part: &'a serde_json::Map<String, Value>,
+    param: &str,
+) -> Result<Option<&'a str>, ServerError> {
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        return Ok(Some(text));
+    }
+    match part.get("type").and_then(Value::as_str) {
+        None | Some("text") => Ok(None),
+        Some(kind) => Err(unsupported(param, &format!("`{kind}` content"))),
     }
 }
 
@@ -750,7 +766,7 @@ mod tests {
         let mixed = serde_json::json!([
             "a",
             {"type": "text", "text": "b"},
-            {"type": "image_url", "image_url": {"url": "x"}}, // no `text` -> contributes nothing
+            {"type": "text", "content": "no text field"},
             {"type": "text", "text": "c"}
         ]);
         assert_eq!(flatten_content(&mixed, "messages.content").unwrap(), "abc");
