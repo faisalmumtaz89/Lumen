@@ -4,7 +4,8 @@
 //! the same `k` tokens, appending the same suffix: their files after the append, the next `M`
 //! greedy tokens and their files after those are equal byte for byte, for `k` of 1, 2, 7 and 64.
 //! The append is also run on a backend whose earlier, longer prefill had already sized its
-//! scratch, and gives the same file as on a fresh backend.
+//! scratch, and gives the same file as on a fresh backend. A prompt whose attention scores
+//! exceed 2^32 elements in one batch gives the same file in one prefill as in two.
 //!
 //! LUMEN_QWEN35_9B_Q8=/path/to/qwen3-5-9b-Q8_0.lbc cargo test --release -p lumen-runtime \
 //!   --test metal_warm_append_test -- --ignored --nocapture
@@ -24,7 +25,7 @@ const M: usize = 8;
 const PROMPT_LEN: usize = 600;
 const SUFFIX_LEN: usize = 400;
 
-fn metal(provider: &MmapWeightProvider) -> MetalF32Backend {
+fn metal(provider: &MmapWeightProvider, context: usize) -> MetalF32Backend {
     if std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
         std::env::set_var("LUMEN_METAL_MMAP_ONLY", "1");
     }
@@ -50,18 +51,18 @@ fn metal(provider: &MmapWeightProvider) -> MetalF32Backend {
         m.set_weight_tying(true);
     }
     let mut hp = provider.lbc().header.hyperparams;
-    hp.max_seq_len = CONTEXT as u32;
+    hp.max_seq_len = context as u32;
     m.init(&hp).unwrap();
     m.preload_weights(provider).unwrap();
     m
 }
 
-fn config() -> RuntimeConfig {
+fn config(context: usize) -> RuntimeConfig {
     RuntimeConfig {
         pipeline_mode: lumen_runtime::pipeline::PipelineMode::MinMem,
         prefetch_distance: 1,
         kv_precision: KvPrecision::F16,
-        max_seq_len: CONTEXT,
+        max_seq_len: context,
         collect_per_layer_timings: false,
     }
 }
@@ -85,18 +86,37 @@ fn tokens(len: usize, salt: usize) -> Vec<u32> {
 struct Model {
     provider: MmapWeightProvider,
     fp: ModelFingerprint,
+    context: usize,
 }
 
 impl Model {
+    fn open(context: usize) -> Model {
+        let path = PathBuf::from(
+            std::env::var("LUMEN_QWEN35_9B_Q8").expect("set LUMEN_QWEN35_9B_Q8 to an LBC"),
+        );
+        let provider = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
+        let fp = ModelFingerprint::from_live_model(
+            &serialize_hyperparams_le(&provider.lbc().header.hyperparams),
+            &[],
+            provider.output_proj_quant.to_u8() as u32,
+            lumen_format::LBC_VERSION,
+        );
+        Model {
+            provider,
+            fp,
+            context,
+        }
+    }
+
     fn hp(&self) -> lumen_format::ModelHyperparams {
         let mut hp = self.provider.lbc().header.hyperparams;
-        hp.max_seq_len = CONTEXT as u32;
+        hp.max_seq_len = self.context as u32;
         hp
     }
 
     fn start(&self, b: &MetalF32Backend, prompt: &[u32]) -> Session {
         b.reset_recurrent_state();
-        let mut s = Session::new(config(), self.hp(), greedy()).unwrap();
+        let mut s = Session::new(config(self.context), self.hp(), greedy()).unwrap();
         s.extend(prompt, b, &self.provider).unwrap();
         s
     }
@@ -135,22 +155,12 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 #[test]
 #[ignore]
 fn a_batched_append_after_generation_continues_the_decoded_state() {
-    let path = PathBuf::from(
-        std::env::var("LUMEN_QWEN35_9B_Q8").expect("set LUMEN_QWEN35_9B_Q8 to an LBC"),
-    );
-    let provider = MmapWeightProvider::open(&path, MmapConfig::default()).unwrap();
-    let fp = ModelFingerprint::from_live_model(
-        &serialize_hyperparams_le(&provider.lbc().header.hyperparams),
-        &[],
-        provider.output_proj_quant.to_u8() as u32,
-        lumen_format::LBC_VERSION,
-    );
-    let model = Model { provider, fp };
+    let model = Model::open(CONTEXT);
     let dir = tempfile::tempdir().unwrap();
     let prompt = tokens(PROMPT_LEN, 1);
     let suffix = tokens(SUFFIX_LEN, 2);
 
-    let x = metal(&model.provider);
+    let x = metal(&model.provider, model.context);
     for k in [1usize, 2, 7, 64] {
         let tag = format!("k={k}");
         let mut a = model.start(&x, &prompt);
@@ -168,8 +178,15 @@ fn a_batched_append_after_generation_continues_the_decoded_state() {
         let live_next = model.generate(&mut live, &x, M);
         let live_after = model.save(&mut live, &x, &dir.path().join("live_after.kv"));
 
-        let mut loaded =
-            Session::load_from_disk(&saved, config(), model.hp(), greedy(), &x, &model.fp).unwrap();
+        let mut loaded = Session::load_from_disk(
+            &saved,
+            config(model.context),
+            model.hp(),
+            greedy(),
+            &x,
+            &model.fp,
+        )
+        .unwrap();
         model.append(&mut loaded, &x, &full);
         let loaded_file = model.save(&mut loaded, &x, &dir.path().join("loaded.kv"));
         let loaded_next = model.generate(&mut loaded, &x, M);
@@ -192,12 +209,12 @@ fn a_batched_append_after_generation_continues_the_decoded_state() {
     // earlier prefill of the whole sequence had sized it already.
     let mut full = prompt.clone();
     full.extend(&suffix);
-    let fresh = metal(&model.provider);
+    let fresh = metal(&model.provider, model.context);
     let mut s = model.start(&fresh, &prompt);
     model.append(&mut s, &fresh, &full);
     let fresh_file = model.save(&mut s, &fresh, &dir.path().join("fresh.kv"));
     drop((s, fresh));
-    let sized = metal(&model.provider);
+    let sized = metal(&model.provider, model.context);
     model.start(&sized, &full);
     let mut s = model.start(&sized, &prompt);
     model.append(&mut s, &sized, &full);
@@ -207,4 +224,29 @@ fn a_batched_append_after_generation_continues_the_decoded_state() {
         None,
         "the append on a fresh backend"
     );
+}
+
+/// Qwen3.5-9B has 16 attention heads: one prefill of 16,384 tokens holds 2^32 attention scores,
+/// the most a 32-bit index reaches, one of 18,324 tokens 18,324 x 16 x 18,328 of them.
+#[test]
+#[ignore]
+fn a_prefill_past_2_pow_32_attention_scores_equals_two_shorter_prefills() {
+    const FIRST: usize = 8_192;
+    let model = Model::open(20_480);
+    let dir = tempfile::tempdir().unwrap();
+    let x = metal(&model.provider, model.context);
+    for long in [16_384usize, 18_324] {
+        let prompt = tokens(long, 3);
+        let mut one = model.start(&x, &prompt);
+        let one_file = model.save(&mut one, &x, &dir.path().join("one.kv"));
+        drop(one);
+        let mut two = model.start(&x, &prompt[..FIRST]);
+        model.append(&mut two, &x, &prompt);
+        let two_file = model.save(&mut two, &x, &dir.path().join("two.kv"));
+        assert_eq!(
+            first_difference(&one_file, &two_file),
+            None,
+            "{long} tokens"
+        );
+    }
 }

@@ -51,6 +51,135 @@ fn dispatch_q8_0_or_orig(
     enc.dispatch_threadgroups(orig_grid, MTLSize::new(128, 1, 1));
 }
 
+/// Attention scores the batched prefill holds at once. The batch's attention runs in slices of
+/// query rows that reuse one score scratch, so its size and the kernels' 32-bit score indices
+/// stay bounded at any prompt and context length.
+const ATTENTION_SLICE_SCORES: usize = 1 << 28;
+
+/// Query rows per attention slice: whole 32-row score tiles, at least one, at most the batch.
+pub(crate) fn attention_slice_rows(
+    batch_size: usize,
+    num_heads: usize,
+    scores_stride: usize,
+) -> usize {
+    (ATTENTION_SLICE_SCORES / (num_heads * scores_stride) / 32 * 32)
+        .max(32)
+        .min(batch_size)
+}
+
+/// One layer's full attention over a batch whose K and V are already in the cache.
+struct BatchedAttention<'a> {
+    q: &'a MetalBuffer,
+    k_cache: &'a MetalBuffer,
+    v_cache: &'a MetalBuffer,
+    scores: &'a MetalBuffer,
+    out: &'a MetalBuffer,
+    head_dim: usize,
+    kv_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    start_pos: usize,
+    batch_size: usize,
+    max_seq_len: usize,
+}
+
+impl BatchedAttention<'_> {
+    /// Scores, softmax and output for each slice of query rows. A row's result does not depend
+    /// on the slice it runs in.
+    fn encode(&self, enc: &MetalComputeEncoder, pipelines: &MetalPipelines) {
+        let q_dim = self.num_heads * self.head_dim;
+        let max_attend_len = self.start_pos + self.batch_size;
+        // Padded to a multiple of 8 for the output kernel's half4 row reads.
+        let scores_stride = (max_attend_len + 7) & !7;
+        let rows = attention_slice_rows(self.batch_size, self.num_heads, scores_stride);
+        let softmax_threads = 256u64.min(max_attend_len as u64).max(1);
+        let precise = metal_attn_precise_pvf32();
+        let u = |v: usize| (v as u32).to_le_bytes();
+        let mut first = 0;
+        while first < self.batch_size {
+            if first > 0 {
+                // The previous slice's output has read the scores this slice overwrites.
+                enc.memory_barrier_with_scope(1);
+            }
+            let slice = rows.min(self.batch_size - first);
+            let start = self.start_pos + first;
+            let rows_off = (first * q_dim * 4) as u64;
+
+            enc.set_pipeline_state(&pipelines.attention_scores_tiled);
+            enc.set_buffer(self.q, rows_off, 0);
+            enc.set_buffer(self.k_cache, 0, 1);
+            enc.set_buffer(self.scores, 0, 2);
+            enc.set_bytes(&u(self.head_dim), 3);
+            enc.set_bytes(&u(self.kv_dim), 4);
+            enc.set_bytes(&u(self.num_heads), 5);
+            enc.set_bytes(&u(self.num_kv_heads), 6);
+            enc.set_bytes(&self.scale.to_le_bytes(), 7);
+            enc.set_bytes(&u(start), 8);
+            enc.set_bytes(&u(scores_stride), 9);
+            enc.set_bytes(&u(slice), 10);
+            enc.dispatch_threadgroups(
+                MTLSize::new(
+                    ((start + slice) as u64).div_ceil(32),
+                    (slice as u64).div_ceil(32),
+                    self.num_heads as u64,
+                ),
+                MTLSize::new(128, 1, 1),
+            );
+            enc.memory_barrier_with_scope(1);
+
+            enc.set_pipeline_state(&pipelines.softmax_batched);
+            enc.set_buffer(self.scores, 0, 0);
+            enc.set_bytes(&u(scores_stride), 1);
+            enc.set_bytes(&u(self.num_heads), 2);
+            enc.set_bytes(&u(start), 3);
+            enc.set_bytes(&u(slice), 4);
+            enc.dispatch_threadgroups(
+                MTLSize::new(self.num_heads as u64, slice as u64, 1),
+                MTLSize::new(softmax_threads, 1, 1),
+            );
+            enc.memory_barrier_with_scope(1);
+
+            // Default: tiled GEMM (F16 simdgroup operands, F32 accumulate).
+            // LUMEN_METAL_ATTN_PRECISE=2: exact-F32 scalar P@V.
+            enc.set_pipeline_state(if precise {
+                &pipelines.attention_output_batched
+            } else {
+                &pipelines.attention_output_tiled
+            });
+            enc.set_buffer(self.scores, 0, 0);
+            enc.set_buffer(self.v_cache, 0, 1);
+            enc.set_buffer(self.out, rows_off, 2);
+            enc.set_bytes(&u(self.head_dim), 3);
+            enc.set_bytes(&u(self.kv_dim), 4);
+            enc.set_bytes(&u(self.num_heads), 5);
+            enc.set_bytes(&u(self.num_kv_heads), 6);
+            enc.set_bytes(&u(start), 7);
+            enc.set_bytes(&u(scores_stride), 8);
+            enc.set_bytes(&u(slice), 9);
+            enc.set_bytes(&u(self.max_seq_len), 10);
+            if precise {
+                let total = (slice * q_dim) as u64;
+                let tg = 256u64.min(total).max(1);
+                enc.dispatch_threadgroups(
+                    MTLSize::new(total.div_ceil(tg), 1, 1),
+                    MTLSize::new(tg, 1, 1),
+                );
+            } else {
+                enc.dispatch_threadgroups(
+                    MTLSize::new(
+                        (self.head_dim as u64).div_ceil(32),
+                        (slice as u64).div_ceil(32),
+                        self.num_heads as u64,
+                    ),
+                    MTLSize::new(128, 1, 1),
+                );
+            }
+            first += slice;
+        }
+    }
+}
+
 impl MetalF32Backend {
     // ========================================================================
     // Batched prefill methods
@@ -215,12 +344,12 @@ impl MetalF32Backend {
             scratch.current_max_batch = batch_size;
         }
 
-        // Scores buffer for batched attention (f16): a row per query token and
-        // head over every attended position, the cached prefix included. The row
-        // stride is padded to a multiple of 8 for half4-aligned vectorized reads in
-        // the tiled attention output kernel, as at dispatch.
+        // Scores buffer for batched attention (f16): a row per query token of one
+        // attention slice and head over every attended position, the cached prefix
+        // included. The row stride is padded to a multiple of 8, as at dispatch.
         let scores_stride_padded = (attend_len + 7) & !7;
-        let scores_bytes = (batch_size * num_heads * scores_stride_padded).max(1) * 2; // f16 = 2 bytes
+        let slice_rows = attention_slice_rows(batch_size, num_heads, scores_stride_padded);
+        let scores_bytes = (slice_rows * num_heads * scores_stride_padded).max(1) * 2; // f16 = 2 bytes
         if scratch
             .batch_scores_buf
             .as_ref()
@@ -1384,20 +1513,9 @@ impl MetalF32Backend {
             // K/V cache writes happen first, then a barrier ensures the cache is populated
             // before attention scores read it. Saves 1 encoder transition per layer.
             {
-                let num_heads_u32 = num_heads as u32;
-                let num_kv_heads_u32 = num_kv_heads as u32;
-                let head_dim_u32 = head_dim as u32;
                 let kv_dim_u32 = kv_dim as u32;
                 let start_pos_u32 = seq_pos_start as u32;
                 let batch_size_u32 = batch_size as u32;
-                let max_attend_len = seq_pos_start + batch_size;
-                // Pad scores stride to multiple of 8 for half4-aligned reads in
-                // attention_output_tiled. The tiled kernel casts score rows to half4*
-                // for vectorized loads; when q_head * stride is not half4-aligned
-                // (stride not divisible by 4), the cast reads garbage bytes. Padding
-                // to 8 ensures alignment for both half4 (4 halfs) and half8 reads.
-                let scores_stride = (max_attend_len + 7) & !7; // round up to multiple of 8
-                let scores_stride_u32 = scores_stride as u32;
 
                 super::profile::set_section("attn/kvwrite+scores+softmax+output");
                 let enc = cmd.new_concurrent_compute_encoder().ok_or_else(|| {
@@ -1434,98 +1552,22 @@ impl MetalF32Backend {
                 // Barrier: KV cache writes must complete before attention reads cache
                 enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
 
-                // -------- Full-attention scores -> softmax -> output (3-pass) --------
-                {
-                    // 6a. Attention scores (tiled GEMM): Q * K^T
-                    enc.set_pipeline_state(&pipelines.attention_scores_tiled);
-                    enc.set_buffer(q_buf, 0, 0);
-                    enc.set_buffer(&scratch.gpu_k_cache[layer_idx], 0, 1);
-                    enc.set_buffer(scores_buf, 0, 2);
-                    enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                    enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                    enc.set_bytes(&attn_scale.to_le_bytes(), 7);
-                    enc.set_bytes(&start_pos_u32.to_le_bytes(), 8);
-                    enc.set_bytes(&scores_stride_u32.to_le_bytes(), 9);
-                    enc.set_bytes(&batch_size_u32.to_le_bytes(), 10);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (max_attend_len as u64).div_ceil(32),
-                            (batch_size as u64).div_ceil(32),
-                            num_heads as u64,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-
-                    // Barrier: attention scores must complete before softmax reads scores_buf
-                    enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
-
-                    // 6b. Softmax over scores
-                    enc.set_pipeline_state(&pipelines.softmax_batched);
-                    enc.set_buffer(scores_buf, 0, 0);
-                    enc.set_bytes(&scores_stride_u32.to_le_bytes(), 1);
-                    enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
-                    enc.set_bytes(&start_pos_u32.to_le_bytes(), 3);
-                    enc.set_bytes(&batch_size_u32.to_le_bytes(), 4);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(num_heads as u64, batch_size as u64, 1),
-                        MTLSize::new(256u64.min(max_attend_len as u64).max(1), 1, 1),
-                    );
-
-                    // Barrier: softmax must complete before attention output reads scores_buf
-                    enc.memory_barrier_with_scope(1); // MTLBarrierScope.buffers
-
-                    // 6c. Attention output: Scores * V
-                    // Default: tiled GEMM (F16 simdgroup operands, F32 accumulate).
-                    // LUMEN_METAL_ATTN_PRECISE=2: exact-F32 scalar P@V (no F16
-                    // operand truncation) — diagnostic precision lever, see
-                    // metal_attn_precise_pvf32 (exact-F32 P@V; diagnostic, default-off).
-                    if metal_attn_precise_pvf32() {
-                        // attention_output_batched: one thread per output element,
-                        // accumulates (float)P * (float)V in F32. Same 11 buffers.
-                        let total_elems = (batch_size * num_heads as usize * head_dim) as u64;
-                        let pv_tg = 256u64.min(total_elems).max(1);
-                        enc.set_pipeline_state(&pipelines.attention_output_batched);
-                        enc.set_buffer(scores_buf, 0, 0);
-                        enc.set_buffer(&scratch.gpu_v_cache[layer_idx], 0, 1);
-                        enc.set_buffer(attn_out_buf, 0, 2);
-                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                        enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
-                        enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
-                        enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
-                        enc.set_bytes(&(max_seq_len as u32).to_le_bytes(), 10);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(total_elems.div_ceil(pv_tg), 1, 1),
-                            MTLSize::new(pv_tg, 1, 1),
-                        );
-                    } else {
-                        // Dispatch: (ceil(head_dim/32), ceil(batch_size/32), num_heads)
-                        enc.set_pipeline_state(&pipelines.attention_output_tiled);
-                        enc.set_buffer(scores_buf, 0, 0);
-                        enc.set_buffer(&scratch.gpu_v_cache[layer_idx], 0, 1);
-                        enc.set_buffer(attn_out_buf, 0, 2);
-                        enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                        enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                        enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                        enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                        enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
-                        enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
-                        enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
-                        enc.set_bytes(&(max_seq_len as u32).to_le_bytes(), 10);
-                        enc.dispatch_threadgroups(
-                            MTLSize::new(
-                                (head_dim as u64).div_ceil(32),
-                                (batch_size as u64).div_ceil(32),
-                                num_heads as u64,
-                            ),
-                            MTLSize::new(128, 1, 1),
-                        );
-                    }
+                BatchedAttention {
+                    q: q_buf,
+                    k_cache: &scratch.gpu_k_cache[layer_idx],
+                    v_cache: &scratch.gpu_v_cache[layer_idx],
+                    scores: scores_buf,
+                    out: attn_out_buf,
+                    head_dim,
+                    kv_dim,
+                    num_heads,
+                    num_kv_heads,
+                    scale: attn_scale,
+                    start_pos: seq_pos_start,
+                    batch_size,
+                    max_seq_len,
                 }
+                .encode(&enc, pipelines);
 
                 enc.end_encoding();
             }
@@ -3367,8 +3409,6 @@ impl MetalF32Backend {
             .get(layer_idx)
             .and_then(|opt| opt.as_ref());
         let qgate_dim = q_dim * 2; // Qwen3.5 attn_q.weight outputs [2*q_dim] interleaved Q+gate
-        let max_attend_len = seq_pos_start + batch_size;
-        let scores_stride = (max_attend_len + 7) & !7;
 
         const TILE_M: u64 = 32;
         const TILE_N: u64 = 32;
@@ -3377,7 +3417,7 @@ impl MetalF32Backend {
         // Buffer-ID byte ranges below use the FULL logical span of each
         // mutable buffer. This is conservative but cheap and matches the
         // design guidance ("for most mutable buffers: use the full
-        // logical tensor byte span"). scores_buf uses the padded stride.
+        // logical tensor byte span").
         let _ = layer_idx;
         let mut plan: Vec<LayerOp<'_>> = Vec::with_capacity(24);
 
@@ -3676,110 +3716,35 @@ impl MetalF32Backend {
             }),
         });
 
-        // Op 12: Attn scores (Strict — depends on KCache + Q; produces scores)
-        let scores_stride_u32 = scores_stride as u32;
-        let p_attn_scores = &pipelines.attention_scores_tiled;
+        // Op 12: Attention scores, softmax and output in slices of query rows (Strict —
+        // depends on KCache + Q; produces attn_out)
+        let attention = BatchedAttention {
+            q: q_buf,
+            k_cache,
+            v_cache,
+            scores: scores_buf,
+            out: attn_out_buf,
+            head_dim,
+            kv_dim,
+            num_heads,
+            num_kv_heads,
+            scale: attn_scale,
+            start_pos: seq_pos_start,
+            batch_size,
+            max_seq_len,
+        };
         plan.push(LayerOp {
-            label: "attn_scores",
+            label: "attention",
             accesses: AccessList::from_iter_inline([
                 Access::read(BufferId::Q),
                 Access::read(BufferId::KCache),
-                Access::write(BufferId::Scores),
-            ]),
-            order_class: OrderClass::Strict,
-            emit: Box::new(move |enc| {
-                enc.set_pipeline_state(p_attn_scores);
-                enc.set_buffer(q_buf, 0, 0);
-                enc.set_buffer(k_cache, 0, 1);
-                enc.set_buffer(scores_buf, 0, 2);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                enc.set_bytes(&attn_scale.to_le_bytes(), 7);
-                enc.set_bytes(&start_pos_u32.to_le_bytes(), 8);
-                enc.set_bytes(&scores_stride_u32.to_le_bytes(), 9);
-                enc.set_bytes(&batch_size_u32.to_le_bytes(), 10);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(
-                        (max_attend_len as u64).div_ceil(32),
-                        (batch_size as u64).div_ceil(32),
-                        num_heads as u64,
-                    ),
-                    MTLSize::new(128, 1, 1),
-                );
-                Ok(())
-            }),
-        });
-
-        // Op 13: Softmax (Strict — in-place on scores)
-        let p_softmax = &pipelines.softmax_batched;
-        plan.push(LayerOp {
-            label: "softmax",
-            accesses: AccessList::from_iter_inline([Access::read_write(BufferId::Scores)]),
-            order_class: OrderClass::Strict,
-            emit: Box::new(move |enc| {
-                enc.set_pipeline_state(p_softmax);
-                enc.set_buffer(scores_buf, 0, 0);
-                enc.set_bytes(&scores_stride_u32.to_le_bytes(), 1);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 2);
-                enc.set_bytes(&start_pos_u32.to_le_bytes(), 3);
-                enc.set_bytes(&batch_size_u32.to_le_bytes(), 4);
-                enc.dispatch_threadgroups(
-                    MTLSize::new(num_heads as u64, batch_size as u64, 1),
-                    MTLSize::new(256u64.min(max_attend_len as u64).max(1), 1, 1),
-                );
-                Ok(())
-            }),
-        });
-
-        // Op 14: Attn output (Strict — reads softmax probs, V cache; writes attn_out)
-        // Default: tiled GEMM (F16 simdgroup P@V). LUMEN_METAL_ATTN_PRECISE=2 routes
-        // to the exact-F32 scalar attention_output_batched (no F16 P@V truncation).
-        let pv_precise = metal_attn_precise_pvf32();
-        let p_attn_out = if pv_precise {
-            &pipelines.attention_output_batched
-        } else {
-            &pipelines.attention_output_tiled
-        };
-        plan.push(LayerOp {
-            label: "attn_output",
-            accesses: AccessList::from_iter_inline([
-                Access::read(BufferId::Scores),
                 Access::read(BufferId::VCache),
+                Access::read_write(BufferId::Scores),
                 Access::write(BufferId::AttnOut),
             ]),
             order_class: OrderClass::Strict,
             emit: Box::new(move |enc| {
-                enc.set_pipeline_state(p_attn_out);
-                enc.set_buffer(scores_buf, 0, 0);
-                enc.set_buffer(v_cache, 0, 1);
-                enc.set_buffer(attn_out_buf, 0, 2);
-                enc.set_bytes(&head_dim_u32.to_le_bytes(), 3);
-                enc.set_bytes(&kv_dim_u32.to_le_bytes(), 4);
-                enc.set_bytes(&num_heads_u32.to_le_bytes(), 5);
-                enc.set_bytes(&num_kv_heads_u32.to_le_bytes(), 6);
-                enc.set_bytes(&start_pos_u32.to_le_bytes(), 7);
-                enc.set_bytes(&scores_stride_u32.to_le_bytes(), 8);
-                enc.set_bytes(&batch_size_u32.to_le_bytes(), 9);
-                enc.set_bytes(&max_seq_len_u32.to_le_bytes(), 10);
-                if pv_precise {
-                    let total_elems = (batch_size * num_heads as usize * head_dim) as u64;
-                    let pv_tg = 256u64.min(total_elems).max(1);
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(total_elems.div_ceil(pv_tg), 1, 1),
-                        MTLSize::new(pv_tg, 1, 1),
-                    );
-                } else {
-                    enc.dispatch_threadgroups(
-                        MTLSize::new(
-                            (head_dim as u64).div_ceil(32),
-                            (batch_size as u64).div_ceil(32),
-                            num_heads as u64,
-                        ),
-                        MTLSize::new(128, 1, 1),
-                    );
-                }
+                attention.encode(enc, pipelines);
                 Ok(())
             }),
         });
