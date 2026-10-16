@@ -649,10 +649,11 @@ fn partition_tool_use_blocks(
                             let t = obj.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
                             reasoning.get_or_insert_with(String::new).push_str(t);
                         }
-                        // text part (or any other block that carries `text`).
+                        // Reasoning the model can no longer read; it adds nothing.
+                        Some("redacted_thinking") => {}
                         _ => {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
-                                text.push_str(t);
+                            if let Some(t) = super::part_text(obj) {
+                                text.push_str(&t);
                             }
                         }
                     }
@@ -698,8 +699,8 @@ fn partition_tool_result_blocks(
                             tool_results.push(inner);
                         }
                         _ => {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
-                                text.push_str(t);
+                            if let Some(t) = super::part_text(obj) {
+                                text.push_str(&t);
                             }
                         }
                     }
@@ -2428,6 +2429,107 @@ mod tests {
                 }
                 other => panic!("{bad}: expected a 400, got {other:?}"),
             }
+        }
+    }
+
+    /// A part carrying input the text model cannot read becomes a note naming it on every
+    /// route a message takes, under both prompt renderers; the parts the renderers use are
+    /// kept as they were.
+    #[test]
+    fn input_the_model_cannot_read_becomes_a_note() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+        let request = |system: Value, messages: Value| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "system": system, "messages": messages,
+                "tools": [{"name": "shot", "input_schema": {"type": "object"}}],
+            }))
+            .unwrap()
+        };
+        let noted = [
+            (
+                "image",
+                Value::Null,
+                json!([{"role": "user", "content": [image, {"type": "text", "text": "What colour?"}]}]),
+            ),
+            (
+                "document",
+                Value::Null,
+                json!([{"role": "user", "content": [{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "x"}}, {"type": "text", "text": "What colour?"}]}]),
+            ),
+            (
+                "search_result",
+                Value::Null,
+                json!([{"role": "user", "content": [{"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]}, {"type": "text", "text": "What colour?"}]}]),
+            ),
+            (
+                "image",
+                Value::Null,
+                json!([
+                    {"role": "user", "content": "take a screenshot"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "shot", "input": {}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [image]}, {"type": "text", "text": "What colour?"}]},
+                ]),
+            ),
+            (
+                "server_tool_use",
+                Value::Null,
+                json!([
+                    {"role": "user", "content": "search"},
+                    {"role": "assistant", "content": [{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}}]},
+                    {"role": "user", "content": "What colour?"},
+                ]),
+            ),
+            (
+                "image",
+                json!([image]),
+                json!([{"role": "user", "content": "What colour?"}]),
+            ),
+        ];
+        for (kind, system, messages) in noted {
+            let req = request(system, messages);
+            for tpl in [None, Some(template)] {
+                let (prompt, _) = req.prompt(tpl).unwrap();
+                let note = format!("[{kind} omitted: this model reads text only]");
+                assert!(
+                    prompt.contains(&note),
+                    "`{kind}` under template {}: {prompt}",
+                    tpl.is_some()
+                );
+                assert!(prompt.contains("What colour?"), "{prompt}");
+            }
+        }
+        let kept = request(
+            json!([{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}]),
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "Hello there", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Reasoning R", "signature": "s"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "Let me look."},
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {"path": "/tmp/kept.png"}},
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": false, "content": [{"type": "text", "text": "Shot taken"}]}]},
+            ]),
+        );
+        for tpl in [None, Some(template)] {
+            let (prompt, _) = kept.prompt(tpl).unwrap();
+            for part in [
+                "Be brief.",
+                "Hello there",
+                "Let me look.",
+                "/tmp/kept.png",
+                "Shot taken",
+            ] {
+                assert!(
+                    prompt.contains(part),
+                    "{part:?} under template {}: {prompt}",
+                    tpl.is_some()
+                );
+            }
+            assert!(!prompt.contains("omitted"), "{prompt}");
+            assert_eq!(prompt.contains("Reasoning R"), tpl.is_some(), "{prompt}");
         }
     }
 

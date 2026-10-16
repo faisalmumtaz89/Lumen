@@ -3,6 +3,7 @@
 //! Each submodule owns the request DTO, the SSE state machine, and the
 //! non-streaming response shape for one external API.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,9 +57,11 @@ pub(crate) fn bench_token_ids_guard(stream: bool, stop_text: &[String]) -> Resul
 /// - `String` → returned verbatim.
 /// - `Null` → empty string (an absent/optional content field).
 /// - `Array` → each element flattened and concatenated: a bare string element
-///   is appended as-is; a content-part object contributes ONLY its `text`
-///   field (the single recognized key). Any other element kind (number, bool,
-///   nested array, object without `text`) contributes nothing.
+///   is appended as-is; a content-part object contributes what [`part_text`]
+///   gives it (its `text`, a `refusal` part's `refusal`, or a note
+///   naming a part the text model cannot read). Any other element kind
+///   (number, bool, nested array, untyped object without `text`) contributes
+///   nothing.
 ///
 /// ROBUST-007 numeric-type-guard: a bare number/bool (or any non
 /// string/array/null scalar) at the top level is REJECTED as a 400 rather
@@ -83,8 +86,8 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
                 if let Some(s) = piece.as_str() {
                     out.push_str(s);
                 } else if let Some(obj) = piece.as_object() {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        out.push_str(text);
+                    if let Some(text) = part_text(obj) {
+                        out.push_str(&text);
                     }
                 }
             }
@@ -96,6 +99,27 @@ pub(crate) fn flatten_content(content: &Value, param: &str) -> Result<String, Se
             param,
             "invalid_type",
         )),
+    }
+}
+
+/// The text a content part gives the prompt: its `text`, or a `refusal` part's `refusal`. A
+/// typed part of another kind that carries no text holds input this text model cannot read (an
+/// image, a document, audio, a file, a search result, a server tool's call or result); it
+/// becomes a note naming it, so the model knows something was left out and a conversation that
+/// holds one can go on.
+pub(crate) fn part_text(part: &serde_json::Map<String, Value>) -> Option<Cow<'_, str>> {
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        return Some(Cow::Borrowed(text));
+    }
+    match part.get("type").and_then(Value::as_str) {
+        None | Some("text") => None,
+        Some("refusal") => part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(Cow::Borrowed),
+        Some(kind) => Some(Cow::Owned(format!(
+            "[{kind} omitted: this model reads text only]\n"
+        ))),
     }
 }
 
@@ -750,7 +774,7 @@ mod tests {
         let mixed = serde_json::json!([
             "a",
             {"type": "text", "text": "b"},
-            {"type": "image_url", "image_url": {"url": "x"}}, // no `text` -> contributes nothing
+            {"type": "text", "content": "no text field"},
             {"type": "text", "text": "c"}
         ]);
         assert_eq!(flatten_content(&mixed, "messages.content").unwrap(), "abc");

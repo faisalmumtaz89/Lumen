@@ -3137,6 +3137,46 @@ mod tests {
         }
     }
 
+    /// A content part carrying input the text model cannot read becomes a note naming it, and
+    /// an assistant `refusal` part is read as its text, under both prompt renderers.
+    #[test]
+    fn render_chat_prompt_notes_input_the_model_cannot_read() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let parts = [
+            (
+                "image_url",
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}),
+            ),
+            (
+                "input_audio",
+                json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}),
+            ),
+            ("file", json!({"type": "file", "file": {"file_id": "f"}})),
+        ];
+        for (kind, part) in parts {
+            let mut msg = user_msg("");
+            msg.content = json!([part, {"type": "text", "text": "What is this?"}]);
+            for tpl in [None, Some(template)] {
+                let prompt =
+                    render_chat_prompt(std::slice::from_ref(&msg), &[], false, tpl, None).unwrap();
+                let noted = format!("[{kind} omitted: this model reads text only]\nWhat is this?");
+                assert!(
+                    prompt.contains(&noted),
+                    "`{kind}` under template {}: {prompt}",
+                    tpl.is_some()
+                );
+            }
+        }
+        let mut refused = assistant_msg("");
+        refused.content = json!([{"type": "refusal", "refusal": "I cannot answer that."}]);
+        let messages = [user_msg("Q1"), refused, user_msg("Then say hello.")];
+        for tpl in [None, Some(template)] {
+            let prompt = render_chat_prompt(&messages, &[], false, tpl, None).unwrap();
+            assert!(prompt.contains("I cannot answer that."), "{prompt}");
+        }
+    }
+
     #[test]
     fn render_chat_prompt_keeps_later_system_where_it_was_sent() {
         let messages = vec![
