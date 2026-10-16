@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.48.2] — 2026-10-16
+
 ### Fixed
 
 - **A request that continued the conversation the server held fed its new tokens one at a
@@ -2171,7 +2173,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.1...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.2...HEAD
+[0.48.2]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.1...v0.48.2
 [0.48.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.0...v0.48.1
 [0.48.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.47.0...v0.48.0
 [0.47.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.46.0...v0.47.0
