@@ -25,7 +25,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   The step that combines each token's routed expert outputs indexed a buffer longer than 2^32
   elements with 32-bit arithmetic, so past 8,192 tokens in one prefill some tokens read another
   expert's slot or leftover data, and the same prompt could give different answers. The index is
-  now 64-bit; a long prompt prefilled at once now matches the same prompt prefilled in parts.
+  now 64-bit: a 12,000-token prompt gives the same answer on every run, prefilled at once or in
+  parts.
 
 ## [0.48.3] — 2026-10-16
 
