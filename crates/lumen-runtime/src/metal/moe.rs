@@ -2424,7 +2424,7 @@ impl MetalF32Backend {
     /// GPU-CPU sync barriers.
     ///
     /// Previous: 1 command buffer × N layers = N sync barriers per prefill.
-    /// Now: 1 command buffer for ALL N layers = 1 sync barrier per prefill.
+    /// Now: 1 command buffer for ALL N layers = 1 sync barrier per prefill slice.
     ///
     /// Uses cached zero-copy layer buffer with subtensor offsets (same as decode path)
     /// instead of creating new Metal buffers from bytes each time.

@@ -3403,7 +3403,7 @@ impl ComputeBackend for MetalF32Backend {
     /// Also honoured via `LUMEN_METAL_PROFILE=1` env var at backend
     /// construction time (`MetalF32Backend::new`).
     ///
-    /// In profile mode, `prefill()` auto-splits its single command buffer
+    /// In profile mode, `prefill()` auto-splits each slice's command buffer
     /// at known section boundaries (attn RMSNorm+QKV, QKV deinterleave,
     /// KV-cache write+attention, Wo proj+residual, FFN gate/up, SwiGLU,
     /// FFN down+residual, GDN). Each split issues a `commit + wait` and
