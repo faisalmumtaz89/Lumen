@@ -34,6 +34,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   indexes are bounded by the slice. A 12,000-token prompt gave identical greedy output to an
   unsliced prefill on the 9B, 27B and 35B-A3B, and its prefill took about 8% less time on the 9B
   and 27B.
+- **With `LUMEN_METAL_BF16_GATE_UP_NR=4`, a Metal prefill of a BF16 model could read and write
+  32 rows past its batch.** The fused gate/up/SwiGLU kernel works in 64-row tiles, but its variant
+  without boundary checks was chosen for any batch that was a multiple of 32, so a batch such as
+  544 tokens ran its last tile 32 rows past the batch, past the end of its buffers when they were
+  sized for exactly that batch. That variant is now chosen only for batches that fill whole tiles
+  of the selected size; the default (NR=2) was not affected.
 
 ## [0.48.3] — 2026-10-16
 
