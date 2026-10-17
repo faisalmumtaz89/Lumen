@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.48.4] — 2026-10-17
+
 ### Fixed
 
 - **An image or other non-text content part was dropped without a trace.** The server reads text
@@ -2222,7 +2224,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.3...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.4...HEAD
+[0.48.4]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.3...v0.48.4
 [0.48.3]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.2...v0.48.3
 [0.48.2]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.1...v0.48.2
 [0.48.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.0...v0.48.1
