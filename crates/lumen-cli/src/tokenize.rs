@@ -8,6 +8,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
+use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;
 
 // ---------------------------------------------------------------------------
@@ -66,8 +67,8 @@ pub struct BpeTokenizer {
     merge_ranks: HashMap<(String, String), usize>,
     /// For SPM: scores per token (higher = higher priority merge).
     scores: Vec<f32>,
-    /// Pre-tokenizer regex pattern (compiled, supports lookahead via fancy-regex).
-    pre_regex: Option<fancy_regex::Regex>,
+    /// Pre-tokenizer pattern, applied through [`next_pre_token`].
+    pre_regex: Option<regex::Regex>,
     /// Tokenizer model type: "gpt2" or "llama".
     model_type: String,
     /// Pre-tokenizer identifier: "llama-bpe", "qwen2", "qwen35", "default".
@@ -99,21 +100,45 @@ pub struct BpeTokenizer {
 }
 
 /// Pre-tokenizer regex for llama-bpe and qwen2 (GPT-4 / Llama-3 `Split`
-/// pattern: digits grouped `\p{N}{1,3}`, letter runs `\p{L}+`).
-/// Uses negative lookahead `(?!\S)` which requires fancy-regex.
-const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// pattern: digits grouped `\p{N}{1,3}`, letter runs `\p{L}+`). The reference
+/// pattern's `\s+(?!\S)` alternative, before the final `\s+`, is applied by
+/// [`next_pre_token`], since the linear-time engine has no lookahead.
+const PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
-/// Pre-tokenizer regex for qwen35. This is the EXACT `Split` `pattern.Regex`
-/// from the Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split
-/// "Isolated" -> ByteLevel use_regex=false). It differs from the llama/qwen2
-/// pattern in three ways that its reference mandates:
+/// Pre-tokenizer regex for qwen35: the `Split` `pattern.Regex` from the
+/// Qwen3.5 `tokenizer.json` pre_tokenizer (Sequence -> Split "Isolated" ->
+/// ByteLevel use_regex=false), less the alternative noted below. It differs
+/// from the llama/qwen2 pattern in three ways that its reference mandates:
 ///   * letter runs include combining marks — `[\p{L}\p{M}]+` (not `\p{L}+`) —
 ///     so scripts like Thai keep a base character and its following marks in
 ///     one pre-token (fixes CORR-007: Thai over-segmentation).
 ///   * digits are isolated one at a time — `\p{N}` (not `\p{N}{1,3}`).
 ///   * the punctuation run also excludes marks — `[^\s\p{L}\p{M}\p{N}]+` — so a
 ///     combining mark is never swallowed into an adjacent punctuation span.
-const PRETOKENIZER_REGEX_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+///
+/// As above, the `\s+(?!\S)` alternative is applied by [`next_pre_token`].
+const PRETOKENIZER_REGEX_QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// The byte range of the pre-token of `chunk` that starts at `start`, or `None` at
+/// the end. A whitespace match without CR or LF can only come from the final
+/// `\s+`; when it is two or more characters long and more text follows, the
+/// reference pattern's `\s+(?!\S)` would have stopped one character short, leaving
+/// the last whitespace character to the next pre-token, so that is done here.
+fn next_pre_token(re: &regex::Regex, chunk: &str, start: usize) -> Option<Range<usize>> {
+    let m = re.find_at(chunk, start)?;
+    let piece = m.as_str();
+    let mut end = m.end();
+    let inline_whitespace = piece
+        .chars()
+        .all(|c| c.is_whitespace() && c != '\r' && c != '\n');
+    if inline_whitespace && end < chunk.len() {
+        let last = piece.chars().next_back()?.len_utf8();
+        if piece.len() > last {
+            end -= last;
+        }
+    }
+    Some(m.start()..end)
+}
 
 impl BpeTokenizer {
     /// Build a tokenizer from extracted GGUF tokenizer data.
@@ -147,7 +172,7 @@ impl BpeTokenizer {
             } else {
                 PRETOKENIZER_REGEX
             };
-            Some(fancy_regex::Regex::new(pattern).expect("failed to compile pre-tokenizer regex"))
+            Some(regex::Regex::new(pattern).expect("failed to compile pre-tokenizer regex"))
         } else {
             None
         };
@@ -471,38 +496,27 @@ impl BpeTokenizer {
                     all_ids.push(id);
                 }
                 Segment::Text(chunk) => {
-                    // Pre-tokenize: split using regex.
-                    // fancy_regex::Regex::find_iter returns Result items.
                     let mut start = 0;
-                    while start < chunk.len() {
-                        match re.find_from_pos(&chunk, start) {
-                            Ok(Some(mat)) => {
-                                let piece = mat.as_str();
-                                // Convert bytes to GPT-2 unicode.
-                                let unicode_piece: String = piece
-                                    .as_bytes()
-                                    .iter()
-                                    .map(|&b| self.byte_to_unicode[b as usize])
-                                    .collect();
+                    while let Some(range) = next_pre_token(re, &chunk, start) {
+                        start = range.end;
+                        // Convert bytes to GPT-2 unicode.
+                        let unicode_piece: String = chunk[range]
+                            .bytes()
+                            .map(|b| self.byte_to_unicode[b as usize])
+                            .collect();
 
-                                // Split into individual GPT-2 unicode chars.
-                                let symbols: Vec<String> =
-                                    unicode_piece.chars().map(|c| c.to_string()).collect();
+                        // Split into individual GPT-2 unicode chars.
+                        let symbols: Vec<String> =
+                            unicode_piece.chars().map(|c| c.to_string()).collect();
 
-                                // Apply BPE merges.
-                                let merged = self.bpe_merge_tiktoken(&symbols);
+                        // Apply BPE merges.
+                        let merged = self.bpe_merge_tiktoken(&symbols);
 
-                                // Map to token IDs.
-                                for sym in &merged {
-                                    if let Some(&id) = self.token_to_id.get(sym) {
-                                        all_ids.push(id);
-                                    }
-                                }
-
-                                start = mat.end();
+                        // Map to token IDs.
+                        for sym in &merged {
+                            if let Some(&id) = self.token_to_id.get(sym) {
+                                all_ids.push(id);
                             }
-                            Ok(None) => break,
-                            Err(_) => break,
                         }
                     }
                 }
@@ -1080,6 +1094,79 @@ mod tests {
                 "case {case}: {text:?} with {:?}",
                 tok.special_tokens
             );
+        }
+    }
+
+    /// A whitespace run without CR or LF gives its last character to what follows,
+    /// as the reference pattern's `\s+(?!\S)` does, unless it ends the text.
+    #[test]
+    fn pre_tokenizer_leaves_the_last_space_to_what_follows() {
+        let cases: [(&str, &[&str]); 7] = [
+            ("  a", &[" ", " a"]),
+            ("  1", &[" ", " ", "1"]),
+            ("\u{a0}\u{a0}a", &["\u{a0}", "\u{a0}a"]),
+            ("\r\n  a", &["\r\n", " ", " a"]),
+            ("a  ", &["a", "  "]),
+            ("a \t\n b", &["a", " \t\n", " b"]),
+            (
+                "x\u{3000}\u{3000}\u{3000}=",
+                &["x", "\u{3000}\u{3000}", "\u{3000}", "="],
+            ),
+        ];
+        for pattern in [PRETOKENIZER_REGEX, PRETOKENIZER_REGEX_QWEN35] {
+            let re = regex::Regex::new(pattern).unwrap();
+            for (text, expected) in cases {
+                let mut pieces = Vec::new();
+                let mut start = 0;
+                while let Some(range) = next_pre_token(&re, text, start) {
+                    start = range.end;
+                    pieces.push(&text[range]);
+                }
+                assert_eq!(pieces, expected, "{text:?}");
+            }
+        }
+    }
+
+    /// Every character reaches a token, around a run of letters, spaces or symbols too long
+    /// for a backtracking regex to hold (a tokenizer with one token per character and no merges).
+    #[test]
+    fn pre_tokenizer_keeps_every_character_of_a_long_run() {
+        let symbols: Vec<String> = "hia=dn"
+            .chars()
+            .chain(['\u{120}'])
+            .map(String::from)
+            .collect();
+        for pre_tokenizer in ["qwen35", "qwen2"] {
+            let tok =
+                BpeTokenizer::from_tokenizer_data(&lumen_convert::tokenizer_data::TokenizerData {
+                    model_type: "gpt2".into(),
+                    pre_tokenizer: pre_tokenizer.into(),
+                    token_types: vec![1; symbols.len()],
+                    tokens: symbols.clone(),
+                    scores: vec![0.0; symbols.len()],
+                    merges: Vec::new(),
+                    bos_token_id: 0,
+                    eos_token_id: 1,
+                    pad_token_id: None,
+                    add_bos_token: false,
+                    add_eos_token: false,
+                    add_space_prefix: false,
+                    chat_template: None,
+                });
+            for run in [
+                "a".repeat(1_100_000),
+                "=".repeat(1_100_000),
+                " ".repeat(1_100_000),
+            ] {
+                let text = format!("hi {run} and");
+                assert_eq!(
+                    tok.encode(&text).len(),
+                    text.chars().count(),
+                    "{pre_tokenizer}: a run of {} {:?}",
+                    run.len(),
+                    &run[..1]
+                );
+            }
         }
     }
 

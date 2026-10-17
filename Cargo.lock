@@ -753,7 +753,6 @@ name = "lumen-cli"
 version = "0.48.3"
 dependencies = [
  "dirs",
- "fancy-regex",
  "indicatif",
  "libc",
  "lumen-bench",
