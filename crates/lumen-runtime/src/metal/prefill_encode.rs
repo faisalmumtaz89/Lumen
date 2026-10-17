@@ -4282,8 +4282,9 @@ impl MetalF32Backend {
     /// The BF16 fused gate+up+SwiGLU pipeline for the NR microtile `nr`
     /// (`LUMEN_METAL_BF16_GATE_UP_NR`), with its tile height (the dispatch grid's
     /// Y divisor) and threadgroup memory. The variant without boundary checks
-    /// needs whole tiles: a batch that is a multiple of 32 and of the tile height,
-    /// the FFN width a multiple of 32 and the hidden width a multiple of 64.
+    /// is chosen only for whole tiles: a batch that is a multiple of 32 and of the
+    /// tile height, the FFN width a multiple of 32 and the hidden width a multiple
+    /// of 64.
     pub(crate) fn bf16_gate_up_swiglu_pipeline(
         pipelines: &MetalPipelines,
         nr: u8,
