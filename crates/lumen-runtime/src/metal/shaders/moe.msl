@@ -502,8 +502,9 @@ kernel void moe_expert_accum_batched(
     for (uint k = 0; k < top_k; k++) {
         uint e = expert_ids[b * top_k + k];
         float w = expert_weights[b * top_k + k];
-        // expert_outputs layout: [num_experts, batch_size, hidden_dim]
-        sum += w * expert_outputs[e * batch_size * hidden_dim + b * hidden_dim + t];
+        // expert_outputs layout: [num_experts, batch_size, hidden_dim]; its
+        // length passes 2^32 elements past batch 8,192 at 256 x 2,048.
+        sum += w * expert_outputs[(ulong)e * batch_size * hidden_dim + (ulong)b * hidden_dim + t];
     }
     output[gid] = sum;
 }
