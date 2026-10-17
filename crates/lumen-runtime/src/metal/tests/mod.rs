@@ -1,6 +1,7 @@
 mod argmax_tiled;
 mod attention;
 mod basic;
+mod bf16_gate_up;
 mod gdn;
 mod microbench;
 mod moe;

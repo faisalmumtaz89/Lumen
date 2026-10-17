@@ -2664,28 +2664,13 @@ impl MetalF32Backend {
                             "Failed to create encoder (fused gate+up+swiglu bf16)".into(),
                         )
                     })?;
-                    let ffn_aligned =
-                        batch_size % 32 == 0 && inter_dim % 32 == 0 && hidden_dim % 32 == 0;
-                    // NR microtile selection. Baseline NR=2 unchanged when
-                    // `LUMEN_METAL_BF16_GATE_UP_NR` is unset or set to a non-{1,4} value.
-                    let nr = super::graph_reorder::bf16_gate_up_nr();
-                    // Per-variant TILE_M (the dispatch grid Y-dim divisor) and shmem size.
-                    // shmem layout invariants are encoded in the MSL kernel; we mirror the
-                    // byte count here so set_threadgroup_memory_length matches the kernel's
-                    // shmem declaration exactly.
-                    let (tile_m_dispatch, shmem_bytes): (u64, u64) = match nr {
-                        1 => (16, 10240), // 5120 bfloats * 2 bytes
-                        4 => (64, 16384), // 8192 bfloats * 2 bytes
-                        _ => (32, 12288), // 6144 bfloats * 2 bytes (NR=2 baseline)
-                    };
-                    let pso = match (nr, ffn_aligned && hidden_dim % 64 == 0) {
-                        (1, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1_aligned,
-                        (1, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1,
-                        (4, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4_aligned,
-                        (4, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4,
-                        (_, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_aligned,
-                        (_, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused,
-                    };
+                    let (pso, tile_m_dispatch, shmem_bytes) = Self::bf16_gate_up_swiglu_pipeline(
+                        pipelines,
+                        super::graph_reorder::bf16_gate_up_nr(),
+                        batch_size,
+                        inter_dim,
+                        hidden_dim,
+                    );
                     enc.set_pipeline_state(pso);
                     enc.set_threadgroup_memory_length(shmem_bytes, 0);
                     enc.set_buffer(layer_buf, w_gate_off, 0);
@@ -3939,20 +3924,13 @@ impl MetalF32Backend {
             // NR=2 (baseline, 12 KB shmem). NR=1 (10 KB). NR=4 (16 KB). The
             // dispatch-grid Y divisor and threadgroup memory length must match
             // the kernel's TILE_M and shmem declaration respectively.
-            let nr = super::graph_reorder::bf16_gate_up_nr();
-            let (tile_m_dispatch, shmem_bytes): (u64, u64) = match nr {
-                1 => (16, 10240),
-                4 => (64, 16384),
-                _ => (32, 12288),
-            };
-            let pso = match (nr, ffn_aligned && hidden_dim % 64 == 0) {
-                (1, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1_aligned,
-                (1, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1,
-                (4, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4_aligned,
-                (4, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4,
-                (_, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_aligned,
-                (_, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused,
-            };
+            let (pso, tile_m_dispatch, shmem_bytes) = Self::bf16_gate_up_swiglu_pipeline(
+                pipelines,
+                super::graph_reorder::bf16_gate_up_nr(),
+                batch_size,
+                inter_dim,
+                hidden_dim,
+            );
             plan.push(LayerOp {
                 label: "ffn_gate_up_swiglu_fused_bf16",
                 accesses: AccessList::from_iter_inline([
@@ -4299,6 +4277,38 @@ impl MetalF32Backend {
                 Ok(())
             }),
         }
+    }
+
+    /// The BF16 fused gate+up+SwiGLU pipeline for the NR microtile `nr`
+    /// (`LUMEN_METAL_BF16_GATE_UP_NR`), with its tile height (the dispatch grid's
+    /// Y divisor) and threadgroup memory. The variant without boundary checks
+    /// needs whole tiles: a batch that is a multiple of the tile height, the FFN
+    /// width a multiple of 32 and the hidden width a multiple of 64.
+    pub(crate) fn bf16_gate_up_swiglu_pipeline(
+        pipelines: &MetalPipelines,
+        nr: u8,
+        batch_size: usize,
+        inter_dim: usize,
+        hidden_dim: usize,
+    ) -> (&super::ffi::MetalPipelineState, u64, u64) {
+        // Per-variant TILE_M and shmem size; the shmem byte count mirrors the
+        // kernel's declaration so set_threadgroup_memory_length matches it.
+        let (tile_m, shmem_bytes): (u64, u64) = match nr {
+            1 => (16, 10240), // 5120 bfloats * 2 bytes
+            4 => (64, 16384), // 8192 bfloats * 2 bytes
+            _ => (32, 12288), // 6144 bfloats * 2 bytes (NR=2 baseline)
+        };
+        let aligned =
+            batch_size as u64 % tile_m == 0 && inter_dim % 32 == 0 && hidden_dim % 64 == 0;
+        let pso = match (nr, aligned) {
+            (1, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1_aligned,
+            (1, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr1,
+            (4, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4_aligned,
+            (4, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused_nr4,
+            (_, true) => &pipelines.bf16_matmul_gate_up_swiglu_fused_aligned,
+            (_, false) => &pipelines.bf16_matmul_gate_up_swiglu_fused,
+        };
+        (pso, tile_m, shmem_bytes)
     }
 
     /// Pick the pipeline + threadgroup-memory pair for a non-residual GEMM.
