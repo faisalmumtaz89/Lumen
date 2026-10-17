@@ -8,6 +8,14 @@ use crate::error::RuntimeError;
 use crate::metal::ffi::MetalCommandBuffer;
 use lumen_format::quantization::QuantScheme;
 
+/// Tokens per prefill slice. A prompt longer than this runs through the layers in
+/// slices, each continuing the KV cache and recurrent state the previous one left, so
+/// the batch-sized scratch and every per-batch element count stay bounded by the slice
+/// rather than the prompt (a 27B prompt near its 262,144-token context would otherwise
+/// need ~96 GiB of scratch and index past 2^32 elements in the FFN). Prompts up to
+/// this length run as one slice, exactly as before.
+pub(crate) const PREFILL_SLICE_TOKENS: usize = 2048;
+
 impl MetalF32Backend {
     /// Embed a batch of token ids into the batch x_buf on the GPU.
     /// Encode token embedding lookup into an existing command buffer.
@@ -126,6 +134,21 @@ impl MetalF32Backend {
     ///
     /// Returns the final hidden state of the LAST token.
     pub fn prefill(
+        &self,
+        prompt_tokens: &[u32],
+        weights: &dyn crate::weight::cache::WeightProvider,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let mut last_hidden = None;
+        for slice in prompt_tokens.chunks(PREFILL_SLICE_TOKENS) {
+            last_hidden = Some(self.prefill_slice(slice, weights, kv)?);
+        }
+        last_hidden.ok_or_else(|| RuntimeError::Compute("empty prompt".into()))
+    }
+
+    /// One slice of [`Self::prefill`]: up to `PREFILL_SLICE_TOKENS` tokens continuing
+    /// the KV cache at `kv.seq_len()`.
+    fn prefill_slice(
         &self,
         prompt_tokens: &[u32],
         weights: &dyn crate::weight::cache::WeightProvider,
