@@ -31,8 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   (about 96 GiB for a Qwen3.8-27B prompt near its 262,144-token context), and from 246,724 tokens
   in one prompt the 27B's FFN matrix products indexed past 2^32 elements and wrote to the wrong
   rows. Metal now prefills in slices of 2,048 tokens, as CUDA does, so the scratch and these
-  indexes are bounded by the slice. Outputs are unchanged: a 12,000-token prompt gives identical
-  greedy output on the 9B, 27B and 35B-A3B, and its prefill took about 8% less time on the 9B
+  indexes are bounded by the slice. A 12,000-token prompt gave identical greedy output to an
+  unsliced prefill on the 9B, 27B and 35B-A3B, and its prefill took about 8% less time on the 9B
   and 27B.
 
 ## [0.48.3] — 2026-10-16

@@ -114,23 +114,15 @@ impl MetalF32Backend {
         Ok(all_data[last_start..last_start + hidden_dim].to_vec())
     }
 
-    /// Run batched prefill: process all prompt tokens through all layers on the GPU.
+    /// Run batched prefill: process all prompt tokens through all layers on the GPU,
+    /// one slice of at most `PREFILL_SLICE_TOKENS` tokens at a time.
     ///
-    /// Optimized: ALL layers are encoded into a SINGLE Metal command buffer.
-    /// Previous: 1 command buffer per layer = N sync barriers per prefill.
-    /// Now: 1 command buffer for ALL N layers = 1 sync barrier for entire prefill.
-    ///
-    /// This eliminates 21 GPU-CPU round-trips for a 22-layer model. The GPU
-    /// processes all layers back-to-back without waiting for CPU acknowledgment
-    /// between layers. Metal encoder barriers (implicit between compute encoders
-    /// in the same command buffer) ensure correct ordering.
-    ///
-    /// Memory safety: All LayerViews are collected into a Vec and kept alive
-    /// until after commit_and_wait(). For mmap-backed weights, the underlying
-    /// memory is the mmap region (outlives the function call). For Arc-backed
-    /// weights, holding the LayerView keeps the Arc alive. The zero-copy Metal
-    /// buffers (bytesNoCopy) in layer_buf_cache reference this same memory,
-    /// so they remain valid for the duration of GPU execution.
+    /// Memory safety: All LayerViews are collected into a Vec once and kept alive
+    /// until every slice's commit_and_wait() has returned. For mmap-backed
+    /// weights, the underlying memory is the mmap region (outlives the function
+    /// call). For Arc-backed weights, holding the LayerView keeps the Arc alive.
+    /// The zero-copy Metal buffers (bytesNoCopy) in layer_buf_cache reference this
+    /// same memory, so they remain valid for the duration of GPU execution.
     ///
     /// Returns the final hidden state of the LAST token.
     pub fn prefill(
@@ -139,19 +131,56 @@ impl MetalF32Backend {
         weights: &dyn crate::weight::cache::WeightProvider,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
+        // E.5: `begin_pass` is "called once per forward pass" per the
+        // trait contract (`cache.rs:309-313`). the prior loop body called
+        // it per-layer, but after layer 0 the compute cursor is set to 0 by
+        // `begin_pass` and immediately overwritten by `try_get_layer`'s
+        // `fetch_max(layer, ...)` — the per-iteration resets in iterations
+        // 2..N were no-ops at best and semantic noise at worst. Moving the
+        // call outside the loop matches the documented intent at
+        // `provider_mmap.rs:243-249` and eliminates 21-31 redundant atomic
+        // stores per prefill.
+        weights.begin_pass();
+        let layer_views = (0..weights.num_layers())
+            .map(|layer| {
+                // get_layer_raw (NOT get_layer_blocking) on the fallback path: the
+                // batched-prefill kernels read weight bytes from the GPU-resident
+                // *raw* unified buffer (uploaded via get_layer_raw) but take the
+                // per-subtensor OFFSETS from this LayerView's `subtensors`. Those
+                // offsets MUST describe the raw native-quant blob layout.
+                // SyncWeightProvider::get_layer_blocking returns a re-quantized F32
+                // blob with DIFFERENT offsets (and stale ssm_* offsets), so using it
+                // here made the kernels read the raw buffer at the wrong offsets ->
+                // pad-token garbage. MmapWeightProvider hits the `Some` arm below
+                // (try_get_layer returns its pre-built raw zero-copy view), so this
+                // fallback only fires for the sync/async providers, which both
+                // return raw bytes + raw offsets from get_layer_raw.
+                match weights.try_get_layer(layer) {
+                    Some(view) => Ok(view),
+                    None => weights.get_layer_raw(layer),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // One profile report covers every slice.
+        super::profile::reset_accum();
+
         let mut last_hidden = None;
         for slice in prompt_tokens.chunks(PREFILL_SLICE_TOKENS) {
-            last_hidden = Some(self.prefill_slice(slice, weights, kv)?);
+            last_hidden = Some(self.prefill_slice(slice, &layer_views, kv)?);
         }
+        // LayerViews are dropped here, after the GPU has finished every slice:
+        // the backing memory stays alive throughout GPU execution.
+        drop(layer_views);
         last_hidden.ok_or_else(|| RuntimeError::Compute("empty prompt".into()))
     }
 
     /// One slice of [`Self::prefill`]: up to `PREFILL_SLICE_TOKENS` tokens continuing
-    /// the KV cache at `kv.seq_len()`.
+    /// the KV cache at `kv.seq_len()`. All layers are encoded into a single Metal
+    /// command buffer, so the slice waits on the GPU once.
     fn prefill_slice(
         &self,
         prompt_tokens: &[u32],
-        weights: &dyn crate::weight::cache::WeightProvider,
+        layer_views: &[crate::weight::cache::LayerView],
         kv: &mut crate::kv::KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
         let batch_size = prompt_tokens.len();
@@ -229,7 +258,6 @@ impl MetalF32Backend {
         // we record it (with the empty-CB elapsed) immediately so subsequent
         // splits attribute correctly under the section that was actually
         // encoded since the last split.
-        super::profile::reset_accum();
         super::profile::set_section("prefill/embed");
         // Promote NEXT_SECTION -> IN_FLIGHT_SECTION via a zero-time record.
         // The zero-cost entry under "(unlabelled)" is harmless and shows up
@@ -245,41 +273,6 @@ impl MetalF32Backend {
 
         // Embed all tokens as first encoder in the prefill command buffer
         self.encode_embed_batched(&cmd, prompt_tokens, pipelines, s)?;
-
-        // Pre-load all layer views and keep them alive until after GPU commit.
-        // This ensures the backing memory (mmap pointers or Arc<[u8]>) remains
-        // valid while the GPU processes the command buffer.
-        //
-        // E.5: `begin_pass` is "called once per forward pass" per the
-        // trait contract (`cache.rs:309-313`). the prior loop body called
-        // it per-layer, but after layer 0 the compute cursor is set to 0 by
-        // `begin_pass` and immediately overwritten by `try_get_layer`'s
-        // `fetch_max(layer, ...)` — the per-iteration resets in iterations
-        // 2..N were no-ops at best and semantic noise at worst. Moving the
-        // call outside the loop matches the documented intent at
-        // `provider_mmap.rs:243-249` and eliminates 21-31 redundant atomic
-        // stores per prefill.
-        weights.begin_pass();
-        let mut layer_views = Vec::with_capacity(num_layers);
-        for layer in 0..num_layers {
-            // get_layer_raw (NOT get_layer_blocking) on the fallback path: the
-            // batched-prefill kernels read weight bytes from the GPU-resident
-            // *raw* unified buffer (uploaded via get_layer_raw) but take the
-            // per-subtensor OFFSETS from this LayerView's `subtensors`. Those
-            // offsets MUST describe the raw native-quant blob layout.
-            // SyncWeightProvider::get_layer_blocking returns a re-quantized F32
-            // blob with DIFFERENT offsets (and stale ssm_* offsets), so using it
-            // here made the kernels read the raw buffer at the wrong offsets ->
-            // pad-token garbage. MmapWeightProvider hits the `Some` arm above
-            // (try_get_layer returns its pre-built raw zero-copy view), so this
-            // fallback only fires for the sync/async providers, which both
-            // return raw bytes + raw offsets from get_layer_raw.
-            let layer_view = match weights.try_get_layer(layer) {
-                Some(view) => view,
-                None => weights.get_layer_raw(layer)?,
-            };
-            layer_views.push(layer_view);
-        }
 
         // Existing default path: 32 iterations, per-layer encoders.
         // Each layer adds ~13 compute encoders. Metal guarantees ordering
@@ -391,11 +384,6 @@ impl MetalF32Backend {
         for mirror in &s.gdn_h_states_f16 {
             *mirror.borrow_mut() = None;
         }
-
-        // LayerViews are dropped here, after GPU has finished.
-        // This is the key safety guarantee: backing memory was alive
-        // throughout GPU execution.
-        drop(layer_views);
 
         // Read the last token's hidden state (must be after commit_and_wait
         // since it reads GPU memory via batch_x_buf.read_f32).

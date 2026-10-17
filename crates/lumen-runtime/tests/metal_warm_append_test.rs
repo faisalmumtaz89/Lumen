@@ -1,11 +1,11 @@
 //! Metal on a real Qwen3.5 model (`#[ignore]`): a batched prefill that extends a session after
 //! generation continues from the state the decode left. A session that generated `k` tokens and
-//! then appends a suffix in one batch is compared with a session loaded from a file saved after
-//! the same `k` tokens, appending the same suffix: their files after the append, the next `M`
-//! greedy tokens and their files after those are equal byte for byte, for `k` of 1, 2, 7 and 64.
-//! The append is also run on a backend whose earlier, longer prefill had already sized its
-//! scratch, and gives the same file as on a fresh backend. A prompt whose attention scores
-//! exceed 2^32 elements in one batch gives the same file in one prefill as in two.
+//! then appends a suffix longer than one prefill slice is compared with a session loaded from a
+//! file saved after the same `k` tokens, appending the same suffix: their files after the append,
+//! the next `M` greedy tokens and their files after those are equal byte for byte, for `k` of 1,
+//! 2, 7 and 64. The append is also run on a backend whose earlier, longer prefill had already
+//! sized its scratch, and gives the same file as on a fresh backend. A long prompt gives the same
+//! file in one prefill as in two cut away from the slice boundaries.
 //!
 //! LUMEN_QWEN35_9B_Q8=/path/to/qwen3-5-9b-Q8_0.lbc cargo test --release -p lumen-runtime \
 //!   --test metal_warm_append_test -- --ignored --nocapture
@@ -19,11 +19,11 @@ use lumen_runtime::weight::provider_mmap::MmapWeightProvider;
 use lumen_runtime::{ComputeBackend, MetalF32Backend, RuntimeConfig, SamplingParams, Session};
 use std::path::{Path, PathBuf};
 
-const CONTEXT: usize = 2048;
+const CONTEXT: usize = 4096;
 /// Greedy tokens compared after the append.
 const M: usize = 8;
 const PROMPT_LEN: usize = 600;
-const SUFFIX_LEN: usize = 400;
+const SUFFIX_LEN: usize = 2500;
 
 fn metal(provider: &MmapWeightProvider, context: usize) -> MetalF32Backend {
     if std::env::var_os("LUMEN_METAL_MMAP_ONLY").is_none() {
@@ -226,12 +226,12 @@ fn a_batched_append_after_generation_continues_the_decoded_state() {
     );
 }
 
-/// Qwen3.5-9B has 16 attention heads: one prefill of 16,384 tokens holds 2^32 attention scores,
-/// the most a 32-bit index reaches, one of 18,324 tokens 18,324 x 16 x 18,328 of them.
+/// The cut at 5,000 tokens is not a multiple of the 2,048-token slice, so the two prefills cross
+/// the recurrent state between slices at other tokens than the one prefill does.
 #[test]
 #[ignore]
-fn a_prefill_past_2_pow_32_attention_scores_equals_two_shorter_prefills() {
-    const FIRST: usize = 8_192;
+fn a_long_prefill_equals_two_prefills_cut_away_from_the_slice_boundaries() {
+    const FIRST: usize = 5_000;
     let model = Model::open(20_480);
     let dir = tempfile::tempdir().unwrap();
     let x = metal(&model.provider, model.context);
