@@ -1,6 +1,6 @@
 //! The BF16 fused gate+up+SwiGLU kernel chosen for a batch writes exactly the
 //! batch's rows, for every NR microtile, including batches that fill only part of
-//! the last tile.
+//! its last tile.
 
 use crate::compute::ComputeBackend;
 use crate::metal::ffi::MTLSize;
@@ -32,7 +32,7 @@ fn bf16_gate_up_swiglu_writes_only_the_batch_rows() {
     let w_up = backend.device.new_buffer_with_bytes(&weights).unwrap();
 
     for nr in [1u8, 2, 4] {
-        for batch_size in [16usize, 32, 48, 64, 96, 128] {
+        for batch_size in [8usize, 16, 24, 32, 48, 64, 96, 128] {
             // Room for a whole extra tile past the batch, so a kernel that runs
             // past it writes there instead of outside the buffer.
             let rows = batch_size + 64;
