@@ -4,8 +4,8 @@
 //!
 //! ## Approach
 //!
-//! Lumen's prefill submits all kernels into ONE command buffer with ONE
-//! `commit_and_wait()` at the end (see `metal/prefill.rs::prefill`). That
+//! Lumen's prefill submits each slice's kernels into ONE command buffer with
+//! ONE `commit_and_wait()` at its end (see `metal/prefill.rs::prefill_slice`). That
 //! design is optimal for production latency (1 GPU-CPU round-trip) but
 //! hides per-kernel timing.
 //!

@@ -187,9 +187,6 @@ impl MetalF32Backend {
         kv: &mut crate::kv::KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
         let batch_size = prompt_tokens.len();
-        if batch_size == 0 {
-            return Err(RuntimeError::Compute("empty prompt".into()));
-        }
 
         let pipelines = self.pipelines.as_ref().ok_or_else(|| {
             RuntimeError::Compute("Metal pipelines not initialized: call init() first".into())
