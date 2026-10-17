@@ -131,6 +131,9 @@ impl MetalF32Backend {
         weights: &dyn crate::weight::cache::WeightProvider,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Vec<f32>, RuntimeError> {
+        if prompt_tokens.is_empty() {
+            return Err(RuntimeError::Compute("empty prompt".into()));
+        }
         // E.5: `begin_pass` is "called once per forward pass" per the
         // trait contract (`cache.rs:309-313`). the prior loop body called
         // it per-layer, but after layer 0 the compute cursor is set to 0 by
@@ -164,14 +167,14 @@ impl MetalF32Backend {
         // One profile report covers every slice.
         super::profile::reset_accum();
 
-        let mut last_hidden = None;
+        let mut last_hidden = Vec::new();
         for slice in prompt_tokens.chunks(PREFILL_SLICE_TOKENS) {
-            last_hidden = Some(self.prefill_slice(slice, &layer_views, kv)?);
+            last_hidden = self.prefill_slice(slice, &layer_views, kv)?;
         }
         // LayerViews are dropped here, after the GPU has finished every slice:
         // the backing memory stays alive throughout GPU execution.
         drop(layer_views);
-        last_hidden.ok_or_else(|| RuntimeError::Compute("empty prompt".into()))
+        Ok(last_hidden)
     }
 
     /// One slice of [`Self::prefill`]: up to `PREFILL_SLICE_TOKENS` tokens continuing
@@ -194,7 +197,7 @@ impl MetalF32Backend {
 
         // ================================================================
         // MUTEX-FREE ENCODING: Acquire the scratch lock ONCE for the
-        // entire prefill operation. Previous code locked/unlocked ~26
+        // whole slice. Previous code locked/unlocked ~26
         // times (1 ensure + 1 num_layers + 1 embed + 22 layers + 1 read
         // = 26 lock ops). Each Mutex::lock() has overhead on macOS, but
         // more importantly each lock boundary forces the compiler to
@@ -260,8 +263,9 @@ impl MetalF32Backend {
         // encoded since the last split.
         super::profile::set_section("prefill/embed");
         // Promote NEXT_SECTION -> IN_FLIGHT_SECTION via a zero-time record.
-        // The zero-cost entry under "(unlabelled)" is harmless and shows up
-        // last in the sorted report.
+        // The zero-cost entry lands under "(unlabelled)" for the first slice
+        // and under the previous slice's last section for the others, adding
+        // a call but no time to it.
         super::profile::mark_section_start();
         super::profile::record_section_end();
         // Now IN_FLIGHT_SECTION = "prefill/embed"; restart the timer for it.
