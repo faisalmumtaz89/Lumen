@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **The published Qwen3.5-9B Q4_0 A100 decode record described a route that no longer ships.**
+  The 146.6 tok/s (0.979×) row in `docs/support.md` and `bench/RESULTS.md` was measured before the
+  0.5.0 quality fix (#29) moved most of the 9B's Q4_0 decode projections to F32 activations; it is
+  withdrawn, and `bench/RESULTS.md` gives the shipped route's measured rate. The support page also
+  dates its decode-attention scope note to 0.31.0, the release that changed it.
+
 - **Greedy output on Qwen3.5-MoE-35B-A3B BF16 could be corrupted by a token veto.** At temperature 0
   a default-on veto (BF16 MoE only, every backend) rejected the model's top token whenever that token
   had already appeared five or more times in the last 28 tokens, prompt included, and took a lower

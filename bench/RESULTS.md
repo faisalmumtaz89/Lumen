@@ -1,6 +1,6 @@
 # Benchmark Results
 
-**Last updated:** 2026-08-26
+**Last updated:** 2026-10-18
 
 > **Scope:** The benchmark suite covers Lumen's v1 model family: Qwen3.5-9B dense, Qwen3.5-MoE-35B-A3B, and (from the retained 2026-07-16 battery) the since-retired Qwen3.6-27B dense CUDA decode. Additional model families will be added as they ship.
 
@@ -128,8 +128,21 @@ H100 batteries with build/protocol not recorded in the artifacts):
 | Quant | GPU | Lumen (tok/s) | llama.cpp | × llama.cpp |
 |-------|-----|------------:|----------:|------------:|
 | Q8_0 | A100-80GB | 114.1 | 117.6 | **0.970×** |
-| Q4_0 | A100-80GB | 146.6 | 149.8 | **0.979×** |
+| Q4_0 | A100-80GB | withdrawn | 149.8 | — |
 | BF16 | H100 | 106.5 | 146.6 | 0.726× |
+
+The Q4_0 row's 146.6 (0.979×) was taken before the 0.5.0 quality fix (#29, 2026-07-25) moved most
+of the 9B's Q4_0 decode projections to F32 activations (on compute capability 8.x and 9.x the FFN
+down projection still quantizes its input to int8), so it does not describe the shipped route. On
+0.48.4 with the default flags and repetition penalty,
+
+```
+lumen run qwen3.5-9b:q4_0 "Write a 400-word story about a lighthouse keeper who finds a message in a bottle." --temperature 0 --max-tokens 256 --verbose
+```
+
+decodes 94.4–94.5 tok/s on an A100 80GB PCIe (mean of three runs, two sessions); Q8_0 measured the
+same way decodes 126.8–130.1 (its 114.1 above is the 2026-07-16 battery's). No llama.cpp run was
+made on this route.
 
 ### Summary — Qwen3.6-27B dense (CUDA)
 

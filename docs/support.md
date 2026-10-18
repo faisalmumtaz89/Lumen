@@ -15,17 +15,17 @@ the model is refused at load. BF16 and the larger models on 7.5 are untested (a 
 
 The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
-> **Scope of the current release's verification.** Decode attention now runs one kernel on every
-> model and context (see the CHANGELOG), and that change was verified on an RTX 5090 (compute
+> **Scope of the 0.31.0 decode-attention verification.** Since 0.31.0 decode attention runs one kernel
+> on every model and context (see the CHANGELOG), and that change was verified on an RTX 5090 (compute
 > capability 12.0) only: Qwen3.8-27B Q4_0 (session boards at six context shapes, the long-context
 > quality record on both KV stores), Qwen3.5-9B Q4_0 (a paired gate against the previous route at
 > three context lengths, the quality record) and Qwen3.5-MoE-35B-A3B Q4_0 (the quality record).
-> The decode-attention route changed for every CUDA model in this release (the MoE and the
+> The decode-attention route changed for every CUDA model in 0.31.0 (the MoE and the
 > Q4_0 dense models on Ampere/Hopper took the tiled kernel before; every model takes the one
 > kernel now) and was measured on the RTX 5090 only. Every A100/H100 ratio in the table below is
 > a **historical record** taken on an earlier release's decode-attention routes; it was not
-> re-measured on this release, and the ratio it states should be read as that release's. What
-> this release verified on the RTX 5090:
+> re-measured on 0.31.0, and the ratio it states should be read as that release's. What
+> 0.31.0 verified on the RTX 5090:
 
 | Model | Quant | RTX 5090 decode, tok/s (2026-09-11) | Verified by |
 |-------|-------|------:|---|
@@ -55,7 +55,7 @@ The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on 
 | Model | Quant | Status | × llama.cpp decode (canonical) | Notes |
 |-------|-------|--------|------:|---|
 | Qwen3.5-9B dense | Q8_0 | Production-ready | **0.970× llama.cpp** (retained co-located A100 record: 114.1 vs 117.6) | All robustness and correctness gates pass |
-| Qwen3.5-9B dense | Q4_0 | Production-ready | **0.979× llama.cpp** (retained co-located A100 record: 146.6 vs 149.8) | All functional gates pass |
+| Qwen3.5-9B dense | Q4_0 | Production-ready | withdrawn: the 2026-07-16 record (146.6 vs 149.8) was taken before the 0.5.0 quality fix (#29, 2026-07-25) moved most of the 9B's Q4_0 decode projections to F32 activations, and does not describe the shipped route (see [`bench/RESULTS.md`](../bench/RESULTS.md)) | All functional gates pass |
 | Qwen3.5-9B dense | BF16 | Production-ready | 0.726× llama.cpp (retained same-GPU H100 record, separate per-engine batteries: 106.5 vs 146.6; earlier 0.93–0.94× not retained) | Highest-precision |
 | Qwen3.5-MoE-35B-A3B | Q8_0 | Production-ready (functional) | 0.567× llama.cpp (retained co-located A100 record: 79.2 vs 139.7) | MoE_Q8_SPLIT=OFF default validated |
 | Qwen3.5-MoE-35B-A3B | Q4_0 | Production-ready (functional) | 0.598× llama.cpp (retained co-located A100 record: 93.6 vs 156.5) | Same MoE setup path as Q8 MoE |
