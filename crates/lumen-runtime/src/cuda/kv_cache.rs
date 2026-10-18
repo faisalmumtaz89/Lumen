@@ -137,7 +137,7 @@ impl KvCacheGpu {
         module: &Arc<CudaModule>,
         precision: KvPrecision,
     ) -> Result<Self, RuntimeError> {
-        let total_elements = num_kv_heads * max_seq_len * head_dim;
+        let total_elements = Self::buffer_elements(num_kv_heads, max_seq_len, head_dim);
         let (store, write_name) = match precision {
             KvPrecision::F32 => (
                 KvStore::F32 {
@@ -196,6 +196,24 @@ impl KvCacheGpu {
     /// Bytes the two buffers occupy.
     pub fn bytes(&self) -> u64 {
         2 * self.store.elements() as u64 * self.store.bytes_per_element() as u64
+    }
+
+    /// Elements in each of the K and V buffers [`Self::with_module_at`]
+    /// allocates.
+    fn buffer_elements(num_kv_heads: usize, max_seq_len: usize, head_dim: usize) -> usize {
+        num_kv_heads * max_seq_len * head_dim
+    }
+
+    /// Bytes [`Self::with_module_at`] allocates for one layer with these
+    /// arguments, so a load can plan them before allocating.
+    pub fn planned_bytes(
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        precision: KvPrecision,
+    ) -> u64 {
+        2 * Self::buffer_elements(num_kv_heads, max_seq_len, head_dim) as u64
+            * precision.bytes_per_element() as u64
     }
 
     /// Append one token's K and V data to the cache at the current position.

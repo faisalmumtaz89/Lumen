@@ -116,6 +116,50 @@ impl GdnParams {
     }
 }
 
+/// Element counts of the CUDA GDN state (per GDN layer) and the shared decode
+/// scratch for one model. The backend allocates exactly these, and the
+/// load-time memory plan sums them, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GdnStateLayout {
+    pub layers: usize,
+    pub h_state: usize,
+    pub conv_state: usize,
+    pub qkv: usize,
+    pub heads: usize,
+    pub value: usize,
+    pub hidden: usize,
+    /// The Q/K norm pair's length, when the register-resident path keeps them.
+    pub qk_norm: Option<usize>,
+}
+
+impl GdnStateLayout {
+    pub(crate) fn new(params: &GdnParams, layers: usize, register_resident: bool) -> Self {
+        Self {
+            layers,
+            h_state: params.h_state_elements(),
+            conv_state: params.conv_state_elements(),
+            qkv: params.qkv_dim,
+            heads: params.num_heads,
+            value: params.value_dim,
+            hidden: params.hidden_dim,
+            qk_norm: register_resident.then_some(params.num_kv_heads * params.head_dim),
+        }
+    }
+
+    /// Device bytes: each layer's recurrent and conv state, then two `qkv`,
+    /// four per-head, three `value` and one `hidden` buffer and the optional
+    /// Q/K norm pair, all F32.
+    pub(crate) fn bytes(&self) -> u64 {
+        let elems = self.layers * (self.h_state + self.conv_state)
+            + 2 * self.qkv
+            + 4 * self.heads
+            + 3 * self.value
+            + self.hidden
+            + 2 * self.qk_norm.unwrap_or(0);
+        4 * elems as u64
+    }
+}
+
 /// GPU-resident scratch buffers for GDN layer computation.
 ///
 /// All buffers are allocated once during `init()` and reused across tokens.

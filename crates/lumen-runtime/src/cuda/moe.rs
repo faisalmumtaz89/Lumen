@@ -1014,57 +1014,114 @@ pub(crate) fn allocate_moe_scratch(
 /// element written before read along the active compact columns).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
+/// Element counts of the grouped MoE prefill scratch for `tok` rows of
+/// `top_k` routed experts each. [`ensure_prefill_grouped`] allocates exactly
+/// these, and the load-time memory plan sums them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillGroupedLayout {
+    pub tok: usize,
+    pub cols: usize,
+    pub num_experts: usize,
+    pub hidden_dim: usize,
+    pub inter_dim: usize,
+    pub top_k: usize,
+    pub w10: bool,
+}
+
+impl PrefillGroupedLayout {
+    pub(crate) fn new(
+        batch: usize,
+        top_k: usize,
+        num_experts: usize,
+        hidden_dim: usize,
+        inter_dim: usize,
+    ) -> Self {
+        let tok = batch.max(1);
+        Self {
+            tok,
+            cols: (tok * top_k).max(1),
+            num_experts,
+            hidden_dim,
+            inter_dim,
+            top_k,
+            w10: moe_gate_up_w10_enabled(),
+        }
+    }
+
+    /// Worst-case grouped tile count: sum_e ceil(cols_e/16) <= cols (one column
+    /// per expert gives one tile each) plus `num_experts` slack.
+    fn tile_slots(&self) -> usize {
+        self.cols + self.num_experts
+    }
+
+    /// Device bytes of every buffer (4-byte elements throughout except the
+    /// W10 prequantized activations, one byte each).
+    pub(crate) fn bytes(&self) -> u64 {
+        let four_byte = self.cols * self.inter_dim
+            + self.cols * self.hidden_dim
+            + 3 * self.cols
+            + (self.num_experts + 1)
+            + self.tile_slots() * 4
+            + 2 * self.tok * self.num_experts
+            + self.tok * self.top_k
+            + self.tok * self.inter_dim
+            + self.tok;
+        let w10 = if self.w10 {
+            (self.hidden_dim / 32) * self.cols * 32
+                + 4 * (self.hidden_dim / 32) * self.cols
+                + 4 * self.tile_slots() * (self.inter_dim / 128).max(1) * 4
+        } else {
+            0
+        };
+        4 * four_byte as u64 + w10 as u64
+    }
+}
+
 pub(crate) fn ensure_prefill_grouped(
     scratch: &mut CudaMoeScratch,
     device: &super::ffi::CudaDevice,
-    batch: usize,
-    top_k: usize,
-    num_experts: usize,
-    hidden_dim: usize,
-    inter_dim: usize,
+    layout: &PrefillGroupedLayout,
 ) -> Result<(), RuntimeError> {
-    let need_tok = batch.max(1);
-    let need_cols = (need_tok * top_k).max(1);
+    let l = layout;
     let big_enough = scratch
         .prefill_grouped
         .as_ref()
-        .map(|g| g.cap_tok >= need_tok && g.cap_cols >= need_cols)
+        .map(|g| g.cap_tok >= l.tok && g.cap_cols >= l.cols)
         .unwrap_or(false);
     if big_enough {
         return Ok(());
     }
     scratch.prefill_grouped = Some(CudaMoePrefillGrouped {
-        cap_cols: need_cols,
-        cap_tok: need_tok,
-        swiglu_compact: device.alloc_zeros::<f32>(need_cols * inter_dim)?,
-        down_compact: device.alloc_zeros::<f32>(need_cols * hidden_dim)?,
-        col_expert: device.alloc_zeros::<i32>(need_cols)?,
-        col_src_tok: device.alloc_zeros::<i32>(need_cols)?,
-        dst_to_col: device.alloc_zeros::<i32>(need_cols)?,
-        expert_bounds: device.alloc_zeros::<i32>(num_experts + 1)?,
-        // worst-case tile count = sum_e ceil(cols_e/16) <= need_cols (each
-        // expert with 1 col -> 1 tile) + num_experts slack. *4 i32 per tile entry.
-        gate_up_tiles16: device.alloc_zeros::<i32>((need_cols + num_experts) * 4)?,
-        router_logits_batched: device.alloc_zeros::<f32>(need_tok * num_experts)?,
-        expert_ids_batched: device.alloc_zeros::<u32>(need_tok * num_experts)?,
-        expert_weights_batched: device.alloc_zeros::<f32>(need_tok * top_k)?,
-        shared_swiglu_batched: device.alloc_zeros::<f32>(need_tok * inter_dim)?,
-        shared_logit_batched: device.alloc_zeros::<f32>(need_tok)?,
-        // allocate prequant + bucketed tile buffers only when the path is on.
-        w10_xq_q: if moe_gate_up_w10_enabled() {
-            Some(device.alloc_zeros::<i8>((hidden_dim / 32) * need_cols * 32)?)
+        cap_cols: l.cols,
+        cap_tok: l.tok,
+        swiglu_compact: device.alloc_zeros::<f32>(l.cols * l.inter_dim)?,
+        down_compact: device.alloc_zeros::<f32>(l.cols * l.hidden_dim)?,
+        col_expert: device.alloc_zeros::<i32>(l.cols)?,
+        col_src_tok: device.alloc_zeros::<i32>(l.cols)?,
+        dst_to_col: device.alloc_zeros::<i32>(l.cols)?,
+        expert_bounds: device.alloc_zeros::<i32>(l.num_experts + 1)?,
+        // *4 i32 per tile entry.
+        gate_up_tiles16: device.alloc_zeros::<i32>(l.tile_slots() * 4)?,
+        router_logits_batched: device.alloc_zeros::<f32>(l.tok * l.num_experts)?,
+        expert_ids_batched: device.alloc_zeros::<u32>(l.tok * l.num_experts)?,
+        expert_weights_batched: device.alloc_zeros::<f32>(l.tok * l.top_k)?,
+        shared_swiglu_batched: device.alloc_zeros::<f32>(l.tok * l.inter_dim)?,
+        shared_logit_batched: device.alloc_zeros::<f32>(l.tok)?,
+        // prequant + bucketed tile buffers only when the path is on.
+        w10_xq_q: if l.w10 {
+            Some(device.alloc_zeros::<i8>((l.hidden_dim / 32) * l.cols * 32)?)
         } else {
             None
         },
-        w10_xq_d: if moe_gate_up_w10_enabled() {
-            Some(device.alloc_zeros::<f32>((hidden_dim / 32) * need_cols)?)
+        w10_xq_d: if l.w10 {
+            Some(device.alloc_zeros::<f32>((l.hidden_dim / 32) * l.cols)?)
         } else {
             None
         },
-        w10_tiles: if moe_gate_up_w10_enabled() {
-            // worst case col-tiles = need_cols + num_experts; times row128 count.
-            let r128 = (inter_dim / 128).max(1);
-            Some(device.alloc_zeros::<i32>((need_cols + num_experts) * r128 * 4)?)
+        w10_tiles: if l.w10 {
+            // worst case col-tiles times the row128 count.
+            let r128 = (l.inter_dim / 128).max(1);
+            Some(device.alloc_zeros::<i32>(l.tile_slots() * r128 * 4)?)
         } else {
             None
         },
@@ -2005,11 +2062,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     ensure_prefill_grouped(
         scratch,
         device,
-        batch,
-        top_k,
-        num_experts,
-        hidden_dim,
-        inter_dim,
+        &PrefillGroupedLayout::new(batch, top_k, num_experts, hidden_dim, inter_dim),
     )?;
 
     let hd_u32 = hidden_dim as u32;

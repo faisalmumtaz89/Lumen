@@ -1177,6 +1177,19 @@ fn moe_batched_routed(
         && super::moe::topk_moe_fused_kernel_for(kernels, meta.expert_gate_offs.len()).is_some()
 }
 
+/// Whether the GDN decode keeps its Q/K norm buffers for the
+/// register-resident path (`LUMEN_CUDA_GDN_REGISTER_RESIDENT`, else the
+/// runtime default); the GDN state allocation and the memory plan both read it.
+fn gdn_register_resident() -> bool {
+    match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
+        .ok()
+        .as_deref()
+    {
+        Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
+        None => crate::runtime_defaults::gdn_register_resident_default(),
+    }
+}
+
 /// Cached `LUMEN_MOE_PROBE=1` gate for the CUDA MoE/GDN decode-vs-prefill
 /// diagnostics ([PROBE] / [GDNSTATE] / [XCHK] / rope probes). Default OFF ->
 /// byte-identical output; when set, every probe site prints. The env is read
@@ -6299,59 +6312,37 @@ impl CudaBackend {
             ));
         }
 
-        // Allocate per-layer persistent state.
+        let l = super::gdn::GdnStateLayout::new(&params, gdn_count, gdn_register_resident());
         let mut h_states = Vec::with_capacity(gdn_count);
         let mut conv_states = Vec::with_capacity(gdn_count);
         for _ in 0..gdn_count {
-            h_states.push(self.device.alloc_zeros::<f32>(params.h_state_elements())?);
-            conv_states.push(
-                self.device
-                    .alloc_zeros::<f32>(params.conv_state_elements())?,
-            );
+            h_states.push(self.device.alloc_zeros::<f32>(l.h_state)?);
+            conv_states.push(self.device.alloc_zeros::<f32>(l.conv_state)?);
         }
-        let conv_positions = vec![0u32; gdn_count];
-
-        // Allocate ephemeral scratch buffers (shared across layers).
-        // Q_norm/K_norm buffers are allocated only when LUMEN_CUDA_GDN_REGISTER_RESIDENT=1
-        // because they are unused by the existing megakernel path.
-        // default ON (no-op for non-GDN models).
-        let use_gdn_register_resident = match std::env::var("LUMEN_CUDA_GDN_REGISTER_RESIDENT")
-            .ok()
-            .as_deref()
-        {
-            Some(v) => matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"),
-            None => crate::runtime_defaults::gdn_register_resident_default(),
-        };
-        let qk_norm_elements = params.num_kv_heads * params.head_dim;
-        let q_norm_buf_rr = if use_gdn_register_resident {
-            Some(self.device.alloc_zeros::<f32>(qk_norm_elements)?)
-        } else {
-            None
-        };
-        let k_norm_buf_rr = if use_gdn_register_resident {
-            Some(self.device.alloc_zeros::<f32>(qk_norm_elements)?)
-        } else {
-            None
-        };
-
         let gdn = GdnScratchGpu {
             params,
             h_states,
             conv_states,
-            conv_positions,
+            conv_positions: vec![0u32; gdn_count],
             gdn_layer_map,
-            qkv_buf: self.device.alloc_zeros::<f32>(params.qkv_dim)?,
-            qkv_conv_buf: self.device.alloc_zeros::<f32>(params.qkv_dim)?,
-            alpha_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
-            beta_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
-            alpha_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
-            beta_raw_buf: self.device.alloc_zeros::<f32>(params.num_heads)?,
-            output_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
-            normed_out_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
-            gate_buf: self.device.alloc_zeros::<f32>(params.value_dim)?,
-            ssm_proj_buf: self.device.alloc_zeros::<f32>(params.hidden_dim)?,
-            q_norm_buf_rr,
-            k_norm_buf_rr,
+            qkv_buf: self.device.alloc_zeros::<f32>(l.qkv)?,
+            qkv_conv_buf: self.device.alloc_zeros::<f32>(l.qkv)?,
+            alpha_buf: self.device.alloc_zeros::<f32>(l.heads)?,
+            beta_buf: self.device.alloc_zeros::<f32>(l.heads)?,
+            alpha_raw_buf: self.device.alloc_zeros::<f32>(l.heads)?,
+            beta_raw_buf: self.device.alloc_zeros::<f32>(l.heads)?,
+            output_buf: self.device.alloc_zeros::<f32>(l.value)?,
+            normed_out_buf: self.device.alloc_zeros::<f32>(l.value)?,
+            gate_buf: self.device.alloc_zeros::<f32>(l.value)?,
+            ssm_proj_buf: self.device.alloc_zeros::<f32>(l.hidden)?,
+            q_norm_buf_rr: match l.qk_norm {
+                Some(n) => Some(self.device.alloc_zeros::<f32>(n)?),
+                None => None,
+            },
+            k_norm_buf_rr: match l.qk_norm {
+                Some(n) => Some(self.device.alloc_zeros::<f32>(n)?),
+                None => None,
+            },
         };
 
         Ok(gdn)
@@ -8810,6 +8801,86 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// The grouped MoE prefill scratch's layout for `rows`, when a layer of
+    /// the model takes that route.
+    fn grouped_moe_layout(
+        st: &MutableState,
+        hp: &ModelHyperparams,
+        rows: usize,
+    ) -> Option<super::moe::PrefillGroupedLayout> {
+        let top_k = hp.num_active_experts? as usize;
+        let hidden_dim = hp.hidden_dim as usize;
+        let inter_dim = hp.intermediate_dim as usize;
+        let num_experts = st
+            .moe_meta_cache
+            .iter()
+            .zip(&st.moe_batched_offsets)
+            .filter_map(|(meta, offsets)| {
+                let meta = meta.as_ref()?;
+                moe_batched_routed(&st.kernels, meta, offsets.is_some(), hidden_dim, inter_dim)
+                    .then_some(meta.expert_gate_offs.len())
+            })
+            .max()?;
+        Some(super::moe::PrefillGroupedLayout::new(
+            rows,
+            top_k,
+            num_experts,
+            hidden_dim,
+            inter_dim,
+        ))
+    }
+
+    /// The device memory `layers` need to serve `context` tokens with a
+    /// `precision` KV store, beyond the weights: what `preload_weights`
+    /// allocates next, from the same layouts its allocators take.
+    fn serving_plan(
+        st: &MutableState,
+        hp: &ModelHyperparams,
+        layers: &[LayerWeightsGpu],
+        context: usize,
+        precision: KvPrecision,
+        f16_caches_forced: bool,
+    ) -> super::memory_plan::ServingPlan {
+        let kv_heads = hp.num_kv_heads as usize;
+        let head_dim = hp.head_dim as usize;
+        let attention = layers
+            .iter()
+            .filter(|lw| lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN)
+            .count();
+        let gdn_layers = layers.len() - attention;
+        let mut plan = super::memory_plan::ServingPlan {
+            kv: attention as u64
+                * KvCacheGpu::planned_bytes(kv_heads, context, head_dim, precision),
+            widening: if matches!(precision, KvPrecision::F16 | KvPrecision::Bf16) {
+                8 * (kv_heads * context * head_dim) as u64
+            } else {
+                0
+            },
+            f16_caches: if f16_caches_forced {
+                0
+            } else {
+                layers
+                    .iter()
+                    .map(|lw| super::gpu_buffers::f16_cache_bytes(lw, hp))
+                    .sum()
+            },
+            ..Default::default()
+        };
+        if gdn_layers > 0 {
+            let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
+            plan.workspace = ws.bytes();
+            plan.gdn_state = super::gdn::GdnStateLayout::new(
+                &super::gdn::GdnParams::from_hyperparams(hp),
+                gdn_layers,
+                gdn_register_resident(),
+            )
+            .bytes();
+            plan.moe_grouped =
+                Self::grouped_moe_layout(st, hp, ws.scratch.token_ids).map_or(0, |l| l.bytes());
+        }
+        plan
+    }
+
     /// The F32 prefill's slices through the workspace `preload_weights`
     /// allocated, leaving the last token's hidden state in the decode scratch.
     fn prefill_slices(
@@ -8849,20 +8920,21 @@ impl CudaBackend {
 
     /// The layout of the F32 prefill's workspace for `layers`: the scratch and
     /// the GDN scratch for the longest slice a request can run, and, when the
-    /// tiled attention will be taken, its score block for the whole context
-    /// (the last slice of a prompt ending at `max_seq_len` attends over every
-    /// key). The route conditions are the ones the attention dispatch reads,
-    /// fixed at load.
+    /// tiled attention will be taken, its score block for a `context`-token
+    /// cache (the last slice of a prompt ending at the context attends over
+    /// every key). The route conditions are the ones the attention dispatch
+    /// reads, fixed at load; a head geometry the tiled route cannot host
+    /// leaves the scalar attention.
     fn prefill_workspace_layout(
-        &self,
-        st: &MutableState,
+        kernels: &super::decode::KernelSet,
+        hp: &ModelHyperparams,
         layers: &[LayerWeightsGpu],
-    ) -> Result<super::prefill::PrefillWorkspaceLayout, RuntimeError> {
-        let hp = self.hp()?;
+        context: usize,
+    ) -> super::prefill::PrefillWorkspaceLayout {
         let num_heads = hp.num_heads as usize;
         let num_kv_heads = hp.num_kv_heads as usize;
         let head_dim = hp.head_dim as usize;
-        let rows = st.kv_max_seq_len.min(super::prefill::PREFILL_SLICE_TOKENS);
+        let rows = context.min(super::prefill::PREFILL_SLICE_TOKENS);
         let has_gdn = layers.iter().any(|lw| lw.layer_type == 1);
         let gdn = has_gdn.then(|| super::gdn::GdnParams::from_hyperparams(hp));
         let scratch = super::prefill::PrefillScratchLayout::new(
@@ -8878,30 +8950,11 @@ impl CudaBackend {
         let tiled = !crate::runtime_defaults::force_scalar_attn_enabled()
             && rows >= 16
             && crate::runtime_defaults::attn_prefill_sgemm_enabled()
-            && st.kernels.attn_softmax_causal.is_some()
+            && kernels.attn_softmax_causal.is_some()
             && layers.iter().any(|lw| {
                 lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
             });
-        let score_elems = if tiled {
-            Some(
-                super::prefill::attn_score_block_elems(
-                    rows,
-                    num_heads,
-                    num_kv_heads,
-                    st.kv_max_seq_len - rows,
-                )
-                .ok_or_else(|| {
-                    RuntimeError::Compute(format!(
-                        "the tiled prefill attention cannot host {num_heads} query heads over \
-                         {num_kv_heads} KV heads at a {}-token context",
-                        st.kv_max_seq_len
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
-        Ok(super::prefill::PrefillWorkspaceLayout {
+        super::prefill::PrefillWorkspaceLayout {
             scratch,
             gdn: gdn.map(|p| {
                 super::prefill::GdnPrefillScratchLayout::new(
@@ -8911,8 +8964,17 @@ impl CudaBackend {
                     p.value_dim,
                 )
             }),
-            score_elems,
-        })
+            score_elems: if tiled {
+                super::prefill::attn_score_block_elems(
+                    rows,
+                    num_heads,
+                    num_kv_heads,
+                    context - rows,
+                )
+            } else {
+                None
+            },
+        }
     }
 
     /// One slice of a prefill: embed `tokens`, run every layer over them at
@@ -21783,6 +21845,42 @@ impl ComputeBackend for CudaBackend {
         // KV caches for the attention layers, now that the layer types are
         // known; before the free-memory query below, so the F16 dequant caches
         // and the clone budgets see the memory net of them.
+        // The serving memory, planned before any of it is allocated: refuse a
+        // load whose plan does not fit rather than let the allocations spill.
+        let f16_cache_forced =
+            parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
+        self.device.synchronize()?;
+        match self.device.free_memory() {
+            Ok(free) => {
+                // The widening pair `init` made for this context is part of the plan.
+                let widening_now = st
+                    .kv_widen
+                    .as_ref()
+                    .map_or(0, |(k, v)| 4 * (k.len() + v.len()) as u64);
+                let refusal = super::memory_plan::refusal(
+                    |context, precision| {
+                        Self::serving_plan(
+                            st,
+                            &hp_copy,
+                            &cache,
+                            context,
+                            precision,
+                            f16_cache_forced,
+                        )
+                    },
+                    st.kv_max_seq_len,
+                    st.kv_precision,
+                    free as u64 + widening_now,
+                );
+                if let Some(msg) = refusal {
+                    return Err(RuntimeError::Compute(msg));
+                }
+            }
+            Err(e) => eprintln!(
+                "[CUDA] free-memory query failed before the serving memory ({e}); \
+                 allocating it without a fit check"
+            ),
+        }
         {
             let mem_before_kv = self.device.free_memory().unwrap_or(0);
             let mut allocated = 0usize;
@@ -21816,7 +21914,8 @@ impl ComputeBackend for CudaBackend {
         // take `prefill`), for the longest slice and the whole context, so no
         // request allocates it and every check below sees the memory net of it.
         let prefill_layout = if cache.iter().any(|lw| lw.layer_type == 1) {
-            let layout = self.prefill_workspace_layout(st, &cache)?;
+            let layout =
+                Self::prefill_workspace_layout(&st.kernels, &hp_copy, &cache, st.kv_max_seq_len);
             st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
                 &self.device,
                 &layout,
@@ -21833,29 +21932,10 @@ impl ComputeBackend for CudaBackend {
             st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&cache)?);
             // The grouped MoE prefill scratch, at the slice's rows, when a
             // layer takes that route, so no request grows it.
-            if let Some(top_k) = hp_copy.num_active_experts.map(|k| k as usize) {
-                let hidden_dim = hp_copy.hidden_dim as usize;
-                let inter_dim = hp_copy.intermediate_dim as usize;
-                let grouped_experts = (0..cache.len())
-                    .filter_map(|i| {
-                        let meta = st.moe_meta_cache.get(i)?.as_ref()?;
-                        let offsets = st.moe_batched_offsets.get(i).is_some_and(|o| o.is_some());
-                        moe_batched_routed(&st.kernels, meta, offsets, hidden_dim, inter_dim)
-                            .then_some(meta.expert_gate_offs.len())
-                    })
-                    .max();
-                if let (Some(num_experts), Some(moe_scratch)) =
-                    (grouped_experts, st.moe_scratch.as_mut())
-                {
-                    super::moe::ensure_prefill_grouped(
-                        moe_scratch,
-                        &self.device,
-                        layout.scratch.token_ids,
-                        top_k,
-                        num_experts,
-                        hidden_dim,
-                        inter_dim,
-                    )?;
+            if let Some(grouped) = Self::grouped_moe_layout(st, &hp_copy, layout.scratch.token_ids)
+            {
+                if let Some(moe_scratch) = st.moe_scratch.as_mut() {
+                    super::moe::ensure_prefill_grouped(moe_scratch, &self.device, &grouped)?;
                 }
             }
             Some(layout)
@@ -21874,8 +21954,6 @@ impl ComputeBackend for CudaBackend {
                 crate::runtime_defaults::FreeMemory::Unknown
             }
         };
-        let f16_cache_forced =
-            parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
         let f16_cache_needed: u64 = cache
             .iter()
             .map(|layer| super::gpu_buffers::f16_cache_bytes(layer, &hp_copy))

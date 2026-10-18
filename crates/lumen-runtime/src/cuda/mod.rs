@@ -29,6 +29,7 @@ pub mod ffi;
 pub(crate) mod gdn;
 pub(crate) mod gpu_buffers;
 pub(crate) mod kv_cache;
+pub(crate) mod memory_plan;
 /// CUDA MoE forward-path types.
 pub(crate) mod moe;
 /// The native NVFP4/FP8 prefill route's admission and publication conditions. The route itself is
