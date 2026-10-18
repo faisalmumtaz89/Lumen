@@ -956,6 +956,10 @@ struct MutableState {
     decode_token_count: usize,
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
+    /// The batched F32 prefill's buffers, allocated by `preload_weights` for
+    /// the longest slice a request can run and the whole context, and lent to
+    /// every request; `None` before preload and on the native prefill route.
+    prefill_workspace: Option<super::prefill::PrefillWorkspace>,
     /// The native NVFP4/FP8 prefill route, published by `preload_weights` when the model and the
     /// runtime meet its conditions (`native_prefill`); `None` selects the F32 prefill.
     native_prefill: Option<native_prefill_forward::NativePrefill>,
@@ -1129,6 +1133,48 @@ fn bf16_gemmex_env_force_off() -> bool {
             None => !crate::runtime_defaults::bf16_gemmex_default(),
         }
     })
+}
+
+/// Whether a MoE layer's prefill takes the batched/grouped routed-FFN path:
+/// the switch on, its experts Q8_0 (or Q4_0 / BF16 with the tiled kernels and
+/// tile-compatible shapes), the layer's batched offset table built, and the
+/// router and scatter kernels loaded. `preload_weights` reserves the grouped
+/// scratch exactly when a layer takes it.
+fn moe_batched_routed(
+    kernels: &super::decode::KernelSet,
+    meta: &super::moe::CudaMoeMeta,
+    has_batched_offsets: bool,
+    hidden_dim: usize,
+    inter_dim: usize,
+) -> bool {
+    let q8_routed = meta.expert_gate_quant == QuantScheme::Q8_0
+        && meta.expert_down_quant == QuantScheme::Q8_0
+        && kernels.moe_grouped_gate_up_swiglu_q8_0.is_some()
+        && kernels.moe_grouped_down_q8_0.is_some();
+    let q4_routed = meta.expert_gate_quant == QuantScheme::Q4_0
+        && meta.expert_down_quant == QuantScheme::Q4_0
+        && super::moe::moe_grouped_tiled_enabled()
+        && kernels
+            .moe_grouped_gate_up_swiglu_q4_0_tiled_f32act
+            .is_some()
+        && kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
+        && hidden_dim % 256 == 0
+        && inter_dim % 32 == 0;
+    let bf16_routed = meta.expert_gate_quant == QuantScheme::Bf16
+        && meta.expert_down_quant == QuantScheme::Bf16
+        && super::moe::moe_grouped_tiled_enabled()
+        && kernels
+            .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
+            .is_some()
+        && kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
+        && hidden_dim % 256 == 0
+        && inter_dim % 16 == 0;
+    super::moe::moe_prefill_batched_enabled()
+        && (q8_routed || q4_routed || bf16_routed)
+        && has_batched_offsets
+        && kernels.moe_router_logits_batched.is_some()
+        && kernels.moe_grouped_scatter_accum_q8_0.is_some()
+        && super::moe::topk_moe_fused_kernel_for(kernels, meta.expert_gate_offs.len()).is_some()
 }
 
 /// Cached `LUMEN_MOE_PROBE=1` gate for the CUDA MoE/GDN decode-vs-prefill
@@ -6218,15 +6264,21 @@ impl CudaBackend {
         })
     }
 
-    /// Lazily allocate GDN GPU scratch buffers on first use.
-    ///
-    /// Scans layer_weights_cache to identify GDN layers (layer_type == 1),
-    /// builds the layer index mapping, and allocates all persistent state
-    /// (h_states, conv_states) and ephemeral scratch buffers on the GPU.
+    /// The GDN state and scratch, allocated by `preload_weights` (and by a
+    /// test that builds its backend without one) before any request.
     fn ensure_gdn_scratch(&self, st: &mut MutableState) -> Result<(), RuntimeError> {
-        if st.gdn_scratch_gpu.is_some() {
-            return Ok(());
+        if st.gdn_scratch_gpu.is_none() {
+            st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&st.layer_weights_cache)?);
         }
+        Ok(())
+    }
+
+    /// Allocate the GDN GPU state and scratch for `layers`.
+    ///
+    /// Scans `layers` to identify GDN layers (layer_type == 1), builds the
+    /// layer index mapping, and allocates all persistent state (h_states,
+    /// conv_states) and ephemeral scratch buffers on the GPU.
+    fn alloc_gdn_scratch(&self, layers: &[LayerWeightsGpu]) -> Result<GdnScratchGpu, RuntimeError> {
         let hp = self.hp()?;
         let params = super::gdn::GdnParams::from_hyperparams(hp);
         let num_layers = hp.num_layers as usize;
@@ -6234,7 +6286,7 @@ impl CudaBackend {
         // Build layer mapping: layer_idx -> gdn_idx.
         let mut gdn_layer_map: Vec<Option<usize>> = vec![None; num_layers];
         let mut gdn_count = 0usize;
-        for (i, lw) in st.layer_weights_cache.iter().enumerate() {
+        for (i, lw) in layers.iter().enumerate() {
             if lw.layer_type == 1 {
                 gdn_layer_map[i] = Some(gdn_count);
                 gdn_count += 1;
@@ -6302,8 +6354,7 @@ impl CudaBackend {
             k_norm_buf_rr,
         };
 
-        st.gdn_scratch_gpu = Some(gdn);
-        Ok(())
+        Ok(gdn)
     }
 
     /// Run the GDN (GatedDeltaNet) attention block on GPU, replacing the
@@ -8759,6 +8810,111 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// The F32 prefill's slices through the workspace `preload_weights`
+    /// allocated, leaving the last token's hidden state in the decode scratch.
+    fn prefill_slices(
+        &self,
+        st: &mut MutableState,
+        ws: &mut super::prefill::PrefillWorkspace,
+        tokens: &[u32],
+        pos_start: usize,
+        slice_len: usize,
+        hidden_dim: usize,
+    ) -> Result<(), RuntimeError> {
+        if ws.gdn.is_some() {
+            self.ensure_gdn_scratch(st)?;
+        }
+        let mut last_len = 0;
+        for (i, slice) in tokens.chunks(slice_len).enumerate() {
+            self.prefill_slice(
+                st,
+                &mut ws.scratch,
+                ws.gdn.as_mut(),
+                slice,
+                pos_start + i * slice_len,
+            )?;
+            last_len = slice.len();
+        }
+        unsafe {
+            super::prefill::launch_extract_row(
+                &self.device,
+                &st.kernels,
+                &ws.scratch.x,
+                &mut st.scratch.x_gpu,
+                last_len - 1,
+                hidden_dim,
+            )
+        }
+    }
+
+    /// The layout of the F32 prefill's workspace for `layers`: the scratch and
+    /// the GDN scratch for the longest slice a request can run, and, when the
+    /// tiled attention will be taken, its score block for the whole context
+    /// (the last slice of a prompt ending at `max_seq_len` attends over every
+    /// key). The route conditions are the ones the attention dispatch reads,
+    /// fixed at load.
+    fn prefill_workspace_layout(
+        &self,
+        st: &MutableState,
+        layers: &[LayerWeightsGpu],
+    ) -> Result<super::prefill::PrefillWorkspaceLayout, RuntimeError> {
+        let hp = self.hp()?;
+        let num_heads = hp.num_heads as usize;
+        let num_kv_heads = hp.num_kv_heads as usize;
+        let head_dim = hp.head_dim as usize;
+        let rows = st.kv_max_seq_len.min(super::prefill::PREFILL_SLICE_TOKENS);
+        let has_gdn = layers.iter().any(|lw| lw.layer_type == 1);
+        let gdn = has_gdn.then(|| super::gdn::GdnParams::from_hyperparams(hp));
+        let scratch = super::prefill::PrefillScratchLayout::new(
+            rows,
+            hp.hidden_dim as usize,
+            num_heads * head_dim,
+            num_kv_heads * head_dim,
+            hp.intermediate_dim as usize,
+            gdn.map(|p| p.qkv_dim),
+            gdn.map(|p| p.value_dim),
+            layers.iter().any(|lw| lw.attn_q_norm.is_some()),
+        );
+        let tiled = !crate::runtime_defaults::force_scalar_attn_enabled()
+            && rows >= 16
+            && crate::runtime_defaults::attn_prefill_sgemm_enabled()
+            && st.kernels.attn_softmax_causal.is_some()
+            && layers.iter().any(|lw| {
+                lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
+            });
+        let score_elems = if tiled {
+            Some(
+                super::prefill::attn_score_block_elems(
+                    rows,
+                    num_heads,
+                    num_kv_heads,
+                    st.kv_max_seq_len - rows,
+                )
+                .ok_or_else(|| {
+                    RuntimeError::Compute(format!(
+                        "the tiled prefill attention cannot host {num_heads} query heads over \
+                         {num_kv_heads} KV heads at a {}-token context",
+                        st.kv_max_seq_len
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(super::prefill::PrefillWorkspaceLayout {
+            scratch,
+            gdn: gdn.map(|p| {
+                super::prefill::GdnPrefillScratchLayout::new(
+                    rows,
+                    p.qkv_dim,
+                    p.num_heads,
+                    p.value_dim,
+                )
+            }),
+            score_elems,
+        })
+    }
+
     /// One slice of a prefill: embed `tokens`, run every layer over them at
     /// positions from `pos_start`, and leave the slice's hidden states in
     /// `pf.x`. The KV caches advance by the slice; the GDN recurrent state
@@ -9194,7 +9350,10 @@ impl CudaBackend {
                     // Copy q -> attn_out (both [batch * q_dim])
                     self.device
                         .stream
-                        .memcpy_dtod(&pf.q, &mut pf.attn_out)
+                        .memcpy_dtod(
+                            &pf.q.slice(..batch * q_dim),
+                            &mut pf.attn_out.slice_mut(..batch * q_dim),
+                        )
                         .map_err(|e| {
                             RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}"))
                         })?;
@@ -9311,7 +9470,10 @@ impl CudaBackend {
                     }
                     self.device
                         .stream
-                        .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                        .memcpy_dtod(
+                            &pf.attn_proj.slice(..batch * hidden_dim),
+                            &mut pf.x.slice_mut(..batch * hidden_dim),
+                        )
                         .map_err(|e| {
                             RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
                         })?;
@@ -9622,7 +9784,10 @@ impl CudaBackend {
                 }
                 self.device
                     .stream
-                    .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                    .memcpy_dtod(
+                        &pf.attn_proj.slice(..batch * hidden_dim),
+                        &mut pf.x.slice_mut(..batch * hidden_dim),
+                    )
                     .map_err(|e| {
                         RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
                     })?;
@@ -10715,7 +10880,10 @@ impl CudaBackend {
             }
             self.device
                 .stream
-                .memcpy_dtod(&pf.attn_proj, &mut pf.x)
+                .memcpy_dtod(
+                    &pf.attn_proj.slice(..batch * hidden_dim),
+                    &mut pf.x.slice_mut(..batch * hidden_dim),
+                )
                 .map_err(|e| {
                     RuntimeError::Compute(format!(
                         "dtod x<-attn_proj GDN prefill L{layer_idx}: {e}"
@@ -10879,36 +11047,13 @@ impl CudaBackend {
         // when `moe_grouped_tiled_enabled()` AND the q4 kernels loaded AND the
         // Qwen3.5-MoE shapes are tiled-compatible — else it stays on the per-token
         // loop). bf16 uses its own grouped tiled f32act path.
-        let q8_routed = moe_meta.expert_gate_quant == QuantScheme::Q8_0
-            && moe_meta.expert_down_quant == QuantScheme::Q8_0
-            && st.kernels.moe_grouped_gate_up_swiglu_q8_0.is_some()
-            && st.kernels.moe_grouped_down_q8_0.is_some();
-        let q4_routed = moe_meta.expert_gate_quant == QuantScheme::Q4_0
-            && moe_meta.expert_down_quant == QuantScheme::Q4_0
-            && super::moe::moe_grouped_tiled_enabled()
-            && st
-                .kernels
-                .moe_grouped_gate_up_swiglu_q4_0_tiled_f32act
-                .is_some()
-            && st.kernels.moe_grouped_down_q4_0_tiled_f32act.is_some()
-            && hidden_dim % 256 == 0
-            && inter_dim % 32 == 0;
-        let bf16_routed = moe_meta.expert_gate_quant == QuantScheme::Bf16
-            && moe_meta.expert_down_quant == QuantScheme::Bf16
-            && super::moe::moe_grouped_tiled_enabled()
-            && st
-                .kernels
-                .moe_grouped_gate_up_swiglu_bf16_tiled_f32act
-                .is_some()
-            && st.kernels.moe_grouped_down_bf16_tiled_f32act.is_some()
-            && hidden_dim % 256 == 0
-            && inter_dim % 16 == 0;
-        let use_batched_routed = super::moe::moe_prefill_batched_enabled()
-            && (q8_routed || q4_routed || bf16_routed)
-            && batched_offsets.is_some()
-            && st.kernels.moe_router_logits_batched.is_some()
-            && st.kernels.moe_grouped_scatter_accum_q8_0.is_some()
-            && super::moe::topk_moe_fused_kernel_for(&st.kernels, num_experts).is_some();
+        let use_batched_routed = moe_batched_routed(
+            &st.kernels,
+            &moe_meta,
+            batched_offsets.is_some(),
+            hidden_dim,
+            inter_dim,
+        );
 
         if use_batched_routed {
             // Engagement probe (no-op unless LUMEN_MOE_PROBE=1): definitively
@@ -11146,7 +11291,10 @@ impl CudaBackend {
         // directly with no downstream attn_proj reader.)
         self.device
             .stream
-            .memcpy_dtod(&pf.x, &mut pf.attn_proj)
+            .memcpy_dtod(
+                &pf.x.slice(..batch * hidden_dim),
+                &mut pf.attn_proj.slice_mut(..batch * hidden_dim),
+            )
             .map_err(|e| {
                 RuntimeError::Compute(format!("dtod attn_proj<-x MoE prefill L{layer_idx}: {e}"))
             })?;
@@ -19717,6 +19865,7 @@ impl ComputeBackend for CudaBackend {
             has_moe_layers: false,
             decode_token_count: 0,
             gdn_scratch_gpu: None,
+            prefill_workspace: None,
             native_prefill: None,
             native_prefill_refusal: None,
             _cublas_workspace: cublas_workspace,
@@ -21199,13 +21348,7 @@ impl ComputeBackend for CudaBackend {
     ) -> Result<Vec<f32>, RuntimeError> {
         let hp = self.hp()?;
         let hidden_dim = hp.hidden_dim as usize;
-        let num_heads = hp.num_heads as usize;
-        let num_kv_heads = hp.num_kv_heads as usize;
-        let head_dim = hp.head_dim as usize;
-        let inter_dim = hp.intermediate_dim as usize;
         let num_layers = hp.num_layers as usize;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
         let total = tokens.len();
         let vocab = hp.vocab_size as usize;
         if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
@@ -21213,16 +21356,6 @@ impl ComputeBackend for CudaBackend {
                 "prefill token id {bad} out of range (vocab_size {vocab})"
             )));
         }
-
-        // Detect GDN layers for batched prefill routing.
-        let has_gdn = {
-            let guard = self.state.lock().unwrap();
-            if let Some(ref st) = *guard {
-                st.layer_weights_cache.iter().any(|lw| lw.layer_type == 1)
-            } else {
-                false
-            }
-        };
 
         if total == 0 {
             return Err(RuntimeError::Compute("empty prompt".into()));
@@ -21290,108 +21423,16 @@ impl ComputeBackend for CudaBackend {
                 pos_start,
             )?;
         } else {
-            // Resolve GDN dims up-front so the shared dequant scratch is
-            // sized correctly for models whose `qkv_dim` exceeds `inter_dim`
-            // (e.g. Qwen3.5-35B-A3B: qkv_dim=8192, hidden_dim=2048, inter_dim=6144
-            // -> gdn_qkv needs 16.8M scratch elements, attn/FFN max is 12.6M).
-            let gdn_dims: Option<(usize, usize)> = if has_gdn {
-                let p = super::gdn::GdnParams::from_hyperparams(hp);
-                Some((p.qkv_dim, p.value_dim))
-            } else {
-                None
-            };
-
-            // Allocate slice-sized scratch buffers. Q+gate fusion (attn_q_norm
-            // present) projects wq at out = q_dim * 2, so the shared dequant
-            // scratch must budget the doubled matrix on those models.
-            let qgate_fused = st
-                .layer_weights_cache
-                .iter()
-                .any(|lw| lw.attn_q_norm.is_some());
-            let mut pf = super::prefill::alloc_prefill_scratch(
-                &self.device,
-                slice_len,
-                hidden_dim,
-                q_dim,
-                kv_dim,
-                inter_dim,
-                gdn_dims.map(|(q, _)| q),
-                gdn_dims.map(|(_, v)| v),
-                qgate_fused,
-            )?;
-
-            // Allocate GDN prefill scratch if the model has GDN layers.
-            let mut gdn_pf = if has_gdn {
-                let gdn_params = super::gdn::GdnParams::from_hyperparams(hp);
-                // Ensure GDN persistent state (h_states, conv_states) is allocated.
-                self.ensure_gdn_scratch(st)?;
-                Some(super::prefill::alloc_gdn_prefill_scratch(
-                    &self.device,
-                    slice_len,
-                    gdn_params.qkv_dim,
-                    gdn_params.num_heads,
-                    gdn_params.value_dim,
-                )?)
-            } else {
-                None
-            };
-
-            // The tiled SGEMM prefill attention's score block, last of the
-            // pre-loop buffers so a tight device does not lose one of those to
-            // it, and
-            // before the layer loop, because the loop writes each layer's KV and
-            // advances that cache's length before it reaches the attention
-            // dispatch while the host-side length only advances after the last
-            // layer. It exists exactly when the dispatch will take that route:
-            // the switch on, the softmax kernel built, a fused Q+gate attention
-            // layer present, 16 tokens or more, and no forced scalar attention. A
-            // refused allocation leaves it `None`, and the attention then runs on
-            // the scalar kernel, which needs no scratch.
-            pf.attn_scores = None;
-            if !crate::runtime_defaults::force_scalar_attn_enabled()
-                && slice_len >= 16
-                && crate::runtime_defaults::attn_prefill_sgemm_enabled()
-                && st.kernels.attn_softmax_causal.is_some()
-                && st.layer_weights_cache.iter().any(|lw| {
-                    lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN && lw.attn_q_norm.is_some()
-                })
-            {
-                pf.attn_scores = super::prefill::alloc_attn_score_block(
-                    &self.device,
-                    // The block serves every slice; the last slice attends over the
-                    // longest key range, so it is sized for that one.
-                    super::prefill::attn_score_block_elems(
-                        slice_len,
-                        num_heads,
-                        num_kv_heads,
-                        pos_start + total - slice_len,
-                    ),
-                );
-            }
-
-            let mut last_len = 0;
-            for (i, slice) in tokens.chunks(slice_len).enumerate() {
-                self.prefill_slice(
-                    st,
-                    &mut pf,
-                    gdn_pf.as_mut(),
-                    slice,
-                    pos_start + i * slice_len,
-                )?;
-                last_len = slice.len();
-            }
-
-            // Step 3: Extract last token's hidden state into decode scratch.
-            unsafe {
-                super::prefill::launch_extract_row(
-                    &self.device,
-                    &st.kernels,
-                    &pf.x,
-                    &mut st.scratch.x_gpu,
-                    last_len - 1,
-                    hidden_dim,
-                )?;
-            }
+            // The workspace is lent out of `st` for the slices and put back
+            // before any error leaves.
+            let mut ws = st.prefill_workspace.take().ok_or_else(|| {
+                RuntimeError::Compute(
+                    "batched prefill requires the workspace preload_weights allocates".into(),
+                )
+            })?;
+            let run = self.prefill_slices(st, &mut ws, tokens, pos_start, slice_len, hidden_dim);
+            st.prefill_workspace = Some(ws);
+            run?;
         }
 
         // Step 4: Single sync + readback.
@@ -21771,6 +21812,56 @@ impl ComputeBackend for CudaBackend {
                 );
             }
         }
+        // The batched F32 prefill's workspace (GDN models: the only ones that
+        // take `prefill`), for the longest slice and the whole context, so no
+        // request allocates it and every check below sees the memory net of it.
+        let prefill_layout = if cache.iter().any(|lw| lw.layer_type == 1) {
+            let layout = self.prefill_workspace_layout(st, &cache)?;
+            st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
+                &self.device,
+                &layout,
+            )?);
+            if super::decode::cuda_verbose() {
+                eprintln!(
+                    "[CUDA mem] prefill workspace: {:.2} GB ({} rows, score block for {} keys: {})",
+                    layout.bytes() as f64 / 1.0e9,
+                    layout.scratch.token_ids,
+                    st.kv_max_seq_len,
+                    layout.score_elems.is_some()
+                );
+            }
+            st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&cache)?);
+            // The grouped MoE prefill scratch, at the slice's rows, when a
+            // layer takes that route, so no request grows it.
+            if let Some(top_k) = hp_copy.num_active_experts.map(|k| k as usize) {
+                let hidden_dim = hp_copy.hidden_dim as usize;
+                let inter_dim = hp_copy.intermediate_dim as usize;
+                let grouped_experts = (0..cache.len())
+                    .filter_map(|i| {
+                        let meta = st.moe_meta_cache.get(i)?.as_ref()?;
+                        let offsets = st.moe_batched_offsets.get(i).is_some_and(|o| o.is_some());
+                        moe_batched_routed(&st.kernels, meta, offsets, hidden_dim, inter_dim)
+                            .then_some(meta.expert_gate_offs.len())
+                    })
+                    .max();
+                if let (Some(num_experts), Some(moe_scratch)) =
+                    (grouped_experts, st.moe_scratch.as_mut())
+                {
+                    super::moe::ensure_prefill_grouped(
+                        moe_scratch,
+                        &self.device,
+                        layout.scratch.token_ids,
+                        top_k,
+                        num_experts,
+                        hidden_dim,
+                        inter_dim,
+                    )?;
+                }
+            }
+            Some(layout)
+        } else {
+            None
+        };
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
         let free_for_refusal = match free_before_f16_cache {
@@ -22543,6 +22634,8 @@ impl ComputeBackend for CudaBackend {
         // has counted as taken, is released while the native route is tried, so the route sees the memory it would
         // have; it is made again, at the cache's capacity, if the route is refused.
         st.kv_widen = None;
+        // Likewise the F32 prefill's workspace, which the native route does not use.
+        st.prefill_workspace = None;
         let publishing = std::time::Instant::now();
         let published = native_prefill_forward::publish(self, st, weights);
         let secs = publishing.elapsed().as_secs_f64();
@@ -22574,6 +22667,12 @@ impl ComputeBackend for CudaBackend {
                         self.device.alloc_zeros::<f32>(floats)?,
                         self.device.alloc_zeros::<f32>(floats)?,
                     ));
+                }
+                if let Some(layout) = &prefill_layout {
+                    st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
+                        &self.device,
+                        layout,
+                    )?);
                 }
             }
         }
