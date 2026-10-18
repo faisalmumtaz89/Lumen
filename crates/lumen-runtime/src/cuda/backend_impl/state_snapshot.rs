@@ -213,9 +213,9 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Fill every buffer of the retained F32 prefill workspace with 0xFF bytes
-    /// (NaN as F32), so a test can show no request reads a row of it that the
-    /// request did not write first.
+    /// Fill every buffer of the retained F32 prefill workspace and the grouped
+    /// MoE prefill scratch with 0xFF bytes (NaN as F32), so a test can show no
+    /// request reads a row of them that the request did not write first.
     pub fn poison_prefill_workspace(&self) -> Result<(), RuntimeError> {
         use cudarc::driver::DevicePtr;
         let guard = self.state.lock().unwrap();
@@ -274,6 +274,35 @@ impl CudaBackend {
                 g.alpha_out,
                 g.beta_out,
             );
+        }
+        if let Some(m) = st
+            .moe_scratch
+            .as_ref()
+            .and_then(|m| m.prefill_grouped.as_ref())
+        {
+            poison!(
+                m.swiglu_compact,
+                m.down_compact,
+                m.col_expert,
+                m.col_src_tok,
+                m.dst_to_col,
+                m.expert_bounds,
+                m.gate_up_tiles16,
+                m.router_logits_batched,
+                m.expert_ids_batched,
+                m.expert_weights_batched,
+                m.shared_swiglu_batched,
+                m.shared_logit_batched,
+            );
+            for q in m.w10_xq_q.iter() {
+                poison!(q);
+            }
+            for d in m.w10_xq_d.iter() {
+                poison!(d);
+            }
+            for t in m.w10_tiles.iter() {
+                poison!(t);
+            }
         }
         self.device.synchronize()
     }

@@ -1,14 +1,16 @@
-//! The batched prefill's workspace is allocated once at load and lent to
-//! every request, so nothing a request computes may depend on what an earlier
-//! request left in it. Here every buffer of it is filled with 0xFF bytes (NaN
-//! as F32) before each request, after a longer and a shorter one, and the
+//! The batched prefill's workspace and the grouped MoE prefill scratch are
+//! allocated once at load and lent to every request, so nothing a request
+//! computes may depend on what an earlier request left in them. Here every
+//! buffer of them is filled with 0xFF bytes (NaN as F32) before each request, after a longer and a shorter one, and the
 //! hidden state, the KV cache and the GDN state must match a fresh backend's
 //! bit for bit.
 #![cfg(all(feature = "cuda", feature = "test-state-snapshot"))]
 
 mod common;
 
-use common::gdn_hybrid::{build_gdn_hybrid_lbc_with, gdn_model_hyperparams_with};
+use common::gdn_hybrid::{
+    build_gdn_hybrid_lbc_with, build_qwen35_cpu_lbc, gdn_model_hyperparams_with, Qwen35Fixture,
+};
 use lumen_format::test_model::{generate_test_model, TestModelConfig};
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::cuda::{CudaBackend, StateSnapshot};
@@ -136,4 +138,25 @@ fn a_gdn_hybrid_reads_no_stale_workspace_row() {
         &build_gdn_hybrid_lbc_with(gdn_model_hyperparams_with(CONTEXT as u32)),
         "gdn-hybrid",
     );
+}
+
+/// Gated attention with Q/K norms (the tiled attention's full-context score
+/// block and the Q+gate pair) and MoE layers, F32.
+#[test]
+fn a_qwen35_shaped_model_reads_no_stale_workspace_row() {
+    check(
+        &build_qwen35_cpu_lbc(&Qwen35Fixture::default(), CONTEXT as u32),
+        "qwen35",
+    );
+}
+
+/// The same model with its matrices in the quantised schemes, so the
+/// dequant scratch and the grouped MoE route are exercised.
+#[test]
+fn a_quantised_qwen35_shaped_model_reads_no_stale_workspace_row() {
+    let fx = Qwen35Fixture {
+        mixed_quant: true,
+        ..Qwen35Fixture::default()
+    };
+    check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), "qwen35-quant");
 }

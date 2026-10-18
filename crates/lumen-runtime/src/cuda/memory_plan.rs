@@ -20,9 +20,19 @@ pub(crate) struct ServingPlan {
     pub gdn_state: u64,
     /// The grouped MoE prefill scratch.
     pub moe_grouped: u64,
-    /// The F16 dequant caches of the full-attention projections.
+    /// The F16 dequant caches (the full-attention projections' with their
+    /// sizing margin, and the GDN alpha/beta copies when they are made).
     pub f16_caches: u64,
+    /// The decode Q+gate pair of a model that fuses Q and gate.
+    pub decode_scratch: u64,
+    /// [`SERVING_ALLOWANCE_BYTES`].
+    pub allowance: u64,
 }
+
+/// Device memory the plan keeps free beyond the buffers it counts: the
+/// allocations the CUDA libraries and driver make for themselves and the
+/// allocator's rounding of each buffer.
+pub(crate) const SERVING_ALLOWANCE_BYTES: u64 = 128 * 1024 * 1024;
 
 impl ServingPlan {
     pub(crate) fn total(&self) -> u64 {
@@ -32,6 +42,8 @@ impl ServingPlan {
             + self.gdn_state
             + self.moe_grouped
             + self.f16_caches
+            + self.decode_scratch
+            + self.allowance
     }
 }
 
@@ -63,6 +75,8 @@ pub(crate) fn refusal(
         ("linear-attention state", need.gdn_state),
         ("MoE prompt workspace", need.moe_grouped),
         ("F16 weight caches", need.f16_caches),
+        ("decode scratch", need.decode_scratch),
+        ("headroom", need.allowance),
     ] {
         if bytes > 0 {
             parts.push(format!("{label} {:.2} GB", gb(bytes)));
@@ -77,7 +91,10 @@ pub(crate) fn refusal(
     };
     let mut advice = match largest(precision) {
         Some(c) => format!("The largest context that fits is {c} tokens (--context-len {c})"),
-        None => "No context fits beside these weights; use a smaller quantization".to_string(),
+        None => format!(
+            "No context of {CONTEXT_STEP} tokens or more fits beside these weights; \
+             use a smaller quantization"
+        ),
     };
     if precision == KvPrecision::F32 {
         if fits(context, KvPrecision::Bf16) {
@@ -149,7 +166,7 @@ mod tests {
         let plan = linear(5_000_000_000, 65_536);
         let msg = refusal(&plan, 8192, KvPrecision::Bf16, 1_000_000_000).expect("refused");
         assert!(
-            msg.contains("No context fits beside these weights"),
+            msg.contains("No context of 1024 tokens or more fits"),
             "{msg}"
         );
         assert!(!msg.contains("--kv-precision"), "{msg}");

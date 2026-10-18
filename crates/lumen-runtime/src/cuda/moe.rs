@@ -1003,17 +1003,11 @@ pub(crate) fn allocate_moe_scratch(
         mmv_q_moe_normed_res: device.alloc_zeros::<u8>(((hidden_dim + 31) / 32) * 72)?,
         mmv_q_moe_swiglu_res: device
             .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 72)?,
-        // Grouped prefill scratch is lazily allocated on first use.
+        // The grouped prefill scratch is reserved by `preload_weights`.
         prefill_grouped: None,
     })
 }
 
-/// Lazily (re)allocate the grouped MoE prefill scratch to hold at least
-/// `need_cols = batch * top_k` compact columns. Grows in place when a larger
-/// prefill batch is seen; reused otherwise. Buffers are NOT zeroed (every
-/// element written before read along the active compact columns).
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 /// Element counts of the grouped MoE prefill scratch for `tok` rows of
 /// `top_k` routed experts each. [`ensure_prefill_grouped`] allocates exactly
 /// these, and the load-time memory plan sums them.
@@ -1077,6 +1071,9 @@ impl PrefillGroupedLayout {
     }
 }
 
+/// Allocate the grouped MoE prefill scratch `layout` describes unless the one
+/// held is at least that large. `preload_weights` reserves it for the longest
+/// prefill slice, so a request finds it large enough and allocates nothing.
 pub(crate) fn ensure_prefill_grouped(
     scratch: &mut CudaMoeScratch,
     device: &super::ffi::CudaDevice,

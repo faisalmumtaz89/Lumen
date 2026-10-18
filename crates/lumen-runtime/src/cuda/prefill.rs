@@ -3284,9 +3284,8 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
     // advances that cache's length BEFORE it reaches this dispatch, while the
     // host-side KV length only advances after the last layer; an allocation
     // that failed inside the loop would abort the prefill with the two out of
-    // step. `alloc_prefill_scratch` therefore sizes the block up front, ahead
-    // of the first KV write, and the dispatcher only routes here when it is
-    // present. This check is the guard on that contract, not a fallback.
+    // step. `preload_weights` therefore reserves the block for the whole
+    // context, and the dispatcher only routes here when it is present. This check is the guard on that contract, not a fallback.
     let have_block = match scores.as_ref() {
         Some(s) => s.len() >= needed,
         None => false,

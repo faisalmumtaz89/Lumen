@@ -960,6 +960,9 @@ struct MutableState {
     /// the longest slice a request can run and the whole context, and lent to
     /// every request; `None` before preload and on the native prefill route.
     prefill_workspace: Option<super::prefill::PrefillWorkspace>,
+    /// The layout `prefill_workspace` was allocated from, kept when the native
+    /// route releases the workspace.
+    prefill_layout: Option<super::prefill::PrefillWorkspaceLayout>,
     /// The native NVFP4/FP8 prefill route, published by `preload_weights` when the model and the
     /// runtime meet its conditions (`native_prefill`); `None` selects the F32 prefill.
     native_prefill: Option<native_prefill_forward::NativePrefill>,
@@ -1253,15 +1256,6 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
-/// Bytes held back from the free-memory-aware split-clone budget. Every buffer
-/// a request uses is allocated before the clone passes (the load's memory
-/// plan), so this covers what follows them at load: the native NVFP4/FP8
-/// route's publication, which releases the F32 prefill workspace and may need
-/// more than it plus its one-time GEMM plan selection's temporaries (about
-/// 1.2 GB when no cached plan table is valid). On every other route it is
-/// memory the clones leave unused.
-const SPLIT_CLONE_ACTIVATION_SLACK_BYTES: usize = 2_000_000_000; // 2 GB
-
 /// Outcome of [`resolve_split_clone_budget`]: the resolved upper cap plus the
 /// inputs that produced it, so the caller can log the "ship what you gated" proof.
 struct ResolvedSplitBudget {
@@ -1271,7 +1265,7 @@ struct ResolvedSplitBudget {
     free_mem_bytes: usize,
     /// The F32 KV cache `init()` allocated before preload; reported, not subtracted.
     kv_reserve_bytes: usize,
-    /// Activation / scratch slack held back ([`SPLIT_CLONE_ACTIVATION_SLACK_BYTES`]).
+    /// Bytes left free for what the load allocates after the clones (the plan's reserve).
     slack_bytes: usize,
     /// True when the value came from the explicit `env_var` override.
     from_env: bool,
@@ -1294,9 +1288,10 @@ struct ResolvedSplitBudget {
 /// * **`env_var` SET** (finite, > 0) → `gb * 1_000_000_000` bytes. Byte-for-byte the
 ///   pre-lever behavior: the same explicit override maps to the same cap, so the
 ///   env-override path is unchanged. The override is not capped.
-/// * **`env_var` UNSET** → `free_mem - ACTIVATION_SLACK`
-///   (`runtime_defaults::split_clone_budget_bytes`), so the default can never spend
-///   the slack. On an 80 GB target with the 27B Q4 FFN (~9.6 GB) the resolved cap
+/// * **`env_var` UNSET** → `free_mem - reserve`
+///   (`runtime_defaults::split_clone_budget_bytes`), where `reserve` is what the
+///   load's memory plan keeps for the allocations after the clones, so the
+///   default can never spend it. On an 80 GB target with the 27B Q4 FFN (~9.6 GB) the resolved cap
 ///   exceeds the FFN size so ALL 64 FFN layers clone (the gated +17%).
 ///
 /// `KV_reserve` mirrors `preload_weights()`'s allocation exactly: one full F32
@@ -1470,6 +1465,7 @@ fn attention_layer_count(layers: &[super::gpu_buffers::LayerWeightsGpu]) -> usiz
 
 fn resolve_split_clone_budget(
     env_var: &str,
+    reserve: usize,
     device: &CudaDevice,
     hp: &ModelHyperparams,
     attention_layers: usize,
@@ -1508,7 +1504,7 @@ fn resolve_split_clone_budget(
     let override_raw = std::env::var(env_var).ok();
     let (budget_bytes, from_env) = crate::runtime_defaults::resolve_split_clone_budget_bytes(
         free_mem_bytes,
-        SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+        reserve,
         override_raw.as_deref(),
     );
 
@@ -1516,7 +1512,7 @@ fn resolve_split_clone_budget(
         budget_bytes,
         free_mem_bytes,
         kv_reserve_bytes,
-        slack_bytes: SPLIT_CLONE_ACTIVATION_SLACK_BYTES,
+        slack_bytes: reserve,
         from_env,
     }
 }
@@ -1666,6 +1662,23 @@ fn gdn_ab_f16_enabled() -> bool {
             && parse_env_truthy("LUMEN_CUDA_GDN_AB_F16")
                 .unwrap_or_else(crate::runtime_defaults::gdn_ab_f16_default)
     })
+}
+
+/// Bytes of the F16 copies of the GDN layers' Q8_0 ssm_alpha / ssm_beta that
+/// `preload_weights` makes when [`gdn_ab_f16_enabled`] holds.
+fn gdn_ab_f16_bytes(layers: &[LayerWeightsGpu]) -> u64 {
+    if !gdn_ab_f16_enabled() {
+        return 0;
+    }
+    let q8_f16_bytes = |w: &Option<GpuWeightBuf>| match w {
+        Some(GpuWeightBuf::Q8Raw(q8)) => 2 * ((q8.len() / 34) * 32) as u64,
+        _ => 0,
+    };
+    layers
+        .iter()
+        .filter(|lw| lw.layer_type == 1)
+        .map(|lw| q8_f16_bytes(&lw.ssm_alpha) + q8_f16_bytes(&lw.ssm_beta))
+        .sum()
 }
 
 /// Resolves `LUMEN_CUDA_GDN_DECODE_VIA_PREFILL`. Unset → quant-aware default
@@ -8827,7 +8840,9 @@ impl CudaBackend {
 
     /// The device memory `layers` need to serve `context` tokens with a
     /// `precision` KV store, beyond the weights: what `preload_weights`
-    /// allocates next, from the same layouts its allocators take.
+    /// allocates next, from the same layouts its allocators take. `native` is
+    /// the native NVFP4/FP8 route's load-time selection bytes when the route
+    /// may serve this load (see [`native_prefill_forward::candidate`]).
     fn serving_plan(
         st: &MutableState,
         hp: &ModelHyperparams,
@@ -8835,7 +8850,7 @@ impl CudaBackend {
         context: usize,
         precision: KvPrecision,
         f16_caches_forced: bool,
-        native_candidate: bool,
+        native: Option<u64>,
     ) -> super::memory_plan::ServingPlan {
         let kv_heads = hp.num_kv_heads as usize;
         let head_dim = hp.head_dim as usize;
@@ -8844,6 +8859,19 @@ impl CudaBackend {
             .filter(|lw| lw.layer_type != super::gpu_buffers::LAYER_TYPE_GDN)
             .count();
         let gdn_layers = layers.len() - attention;
+        let q_dim = hp.num_heads as usize * head_dim;
+        // The F16 caches are a lower-bound prediction (see
+        // F16_CACHE_HEADROOM_BYTES), so the plan carries their measured spread
+        // as the cache check does; forcing them drops only that margin.
+        let f16_predicted: u64 = layers
+            .iter()
+            .map(|lw| super::gpu_buffers::f16_cache_bytes(lw, hp))
+            .sum();
+        let f16_margin = if f16_predicted > 0 && !f16_caches_forced {
+            crate::runtime_defaults::F16_CACHE_HEADROOM_BYTES
+        } else {
+            0
+        };
         let mut plan = super::memory_plan::ServingPlan {
             kv: attention as u64
                 * KvCacheGpu::planned_bytes(kv_heads, context, head_dim, precision),
@@ -8852,24 +8880,25 @@ impl CudaBackend {
             } else {
                 0
             },
-            f16_caches: if f16_caches_forced {
-                0
+            f16_caches: f16_predicted + f16_margin + gdn_ab_f16_bytes(layers),
+            // The decode Q+gate pair, when a layer fuses Q and gate.
+            decode_scratch: if layers.iter().any(|lw| lw.attn_q_norm.is_some()) {
+                4 * (2 * q_dim + q_dim) as u64
             } else {
-                layers
-                    .iter()
-                    .map(|lw| super::gpu_buffers::f16_cache_bytes(lw, hp))
-                    .sum()
+                0
             },
+            allowance: super::memory_plan::SERVING_ALLOWANCE_BYTES,
             ..Default::default()
         };
         let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
         // A model the native route may serve gets the larger of the two routes'
-        // workspaces: publication decides which one serves, after this plan.
-        plan.workspace = if native_candidate {
-            ws.bytes()
-                .max(native_prefill_forward::serving_bytes(context, precision))
-        } else {
-            ws.bytes()
+        // needs: publication decides which one serves, after this plan, and
+        // the native route also selects its GEMM plans then.
+        plan.workspace = match native {
+            Some(selection) => ws
+                .bytes()
+                .max(native_prefill_forward::serving_bytes(context, precision) + selection),
+            None => ws.bytes(),
         };
         if gdn_layers > 0 {
             plan.gdn_state = super::gdn::GdnStateLayout::new(
@@ -8878,9 +8907,9 @@ impl CudaBackend {
                 gdn_register_resident(),
             )
             .bytes();
-            plan.moe_grouped =
-                Self::grouped_moe_layout(st, hp, ws.scratch.token_ids).map_or(0, |l| l.bytes());
         }
+        plan.moe_grouped =
+            Self::grouped_moe_layout(st, hp, ws.scratch.token_ids).map_or(0, |l| l.bytes());
         plan
     }
 
@@ -19931,6 +19960,7 @@ impl ComputeBackend for CudaBackend {
             decode_token_count: 0,
             gdn_scratch_gpu: None,
             prefill_workspace: None,
+            prefill_layout: None,
             native_prefill: None,
             native_prefill_refusal: None,
             _cublas_workspace: cublas_workspace,
@@ -21839,22 +21869,17 @@ impl ComputeBackend for CudaBackend {
             );
         }
 
-        // Pre-dequant Q8_0 weights to F16 for HGEMM prefill (tensor core path).
-        // This runs the dequant_q8_0_to_f16 kernel once per Q8_0 weight tensor,
-        // storing the F16 version alongside the original Q8_0 data. The extra GPU
-        // memory is ~2x the Q8_0 weight size (F16 = 2 bytes/element vs Q8_0 ~1.0625).
-        // BF16 weights skip this step entirely (no F16 cache needed; matvec_bf16
-        // dispatches directly off the raw BF16 bytes).
-        // KV caches for the attention layers, now that the layer types are
-        // known; before the free-memory query below, so the F16 dequant caches
-        // and the clone budgets see the memory net of them.
         // The serving memory, planned before any of it is allocated: refuse a
         // load whose plan does not fit rather than let the allocations spill.
+        // Then the KV caches for the attention layers, the prefill workspace and
+        // the rest of the plan, so the F16 dequant caches and the clone budgets
+        // see the memory net of them.
         let f16_cache_forced =
             parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
         let native_candidate = native_prefill_forward::candidate(self, st.kv_precision);
         self.device.synchronize()?;
-        match self.device.free_memory() {
+        let free_before_serving = self.device.free_memory();
+        match free_before_serving {
             Ok(free) => {
                 // The widening pair `init` made for this context is part of the plan.
                 let widening_now = st
@@ -21881,11 +21906,28 @@ impl ComputeBackend for CudaBackend {
                     return Err(RuntimeError::Compute(msg));
                 }
             }
-            Err(e) => eprintln!(
+            Err(ref e) => eprintln!(
                 "[CUDA] free-memory query failed before the serving memory ({e}); \
                  allocating it without a fit check"
             ),
         }
+        // What the clone passes leave free: the plan's allowance and, for a
+        // native candidate, what its publication needs beyond the F32
+        // workspace it releases.
+        let clone_reserve = super::memory_plan::SERVING_ALLOWANCE_BYTES
+            + native_candidate.map_or(0, |selection| {
+                (native_prefill_forward::serving_bytes(st.kv_max_seq_len, st.kv_precision)
+                    + selection)
+                    .saturating_sub(
+                        Self::prefill_workspace_layout(
+                            &st.kernels,
+                            &hp_copy,
+                            &cache,
+                            st.kv_max_seq_len,
+                        )
+                        .bytes(),
+                    )
+            });
         {
             let mem_before_kv = self.device.free_memory().unwrap_or(0);
             let mut allocated = 0usize;
@@ -21926,6 +21968,7 @@ impl ComputeBackend for CudaBackend {
             &self.device,
             &prefill_layout,
         )?);
+        st.prefill_layout = Some(prefill_layout);
         if super::decode::cuda_verbose() {
             eprintln!(
                 "[CUDA mem] prefill workspace: {:.2} GB ({} rows, score block for {} keys: {})",
@@ -21945,6 +21988,9 @@ impl ComputeBackend for CudaBackend {
                 }
             }
         }
+        // Pre-dequant the projections that get an F16 copy for HGEMM (tensor
+        // core path; see `f16_cache_slots`), stored beside their quantised
+        // data. BF16 weights need none (matvec_bf16 reads the raw bytes).
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
         let free_for_refusal = match free_before_f16_cache {
@@ -22060,6 +22106,40 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
+        // The decode Q+gate fusion scratch, if any layer has attn_q_norm: the
+        // last of the planned allocations, ahead of the optional clones.
+        let has_qgate = cache.iter().any(|lw| lw.attn_q_norm.is_some());
+        if has_qgate {
+            let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
+            let q_gate_dim = q_dim * 2;
+            st.scratch.q_gate = Some(self.device.alloc_zeros(q_gate_dim)?);
+            st.scratch.gate_buf = Some(self.device.alloc_zeros(q_dim)?);
+            if super::decode::cuda_verbose() {
+                eprintln!(
+                    "[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements"
+                );
+            }
+        }
+        if let (Ok(before), true) = (free_before_serving, super::decode::cuda_verbose()) {
+            self.device.synchronize()?;
+            let after = self.device.free_memory().unwrap_or(before);
+            let planned = Self::serving_plan(
+                st,
+                &hp_copy,
+                &cache,
+                st.kv_max_seq_len,
+                st.kv_precision,
+                f16_cache_forced,
+                native_candidate,
+            );
+            eprintln!(
+                "[CUDA mem] serving memory: planned {} B without the {} B headroom, taken {} B",
+                planned.total() - planned.allowance,
+                planned.allowance,
+                before.saturating_sub(after)
+            );
+        }
+
         // Tile ssm_norm from [head_dim] to [value_dim] for GDN layers.
         // This allows the standard rmsnorm kernel to be used on the [value_dim] output.
         let _gdn_params = super::gdn::GdnParams::from_hyperparams(&hp_copy);
@@ -22104,6 +22184,7 @@ impl ComputeBackend for CudaBackend {
                 // Reuses the shared L8 resolver (same helper as the Q4 clone pass).
                 let budget = resolve_split_clone_budget(
                     "LUMEN_CUDA_Q8_SPLIT_BUDGET_GB",
+                    clone_reserve as usize,
                     &self.device,
                     &hp_copy,
                     attention_layer_count(&cache),
@@ -22265,7 +22346,7 @@ impl ComputeBackend for CudaBackend {
                         .free_memory()
                         .map(|f| crate::runtime_defaults::FreeMemory::Bytes(f as u64))
                         .unwrap_or(crate::runtime_defaults::FreeMemory::Unknown),
-                    SPLIT_CLONE_ACTIVATION_SLACK_BYTES as u64,
+                    clone_reserve,
                     forced,
                 );
                 if let Some(reason) = decision.skip_reason() {
@@ -22378,6 +22459,7 @@ impl ComputeBackend for CudaBackend {
                 // init() allocated the KV cache, so `free` is already net of it.
                 let budget = resolve_split_clone_budget(
                     "LUMEN_CUDA_Q4_SPLIT_BUDGET_GB",
+                    clone_reserve as usize,
                     &self.device,
                     &hp_copy,
                     attention_layer_count(&cache),
@@ -22472,20 +22554,6 @@ impl ComputeBackend for CudaBackend {
                         }
                     }
                 }
-            }
-        }
-
-        // Allocate Q+gate fusion scratch buffers if any layer has attn_q_norm.
-        let has_qgate = cache.iter().any(|lw| lw.attn_q_norm.is_some());
-        if has_qgate {
-            let q_dim = hp_copy.num_heads as usize * hp_copy.head_dim as usize;
-            let q_gate_dim = q_dim * 2;
-            st.scratch.q_gate = Some(self.device.alloc_zeros(q_gate_dim)?);
-            st.scratch.gate_buf = Some(self.device.alloc_zeros(q_dim)?);
-            if super::decode::cuda_verbose() {
-                eprintln!(
-                    "[CUDA] Q+gate fusion scratch: q_gate={q_gate_dim}, gate_buf={q_dim} elements"
-                );
             }
         }
 

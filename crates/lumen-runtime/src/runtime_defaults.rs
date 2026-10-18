@@ -1606,7 +1606,7 @@ pub fn resolve_split_clone_budget_bytes(
 /// Whether a clone of `clone_bytes` may be made when `free` bytes remain and
 /// `slack` must stay free for decode afterwards. The output-projection split
 /// clone, made between the Q8 and Q4 sibling passes, goes through this, so it
-/// cannot spend the decode slack. Two clones do not: the aligned Q8 and Q4
+/// cannot spend the reserve the load keeps for what follows the clones. Two clones do not: the aligned Q8 and Q4
 /// repacks of the output projection on a model without GDN layers, which every
 /// model in the shipped registry has, so neither path is reached. On a 32 GB card
 /// (Qwen3.8-27B Q4_0, 4096-token context) the sibling pass left 2.06 GB free;
@@ -1623,7 +1623,7 @@ pub fn clone_fits(clone_bytes: u64, free: u64, slack: u64) -> bool {
 }
 
 /// Whether the output-projection split clone is made. A clone that would
-/// spend the decode slack is skipped, and so is one decided on a failed
+/// spend that reserve is skipped, and so is one decided on a failed
 /// memory query: the clone is an optimisation, so skipping it costs nothing.
 /// [`f16_cache_refusal`] goes the other way on a failed query and builds,
 /// because a telemetry failure is not a memory shortage and a load that got
@@ -1656,7 +1656,7 @@ impl CloneDecision {
         match self {
             CloneDecision::Proceed => None,
             CloneDecision::NoRoom { clone_bytes, free, slack } => Some(format!(
-                "a {:.2} GB clone would leave less than the {:.2} GB decode slack of the {:.2} GB free \
+                "a {:.2} GB clone would leave less than the {:.2} GB the load reserves of the {:.2} GB free \
                  (set {F16_CACHE_FORCE_ENV}=1 to make it anyway)",
                 gb(clone_bytes),
                 gb(slack),

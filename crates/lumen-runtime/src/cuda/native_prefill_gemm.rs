@@ -125,6 +125,18 @@ pub const BUCKETS: usize = MAX_ROWS / ROW_STEP;
 /// cuBLASLt workspace.
 pub const WORKSPACE_BYTES: usize = 32 << 20;
 
+/// Whether a valid plan table for this device and library is cached, so
+/// [`NativeGemm::build`] reads it instead of selecting.
+pub fn plans_cached(device: &CudaDevice) -> bool {
+    let Ok(lib) = super::cublaslt::library() else {
+        return false;
+    };
+    Identity::new(device, lib, WORKSPACE_BYTES)
+        .ok()
+        .and_then(|identity| algo_cache::load(&identity, lib).ok())
+        .is_some_and(|found| found.is_ok())
+}
+
 /// Rows a GEMM runs at for bucket `b`.
 pub fn bucket_rows(b: usize) -> usize {
     (b + 1) * ROW_STEP

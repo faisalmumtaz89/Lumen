@@ -317,21 +317,31 @@ fn views_bytes() -> usize {
     layers * per_layer + gdn_layers * GDN_AB * H * 2 + layers * 2 * 4
 }
 
-/// Whether the route may serve this load: its switches, the KV store and the
-/// model's structure, the conditions [`publish`] checks before it reads a
-/// weight. The memory plan charges [`serving_bytes`] for such a model beside
-/// the F32 prefill's workspace, so whichever route publication ends on has
-/// its memory.
-pub(super) fn candidate(backend: &CudaBackend, kv_precision: KvPrecision) -> bool {
-    route::switches(
+/// The route's load-time GEMM plan selection bytes when the route may serve
+/// this load, `None` when it cannot: its switches, the KV store, the device's
+/// compute capability and the model's structure, the conditions [`publish`]
+/// checks before it reads a weight. Selection takes nothing when a valid plan
+/// table is cached. The memory plan charges [`serving_bytes`] plus these for
+/// such a model beside the F32 prefill's workspace, so whichever route
+/// publication ends on has its memory.
+pub(super) fn candidate(backend: &CudaBackend, kv_precision: KvPrecision) -> Option<u64> {
+    let admitted = route::switches(
         crate::runtime_defaults::native_prefill_enabled(),
         std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok(),
     )
     .is_ok()
         && matches!(kv_precision, KvPrecision::F32 | KvPrecision::Bf16)
+        && backend.device.compute_capability().ok() == Some((12, 0))
         && backend
             .hp()
-            .is_ok_and(|hp| route::admit_structure(hp, backend.embedding_quant).is_ok())
+            .is_ok_and(|hp| route::admit_structure(hp, backend.embedding_quant).is_ok());
+    admitted.then(|| {
+        if crate::cuda::native_prefill_gemm::plans_cached(&backend.device) {
+            0
+        } else {
+            crate::cuda::cublaslt_algo_cache::selection_peak_bytes()
+        }
+    })
 }
 
 /// Device bytes the route holds while it serves a `max_seq`-token context of
@@ -1162,10 +1172,21 @@ impl CudaBackend {
     /// Prefill with the F32 route (`true`) or the published native route (`false`) from the next
     /// prompt on. The F32 route reads a 16-bit KV store through widening buffers, which exist only
     /// when the native route was refused, so over a published route the KV store must be F32.
+    /// Publication released the F32 route's workspace; suspending the route
+    /// allocates it again from the layout the load planned.
     pub fn set_native_prefill_suspended(&self, suspended: bool) {
         self.with_route(|st| {
             if let Some(np) = st.native_prefill.as_mut() {
                 np.suspended = suspended;
+                if suspended && st.prefill_workspace.is_none() {
+                    let layout = st
+                        .prefill_layout
+                        .expect("preload planned the F32 workspace");
+                    st.prefill_workspace = Some(
+                        crate::cuda::prefill::alloc_prefill_workspace(&self.device, &layout)
+                            .expect("the F32 prefill workspace"),
+                    );
+                }
             }
         })
     }
