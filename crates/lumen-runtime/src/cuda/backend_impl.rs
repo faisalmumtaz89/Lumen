@@ -22188,9 +22188,15 @@ impl ComputeBackend for CudaBackend {
                 f16_cache_forced,
                 native_candidate,
             );
+            // `init` allocated the widening pair before the first reading.
+            let widening_now = st
+                .kv_widen
+                .as_ref()
+                .map_or(0, |(k, v)| 4 * (k.len() + v.len()) as u64);
             eprintln!(
-                "[CUDA mem] serving memory: planned {} B without the {} B headroom, taken {} B",
-                planned.total() - planned.allowance,
+                "[CUDA mem] serving memory: planned {} B without the {} B headroom and the \
+                 {widening_now} B allocated at init, taken {} B",
+                planned.total() - planned.allowance - widening_now,
                 planned.allowance,
                 before.saturating_sub(after)
             );
