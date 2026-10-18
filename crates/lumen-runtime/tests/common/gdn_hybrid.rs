@@ -270,6 +270,9 @@ pub struct Qwen35Fixture {
     pub mixed_quant: bool,
     /// Give the last layer's `attn_q_norm` one element too few.
     pub bad_last_layer: bool,
+    /// Store every expert matrix (gate, up and down, the shared expert's too)
+    /// in this one scheme, as a CUDA MoE layer takes them.
+    pub expert_quant: Option<QuantScheme>,
 }
 
 const CPU_HEAD_DIM: u32 = 256;
@@ -591,20 +594,26 @@ pub fn build_qwen35_cpu_lbc(fx: &Qwen35Fixture, max_seq_len: u32) -> Vec<u8> {
                 f32q,
             ));
             let mut experts = Vec::new();
+            let (expert_in, expert_down) = fx.expert_quant.map_or((narrow, f32q), |q| (q, q));
             for e in 0..=CPU_EXPERTS as u64 {
                 let gate = push_as(
                     &mut blob,
                     &mat(inter, hidden, 21 + 3 * e, 1.0),
                     hidden,
-                    narrow,
+                    expert_in,
                 );
                 let up = push_as(
                     &mut blob,
                     &mat(inter, hidden, 22 + 3 * e, 1.0),
                     hidden,
-                    narrow,
+                    expert_in,
                 );
-                let down = push_as(&mut blob, &mat(hidden, inter, 23 + 3 * e, 1.0), inter, f32q);
+                let down = push_as(
+                    &mut blob,
+                    &mat(hidden, inter, 23 + 3 * e, 1.0),
+                    inter,
+                    expert_down,
+                );
                 experts.push(ExpertSlice { gate, up, down });
             }
             let shared = experts.pop().unwrap();

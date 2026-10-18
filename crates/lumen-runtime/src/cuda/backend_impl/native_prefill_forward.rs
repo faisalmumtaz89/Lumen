@@ -41,6 +41,8 @@ use crate::kv::KvPrecision;
 use crate::weight::cache::WeightProvider;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, ValidAsZeroBits};
+use lumen_format::index::SubtensorOffsets;
+use lumen_format::ModelHyperparams;
 
 const H: usize = HIDDEN as usize;
 const I: usize = INTERMEDIATE as usize;
@@ -319,22 +321,25 @@ fn views_bytes() -> usize {
 
 /// The route's load-time GEMM plan selection bytes when the route may serve
 /// this load, `None` when it cannot: its switches, the KV store, the device's
-/// compute capability and the model's structure, the conditions [`publish`]
-/// checks before it reads a weight. Selection takes nothing when a valid plan
-/// table is cached. The memory plan charges [`serving_bytes`] plus these for
-/// such a model beside the F32 prefill's workspace, so whichever route
-/// publication ends on has its memory.
-pub(super) fn candidate(backend: &CudaBackend, kv_precision: KvPrecision) -> Option<u64> {
+/// compute capability and [`admit_model`] over the uploaded `layers`, every
+/// condition [`publish`] checks before it loads a kernel. Selection takes
+/// nothing when a valid plan table is cached. The memory plan charges
+/// [`serving_bytes`] plus these for such a model beside the F32 prefill's
+/// workspace, so whichever route publication ends on has its memory.
+pub(super) fn candidate(
+    backend: &CudaBackend,
+    st: &MutableState,
+    layers: &[LayerWeightsGpu],
+    weights: &dyn WeightProvider,
+) -> Option<u64> {
     let admitted = route::switches(
         crate::runtime_defaults::native_prefill_enabled(),
         std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok(),
     )
     .is_ok()
-        && matches!(kv_precision, KvPrecision::F32 | KvPrecision::Bf16)
+        && matches!(st.kv_precision, KvPrecision::F32 | KvPrecision::Bf16)
         && backend.device.compute_capability().ok() == Some((12, 0))
-        && backend
-            .hp()
-            .is_ok_and(|hp| route::admit_structure(hp, backend.embedding_quant).is_ok());
+        && admit_model(backend, st, layers, &ProviderSlices::new(weights)).is_ok();
     admitted.then(|| {
         if crate::cuda::native_prefill_gemm::plans_cached(&backend.device) {
             0
@@ -359,6 +364,47 @@ pub(super) fn serving_bytes(max_seq: usize, precision: KvPrecision) -> u64 {
         + staging
         + 4 * max_seq * ROT
         + crate::cuda::native_prefill_gemm::WORKSPACE_BYTES) as u64
+}
+
+/// The model conditions [`publish`] checks before it loads a kernel or allocates (Q0-Q6): the
+/// structure, every layer's schemes and values, the BF16 embedding, and `layers`' planes resident as
+/// the route reads them. Every layer is read twice at most here and in publication: its descriptor
+/// and the values admission checks from one fetch per layer (a model refused at a layer is read no
+/// further), and once more for the weight views.
+fn admit_model(
+    backend: &CudaBackend,
+    st: &MutableState,
+    layers: &[LayerWeightsGpu],
+    src: &ProviderSlices,
+) -> Result<(ModelHyperparams, Vec<SubtensorOffsets>, Vec<LayerPlanes>), Refusal> {
+    injected(&["Q0", "Q0.a", "Q0.b", "Q0.c", "Q0.d", "Q5", "Q6"])?;
+    let hp = *backend.hp().map_err(|e| Refusal {
+        condition: "Q0",
+        reason: e.to_string(),
+    })?;
+    let offsets = admit_each(&hp, backend.embedding_quant, |l| src.subtensors(l), src)?;
+    if st.globals.embedding_bf16.is_none() {
+        return Err(Refusal {
+            condition: "Q0.d",
+            reason: "the BF16 embedding is not resident on the device".into(),
+        });
+    }
+    let planes = layers
+        .iter()
+        .enumerate()
+        .map(|(l, lw)| layer_planes(&backend.device, l, lw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|reason| Refusal {
+            condition: "Q5",
+            reason,
+        })?;
+    if planes.len() != hp.num_layers as usize {
+        return Err(Refusal {
+            condition: "Q5",
+            reason: format!("{} of {} layers resident", planes.len(), hp.num_layers),
+        });
+    }
+    Ok((hp, offsets, planes))
 }
 
 /// Publish the route for the weights `weights` just loaded into `st`, or name the first condition
@@ -392,35 +438,8 @@ pub(super) fn publish(
     }
 
     // Structure (Q0-Q6).
-    injected(&["Q0", "Q0.a", "Q0.b", "Q0.c", "Q0.d", "Q5", "Q6"])?;
-    let hp = *backend.hp().map_err(refusal("Q0"))?;
-    // Every layer is read twice at most: here, its descriptor and the values admission checks from one
-    // fetch per layer (a model refused at a layer is read no further), and once more below for the
-    // weight views.
     let src = ProviderSlices::new(weights);
-    let layers = admit_each(&hp, backend.embedding_quant, |l| src.subtensors(l), &src)?;
-    if st.globals.embedding_bf16.is_none() {
-        return Err(Refusal {
-            condition: "Q0.d",
-            reason: "the BF16 embedding is not resident on the device".into(),
-        });
-    }
-    let planes = st
-        .layer_weights_cache
-        .iter()
-        .enumerate()
-        .map(|(l, lw)| layer_planes(device, l, lw))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|reason| Refusal {
-            condition: "Q5",
-            reason,
-        })?;
-    if planes.len() != hp.num_layers as usize {
-        return Err(Refusal {
-            condition: "Q5",
-            reason: format!("{} of {} layers resident", planes.len(), hp.num_layers),
-        });
-    }
+    let (hp, layers, planes) = admit_model(backend, st, &st.layer_weights_cache, &src)?;
 
     // Kernels (Q1-Q3).
     injected(&["Q1", "Q2", "Q3"])?;

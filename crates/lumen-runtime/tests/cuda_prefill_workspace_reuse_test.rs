@@ -12,6 +12,7 @@ use common::gdn_hybrid::{
     build_gdn_hybrid_lbc_with, build_qwen35_cpu_lbc, gdn_model_hyperparams_with, Qwen35Fixture,
 };
 use lumen_format::test_model::{generate_test_model, TestModelConfig};
+use lumen_format::QuantScheme;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::cuda::{CudaBackend, StateSnapshot};
 use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
@@ -141,21 +142,24 @@ fn a_gdn_hybrid_reads_no_stale_workspace_row() {
 }
 
 /// Gated attention with Q/K norms (the tiled attention's full-context score
-/// block and the Q+gate pair) and MoE layers, F32.
+/// block and the Q+gate pair) and MoE layers with Q8_0 experts (the grouped
+/// MoE route), the other matrices F32.
 #[test]
 fn a_qwen35_shaped_model_reads_no_stale_workspace_row() {
-    check(
-        &build_qwen35_cpu_lbc(&Qwen35Fixture::default(), CONTEXT as u32),
-        "qwen35",
-    );
+    let fx = Qwen35Fixture {
+        expert_quant: Some(QuantScheme::Q8_0),
+        ..Qwen35Fixture::default()
+    };
+    check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), "qwen35");
 }
 
-/// The same model with its matrices in the quantised schemes, so the
-/// dequant scratch and the grouped MoE route are exercised.
+/// The same model with its other matrices in the quantised schemes, so the
+/// dequant scratch is exercised too.
 #[test]
 fn a_quantised_qwen35_shaped_model_reads_no_stale_workspace_row() {
     let fx = Qwen35Fixture {
         mixed_quant: true,
+        expert_quant: Some(QuantScheme::Q8_0),
         ..Qwen35Fixture::default()
     };
     check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), "qwen35-quant");

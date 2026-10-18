@@ -16473,6 +16473,9 @@ unsafe fn repack_all_layers_q8_clone_to_split(
     let mut layers_with_split = std::collections::HashSet::new();
     let mut oom_layer: Option<usize> = None;
     let mut oom_count: usize = 0;
+    // The bytes the siblings hold beyond the raw planes they replaced: a job's sibling
+    // is allocated beside its raw plane, so the cap must take the whole sibling, and a
+    // released plane gives its bytes back.
     let mut bytes_cloned: usize = 0;
     // `release_raw`: the caller decided whether the split-only routes can serve this
     // model (see the call site); when false the raw plane stays beside its sibling.
@@ -16588,13 +16591,14 @@ unsafe fn repack_all_layers_q8_clone_to_split(
                     SplitWeightKind::AttnWo => (&mut layer.q8_split_wo, &mut layer.wo),
                 };
                 *sibling = Some(split_buf.clone());
+                bytes_cloned += job.size_bytes;
                 if release_raw {
                     *base = GpuWeightBuf::Q8Split(split_buf);
                     raw_released += 1;
                     raw_released_bytes += raw_len;
+                    bytes_cloned = bytes_cloned.saturating_sub(raw_len);
                 }
                 layers_with_split.insert(job.layer_idx);
-                bytes_cloned += job.size_bytes;
             }
             Err(_) => {
                 oom_layer = Some(job.layer_idx);
@@ -21876,7 +21880,7 @@ impl ComputeBackend for CudaBackend {
         // see the memory net of them.
         let f16_cache_forced =
             parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
-        let native_candidate = native_prefill_forward::candidate(self, st.kv_precision);
+        let native_candidate = native_prefill_forward::candidate(self, st, &cache, weights);
         self.device.synchronize()?;
         let free_before_serving = self.device.free_memory();
         match free_before_serving {
@@ -22186,7 +22190,8 @@ impl ComputeBackend for CudaBackend {
                 st.kv_max_seq_len,
                 st.kv_precision,
                 f16_cache_forced,
-                native_candidate,
+                // This window allocates the F32 workspace whatever publication decides.
+                None,
             );
             // `init` allocated the widening pair before the first reading.
             let widening_now = st
@@ -22195,10 +22200,11 @@ impl ComputeBackend for CudaBackend {
                 .map_or(0, |(k, v)| 4 * (k.len() + v.len()) as u64);
             eprintln!(
                 "[CUDA mem] serving memory: planned {} B without the {} B headroom and the \
-                 {widening_now} B allocated at init, taken {} B",
+                 {widening_now} B allocated at init, taken {} B (native prefill candidate: {})",
                 planned.total() - planned.allowance - widening_now,
                 planned.allowance,
-                before.saturating_sub(after)
+                before.saturating_sub(after),
+                native_candidate.is_some()
             );
         }
 
