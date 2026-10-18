@@ -3261,13 +3261,8 @@ impl ComputeBackend for MetalF32Backend {
         if !full_history_window {
             return false;
         }
-        // BYTE-GUARD gate (checklist item 6): the anti-restate byte-guard is only
-        // ever consulted in the greedy (temperature<=0) branch of sample_logits,
-        // so for temperature>0 it is structurally inactive and the GPU sampler
-        // (which omits it) is faithful. Assert the invariant defensively: if it
-        // were somehow requested alongside temp>0 we still match, but make the
-        // reasoning explicit so a future change that wires the guard into the
-        // sampled path cannot silently skip it.
+        // The GPU sampler serves only the sampled (temperature > 0) branch of
+        // sample_logits; the greedy branch takes the argmax route.
         debug_assert!(
             params.temperature > 0.0,
             "gpu sampler gate reached with greedy temperature"

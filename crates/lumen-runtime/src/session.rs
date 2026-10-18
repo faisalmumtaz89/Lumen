@@ -262,26 +262,8 @@ impl Session {
         self.sampling = sampling;
         // Reset penalty history on sampling-param change; the next
         // next_token() call's sync_sampler_state will re-seed it from
-        // self.tokens. Preserve the installed anti-restate byte decoder — it
-        // is a per-session capability, not per-sequence state, so a per-job
-        // `set_sampling` must not silently disable the sub-word-doubling rule.
-        let decoder = self.sampler_state.decoder.take();
+        // self.tokens.
         self.sampler_state = SamplerState::new();
-        self.sampler_state.decoder = decoder;
-    }
-
-    /// Install the per-token-id byte decoder used by the greedy anti-restate
-    /// guard's sub-word-doubling rule (see [`crate::sampling::SamplerState`]).
-    ///
-    /// The runtime is tokenizer-agnostic, so the embedder (CLI / server, which
-    /// own a `BpeTokenizer`) passes a closure mapping a token id to its decoded
-    /// UTF-8 bytes. This is a per-session capability and survives the
-    /// `sampler_state` re-seeding that `set_sampling` / `sync_sampler_state`
-    /// perform (those reset history, not the decoder). Call once after
-    /// constructing the session. A no-op-safe choice: if never called, the
-    /// byte-level rule is skipped and only the id-only n-gram restate rule runs.
-    pub fn set_token_decoder(&mut self, decoder: crate::sampling::TokenByteDecoder) {
-        self.sampler_state.set_decoder(decoder);
     }
 
     /// refresh `sampler_state` from `tokens` when out of sync.

@@ -1,10 +1,10 @@
 // GPU-side argmax: finds the index of the maximum value in a float array.
 //
 // Tie semantics (CORR-011): on exact-equal values this returns the LOWEST
-// index, matching the CPU `argmax` in sampling.rs, `argmax_excluding`, and
-// llama.cpp. The per-thread strided scan keeps the lowest index within a
-// thread (strict `>` over increasing `i`); the warp/block reductions break
-// ties by `other_idx < best_idx`. Because "max value, then min index" is an
+// index, matching the CPU `argmax` in sampling.rs and llama.cpp. The
+// per-thread strided scan keeps the lowest index within a thread (strict `>`
+// over increasing `i`); the warp/block reductions break ties by
+// `other_idx < best_idx`. Because "max value, then min index" is an
 // associative+commutative reduction operator, every lane converges to the
 // global (max-value, min-index) pair regardless of lane assignment. NaN is
 // never selected (`>` and `<` on NaN are false), preserving prior behaviour.

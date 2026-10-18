@@ -108,8 +108,7 @@ fn maybe_apply_metal_decode_delay() {
 /// Opt-in switch for the GPU temperature sampler (Option A,
 /// `LUMEN_METAL_GPU_SAMPLER=1`, default OFF). When set AND the active sampling
 /// config is the subset the `gpu_sampler` kernel reproduces (temperature>0;
-/// no top_k/top_p/min_p; the anti-restate byte-guard inactive — always true for
-/// temperature>0), the lean decode pipeline finalizes the sampled token ON the
+/// no top_k/top_p/min_p), the lean decode pipeline finalizes the sampled token ON the
 /// GPU (parity-matched to the CPU `sample_logits`) so temp>0 decode pipelines
 /// exactly like the greedy argmax chain, removing the serial CPU-sampler +
 /// logit-readback that caps the sampled decode rate. With the flag UNSET the

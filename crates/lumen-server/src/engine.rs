@@ -850,19 +850,6 @@ pub trait Tokenize: Send + Sync + 'static {
     /// each call.
     fn decode_incremental(&self, state: &mut Vec<u8>, token_id: u32) -> String;
 
-    /// Decode a SINGLE token id to its raw bytes (no UTF-8 buffering / no
-    /// lossy substitution). Powers the greedy anti-restate guard's sub-word
-    /// doubling rule, which needs the bytes of the candidate and of the
-    /// just-emitted token to recognise " multiplication" → "lication".
-    ///
-    /// Default impl returns an empty `Vec` so tokenizers that do not override
-    /// it simply disable the byte-level rule (the id-only n-gram restate rule
-    /// still works). Real BPE/SPM tokenizers should return the token's
-    /// per-id bytes (e.g. `BpeTokenizer::decode_bytes(&[id])`).
-    fn decode_id_bytes(&self, _token_id: u32) -> Vec<u8> {
-        Vec::new()
-    }
-
     /// Encode + apply chat template for a system+user pair. Default impl
     /// returns `None` so callers that just want raw completion don't have
     /// to override.
@@ -1949,11 +1936,9 @@ impl EngineWorker {
         false
     }
 
-    /// A session with the worker's per-session hooks installed: the top-2
-    /// bench record and the token-id byte decoder the greedy anti-restate
-    /// guard's sub-word-doubling rule reads (when that guard is off the
-    /// decoder is never invoked). Every session the worker runs — the first
-    /// one and each rebuild — comes from here, so no rebuild loses a hook.
+    /// A session with the worker's per-session hook installed: the top-2
+    /// bench record. Every session the worker runs — the first one and each
+    /// rebuild — comes from here, so no rebuild loses it.
     fn fresh_session(&self) -> Result<Session, RuntimeError> {
         // A device-resident backend (CUDA) keeps its live KV in VRAM and never
         // touches the host key/value mirror, so skip allocating it: that is
@@ -1975,8 +1960,6 @@ impl EngineWorker {
             )?
         };
         session.set_bench_top2(self.bench_top2);
-        let tok = Arc::clone(&self.tokenizer);
-        session.set_token_decoder(Arc::new(move |id: u32| tok.decode_id_bytes(id)));
         Ok(session)
     }
 

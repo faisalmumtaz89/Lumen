@@ -799,61 +799,6 @@ pub fn gdn_convstate_parity_default() -> bool {
     true
 }
 
-/// Per-process default for the greedy anti-degeneration guard
-/// (`SamplingParams::anti_restate`).
-///
-/// * MoE (Qwen3.5-MoE-35B-A3B class) → ON.
-/// * Dense / non-MoE → OFF (dense decode stays byte-identical to history).
-///
-/// **What it fixes.** On the MoE GDN-hybrid the per-quant CUDA decode forward
-/// produces a single near-tie at one step where Lumen's top-1 logit is a
-/// degenerate continuation of the just-emitted text that llama.cpp does NOT
-/// pick: a sub-word doubling (" multiplication" → "lication", rendering
-/// "multiplicationlication") and a short n-gram restate ("17 × 20 = 17 × 20",
-/// the q4 "340 + 51 = 340 + 51" loop). This is a *near-tie flip*, not a
-/// magnitude error — confirmed by bf16 (near-full precision) reproducing the
-/// doubling and by F64 GDN accumulation shifting but not removing it. Because
-/// the divergence is a sub-ULP logit-margin disagreement at a single greedy
-/// step, no precision lever or repetition-penalty value removes it without
-/// collateral arithmetic corruption (rp ≥ 1.05 breaks the math).
-///
-/// The guard is a deterministic, backend-agnostic veto applied AFTER the
-/// argmax: it only fires on a genuine degenerate restatement and otherwise
-/// returns the plain argmax unchanged, so it never perturbs coherent text and
-/// is safe to default ON for MoE. The override (`LUMEN_ANTI_RESTATE=0/1`)
-/// wins; operators who want byte-pure greedy can disable it.
-pub fn anti_restate_default() -> bool {
-    match std::env::var("LUMEN_ANTI_RESTATE").ok().as_deref() {
-        Some("0" | "false" | "no" | "off") => false,
-        Some(_) => true,
-        // BF16 MoE ONLY. The anti-degeneration veto is INCOMPATIBLE with the
-        // QUANTISED (q8/q4) MoE math path: token-level A/B on Qwen3.5-MoE-35B
-        // (A100, temp 0, raw-token-id dumps) proves the q8/q4 "Compute 17×23"
-        // greedy trajectory reaches the correct `…= 340 + 51 = 391` ONLY when
-        // the veto is OFF. The veto's sub-word-doubling rule flips the single
-        // token at the word "multiplication" (id 44896 → 1633 "…lication"
-        // vs 2820); the 1633 branch carries BOTH the cosmetic doubling AND the
-        // arithmetic that lands 391, while the vetoed 2820 branch deterministly
-        // routes into a "17×20 = 17×20 = …" loop that never emits 391. The
-        // loop/ngram id-level rules likewise veto the high-frequency digit /
-        // space / operator tokens the answer needs, redirecting the bounded
-        // fallback into the same loop. So for q8/q4 MoE every rule combination
-        // REGRESSES a passing rep≤2 / 391 baseline into a non-terminating loop;
-        // the documented baseline (veto OFF) is the correct, PASSING state and
-        // its only blemish is a cosmetic doubling inside an English WORD, not
-        // the arithmetic (391 is present and correct).
-        //
-        // BF16 MoE reaches 391 from a DIFFERENT basin whose token at "multipl-
-        // ication" is not the vetoed near-tie, so there the veto cleanly removes
-        // the doubling AND keeps 391 — a genuine win. BF16 is distinguishable
-        // from q8/q4 by the dense-quant hint (`HINT_BF16` vs `HINT_QUANTISED`),
-        // so no expert-quant probe is needed for this gate (the MMQ-Q4-default
-        // gate DOES need one because q8/q4 share `HINT_QUANTISED`). Operators
-        // who want the veto on a quantised MoE anyway can force `=1`.
-        None => model_is_moe() && MODEL_DENSE_QUANT_HINT.load(Ordering::Relaxed) == HINT_BF16,
-    }
-}
-
 /// Per-process default for `LUMEN_CUDA_BF16_MOE_V3` when unset. ON by
 /// default — fires only for BF16 MoE expert dispatch.
 pub fn bf16_moe_v3_default() -> bool {
@@ -1948,10 +1893,6 @@ pub fn output_proj_nr_default() -> u32 {
 const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_AB_ITERATIONS",
     "LUMEN_AB_WARMUP",
-    "LUMEN_ANTI_RESTATE",
-    "LUMEN_ANTI_RESTATE_LOOP",
-    "LUMEN_ANTI_RESTATE_NGRAM",
-    "LUMEN_ANTI_RESTATE_SUBWORD",
     "LUMEN_ATTN_FIXTURE_WRITE",
     "LUMEN_BASE_URL",
     "LUMEN_BENCH_ITERATIONS",
@@ -2417,6 +2358,22 @@ pub fn validator_was_run() -> bool {
 /// and a process that starts anyway runs a configuration they did not choose.
 /// Sorted alphabetically.
 pub const REMOVED_LUMEN_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "LUMEN_ANTI_RESTATE",
+        "the greedy anti-restate veto was removed: greedy decoding takes the top-scoring token (after any penalties) on every model. Unset it.",
+    ),
+    (
+        "LUMEN_ANTI_RESTATE_LOOP",
+        "the greedy anti-restate veto was removed: greedy decoding takes the top-scoring token (after any penalties) on every model. Unset it.",
+    ),
+    (
+        "LUMEN_ANTI_RESTATE_NGRAM",
+        "the greedy anti-restate veto was removed: greedy decoding takes the top-scoring token (after any penalties) on every model. Unset it.",
+    ),
+    (
+        "LUMEN_ANTI_RESTATE_SUBWORD",
+        "the greedy anti-restate veto was removed: greedy decoding takes the top-scoring token (after any penalties) on every model. Unset it.",
+    ),
     (
         "LUMEN_CUDA_ATTN_SPLITK",
         "decode attention runs one kernel on every model and every context; there is no other route to switch on or off. Unset it.",
@@ -4068,6 +4025,31 @@ mod tests {
     }
 
     #[test]
+    fn removed_sampling_names_are_refused_whatever_the_value() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (name, _) in REMOVED_LUMEN_ENV_VARS {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("LUMEN_ANTI_RESTATE", "0");
+        std::env::set_var("LUMEN_ANTI_RESTATE_LOOP", "");
+        let found = removed_lumen_env_vars_set();
+        std::env::remove_var("LUMEN_ANTI_RESTATE");
+        std::env::remove_var("LUMEN_ANTI_RESTATE_LOOP");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[0].starts_with("LUMEN_ANTI_RESTATE is set but this release does not read it"),
+            "{found:?}"
+        );
+        assert!(
+            found[1]
+                .starts_with("LUMEN_ANTI_RESTATE_LOOP is set but this release does not read it"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
     fn removed_env_vars_are_sorted_and_absent_from_both_allowlists() {
         let names: Vec<&str> = REMOVED_LUMEN_ENV_VARS.iter().map(|(n, _)| *n).collect();
         let mut sorted = names.clone();
@@ -4292,10 +4274,6 @@ mod tests {
     static READ_SITE_LUMEN_ENV_VARS: &[&str] = &[
         "LUMEN_AB_ITERATIONS",
         "LUMEN_AB_WARMUP",
-        "LUMEN_ANTI_RESTATE",
-        "LUMEN_ANTI_RESTATE_LOOP",
-        "LUMEN_ANTI_RESTATE_NGRAM",
-        "LUMEN_ANTI_RESTATE_SUBWORD",
         "LUMEN_ATTN_FIXTURE_WRITE",
         "LUMEN_BASE_URL",
         "LUMEN_BENCH_ITERATIONS",

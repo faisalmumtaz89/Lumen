@@ -600,10 +600,6 @@ impl Tokenize for BpeTokenizerAdapter {
         }
     }
 
-    fn decode_id_bytes(&self, token_id: u32) -> Vec<u8> {
-        self.inner.decode_bytes(&[token_id])
-    }
-
     fn apply_chat_template(&self, system: Option<&str>, user: &str) -> Option<String> {
         // Soak/bench harness: reasoning off (closed think tail), byte-identical
         // to the pre-reasoning-control template.

@@ -328,49 +328,6 @@ impl BpeTokenizer {
         }
     }
 
-    /// Build a self-contained, `'static` per-token-id byte decoder closure for
-    /// the runtime's greedy anti-restate guard.
-    ///
-    /// The runtime crate is tokenizer-agnostic and the guard's
-    /// sub-word-doubling rule needs to decode a single candidate token id to
-    /// its raw bytes from inside the sampler. `BpeTokenizer` itself is not
-    /// `Clone` (it holds a compiled regex), so instead of cloning the whole
-    /// tokenizer we capture ONLY the byte-decode inputs — the `vocab` strings,
-    /// the `unicode_to_byte` map, and the `model_type` discriminator — into an
-    /// owned closure. The closure reproduces `decode_bytes(&[id])` exactly for
-    /// a single id, so the guard sees identical bytes to the streaming
-    /// detokenizer. Cost is a one-time clone of the vocab at engine setup.
-    pub fn byte_decoder_fn(&self) -> std::sync::Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync> {
-        let vocab = self.vocab.clone();
-        let unicode_to_byte = self.unicode_to_byte.clone();
-        let is_spm = self.model_type == "llama";
-        std::sync::Arc::new(move |id: u32| {
-            let tok_str = match vocab.get(id as usize) {
-                Some(s) => s,
-                None => return Vec::new(),
-            };
-            if is_spm {
-                // SPM byte-fallback `<0xHH>` -> byte; ▁ -> space; else UTF-8.
-                if tok_str.starts_with("<0x") && tok_str.ends_with('>') && tok_str.len() == 6 {
-                    if let Ok(byte_val) = u8::from_str_radix(&tok_str[3..5], 16) {
-                        return vec![byte_val];
-                    }
-                }
-                tok_str.replace('\u{2581}', " ").into_bytes()
-            } else {
-                // tiktoken / byte-level BPE: map each char through the
-                // GPT-2 unicode->byte table.
-                let mut bytes = Vec::new();
-                for c in tok_str.chars() {
-                    if let Some(&b) = unicode_to_byte.get(&c) {
-                        bytes.push(b);
-                    }
-                }
-                bytes
-            }
-        })
-    }
-
     /// Apply chat template and return the full prompt string.
     ///
     /// Defaults `enable_thinking` to `false` (the closed empty-think tail) so

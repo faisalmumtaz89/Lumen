@@ -101,32 +101,16 @@ pub fn sample_token_with_state(
 /// GPU argmax with a 4-byte readback and never returns logits to the CPU,
 /// so a history-aware penalty cannot be applied to its output.
 /// disables this fast path when ANY penalty is active so penalized-greedy
-/// works correctly even at `temperature <= 0`.
-///
-/// It ALSO disables the fast path when `anti_restate` is on: the greedy
-/// anti-degeneration veto (`guarded_argmax`, applied on the CPU sampling path)
-/// inspects the emitted-token history and can override the raw argmax, which the
-/// GPU-argmax readback cannot do. Without this term the veto was silently
-/// BYPASSED on GPU-argmax backends while always applied on backends that read
-/// logits back to the CPU (at the time Metal advertised `gpu_argmax` and CUDA did
-/// not) — an asymmetry that left the BF16-MoE greedy path on Metal without
-/// the veto. `anti_restate` is NOT part of `penalties_active()` (it is a
-/// deterministic post-argmax veto, not a logit penalty), so it must be tested
-/// explicitly here. Dense models keep `anti_restate=false`, so this term leaves
-/// every non-MoE greedy path byte-identical. (CUDA advertises `gpu_argmax` once
-/// its weights are preloaded and `LUMEN_CUDA_GPU_SAMPLE` is on, its default, so
-/// it does take the on-device argmax route; the device kernel and the host
-/// sampler break ties the same way, to the lowest index.)
+/// works correctly even at `temperature <= 0`. (CUDA advertises `gpu_argmax`
+/// once its weights are preloaded and `LUMEN_CUDA_GPU_SAMPLE` is on, its
+/// default, so it does take the on-device argmax route; the device kernel and
+/// the host sampler break ties the same way, to the lowest index.)
 pub fn use_gpu_greedy_predicate(
     params: &SamplingParams,
     gpu_resident: bool,
     gpu_argmax: bool,
 ) -> bool {
-    gpu_resident
-        && gpu_argmax
-        && params.temperature <= 0.0
-        && !params.penalties_active()
-        && !params.anti_restate
+    gpu_resident && gpu_argmax && params.temperature <= 0.0 && !params.penalties_active()
 }
 
 /// When to stop generating tokens.
@@ -167,12 +151,6 @@ impl StopCondition {
 pub struct InferenceEngine {
     config: RuntimeConfig,
     hyperparams: ModelHyperparams,
-    /// Optional per-token-id byte decoder for the greedy anti-restate guard's
-    /// sub-word-doubling rule. Installed by the CLI (which owns a
-    /// `BpeTokenizer`) via [`InferenceEngine::set_token_decoder`]; the engine
-    /// copies it onto each generation's `SamplerState`. `None` leaves the
-    /// byte-level rule disabled (the id-only n-gram restate rule still runs).
-    token_decoder: Option<crate::sampling::TokenByteDecoder>,
 }
 
 impl InferenceEngine {
@@ -181,16 +159,7 @@ impl InferenceEngine {
         Self {
             config,
             hyperparams,
-            token_decoder: None,
         }
-    }
-
-    /// Install the per-token-id byte decoder used by the greedy anti-restate
-    /// guard's sub-word-doubling rule. The CLI calls this once after building
-    /// the engine and its tokenizer. A no-op for the id-only n-gram rule,
-    /// which never consults the decoder.
-    pub fn set_token_decoder(&mut self, decoder: crate::sampling::TokenByteDecoder) {
-        self.token_decoder = Some(decoder);
     }
 
     /// Run the unified token generation loop.
@@ -269,9 +238,6 @@ impl InferenceEngine {
         // then suppresses tokens that already appear in the most recent
         // window.
         let mut sampler_state = SamplerState::new();
-        if let Some(ref d) = self.token_decoder {
-            sampler_state.set_decoder(d.clone());
-        }
         for &t in prompt_tokens.iter() {
             sampler_state.record(t);
         }
@@ -550,9 +516,6 @@ impl InferenceEngine {
         // SamplerState seeded with the prompt for the
         // repeat-last-n window. See generate() for rationale.
         let mut sampler_state = SamplerState::new();
-        if let Some(ref d) = self.token_decoder {
-            sampler_state.set_decoder(d.clone());
-        }
         for &t in prompt_tokens.iter() {
             sampler_state.record(t);
         }
@@ -843,13 +806,6 @@ impl InferenceEngine {
         // contract `generate()` enforces. Failing here surfaces the same
         // actionable "Metal requires F16" / "CUDA was built for F32" message.
         backend.validate_kv_precision(self.config.kv_precision)?;
-
-        // Propagate the anti-restate byte decoder (if the CLI installed one)
-        // onto the session so its sub-word-doubling rule can decode candidate
-        // token bytes. Idempotent; no-op when no decoder was installed.
-        if let Some(ref d) = self.token_decoder {
-            session.set_token_decoder(d.clone());
-        }
 
         // library-side prompt-length guard. The session's
         // own `extend` / `extend_with_cache` re-check, but failing here
@@ -1173,52 +1129,28 @@ mod tests {
         assert!(p.seed.is_none());
     }
 
-    // --- F10: GPU-greedy predicate must yield to the anti_restate veto ---
-
     #[test]
-    fn gpu_greedy_predicate_disabled_by_anti_restate_on_every_backend() {
-        // With anti_restate=true, temperature=0, rep=1.0 (no penalty active),
-        // the GPU-argmax fast path MUST be disabled regardless of the backend
-        // caps, so the CPU `guarded_argmax` veto is forced on. Previously the
-        // predicate was TRUE for Metal (gpu_argmax=true) — silently bypassing
-        // the veto — while CUDA (gpu_argmax=false) always took the CPU path.
-        let params = SamplingParams {
-            temperature: 0.0,
-            repetition_penalty: Some(1.0), // no penalty active
-            anti_restate: true,
-            ..Default::default()
-        };
-        // Sanity: rep=1.0 means no logit penalty is active, so ONLY the new
-        // anti_restate term can be what disables the fast path here.
-        assert!(!params.penalties_active());
-        for gpu_resident in [false, true] {
-            for gpu_argmax in [false, true] {
-                assert!(
-                    !use_gpu_greedy_predicate(&params, gpu_resident, gpu_argmax),
-                    "anti_restate=true must disable GPU greedy for \
-                     (gpu_resident={gpu_resident}, gpu_argmax={gpu_argmax})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn gpu_greedy_predicate_unaffected_when_anti_restate_off() {
-        // Dense models (anti_restate=false) keep the fast path on the gpu_resident
-        // + gpu_argmax + temp<=0 + no-penalty cell — byte-identical to before the
-        // F10 term was added. This also confirms CUDA's CPU-path behaviour
-        // (gpu_argmax=false) is unchanged.
+    fn gpu_greedy_predicate_requires_every_term() {
+        // The fast path is ON only for a resident model on a backend with a
+        // device argmax, at temperature <= 0 with no penalty active.
         let greedy = SamplingParams {
             temperature: 0.0,
             repetition_penalty: Some(1.0),
-            anti_restate: false,
             ..Default::default()
         };
-        // The fast path is ON only when gpu_resident && gpu_argmax (the
-        // pre-existing terms), and OFF otherwise.
         assert!(use_gpu_greedy_predicate(&greedy, true, true));
-        assert!(!use_gpu_greedy_predicate(&greedy, true, false)); // CUDA decode caps
+        assert!(!use_gpu_greedy_predicate(&greedy, true, false));
         assert!(!use_gpu_greedy_predicate(&greedy, false, true));
         assert!(!use_gpu_greedy_predicate(&greedy, false, false));
+        let penalized = SamplingParams {
+            repetition_penalty: Some(1.05),
+            ..greedy.clone()
+        };
+        assert!(!use_gpu_greedy_predicate(&penalized, true, true));
+        let sampled = SamplingParams {
+            temperature: 0.7,
+            ..greedy
+        };
+        assert!(!use_gpu_greedy_predicate(&sampled, true, true));
     }
 }

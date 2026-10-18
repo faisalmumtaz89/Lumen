@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Greedy output on Qwen3.5-MoE-35B-A3B BF16 could be corrupted by a token veto.** At temperature 0
+  a default-on veto (BF16 MoE only, every backend) rejected the model's top token whenever that token
+  had already appeared five or more times in the last 28 tokens, prompt included, and took a lower
+  one instead. Structured output repeats tokens that often: a one-tool call asking for the weather in
+  Paris was sent with the city `"Paris, France, Paris, France"`, because the newline that ends the
+  argument was vetoed. The veto is removed: greedy decoding takes the top-scoring token (after any
+  penalties) on every model. `LUMEN_ANTI_RESTATE`, `LUMEN_ANTI_RESTATE_SUBWORD`,
+  `LUMEN_ANTI_RESTATE_NGRAM` and `LUMEN_ANTI_RESTATE_LOOP` are no longer read; setting one refuses
+  startup.
+
 ## [0.48.4] — 2026-10-17
 
 ### Fixed

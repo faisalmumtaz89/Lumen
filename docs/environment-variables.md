@@ -55,15 +55,6 @@ unless a source is named.
 | `https_proxy`, `all_proxy`, `no_proxy` (or uppercase) | unset: downloads connect directly | config | `lumen pull`, and so the installer's model download, reach Hugging Face through the proxy that `https_proxy` names, else `all_proxy`, each read lowercase first: HTTP or SOCKS (`socks4`, `socks4a`, `socks5`, `socks5h`; SOCKS5 resolves names on the proxy), with the user name and password percent-encoded as curl expects. A Hugging Face host that `no_proxy` covers (a listed name or any of its subdomains, `*` for all) is reached directly, and the download's redirect to Hugging Face's file servers takes the same route. A proxy set only in `~/.curlrc` is not read. | On a network that reaches the internet only through a proxy. |
 | `LUMEN_BUILD_VERSION` | falls back to `CARGO_PKG_VERSION` | config | **Compile-time** `option_env!` stamped into the version banner. Not a runtime var (intentionally not in the runtime allowlist). | Set at build time to embed a custom build tag. |
 
-## Sampling determinism / anti-degeneration (CUDA MoE)
-
-| Variable | Default | Category | Effect | When to touch |
-|---|---|---|---|---|
-| `LUMEN_ANTI_RESTATE` | ON for **BF16 MoE** only; OFF dense & q8/q4 MoE | kill-switch | Deterministic greedy veto after argmax; suppresses a single near-tie sub-word doubling / n-gram restate the BF16-MoE decode picks but llama.cpp does not. | Leave as-is; `=0` to observe the un-vetoed token, `=1` to force on. |
-| `LUMEN_ANTI_RESTATE_SUBWORD` | ON (while veto active) | kill-switch | Enables the sub-word-doubling arm of the anti-restate veto. | `=0` to isolate one veto rule during triage. |
-| `LUMEN_ANTI_RESTATE_NGRAM` | ON (while veto active) | kill-switch | Enables the n-gram-restate arm of the veto. | `=0` to isolate one veto rule during triage. |
-| `LUMEN_ANTI_RESTATE_LOOP` | ON (while veto active) | kill-switch | Enables the loop-restate arm of the veto. | `=0` to isolate one veto rule during triage. |
-
 ---
 
 ## CUDA — production kill-switches (default-ON)
@@ -208,6 +199,16 @@ string included: a stack that pinned a kill switch to `0` must drop the line, no
 | `LUMEN_CUDA_ATTN_SPLITK_CHUNK`, `LUMEN_CUDA_ATTN_SPLITK_SCALE`, `LUMEN_CUDA_ATTN_SPLITK_GQA6_MAX_CHUNKS`, `LUMEN_CUDA_DECODE_TILED_THRESHOLD` | the partition is set by `LUMEN_CUDA_ATTN_ONE_TILE` and `LUMEN_CUDA_ATTN_TARGET` |
 | `LUMEN_CUDA_ATTN_SPLITK_GQA6_ONE_TILE`, `LUMEN_CUDA_ATTN_SPLITK_GQA6_TARGET` | renamed `LUMEN_CUDA_ATTN_ONE_TILE`, `LUMEN_CUDA_ATTN_TARGET` (same meaning, same default) |
 | `LUMEN_CUDA_ATTN_TILED_CODEGEN` | `LUMEN_CUDA_ATTN_CODEGEN` |
+
+### Removed sampling names
+
+Greedy decoding takes the top-scoring token (after any penalties) on every model and backend; the
+anti-restate veto that could replace it, on by default for BF16 MoE, is gone. These names refuse startup the
+same way, any value included.
+
+| Removed | Replacement |
+|---|---|
+| `LUMEN_ANTI_RESTATE`, `LUMEN_ANTI_RESTATE_SUBWORD`, `LUMEN_ANTI_RESTATE_NGRAM`, `LUMEN_ANTI_RESTATE_LOOP` | none: there is no veto to switch on or off |
 
 ## Metal — production kill-switches (default-ON)
 

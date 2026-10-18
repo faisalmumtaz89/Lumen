@@ -3291,9 +3291,9 @@ impl MetalF32Backend {
     /// `Xorshift64::new` + `SamplerState` prompt seeding.
     ///
     /// The engine route gate (`supports_gpu_sampler`) guarantees: temperature>0,
-    /// no top_k/top_p/min_p, full-history window (`repeat_last_n == None`), the
-    /// kernel compiled, and the byte-guard inactive (always true for temp>0). So
-    /// this driver is only ever invoked for the exact subset the kernel matches.
+    /// no top_k/top_p/min_p, full-history window (`repeat_last_n == None`) and
+    /// the kernel compiled. So this driver is only ever invoked for the exact
+    /// subset the kernel matches.
     pub fn decode_token_sampled_lean(
         &self,
         prev_token: u32,

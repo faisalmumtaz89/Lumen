@@ -642,7 +642,6 @@ impl ChatCompletionRequest {
             presence_penalty,
             frequency_penalty: Some(frequency_penalty),
             repeat_last_n: super::diag_repeat_last_n(),
-            anti_restate: super::diag_anti_restate(),
             ..Default::default()
         };
         Ok(JobRequest {
@@ -752,7 +751,6 @@ impl CompletionRequest {
             presence_penalty,
             frequency_penalty: Some(frequency_penalty),
             repeat_last_n: super::diag_repeat_last_n(),
-            anti_restate: super::diag_anti_restate(),
             ..Default::default()
         };
         Ok(JobRequest {

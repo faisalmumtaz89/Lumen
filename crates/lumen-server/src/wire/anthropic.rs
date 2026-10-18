@@ -377,7 +377,6 @@ impl MessagesRequest {
             repetition_penalty: Some(super::diag_repetition_penalty(temperature)),
             frequency_penalty: Some(super::diag_frequency_penalty()),
             repeat_last_n: super::diag_repeat_last_n(),
-            anti_restate: super::diag_anti_restate(),
             ..Default::default()
         };
         Ok(JobRequest {

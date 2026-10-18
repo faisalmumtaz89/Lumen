@@ -73,21 +73,11 @@ fn finish_answer(
 /// (`--repeat-penalty 1.0` → `repetition_penalty = None`) is preserved because
 /// it sets the explicit flag and is therefore not substituted.
 fn effective_sampling(base: &SamplingParams) -> SamplingParams {
-    // The greedy anti-degeneration guard is resolved from the MoE flag (+
-    // LUMEN_ANTI_RESTATE override) regardless of whether the operator pinned an
-    // explicit repetition penalty — it is an orthogonal, backend-agnostic veto
-    // and a `--repeat-penalty 1.0` pure-greedy run still wants the doubling
-    // gone.
-    let anti_restate = lumen_runtime::runtime_defaults::anti_restate_default();
     if REPETITION_PENALTY_EXPLICIT.load(std::sync::atomic::Ordering::Relaxed) {
-        return SamplingParams {
-            anti_restate,
-            ..base.clone()
-        };
+        return base.clone();
     }
     SamplingParams {
         repetition_penalty: Some(lumen_runtime::runtime_defaults::repetition_penalty_default()),
-        anti_restate,
         ..base.clone()
     }
 }
@@ -1168,9 +1158,6 @@ pub(crate) fn run_inference(args: &[String]) {
         presence_penalty,
         frequency_penalty,
         repeat_last_n,
-        // Resolved later in `effective_sampling` from the MoE flag +
-        // LUMEN_ANTI_RESTATE; this base literal just satisfies the field.
-        anti_restate: false,
     };
     // CUDA is taken before Metal when both are asked for.
     let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal && !use_cuda, context_len);
@@ -2171,13 +2158,7 @@ fn run_with_async(
         collect_per_layer_timings: profile,
     };
 
-    let mut engine = InferenceEngine::new(config, hyperparams_capped);
-    // Install the anti-restate guard's per-token-id byte decoder (powers the
-    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
-    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
-    if let Some(tok) = tokenizer {
-        engine.set_token_decoder(tok.byte_decoder_fn());
-    }
+    let engine = InferenceEngine::new(config, hyperparams_capped);
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
         &engine,
@@ -2317,13 +2298,7 @@ fn run_with_sync(
         collect_per_layer_timings: profile,
     };
 
-    let mut engine = InferenceEngine::new(config, hyperparams_capped);
-    // Install the anti-restate guard's per-token-id byte decoder (powers the
-    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
-    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
-    if let Some(tok) = tokenizer {
-        engine.set_token_decoder(tok.byte_decoder_fn());
-    }
+    let engine = InferenceEngine::new(config, hyperparams_capped);
     let live = LiveModel::from_lbc(provider.lbc(), provider.output_proj_quant);
     run_engine(
         &engine,
@@ -2443,13 +2418,7 @@ fn run_with_mmap(
         collect_per_layer_timings: profile,
     };
 
-    let mut engine = InferenceEngine::new(config, hyperparams_capped);
-    // Install the anti-restate guard's per-token-id byte decoder (powers the
-    // sub-word-doubling rule). No-op for the id-only n-gram restate rule and
-    // when the guard is disabled (dense / LUMEN_ANTI_RESTATE=0).
-    if let Some(tok) = tokenizer {
-        engine.set_token_decoder(tok.byte_decoder_fn());
-    }
+    let engine = InferenceEngine::new(config, hyperparams_capped);
 
     // Metal path: use concrete MetalF32Backend for both batched prefill + decode
     #[cfg(target_os = "macos")]

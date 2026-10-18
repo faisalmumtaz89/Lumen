@@ -161,12 +161,11 @@ pub(crate) fn next_random_seed() -> u64 {
 ///    arithmetic correct at greedy without the penalty.
 ///
 ///    Tradeoff: the penalty's *other* role was damping long-form repetition, which
-///    pure greedy gives up — long generations can repeat or loop (dense and q8/q4
-///    MoE have no other default guard; only BF16 MoE keeps `anti_restate`). To
+///    pure greedy gives up — long generations can repeat or loop. To
 ///    restore taming set `LUMEN_REPETITION_PENALTY` (process-global, all requests),
 ///    or use `temperature > 0` (per request).
 ///    "Greedy" here means no *repetition* penalty: an active `frequency_penalty`
-///    or `anti_restate` still shapes the selection.
+///    still shapes the selection.
 /// 3. Otherwise (sampling, `temperature > 0`) the model-aware default from
 ///    [`lumen_runtime::runtime_defaults::repetition_penalty_default`]: `1.05`
 ///    dense, `1.03` MoE (Qwen3.5-MoE-35B-A3B class, all quants).
@@ -223,16 +222,6 @@ pub(crate) fn diag_frequency_penalty() -> f32 {
 /// (when `--repeat-last-n` is absent) honours it identically.
 pub(crate) fn diag_repeat_last_n() -> Option<usize> {
     lumen_runtime::runtime_defaults::repeat_last_n_resolved()
-}
-
-/// Resolves the greedy anti-degeneration guard flag for a server request.
-///
-/// Delegates to [`runtime_defaults::anti_restate_default`] (ON for MoE, OFF
-/// for dense, `LUMEN_ANTI_RESTATE=0/1` override). Centralised here so the
-/// three wire constructors (OpenAI chat + completions, Anthropic messages)
-/// stay in sync.
-pub(crate) fn diag_anti_restate() -> bool {
-    lumen_runtime::runtime_defaults::anti_restate_default()
 }
 
 /// Resolves whether chat "thinking" (reasoning trace) is enabled for a server
