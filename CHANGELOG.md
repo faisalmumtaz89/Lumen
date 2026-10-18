@@ -9,6 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **CUDA prefill on Qwen3.5-MoE-35B-A3B copied each layer's weights on every prompt chunk.** For every MoE
+  layer and every 2048-token chunk of the prompt, the prefill allocated a new device buffer and copied the
+  layer's whole weight blob into it. It now reads the resident weights in place. Output is unchanged; the
+  peak memory of a 30k-token prompt falls by 0.5 GB on Q4_0 (RTX 5090), 0.9 GB on Q8_0 and 1.7 GB on BF16
+  (H100), and that prompt's prefill is 2-4% faster.
+
 - **The published Qwen3.5-9B Q4_0 A100 decode record described a route that no longer ships.**
   The 146.6 tok/s (0.979×) row in `docs/support.md` and `bench/RESULTS.md` was measured before the
   0.5.0 quality fix (#29) moved most of the 9B's Q4_0 decode projections to F32 activations; it is

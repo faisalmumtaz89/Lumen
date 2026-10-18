@@ -996,8 +996,8 @@ struct MutableState {
     /// dense models. ~6 KB per MoE layer.
     ///
     /// Separated from `CudaMoeMeta` because `CudaMoeMeta` derives `Clone`
-    /// (used in `prefill_moe_ffn_layer`) and `cudarc::CudaSlice<u64>` is not
-    /// `Clone`.
+    /// (used in `prefill_moe_ffn_layer`) and cloning a `cudarc::CudaSlice`
+    /// allocates and copies device memory.
     moe_batched_offsets: Vec<Option<super::moe::CudaMoeBatchedOffsets>>,
     /// Per-layer REPACKED aligned gate+up planes for the W10 wide-M gate+up
     /// kernel. `Some(_)` iff the layer is MoE AND `moe_repack_needed()` (the
@@ -10818,10 +10818,10 @@ impl CudaBackend {
         // and pf.x (output). The decode function reads expert_ids back to CPU
         // host memory once per call (one sync per token, ~K * 4 bytes).
         //
-        // Borrow strategy: extract the MoE meta + scratch references once
-        // outside the loop, take per-token splits of pf.{normed, attn_proj, x}
-        // inside. layer_weights_cache borrow needs to be re-acquired per loop
-        // iteration because pf is &mut.
+        // Borrow strategy: extract the MoE meta, the layer blob and the
+        // scratch references once outside the loop, take per-token splits of
+        // pf.{normed, attn_proj, x} inside; pf is a separate argument, so the
+        // borrows of `st` fields stay disjoint from it.
         let moe_meta = st
             .moe_meta_cache
             .get(layer_idx)
@@ -10842,15 +10842,11 @@ impl CudaBackend {
                     "MoE prefill layer {layer_idx} missing moe_layer_blob; \
                      upload_layer_weights must populate it when subtensors.experts.is_some()",
                 ))
-            })?
-            // Clone the CudaSlice<u8> handle so we can hold the blob without
-            // borrowing st.layer_weights_cache for the per-token loop's life.
-            // CudaSlice is just a refcount + device ptr; clone is cheap.
-            .clone();
+            })?;
 
         // borrow the per-layer batched offset table once outside the
-        // loop. `CudaMoeBatchedOffsets` is not Clone (`CudaSlice<u64>` is not
-        // Clone), but the borrow on `st.moe_batched_offsets` is disjoint from
+        // loop. `CudaMoeBatchedOffsets` is not Clone (cloning its `CudaSlice`
+        // copies device memory), and the borrow on `st.moe_batched_offsets` is disjoint from
         // the borrows on `st.kernels` (&) and `st.moe_scratch` (&mut), so NLL
         // allows holding all three across the loop.
         let batched_offsets = st

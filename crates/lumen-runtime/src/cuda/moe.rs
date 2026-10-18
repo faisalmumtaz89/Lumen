@@ -64,7 +64,8 @@ pub(crate) struct CudaMoeMeta {
 /// Built once at preload from `CudaMoeMeta::{expert_gate_offs, expert_up_offs,
 /// expert_down_offs}` and stored on `MutableState` keyed by `layer_idx`.
 /// Not folded into `CudaMoeMeta` because `CudaMoeMeta` derives `Clone` (used
-/// by the prefill per-token loop) and `cudarc::CudaSlice` is not `Clone`.
+/// by the prefill per-token loop) and cloning a `cudarc::CudaSlice` allocates
+/// and copies device memory.
 ///
 /// Total cost: ~6 KB per MoE layer at num_experts=256.
 pub(crate) struct CudaMoeBatchedOffsets {
