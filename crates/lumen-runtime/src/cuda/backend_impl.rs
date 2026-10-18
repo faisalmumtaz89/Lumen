@@ -21962,6 +21962,23 @@ impl ComputeBackend for CudaBackend {
         // the memory net of it; and, for a GDN model, the recurrent state and
         // the grouped MoE prefill scratch (at the slice's rows, when a layer
         // takes that route) for the same reason.
+        let verbose = super::decode::cuda_verbose();
+        // A synchronized free reading, so allocations still queued are counted.
+        let synced_free = |device: &CudaDevice| -> u64 {
+            let _ = device.synchronize();
+            device.free_memory().unwrap_or(0) as u64
+        };
+        let mem_line = |label: &str, planned: u64, before: u64, after: u64| {
+            eprintln!(
+                "[CUDA mem] {label}: planned {planned} B, taken {} B",
+                before.saturating_sub(after)
+            );
+        };
+        let before_workspace = if verbose {
+            synced_free(&self.device)
+        } else {
+            0
+        };
         let prefill_layout =
             Self::prefill_workspace_layout(&st.kernels, &hp_copy, &cache, st.kv_max_seq_len);
         st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
@@ -21969,28 +21986,54 @@ impl ComputeBackend for CudaBackend {
             &prefill_layout,
         )?);
         st.prefill_layout = Some(prefill_layout);
-        if super::decode::cuda_verbose() {
-            eprintln!(
-                "[CUDA mem] prefill workspace: {:.2} GB ({} rows, score block for {} keys: {})",
-                prefill_layout.bytes() as f64 / 1.0e9,
-                prefill_layout.scratch.token_ids,
-                st.kv_max_seq_len,
-                prefill_layout.score_elems.is_some()
+        let before_state = if verbose {
+            let now = synced_free(&self.device);
+            mem_line(
+                &format!(
+                    "prefill workspace ({} rows, score block for {} keys: {})",
+                    prefill_layout.scratch.token_ids,
+                    st.kv_max_seq_len,
+                    prefill_layout.score_elems.is_some()
+                ),
+                prefill_layout.bytes(),
+                before_workspace,
+                now,
             );
-        }
-        if cache.iter().any(|lw| lw.layer_type == 1) {
+            now
+        } else {
+            0
+        };
+        let gdn_layers = cache.iter().filter(|lw| lw.layer_type == 1).count();
+        if gdn_layers > 0 {
             st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&cache)?);
-            if let Some(grouped) =
-                Self::grouped_moe_layout(st, &hp_copy, prefill_layout.scratch.token_ids)
-            {
-                if let Some(moe_scratch) = st.moe_scratch.as_mut() {
-                    super::moe::ensure_prefill_grouped(moe_scratch, &self.device, &grouped)?;
-                }
-            }
+        }
+        let grouped = Self::grouped_moe_layout(st, &hp_copy, prefill_layout.scratch.token_ids);
+        if let (Some(grouped), Some(moe_scratch)) = (grouped, st.moe_scratch.as_mut()) {
+            super::moe::ensure_prefill_grouped(moe_scratch, &self.device, &grouped)?;
+        }
+        if verbose {
+            let planned = grouped.map_or(0, |g| g.bytes())
+                + if gdn_layers > 0 {
+                    super::gdn::GdnStateLayout::new(
+                        &super::gdn::GdnParams::from_hyperparams(&hp_copy),
+                        gdn_layers,
+                        gdn_register_resident(),
+                    )
+                    .bytes()
+                } else {
+                    0
+                };
+            mem_line(
+                "GDN state and MoE prompt workspace",
+                planned,
+                before_state,
+                synced_free(&self.device),
+            );
         }
         // Pre-dequant the projections that get an F16 copy for HGEMM (tensor
         // core path; see `f16_cache_slots`), stored beside their quantised
         // data. BF16 weights need none (matvec_bf16 reads the raw bytes).
+        self.device.synchronize()?;
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
         let free_for_refusal = match free_before_f16_cache {
@@ -22042,12 +22085,12 @@ impl ComputeBackend for CudaBackend {
                 RuntimeError::Compute(format!("F16 pre-dequant layer {layer_idx}: {e}",))
             })?;
         }
-        let mem_after_f16_cache = self.device.free_memory().unwrap_or(0);
-        if super::decode::cuda_verbose() {
-            eprintln!(
-                "[CUDA mem] after F16 dequant caches: {:.2} GB free (consumed: {:.2} GB)",
-                (mem_after_f16_cache as f64) / 1.0e9,
-                (mem_before_f16_cache.saturating_sub(mem_after_f16_cache) as f64) / 1.0e9
+        if verbose {
+            mem_line(
+                "F16 dequant caches",
+                f16_cache_needed,
+                mem_before_f16_cache as u64,
+                synced_free(&self.device),
             );
         }
 
