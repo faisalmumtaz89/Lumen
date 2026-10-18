@@ -35,9 +35,10 @@ pub(crate) struct ServingPlan {
 /// where the most is taken: the driver takes 72 to 212 MB once, when free
 /// memory first falls below about 7.6 GB, and the pool rounds a phase up by
 /// at most 11 MB, so a load takes up to 223 MB beyond its buffers. The clones
-/// leave it free, and after them the cuBLAS tuning of the F16 projections
-/// holds at most 33.6 MB of it (one 4096 x 4096 F16 shape at a time, released
-/// before the load serves; a failed allocation keeps the default algorithms).
+/// leave it free, and after them the cuBLAS tuning of the F16 or BF16
+/// projections holds at most 33.6 MB of it (one 4096 x 4096 shape at a time,
+/// released before the load serves; a failed allocation keeps the default
+/// algorithms).
 pub(crate) const SERVING_ALLOWANCE_BYTES: u64 = 256 * 1024 * 1024;
 
 impl ServingPlan {
