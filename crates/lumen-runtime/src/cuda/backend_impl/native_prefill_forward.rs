@@ -277,6 +277,80 @@ impl Drop for NativePrefill {
     }
 }
 
+impl NativeScratch {
+    /// Device bytes of [`NativeScratch::new`]'s buffers, field by field.
+    fn bytes() -> usize {
+        let r = MAX_ROWS;
+        let hd = GDN_HEADS * 128;
+        4 * r // ids
+            + 2 * 3 * r * H // resid, hidden, normed
+            + r * H // x8
+            + 2 * r * CONV // qkv
+            + 2 * r * GDN_V // z
+            + 4 * r * GDN_AB // ab
+            + 2 * r * CONV // cv
+            + 4 * r * GDN_HEADS // gc
+            + 2 * 2 * r * hd // w, u
+            + 2 * r * GDN_HEADS * CHUNK as usize // aqk
+            + 2 * r * hd // core
+            + r * AO // codes_out
+            + 2 * r * ATTN_QG // qg
+            + 2 * 2 * r * ATTN_KVD // k, v
+            + 2 * 3 * r * AO // q, gate, o
+            + 2 * r * H // attn_out
+            + r * H / 2 // x4
+            + fp4_scale_bytes(r as u32, HIDDEN) // x4sf
+            + 2 * r * 2 * I // gu
+            + r * I / 2 // d4
+            + fp4_scale_bytes(r as u32, INTERMEDIATE) // d4sf
+    }
+}
+
+/// Device bytes of the [`PrefillWeightViews`] of a model the route admits:
+/// every layer's swizzled gate, up and down block scales, every GDN layer's
+/// BF16 `a` and `b` rows, and the per-layer FP8 activation-scale pair.
+fn views_bytes() -> usize {
+    use crate::cuda::native_prefill_weights::swizzled_len;
+    let layers = route::LAYERS as usize;
+    let per_layer = 2 * swizzled_len(I, H / 16) + swizzled_len(H, I / 16);
+    let gdn_layers = (0..layers).filter(|&l| !is_attention_layer(l)).count();
+    layers * per_layer + gdn_layers * GDN_AB * H * 2 + layers * 2 * 4
+}
+
+/// Whether the route may serve this load: its switches, the KV store and the
+/// model's structure, the conditions [`publish`] checks before it reads a
+/// weight. The memory plan charges [`serving_bytes`] for such a model beside
+/// the F32 prefill's workspace, so whichever route publication ends on has
+/// its memory.
+pub(super) fn candidate(backend: &CudaBackend, kv_precision: KvPrecision) -> bool {
+    route::switches(
+        crate::runtime_defaults::native_prefill_enabled(),
+        std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok(),
+    )
+    .is_ok()
+        && matches!(kv_precision, KvPrecision::F32 | KvPrecision::Bf16)
+        && backend
+            .hp()
+            .is_ok_and(|hp| route::admit_structure(hp, backend.embedding_quant).is_ok())
+}
+
+/// Device bytes the route holds while it serves a `max_seq`-token context of
+/// a `precision` store, beyond the GDN state it shares with decode: the weight
+/// views, the scratch, an F32 store's BF16 staging, the RoPE table and the
+/// GEMM workspace, each as [`publish`] allocates it.
+pub(super) fn serving_bytes(max_seq: usize, precision: KvPrecision) -> u64 {
+    let staging = if precision == KvPrecision::F32 {
+        2 * 2 * (route::KV_HEADS * route::HEAD_DIM) as usize * max_seq
+    } else {
+        0
+    };
+    (views_bytes()
+        + NativeScratch::bytes()
+        + staging
+        + 4 * max_seq * ROT
+        + crate::cuda::native_prefill_gemm::WORKSPACE_BYTES) as u64
+}
+
 /// Publish the route for the weights `weights` just loaded into `st`, or name the first condition
 /// it fails. On success the second value describes the route for the load log.
 pub(super) fn publish(
@@ -1094,5 +1168,27 @@ impl CudaBackend {
                 np.suspended = suspended;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scratch and views of the one geometry the route admits, Qwen3.8-27B:
+    /// the byte totals of their allocations, counted independently.
+    #[test]
+    fn the_route_s_scratch_and_views_are_the_bytes_publish_allocates() {
+        assert_eq!(NativeScratch::bytes(), 608_051_200);
+        assert_eq!(views_bytes(), 1_116_733_952);
+        // An F32 store adds BF16 staging of K and V; both add the RoPE table and
+        // the 32 MiB GEMM workspace.
+        let f32 = serving_bytes(32768, KvPrecision::F32);
+        let bf16 = serving_bytes(32768, KvPrecision::Bf16);
+        assert_eq!(f32 - bf16, 2 * 2 * 4 * 256 * 32768);
+        assert_eq!(
+            bf16,
+            608_051_200 + 1_116_733_952 + 4 * 32768 * 64 + (32 << 20)
+        );
     }
 }

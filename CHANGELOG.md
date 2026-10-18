@@ -9,6 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **A CUDA load that did not fit in GPU memory started anyway.** The KV cache was allocated with no fit check and
+  the prompt workspace (about 2 GB on Qwen3.8-27B) was allocated on every request, after every check. Where the
+  driver backs GPU memory with system memory once the card is full (Windows under WSL), those allocations
+  succeeded past the card: Qwen3.8-27B Q8_0 at a 32768-token context on a 32 GB RTX 5090 decoded at 1.3 tok/s
+  and gave no answer to a 16k-token prompt, and at F32 contexts from 22k to 26k tokens a 15.7k-token prompt
+  took 111 s or more, or timed out, where it takes 9 s when the memory fits. A CUDA load now reserves everything a request uses besides the weights (KV
+  cache, prompt workspace, linear-attention state, MoE prompt workspace) and checks the total against free
+  memory before allocating it; a load that does not fit is refused with each part's size, the largest context
+  that fits and whether `--kv-precision bf16` fits. On the Qwen3.5, 3.6 and 3.8 models a request no longer
+  allocates GPU memory: on an RTX 5090 the card's memory in use stays at its after-load level through 30k-token,
+  short and one-token requests.
+
 - **CUDA prefill on Qwen3.5-MoE-35B-A3B copied each layer's weights on every prompt chunk.** For every MoE
   layer and every 2048-token chunk of the prompt, the prefill allocated a new device buffer and copied the
   layer's whole weight blob into it. It now reads the resident weights in place. Output is unchanged; the

@@ -212,4 +212,69 @@ impl CudaBackend {
         }
         Ok(())
     }
+
+    /// Fill every buffer of the retained F32 prefill workspace with 0xFF bytes
+    /// (NaN as F32), so a test can show no request reads a row of it that the
+    /// request did not write first.
+    pub fn poison_prefill_workspace(&self) -> Result<(), RuntimeError> {
+        use cudarc::driver::DevicePtr;
+        let guard = self.state.lock().unwrap();
+        let st = guard
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+        let ws = st
+            .prefill_workspace
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("no prefill workspace".into()))?;
+        let stream = &self.device.stream;
+        let fill = |ptr: u64, bytes: usize| -> Result<(), RuntimeError> {
+            // SAFETY: `ptr` addresses a live workspace buffer of `bytes` bytes.
+            unsafe { cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, stream.cu_stream()) }
+                .map_err(|e| RuntimeError::Compute(format!("poison: {e}")))
+        };
+        macro_rules! poison {
+            ($($buf:expr),* $(,)?) => {
+                $(fill($buf.device_ptr(stream).0, $buf.num_bytes())?;)*
+            };
+        }
+        let p = &ws.scratch;
+        poison!(
+            p.x,
+            p.normed,
+            p.q,
+            p.k,
+            p.v,
+            p.attn_out,
+            p.attn_proj,
+            p.gate,
+            p.up,
+            p.down,
+            p.token_ids_gpu,
+            p.q_single,
+            p.attn_out_single,
+            p.dequant_f32,
+            p.activation_f16,
+            p.dequant_f16,
+        );
+        if let Some((fused, gate)) = &p.q_gate {
+            poison!(fused, gate);
+        }
+        if let Some(scores) = &p.attn_scores {
+            poison!(scores);
+        }
+        if let Some(g) = &ws.gdn {
+            poison!(
+                g.qkv,
+                g.alpha_raw,
+                g.beta_raw,
+                g.gate,
+                g.gdn_out,
+                g.conv_out,
+                g.raw_out,
+                g.alpha_out,
+                g.beta_out,
+            );
+        }
+        self.device.synchronize()
+    }
 }

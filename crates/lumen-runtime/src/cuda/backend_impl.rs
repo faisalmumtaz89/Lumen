@@ -1253,18 +1253,13 @@ fn cuda_decode_delay_us() -> u64 {
     })
 }
 
-/// Bytes held back from the free-memory-aware split-clone budget for per-token
-/// activations and transient scratch that live *beyond* weights + KV cache.
-///
-/// This covers the cuBLAS graph-capture workspace, the pre-allocated full-vocab
-/// logits buffer (`vocab_size * 4 B` ≈ 1 MB at 248K vocab), per-token activation
-/// buffers (hidden/intermediate-sized, KB-scale each), and the Q4/Q8 *aligned*
-/// repack passes that run immediately after the split clone and stage additional
-/// aligned weight buffers. 2 GB is a deliberately conservative envelope: the true
-/// transient footprint is well under this, and the per-clone `cudaMalloc`
-/// fail-safe in the clone loop (records the first OOM layer and stops) is the
-/// ultimate backstop, so an optimistic budget can never crash preload — it only
-/// permits more clones to be attempted.
+/// Bytes held back from the free-memory-aware split-clone budget. Every buffer
+/// a request uses is allocated before the clone passes (the load's memory
+/// plan), so this covers what follows them at load: the native NVFP4/FP8
+/// route's publication, which releases the F32 prefill workspace and may need
+/// more than it plus its one-time GEMM plan selection's temporaries (about
+/// 1.2 GB when no cached plan table is valid). On every other route it is
+/// memory the clones leave unused.
 const SPLIT_CLONE_ACTIVATION_SLACK_BYTES: usize = 2_000_000_000; // 2 GB
 
 /// Outcome of [`resolve_split_clone_budget`]: the resolved upper cap plus the
@@ -8840,6 +8835,7 @@ impl CudaBackend {
         context: usize,
         precision: KvPrecision,
         f16_caches_forced: bool,
+        native_candidate: bool,
     ) -> super::memory_plan::ServingPlan {
         let kv_heads = hp.num_kv_heads as usize;
         let head_dim = hp.head_dim as usize;
@@ -8867,7 +8863,14 @@ impl CudaBackend {
             ..Default::default()
         };
         let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
-        plan.workspace = ws.bytes();
+        // A model the native route may serve gets the larger of the two routes'
+        // workspaces: publication decides which one serves, after this plan.
+        plan.workspace = if native_candidate {
+            ws.bytes()
+                .max(native_prefill_forward::serving_bytes(context, precision))
+        } else {
+            ws.bytes()
+        };
         if gdn_layers > 0 {
             plan.gdn_state = super::gdn::GdnStateLayout::new(
                 &super::gdn::GdnParams::from_hyperparams(hp),
@@ -21849,6 +21852,7 @@ impl ComputeBackend for CudaBackend {
         // load whose plan does not fit rather than let the allocations spill.
         let f16_cache_forced =
             parse_env_truthy(crate::runtime_defaults::F16_CACHE_FORCE_ENV).unwrap_or(false);
+        let native_candidate = native_prefill_forward::candidate(self, st.kv_precision);
         self.device.synchronize()?;
         match self.device.free_memory() {
             Ok(free) => {
@@ -21866,6 +21870,7 @@ impl ComputeBackend for CudaBackend {
                             context,
                             precision,
                             f16_cache_forced,
+                            native_candidate,
                         )
                     },
                     st.kv_max_seq_len,
