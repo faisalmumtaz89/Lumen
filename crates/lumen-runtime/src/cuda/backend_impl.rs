@@ -8866,9 +8866,9 @@ impl CudaBackend {
             },
             ..Default::default()
         };
+        let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
+        plan.workspace = ws.bytes();
         if gdn_layers > 0 {
-            let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
-            plan.workspace = ws.bytes();
             plan.gdn_state = super::gdn::GdnStateLayout::new(
                 &super::gdn::GdnParams::from_hyperparams(hp),
                 gdn_layers,
@@ -21910,38 +21910,36 @@ impl ComputeBackend for CudaBackend {
                 );
             }
         }
-        // The batched F32 prefill's workspace (GDN models: the only ones that
-        // take `prefill`), for the longest slice and the whole context, so no
-        // request allocates it and every check below sees the memory net of it.
-        let prefill_layout = if cache.iter().any(|lw| lw.layer_type == 1) {
-            let layout =
-                Self::prefill_workspace_layout(&st.kernels, &hp_copy, &cache, st.kv_max_seq_len);
-            st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
-                &self.device,
-                &layout,
-            )?);
-            if super::decode::cuda_verbose() {
-                eprintln!(
-                    "[CUDA mem] prefill workspace: {:.2} GB ({} rows, score block for {} keys: {})",
-                    layout.bytes() as f64 / 1.0e9,
-                    layout.scratch.token_ids,
-                    st.kv_max_seq_len,
-                    layout.score_elems.is_some()
-                );
-            }
+        // The batched F32 prefill's workspace, for the longest slice and the
+        // whole context, so no request allocates it and every check below sees
+        // the memory net of it; and, for a GDN model, the recurrent state and
+        // the grouped MoE prefill scratch (at the slice's rows, when a layer
+        // takes that route) for the same reason.
+        let prefill_layout =
+            Self::prefill_workspace_layout(&st.kernels, &hp_copy, &cache, st.kv_max_seq_len);
+        st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
+            &self.device,
+            &prefill_layout,
+        )?);
+        if super::decode::cuda_verbose() {
+            eprintln!(
+                "[CUDA mem] prefill workspace: {:.2} GB ({} rows, score block for {} keys: {})",
+                prefill_layout.bytes() as f64 / 1.0e9,
+                prefill_layout.scratch.token_ids,
+                st.kv_max_seq_len,
+                prefill_layout.score_elems.is_some()
+            );
+        }
+        if cache.iter().any(|lw| lw.layer_type == 1) {
             st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&cache)?);
-            // The grouped MoE prefill scratch, at the slice's rows, when a
-            // layer takes that route, so no request grows it.
-            if let Some(grouped) = Self::grouped_moe_layout(st, &hp_copy, layout.scratch.token_ids)
+            if let Some(grouped) =
+                Self::grouped_moe_layout(st, &hp_copy, prefill_layout.scratch.token_ids)
             {
                 if let Some(moe_scratch) = st.moe_scratch.as_mut() {
                     super::moe::ensure_prefill_grouped(moe_scratch, &self.device, &grouped)?;
                 }
             }
-            Some(layout)
-        } else {
-            None
-        };
+        }
         let free_before_f16_cache = self.device.free_memory();
         let mem_before_f16_cache = *free_before_f16_cache.as_ref().unwrap_or(&0);
         let free_for_refusal = match free_before_f16_cache {
@@ -22746,12 +22744,10 @@ impl ComputeBackend for CudaBackend {
                         self.device.alloc_zeros::<f32>(floats)?,
                     ));
                 }
-                if let Some(layout) = &prefill_layout {
-                    st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
-                        &self.device,
-                        layout,
-                    )?);
-                }
+                st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
+                    &self.device,
+                    &prefill_layout,
+                )?);
             }
         }
         Ok(())
