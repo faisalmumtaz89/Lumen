@@ -45,7 +45,7 @@ mod native_prefill_forward;
 #[cfg(feature = "test-state-snapshot")]
 mod state_snapshot;
 #[cfg(feature = "test-state-snapshot")]
-pub use state_snapshot::StateSnapshot;
+pub use state_snapshot::{PoisonedParts, StateSnapshot};
 
 /// Cached cuBLAS algorithm selection for HGEMV (M, N=1, K) shapes.
 ///

@@ -368,9 +368,9 @@ pub(super) fn serving_bytes(max_seq: usize, precision: KvPrecision) -> u64 {
 
 /// The model conditions [`publish`] checks before it loads a kernel or allocates (Q0-Q6): the
 /// structure, every layer's schemes and values, the BF16 embedding, and `layers`' planes resident as
-/// the route reads them. Every layer is read twice at most here and in publication: its descriptor
-/// and the values admission checks from one fetch per layer (a model refused at a layer is read no
-/// further), and once more for the weight views.
+/// the route reads them. Each run reads a layer's descriptor and the values it checks from one
+/// fetch per layer (a model refused at a layer is read no further); a load runs it for the memory
+/// plan and again at publication, which reads each layer once more for the weight views.
 fn admit_model(
     backend: &CudaBackend,
     st: &MutableState,

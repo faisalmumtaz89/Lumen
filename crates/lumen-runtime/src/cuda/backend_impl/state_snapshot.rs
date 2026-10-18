@@ -12,6 +12,17 @@ use super::{CudaBackend, KvStore};
 use crate::error::RuntimeError;
 use crate::kv::KvCache;
 
+/// The optional parts of the prefill workspace a poisoning filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoisonedParts {
+    /// The tiled attention's score block.
+    pub score_block: bool,
+    /// The fused Q+gate pair.
+    pub q_gate: bool,
+    /// The grouped MoE prefill scratch.
+    pub grouped_moe: bool,
+}
+
 /// Decode state copied to the host. Vectors are in layer order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StateSnapshot {
@@ -216,7 +227,8 @@ impl CudaBackend {
     /// Fill every buffer of the retained F32 prefill workspace and the grouped
     /// MoE prefill scratch with 0xFF bytes (NaN as F32), so a test can show no
     /// request reads a row of them that the request did not write first.
-    pub fn poison_prefill_workspace(&self) -> Result<(), RuntimeError> {
+    /// Returns which of the parts a model may not have were there to fill.
+    pub fn poison_prefill_workspace(&self) -> Result<PoisonedParts, RuntimeError> {
         use cudarc::driver::DevicePtr;
         let guard = self.state.lock().unwrap();
         let st = guard
@@ -256,11 +268,14 @@ impl CudaBackend {
             p.activation_f16,
             p.dequant_f16,
         );
+        let mut parts = PoisonedParts::default();
         if let Some((fused, gate)) = &p.q_gate {
             poison!(fused, gate);
+            parts.q_gate = true;
         }
         if let Some(scores) = &p.attn_scores {
             poison!(scores);
+            parts.score_block = true;
         }
         if let Some(g) = &ws.gdn {
             poison!(
@@ -303,7 +318,9 @@ impl CudaBackend {
             for t in m.w10_tiles.iter() {
                 poison!(t);
             }
+            parts.grouped_moe = true;
         }
-        self.device.synchronize()
+        self.device.synchronize()?;
+        Ok(parts)
     }
 }

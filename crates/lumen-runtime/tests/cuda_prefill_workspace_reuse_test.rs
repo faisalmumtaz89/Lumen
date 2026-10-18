@@ -1,9 +1,11 @@
 //! The batched prefill's workspace and the grouped MoE prefill scratch are
 //! allocated once at load and lent to every request, so nothing a request
 //! computes may depend on what an earlier request left in them. Here every
-//! buffer of them is filled with 0xFF bytes (NaN as F32) before each request, after a longer and a shorter one, and the
-//! hidden state, the KV cache and the GDN state must match a fresh backend's
-//! bit for bit.
+//! buffer of them is filled with 0xFF bytes (NaN as F32) before each request,
+//! after a longer and a shorter one, and the hidden state, the KV cache and the
+//! GDN state must match a fresh backend's bit for bit. Each model states which
+//! optional parts (score block, Q+gate pair, grouped MoE scratch) it has, so a
+//! route the test names cannot drop out unseen.
 #![cfg(all(feature = "cuda", feature = "test-state-snapshot"))]
 
 mod common;
@@ -14,7 +16,7 @@ use common::gdn_hybrid::{
 use lumen_format::test_model::{generate_test_model, TestModelConfig};
 use lumen_format::QuantScheme;
 use lumen_runtime::compute::ComputeBackend;
-use lumen_runtime::cuda::{CudaBackend, StateSnapshot};
+use lumen_runtime::cuda::{CudaBackend, PoisonedParts, StateSnapshot};
 use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::io::Write;
@@ -92,7 +94,9 @@ fn prompt(len: usize, vocab: usize, seed: usize) -> Vec<u32> {
         .collect()
 }
 
-fn check(lbc: &[u8], label: &str) {
+/// `parts`: the optional workspace parts the model must have, so the poisoning
+/// covers the routes the test names.
+fn check(lbc: &[u8], label: &str, parts: PoisonedParts) {
     let provider = open(lbc, label);
     let Some(reused) = backend(&provider) else {
         return;
@@ -109,7 +113,11 @@ fn check(lbc: &[u8], label: &str) {
             .unwrap_or_else(|e| panic!("{label}: fresh prefill of {len}: {e}"));
         let want = outcome(&h, &fresh.snapshot_state(&kv_fresh).unwrap());
 
-        reused.poison_prefill_workspace().unwrap();
+        assert_eq!(
+            reused.poison_prefill_workspace().unwrap(),
+            parts,
+            "{label}: the workspace parts the poisoning filled"
+        );
         let mut kv_reused = kv(&provider);
         reused.reset_recurrent_state();
         let h = reused
@@ -130,7 +138,11 @@ fn an_attention_model_reads_no_stale_workspace_row() {
         max_seq_len: CONTEXT as u32,
         ..TestModelConfig::default()
     };
-    check(&generate_test_model(&config), "attention");
+    check(
+        &generate_test_model(&config),
+        "attention",
+        PoisonedParts::default(),
+    );
 }
 
 #[test]
@@ -138,19 +150,32 @@ fn a_gdn_hybrid_reads_no_stale_workspace_row() {
     check(
         &build_gdn_hybrid_lbc_with(gdn_model_hyperparams_with(CONTEXT as u32)),
         "gdn-hybrid",
+        PoisonedParts::default(),
     );
 }
 
+/// Every optional part of the workspace a Qwen3.5-shaped model has.
+const QWEN35_PARTS: PoisonedParts = PoisonedParts {
+    score_block: true,
+    q_gate: true,
+    grouped_moe: true,
+};
+
 /// Gated attention with Q/K norms (the tiled attention's full-context score
-/// block and the Q+gate pair) and MoE layers with Q8_0 experts (the grouped
+/// block and the Q+gate pair) and MoE layers of 64 Q8_0 experts (the grouped
 /// MoE route), the other matrices F32.
 #[test]
 fn a_qwen35_shaped_model_reads_no_stale_workspace_row() {
     let fx = Qwen35Fixture {
         expert_quant: Some(QuantScheme::Q8_0),
+        routed_experts: Some(64),
         ..Qwen35Fixture::default()
     };
-    check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), "qwen35");
+    check(
+        &build_qwen35_cpu_lbc(&fx, CONTEXT as u32),
+        "qwen35",
+        QWEN35_PARTS,
+    );
 }
 
 /// The same model with its other matrices in the quantised schemes, so the
@@ -160,7 +185,12 @@ fn a_quantised_qwen35_shaped_model_reads_no_stale_workspace_row() {
     let fx = Qwen35Fixture {
         mixed_quant: true,
         expert_quant: Some(QuantScheme::Q8_0),
+        routed_experts: Some(64),
         ..Qwen35Fixture::default()
     };
-    check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), "qwen35-quant");
+    check(
+        &build_qwen35_cpu_lbc(&fx, CONTEXT as u32),
+        "qwen35-quant",
+        QWEN35_PARTS,
+    );
 }

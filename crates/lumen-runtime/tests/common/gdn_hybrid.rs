@@ -270,9 +270,13 @@ pub struct Qwen35Fixture {
     pub mixed_quant: bool,
     /// Give the last layer's `attn_q_norm` one element too few.
     pub bad_last_layer: bool,
-    /// Store every expert matrix (gate, up and down, the shared expert's too)
-    /// in this one scheme, as a CUDA MoE layer takes them.
+    /// Store the routed experts' matrices (gate, up and down) in this one
+    /// scheme and the shared expert's in Q4_0, as the converter writes an MoE
+    /// layer and the CUDA backend takes it.
     pub expert_quant: Option<QuantScheme>,
+    /// Routed experts per MoE layer instead of 4 (the CUDA grouped MoE
+    /// prefill takes 64, 128 or 256).
+    pub routed_experts: Option<usize>,
 }
 
 const CPU_HEAD_DIM: u32 = 256;
@@ -281,7 +285,7 @@ const CPU_EXPERTS: usize = 4;
 
 /// Hyperparams of [`build_qwen35_cpu_lbc`]: GDN 4 V heads / 2 K heads x 128,
 /// gated attention 4 heads / 2 KV heads x 256 with 64 rotary dims, 4 experts
-/// with 2 active.
+/// (or `routed_experts`) with 2 active.
 fn qwen35_cpu_hyperparams(fx: &Qwen35Fixture, max_seq_len: u32) -> ModelHyperparams {
     ModelHyperparams {
         num_layers: 4 + fx.plain_first as u32,
@@ -296,7 +300,7 @@ fn qwen35_cpu_hyperparams(fx: &Qwen35Fixture, max_seq_len: u32) -> ModelHyperpar
             theta: 10_000_000.0,
             ..RopeParams::default()
         }),
-        num_experts: Some(CPU_EXPERTS as u32),
+        num_experts: Some(fx.routed_experts.unwrap_or(CPU_EXPERTS) as u32),
         num_active_experts: Some(2),
         norm_eps: 1e-6,
         rotary_dim: Some(CPU_ROTARY_DIM),
@@ -587,33 +591,33 @@ pub fn build_qwen35_cpu_lbc(fx: &Qwen35Fixture, max_seq_len: u32) -> Vec<u8> {
             st.ffn_norm = push_as(&mut blob, &norm(1), hidden, f32q);
         }
         if matches!(kind, Some(1) | Some(3)) {
+            let routed = fx.routed_experts.unwrap_or(CPU_EXPERTS);
+            // Expert e's gate, up and down; past the default 4 experts the seeds
+            // leave the layer's own range so every layer's weights stay distinct.
+            let expert = |rows: usize, cols: usize, e: u64, k: u64| {
+                let s = if fx.routed_experts.is_some() {
+                    seed * 1000 + 3 * e + k
+                } else {
+                    seed + 21 + 3 * e + k
+                };
+                rand_vals(rows * cols, s, 1.0 / (cols as f32).sqrt())
+            };
             st.router_weight = Some(push_as(
                 &mut blob,
-                &mat(CPU_EXPERTS, hidden, 20, 3.0),
+                &mat(routed, hidden, 20, 3.0),
                 hidden,
                 f32q,
             ));
             let mut experts = Vec::new();
-            let (expert_in, expert_down) = fx.expert_quant.map_or((narrow, f32q), |q| (q, q));
-            for e in 0..=CPU_EXPERTS as u64 {
-                let gate = push_as(
-                    &mut blob,
-                    &mat(inter, hidden, 21 + 3 * e, 1.0),
-                    hidden,
-                    expert_in,
-                );
-                let up = push_as(
-                    &mut blob,
-                    &mat(inter, hidden, 22 + 3 * e, 1.0),
-                    hidden,
-                    expert_in,
-                );
-                let down = push_as(
-                    &mut blob,
-                    &mat(hidden, inter, 23 + 3 * e, 1.0),
-                    inter,
-                    expert_down,
-                );
+            for e in 0..=routed as u64 {
+                let (expert_in, expert_down) = match fx.expert_quant {
+                    None => (narrow, f32q),
+                    Some(_) if e == routed as u64 => (QuantScheme::Q4_0, QuantScheme::Q4_0),
+                    Some(q) => (q, q),
+                };
+                let gate = push_as(&mut blob, &expert(inter, hidden, e, 0), hidden, expert_in);
+                let up = push_as(&mut blob, &expert(inter, hidden, e, 1), hidden, expert_in);
+                let down = push_as(&mut blob, &expert(hidden, inter, e, 2), inter, expert_down);
                 experts.push(ExpertSlice { gate, up, down });
             }
             let shared = experts.pop().unwrap();
