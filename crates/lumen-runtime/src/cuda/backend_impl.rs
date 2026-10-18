@@ -21928,8 +21928,24 @@ impl ComputeBackend for CudaBackend {
                         .bytes(),
                     )
             });
+        let verbose = super::decode::cuda_verbose();
+        // A synchronized free reading, so allocations still queued are counted.
+        let synced_free = |device: &CudaDevice| -> u64 {
+            let _ = device.synchronize();
+            device.free_memory().unwrap_or(0) as u64
+        };
+        let mem_line = |label: &str, planned: u64, before: u64, after: u64| {
+            eprintln!(
+                "[CUDA mem] {label}: planned {planned} B, taken {} B",
+                before.saturating_sub(after)
+            );
+        };
         {
-            let mem_before_kv = self.device.free_memory().unwrap_or(0);
+            let before_kv = if verbose {
+                synced_free(&self.device)
+            } else {
+                0
+            };
             let mut allocated = 0usize;
             for (layer_idx, layer) in cache.iter().enumerate() {
                 if layer.layer_type == super::gpu_buffers::LAYER_TYPE_GDN {
@@ -21946,14 +21962,23 @@ impl ComputeBackend for CudaBackend {
                 )?);
                 allocated += 1;
             }
-            let mem_after_kv = self.device.free_memory().unwrap_or(0);
-            if super::decode::cuda_verbose() {
-                eprintln!(
-                    "[CUDA mem] after KV cache alloc ({allocated} attention layers of {num_layers}, \
-                     max_seq_len={}): {:.2} GB free (consumed: {:.2} GB)",
-                    st.kv_max_seq_len,
-                    (mem_after_kv as f64) / 1.0e9,
-                    (mem_before_kv.saturating_sub(mem_after_kv) as f64) / 1.0e9
+            if verbose {
+                let planned = allocated as u64
+                    * KvCacheGpu::planned_bytes(
+                        hp_copy.num_kv_heads as usize,
+                        st.kv_max_seq_len,
+                        hp_copy.head_dim as usize,
+                        st.kv_precision,
+                    );
+                mem_line(
+                    &format!(
+                        "KV caches ({allocated} attention layers of {num_layers}, \
+                         max_seq_len={})",
+                        st.kv_max_seq_len
+                    ),
+                    planned,
+                    before_kv,
+                    synced_free(&self.device),
                 );
             }
         }
@@ -21962,18 +21987,6 @@ impl ComputeBackend for CudaBackend {
         // the memory net of it; and, for a GDN model, the recurrent state and
         // the grouped MoE prefill scratch (at the slice's rows, when a layer
         // takes that route) for the same reason.
-        let verbose = super::decode::cuda_verbose();
-        // A synchronized free reading, so allocations still queued are counted.
-        let synced_free = |device: &CudaDevice| -> u64 {
-            let _ = device.synchronize();
-            device.free_memory().unwrap_or(0) as u64
-        };
-        let mem_line = |label: &str, planned: u64, before: u64, after: u64| {
-            eprintln!(
-                "[CUDA mem] {label}: planned {planned} B, taken {} B",
-                before.saturating_sub(after)
-            );
-        };
         let before_workspace = if verbose {
             synced_free(&self.device)
         } else {
