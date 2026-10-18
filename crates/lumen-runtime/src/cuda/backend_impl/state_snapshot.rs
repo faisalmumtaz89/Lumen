@@ -12,6 +12,17 @@ use super::{CudaBackend, KvStore};
 use crate::error::RuntimeError;
 use crate::kv::KvCache;
 
+/// The optional parts of the prefill workspace a poisoning filled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoisonedParts {
+    /// The tiled attention's score block.
+    pub score_block: bool,
+    /// The fused Q+gate pair.
+    pub q_gate: bool,
+    /// The grouped MoE prefill scratch.
+    pub grouped_moe: bool,
+}
+
 /// Decode state copied to the host. Vectors are in layer order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StateSnapshot {
@@ -211,5 +222,105 @@ impl CudaBackend {
             kv.advance_seq_len()?;
         }
         Ok(())
+    }
+
+    /// Fill every buffer of the retained F32 prefill workspace and the grouped
+    /// MoE prefill scratch with 0xFF bytes (NaN as F32), so a test can show no
+    /// request reads a row of them that the request did not write first.
+    /// Returns which of the parts a model may not have were there to fill.
+    pub fn poison_prefill_workspace(&self) -> Result<PoisonedParts, RuntimeError> {
+        use cudarc::driver::DevicePtr;
+        let guard = self.state.lock().unwrap();
+        let st = guard
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+        let ws = st
+            .prefill_workspace
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Compute("no prefill workspace".into()))?;
+        let stream = &self.device.stream;
+        let fill = |ptr: u64, bytes: usize| -> Result<(), RuntimeError> {
+            // SAFETY: `ptr` addresses a live workspace buffer of `bytes` bytes.
+            unsafe { cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, stream.cu_stream()) }
+                .map_err(|e| RuntimeError::Compute(format!("poison: {e}")))
+        };
+        macro_rules! poison {
+            ($($buf:expr),* $(,)?) => {
+                $(fill($buf.device_ptr(stream).0, $buf.num_bytes())?;)*
+            };
+        }
+        let p = &ws.scratch;
+        poison!(
+            p.x,
+            p.normed,
+            p.q,
+            p.k,
+            p.v,
+            p.attn_out,
+            p.attn_proj,
+            p.gate,
+            p.up,
+            p.down,
+            p.token_ids_gpu,
+            p.q_single,
+            p.attn_out_single,
+            p.dequant_f32,
+            p.activation_f16,
+            p.dequant_f16,
+        );
+        let mut parts = PoisonedParts::default();
+        if let Some((fused, gate)) = &p.q_gate {
+            poison!(fused, gate);
+            parts.q_gate = true;
+        }
+        if let Some(scores) = &p.attn_scores {
+            poison!(scores);
+            parts.score_block = true;
+        }
+        if let Some(g) = &ws.gdn {
+            poison!(
+                g.qkv,
+                g.alpha_raw,
+                g.beta_raw,
+                g.gate,
+                g.gdn_out,
+                g.conv_out,
+                g.raw_out,
+                g.alpha_out,
+                g.beta_out,
+            );
+        }
+        if let Some(m) = st
+            .moe_scratch
+            .as_ref()
+            .and_then(|m| m.prefill_grouped.as_ref())
+        {
+            poison!(
+                m.swiglu_compact,
+                m.down_compact,
+                m.col_expert,
+                m.col_src_tok,
+                m.dst_to_col,
+                m.expert_bounds,
+                m.gate_up_tiles16,
+                m.router_logits_batched,
+                m.expert_ids_batched,
+                m.expert_weights_batched,
+                m.shared_swiglu_batched,
+                m.shared_logit_batched,
+            );
+            for q in m.w10_xq_q.iter() {
+                poison!(q);
+            }
+            for d in m.w10_xq_d.iter() {
+                poison!(d);
+            }
+            for t in m.w10_tiles.iter() {
+                poison!(t);
+            }
+            parts.grouped_moe = true;
+        }
+        self.device.synchronize()?;
+        Ok(parts)
     }
 }

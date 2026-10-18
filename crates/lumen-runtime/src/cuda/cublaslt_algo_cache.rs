@@ -823,6 +823,30 @@ pub fn parse(identity: &Identity, text: &str) -> Result<Vec<Selected>, String> {
     Ok(table)
 }
 
+/// Peak device bytes of a [`select_shape`] call, the largest over [`SHAPES`]:
+/// its synthetic activation (codes, linear and swizzled scales), the
+/// [`Verifier`]'s decoded weight and activation with their absolute copies and
+/// its two result rows, and the BF16 output. Each shape's are freed before the
+/// next; the load's memory plan charges this for a load that selects.
+pub fn selection_peak_bytes() -> u64 {
+    use super::native_prefill_weights::swizzled_len;
+    let rows = MAX_ROWS;
+    SHAPES
+        .iter()
+        .map(|s| {
+            let activation = match s.input {
+                LtInput::Nvfp4 => {
+                    rows * s.k / 2 + rows * s.k / 16 + 4 + swizzled_len(rows, s.k / 16)
+                }
+                LtInput::Fp8 => rows * s.k + 4,
+            };
+            let verifier = 4 * (2 * s.n * s.k + 2 * rows * s.k + 2 * rows * s.n) + 8;
+            (activation + verifier + 2 * rows * s.ldd) as u64
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The cached table for `identity` and its file. The outer `Err` is a library call that failed; the
 /// inner one says why the cache cannot be used (absent, unreadable, for another identity, damaged, or
 /// holding an algorithm the library now reads back with a different configuration).

@@ -41,6 +41,8 @@ use crate::kv::KvPrecision;
 use crate::weight::cache::WeightProvider;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, ValidAsZeroBits};
+use lumen_format::index::SubtensorOffsets;
+use lumen_format::ModelHyperparams;
 
 const H: usize = HIDDEN as usize;
 const I: usize = INTERMEDIATE as usize;
@@ -277,6 +279,134 @@ impl Drop for NativePrefill {
     }
 }
 
+impl NativeScratch {
+    /// Device bytes of [`NativeScratch::new`]'s buffers, field by field.
+    fn bytes() -> usize {
+        let r = MAX_ROWS;
+        let hd = GDN_HEADS * 128;
+        4 * r // ids
+            + 2 * 3 * r * H // resid, hidden, normed
+            + r * H // x8
+            + 2 * r * CONV // qkv
+            + 2 * r * GDN_V // z
+            + 4 * r * GDN_AB // ab
+            + 2 * r * CONV // cv
+            + 4 * r * GDN_HEADS // gc
+            + 2 * 2 * r * hd // w, u
+            + 2 * r * GDN_HEADS * CHUNK as usize // aqk
+            + 2 * r * hd // core
+            + r * AO // codes_out
+            + 2 * r * ATTN_QG // qg
+            + 2 * 2 * r * ATTN_KVD // k, v
+            + 2 * 3 * r * AO // q, gate, o
+            + 2 * r * H // attn_out
+            + r * H / 2 // x4
+            + fp4_scale_bytes(r as u32, HIDDEN) // x4sf
+            + 2 * r * 2 * I // gu
+            + r * I / 2 // d4
+            + fp4_scale_bytes(r as u32, INTERMEDIATE) // d4sf
+    }
+}
+
+/// Device bytes of the [`PrefillWeightViews`] of a model the route admits:
+/// every layer's swizzled gate, up and down block scales, every GDN layer's
+/// BF16 `a` and `b` rows, and the per-layer FP8 activation-scale pair.
+fn views_bytes() -> usize {
+    use crate::cuda::native_prefill_weights::swizzled_len;
+    let layers = route::LAYERS as usize;
+    let per_layer = 2 * swizzled_len(I, H / 16) + swizzled_len(H, I / 16);
+    let gdn_layers = (0..layers).filter(|&l| !is_attention_layer(l)).count();
+    layers * per_layer + gdn_layers * GDN_AB * H * 2 + layers * 2 * 4
+}
+
+/// The route's load-time GEMM plan selection bytes when the route may serve
+/// this load, `None` when it cannot: its switches, the KV store, the device's
+/// compute capability and [`admit_model`] over the uploaded `layers`, every
+/// condition [`publish`] checks before it loads a kernel. Selection takes
+/// nothing when a valid plan table is cached. The memory plan charges
+/// [`serving_bytes`] plus these for such a model beside the F32 prefill's
+/// workspace, so whichever route publication ends on has its memory.
+pub(super) fn candidate(
+    backend: &CudaBackend,
+    st: &MutableState,
+    layers: &[LayerWeightsGpu],
+    weights: &dyn WeightProvider,
+) -> Option<u64> {
+    let admitted = route::switches(
+        crate::runtime_defaults::native_prefill_enabled(),
+        std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok(),
+    )
+    .is_ok()
+        && matches!(st.kv_precision, KvPrecision::F32 | KvPrecision::Bf16)
+        && backend.device.compute_capability().ok() == Some((12, 0))
+        && admit_model(backend, st, layers, &ProviderSlices::new(weights)).is_ok();
+    admitted.then(|| {
+        if crate::cuda::native_prefill_gemm::plans_cached(&backend.device) {
+            0
+        } else {
+            crate::cuda::cublaslt_algo_cache::selection_peak_bytes()
+        }
+    })
+}
+
+/// Device bytes the route holds while it serves a `max_seq`-token context of
+/// a `precision` store, beyond the GDN state it shares with decode: the weight
+/// views, the scratch, an F32 store's BF16 staging, the RoPE table and the
+/// GEMM workspace, each as [`publish`] allocates it.
+pub(super) fn serving_bytes(max_seq: usize, precision: KvPrecision) -> u64 {
+    let staging = if precision == KvPrecision::F32 {
+        2 * 2 * (route::KV_HEADS * route::HEAD_DIM) as usize * max_seq
+    } else {
+        0
+    };
+    (views_bytes()
+        + NativeScratch::bytes()
+        + staging
+        + 4 * max_seq * ROT
+        + crate::cuda::native_prefill_gemm::WORKSPACE_BYTES) as u64
+}
+
+/// The model conditions [`publish`] checks before it loads a kernel or allocates (Q0-Q6): the
+/// structure, every layer's schemes and values, the BF16 embedding, and `layers`' planes resident as
+/// the route reads them. Each run reads a layer's descriptor and the values it checks from one
+/// fetch per layer (a model refused at a layer is read no further); a load runs it for the memory
+/// plan and again at publication, which reads each layer once more for the weight views.
+fn admit_model(
+    backend: &CudaBackend,
+    st: &MutableState,
+    layers: &[LayerWeightsGpu],
+    src: &ProviderSlices,
+) -> Result<(ModelHyperparams, Vec<SubtensorOffsets>, Vec<LayerPlanes>), Refusal> {
+    injected(&["Q0", "Q0.a", "Q0.b", "Q0.c", "Q0.d", "Q5", "Q6"])?;
+    let hp = *backend.hp().map_err(|e| Refusal {
+        condition: "Q0",
+        reason: e.to_string(),
+    })?;
+    let offsets = admit_each(&hp, backend.embedding_quant, |l| src.subtensors(l), src)?;
+    if st.globals.embedding_bf16.is_none() {
+        return Err(Refusal {
+            condition: "Q0.d",
+            reason: "the BF16 embedding is not resident on the device".into(),
+        });
+    }
+    let planes = layers
+        .iter()
+        .enumerate()
+        .map(|(l, lw)| layer_planes(&backend.device, l, lw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|reason| Refusal {
+            condition: "Q5",
+            reason,
+        })?;
+    if planes.len() != hp.num_layers as usize {
+        return Err(Refusal {
+            condition: "Q5",
+            reason: format!("{} of {} layers resident", planes.len(), hp.num_layers),
+        });
+    }
+    Ok((hp, offsets, planes))
+}
+
 /// Publish the route for the weights `weights` just loaded into `st`, or name the first condition
 /// it fails. On success the second value describes the route for the load log.
 pub(super) fn publish(
@@ -308,35 +438,8 @@ pub(super) fn publish(
     }
 
     // Structure (Q0-Q6).
-    injected(&["Q0", "Q0.a", "Q0.b", "Q0.c", "Q0.d", "Q5", "Q6"])?;
-    let hp = *backend.hp().map_err(refusal("Q0"))?;
-    // Every layer is read twice at most: here, its descriptor and the values admission checks from one
-    // fetch per layer (a model refused at a layer is read no further), and once more below for the
-    // weight views.
     let src = ProviderSlices::new(weights);
-    let layers = admit_each(&hp, backend.embedding_quant, |l| src.subtensors(l), &src)?;
-    if st.globals.embedding_bf16.is_none() {
-        return Err(Refusal {
-            condition: "Q0.d",
-            reason: "the BF16 embedding is not resident on the device".into(),
-        });
-    }
-    let planes = st
-        .layer_weights_cache
-        .iter()
-        .enumerate()
-        .map(|(l, lw)| layer_planes(device, l, lw))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|reason| Refusal {
-            condition: "Q5",
-            reason,
-        })?;
-    if planes.len() != hp.num_layers as usize {
-        return Err(Refusal {
-            condition: "Q5",
-            reason: format!("{} of {} layers resident", planes.len(), hp.num_layers),
-        });
-    }
+    let (hp, layers, planes) = admit_model(backend, st, &st.layer_weights_cache, &src)?;
 
     // Kernels (Q1-Q3).
     injected(&["Q1", "Q2", "Q3"])?;
@@ -1088,11 +1191,44 @@ impl CudaBackend {
     /// Prefill with the F32 route (`true`) or the published native route (`false`) from the next
     /// prompt on. The F32 route reads a 16-bit KV store through widening buffers, which exist only
     /// when the native route was refused, so over a published route the KV store must be F32.
+    /// Publication released the F32 route's workspace; suspending the route
+    /// allocates it again from the layout the load planned.
     pub fn set_native_prefill_suspended(&self, suspended: bool) {
         self.with_route(|st| {
             if let Some(np) = st.native_prefill.as_mut() {
                 np.suspended = suspended;
+                if suspended && st.prefill_workspace.is_none() {
+                    let layout = st
+                        .prefill_layout
+                        .expect("preload planned the F32 workspace");
+                    st.prefill_workspace = Some(
+                        crate::cuda::prefill::alloc_prefill_workspace(&self.device, &layout)
+                            .expect("the F32 prefill workspace"),
+                    );
+                }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scratch and views of the one geometry the route admits, Qwen3.8-27B:
+    /// the byte totals of their allocations, counted independently.
+    #[test]
+    fn the_route_s_scratch_and_views_are_the_bytes_publish_allocates() {
+        assert_eq!(NativeScratch::bytes(), 608_051_200);
+        assert_eq!(views_bytes(), 1_116_733_952);
+        // An F32 store adds BF16 staging of K and V; both add the RoPE table and
+        // the 32 MiB GEMM workspace.
+        let f32 = serving_bytes(32768, KvPrecision::F32);
+        let bf16 = serving_bytes(32768, KvPrecision::Bf16);
+        assert_eq!(f32 - bf16, 2 * 2 * 4 * 256 * 32768);
+        assert_eq!(
+            bf16,
+            608_051_200 + 1_116_733_952 + 4 * 32768 * 64 + (32 << 20)
+        );
     }
 }
