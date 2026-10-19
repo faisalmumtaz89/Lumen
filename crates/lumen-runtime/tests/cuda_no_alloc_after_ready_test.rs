@@ -1,19 +1,21 @@
 //! Once a CUDA model is ready, no request allocates device memory: everything a
-//! request uses was reserved at load. CUPTI records every device allocation the
-//! process makes, the program's own and the CUDA libraries' alike; recording
-//! starts after `preload_weights` returns and covers requests driven through
-//! `Session` the way the server drives them (cold prompts of one and several
-//! slices, decode greedy and sampled, a generated tail caught up, short and long
-//! suffixes, a divergent prompt that restarts, the same prompt again, a prompt
-//! longer than the context refused and the context filled to its last slot).
-//! No allocation call may be recorded, synchronous or stream-ordered, made by
-//! the program or by a library. The one record a request may leave is the
-//! driver loading a library kernel's module the first time a request launches
-//! it (CUDA loads modules lazily): its static data, recorded with no calling
-//! API, which the serving plan's allowance covers; those are printed. Before it
-//! is trusted the recorder must see a synchronous driver allocation, a stream
-//! allocation and a buffer clone, each as an allocation call. Free memory before
-//! and after is printed, not asserted: other users of the GPU move it.
+//! request uses was reserved at load. Recording starts after `preload_weights`
+//! returns and covers requests driven through `Session` the way the server drives
+//! them (cold prompts of one and several slices, decode greedy and sampled, a
+//! generated tail caught up, short and long suffixes, a divergent prompt that
+//! restarts, the same prompt again, a prompt longer than the context refused and
+//! the context filled to its last slot). CUPTI records every allocation call,
+//! synchronous, stream-ordered, managed or from a pool, the program's own and the
+//! CUDA libraries' alike, and the static data of a module the driver loads: no
+//! allocation call may be recorded, and a window that lost records fails. The one
+//! record a request may leave is the driver loading a library kernel's module the
+//! first time a request launches it (CUDA loads modules lazily), which the serving
+//! plan's allowance covers; those are printed. Module code and virtual-memory
+//! mappings leave no record, so with `LUMEN_NO_ALLOC_ISOLATED_GPU=1` (nothing else
+//! on the GPU) free memory may fall by at most one allocation granule, the driver's
+//! smallest unit of device memory, which one module load takes. Before it is
+//! trusted the recorder must see a synchronous driver allocation, a stream
+//! allocation and a buffer clone, each as an allocation call.
 //! `LUMEN_CUDA_PROFILE` creates CUDA events per stage and is not part of a
 //! request's contract.
 #![cfg(all(feature = "cuda", feature = "test-cupti"))]
@@ -63,6 +65,9 @@ impl Allocation {
 }
 
 static RECORDED: Mutex<Vec<Allocation>> = Mutex::new(Vec::new());
+/// Why a recording window cannot be trusted: a buffer CUPTI could not be given,
+/// or a record it could not decode.
+static LOST: Mutex<Option<String>> = Mutex::new(None);
 static REGISTER: Once = Once::new();
 
 fn layout() -> Layout {
@@ -71,9 +76,15 @@ fn layout() -> Layout {
 
 extern "C" fn buffer_requested(buffer: *mut *mut u8, size: *mut usize, max_records: *mut usize) {
     // SAFETY: CUPTI hands this buffer back to `buffer_completed`, which frees it.
+    let ptr = unsafe { alloc(layout()) };
+    if ptr.is_null() {
+        *LOST.lock().unwrap() = Some("no host memory for a CUPTI buffer".into());
+    }
+    // SAFETY: CUPTI's out-parameters; a zero size makes it drop the records,
+    // which the dropped count then shows.
     unsafe {
-        *buffer = alloc(layout());
-        *size = BUFFER;
+        *buffer = ptr;
+        *size = if ptr.is_null() { 0 } else { BUFFER };
         *max_records = 0;
     }
 }
@@ -87,8 +98,16 @@ extern "C" fn buffer_completed(
 ) {
     let mut record: *mut cupti::CUpti_Activity = std::ptr::null_mut();
     let mut recorded = RECORDED.lock().unwrap();
-    // SAFETY: `buffer` holds `valid` bytes of activity records CUPTI wrote.
-    while unsafe { activity::get_next_record(buffer, valid, &mut record) }.is_ok() {
+    loop {
+        // SAFETY: `buffer` holds `valid` bytes of activity records CUPTI wrote.
+        match unsafe { activity::get_next_record(buffer, valid, &mut record) } {
+            Ok(()) => {}
+            Err(e) if e.0 == cupti::CUptiResult::CUPTI_ERROR_MAX_LIMIT_REACHED => break,
+            Err(e) => {
+                *LOST.lock().unwrap() = Some(format!("a CUPTI record could not be read: {e:?}"));
+                break;
+            }
+        }
         if unsafe { (*record).kind } != cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2 {
             continue;
         }
@@ -121,8 +140,10 @@ extern "C" fn buffer_completed(
             });
         }
     }
-    // SAFETY: allocated in `buffer_requested` with the same layout.
-    unsafe { dealloc(buffer, layout()) };
+    if !buffer.is_null() {
+        // SAFETY: allocated in `buffer_requested` with the same layout.
+        unsafe { dealloc(buffer, layout()) };
+    }
 }
 
 /// Records device allocations from `start` until `allocations`.
@@ -135,16 +156,29 @@ impl Recorder {
                 .expect("register the CUPTI activity buffers");
         });
         RECORDED.lock().unwrap().clear();
+        *LOST.lock().unwrap() = None;
         activity::enable(cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2)
             .expect("enable CUPTI memory records");
         Recorder
     }
 
-    fn allocations(self) -> Vec<Allocation> {
+    /// The allocations recorded, or why the window lost some.
+    fn allocations(self, ctx: &CudaContext) -> Result<Vec<Allocation>, String> {
         activity::disable(cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2).unwrap();
         activity::flush_all(cupti::CUpti_ActivityFlag::CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32)
             .unwrap();
-        std::mem::take(&mut *RECORDED.lock().unwrap())
+        if let Some(lost) = LOST.lock().unwrap().take() {
+            return Err(lost);
+        }
+        for context in [std::ptr::null_mut(), ctx.cu_ctx()] {
+            let mut dropped = 0;
+            // SAFETY: `dropped` is a valid out-parameter.
+            unsafe { activity::get_num_dropped_records(context, 0, &mut dropped) }.unwrap();
+            if dropped != 0 {
+                return Err(format!("CUPTI dropped {dropped} records"));
+            }
+        }
+        Ok(std::mem::take(&mut *RECORDED.lock().unwrap()))
     }
 }
 
@@ -163,7 +197,7 @@ fn recorder_sees_every_allocation_kind(ctx: &std::sync::Arc<CudaContext>) {
     let b = a.clone();
     stream.synchronize().unwrap();
     drop((a, b));
-    let seen = recorder.allocations();
+    let seen = recorder.allocations(ctx).unwrap();
     let calls = seen.iter().filter(|a| !a.is_module_load()).count();
     assert!(
         calls >= 3,
@@ -205,6 +239,28 @@ fn prompt(len: usize, vocab: usize, seed: usize) -> Vec<u32> {
 fn free_memory(ctx: &CudaContext) -> usize {
     ctx.bind_to_thread().unwrap();
     driver::mem_get_info().unwrap().0
+}
+
+/// The driver's smallest unit of device memory on this GPU.
+fn allocation_granule(ctx: &CudaContext) -> usize {
+    ctx.bind_to_thread().unwrap();
+    // SAFETY: a zeroed property block with its type and location set is what the
+    // query reads; `granule` is a valid out-parameter.
+    unsafe {
+        let mut prop: driver_sys::CUmemAllocationProp = std::mem::zeroed();
+        prop.type_ = driver_sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type_ = driver_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = ctx.ordinal() as i32;
+        let mut granule = 0;
+        driver_sys::cuMemGetAllocationGranularity(
+            &mut granule,
+            &prop,
+            driver_sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+        )
+        .result()
+        .unwrap();
+        granule
+    }
 }
 
 fn stack_limit(ctx: &CudaContext) -> usize {
@@ -306,7 +362,7 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
     let recorder = Recorder::start();
     requests(&cuda, &provider, precision);
     let (loads, calls): (Vec<_>, Vec<_>) = recorder
-        .allocations()
+        .allocations(&ctx)?
         .into_iter()
         .partition(Allocation::is_module_load);
     let free_after = free_memory(&ctx);
@@ -319,6 +375,14 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
     }
     if stack_limit(&ctx) != stack {
         return Err("a request grew the stack".into());
+    }
+    let granule = allocation_granule(&ctx);
+    if std::env::var("LUMEN_NO_ALLOC_ISOLATED_GPU").as_deref() == Ok("1")
+        && free.saturating_sub(free_after) > granule
+    {
+        return Err(format!(
+            "free memory fell from {free} to {free_after} bytes, more than one {granule}-byte granule"
+        ));
     }
     Ok(())
 }
@@ -350,9 +414,9 @@ fn no_request_allocates_device_memory_after_ready() {
                 .status()
                 .unwrap();
             if !status.success() {
-                failed.push(case);
+                failed.push(format!("{case} ({status})"));
             }
         }
     }
-    assert!(failed.is_empty(), "cases that allocated: {failed:?}");
+    assert!(failed.is_empty(), "cases that failed: {failed:?}");
 }
