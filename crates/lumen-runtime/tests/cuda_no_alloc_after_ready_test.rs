@@ -8,11 +8,13 @@
 //! synchronous, stream-ordered, managed or from a pool, the program's own and the
 //! CUDA libraries' alike, and every driver call that makes device memory without
 //! an allocation record (a module or library load, a virtual-memory create or
-//! map); none may be made, and a window that lost records fails. What a request
-//! may still take is the code and static data of a library kernel's module the
-//! driver loads, with no call, the first time a request launches it (CUDA's
-//! default lazy loading), which the serving plan's allowance covers: the static
-//! data the driver records is printed, and with `LUMEN_NO_ALLOC_ISOLATED_GPU=1`
+//! map); none may be made by the program, and a window that lost records fails.
+//! What a request may still take is the code and static data of a library
+//! kernel's module loaded the first time a request launches it (CUDA's default
+//! lazy loading): the runtime makes those load calls inside one of its own calls,
+//! which tells them from the program's, and the serving plan's allowance covers
+//! them. They and the static data the driver records are printed, and with
+//! `LUMEN_NO_ALLOC_ISOLATED_GPU=1`
 //! (nothing else on the GPU) free memory may fall by at most one allocation
 //! granule, the driver's smallest unit of device memory, across the requests.
 //! Before it is trusted the recorder must see a synchronous driver allocation, a
@@ -34,10 +36,12 @@ use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::config::RuntimeConfig;
 use lumen_runtime::cuda::CudaBackend;
 use lumen_runtime::kv::KvPrecision;
+use lumen_runtime::runtime_defaults;
 use lumen_runtime::sampling::SamplingParams;
 use lumen_runtime::session::Session;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::alloc::{alloc, dealloc, Layout};
+use std::cell::Cell;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -79,8 +83,16 @@ const MEMORY_CALLS: [cupti::CUpti_driver_api_trace_cbid; 8] = [
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemMap,
 ];
 
-/// The [`MEMORY_CALLS`] made while a window records.
+/// The [`MEMORY_CALLS`] the program made while a window records.
 static CALLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The [`MEMORY_CALLS`] the CUDA runtime made inside one of its calls: its lazy
+/// load of a library kernel's module.
+static LIBRARY_LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// How many CUDA runtime calls this thread is inside.
+    static IN_RUNTIME: Cell<u32> = const { Cell::new(0) };
+}
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Why a recording window cannot be trusted: a buffer CUPTI could not be given,
@@ -170,27 +182,42 @@ unsafe extern "C" fn driver_call(
     _cbid: cupti::CUpti_CallbackId,
     data: *const std::ffi::c_void,
 ) {
+    // SAFETY: an API callback's data is a `CUpti_CallbackData`.
+    let data = unsafe { &*(data as *const cupti::CUpti_CallbackData) };
+    let enter = data.callbackSite == cupti::CUpti_ApiCallbackSite::CUPTI_API_ENTER;
+    if domain == cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_RUNTIME_API {
+        IN_RUNTIME.with(|n| {
+            n.set(if enter {
+                n.get() + 1
+            } else {
+                n.get().saturating_sub(1)
+            })
+        });
+        return;
+    }
     if !WATCHING.load(Ordering::SeqCst)
         || domain != cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_DRIVER_API
+        || !enter
     {
         return;
     }
-    // SAFETY: a driver-API callback's data is a `CUpti_CallbackData`.
-    let data = unsafe { &*(data as *const cupti::CUpti_CallbackData) };
-    if data.callbackSite == cupti::CUpti_ApiCallbackSite::CUPTI_API_ENTER {
-        // SAFETY: CUPTI's NUL-terminated name of the called function.
-        let name = unsafe { std::ffi::CStr::from_ptr(data.functionName) };
-        CALLED
-            .lock()
-            .unwrap()
-            .push(name.to_string_lossy().into_owned());
+    // SAFETY: CUPTI's NUL-terminated name of the called function.
+    let name = unsafe { std::ffi::CStr::from_ptr(data.functionName) }
+        .to_string_lossy()
+        .into_owned();
+    if IN_RUNTIME.with(Cell::get) > 0 {
+        LIBRARY_LOADS.lock().unwrap().push(name);
+    } else {
+        CALLED.lock().unwrap().push(name);
     }
 }
 
-/// What a window recorded: device allocations, and the [`MEMORY_CALLS`] made.
+/// What a window recorded: device allocations, the [`MEMORY_CALLS`] the program
+/// made and those the runtime made loading library modules.
 struct Recorded {
     allocations: Vec<Allocation>,
     memory_calls: Vec<String>,
+    library_loads: Vec<String>,
 }
 
 /// Records device allocations and memory calls from `start` until `finish`.
@@ -211,6 +238,12 @@ impl Recorder {
                     std::ptr::null_mut(),
                 )
                 .expect("subscribe to CUPTI callbacks");
+                cudarc::cupti::result::enable_domain(
+                    1,
+                    subscriber,
+                    cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_RUNTIME_API,
+                )
+                .expect("enable the runtime callbacks");
                 for call in MEMORY_CALLS {
                     cudarc::cupti::result::enable_callback(
                         1,
@@ -225,6 +258,7 @@ impl Recorder {
         RECORDED.lock().unwrap().clear();
         *LOST.lock().unwrap() = None;
         CALLED.lock().unwrap().clear();
+        LIBRARY_LOADS.lock().unwrap().clear();
         WATCHING.store(true, Ordering::SeqCst);
         activity::enable(cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2)
             .expect("enable CUPTI memory records");
@@ -251,6 +285,7 @@ impl Recorder {
         Ok(Recorded {
             allocations: std::mem::take(&mut *RECORDED.lock().unwrap()),
             memory_calls: std::mem::take(&mut *CALLED.lock().unwrap()),
+            library_loads: std::mem::take(&mut *LIBRARY_LOADS.lock().unwrap()),
         })
     }
 }
@@ -310,6 +345,13 @@ fn provider(lbc: &[u8], label: &str) -> SyncWeightProvider {
 
 fn backend(provider: &SyncWeightProvider, precision: KvPrecision) -> CudaBackend {
     let hp = provider.lbc().header.hyperparams;
+    // The model defaults the server sets before it builds its backend, so the
+    // routes are the ones it serves.
+    runtime_defaults::set_path_is_server(true);
+    runtime_defaults::set_model_dense_quant(provider.output_proj_quant);
+    runtime_defaults::set_model_primary_quant(provider.lbc().header.quantization.scheme);
+    runtime_defaults::set_model_block_count(hp.num_layers);
+    runtime_defaults::set_model_is_moe(hp.num_experts.unwrap_or(0) > 0);
     let mut cuda = CudaBackend::new(0).expect("a CUDA GPU");
     cuda.set_kv_precision(precision).unwrap();
     cuda.set_global_tensors(
@@ -462,8 +504,9 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
         .partition(Allocation::is_module_load);
     let free_after = free_memory(&ctx);
     println!(
-        "{label}/{precision:?}: {} allocation calls, modules loaded {loads:?}, free {free} -> {free_after} bytes",
-        calls.len()
+        "{label}/{precision:?}: {} allocation calls, {} library module loads, static data {loads:?}, free {free} -> {free_after} bytes",
+        calls.len(),
+        recorded.library_loads.len()
     );
     if !calls.is_empty() {
         return Err(format!("requests allocated device memory: {calls:?}"));
