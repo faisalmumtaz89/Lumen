@@ -901,6 +901,7 @@ impl RoleView<'_> {
     }
 
     /// The region as I32 elements. Panics when the role holds another type.
+    #[cfg(feature = "test-state-snapshot")]
     pub(crate) fn i32(&mut self) -> CudaViewMut<'_, i32> {
         match &mut self.view {
             Typed::I32(v) => v.slice_mut(..),
@@ -917,6 +918,7 @@ impl RoleView<'_> {
     }
 
     /// The region as I8 elements. Panics when the role holds another type.
+    #[cfg(feature = "test-state-snapshot")]
     pub(crate) fn i8(&mut self) -> CudaViewMut<'_, i8> {
         match &mut self.view {
             Typed::I8(v) => v.slice_mut(..),
@@ -1324,7 +1326,7 @@ mod tests {
 
     /// Values the prefill holds at one instant, read off `prefill_slice`,
     /// `prefill_gdn_layer` and `prefill_moe_ffn_layer` independently of the
-    /// liveness table (the census of the workspace's values), with the route
+    /// liveness table (the values the code holds together), with the route
     /// each instant is on: the compact regions of each set share no byte.
     #[test]
     fn the_values_the_code_holds_together_lie_apart() {
