@@ -21,7 +21,10 @@
 //! A(cublas)=W, lda=in_dim, B(cublas)=A, ldb=in_dim, C(cublas)=C, ldc=out_dim
 
 use cudarc::cublas::{sys as cublas_sys, Gemm, GemmConfig};
-use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig as CudarcLaunchConfig,
+    PushKernelArg,
+};
 
 use crate::error::RuntimeError;
 
@@ -30,103 +33,14 @@ use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
 use super::kv_cache::KvView;
 use super::types::LaunchConfig;
+use super::workspace::{Rest, Role, Workspace};
 use lumen_format::quantization::QuantScheme;
 
-/// Pre-allocated GPU scratch buffers for the batched prefill path.
-///
-/// Sized for the longest slice a request can run; allocated once at load (see
-/// [`PrefillWorkspace`]) and reused across every request and layer. All
-/// buffers are [rows, dim] matrices of which a slice uses its first rows.
-pub(crate) struct PrefillScratch {
-    /// Activation matrix: [batch, hidden_dim].
-    pub x: CudaSlice<f32>,
-    /// Normalized activation: [batch, hidden_dim].
-    pub normed: CudaSlice<f32>,
-    /// Q projection: [batch, q_dim].
-    pub q: CudaSlice<f32>,
-    /// K projection: [batch, kv_dim].
-    pub k: CudaSlice<f32>,
-    /// V projection: [batch, kv_dim].
-    pub v: CudaSlice<f32>,
-    /// Attention output: [batch, q_dim] (filled token-at-a-time).
-    pub attn_out: CudaSlice<f32>,
-    /// Score block of the tiled SGEMM prefill attention: `group ×
-    /// min(rows, 512) × context` F32, reused across every KV head, layer and
-    /// request. `None` when the tiled route is not taken (switch off, kernel
-    /// not loaded, no fused Q+gate attention layer); the dispatcher then
-    /// takes the scalar attention, which needs no score scratch.
-    pub attn_scores: Option<CudaSlice<f32>>,
-    /// Q+gate fusion temporaries: the fused projection `[batch, q_dim * 2]`
-    /// and the deinterleaved gate `[batch, q_dim]`. Present when a layer fuses
-    /// Q and gate.
-    pub q_gate: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
-    /// Output projection + residual: [batch, hidden_dim].
-    pub attn_proj: CudaSlice<f32>,
-    /// Gate FFN: [batch, inter_dim].
-    pub gate: CudaSlice<f32>,
-    /// Up FFN: [batch, inter_dim].
-    pub up: CudaSlice<f32>,
-    /// Down projection: [batch, hidden_dim].
-    pub down: CudaSlice<f32>,
-    /// Token IDs on GPU: [batch].
-    pub token_ids_gpu: CudaSlice<u32>,
-    /// Single-token Q for attention: [q_dim].
-    /// Used by `launch_attention_for_token` (sequential prefill fallback).
-    #[allow(dead_code)]
-    pub q_single: CudaSlice<f32>,
-    /// Single-token attention output: [q_dim].
-    /// Used by `launch_attention_for_token` (sequential prefill fallback).
-    #[allow(dead_code)]
-    pub attn_out_single: CudaSlice<f32>,
-    /// F32 scratch for dequantized Q8_0 weights: [max_weight_elements].
-    ///
-    /// Sized to hold the largest projection weight matrix in F32 format.
-    /// Reused across all projections within a layer. Replaces the per-row
-    /// matvec fallback with: dequant Q8_0 -> F32 scratch -> cuBLAS SGEMM.
-    pub dequant_f32: CudaSlice<f32>,
-    /// F16 activation scratch for HGEMM input conversion: [batch * max_in_dim * 2] bytes.
-    ///
-    /// Used to convert F32 activations to F16 before `cublasGemmEx` HGEMM.
-    /// Reused across all projections. Only allocated when F16 weight caches exist.
-    pub activation_f16: CudaSlice<u8>,
-    /// F16 scratch for dequantized Q8_0/Q4_0 weights: [max_weight_elements * 2] bytes.
-    ///
-    /// Sized to hold the largest projection weight matrix in F16 format.
-    /// Reused across all projections within a layer. Enables the HGEMM path
-    /// (312 TFLOPS tensor cores) for quantized weights that lack a persistent
-    /// F16 cache (e.g., GDN layers). Replaces the slow dequant->F32->SGEMM
-    /// path (19.5 TFLOPS) with dequant->F16->HGEMM.
-    pub dequant_f16: CudaSlice<u8>,
-}
-
-/// Pre-allocated GPU scratch buffers for GDN batched prefill.
-///
-/// Holds batched projections and per-token outputs specific to GDN layers.
-/// Part of the [`PrefillWorkspace`] when the model has GDN layers.
-pub(crate) struct GdnPrefillScratch {
-    /// Batched QKV output: [batch, qkv_dim].
-    pub qkv: CudaSlice<f32>,
-    /// Batched alpha raw projection: [batch, num_heads].
-    pub alpha_raw: CudaSlice<f32>,
-    /// Batched beta raw projection: [batch, num_heads].
-    pub beta_raw: CudaSlice<f32>,
-    /// Batched gate projection: [batch, value_dim].
-    pub gate: CudaSlice<f32>,
-    /// Batched GDN output (per-token gated output): [batch, value_dim].
-    pub gdn_out: CudaSlice<f32>,
-    /// Batched conv1d + SiLU output: [batch, qkv_dim].
-    pub conv_out: CudaSlice<f32>,
-    /// Raw output from gdn_prefill_fused_v3: [batch, num_heads * val_dim].
-    pub raw_out: CudaSlice<f32>,
-    /// Computed alpha gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
-    pub alpha_out: CudaSlice<f32>,
-    /// Computed beta gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
-    pub beta_out: CudaSlice<f32>,
-}
-
-/// Element counts of the buffers in a [`GdnPrefillScratch`] for `batch` rows.
-/// [`alloc_gdn_prefill_scratch`] allocates exactly these, and the load-time
-/// memory plan sums them, so the two cannot disagree.
+/// Element counts of the GDN prefill's workspace values for `batch` rows: the
+/// QKV projection and conv output (`qkv`), the four per-head gate values
+/// (`heads`) and the three value-side outputs (`value`), all F32. The
+/// workspace planner places exactly these, and the load-time memory plan
+/// counts what it places, so the two cannot disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GdnPrefillScratchLayout {
     pub qkv: usize,
@@ -142,37 +56,13 @@ impl GdnPrefillScratchLayout {
             value: batch * value_dim,
         }
     }
-
-    /// Device bytes of the scratch: two `qkv` buffers (projection and conv
-    /// output), four per-head gate buffers and three `value` buffers, all F32.
-    pub(crate) fn bytes(&self) -> u64 {
-        4 * (2 * self.qkv + 4 * self.heads + 3 * self.value) as u64
-    }
 }
 
-/// Allocate GDN prefill scratch buffers.
-pub(crate) fn alloc_gdn_prefill_scratch(
-    device: &super::ffi::CudaDevice,
-    layout: &GdnPrefillScratchLayout,
-) -> Result<GdnPrefillScratch, RuntimeError> {
-    let l = layout;
-    Ok(GdnPrefillScratch {
-        qkv: device.alloc_zeros(l.qkv)?,
-        alpha_raw: device.alloc_zeros(l.heads)?,
-        beta_raw: device.alloc_zeros(l.heads)?,
-        gate: device.alloc_zeros(l.value)?,
-        gdn_out: device.alloc_zeros(l.value)?,
-        conv_out: device.alloc_zeros(l.qkv)?,
-        raw_out: device.alloc_zeros(l.value)?,
-        alpha_out: device.alloc_zeros(l.heads)?,
-        beta_out: device.alloc_zeros(l.heads)?,
-    })
-}
-
-/// Element counts of the buffers in a [`PrefillScratch`] for `batch` rows of
-/// one model's geometry (`activation_f16` and `dequant_f16` in bytes).
-/// [`alloc_prefill_scratch`] allocates exactly these, and the load-time
-/// memory plan sums them, so the two cannot disagree.
+/// Element counts of the prefill's workspace values for `batch` rows of one
+/// model's geometry (`activation_f16` and `dequant_f16` in bytes). The
+/// workspace planner places these, the conversion scratch at most these
+/// ([`ConversionScratch::plan`]), and the load-time memory plan counts what
+/// it places, so the two cannot disagree.
 ///
 /// `dequant_f32` holds the largest projection weight matrix in F32 across ALL
 /// kernels that share this scratch: standard attention (wq/wk/wv/wo), FFN
@@ -248,109 +138,287 @@ impl PrefillScratchLayout {
             dequant_f16: max_weight_elems * 2,
         }
     }
-
-    /// Device bytes of the scratch: four `hidden` buffers (x, normed,
-    /// attn_proj, down), two `q` (q, attn_out), two `kv`, two `inter` (gate,
-    /// up), the Q+gate pair, the token ids, two single-token `q` buffers and
-    /// the dequant / activation scratch.
-    pub(crate) fn bytes(&self) -> u64 {
-        let (qg_fused, qg_gate) = self.q_gate.unwrap_or((0, 0));
-        let f32_elems = 4 * self.hidden
-            + 2 * self.q
-            + 2 * self.kv
-            + 2 * self.inter
-            + qg_fused
-            + qg_gate
-            + 2 * self.q_single
-            + self.dequant_f32;
-        4 * (f32_elems + self.token_ids) as u64 + (self.activation_f16 + self.dequant_f16) as u64
-    }
 }
 
-/// Allocate the prefill scratch a [`PrefillScratchLayout`] describes.
-pub(crate) fn alloc_prefill_scratch(
-    device: &CudaDevice,
-    layout: &PrefillScratchLayout,
-) -> Result<PrefillScratch, RuntimeError> {
-    let l = layout;
-    Ok(PrefillScratch {
-        x: device.alloc_zeros(l.hidden)?,
-        normed: device.alloc_zeros(l.hidden)?,
-        q: device.alloc_zeros(l.q)?,
-        k: device.alloc_zeros(l.kv)?,
-        v: device.alloc_zeros(l.kv)?,
-        attn_out: device.alloc_zeros(l.q)?,
-        attn_scores: None,
-        q_gate: match l.q_gate {
-            Some((fused, gate)) => Some((device.alloc_zeros(fused)?, device.alloc_zeros(gate)?)),
-            None => None,
-        },
-        attn_proj: device.alloc_zeros(l.hidden)?,
-        gate: device.alloc_zeros(l.inter)?,
-        up: device.alloc_zeros(l.inter)?,
-        down: device.alloc_zeros(l.hidden)?,
-        token_ids_gpu: device.alloc_zeros(l.token_ids)?,
-        q_single: device.alloc_zeros(l.q_single)?,
-        attn_out_single: device.alloc_zeros(l.q_single)?,
-        dequant_f32: device.alloc_zeros(l.dequant_f32)?,
-        activation_f16: device.alloc_zeros(l.activation_f16)?,
-        dequant_f16: device.alloc_zeros(l.dequant_f16)?,
-    })
-}
-
-/// The batched F32 prefill's buffers: [`PrefillScratch`] (its score block
-/// included) and the GDN prefill scratch, allocated once at load and lent to
-/// every request.
-pub(crate) struct PrefillWorkspace {
-    pub scratch: PrefillScratch,
-    pub gdn: Option<GdnPrefillScratch>,
+/// The paths of a prefill slice a load can take, beyond those the layouts'
+/// optional parts record (the fused Q+gate attention, the tiled attention,
+/// the GDN layers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrefillRoutes {
+    /// An attention layer without the fused Q+gate projection.
+    pub plain_attention: bool,
+    /// The GDN layers' fused batched state update; otherwise their per-token
+    /// loop over the decode kernels.
+    pub gdn_fused: bool,
+    /// A layer with a dense FFN.
+    pub dense_ffn: bool,
+    /// A layer with a MoE FFN.
+    pub moe_ffn: bool,
 }
 
 /// What [`alloc_prefill_workspace`] allocates: the scratch layouts for the
-/// longest slice and, when the tiled attention is the route, the score
-/// block's element count for the whole context.
+/// longest slice, when the tiled attention is the route the score block's
+/// element count for the whole context, when a MoE layer takes the grouped
+/// route its scratch for the longest slice, the paths a slice can take and
+/// the conversion scratch its GEMMs take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefillWorkspaceLayout {
     pub scratch: PrefillScratchLayout,
     pub gdn: Option<GdnPrefillScratchLayout>,
     pub score_elems: Option<usize>,
+    pub grouped: Option<super::moe::PrefillGroupedLayout>,
+    pub routes: PrefillRoutes,
+    pub conversion: ConversionScratch,
+    /// Place every value in its own region (the unshared layout) instead of
+    /// sharing bytes between values never live together, so a test can
+    /// compare the two.
+    #[cfg(feature = "test-state-snapshot")]
+    pub unshared: bool,
 }
 
 impl PrefillWorkspaceLayout {
-    /// Device bytes of the whole workspace.
+    /// Where each value lies in the workspace's arena.
+    pub(crate) fn regions(&self) -> super::workspace::RegionTable {
+        #[cfg(feature = "test-state-snapshot")]
+        if self.unshared {
+            return super::workspace::unshared(self);
+        }
+        super::workspace::compact(self, &super::workspace::liveness(self))
+    }
+
+    /// Device bytes of the whole workspace: the arena its regions lie in.
     pub(crate) fn bytes(&self) -> u64 {
-        self.scratch.bytes()
-            + self.gdn.map_or(0, |g| g.bytes())
-            + 4 * self.score_elems.unwrap_or(0) as u64
+        self.regions().bytes() as u64
+    }
+
+    /// The layout of these parts with the compact planner.
+    #[cfg(test)]
+    pub(crate) fn of(
+        scratch: PrefillScratchLayout,
+        gdn: Option<GdnPrefillScratchLayout>,
+        score_elems: Option<usize>,
+        grouped: Option<super::moe::PrefillGroupedLayout>,
+        routes: PrefillRoutes,
+        conversion: ConversionScratch,
+    ) -> Self {
+        Self {
+            scratch,
+            gdn,
+            score_elems,
+            grouped,
+            routes,
+            conversion,
+            #[cfg(feature = "test-state-snapshot")]
+            unshared: false,
+        }
     }
 }
 
-/// Allocate the workspace `layout` describes. The score block is part of the
-/// selected route, so failing to allocate it fails the load.
+/// The served models' prefill geometry at the 2048-row slice and a 32768-token
+/// context, for the workspace's unit tests.
+#[cfg(test)]
+pub(crate) mod test_models {
+    use super::*;
+
+    /// A model's geometry: hidden width, query and KV heads of `head_dim`,
+    /// FFN width, GDN `(qkv_dim, num_heads, value_dim)`, and whether its FFN
+    /// is MoE (no dense FFN).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Model {
+        pub name: &'static str,
+        pub hidden: usize,
+        pub heads: usize,
+        pub kv_heads: usize,
+        pub head_dim: usize,
+        pub inter: usize,
+        pub gdn: (usize, usize, usize),
+        pub moe: bool,
+    }
+
+    /// Qwen3.8-27B: 24 query / 4 KV heads of 256, FFN 17408, GDN 10240 / 48 / 6144.
+    pub(crate) const Q27B: Model = Model {
+        name: "27B",
+        hidden: 5120,
+        heads: 24,
+        kv_heads: 4,
+        head_dim: 256,
+        inter: 17408,
+        gdn: (10240, 48, 6144),
+        moe: false,
+    };
+    /// Qwen3.5-9B: 16 query / 4 KV heads of 256, FFN 12288, GDN 8192 / 32 / 4096.
+    pub(crate) const Q9B: Model = Model {
+        name: "9B",
+        hidden: 4096,
+        heads: 16,
+        kv_heads: 4,
+        head_dim: 256,
+        inter: 12288,
+        gdn: (8192, 32, 4096),
+        moe: false,
+    };
+    /// Qwen3.5-35B-A3B: 16 query / 2 KV heads of 256, expert FFN 512, GDN
+    /// 8192 / 32 / 4096, every layer MoE.
+    pub(crate) const MOE: Model = Model {
+        name: "35B-A3B",
+        hidden: 2048,
+        heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        inter: 512,
+        gdn: (8192, 32, 4096),
+        moe: true,
+    };
+
+    pub(crate) const ROWS: usize = 2048;
+    pub(crate) const CONTEXT: usize = 32768;
+
+    impl Model {
+        pub(crate) fn q_dim(&self) -> usize {
+            self.heads * self.head_dim
+        }
+
+        pub(crate) fn scratch(&self) -> PrefillScratchLayout {
+            PrefillScratchLayout::new(
+                ROWS,
+                self.hidden,
+                self.q_dim(),
+                self.kv_heads * self.head_dim,
+                self.inter,
+                Some(self.gdn.0),
+                Some(self.gdn.2),
+                true,
+            )
+        }
+
+        /// The GEMMs of a fused Q+gate attention layer and a GDN layer, each
+        /// with its FFN, every weight `weight` but the GDN alpha/beta pair,
+        /// `alpha_beta` (passed an F16 cache when `ab_cache`).
+        pub(crate) fn gemms(
+            &self,
+            weight: WeightClass,
+            alpha_beta: WeightClass,
+            ab_cache: bool,
+        ) -> Vec<PrefillGemm> {
+            let (h, q, kv, i) = (
+                self.hidden,
+                self.q_dim(),
+                self.kv_heads * self.head_dim,
+                self.inter,
+            );
+            let (qkv, heads, value) = self.gdn;
+            let g = |out_dim, in_dim| PrefillGemm {
+                weight,
+                out_dim,
+                in_dim,
+                residual: false,
+                gdn_alpha_beta: false,
+                f16_cache: false,
+            };
+            let ab = PrefillGemm {
+                weight: alpha_beta,
+                gdn_alpha_beta: true,
+                f16_cache: ab_cache,
+                ..g(heads, h)
+            };
+            let mut gemms = vec![
+                g(2 * q, h),
+                g(kv, h),
+                g(kv, h),
+                PrefillGemm {
+                    residual: true,
+                    ..g(h, q)
+                },
+                g(qkv, h),
+                g(value, h),
+                ab,
+                ab,
+                PrefillGemm {
+                    residual: true,
+                    ..g(h, value)
+                },
+            ];
+            if !self.moe {
+                for _ in 0..2 {
+                    gemms.extend([g(i, h), g(i, h), g(h, i)]);
+                }
+            }
+            gemms
+        }
+
+        /// The workspace layout of this model with conversion scratch
+        /// `conversion` and the fused GDN path.
+        pub(crate) fn layout(&self, conversion: ConversionScratch) -> PrefillWorkspaceLayout {
+            PrefillWorkspaceLayout::of(
+                self.scratch(),
+                Some(GdnPrefillScratchLayout::new(
+                    ROWS, self.gdn.0, self.gdn.1, self.gdn.2,
+                )),
+                attn_score_block_elems(ROWS, self.heads, self.kv_heads, CONTEXT - ROWS),
+                // 256 experts, 8 routed per token, the W10 gate+up on.
+                self.moe.then(|| super::super::moe::PrefillGroupedLayout {
+                    w10: true,
+                    ..super::super::moe::PrefillGroupedLayout::new(
+                        ROWS,
+                        8,
+                        256,
+                        self.hidden,
+                        self.inter,
+                    )
+                }),
+                PrefillRoutes {
+                    plain_attention: false,
+                    gdn_fused: true,
+                    dense_ffn: !self.moe,
+                    moe_ffn: self.moe,
+                },
+                conversion,
+            )
+        }
+    }
+
+    /// The default switches of a dense model: projections through HGEMM, the
+    /// Q8_0 split layout releasing the raw planes.
+    pub(crate) fn dense_switches() -> GemmSwitches {
+        GemmSwitches {
+            mmq_kernel: true,
+            mmq_residual_kernel: true,
+            q8_split: true,
+            ..GemmSwitches::default()
+        }
+    }
+
+    /// The default switches of a MoE model: Q8_0 projections through MMQ,
+    /// BF16 weights past the F16 caches, `bf16` alpha/beta through F32.
+    pub(crate) fn moe_switches(bf16: bool) -> GemmSwitches {
+        GemmSwitches {
+            q8_proj_mmq: true,
+            gdn_ab_f32: bf16,
+            moe_bf16_native: true,
+            mmq_kernel: true,
+            mmq_residual_kernel: true,
+            ..GemmSwitches::default()
+        }
+    }
+}
+
+/// Allocate the workspace `layout` describes: one arena with its values'
+/// regions. The score block is part of the selected route, so failing to
+/// allocate it fails the load.
 pub(crate) fn alloc_prefill_workspace(
     device: &CudaDevice,
     layout: &PrefillWorkspaceLayout,
-) -> Result<PrefillWorkspace, RuntimeError> {
-    let mut scratch = alloc_prefill_scratch(device, &layout.scratch)?;
-    scratch.attn_scores = match layout.score_elems {
-        Some(n) => Some(device.alloc_zeros(n)?),
-        None => None,
-    };
-    let gdn = match &layout.gdn {
-        Some(g) => Some(alloc_gdn_prefill_scratch(device, g)?),
-        None => None,
-    };
-    Ok(PrefillWorkspace { scratch, gdn })
+) -> Result<Workspace, RuntimeError> {
+    Workspace::alloc(device, layout.regions())
 }
 
 /// Tokens per prefill slice. A prompt longer than this runs through the
-/// layers in slices, each through one scratch sized for the slice, so the
-/// per-token scratch is bounded by this and not by the prompt: on the 27B
-/// dense model it measures about 0.55 MiB per token over a fixed ~0.6 GiB, so a
-/// slice takes at most ~1.8 GiB, which fits beside the weights and a 16k-token
-/// KV cache on a 32 GB card. The tiled attention's score block still grows with the prompt
-/// (`group × min(slice, 512) × keys` F32: ~190 MiB at 16k keys on the 27B).
-/// Prompts up to this length run as one slice, exactly as before.
+/// layers in slices, each through one workspace sized for the slice, so the
+/// workspace is bounded by this and not by the prompt: on the 27B Q8_0 model
+/// it takes 668,991,488 bytes with a 32768-token context. The tiled
+/// attention's score block, which shares the workspace, grows with the
+/// context (`group × min(slice, 512) × keys` F32: ~384 MiB at 32k keys on the
+/// 27B). Prompts up to this length run as one slice, exactly as before.
 pub(crate) const PREFILL_SLICE_TOKENS: usize = 2048;
 
 /// Element count of the tiled prefill attention's score block for one
@@ -390,7 +458,7 @@ unsafe fn launch_dequant_plane_to_f32(
     func: &CudaFunction,
     quant: QuantScheme,
     plane: &CudaSlice<u8>,
-    out: &mut CudaSlice<f32>,
+    out: &mut CudaViewMut<'_, f32>,
     n_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -424,7 +492,7 @@ unsafe fn dequant_planar_into_scratch(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    dequant_scratch: &mut CudaSlice<f32>,
+    dequant_scratch: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -478,8 +546,8 @@ pub(crate) unsafe fn launch_embed_batch(
     embedding_bf16: Option<&CudaSlice<u8>>,
     embedding_q4: Option<&CudaSlice<u8>>,
     embedding_kquant: Option<(QuantScheme, &CudaSlice<u8>)>,
-    token_ids_gpu: &CudaSlice<u32>,
-    output: &mut CudaSlice<f32>,
+    token_ids_gpu: &CudaView<'_, u32>,
+    output: &mut CudaViewMut<'_, f32>,
     batch: usize,
     hidden_dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -587,9 +655,9 @@ pub(crate) unsafe fn launch_embed_batch(
 pub(crate) unsafe fn launch_rmsnorm_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    x: &CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
     weight: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    out: &mut CudaViewMut<'_, f32>,
     eps: f32,
     batch: usize,
     dim: usize,
@@ -645,6 +713,233 @@ fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
         && moe_bf16_native_enabled()
 }
 
+/// `LUMEN_CUDA_PREFILL_F32` present: the prefill GEMMs take their F32 SGEMM
+/// fallback where the weight has one.
+fn prefill_f32_forced() -> bool {
+    std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok()
+}
+
+/// `LUMEN_CUDA_Q8_PROJ_MMQ` present, whatever its value: a raw Q8_0 weight
+/// prefers MMQ over an F16 cache, and the residual GEMM takes MMQ.
+fn q8_proj_mmq_set() -> bool {
+    std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok()
+}
+
+/// Whether the GDN alpha/beta projections take the F32 SGEMM, from the value
+/// of `LUMEN_CUDA_GDN_AB_F32` (`0`/`false` off, any other value on; unset: on
+/// for a MoE BF16 model).
+fn gdn_ab_f32_on(env: Option<&str>) -> bool {
+    match env {
+        Some("0") | Some("false") | Some("FALSE") => false,
+        Some(_) => true,
+        None => crate::runtime_defaults::model_is_moe_bf16(),
+    }
+}
+
+/// A prefill GEMM's weight as [`launch_gemm_projection`] and
+/// [`launch_gemm_residual`] dispatch on it: the variant that picks the arm,
+/// and with it the conversion scratch the arm takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WeightClass {
+    F32,
+    F16Raw,
+    Bf16Raw,
+    Q8Raw,
+    Q8Split,
+    Q4Raw,
+    KQuant,
+    Ct4Raw,
+    /// NVFP4 or FP8 planes.
+    Planar,
+    /// `Q8Aligned` (per-row matvec) or `Q4Aligned` (refused): no scratch.
+    Aligned,
+}
+
+impl WeightClass {
+    pub(crate) fn of(weight: &GpuWeightBuf) -> Self {
+        match weight {
+            GpuWeightBuf::F32(_) => Self::F32,
+            GpuWeightBuf::F16Raw(_) => Self::F16Raw,
+            GpuWeightBuf::Bf16Raw(_) => Self::Bf16Raw,
+            GpuWeightBuf::Q8Raw(_) => Self::Q8Raw,
+            GpuWeightBuf::Q8Split(_) => Self::Q8Split,
+            GpuWeightBuf::Q4Raw(_) => Self::Q4Raw,
+            GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+                Self::KQuant
+            }
+            GpuWeightBuf::Ct4Raw(_) => Self::Ct4Raw,
+            GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => Self::Planar,
+            GpuWeightBuf::Q8Aligned(_) | GpuWeightBuf::Q4Aligned(_) => Self::Aligned,
+        }
+    }
+}
+
+/// One GEMM a prefill slice runs, as far as the conversion scratch its route
+/// takes depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillGemm {
+    pub weight: WeightClass,
+    pub out_dim: usize,
+    pub in_dim: usize,
+    /// Run by [`launch_gemm_residual`], not [`launch_gemm_projection`].
+    pub residual: bool,
+    /// The `gdn_alpha` / `gdn_beta` projection.
+    pub gdn_alpha_beta: bool,
+    /// Passed an F16 cache the load builds.
+    pub f16_cache: bool,
+}
+
+/// The switches the prefill GEMMs' routes read, read as the GEMMs read them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GemmSwitches {
+    /// [`prefill_f32_forced`].
+    pub force_f32: bool,
+    /// [`q8_proj_mmq_set`].
+    pub q8_proj_mmq_set: bool,
+    /// `q8_proj_mmq_enabled()`: the projection GEMM's MMQ route.
+    pub q8_proj_mmq: bool,
+    /// [`gdn_ab_f32_on`].
+    pub gdn_ab_f32: bool,
+    /// A BF16 weight bypasses an F16 cache ([`moe_bf16_native_path`]).
+    pub moe_bf16_native: bool,
+    pub mmq_kernel: bool,
+    pub mmq_residual_kernel: bool,
+    /// A raw Q8_0 plane may be resident only in the split layout by the time a
+    /// request runs (`q8_split_release_raw_enabled()`).
+    pub q8_split: bool,
+}
+
+impl GemmSwitches {
+    pub(crate) fn read(kernels: &KernelSet) -> Self {
+        Self {
+            force_f32: prefill_f32_forced(),
+            q8_proj_mmq_set: q8_proj_mmq_set(),
+            q8_proj_mmq: crate::runtime_defaults::q8_proj_mmq_enabled(),
+            gdn_ab_f32: gdn_ab_f32_on(std::env::var("LUMEN_CUDA_GDN_AB_F32").ok().as_deref()),
+            moe_bf16_native: crate::runtime_defaults::model_is_moe() && moe_bf16_native_enabled(),
+            mmq_kernel: kernels.mmq_q8_0_batched.is_some(),
+            mmq_residual_kernel: kernels.mmq_q8_0_batched_residual.is_some(),
+            q8_split: crate::runtime_defaults::q8_split_release_raw_enabled(),
+        }
+    }
+}
+
+/// Lengths of the conversion scratch regions (`dequant_f32` in F32
+/// elements, the others in bytes); `None` for one no GEMM's route takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversionScratch {
+    pub dequant_f32: Option<usize>,
+    pub activation_f16: Option<usize>,
+    pub dequant_f16: Option<usize>,
+}
+
+impl ConversionScratch {
+    /// The scratch `gemms` take over `rows` rows under `switches`: each region
+    /// is the largest need, capped at `bound`, of the GEMMs whose route can
+    /// reach an arm that takes it. `bound` is the scratch sized to the model's
+    /// largest weight and widest row, so every length comparison a GEMM makes
+    /// on a region decides as it does on `bound`: a need within `bound` is
+    /// within the region, and a need over `bound` is over the region, which
+    /// never exceeds `bound`. The arms follow [`launch_gemm_projection`] and
+    /// [`launch_gemm_residual`]; an arm counts whenever a GEMM can reach it:
+    /// an F16-cache arm and the arm the GEMM takes without the cache, and a
+    /// raw Q8_0 weight's split-layout arm when its raw copy can be released.
+    pub(crate) fn plan(
+        gemms: &[PrefillGemm],
+        switches: &GemmSwitches,
+        rows: usize,
+        bound: &PrefillScratchLayout,
+    ) -> Self {
+        let mut scratch = Self::default();
+        for gemm in gemms {
+            scratch.add(gemm, gemm.weight, switches, rows, bound);
+            if gemm.weight == WeightClass::Q8Raw && switches.q8_split {
+                scratch.add(gemm, WeightClass::Q8Split, switches, rows, bound);
+            }
+        }
+        scratch
+    }
+
+    fn add(
+        &mut self,
+        gemm: &PrefillGemm,
+        weight: WeightClass,
+        sw: &GemmSwitches,
+        rows: usize,
+        bound: &PrefillScratchLayout,
+    ) {
+        fn grow(region: &mut Option<usize>, need: usize, bound: usize) {
+            *region = Some(region.unwrap_or(0).max(need.min(bound)));
+        }
+        let (out_dim, in_dim) = (gemm.out_dim, gemm.in_dim);
+        let dequant_f16_need = 2 * out_dim * in_dim;
+        let dequant_f16_short = dequant_f16_need > bound.dequant_f16;
+        let dequant_f32 =
+            |s: &mut Self| grow(&mut s.dequant_f32, out_dim * in_dim, bound.dequant_f32);
+        let activation = |s: &mut Self| {
+            grow(
+                &mut s.activation_f16,
+                rows * in_dim * 2,
+                bound.activation_f16,
+            )
+        };
+        let f16_pair = |s: &mut Self| {
+            grow(&mut s.dequant_f16, dequant_f16_need, bound.dequant_f16);
+            activation(s);
+        };
+        let q8raw = weight == WeightClass::Q8Raw;
+        let mmq_kernel = if gemm.residual {
+            sw.mmq_residual_kernel
+        } else {
+            sw.mmq_kernel
+        };
+        let prefer_mmq_over_f16cache =
+            sw.q8_proj_mmq_set && q8raw && in_dim % 32 == 0 && mmq_kernel;
+        let force_alpha_beta_f32 = !gemm.residual && sw.gdn_ab_f32 && gemm.gdn_alpha_beta && q8raw;
+        let moe_bf16_native = weight == WeightClass::Bf16Raw && sw.moe_bf16_native;
+        if gemm.f16_cache
+            && !sw.force_f32
+            && !prefer_mmq_over_f16cache
+            && !force_alpha_beta_f32
+            && !moe_bf16_native
+        {
+            activation(self);
+        }
+        match weight {
+            WeightClass::Planar => dequant_f32(self),
+            WeightClass::F32 | WeightClass::Aligned => {}
+            WeightClass::F16Raw | WeightClass::Bf16Raw => activation(self),
+            WeightClass::Q8Raw => {
+                let use_mmq = if gemm.residual {
+                    sw.q8_proj_mmq_set
+                } else {
+                    sw.q8_proj_mmq && !force_alpha_beta_f32
+                } && mmq_kernel
+                    && in_dim % 32 == 0;
+                if use_mmq {
+                    // MMQ reads the raw plane and takes no scratch.
+                } else if sw.force_f32 || force_alpha_beta_f32 || dequant_f16_short {
+                    dequant_f32(self);
+                } else {
+                    f16_pair(self);
+                }
+            }
+            WeightClass::Q4Raw | WeightClass::Q8Split => {
+                if sw.force_f32 || dequant_f16_short {
+                    dequant_f32(self);
+                } else {
+                    f16_pair(self);
+                }
+            }
+            WeightClass::KQuant | WeightClass::Ct4Raw => {
+                if !(sw.force_f32 || dequant_f16_short) {
+                    f16_pair(self);
+                }
+            }
+        }
+    }
+}
+
 /// One line per process for the Q8_0 dequant -> F16 -> HGEMM prefill route on a raw AoS plane.
 fn announce_q8_hgemm_once() {
     static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
@@ -687,18 +982,18 @@ fn announce_q8_split_hgemm_once() {
 /// # Safety
 ///
 /// `input` must be [batch, in_dim]. `weight` must be [out_dim, in_dim].
-/// `output` must be [batch, out_dim]. `dequant_scratch` must have at least
-/// `out_dim * in_dim` elements (only used for Q8_0 weights).
-pub(crate) unsafe fn launch_gemm_projection(
+/// `output` must be [batch, out_dim]. `conversion` lends the conversion
+/// scratch the weight's route takes: an `ActivationF16` region the route
+/// borrows must hold `batch * in_dim` 16-bit elements (the conversion does
+/// not check); the dequant regions' lengths are checked.
+pub(crate) unsafe fn launch_gemm_projection<const N: usize>(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
     weight_f16_cache: Option<&CudaSlice<u8>>,
-    input: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
-    dequant_scratch: &mut CudaSlice<f32>,
-    activation_f16: &mut CudaSlice<u8>,
-    dequant_f16: &mut CudaSlice<u8>,
+    input: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
+    conversion: &mut Rest<'_, N>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -728,13 +1023,13 @@ pub(crate) unsafe fn launch_gemm_projection(
     // tensor-core fast path AND the F16-cache Q8/Q4 paths; force the SGEMM-F32
     // fallback paths in the `match weight` block. Used to test whether HGEMM-F16
     // rounding accounts for the L0 drift on the Q8 projection.
-    let force_f32 = std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok();
+    let force_f32 = prefill_f32_forced();
 
     // when LUMEN_CUDA_Q8_PROJ_MMQ=1, also bypass the F16-cache
     // fast path so that Q8Raw weights are routed to mmq_q8_0_batched (MMQ-style
     // INT8xINT8->INT32->F32-scale dp4a math). The F16 cache would otherwise
     // short-circuit before the match arm.
-    let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
+    let q8_proj_mmq = q8_proj_mmq_set();
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
     let prefer_mmq_over_f16cache =
         q8_proj_mmq && weight_is_q8raw && in_dim % 32 == 0 && kernels.mmq_q8_0_batched.is_some();
@@ -758,12 +1053,8 @@ pub(crate) unsafe fn launch_gemm_projection(
     // q8 (adds a DD-REP). Env override: `LUMEN_CUDA_GDN_AB_F32=0` forces OFF, any
     // other value forces ON.
     let gdn_ab_f32_env = std::env::var("LUMEN_CUDA_GDN_AB_F32").ok();
-    let gdn_ab_f32_on = match gdn_ab_f32_env.as_deref() {
-        Some("0") | Some("false") | Some("FALSE") => false,
-        Some(_) => true,
-        None => crate::runtime_defaults::model_is_moe_bf16(),
-    };
-    let gdn_ab_f32 = gdn_ab_f32_on && (label == "gdn_alpha" || label == "gdn_beta");
+    let gdn_ab_f32 =
+        gdn_ab_f32_on(gdn_ab_f32_env.as_deref()) && (label == "gdn_alpha" || label == "gdn_beta");
     let force_alpha_beta_f32 = gdn_ab_f32 && weight_is_q8raw;
 
     // Fast path: HGEMM with pre-dequanted F16 weights (tensor core, 312 TFLOPS on A100).
@@ -775,6 +1066,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
+        let [mut activation] = conversion.regions([Role::ActivationF16]);
+        let activation_f16 = &mut activation.u8();
         static HGEMM_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if super::decode::cuda_verbose()
@@ -796,8 +1089,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
         launch_cublas_hgemm(
             device,
-            w_f16,
-            activation_f16,
+            &w_f16.as_view(),
+            &activation_f16.as_view(),
             output,
             out_dim,
             batch,
@@ -814,6 +1107,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
         // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
         GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+            let dequant_scratch = &mut dequant_f32.f32();
             dequant_planar_into_scratch(
                 device,
                 kernels,
@@ -936,7 +1231,10 @@ pub(crate) unsafe fn launch_gemm_projection(
             // the Q8 projection (qkv_pre_conv) path.
             // also force F32 SGEMM for `gdn_alpha`/`gdn_beta` to
             // restore the F32-GGUF path for these projections.
-            if force_f32 || force_alpha_beta_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32
+                || force_alpha_beta_f32
+                || conversion.len(Role::DequantF16) < f16_bytes_needed
+            {
                 if force_alpha_beta_f32 {
                     static AB_F32_LOGGED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
@@ -950,14 +1248,16 @@ pub(crate) unsafe fn launch_gemm_projection(
                     }
                 }
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_0_to_f32(
                     device,
                     kernels,
@@ -987,6 +1287,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 announce_q8_hgemm_once();
 
                 // Step 1: Dequantize Q8_0 -> F16 in scratch buffer.
@@ -1012,8 +1315,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1024,6 +1327,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             // Native F16 weights: cublasGemmEx HGEMM directly (no dequant needed).
             // Convert F32 activations to F16, then HGEMM with F16 weights.
             // note: when LUMEN_CUDA_PREFILL_F32=1, this branch CANNOT
@@ -1059,8 +1364,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
             launch_cublas_hgemm(
                 device,
-                w_f16,
-                activation_f16,
+                &w_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1081,16 +1386,18 @@ pub(crate) unsafe fn launch_gemm_projection(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q4_0_to_f32(
                     device,
                     kernels,
@@ -1120,6 +1427,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 static Q4_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if super::decode::cuda_verbose()
@@ -1151,8 +1461,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1169,14 +1479,17 @@ pub(crate) unsafe fn launch_gemm_projection(
                 super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: {scheme:?} requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_kquant_to_f16(
                 device,
                 kernels,
@@ -1196,8 +1509,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1212,14 +1525,17 @@ pub(crate) unsafe fn launch_gemm_projection(
             // exists for this format (its dequant kernel emits F16 only).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
             launch_f32_to_f16_fast(
                 device,
@@ -1231,8 +1547,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1269,14 +1585,14 @@ pub(crate) unsafe fn launch_gemm_projection(
             //
             // BF16 has the same 2 B/elem footprint as F16 — we reuse the F16
             // activation scratch buffer (`activation_f16`) for the BF16
-            // activation conversion. The buffer is `CudaSlice<u8>`, so the
+            // activation conversion. The buffer holds bytes (`u8`), so the
             // interpretation is determined by the cuBLAS `cudaDataType_t`.
             let activation_needed = batch * in_dim * 2;
-            if activation_f16.len() < activation_needed {
+            if conversion.len(Role::ActivationF16) < activation_needed {
                 return Err(RuntimeError::Compute(format!(
                     "bf16_gemm {label}: activation scratch too small: have {} bytes, \
                      need {} (batch={batch}, in_dim={in_dim})",
-                    activation_f16.len(),
+                    conversion.len(Role::ActivationF16),
                     activation_needed,
                 )));
             }
@@ -1289,6 +1605,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
 
             // Step 1: Convert F32 activation to BF16 via vectorized kernel.
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             launch_f32_to_bf16_fast(
                 device,
                 kernels,
@@ -1301,8 +1619,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             // Step 2: cublasGemmEx (BF16 weight + BF16 activation -> F32 output).
             launch_cublas_gemm_bf16(
                 device,
-                w_bf16,
-                activation_f16,
+                &w_bf16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1320,15 +1638,17 @@ pub(crate) unsafe fn launch_gemm_projection(
             // keeps its raw planes and never reaches this arm.
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
-                if dequant_scratch.len() < num_elements {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_split_to_f32(
                     device,
                     kernels,
@@ -1359,6 +1679,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 announce_q8_split_hgemm_once();
                 launch_dequant_q8_split_to_f16(
                     device,
@@ -1379,8 +1702,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 )?;
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1408,19 +1731,17 @@ pub(crate) unsafe fn launch_gemm_projection(
 /// # Safety
 ///
 /// `input` must be [batch, in_dim]. `weight` must be [out_dim, in_dim].
-/// `residual` and `output` must be [batch, out_dim]. `dequant_scratch` must
-/// have at least `out_dim * in_dim` elements (only used for Q8_0 weights).
-pub(crate) unsafe fn launch_gemm_residual(
+/// `residual` and `output` must be [batch, out_dim]. `conversion` lends the
+/// conversion scratch as for [`launch_gemm_projection`].
+pub(crate) unsafe fn launch_gemm_residual<const N: usize>(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
     weight_f16_cache: Option<&CudaSlice<u8>>,
-    input: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
-    dequant_scratch: &mut CudaSlice<f32>,
-    activation_f16: &mut CudaSlice<u8>,
-    dequant_f16: &mut CudaSlice<u8>,
+    input: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
+    conversion: &mut Rest<'_, N>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -1457,7 +1778,7 @@ pub(crate) unsafe fn launch_gemm_residual(
     // diagnostic: when LUMEN_CUDA_PREFILL_F32=1, bypass HGEMM-F16 paths
     // and use the SGEMM-F32 fallbacks. Used to test the HGEMM-F16-precision
     // hypothesis on the linear_attn_out (ssm_out residual) GEMM.
-    let force_f32 = std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok();
+    let force_f32 = prefill_f32_forced();
 
     // same env gate as's projection MMQ (LUMEN_CUDA_Q8_PROJ_MMQ=1)
     // also covers the residual GEMM site (ssm_out). When the env is set AND the
@@ -1469,7 +1790,7 @@ pub(crate) unsafe fn launch_gemm_residual(
     // closed `qkv_pre_conv` drift 7700x; closes the residual
     // `linear_attn_out` drift (~0.226 max-abs persists with alone) by
     // extending the same MMQ math to this second Q8 projection site.
-    let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
+    let q8_proj_mmq = q8_proj_mmq_set();
     let q8_residual_mmq = q8_proj_mmq;
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
     let prefer_mmq_over_f16cache = q8_residual_mmq
@@ -1508,6 +1829,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
+        let [mut activation] = conversion.regions([Role::ActivationF16]);
+        let activation_f16 = &mut activation.u8();
         // Copy residual -> output for beta=1.0 accumulation.
         device
             .stream
@@ -1530,8 +1853,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         // cublasGemmEx with beta=1.0 for residual accumulation.
         launch_cublas_hgemm(
             device,
-            w_f16,
-            activation_f16,
+            &w_f16.as_view(),
+            &activation_f16.as_view(),
             output,
             out_dim,
             batch,
@@ -1548,6 +1871,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
         // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
         GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+            let dequant_scratch = &mut dequant_f32.f32();
             dequant_planar_into_scratch(
                 device,
                 kernels,
@@ -1656,16 +1981,18 @@ pub(crate) unsafe fn launch_gemm_residual(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_0_to_f32(
                     device,
                     kernels,
@@ -1706,6 +2033,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
                 device
                     .stream
@@ -1742,8 +2072,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1754,6 +2084,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             // Native F16 weights: cublasGemmEx HGEMM with residual (no dequant needed).
             // Copy residual -> output, convert F32 activation to F16, then HGEMM beta=1.0.
             // note: when LUMEN_CUDA_PREFILL_F32=1, this branch CANNOT
@@ -1793,8 +2125,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             // Step 3: cublasGemmEx with beta=1.0 for residual accumulation.
             launch_cublas_hgemm(
                 device,
-                w_f16,
-                activation_f16,
+                &w_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1808,16 +2140,18 @@ pub(crate) unsafe fn launch_gemm_residual(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q4_0_to_f32(
                     device,
                     kernels,
@@ -1858,6 +2192,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
                 device
                     .stream
@@ -1894,8 +2231,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1912,12 +2249,12 @@ pub(crate) unsafe fn launch_gemm_residual(
                 super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: {scheme:?} requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
             device
@@ -1929,6 +2266,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("dtod residual copy ({scheme:?}) {label}: {e}"))
                 })?;
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_kquant_to_f16(
                 device,
                 kernels,
@@ -1948,8 +2288,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1964,12 +2304,12 @@ pub(crate) unsafe fn launch_gemm_residual(
             // exists for this format (its dequant kernel emits F16 only).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
             // beta=1.0 accumulates into `output`, so it must hold the residual first.
@@ -1982,6 +2322,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("dtod residual copy (CtInt4G32) {label}: {e}"))
                 })?;
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
             launch_f32_to_f16_fast(
                 device,
@@ -1993,8 +2336,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -2027,11 +2370,11 @@ pub(crate) unsafe fn launch_gemm_residual(
             // accumulates W * A + residual into output.
             // replaces the per-row matvec_bf16_residual fallback (the 42x gap).
             let activation_needed = batch * in_dim * 2;
-            if activation_f16.len() < activation_needed {
+            if conversion.len(Role::ActivationF16) < activation_needed {
                 return Err(RuntimeError::Compute(format!(
                     "bf16_gemm_residual {label}: activation scratch too small: have {} bytes, \
                      need {} (batch={batch}, in_dim={in_dim})",
-                    activation_f16.len(),
+                    conversion.len(Role::ActivationF16),
                     activation_needed,
                 )));
             }
@@ -2048,6 +2391,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 })?;
 
             // Step 2: Convert F32 activation to BF16 via vectorized kernel.
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             launch_f32_to_bf16_fast(
                 device,
                 kernels,
@@ -2060,8 +2405,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             // Step 3: cublasGemmEx BF16 with beta=1.0 for residual accumulation.
             launch_cublas_gemm_bf16(
                 device,
-                w_bf16,
-                activation_f16,
+                &w_bf16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -2078,15 +2423,17 @@ pub(crate) unsafe fn launch_gemm_residual(
             // projection arm).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
-                if dequant_scratch.len() < num_elements {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_split_to_f32(
                     device,
                     kernels,
@@ -2128,6 +2475,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 device
                     .stream
                     .memcpy_dtod(
@@ -2158,8 +2508,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 )?;
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -2181,8 +2531,8 @@ pub(crate) unsafe fn launch_gemm_residual(
 pub(crate) unsafe fn launch_rope_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q: &mut CudaSlice<f32>,
-    k: &mut CudaSlice<f32>,
+    q: &mut CudaViewMut<'_, f32>,
+    k: &mut CudaViewMut<'_, f32>,
     pos_start: usize,
     batch: usize,
     num_q_heads: usize,
@@ -2244,7 +2594,7 @@ pub(crate) unsafe fn launch_kv_cache_write_batch(
     device: &CudaDevice,
     kernels: &KernelSet,
     cache: &mut CudaSlice<f32>,
-    data: &CudaSlice<f32>,
+    data: &CudaView<'_, f32>,
     pos_start: usize,
     batch: usize,
     num_kv_heads: usize,
@@ -2287,8 +2637,8 @@ pub(crate) unsafe fn launch_kv_cache_write_batch(
 pub(crate) unsafe fn launch_swiglu_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    gate: &mut CudaSlice<f32>,
-    up: &CudaSlice<f32>,
+    gate: &mut CudaViewMut<'_, f32>,
+    up: &CudaView<'_, f32>,
     batch: usize,
     inter_dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -2319,8 +2669,8 @@ pub(crate) unsafe fn launch_swiglu_batched(
 pub(crate) unsafe fn launch_residual_add_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    x: &mut CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
+    x: &mut CudaViewMut<'_, f32>,
+    residual: &CudaView<'_, f32>,
     batch: usize,
     dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -2352,7 +2702,7 @@ pub(crate) unsafe fn launch_residual_add_batched(
 pub(crate) unsafe fn launch_extract_row(
     device: &CudaDevice,
     kernels: &KernelSet,
-    matrix: &CudaSlice<f32>,
+    matrix: &CudaView<'_, f32>,
     output: &mut CudaSlice<f32>,
     row_idx: usize,
     dim: usize,
@@ -2443,8 +2793,8 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight_q8: &CudaSlice<u8>,
-    x: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
+    out: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     in_dim: usize,
     batch: usize,
@@ -2506,9 +2856,9 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched_residual(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight_q8: &CudaSlice<u8>,
-    x: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    out: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     in_dim: usize,
     batch: usize,
@@ -2554,7 +2904,7 @@ unsafe fn launch_dequant_q8_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     q8_data: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2589,7 +2939,7 @@ unsafe fn launch_dequant_q4_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     q4_data: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2625,7 +2975,7 @@ unsafe fn launch_dequant_q8_0_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     q8_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2652,7 +3002,7 @@ unsafe fn launch_dequant_q8_split_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     split: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     in_dim: usize,
     label: &str,
@@ -2702,7 +3052,7 @@ unsafe fn launch_dequant_q8_split_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     split: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     in_dim: usize,
     label: &str,
@@ -2760,7 +3110,7 @@ unsafe fn launch_dequant_q4_0_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     q4_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2790,7 +3140,7 @@ unsafe fn launch_dequant_kquant_to_f16(
     kernels: &KernelSet,
     scheme: QuantScheme,
     data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2845,7 +3195,7 @@ unsafe fn launch_dequant_ct4_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     ct4_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2898,8 +3248,8 @@ unsafe fn launch_matvec_slice(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    input: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    input: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
     _in_offset: usize,
     _out_offset: usize,
     out_dim: usize,
@@ -3203,7 +3553,7 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 /// without per-head q/k norms takes the plain prefill dispatch, which runs the
 /// scalar kernel.
 ///
-/// `scores` is the block `alloc_prefill_scratch` sized for this prefill; it
+/// `scores` is the block `alloc_prefill_workspace` sized for this prefill; it
 /// is never allocated here (see the check below for why).
 ///
 /// Both GEMMs batch over the query group with `stride_a = 0`, which points
@@ -3229,10 +3579,10 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 pub(crate) unsafe fn launch_flash_attention_sgemm(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q: &CudaSlice<f32>,
+    q: &CudaView<'_, f32>,
     kv: &KvView<'_>,
-    attn_out: &mut CudaSlice<f32>,
-    scores: &mut Option<CudaSlice<f32>>,
+    attn_out: &mut CudaViewMut<'_, f32>,
+    scores: Option<&mut CudaViewMut<'_, f32>>,
     batch: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -3297,9 +3647,7 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
              layer loop and this route runs only when it exists"
         )));
     }
-    let s_buf = scores
-        .as_mut()
-        .expect("score block presence checked immediately above");
+    let s_buf = scores.expect("score block presence checked immediately above");
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut qb = 0usize;
     while qb < batch {
@@ -3407,9 +3755,9 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
 pub(crate) unsafe fn launch_flash_attention_br4(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q_batch: &CudaSlice<f32>,
+    q_batch: &CudaView<'_, f32>,
     kv: &KvView<'_>,
-    attn_out: &mut CudaSlice<f32>,
+    attn_out: &mut CudaViewMut<'_, f32>,
     batch: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -3484,9 +3832,9 @@ unsafe fn launch_matvec_residual_slice(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    input: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    input: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
     in_offset: usize,
     res_offset: usize,
     out_offset: usize,
@@ -3670,8 +4018,8 @@ unsafe fn launch_matvec_residual_slice(
 pub(crate) unsafe fn launch_f32_to_f16_fast(
     device: &CudaDevice,
     kernels: &super::decode::KernelSet,
-    src: &CudaSlice<f32>,
-    dst: &mut CudaSlice<u8>,
+    src: &CudaView<'_, f32>,
+    dst: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -3729,9 +4077,9 @@ pub(crate) unsafe fn launch_f32_to_f16_fast(
 /// `output` must be [batch * out_dim] F32 elements.
 unsafe fn launch_cublas_hgemm(
     device: &CudaDevice,
-    w_f16: &CudaSlice<u8>,
-    a_f16: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
+    w_f16: &CudaView<'_, u8>,
+    a_f16: &CudaView<'_, u8>,
+    output: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     batch: usize,
     in_dim: usize,
@@ -3786,8 +4134,8 @@ unsafe fn launch_cublas_hgemm(
 pub(crate) unsafe fn launch_f32_to_bf16_fast(
     device: &CudaDevice,
     kernels: &super::decode::KernelSet,
-    src: &CudaSlice<f32>,
-    dst: &mut CudaSlice<u8>,
+    src: &CudaView<'_, f32>,
+    dst: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -3851,9 +4199,9 @@ pub(crate) unsafe fn launch_f32_to_bf16_fast(
 /// `output` must be `batch * out_dim` F32 elements.
 pub(crate) unsafe fn launch_cublas_gemm_bf16(
     device: &CudaDevice,
-    w_bf16: &CudaSlice<u8>,
-    a_bf16: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
+    w_bf16: &CudaView<'_, u8>,
+    a_bf16: &CudaView<'_, u8>,
+    output: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     batch: usize,
     in_dim: usize,
@@ -3912,7 +4260,7 @@ pub(crate) unsafe fn launch_kv_cache_write_batch_16(
     device: &CudaDevice,
     kv16: &super::decode::Kv16Kernels,
     cache: &mut CudaSlice<u16>,
-    data: &CudaSlice<f32>,
+    data: &CudaView<'_, f32>,
     overflow: &mut CudaSlice<u32>,
     pos_start: usize,
     batch: usize,
@@ -4007,13 +4355,15 @@ pub(crate) unsafe fn launch_kv_widen_16<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace::RegionTable;
+    use super::test_models::{dense_switches, moe_switches, Model, MOE, Q27B, Q9B, ROWS};
     use super::*;
     use lumen_format::planar_dequant::{dequantize_fp8, dequantize_nvfp4};
 
     /// Qwen3.8-27B (hidden 5120, 24 query / 4 KV heads of 256, FFN 17408,
     /// GDN qkv 10240 and value 6144 over 48 heads, fused Q+gate) at the
     /// 2048-row slice and a 32768-token context: the bytes the load reserves
-    /// for its prefill, element by element from the allocators' arithmetic.
+    /// for its prefill, element by element from the layouts' arithmetic.
     #[test]
     fn the_27b_prefill_workspace_is_what_its_buffers_take() {
         let scratch = PrefillScratchLayout::new(
@@ -4029,24 +4379,249 @@ mod tests {
         // dequant_f32 is the FFN matrix, activation_f16 the FFN row width.
         assert_eq!(scratch.dequant_f32, 17408 * 5120);
         assert_eq!(scratch.activation_f16, 2048 * 17408 * 2);
-        assert_eq!(scratch.bytes(), 1_327_554_560);
         let gdn = GdnPrefillScratchLayout::new(2048, 10240, 48, 6144);
-        assert_eq!(
-            gdn.bytes(),
-            4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144)
-        );
         let scores = attn_score_block_elems(2048, 24, 4, 32768 - 2048).unwrap();
         // group 6 x min(rows, 512) x 32768 keys.
         assert_eq!(scores, 6 * 512 * 32768);
-        let ws = PrefillWorkspaceLayout {
+        let ws = PrefillWorkspaceLayout::of(
             scratch,
-            gdn: Some(gdn),
-            score_elems: Some(scores),
-        };
-        assert_eq!(
-            ws.bytes(),
-            scratch.bytes() + gdn.bytes() + 4 * scores as u64
+            Some(gdn),
+            Some(scores),
+            None,
+            PrefillRoutes::default(),
+            ConversionScratch::default(),
         );
+        // One buffer per value: the scratch values take 1_327_554_560 bytes,
+        // the GDN values 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 *
+        // 6144) and the score block 4 * 6 * 512 * 32768. Every value's bytes
+        // are a multiple of the 256-byte region alignment at 2048 rows, so the
+        // arena holds no padding between them: 0 bytes.
+        let unshared = super::super::workspace::unshared(&ws).bytes() as u64;
+        assert_eq!(
+            unshared,
+            1_327_554_560
+                + 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144)
+                + 4 * scores as u64
+        );
+        assert_eq!(unshared, 2_050_547_712);
+    }
+
+    fn plan(model: &Model, gemms: &[PrefillGemm], switches: &GemmSwitches) -> ConversionScratch {
+        ConversionScratch::plan(gemms, switches, ROWS, &model.scratch())
+    }
+
+    fn sizes(
+        f32: Option<usize>,
+        activation: Option<usize>,
+        f16: Option<usize>,
+    ) -> ConversionScratch {
+        ConversionScratch {
+            dequant_f32: f32,
+            activation_f16: activation,
+            dequant_f16: f16,
+        }
+    }
+
+    /// A dense model whose projections dequantize to F16 (Q8_0, its split
+    /// layout, Q4_0, the K-quants, INT4) takes the F16 pair at the largest
+    /// weight (the FFN matrix, 2 bytes an element) and the widest row (the
+    /// down projection's FFN width), and no F32 dequant scratch: no GEMM's
+    /// F16 need exceeds the one-size bound, so none falls back.
+    #[test]
+    fn the_f16_dequant_schemes_take_the_f16_pair_at_the_largest_weight() {
+        for model in [Q27B, Q9B] {
+            for weight in [
+                WeightClass::Q8Raw,
+                WeightClass::Q8Split,
+                WeightClass::Q4Raw,
+                WeightClass::KQuant,
+                WeightClass::Ct4Raw,
+            ] {
+                let got = plan(
+                    &model,
+                    &model.gemms(weight, WeightClass::Q8Raw, false),
+                    &dense_switches(),
+                );
+                let ffn = model.inter * model.hidden;
+                assert_eq!(
+                    got,
+                    sizes(None, Some(ROWS * model.inter * 2), Some(2 * ffn)),
+                    "{} {weight:?}",
+                    model.name
+                );
+                assert_eq!(got.dequant_f16, Some(model.scratch().dequant_f16));
+            }
+        }
+    }
+
+    /// BF16 weights convert only their activations; the Q8_0 alpha/beta pair
+    /// still dequantizes to F16 at its own size (heads x hidden).
+    #[test]
+    fn bf16_weights_take_the_activation_scratch_and_q8_gates_their_own_f16() {
+        for model in [Q27B, Q9B] {
+            let got = plan(
+                &model,
+                &model.gemms(WeightClass::Bf16Raw, WeightClass::Q8Raw, false),
+                &dense_switches(),
+            );
+            let gates = model.gdn.1 * model.hidden;
+            assert_eq!(
+                got,
+                sizes(None, Some(ROWS * model.inter * 2), Some(2 * gates)),
+                "{}",
+                model.name
+            );
+        }
+    }
+
+    /// Planar weights decode into the F32 scratch only, at the largest
+    /// weight; F32 weights take no scratch at all.
+    #[test]
+    fn planar_weights_take_the_f32_scratch_and_f32_weights_none() {
+        for model in [Q27B, Q9B] {
+            let planar = plan(
+                &model,
+                &model.gemms(WeightClass::Planar, WeightClass::F32, false),
+                &dense_switches(),
+            );
+            let f32 = plan(
+                &model,
+                &model.gemms(WeightClass::F32, WeightClass::F32, false),
+                &dense_switches(),
+            );
+            assert_eq!(
+                planar,
+                sizes(Some(model.inter * model.hidden), None, None),
+                "{}",
+                model.name
+            );
+            assert_eq!(f32, ConversionScratch::default(), "{}", model.name);
+        }
+    }
+
+    /// A mixed import (planar projections, a BF16 GDN output projection)
+    /// takes the F32 scratch for the planes and the activation scratch at the
+    /// BF16 GEMM's row.
+    #[test]
+    fn a_mixed_import_takes_the_scratch_of_each_of_its_routes() {
+        let model = Q27B;
+        let mut gemms = model.gemms(WeightClass::Planar, WeightClass::F32, false);
+        let ssm_out = gemms
+            .iter_mut()
+            .find(|g| g.residual && g.in_dim == model.gdn.2)
+            .unwrap();
+        ssm_out.weight = WeightClass::Bf16Raw;
+        let got = plan(&model, &gemms, &dense_switches());
+        assert_eq!(
+            got,
+            sizes(
+                Some(model.inter * model.hidden),
+                Some(ROWS * model.gdn.2 * 2),
+                None
+            )
+        );
+    }
+
+    /// `LUMEN_CUDA_PREFILL_F32` sends the Q8_0 and Q4_0 projections to the F32
+    /// fallback (and leaves the K-quants refused, needing nothing).
+    #[test]
+    fn the_f32_switch_takes_the_f32_scratch() {
+        let model = Q27B;
+        let switches = GemmSwitches {
+            force_f32: true,
+            ..dense_switches()
+        };
+        for weight in [WeightClass::Q8Raw, WeightClass::Q4Raw] {
+            let got = plan(&model, &model.gemms(weight, weight, false), &switches);
+            assert_eq!(
+                got,
+                sizes(Some(model.inter * model.hidden), None, None),
+                "{weight:?}"
+            );
+        }
+        let kquant = plan(
+            &model,
+            &model.gemms(WeightClass::KQuant, WeightClass::KQuant, false),
+            &switches,
+        );
+        assert_eq!(kquant, ConversionScratch::default());
+    }
+
+    /// The MoE model's Q8_0 projections take MMQ (no scratch); its residual
+    /// GEMMs (`wo`, `ssm_out`, 2048 x 4096) dequantize to F16, and the cached
+    /// alpha/beta pair converts its hidden-wide rows.
+    #[test]
+    fn moe_q8_takes_the_f16_pair_of_its_residual_gemms_only() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Q8Raw, WeightClass::Q8Raw, true),
+            &moe_switches(false),
+        );
+        assert_eq!(
+            got,
+            sizes(None, Some(ROWS * 4096 * 2), Some(2 * 2048 * 4096))
+        );
+        // With the MMQ switch set, the residual GEMMs take MMQ too, and the
+        // alpha/beta pair prefers MMQ over its cache: nothing converts.
+        let mmq_everywhere = GemmSwitches {
+            q8_proj_mmq_set: true,
+            ..moe_switches(false)
+        };
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Q8Raw, WeightClass::Q8Raw, true),
+            &mmq_everywhere,
+        );
+        assert_eq!(got, ConversionScratch::default());
+    }
+
+    /// A model whose only converting GEMM is the cached alpha/beta pair (MoE
+    /// planes, Q8_0 gates) takes the activation scratch at the pair's
+    /// hidden-wide row for the cache arm, and the F32 scratch at the largest
+    /// plane (the fused Q+gate and GDN QKV weights, 8192 x 2048).
+    #[test]
+    fn the_f16_cache_arm_takes_the_activation_scratch() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Planar, WeightClass::Q8Raw, true),
+            &moe_switches(false),
+        );
+        assert_eq!(got, sizes(Some(8192 * 2048), Some(ROWS * 2048 * 2), None));
+    }
+
+    /// MoE BF16: BF16 GEMMs convert their activations (widest row 4096), the
+    /// Q8_0 alpha/beta pair takes the F32 SGEMM at heads x hidden.
+    #[test]
+    fn moe_bf16_takes_the_activation_scratch_and_f32_gates() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Bf16Raw, WeightClass::Q8Raw, true),
+            &moe_switches(true),
+        );
+        assert_eq!(got, sizes(Some(32 * 2048), Some(ROWS * 4096 * 2), None));
+    }
+
+    /// A GEMM whose F16 need exceeds the one-size bound takes the F32
+    /// fallback as with the bound, and that fallback's own length check
+    /// fails as with the bound: the regions are capped at the bound.
+    #[test]
+    fn a_need_over_the_bound_is_planned_as_the_bound_decides_it() {
+        let model = Q27B;
+        let bound = model.scratch();
+        let over = PrefillGemm {
+            weight: WeightClass::Q8Raw,
+            out_dim: model.inter + 1,
+            in_dim: model.hidden,
+            residual: false,
+            gdn_alpha_beta: false,
+            f16_cache: false,
+        };
+        let got = plan(&model, &[over], &dense_switches());
+        assert_eq!(got, sizes(Some(bound.dequant_f32), None, None));
+        assert!(got.dequant_f32.unwrap() < over.out_dim * over.in_dim);
     }
 
     /// The production planar prefill launchers on NVFP4 and FP8 planes of many groups:
@@ -4102,8 +4677,15 @@ mod tests {
         for (tag, weight, w) in &cases {
             let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
             unsafe {
-                dequant_planar_into_scratch(&device, &kernels, weight, &mut scratch, n, tag)
-                    .unwrap();
+                dequant_planar_into_scratch(
+                    &device,
+                    &kernels,
+                    weight,
+                    &mut scratch.as_view_mut(),
+                    n,
+                    tag,
+                )
+                .unwrap();
             }
             let decoded = device.dtoh_copy(&scratch).unwrap();
             if let Some(i) = (0..n).find(|&i| decoded[i].to_bits() != w[i].to_bits()) {
@@ -4124,22 +4706,20 @@ mod tests {
                 let x_gpu = device.htod_copy(&x).unwrap();
                 let residual_gpu = device.htod_copy(&residual).unwrap();
                 let mut out = device.alloc_zeros::<f32>(batch * out_dim).unwrap();
-                let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
-                // The F16 operands belong to the other arms; the planar arm does not touch them.
-                let mut activation_f16 = device.alloc_zeros::<u8>(1).unwrap();
-                let mut dequant_f16 = device.alloc_zeros::<u8>(1).unwrap();
+                // The planar arm borrows the F32 dequant scratch only.
+                let mut ws =
+                    Workspace::alloc(&device, RegionTable::of(&[(Role::DequantF32, n)])).unwrap();
+                let ([], mut conversion) = ws.lend([]);
                 unsafe {
                     launch_gemm_residual(
                         &device,
                         &kernels,
                         weight,
                         None,
-                        &x_gpu,
-                        &residual_gpu,
-                        &mut out,
-                        &mut scratch,
-                        &mut activation_f16,
-                        &mut dequant_f16,
+                        &x_gpu.as_view(),
+                        &residual_gpu.as_view(),
+                        &mut out.as_view_mut(),
+                        &mut conversion,
                         batch,
                         out_dim,
                         in_dim,

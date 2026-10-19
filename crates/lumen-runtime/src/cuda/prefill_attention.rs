@@ -108,7 +108,7 @@ pub fn prefill_attention_sequential(
 
         // 1. Extract this token's Q vector from the batch matrix.
         unsafe {
-            launch_extract_row(device, kernels, q_batch, q_single, t, q_dim)?;
+            launch_extract_row(device, kernels, &q_batch.as_view(), q_single, t, q_dim)?;
         }
 
         // 2. Run decode-attention for this single token against the KV cache.
@@ -789,9 +789,9 @@ mod tests {
             super::super::prefill::launch_flash_attention_br4(
                 &device,
                 &kernels,
-                &q_batch,
+                &q_batch.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut attn_out,
+                &mut attn_out.as_view_mut(),
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1275,17 +1275,16 @@ mod tests {
             pos_start,
         )
         .unwrap();
-        let mut scores: Option<cudarc::driver::CudaSlice<f32>> =
-            Some(device.alloc_zeros::<f32>(score_elems).unwrap());
+        let mut scores = device.alloc_zeros::<f32>(score_elems).unwrap();
 
         unsafe {
             super::super::prefill::launch_flash_attention_sgemm(
                 &device,
                 &kernels,
-                &q_batch,
+                &q_batch.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut out_sgemm,
-                &mut scores,
+                &mut out_sgemm.as_view_mut(),
+                Some(&mut scores.as_view_mut()),
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1296,9 +1295,9 @@ mod tests {
             super::super::prefill::launch_flash_attention_br4(
                 &device,
                 &kernels,
-                &q_batch,
+                &q_batch.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut out_br4,
+                &mut out_br4.as_view_mut(),
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1427,16 +1426,15 @@ mod tests {
         let full_q = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         let mut full_out = device.alloc_zeros::<f32>(batch * q_dim).unwrap();
         let mut small_out = device.alloc_zeros::<f32>(q_dim).unwrap();
-        let mut scores: Option<cudarc::driver::CudaSlice<f32>> = None;
 
         let err = unsafe {
             super::super::prefill::launch_flash_attention_sgemm(
                 &device,
                 &kernels,
-                &small_q,
+                &small_q.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut full_out,
-                &mut scores,
+                &mut full_out.as_view_mut(),
+                None,
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1452,10 +1450,10 @@ mod tests {
             super::super::prefill::launch_flash_attention_sgemm(
                 &device,
                 &kernels,
-                &full_q,
+                &full_q.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut small_out,
-                &mut scores,
+                &mut small_out.as_view_mut(),
+                None,
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1469,17 +1467,15 @@ mod tests {
             err.contains("attn_out too small"),
             "unexpected error: {err}"
         );
-        // Valid buffers but no score block: the route reports its contract
-        // rather than allocating for itself.
-        let mut scores_none: Option<cudarc::driver::CudaSlice<f32>> = None;
+        // Valid buffers but no score block: the route reports its contract.
         let err = unsafe {
             super::super::prefill::launch_flash_attention_sgemm(
                 &device,
                 &kernels,
-                &full_q,
+                &full_q.as_view(),
                 &kv_cache.f32_view().unwrap(),
-                &mut full_out,
-                &mut scores_none,
+                &mut full_out.as_view_mut(),
+                None,
                 batch,
                 num_heads,
                 num_kv_heads,
@@ -1490,10 +1486,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("no score block"), "unexpected error: {err}");
-        assert!(
-            scores_none.is_none(),
-            "the launcher must not allocate the block"
-        );
     }
 
     // ------------------------------------------------------------------

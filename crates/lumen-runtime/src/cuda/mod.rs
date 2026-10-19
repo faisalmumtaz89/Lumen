@@ -58,6 +58,7 @@ pub(crate) mod ptx_cache;
 /// Embedded CUDA kernel source strings, compiled to PTX at runtime via NVRTC.
 pub mod shaders;
 pub(crate) mod types;
+pub(crate) mod workspace;
 
 pub use backend_impl::CudaBackend;
 /// Decode-state snapshots, for tests that decode two builds from one state.

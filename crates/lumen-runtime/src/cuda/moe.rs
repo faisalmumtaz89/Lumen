@@ -17,6 +17,8 @@
 
 use crate::error::RuntimeError;
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
+
+use super::workspace::{Rest, Role, RoleView};
 use lumen_format::index::TensorSlice;
 use lumen_format::quantization::QuantScheme;
 use std::sync::atomic::AtomicUsize;
@@ -156,58 +158,6 @@ pub(crate) struct CudaMoeScratch {
     /// Two-term residual-Q8 quantized per-expert swiglu_buf.
     /// Size: top_k * ceil(inter_dim / 32) * 72 bytes. ~26 KB at top_k=8, inter_dim=1408.
     pub(crate) mmv_q_moe_swiglu_res: CudaSlice<u8>,
-
-    /// Grouped MoE PREFILL scratch. Lazily allocated on first
-    /// use of the batched/grouped prefill path, sized to `prefill_grouped_cap`
-    /// (max compact columns = batch * top_k seen so far). `None` until the
-    /// `LUMEN_CUDA_MOE_PREFILL_BATCHED` path runs. Reused across all MoE layers
-    /// of a prefill and across prefills with batch ≤ cap.
-    ///
-    /// `swiglu_compact`: [cap * inter_dim] F32 — per compact-column SwiGLU output.
-    /// `down_compact`:   [cap * hidden_dim] F32 — per compact-column down output.
-    /// `col_expert`/`col_src_tok`: [cap] i32 — gather tables (compact col -> expert/token).
-    /// `dst_to_col`:     [batch * top_k] i32 — scatter inverse (dst slot -> compact col).
-    pub(crate) prefill_grouped: Option<CudaMoePrefillGrouped>,
-}
-
-/// Lazily-allocated GPU scratch for the grouped MoE prefill FFN path.
-pub(crate) struct CudaMoePrefillGrouped {
-    /// Capacity in compact columns (= max batch*top_k seen). Realloc grows it.
-    pub(crate) cap_cols: usize,
-    /// Capacity in tokens (= max batch seen). cap_cols == cap_tok * top_k.
-    pub(crate) cap_tok: usize,
-    pub(crate) swiglu_compact: CudaSlice<f32>, // [cap_cols * inter_dim]
-    pub(crate) down_compact: CudaSlice<f32>,   // [cap_cols * hidden_dim]
-    pub(crate) col_expert: CudaSlice<i32>,     // [cap_cols]
-    pub(crate) col_src_tok: CudaSlice<i32>,    // [cap_cols]
-    pub(crate) dst_to_col: CudaSlice<i32>,     // [cap_cols] (cap_cols == batch*top_k)
-    /// Prefix-sum expert column bounds (M-tiled GEMM): expert e owns
-    /// compact columns [expert_bounds[e], expert_bounds[e+1]). [num_experts+1] i32.
-    pub(crate) expert_bounds: CudaSlice<i32>,
-    /// flattened column-tile list for the tiled grouped gate+up kernel, sized
-    /// `(need_cols + num_experts) * 4` i32, each entry {expert, col_start,
-    /// col_count, pad}. Built host-side from expert_bounds (one entry per
-    /// ceil(cols_e/16) block).
-    pub(crate) gate_up_tiles16: CudaSlice<i32>,
-    /// Batched router logits, [cap_tok * num_experts] F32 (topk input layout).
-    pub(crate) router_logits_batched: CudaSlice<f32>,
-    /// Batched expert ids, [cap_tok * num_experts] u32 (topk output: first top_k valid/row).
-    pub(crate) expert_ids_batched: CudaSlice<u32>,
-    /// Batched expert weights, [cap_tok * top_k] F32 (topk output, slot-major/row).
-    pub(crate) expert_weights_batched: CudaSlice<f32>,
-    /// Batched SHARED-expert SwiGLU output, [cap_tok * inter_dim] F32
-    /// (routed inter_dim is an upper bound for shared inter_dim).
-    pub(crate) shared_swiglu_batched: CudaSlice<f32>,
-    /// Batched SHARED-expert per-token sigmoid-gate logit, [cap_tok] F32.
-    pub(crate) shared_logit_batched: CudaSlice<f32>,
-    /// one-time prequant K-major activation. `xq_q` = [Kb * cap_cols * 32]
-    /// int8, `xq_d` = [Kb * cap_cols] f32. Allocated only when the W10 path is on.
-    pub(crate) w10_xq_q: Option<CudaSlice<i8>>,
-    pub(crate) w10_xq_d: Option<CudaSlice<f32>>,
-    /// W10 bucketed tile list, `(need_cols + num_experts) * (inter_dim/128) * 4`
-    /// i32, entries {col0,expert,row128,cols_valid}, 4 buckets (MG=1..4)
-    /// concatenated. Allocated only when W10 is on.
-    pub(crate) w10_tiles: Option<CudaSlice<i32>>,
 }
 
 /// Build per-layer MoE metadata from a layer's subtensor offsets.
@@ -1003,14 +953,12 @@ pub(crate) fn allocate_moe_scratch(
         mmv_q_moe_normed_res: device.alloc_zeros::<u8>(((hidden_dim + 31) / 32) * 72)?,
         mmv_q_moe_swiglu_res: device
             .alloc_zeros::<u8>(top_k.max(1) * ((expert_inter_dim + 31) / 32) * 72)?,
-        // The grouped prefill scratch is reserved by `preload_weights`.
-        prefill_grouped: None,
     })
 }
 
 /// Element counts of the grouped MoE prefill scratch for `tok` rows of
-/// `top_k` routed experts each. [`ensure_prefill_grouped`] allocates exactly
-/// these, and the load-time memory plan sums them.
+/// `top_k` routed experts each, which the prefill workspace holds as the
+/// `Moe*` roles' regions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefillGroupedLayout {
     pub tok: usize,
@@ -1048,82 +996,108 @@ impl PrefillGroupedLayout {
         self.cols + self.num_experts
     }
 
-    /// Device bytes of every buffer (4-byte elements throughout except the
-    /// W10 prequantized activations, one byte each).
-    pub(crate) fn bytes(&self) -> u64 {
-        let four_byte = self.cols * self.inter_dim
-            + self.cols * self.hidden_dim
-            + 3 * self.cols
-            + (self.num_experts + 1)
-            + self.tile_slots() * 4
-            + 2 * self.tok * self.num_experts
-            + self.tok * self.top_k
-            + self.tok * self.inter_dim
-            + self.tok;
-        let w10 = if self.w10 {
-            (self.hidden_dim / 32) * self.cols * 32
-                + 4 * (self.hidden_dim / 32) * self.cols
-                + 4 * self.tile_slots() * (self.inter_dim / 128).max(1) * 4
-        } else {
-            0
-        };
-        4 * four_byte as u64 + w10 as u64
+    /// The element count of `role`'s region, the grouped scratch's buffer
+    /// for it; `None` for a role it has no buffer for (the W10 values when the
+    /// W10 gate+up is off).
+    pub(crate) fn len(&self, role: Role) -> Option<usize> {
+        let r128 = (self.inter_dim / 128).max(1);
+        match role {
+            Role::MoeSwiglu => Some(self.cols * self.inter_dim),
+            Role::MoeDown => Some(self.cols * self.hidden_dim),
+            Role::MoeColExpert | Role::MoeColSrcTok | Role::MoeDstToCol => Some(self.cols),
+            Role::MoeExpertBounds => Some(self.num_experts + 1),
+            Role::MoeGateUpTiles => Some(self.tile_slots() * 4),
+            Role::MoeRouterLogits | Role::MoeExpertIds => Some(self.tok * self.num_experts),
+            Role::MoeExpertWeights => Some(self.tok * self.top_k),
+            Role::MoeSharedSwiglu => Some(self.tok * self.inter_dim),
+            Role::MoeSharedLogit => Some(self.tok),
+            Role::MoeW10Activation => self.w10.then(|| (self.hidden_dim / 32) * self.cols * 32),
+            Role::MoeW10Scales => self.w10.then(|| (self.hidden_dim / 32) * self.cols),
+            Role::MoeW10Tiles => self.w10.then(|| self.tile_slots() * r128 * 4),
+            _ => None,
+        }
     }
 }
 
-/// Allocate the grouped MoE prefill scratch `layout` describes unless the one
-/// held is at least that large. `preload_weights` reserves it for the longest
-/// prefill slice, so a request finds it large enough and allocates nothing.
-pub(crate) fn ensure_prefill_grouped(
-    scratch: &mut CudaMoeScratch,
-    device: &super::ffi::CudaDevice,
+/// Refuses a batch the workspace's grouped MoE regions cannot hold: each
+/// region must be at least `layout`'s length for it. A W10 region counts only
+/// when the load has it, as its presence selects the W10 gate+up.
+pub(crate) fn check_prefill_grouped<const N: usize>(
+    workspace: &Rest<'_, N>,
     layout: &PrefillGroupedLayout,
 ) -> Result<(), RuntimeError> {
-    let l = layout;
-    let big_enough = scratch
-        .prefill_grouped
-        .as_ref()
-        .map(|g| g.cap_tok >= l.tok && g.cap_cols >= l.cols)
-        .unwrap_or(false);
-    if big_enough {
-        return Ok(());
+    for role in Role::MOE_ROUTED
+        .into_iter()
+        .chain([Role::MoeSharedSwiglu, Role::MoeSharedLogit])
+    {
+        let Some(need) = layout.len(role) else {
+            continue;
+        };
+        let w10 = matches!(
+            role,
+            Role::MoeW10Activation | Role::MoeW10Scales | Role::MoeW10Tiles
+        );
+        if w10 && !workspace.has(role) {
+            continue;
+        }
+        if workspace.len(role) < need {
+            return Err(RuntimeError::Compute(format!(
+                "grouped MoE prefill: the workspace's {role:?} holds {} elements, the batch \
+                 needs {need}",
+                workspace.len(role)
+            )));
+        }
     }
-    scratch.prefill_grouped = Some(CudaMoePrefillGrouped {
-        cap_cols: l.cols,
-        cap_tok: l.tok,
-        swiglu_compact: device.alloc_zeros::<f32>(l.cols * l.inter_dim)?,
-        down_compact: device.alloc_zeros::<f32>(l.cols * l.hidden_dim)?,
-        col_expert: device.alloc_zeros::<i32>(l.cols)?,
-        col_src_tok: device.alloc_zeros::<i32>(l.cols)?,
-        dst_to_col: device.alloc_zeros::<i32>(l.cols)?,
-        expert_bounds: device.alloc_zeros::<i32>(l.num_experts + 1)?,
-        // *4 i32 per tile entry.
-        gate_up_tiles16: device.alloc_zeros::<i32>(l.tile_slots() * 4)?,
-        router_logits_batched: device.alloc_zeros::<f32>(l.tok * l.num_experts)?,
-        expert_ids_batched: device.alloc_zeros::<u32>(l.tok * l.num_experts)?,
-        expert_weights_batched: device.alloc_zeros::<f32>(l.tok * l.top_k)?,
-        shared_swiglu_batched: device.alloc_zeros::<f32>(l.tok * l.inter_dim)?,
-        shared_logit_batched: device.alloc_zeros::<f32>(l.tok)?,
-        // prequant + bucketed tile buffers only when the path is on.
-        w10_xq_q: if l.w10 {
-            Some(device.alloc_zeros::<i8>((l.hidden_dim / 32) * l.cols * 32)?)
-        } else {
-            None
-        },
-        w10_xq_d: if l.w10 {
-            Some(device.alloc_zeros::<f32>((l.hidden_dim / 32) * l.cols)?)
-        } else {
-            None
-        },
-        w10_tiles: if l.w10 {
-            // worst case col-tiles times the row128 count.
-            let r128 = (l.inter_dim / 128).max(1);
-            Some(device.alloc_zeros::<i32>(l.tile_slots() * r128 * 4)?)
-        } else {
-            None
-        },
-    });
     Ok(())
+}
+
+/// The grouped MoE prefill's routed-expert regions, borrowed for one layer
+/// (named as the buffers the kernels take).
+struct GroupedRegions<'a> {
+    router_logits_batched: CudaViewMut<'a, f32>,
+    expert_ids_batched: CudaViewMut<'a, u32>,
+    expert_weights_batched: CudaViewMut<'a, f32>,
+    col_expert: CudaViewMut<'a, i32>,
+    col_src_tok: CudaViewMut<'a, i32>,
+    dst_to_col: CudaViewMut<'a, i32>,
+    expert_bounds: CudaViewMut<'a, i32>,
+    gate_up_tiles16: CudaViewMut<'a, i32>,
+    swiglu_compact: CudaViewMut<'a, f32>,
+    down_compact: CudaViewMut<'a, f32>,
+    w10_xq_q: Option<CudaViewMut<'a, i8>>,
+    w10_xq_d: Option<CudaViewMut<'a, f32>>,
+    w10_tiles: Option<CudaViewMut<'a, i32>>,
+}
+
+/// The batched shared expert's regions, borrowed for one layer.
+struct SharedRegions<'a> {
+    shared_swiglu_batched: CudaViewMut<'a, f32>,
+    shared_logit_batched: CudaViewMut<'a, f32>,
+}
+
+impl<'a> GroupedRegions<'a> {
+    /// Borrow the regions from `workspace`, which [`check_prefill_grouped`]
+    /// has checked.
+    fn borrow<const N: usize>(workspace: &'a mut Rest<'_, N>) -> Self {
+        let [router_logits, expert_ids, expert_weights, col_expert, col_src_tok, dst_to_col, expert_bounds, gate_up_tiles, swiglu, down, w10_activation, w10_scales, w10_tiles] =
+            workspace.present(Role::MOE_ROUTED);
+        let held = |view: Option<RoleView<'a>>| view.expect("checked by check_prefill_grouped");
+        Self {
+            router_logits_batched: held(router_logits).into_f32(),
+            expert_ids_batched: held(expert_ids).into_u32(),
+            expert_weights_batched: held(expert_weights).into_f32(),
+            col_expert: held(col_expert).into_i32(),
+            col_src_tok: held(col_src_tok).into_i32(),
+            dst_to_col: held(dst_to_col).into_i32(),
+            expert_bounds: held(expert_bounds).into_i32(),
+            gate_up_tiles16: held(gate_up_tiles).into_i32(),
+            swiglu_compact: held(swiglu).into_f32(),
+            down_compact: held(down).into_f32(),
+            w10_xq_q: w10_activation.map(RoleView::into_i8),
+            w10_xq_d: w10_scales.map(RoleView::into_f32),
+            w10_tiles: w10_tiles.map(RoleView::into_i32),
+        }
+    }
 }
 
 /// Three-phase MoE FFN forward path for one token.
@@ -1153,7 +1127,7 @@ pub(crate) fn ensure_prefill_grouped(
 /// write) rather than full `CudaSlice` so callers can pass a per-token slice
 /// of a batched buffer. Decode callers can construct a full-buffer view via
 /// `pf.normed.slice(..)` / `pf.x_gpu.slice_mut(..)`. Prefill callers slice the
-/// batched buffer per token: `pf.normed.slice(t*H..(t+1)*H)`. Byte-identical
+/// workspace's batched `Normed` view per token: `normed.slice(t*H..(t+1)*H)`. Byte-identical
 /// kernels, only the parameter binding changes.
 ///
 /// **(Phase-F dispatch wiring)**: when `LUMEN_CUDA_MOE_BATCHED=1` is
@@ -1953,17 +1927,17 @@ pub(crate) fn encode_moe_ffn_decode(
 /// `[CHK]` x_sumsq must match the per-token path per (pos, layer).
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
-pub(crate) fn encode_moe_ffn_prefill_grouped(
+pub(crate) fn encode_moe_ffn_prefill_grouped<const N: usize>(
     device: &super::ffi::CudaDevice,
     kernels: &super::decode::KernelSet,
-    scratch: &mut CudaMoeScratch,
+    workspace: &mut Rest<'_, N>,
     meta: &CudaMoeMeta,
     batched_offsets: Option<&CudaMoeBatchedOffsets>,
     repacked: Option<&CudaMoeRepacked>,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
-    residual: &CudaSlice<f32>,   // [batch, hidden_dim]
-    output: &mut CudaSlice<f32>, // [batch, hidden_dim]
+    normed: &CudaView<'_, f32>,        // [batch, hidden_dim]
+    residual: &CudaView<'_, f32>,      // [batch, hidden_dim]
+    output: &mut CudaViewMut<'_, f32>, // [batch, hidden_dim]
     batch: usize,
     hidden_dim: usize,
     inter_dim: usize,
@@ -2055,12 +2029,12 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             )
         })?;
 
-    // Ensure grouped scratch is sized for this batch.
-    ensure_prefill_grouped(
-        scratch,
-        device,
+    // The workspace holds the grouped scratch for the longest slice.
+    check_prefill_grouped(
+        workspace,
         &PrefillGroupedLayout::new(batch, top_k, num_experts, hidden_dim, inter_dim),
     )?;
+    let mut g = GroupedRegions::borrow(workspace);
 
     let hd_u32 = hidden_dim as u32;
     let id_u32 = inter_dim as u32;
@@ -2096,7 +2070,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
 
     // ---- Stage 0: batched router logits [batch, num_experts]. ----
     {
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (ne_u32, batch_u32, 1),
             block_dim: (256, 1, 1),
@@ -2119,7 +2092,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
 
     // ---- Stage 1: batched top-K (sigmoid + norm), n_rows=batch. ----
     {
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let n_rows: i32 = batch as i32;
         let n_expert_used: i32 = top_k as i32;
         let clamp_val: f32 = 0.0;
@@ -2137,7 +2109,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             device
                 .stream
                 .launch_builder(topk_fn)
-                .arg(&g.router_logits_batched)
+                .arg(&g.router_logits_batched.as_view())
                 .arg(&mut g.expert_weights_batched)
                 .arg(&mut g.expert_ids_batched)
                 .arg(&n_rows)
@@ -2155,7 +2127,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     // ---- Stage 2: host gather-sort by expert. ONE DtoH sync. ----
     // Read expert_ids [batch, num_experts] (first top_k valid per row).
     let (col_expert_host, col_src_tok_host, dst_to_col_host, expert_bounds_host) = {
-        let g = scratch.prefill_grouped.as_ref().unwrap();
         // dtoh_copy syncs the stream, so all upstream kernels have completed.
         // Copy ONLY the live [batch, num_experts] region (NOT the full cap_tok
         // capacity) — at cap_tok=8192 the full buffer is 8 MB vs ~num_experts*
@@ -2326,7 +2297,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     // HtoD the tables (copied into the START of each buffer; kernels read
     // [0..total_cols]). host len == total_cols ≤ cap_cols == dst capacity.
     {
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         device.htod_copy_into(&col_expert_host, &mut g.col_expert)?;
         device.htod_copy_into(&col_src_tok_host, &mut g.col_src_tok)?;
         device.htod_copy_into(&dst_to_col_host, &mut g.dst_to_col)?;
@@ -2355,11 +2325,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg2.is_some()
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg3.is_some()
         && kernels.moe_grouped_gate_up_swiglu_q8_0_w10_mg4.is_some()
-        && scratch
-            .prefill_grouped
-            .as_ref()
-            .map(|g| g.w10_xq_q.is_some() && g.w10_xq_d.is_some() && g.w10_tiles.is_some())
-            .unwrap_or(false);
+        && g.w10_xq_q.is_some()
+        && g.w10_xq_d.is_some()
+        && g.w10_tiles.is_some();
     if gate_up_w10_ok {
         let rp = repacked.unwrap();
         let gu_q = rp.gate_up_q.as_ref().unwrap();
@@ -2398,7 +2366,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         }
         // ---- prequant: one block per compact column. ----
         {
-            let g = scratch.prefill_grouped.as_mut().unwrap();
             let xq_q = g.w10_xq_q.as_mut().unwrap();
             let pre_cfg = CudarcLaunchConfig {
                 grid_dim: (total_cols_u32, 1, 1),
@@ -2411,7 +2378,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                     .stream
                     .launch_builder(prequant_fn)
                     .arg(normed)
-                    .arg(&g.col_src_tok)
+                    .arg(&g.col_src_tok.as_view())
                     .arg(xq_q)
                     .arg(g.w10_xq_d.as_mut().unwrap())
                     .arg(&hd_u32)
@@ -2421,9 +2388,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
             }
         }
         // ---- 4 MG gate+up launches over contiguous tile sub-ranges. ----
-        let g = scratch.prefill_grouped.as_mut().unwrap();
-        let xq_q = g.w10_xq_q.as_ref().unwrap();
-        let xq_d = g.w10_xq_d.as_ref().unwrap();
+        let xq_q = g.w10_xq_q.as_ref().unwrap().as_view();
+        let xq_d = g.w10_xq_d.as_ref().unwrap().as_view();
         let tiles = g.w10_tiles.as_ref().unwrap();
         let mut base: u64 = 0;
         for mg in 0..4usize {
@@ -2440,8 +2406,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                     device
                         .stream
                         .launch_builder(mg_fns[mg])
-                        .arg(xq_q)
-                        .arg(xq_d)
+                        .arg(&xq_q)
+                        .arg(&xq_d)
                         .arg(gu_q)
                         .arg(gu_s)
                         .arg(&tile_slice)
@@ -2479,7 +2445,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2491,8 +2456,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(bf_fn)
                 .arg(normed)
                 .arg(layer_buf)
-                .arg(&g.col_src_tok)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.col_src_tok.as_view())
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.gate_up_offsets)
                 .arg(&mut g.swiglu_compact)
@@ -2522,7 +2487,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2534,8 +2498,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(q4_fn)
                 .arg(normed)
                 .arg(layer_buf)
-                .arg(&g.col_src_tok)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.col_src_tok.as_view())
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.gate_up_offsets)
                 .arg(&mut g.swiglu_compact)
@@ -2565,7 +2529,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2577,8 +2540,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(tiled_fn)
                 .arg(normed)
                 .arg(layer_buf)
-                .arg(&g.col_src_tok)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.col_src_tok.as_view())
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.gate_up_offsets)
                 .arg(&mut g.swiglu_compact)
@@ -2595,7 +2558,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         let gate_up_fn = gate_up_fn.ok_or_else(|| RuntimeError::Compute(
             "grouped MoE prefill: Q4_0 reached the Q8 per-column gate_up fallback (caller gate bug)".into()
         ))?;
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let grid_x = ((inter_dim as u32) + 3) / 4; // NR_GU = 4
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, total_cols_u32, 1),
@@ -2608,8 +2570,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(gate_up_fn)
                 .arg(normed)
                 .arg(layer_buf)
-                .arg(&g.col_expert)
-                .arg(&g.col_src_tok)
+                .arg(&g.col_expert.as_view())
+                .arg(&g.col_src_tok.as_view())
                 .arg(&bo.gate_up_offsets)
                 .arg(&mut g.swiglu_compact)
                 .arg(&hd_u32)
@@ -2657,7 +2619,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2670,7 +2631,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(bf_down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.down_offsets)
                 .arg(&mut g.down_compact)
@@ -2694,7 +2655,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2707,7 +2667,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(q4_down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.down_offsets)
                 .arg(&mut g.down_compact)
@@ -2731,7 +2691,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 );
             }
         }
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (num_tiles16, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2744,7 +2703,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(down_f32act_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
-                .arg(&g.gate_up_tiles16)
+                .arg(&g.gate_up_tiles16.as_view())
                 .arg(&num_tiles16)
                 .arg(&bo.down_offsets)
                 .arg(&mut g.down_compact)
@@ -2762,7 +2721,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
         let down_fn = down_fn.ok_or_else(|| RuntimeError::Compute(
             "grouped MoE prefill: Q4_0 reached the Q8 per-column down fallback (caller gate bug)".into()
         ))?;
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let grid_x = ((hidden_dim as u32) + 3) / 4; // NR_DOWN = 4
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, total_cols_u32, 1),
@@ -2777,7 +2735,7 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(down_fn)
                 .arg(&swiglu_view)
                 .arg(layer_buf)
-                .arg(&g.col_expert)
+                .arg(&g.col_expert.as_view())
                 .arg(&bo.down_offsets)
                 .arg(&mut g.down_compact)
                 .arg(&hd_u32)
@@ -2790,7 +2748,6 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
 
     // ---- Stage 5: scatter-accumulate into output. ----
     {
-        let g = scratch.prefill_grouped.as_ref().unwrap();
         let tk_u32 = top_k as u32;
         let grid_x = ((hidden_dim as u32) + 255) / 256;
         let cfg = CudarcLaunchConfig {
@@ -2805,8 +2762,8 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
                 .launch_builder(scatter_fn)
                 .arg(&down_view)
                 .arg(residual)
-                .arg(&g.expert_weights_batched)
-                .arg(&g.dst_to_col)
+                .arg(&g.expert_weights_batched.as_view())
+                .arg(&g.dst_to_col.as_view())
                 .arg(output)
                 .arg(&hd_u32)
                 .arg(&tk_u32)
@@ -2833,18 +2790,17 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
 ///   2. `shared_dot_f32_batched`: logit[batch] = gate_inp·x (if gate_inp present).
 ///   3. `shared_down_*_accum_batched`: out[tok] += [sigmoid(logit[tok])]*down·swiglu.
 ///
-/// Uses the grouped scratch's `shared_swiglu_batched` + `shared_logit_batched`
-/// (ensure_prefill_grouped must have run, which the routed dispatch does first).
+/// Uses the workspace's `MoeSharedSwiglu` and `MoeSharedLogit` regions.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
-pub(crate) fn encode_shared_expert_ffn_prefill_batched(
+pub(crate) fn encode_shared_expert_ffn_prefill_batched<const N: usize>(
     device: &super::ffi::CudaDevice,
     kernels: &super::decode::KernelSet,
-    scratch: &mut CudaMoeScratch,
+    workspace: &mut Rest<'_, N>,
     meta: &CudaMoeMeta,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
-    output: &mut CudaSlice<f32>, // [batch, hidden_dim] in/out (residual+routed already present)
+    normed: &CudaView<'_, f32>,        // [batch, hidden_dim]
+    output: &mut CudaViewMut<'_, f32>, // [batch, hidden_dim] in/out (residual+routed already present)
     batch: usize,
     hidden_dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -2919,18 +2875,24 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
     let down_view = layer_buf.slice(down_off..down_off + down_bytes);
 
     // Verify scratch capacity (inter_dim_eff ≤ routed inter_dim that sized it).
-    {
-        let g = scratch.prefill_grouped.as_ref().ok_or_else(|| {
-            RuntimeError::Compute("batched shared expert: prefill_grouped scratch missing".into())
-        })?;
-        if g.shared_swiglu_batched.len() < batch * inter_dim_eff {
-            return Err(RuntimeError::Compute(format!(
-                "batched shared expert: shared_swiglu_batched too small ({} < {})",
-                g.shared_swiglu_batched.len(),
-                batch * inter_dim_eff,
-            )));
-        }
+    if !workspace.has(Role::MoeSharedSwiglu) {
+        return Err(RuntimeError::Compute(
+            "batched shared expert: the workspace holds no grouped MoE scratch".into(),
+        ));
     }
+    if workspace.len(Role::MoeSharedSwiglu) < batch * inter_dim_eff {
+        return Err(RuntimeError::Compute(format!(
+            "batched shared expert: shared_swiglu_batched too small ({} < {})",
+            workspace.len(Role::MoeSharedSwiglu),
+            batch * inter_dim_eff,
+        )));
+    }
+    let [shared_swiglu, shared_logit] =
+        workspace.regions([Role::MoeSharedSwiglu, Role::MoeSharedLogit]);
+    let mut g = SharedRegions {
+        shared_swiglu_batched: shared_swiglu.into_f32(),
+        shared_logit_batched: shared_logit.into_f32(),
+    };
 
     // TILED shared-expert path. Engaged under the parent tiled flag when the
     // tiled kernels are loaded AND the shapes are compatible (gate_up: hidden%256
@@ -2965,7 +2927,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             .unwrap();
         let grid_x = ((batch as u32) + 15) / 16; // SBT_BM = 16
         let grid_y = (inter_dim_eff as u32) / 32; // SBT_BN = 32 (shape-guarded)
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
             block_dim: (256, 1, 1),
@@ -2988,7 +2949,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 })?;
         }
     } else {
-        let g = scratch.prefill_grouped.as_mut().unwrap();
         let grid_x = ((inter_dim_eff as u32) + 1) / 2; // SB_NR = 2
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, batch_u32, 1),
@@ -3040,7 +3000,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             })?;
         // Stage 2: per-token logit.
         {
-            let g = scratch.prefill_grouped.as_mut().unwrap();
             let cfg = CudarcLaunchConfig {
                 grid_dim: (1, batch_u32, 1),
                 block_dim: (256, 1, 1),
@@ -3068,7 +3027,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
             let grid_x = ((batch as u32) + 15) / 16; // SBTD_BM = 16
             let grid_y = (hidden_dim as u32) / 64; // SBTD_BN = 64 (shape-guarded)
             let gate_mode: u32 = 1; // sigmoid-gated
-            let g = scratch.prefill_grouped.as_ref().unwrap();
             let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
             let cfg = CudarcLaunchConfig {
                 grid_dim: (grid_x, grid_y, 1),
@@ -3081,7 +3039,7 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                     .launch_builder(down_tiled_fn)
                     .arg(&down_view)
                     .arg(&swiglu_view)
-                    .arg(&g.shared_logit_batched)
+                    .arg(&g.shared_logit_batched.as_view())
                     .arg(output)
                     .arg(&hd_u32)
                     .arg(&ie_u32)
@@ -3095,7 +3053,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                     })?;
             }
         } else {
-            let g = scratch.prefill_grouped.as_ref().unwrap();
             let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
             let cfg = CudarcLaunchConfig {
                 grid_dim: (hd_u32, batch_u32, 1),
@@ -3108,7 +3065,7 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                     .launch_builder(down_fn)
                     .arg(&down_view)
                     .arg(&swiglu_view)
-                    .arg(&g.shared_logit_batched)
+                    .arg(&g.shared_logit_batched.as_view())
                     .arg(output)
                     .arg(&hd_u32)
                     .arg(&ie_u32)
@@ -3130,7 +3087,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
         let grid_x = ((batch as u32) + 15) / 16; // SBTD_BM = 16
         let grid_y = (hidden_dim as u32) / 64; // SBTD_BN = 64 (shape-guarded)
         let gate_mode: u32 = 0; // plain residual
-        let g = scratch.prefill_grouped.as_ref().unwrap();
         let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
         let cfg = CudarcLaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
@@ -3143,7 +3099,7 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                 .launch_builder(down_tiled_fn)
                 .arg(&down_view)
                 .arg(&swiglu_view)
-                .arg(&g.shared_logit_batched) // unused at gate_mode=0; valid ptr
+                .arg(&g.shared_logit_batched.as_view()) // unused at gate_mode=0; valid ptr
                 .arg(output)
                 .arg(&hd_u32)
                 .arg(&ie_u32)
@@ -3167,7 +3123,6 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
                         .into(),
                 )
             })?;
-        let g = scratch.prefill_grouped.as_ref().unwrap();
         let swiglu_view = g.shared_swiglu_batched.slice(0..batch * inter_dim_eff);
         let cfg = CudarcLaunchConfig {
             grid_dim: (hd_u32, batch_u32, 1),

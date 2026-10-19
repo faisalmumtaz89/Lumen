@@ -428,14 +428,14 @@ impl CudaDevice {
         self.stream.clone_htod(host_data).map_err(cuda_driver_err)
     }
 
-    /// Copy host data into an existing device buffer (no allocation).
+    /// Copy host data into an existing device buffer or view (no allocation).
     ///
-    /// The destination buffer must have capacity >= source length.
+    /// The destination must have capacity >= source length.
     /// Used in the hot path to reuse pre-allocated scratch buffers.
-    pub fn htod_copy_into<T: DeviceRepr>(
+    pub fn htod_copy_into<T: DeviceRepr, Dst: cudarc::driver::DevicePtrMut<T>>(
         &self,
         host_data: &[T],
-        dst: &mut CudaSlice<T>,
+        dst: &mut Dst,
     ) -> Result<(), RuntimeError> {
         self.stream
             .memcpy_htod(host_data, dst)

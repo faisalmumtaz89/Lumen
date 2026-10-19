@@ -224,23 +224,43 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Fill every buffer of the retained F32 prefill workspace and the grouped
-    /// MoE prefill scratch with 0xFF bytes (NaN as F32), so a test can show no
-    /// request reads a row of them that the request did not write first.
-    /// Returns which of the parts a model may not have were there to fill.
-    pub fn poison_prefill_workspace(&self) -> Result<PoisonedParts, RuntimeError> {
-        use cudarc::driver::DevicePtr;
-        let guard = self.state.lock().unwrap();
+    /// Lay the F32 prefill workspace out with every value in its own region,
+    /// sized as the one-size-fits-all scratch, instead of letting values never
+    /// live together share bytes, so a test can show the two layouts prefill
+    /// alike. Call between `init` and `preload_weights`.
+    pub fn set_unshared_prefill_workspace(&self) -> Result<(), RuntimeError> {
+        let mut guard = self.state.lock().unwrap();
         let st = guard
-            .as_ref()
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+        if st.prefill_layout.is_some() {
+            return Err(RuntimeError::Config(
+                "set_unshared_prefill_workspace must be called before preload_weights()".into(),
+            ));
+        }
+        st.unshared_prefill_workspace = true;
+        Ok(())
+    }
+
+    /// Fill every region of the retained F32 prefill workspace, the grouped MoE
+    /// prefill scratch's among them, with 0xFF bytes (NaN as F32), so a test
+    /// can show no request reads a row of them that the request did not write
+    /// first. Returns which of the parts a model may not have were there to
+    /// fill.
+    pub fn poison_prefill_workspace(&self) -> Result<PoisonedParts, RuntimeError> {
+        use super::super::workspace::{Elem, Role};
+        use cudarc::driver::{DevicePtr, DeviceSlice};
+        let mut guard = self.state.lock().unwrap();
+        let st = guard
+            .as_mut()
             .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
         let ws = st
             .prefill_workspace
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| RuntimeError::Compute("no prefill workspace".into()))?;
         let stream = &self.device.stream;
         let fill = |ptr: u64, bytes: usize| -> Result<(), RuntimeError> {
-            // SAFETY: `ptr` addresses a live workspace buffer of `bytes` bytes.
+            // SAFETY: `ptr` addresses a live workspace region or buffer of `bytes` bytes.
             unsafe { cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, stream.cu_stream()) }
                 .map_err(|e| RuntimeError::Compute(format!("poison: {e}")))
         };
@@ -249,77 +269,39 @@ impl CudaBackend {
                 $(fill($buf.device_ptr(stream).0, $buf.num_bytes())?;)*
             };
         }
-        let p = &ws.scratch;
-        poison!(
-            p.x,
-            p.normed,
-            p.q,
-            p.k,
-            p.v,
-            p.attn_out,
-            p.attn_proj,
-            p.gate,
-            p.up,
-            p.down,
-            p.token_ids_gpu,
-            p.q_single,
-            p.attn_out_single,
-            p.dequant_f32,
-            p.activation_f16,
-            p.dequant_f16,
-        );
-        let mut parts = PoisonedParts::default();
-        if let Some((fused, gate)) = &p.q_gate {
-            poison!(fused, gate);
-            parts.q_gate = true;
-        }
-        if let Some(scores) = &p.attn_scores {
-            poison!(scores);
-            parts.score_block = true;
-        }
-        if let Some(g) = &ws.gdn {
-            poison!(
-                g.qkv,
-                g.alpha_raw,
-                g.beta_raw,
-                g.gate,
-                g.gdn_out,
-                g.conv_out,
-                g.raw_out,
-                g.alpha_out,
-                g.beta_out,
-            );
-        }
-        if let Some(m) = st
-            .moe_scratch
-            .as_ref()
-            .and_then(|m| m.prefill_grouped.as_ref())
-        {
-            poison!(
-                m.swiglu_compact,
-                m.down_compact,
-                m.col_expert,
-                m.col_src_tok,
-                m.dst_to_col,
-                m.expert_bounds,
-                m.gate_up_tiles16,
-                m.router_logits_batched,
-                m.expert_ids_batched,
-                m.expert_weights_batched,
-                m.shared_swiglu_batched,
-                m.shared_logit_batched,
-            );
-            for q in m.w10_xq_q.iter() {
-                poison!(q);
+        for role in Role::ALL {
+            if !ws.has(role) {
+                continue;
             }
-            for d in m.w10_xq_d.iter() {
-                poison!(d);
+            let [mut region] = ws.regions([role]);
+            match role.elem() {
+                Elem::F32 => {
+                    let view = region.f32();
+                    poison!(view);
+                }
+                Elem::U32 => {
+                    let view = region.u32();
+                    poison!(view);
+                }
+                Elem::I32 => {
+                    let view = region.i32();
+                    poison!(view);
+                }
+                Elem::U8 => {
+                    let view = region.u8();
+                    poison!(view);
+                }
+                Elem::I8 => {
+                    let view = region.i8();
+                    poison!(view);
+                }
             }
-            for t in m.w10_tiles.iter() {
-                poison!(t);
-            }
-            parts.grouped_moe = true;
         }
+        let parts = PoisonedParts {
+            q_gate: ws.has(Role::QGateFused),
+            score_block: ws.has(Role::Scores),
+            grouped_moe: ws.has(Role::MoeRouterLogits),
+        };
         self.device.synchronize()?;
         Ok(parts)
     }
