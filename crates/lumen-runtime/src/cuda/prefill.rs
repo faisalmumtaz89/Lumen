@@ -21,7 +21,10 @@
 //! A(cublas)=W, lda=in_dim, B(cublas)=A, ldb=in_dim, C(cublas)=C, ldc=out_dim
 
 use cudarc::cublas::{sys as cublas_sys, Gemm, GemmConfig};
-use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig as CudarcLaunchConfig,
+    PushKernelArg,
+};
 
 use crate::error::RuntimeError;
 
@@ -390,7 +393,7 @@ unsafe fn launch_dequant_plane_to_f32(
     func: &CudaFunction,
     quant: QuantScheme,
     plane: &CudaSlice<u8>,
-    out: &mut CudaSlice<f32>,
+    out: &mut CudaViewMut<'_, f32>,
     n_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -424,7 +427,7 @@ unsafe fn dequant_planar_into_scratch(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    dequant_scratch: &mut CudaSlice<f32>,
+    dequant_scratch: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -478,8 +481,8 @@ pub(crate) unsafe fn launch_embed_batch(
     embedding_bf16: Option<&CudaSlice<u8>>,
     embedding_q4: Option<&CudaSlice<u8>>,
     embedding_kquant: Option<(QuantScheme, &CudaSlice<u8>)>,
-    token_ids_gpu: &CudaSlice<u32>,
-    output: &mut CudaSlice<f32>,
+    token_ids_gpu: &CudaView<'_, u32>,
+    output: &mut CudaViewMut<'_, f32>,
     batch: usize,
     hidden_dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -587,9 +590,9 @@ pub(crate) unsafe fn launch_embed_batch(
 pub(crate) unsafe fn launch_rmsnorm_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    x: &CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
     weight: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    out: &mut CudaViewMut<'_, f32>,
     eps: f32,
     batch: usize,
     dim: usize,
@@ -694,11 +697,11 @@ pub(crate) unsafe fn launch_gemm_projection(
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
     weight_f16_cache: Option<&CudaSlice<u8>>,
-    input: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
-    dequant_scratch: &mut CudaSlice<f32>,
-    activation_f16: &mut CudaSlice<u8>,
-    dequant_f16: &mut CudaSlice<u8>,
+    input: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
+    dequant_scratch: &mut CudaViewMut<'_, f32>,
+    activation_f16: &mut CudaViewMut<'_, u8>,
+    dequant_f16: &mut CudaViewMut<'_, u8>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -796,8 +799,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
         launch_cublas_hgemm(
             device,
-            w_f16,
-            activation_f16,
+            &w_f16.as_view(),
+            &activation_f16.as_view(),
             output,
             out_dim,
             batch,
@@ -1012,8 +1015,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1059,8 +1062,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             // Step 2: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
             launch_cublas_hgemm(
                 device,
-                w_f16,
-                activation_f16,
+                &w_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1151,8 +1154,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 // Step 3: cublasGemmEx HGEMM (F16 weight + F16 activation -> F32 output).
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1196,8 +1199,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1231,8 +1234,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1269,7 +1272,7 @@ pub(crate) unsafe fn launch_gemm_projection(
             //
             // BF16 has the same 2 B/elem footprint as F16 — we reuse the F16
             // activation scratch buffer (`activation_f16`) for the BF16
-            // activation conversion. The buffer is `CudaSlice<u8>`, so the
+            // activation conversion. The buffer holds bytes (`u8`), so the
             // interpretation is determined by the cuBLAS `cudaDataType_t`.
             let activation_needed = batch * in_dim * 2;
             if activation_f16.len() < activation_needed {
@@ -1301,8 +1304,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             // Step 2: cublasGemmEx (BF16 weight + BF16 activation -> F32 output).
             launch_cublas_gemm_bf16(
                 device,
-                w_bf16,
-                activation_f16,
+                &w_bf16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1379,8 +1382,8 @@ pub(crate) unsafe fn launch_gemm_projection(
                 )?;
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1415,12 +1418,12 @@ pub(crate) unsafe fn launch_gemm_residual(
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
     weight_f16_cache: Option<&CudaSlice<u8>>,
-    input: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
-    dequant_scratch: &mut CudaSlice<f32>,
-    activation_f16: &mut CudaSlice<u8>,
-    dequant_f16: &mut CudaSlice<u8>,
+    input: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
+    dequant_scratch: &mut CudaViewMut<'_, f32>,
+    activation_f16: &mut CudaViewMut<'_, u8>,
+    dequant_f16: &mut CudaViewMut<'_, u8>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -1530,8 +1533,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         // cublasGemmEx with beta=1.0 for residual accumulation.
         launch_cublas_hgemm(
             device,
-            w_f16,
-            activation_f16,
+            &w_f16.as_view(),
+            &activation_f16.as_view(),
             output,
             out_dim,
             batch,
@@ -1742,8 +1745,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1793,8 +1796,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             // Step 3: cublasGemmEx with beta=1.0 for residual accumulation.
             launch_cublas_hgemm(
                 device,
-                w_f16,
-                activation_f16,
+                &w_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1894,8 +1897,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 // Step 4: cublasGemmEx HGEMM with beta=1.0 for residual accumulation.
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -1948,8 +1951,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -1993,8 +1996,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             )?;
             launch_cublas_hgemm(
                 device,
-                dequant_f16,
-                activation_f16,
+                &dequant_f16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -2060,8 +2063,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             // Step 3: cublasGemmEx BF16 with beta=1.0 for residual accumulation.
             launch_cublas_gemm_bf16(
                 device,
-                w_bf16,
-                activation_f16,
+                &w_bf16.as_view(),
+                &activation_f16.as_view(),
                 output,
                 out_dim,
                 batch,
@@ -2158,8 +2161,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 )?;
                 launch_cublas_hgemm(
                     device,
-                    dequant_f16,
-                    activation_f16,
+                    &dequant_f16.as_view(),
+                    &activation_f16.as_view(),
                     output,
                     out_dim,
                     batch,
@@ -2181,8 +2184,8 @@ pub(crate) unsafe fn launch_gemm_residual(
 pub(crate) unsafe fn launch_rope_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q: &mut CudaSlice<f32>,
-    k: &mut CudaSlice<f32>,
+    q: &mut CudaViewMut<'_, f32>,
+    k: &mut CudaViewMut<'_, f32>,
     pos_start: usize,
     batch: usize,
     num_q_heads: usize,
@@ -2244,7 +2247,7 @@ pub(crate) unsafe fn launch_kv_cache_write_batch(
     device: &CudaDevice,
     kernels: &KernelSet,
     cache: &mut CudaSlice<f32>,
-    data: &CudaSlice<f32>,
+    data: &CudaView<'_, f32>,
     pos_start: usize,
     batch: usize,
     num_kv_heads: usize,
@@ -2287,8 +2290,8 @@ pub(crate) unsafe fn launch_kv_cache_write_batch(
 pub(crate) unsafe fn launch_swiglu_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    gate: &mut CudaSlice<f32>,
-    up: &CudaSlice<f32>,
+    gate: &mut CudaViewMut<'_, f32>,
+    up: &CudaView<'_, f32>,
     batch: usize,
     inter_dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -2319,8 +2322,8 @@ pub(crate) unsafe fn launch_swiglu_batched(
 pub(crate) unsafe fn launch_residual_add_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
-    x: &mut CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
+    x: &mut CudaViewMut<'_, f32>,
+    residual: &CudaView<'_, f32>,
     batch: usize,
     dim: usize,
 ) -> Result<(), RuntimeError> {
@@ -2352,7 +2355,7 @@ pub(crate) unsafe fn launch_residual_add_batched(
 pub(crate) unsafe fn launch_extract_row(
     device: &CudaDevice,
     kernels: &KernelSet,
-    matrix: &CudaSlice<f32>,
+    matrix: &CudaView<'_, f32>,
     output: &mut CudaSlice<f32>,
     row_idx: usize,
     dim: usize,
@@ -2443,8 +2446,8 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight_q8: &CudaSlice<u8>,
-    x: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
+    out: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     in_dim: usize,
     batch: usize,
@@ -2506,9 +2509,9 @@ pub(crate) unsafe fn launch_mmq_q8_0_batched_residual(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight_q8: &CudaSlice<u8>,
-    x: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    out: &mut CudaSlice<f32>,
+    x: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    out: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     in_dim: usize,
     batch: usize,
@@ -2554,7 +2557,7 @@ unsafe fn launch_dequant_q8_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     q8_data: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2589,7 +2592,7 @@ unsafe fn launch_dequant_q4_0_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     q4_data: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2625,7 +2628,7 @@ unsafe fn launch_dequant_q8_0_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     q8_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2652,7 +2655,7 @@ unsafe fn launch_dequant_q8_split_to_f32(
     device: &CudaDevice,
     kernels: &KernelSet,
     split: &CudaSlice<u8>,
-    f32_out: &mut CudaSlice<f32>,
+    f32_out: &mut CudaViewMut<'_, f32>,
     num_elements: usize,
     in_dim: usize,
     label: &str,
@@ -2702,7 +2705,7 @@ unsafe fn launch_dequant_q8_split_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     split: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     in_dim: usize,
     label: &str,
@@ -2760,7 +2763,7 @@ unsafe fn launch_dequant_q4_0_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     q4_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2790,7 +2793,7 @@ unsafe fn launch_dequant_kquant_to_f16(
     kernels: &KernelSet,
     scheme: QuantScheme,
     data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2845,7 +2848,7 @@ unsafe fn launch_dequant_ct4_to_f16(
     device: &CudaDevice,
     kernels: &KernelSet,
     ct4_data: &CudaSlice<u8>,
-    f16_out: &mut CudaSlice<u8>,
+    f16_out: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -2898,8 +2901,8 @@ unsafe fn launch_matvec_slice(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    input: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    input: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
     _in_offset: usize,
     _out_offset: usize,
     out_dim: usize,
@@ -3229,10 +3232,10 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 pub(crate) unsafe fn launch_flash_attention_sgemm(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q: &CudaSlice<f32>,
+    q: &CudaView<'_, f32>,
     kv: &KvView<'_>,
-    attn_out: &mut CudaSlice<f32>,
-    scores: &mut Option<CudaSlice<f32>>,
+    attn_out: &mut CudaViewMut<'_, f32>,
+    scores: Option<&mut CudaViewMut<'_, f32>>,
     batch: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -3297,9 +3300,7 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
              layer loop and this route runs only when it exists"
         )));
     }
-    let s_buf = scores
-        .as_mut()
-        .expect("score block presence checked immediately above");
+    let s_buf = scores.expect("score block presence checked immediately above");
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let mut qb = 0usize;
     while qb < batch {
@@ -3407,9 +3408,9 @@ pub(crate) unsafe fn launch_flash_attention_sgemm(
 pub(crate) unsafe fn launch_flash_attention_br4(
     device: &CudaDevice,
     kernels: &KernelSet,
-    q_batch: &CudaSlice<f32>,
+    q_batch: &CudaView<'_, f32>,
     kv: &KvView<'_>,
-    attn_out: &mut CudaSlice<f32>,
+    attn_out: &mut CudaViewMut<'_, f32>,
     batch: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -3484,9 +3485,9 @@ unsafe fn launch_matvec_residual_slice(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
-    input: &CudaSlice<f32>,
-    residual: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    input: &CudaView<'_, f32>,
+    residual: &CudaView<'_, f32>,
+    output: &mut CudaViewMut<'_, f32>,
     in_offset: usize,
     res_offset: usize,
     out_offset: usize,
@@ -3670,8 +3671,8 @@ unsafe fn launch_matvec_residual_slice(
 pub(crate) unsafe fn launch_f32_to_f16_fast(
     device: &CudaDevice,
     kernels: &super::decode::KernelSet,
-    src: &CudaSlice<f32>,
-    dst: &mut CudaSlice<u8>,
+    src: &CudaView<'_, f32>,
+    dst: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -3729,9 +3730,9 @@ pub(crate) unsafe fn launch_f32_to_f16_fast(
 /// `output` must be [batch * out_dim] F32 elements.
 unsafe fn launch_cublas_hgemm(
     device: &CudaDevice,
-    w_f16: &CudaSlice<u8>,
-    a_f16: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
+    w_f16: &CudaView<'_, u8>,
+    a_f16: &CudaView<'_, u8>,
+    output: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     batch: usize,
     in_dim: usize,
@@ -3786,8 +3787,8 @@ unsafe fn launch_cublas_hgemm(
 pub(crate) unsafe fn launch_f32_to_bf16_fast(
     device: &CudaDevice,
     kernels: &super::decode::KernelSet,
-    src: &CudaSlice<f32>,
-    dst: &mut CudaSlice<u8>,
+    src: &CudaView<'_, f32>,
+    dst: &mut CudaViewMut<'_, u8>,
     num_elements: usize,
     label: &str,
 ) -> Result<(), RuntimeError> {
@@ -3851,9 +3852,9 @@ pub(crate) unsafe fn launch_f32_to_bf16_fast(
 /// `output` must be `batch * out_dim` F32 elements.
 pub(crate) unsafe fn launch_cublas_gemm_bf16(
     device: &CudaDevice,
-    w_bf16: &CudaSlice<u8>,
-    a_bf16: &CudaSlice<u8>,
-    output: &mut CudaSlice<f32>,
+    w_bf16: &CudaView<'_, u8>,
+    a_bf16: &CudaView<'_, u8>,
+    output: &mut CudaViewMut<'_, f32>,
     out_dim: usize,
     batch: usize,
     in_dim: usize,
@@ -3912,7 +3913,7 @@ pub(crate) unsafe fn launch_kv_cache_write_batch_16(
     device: &CudaDevice,
     kv16: &super::decode::Kv16Kernels,
     cache: &mut CudaSlice<u16>,
-    data: &CudaSlice<f32>,
+    data: &CudaView<'_, f32>,
     overflow: &mut CudaSlice<u32>,
     pos_start: usize,
     batch: usize,
@@ -4102,8 +4103,15 @@ mod tests {
         for (tag, weight, w) in &cases {
             let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
             unsafe {
-                dequant_planar_into_scratch(&device, &kernels, weight, &mut scratch, n, tag)
-                    .unwrap();
+                dequant_planar_into_scratch(
+                    &device,
+                    &kernels,
+                    weight,
+                    &mut scratch.as_view_mut(),
+                    n,
+                    tag,
+                )
+                .unwrap();
             }
             let decoded = device.dtoh_copy(&scratch).unwrap();
             if let Some(i) = (0..n).find(|&i| decoded[i].to_bits() != w[i].to_bits()) {
@@ -4134,12 +4142,12 @@ mod tests {
                         &kernels,
                         weight,
                         None,
-                        &x_gpu,
-                        &residual_gpu,
-                        &mut out,
-                        &mut scratch,
-                        &mut activation_f16,
-                        &mut dequant_f16,
+                        &x_gpu.as_view(),
+                        &residual_gpu.as_view(),
+                        &mut out.as_view_mut(),
+                        &mut scratch.as_view_mut(),
+                        &mut activation_f16.as_view_mut(),
+                        &mut dequant_f16.as_view_mut(),
                         batch,
                         out_dim,
                         in_dim,

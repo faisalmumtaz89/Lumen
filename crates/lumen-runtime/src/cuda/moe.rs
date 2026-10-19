@@ -1961,9 +1961,9 @@ pub(crate) fn encode_moe_ffn_prefill_grouped(
     batched_offsets: Option<&CudaMoeBatchedOffsets>,
     repacked: Option<&CudaMoeRepacked>,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
-    residual: &CudaSlice<f32>,   // [batch, hidden_dim]
-    output: &mut CudaSlice<f32>, // [batch, hidden_dim]
+    normed: &CudaView<'_, f32>,        // [batch, hidden_dim]
+    residual: &CudaView<'_, f32>,      // [batch, hidden_dim]
+    output: &mut CudaViewMut<'_, f32>, // [batch, hidden_dim]
     batch: usize,
     hidden_dim: usize,
     inter_dim: usize,
@@ -2843,8 +2843,8 @@ pub(crate) fn encode_shared_expert_ffn_prefill_batched(
     scratch: &mut CudaMoeScratch,
     meta: &CudaMoeMeta,
     layer_buf: &CudaSlice<u8>,
-    normed: &CudaSlice<f32>,     // [batch, hidden_dim]
-    output: &mut CudaSlice<f32>, // [batch, hidden_dim] in/out (residual+routed already present)
+    normed: &CudaView<'_, f32>,        // [batch, hidden_dim]
+    output: &mut CudaViewMut<'_, f32>, // [batch, hidden_dim] in/out (residual+routed already present)
     batch: usize,
     hidden_dim: usize,
 ) -> Result<(), RuntimeError> {
