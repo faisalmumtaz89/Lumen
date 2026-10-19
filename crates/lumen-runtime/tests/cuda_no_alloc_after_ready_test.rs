@@ -45,6 +45,8 @@ struct Allocation {
     kind: cupti::CUpti_ActivityMemoryKind,
     is_async: bool,
     correlation: u32,
+    /// The variable's name, for a module's static device memory.
+    name: String,
 }
 
 static RECORDED: Mutex<Vec<Allocation>> = Mutex::new(Vec::new());
@@ -95,6 +97,14 @@ extern "C" fn buffer_completed(
                 kind,
                 is_async: memory.isAsync != 0,
                 correlation: memory.correlationId,
+                name: if memory.name.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: CUPTI's NUL-terminated name, valid while the record is.
+                    unsafe { std::ffi::CStr::from_ptr(memory.name) }
+                        .to_string_lossy()
+                        .into_owned()
+                },
             });
         }
     }
@@ -248,62 +258,90 @@ fn requests(cuda: &CudaBackend, provider: &SyncWeightProvider, precision: KvPrec
     decode(&mut s, 1);
 }
 
-fn check(lbc: &[u8], label: &str) {
-    let provider = provider(lbc, label);
+/// The fixtures: a dense GDN hybrid, a Qwen3.5-shaped MoE model with Q8_0
+/// experts, and the same with every scheme the CPU decodes.
+fn model(label: &str) -> Vec<u8> {
+    match label {
+        "gdn-hybrid" => build_gdn_hybrid_lbc_with(gdn_model_hyperparams_with(CONTEXT as u32)),
+        "qwen35" | "qwen35-quant" => build_qwen35_cpu_lbc(
+            &Qwen35Fixture {
+                mixed_quant: label == "qwen35-quant",
+                expert_quant: Some(QuantScheme::Q8_0),
+                routed_experts: Some(64),
+                ..Qwen35Fixture::default()
+            },
+            CONTEXT as u32,
+        ),
+        other => panic!("no fixture {other}"),
+    }
+}
+
+const PRECISIONS: [(&str, KvPrecision); 3] = [
+    ("f32", KvPrecision::F32),
+    ("bf16", KvPrecision::Bf16),
+    ("f16", KvPrecision::F16),
+];
+
+/// One model at one KV precision, in this process.
+fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
+    let provider = provider(&model(label), label);
     let ctx = CudaContext::new(0).unwrap();
     recorder_sees_every_allocation_kind(&ctx);
-    let isolated = std::env::var("LUMEN_NO_ALLOC_ISOLATED_GPU").as_deref() == Ok("1");
-    for precision in [KvPrecision::F32, KvPrecision::Bf16, KvPrecision::F16] {
-        let cuda = backend(&provider, precision);
-        let free = free_memory(&ctx);
-        let stack = stack_limit(&ctx);
-        let recorder = Recorder::start();
-        requests(&cuda, &provider, precision);
-        let allocations = recorder.allocations();
-        let free_after = free_memory(&ctx);
-        println!(
-            "{label}/{precision:?}: {} allocations, free {} -> {} bytes",
-            allocations.len(),
-            free,
-            free_after
-        );
-        assert!(
-            allocations.is_empty(),
-            "{label}/{precision:?}: requests allocated device memory: {allocations:?}"
-        );
-        assert_eq!(
-            stack_limit(&ctx),
-            stack,
-            "{label}/{precision:?}: a request grew the stack"
-        );
-        if isolated {
-            assert!(
-                free_after >= free,
-                "{label}/{precision:?}: free memory fell from {free} to {free_after} bytes"
-            );
+    let cuda = backend(&provider, precision);
+    let free = free_memory(&ctx);
+    let stack = stack_limit(&ctx);
+    let recorder = Recorder::start();
+    requests(&cuda, &provider, precision);
+    let allocations = recorder.allocations();
+    let free_after = free_memory(&ctx);
+    println!(
+        "{label}/{precision:?}: {} allocations, free {free} -> {free_after} bytes",
+        allocations.len()
+    );
+    if !allocations.is_empty() {
+        return Err(format!("requests allocated device memory: {allocations:?}"));
+    }
+    if stack_limit(&ctx) != stack {
+        return Err("a request grew the stack".into());
+    }
+    if std::env::var("LUMEN_NO_ALLOC_ISOLATED_GPU").as_deref() == Ok("1") && free_after < free {
+        return Err(format!(
+            "free memory fell from {free} to {free_after} bytes"
+        ));
+    }
+    Ok(())
+}
+
+/// Every case runs in a process of its own, as a server loads one model per
+/// process: a module an earlier backend loaded stays loaded in the context, so
+/// in a shared process a later case would not show its own first use.
+#[test]
+#[ignore = "needs a GPU and the CUPTI library"]
+fn no_request_allocates_device_memory_after_ready() {
+    const TEST: &str = "no_request_allocates_device_memory_after_ready";
+    if let Ok(case) = std::env::var("LUMEN_NO_ALLOC_CASE") {
+        let (label, name) = case.split_once('/').expect("<model>/<precision>");
+        let precision = PRECISIONS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("precision")
+            .1;
+        check(label, precision).unwrap_or_else(|e| panic!("{case}: {e}"));
+        return;
+    }
+    let mut failed = Vec::new();
+    for label in ["gdn-hybrid", "qwen35", "qwen35-quant"] {
+        for (name, _) in PRECISIONS {
+            let case = format!("{label}/{name}");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--ignored", "--nocapture"])
+                .env("LUMEN_NO_ALLOC_CASE", &case)
+                .status()
+                .unwrap();
+            if !status.success() {
+                failed.push(case);
+            }
         }
     }
-}
-
-#[test]
-#[ignore = "needs a GPU and the CUPTI library"]
-fn a_gdn_hybrid_allocates_nothing_after_ready() {
-    check(
-        &build_gdn_hybrid_lbc_with(gdn_model_hyperparams_with(CONTEXT as u32)),
-        "gdn-hybrid",
-    );
-}
-
-#[test]
-#[ignore = "needs a GPU and the CUPTI library"]
-fn a_qwen35_shaped_model_allocates_nothing_after_ready() {
-    for (label, mixed_quant) in [("qwen35", false), ("qwen35-quant", true)] {
-        let fx = Qwen35Fixture {
-            mixed_quant,
-            expert_quant: Some(QuantScheme::Q8_0),
-            routed_experts: Some(64),
-            ..Qwen35Fixture::default()
-        };
-        check(&build_qwen35_cpu_lbc(&fx, CONTEXT as u32), label);
-    }
+    assert!(failed.is_empty(), "cases that allocated: {failed:?}");
 }
