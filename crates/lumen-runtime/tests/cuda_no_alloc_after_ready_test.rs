@@ -11,9 +11,11 @@
 //! map); none may be made by the program, and a window that lost records fails.
 //! What a request may still take is the code and static data of a library
 //! kernel's module loaded the first time a request launches it (CUDA's default
-//! lazy loading): the runtime makes those load calls inside one of its own calls,
-//! which tells them from the program's, and the serving plan's allowance covers
-//! them. They and the static data the driver records are printed, and with
+//! lazy loading): a CUDA library makes those load calls itself, so the code that
+//! calls the driver lies outside this executable, which tells them from the
+//! program's, and the serving plan's allowance covers them. A virtual-memory call
+//! fails whoever makes it. The loads and the static data the driver records are
+//! printed, and with
 //! `LUMEN_NO_ALLOC_ISOLATED_GPU=1`
 //! (nothing else on the GPU) free memory may fall by at most one allocation
 //! granule, the driver's smallest unit of device memory, across the requests.
@@ -41,7 +43,6 @@ use lumen_runtime::sampling::SamplingParams;
 use lumen_runtime::session::Session;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::alloc::{alloc, dealloc, Layout};
-use std::cell::Cell;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
@@ -85,14 +86,9 @@ const MEMORY_CALLS: [cupti::CUpti_driver_api_trace_cbid; 8] = [
 
 /// The [`MEMORY_CALLS`] the program made while a window records.
 static CALLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// The [`MEMORY_CALLS`] the CUDA runtime made inside one of its calls: its lazy
-/// load of a library kernel's module.
+/// The module and library loads a CUDA library made while a window records: its
+/// lazy load of a kernel's module.
 static LIBRARY_LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-thread_local! {
-    /// How many CUDA runtime calls this thread is inside.
-    static IN_RUNTIME: Cell<u32> = const { Cell::new(0) };
-}
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
 /// Why a recording window cannot be trusted: a buffer CUPTI could not be given,
@@ -179,41 +175,73 @@ extern "C" fn buffer_completed(
 unsafe extern "C" fn driver_call(
     _userdata: *mut std::ffi::c_void,
     domain: cupti::CUpti_CallbackDomain,
-    _cbid: cupti::CUpti_CallbackId,
+    cbid: cupti::CUpti_CallbackId,
     data: *const std::ffi::c_void,
 ) {
-    // SAFETY: an API callback's data is a `CUpti_CallbackData`.
-    let data = unsafe { &*(data as *const cupti::CUpti_CallbackData) };
-    let enter = data.callbackSite == cupti::CUpti_ApiCallbackSite::CUPTI_API_ENTER;
-    if domain == cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_RUNTIME_API {
-        IN_RUNTIME.with(|n| {
-            n.set(if enter {
-                n.get() + 1
-            } else {
-                n.get().saturating_sub(1)
-            })
-        });
-        return;
-    }
     if !WATCHING.load(Ordering::SeqCst)
         || domain != cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_DRIVER_API
-        || !enter
     {
+        return;
+    }
+    // SAFETY: a driver-API callback's data is a `CUpti_CallbackData`.
+    let data = unsafe { &*(data as *const cupti::CUpti_CallbackData) };
+    if data.callbackSite != cupti::CUpti_ApiCallbackSite::CUPTI_API_ENTER {
         return;
     }
     // SAFETY: CUPTI's NUL-terminated name of the called function.
     let name = unsafe { std::ffi::CStr::from_ptr(data.functionName) }
         .to_string_lossy()
         .into_owned();
-    if IN_RUNTIME.with(Cell::get) > 0 {
+    let mapping = [
+        cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemCreate,
+        cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemMap,
+    ]
+    .iter()
+    .any(|&c| c as cupti::CUpti_CallbackId == cbid);
+    if !mapping && !program_made_call() {
         LIBRARY_LOADS.lock().unwrap().push(name);
     } else {
         CALLED.lock().unwrap().push(name);
     }
 }
 
+/// Whether this executable, not a CUDA library, made the driver call a callback
+/// is reporting: the first frame below the driver's own lies in this executable.
+/// A stack with no frame below the driver counts as the program's.
+fn program_made_call() -> bool {
+    extern "C" {
+        fn backtrace(frames: *mut *mut std::ffi::c_void, size: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    let object = |addr: *const std::ffi::c_void| {
+        // SAFETY: zeroed is a valid `Dl_info`, which dladdr fills.
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: dladdr only reads the loader's tables; `info` outlives the call.
+        let found = unsafe { libc::dladdr(addr, &mut info) } != 0 && !info.dli_fname.is_null();
+        found.then(|| {
+            // SAFETY: the loader's NUL-terminated path of the object.
+            let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+            (info.dli_fbase, path.to_string_lossy().into_owned())
+        })
+    };
+    let program = object(program_made_call as *const std::ffi::c_void).map(|(base, _)| base);
+    let mut frames = [std::ptr::null_mut(); 64];
+    // SAFETY: backtrace writes at most `frames.len()` return addresses.
+    let n = unsafe { backtrace(frames.as_mut_ptr(), frames.len() as std::ffi::c_int) };
+    let mut in_driver = false;
+    // A return address is the instruction after the call; one byte back lies
+    // inside the calling function.
+    for frame in &frames[..n.max(0) as usize] {
+        match object(frame.cast::<u8>().wrapping_sub(1).cast()) {
+            Some((_, path)) if path.contains("libcuda.so") => in_driver = true,
+            Some((base, _)) if in_driver => return Some(base) == program,
+            _ => {}
+        }
+    }
+    true
+}
+
 /// What a window recorded: device allocations, the [`MEMORY_CALLS`] the program
-/// made and those the runtime made loading library modules.
+/// made and the loads a CUDA library made.
 struct Recorded {
     allocations: Vec<Allocation>,
     memory_calls: Vec<String>,
@@ -238,12 +266,6 @@ impl Recorder {
                     std::ptr::null_mut(),
                 )
                 .expect("subscribe to CUPTI callbacks");
-                cudarc::cupti::result::enable_domain(
-                    1,
-                    subscriber,
-                    cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_RUNTIME_API,
-                )
-                .expect("enable the runtime callbacks");
                 for call in MEMORY_CALLS {
                     cudarc::cupti::result::enable_callback(
                         1,
