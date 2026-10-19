@@ -58,6 +58,15 @@ impl Target {
         }
     }
 
+    /// The `lumen run` flag that runs on this target, when it is not the
+    /// default device.
+    fn flag(self) -> String {
+        match self {
+            Target::Cuda(0) | Target::Host => String::new(),
+            Target::Cuda(ordinal) => format!(" --cuda-device {ordinal}"),
+        }
+    }
+
     /// What would run the model instead when none of its quantizations can.
     fn instead(self) -> &'static str {
         match self {
@@ -69,16 +78,18 @@ impl Target {
 
 /// The least each BF16 registry model's weights take on a CUDA device that
 /// holds BF16 layer weights as F32 (compute capability below 9.0), in
-/// hundredths of its download, rounded down: every 2-D BF16 layer tensor at 4
-/// bytes an element, except `ssm_alpha`, `ssm_beta` and `ssm_out`, which the
-/// converter re-quantizes to Q8_0, and everything else at its stored size
-/// (the embedding and output head stay BF16, norms F32), without the MTP
-/// layer the converter drops. Measured from each file's real header for the
-/// download of the bytes given, and used only when the download is that size.
-/// The MoE has no row: its experts are read as BF16 in place, so its weights
-/// are no bigger than its download.
-const BF16_AS_F32: [(&str, u64, u64); 2] = [
+/// hundredths of its download, rounded down, without the MTP layer the
+/// converter drops. A dense model: every 2-D BF16 layer tensor at 4 bytes an
+/// element, except `ssm_alpha`, `ssm_beta` and `ssm_out`, which the converter
+/// re-quantizes to Q8_0, and everything else at its stored size (the
+/// embedding and output head stay BF16, norms F32). The MoE: each layer as it
+/// is stored, uploaded whole for its experts, which are read as BF16 in place,
+/// and its attention projections again at 4 bytes an element beside it.
+/// Measured from each file's real header for the download of the bytes given,
+/// and used only when the download is that size.
+const BF16_AS_F32: [(&str, u64, u64); 3] = [
     ("qwen3-5-9b", 18_407_321_344, 165),
+    ("qwen3-5-moe-35b-a3b", 71_065_941_760, 103),
     ("qwen3-8-27b", 54_657_735_616, 179),
 ];
 
@@ -239,19 +250,20 @@ pub(crate) fn refusal(
                 ""
             };
             message.push_str(&format!(
-                "\n  lumen run {name}:{} \"…\"   ({size}{default}{downloaded})",
+                "\n  lumen run {name}:{}{} \"…\"   ({size}{default}{downloaded})",
                 q.to_lowercase(),
+                target.flag(),
             ));
         }
     }
     Some(message)
 }
 
-/// Refuse a download of `quant` of `entry` that CUDA device `ordinal` could
-/// not run. Nothing is checked when no file is left to download or when this
-/// machine has no such device; a rule whose facts (the device's memory or
-/// compute capability, a download size) cannot be learnt is skipped, and the
-/// download then goes ahead as it would have.
+/// Refuse to download or convert `quant` of `entry` when CUDA device
+/// `ordinal` could not run it. Nothing is checked when this machine has no
+/// such device; a rule whose facts (the device's memory or compute capability,
+/// a download size, from disk for a file already downloaded) cannot be learnt
+/// is skipped, and the download then goes ahead as it would have.
 #[cfg(all(feature = "download", feature = "cuda"))]
 pub(crate) fn check(
     entry: &ModelEntry,
@@ -265,10 +277,9 @@ pub(crate) fn check(
     })
 }
 
-/// Refuse a download of `quant` of `entry` for a CPU run when its weights
-/// alone could not fit the memory this machine has available. Nothing is
-/// checked when no file is left to download or when a size or the available
-/// memory cannot be learnt.
+/// Refuse to download or convert `quant` of `entry` for a CPU run when its
+/// weights alone could not fit the memory this machine has available. Nothing
+/// is checked when a size or the available memory cannot be learnt.
 #[cfg(feature = "download")]
 pub(crate) fn check_host(entry: &ModelEntry, name: &str, quant: &str) -> Result<(), String> {
     check_against(entry, name, quant, Target::Host, || Device {
@@ -286,10 +297,7 @@ fn check_against(
     target: Target,
     device: impl FnOnce() -> Device,
 ) -> Result<(), String> {
-    let Some(src) = entry.gguf_files.get(quant) else {
-        return Ok(());
-    };
-    if src.files.iter().all(|f| downloaded(f).is_some()) {
+    if !entry.gguf_files.contains_key(quant) {
         return Ok(());
     }
     let device = device();
@@ -485,10 +493,12 @@ mod tests {
             "{message}"
         );
         let k = message
-            .find("lumen run qwen3.8-27b:q4_k_m")
+            .find("lumen run qwen3.8-27b:q4_k_m --cuda-device 1")
             .expect(&message);
         let q4 = message
-            .find("lumen run qwen3.8-27b:q4_0 \"…\"   (15.00 GiB, the default, already downloaded)")
+            .find(
+                "lumen run qwen3.8-27b:q4_0 --cuda-device 1 \"…\"   (15.00 GiB, the default, already downloaded)",
+            )
             .expect(&message);
         assert!(k < q4, "the biggest not ruled out comes first: {message}");
         assert!(!message.contains(":bf16"), "{message}");
@@ -793,37 +803,39 @@ mod tests {
     }
 
     #[test]
-    fn the_moe_bf16_has_no_f32_bound() {
+    fn the_moe_bf16_on_f32_is_judged_by_its_own_row() {
         let reg = crate::registry::load_registry();
         let moe = reg.resolve("qwen3.5-moe").unwrap();
-        let s = sizes(&[("BF16", 71_065_941_760)]);
-        assert_eq!(
+        let download = 71_065_941_760u64;
+        let at_least = (u128::from(download) * 103 / 100) as u64;
+        let s = sizes(&[("BF16", download)]);
+        let rule = |memory| {
             refusal(
                 moe,
                 "qwen3.5-moe",
                 "BF16",
                 Target::Cuda(0),
-                gpu(80 * GIB, (8, 0)),
+                gpu(memory, (8, 0)),
                 &s,
-                &[]
-            ),
-            None
-        );
+                &[],
+            )
+        };
+        assert!(rule(at_least - 1).is_some());
+        assert_eq!(rule(at_least), None);
+        assert_eq!(rule(80 * GIB), None, "an A100-80GB is not ruled out");
     }
 
     #[test]
-    fn every_bf16_registry_model_has_a_row_or_reads_experts_in_place() {
+    fn every_bf16_registry_model_has_a_row() {
         let reg = crate::registry::load_registry();
         for entry in reg
             .list()
             .iter()
             .filter(|e| e.gguf_files.contains_key("BF16"))
         {
-            let has_row = BF16_AS_F32.iter().any(|(key, _, _)| *key == entry.key);
-            assert_eq!(
-                has_row,
-                entry.architecture != "qwen35moe",
-                "{}: a dense BF16 model needs a census row, the MoE none",
+            assert!(
+                BF16_AS_F32.iter().any(|(key, _, _)| *key == entry.key),
+                "{} BF16 has no census row",
                 entry.key
             );
         }
@@ -831,6 +843,35 @@ mod tests {
             assert!(reg.list().iter().any(|e| e.key == key), "{key}");
             assert!((100..=200).contains(&hundredths), "{key}: {hundredths}");
         }
+    }
+
+    #[test]
+    fn a_suggested_command_runs_on_the_device_that_was_checked() {
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "BF16",
+            Target::Cuda(1),
+            gpu(80 * GIB, (8, 0)),
+            &sizes_27b(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            message.contains("lumen run qwen3.8-27b:q8_0 --cuda-device 1 \"…\""),
+            "{message}"
+        );
+        let on_0 = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "BF16",
+            Target::Cuda(0),
+            gpu(80 * GIB, (8, 0)),
+            &sizes_27b(),
+            &[],
+        )
+        .unwrap();
+        assert!(!on_0.contains("--cuda-device"), "{on_0}");
     }
 
     #[cfg(feature = "download")]

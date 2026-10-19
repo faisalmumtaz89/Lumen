@@ -16,7 +16,7 @@ before downloading it, naming both compute capabilities and the quantizations it
 a model converted elsewhere is refused at load. BF16 and the larger models on 7.5 are untested (a T4
 has 16 GB).
 
-The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them, so a CUDA build refuses the dense BF16 models before downloading them on a GPU below 9.0 that their F32 weights do not fit; the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
+The ratios in this table were measured on an A100-80GB (27B-class BF16 cells on H100 — sm_80 routes BF16 through F32 and cannot hold them, so a CUDA build refuses the BF16 models before downloading them on a GPU below 9.0 that their F32 weights do not fit, when the download's size is known (not through a proxy, which reports none); the MoE BF16 record is also H100-measured); see [`bench/RESULTS.md`](../bench/RESULTS.md) for the rig and full numbers.
 
 > **Scope of the 0.31.0 decode-attention verification.** Since 0.31.0 decode attention runs one kernel
 > on every model and context (see the CHANGELOG), and that change was verified on an RTX 5090 (compute
