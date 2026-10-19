@@ -35,6 +35,7 @@ use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
 use super::kv_cache::{KvCacheGpu, KvStore, KvView};
 use super::shaders::EMBED_KERNEL_SOURCE;
 use super::types::LaunchConfig;
+use super::workspace::{Role, Workspace};
 use cudarc::cublas::{sys as cublas_sys, Gemv, GemvConfig};
 use cudarc::driver::{
     CudaFunction, CudaSlice, CudaView, LaunchConfig as CudarcLaunchConfig, PushKernelArg,
@@ -961,7 +962,7 @@ struct MutableState {
     /// The batched F32 prefill's buffers, allocated by `preload_weights` for
     /// the longest slice a request can run and the whole context, and lent to
     /// every request; `None` before preload and on the native prefill route.
-    prefill_workspace: Option<super::prefill::PrefillWorkspace>,
+    prefill_workspace: Option<Workspace>,
     /// The layout `prefill_workspace` was allocated from, kept when the native
     /// route releases the workspace.
     prefill_layout: Option<super::prefill::PrefillWorkspaceLayout>,
@@ -8920,31 +8921,26 @@ impl CudaBackend {
     fn prefill_slices(
         &self,
         st: &mut MutableState,
-        ws: &mut super::prefill::PrefillWorkspace,
+        ws: &mut Workspace,
         tokens: &[u32],
         pos_start: usize,
         slice_len: usize,
         hidden_dim: usize,
     ) -> Result<(), RuntimeError> {
-        if ws.gdn.is_some() {
+        if ws.has(Role::GdnQkv) {
             self.ensure_gdn_scratch(st)?;
         }
         let mut last_len = 0;
         for (i, slice) in tokens.chunks(slice_len).enumerate() {
-            self.prefill_slice(
-                st,
-                &mut ws.scratch,
-                ws.gdn.as_mut(),
-                slice,
-                pos_start + i * slice_len,
-            )?;
+            self.prefill_slice(st, ws, slice, pos_start + i * slice_len)?;
             last_len = slice.len();
         }
         unsafe {
+            let [mut x] = ws.regions([Role::X]);
             super::prefill::launch_extract_row(
                 &self.device,
                 &st.kernels,
-                &ws.scratch.x.as_view(),
+                &x.f32().as_view(),
                 &mut st.scratch.x_gpu,
                 last_len - 1,
                 hidden_dim,
@@ -9012,14 +9008,13 @@ impl CudaBackend {
     }
 
     /// One slice of a prefill: embed `tokens`, run every layer over them at
-    /// positions from `pos_start`, and leave the slice's hidden states in
-    /// `pf.x`. The KV caches advance by the slice; the GDN recurrent state
+    /// positions from `pos_start`, and leave the slice's hidden states in the
+    /// `X` region. The KV caches advance by the slice; the GDN recurrent state
     /// continues from the previous slice.
     fn prefill_slice(
         &self,
         st: &mut MutableState,
-        pf: &mut super::prefill::PrefillScratch,
-        mut gdn_pf: Option<&mut super::prefill::GdnPrefillScratch>,
+        ws: &mut Workspace,
         tokens: &[u32],
         pos_start: usize,
     ) -> Result<(), RuntimeError> {
@@ -9037,7 +9032,8 @@ impl CudaBackend {
         let batch = tokens.len();
 
         // Upload token IDs to GPU.
-        self.device.htod_copy_into(tokens, &mut pf.token_ids_gpu)?;
+        let [mut token_ids] = ws.regions([Role::TokenIds]);
+        self.device.htod_copy_into(tokens, &mut token_ids.u32())?;
 
         // Step 1: Batch embed all tokens into [batch, hidden_dim].
         unsafe {
@@ -9053,6 +9049,7 @@ impl CudaBackend {
                     || st.globals.embedding.len() > 1,
                 "batched embed would read the placeholder F32 embedding"
             );
+            let [mut token_ids, mut x] = ws.regions([Role::TokenIds, Role::X]);
             super::prefill::launch_embed_batch(
                 &self.device,
                 &st.kernels,
@@ -9062,8 +9059,8 @@ impl CudaBackend {
                 st.globals.embedding_bf16.as_ref(),
                 st.globals.embedding_q4.as_ref(),
                 st.globals.embedding_kquant.as_ref().map(|(q, b)| (*q, b)),
-                &pf.token_ids_gpu.as_view(),
-                &mut pf.x.as_view_mut(),
+                &token_ids.u32().as_view(),
+                &mut x.f32(),
                 batch,
                 hidden_dim,
             )?;
@@ -9075,14 +9072,7 @@ impl CudaBackend {
 
             // ---- GDN LAYER: batched projections + sequential state update ----
             if lw.layer_type == 1 {
-                self.prefill_gdn_layer(
-                    layer_idx,
-                    batch,
-                    st,
-                    pf,
-                    gdn_pf.as_deref_mut().unwrap(),
-                    eps,
-                )?;
+                self.prefill_gdn_layer(layer_idx, batch, st, ws, eps)?;
                 continue;
             }
 
@@ -9090,12 +9080,13 @@ impl CudaBackend {
 
             // 2a. Batched RMSNorm for QKV projections (always F32 path for precision).
             unsafe {
+                let [mut x, mut normed] = ws.regions([Role::X, Role::Normed]);
                 super::prefill::launch_rmsnorm_batched(
                     &self.device,
                     &st.kernels,
-                    &pf.x.as_view(),
+                    &x.f32().as_view(),
                     &lw.attn_norm,
-                    &mut pf.normed.as_view_mut(),
+                    &mut normed.f32(),
                     eps,
                     batch,
                     hidden_dim,
@@ -9107,50 +9098,76 @@ impl CudaBackend {
             if has_qgate_fusion_pf {
                 // Q+gate fusion: project wq to [batch, q_dim*2], then deinterleave.
                 let q_gate_dim = q_dim * 2;
-                let (pf_q_gate, pf_gate_buf) = pf.q_gate.as_mut().ok_or_else(|| {
-                    RuntimeError::Compute("Q+gate prefill scratch missing".into())
-                })?;
+                if !ws.has(Role::QGateFused) {
+                    return Err(RuntimeError::Compute(
+                        "Q+gate prefill scratch missing".into(),
+                    ));
+                }
                 unsafe {
+                    let [mut normed, mut q_gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Normed,
+                            Role::QGateFused,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.wq,
                         None,
-                        &pf.normed.as_view(),
-                        &mut pf_q_gate.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &normed.f32().as_view(),
+                        &mut q_gate.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         q_gate_dim,
                         hidden_dim,
                         "wq_qgate",
                     )?;
+                    let [mut normed, mut k, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Normed,
+                            Role::K,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.wk,
                         None,
-                        &pf.normed.as_view(),
-                        &mut pf.k.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &normed.f32().as_view(),
+                        &mut k.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         kv_dim,
                         hidden_dim,
                         "wk",
                     )?;
+                    let [mut normed, mut v, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Normed,
+                            Role::V,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.wv,
                         None,
-                        &pf.normed.as_view(),
-                        &mut pf.v.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &normed.f32().as_view(),
+                        &mut v.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         kv_dim,
                         hidden_dim,
@@ -9171,13 +9188,15 @@ impl CudaBackend {
                         block_dim: (block, 1, 1),
                         shared_mem_bytes: 0,
                     };
+                    let [mut q_gate, mut q, mut attn_gate] =
+                        ws.regions([Role::QGateFused, Role::Q, Role::QGateGate]);
                     unsafe {
                         self.device
                             .stream
                             .launch_builder(deinterleave_fn)
-                            .arg(&*pf_q_gate)
-                            .arg(&mut pf.q)
-                            .arg(&mut *pf_gate_buf)
+                            .arg(&q_gate.f32().as_view())
+                            .arg(&mut q.f32())
+                            .arg(&mut attn_gate.f32())
                             .arg(&hd)
                             .arg(&total_heads)
                             .launch(launch_cfg)
@@ -9211,11 +9230,12 @@ impl CudaBackend {
                         block_dim: (block, 1, 1),
                         shared_mem_bytes: shared_bytes,
                     };
+                    let [mut q] = ws.regions([Role::Q]);
                     unsafe {
                         self.device
                             .stream
                             .launch_builder(norm_fn)
-                            .arg(&mut pf.q)
+                            .arg(&mut q.f32())
                             .arg(q_norm_w)
                             .arg(&total_heads)
                             .arg(&hd)
@@ -9246,11 +9266,12 @@ impl CudaBackend {
                         block_dim: (block, 1, 1),
                         shared_mem_bytes: shared_bytes,
                     };
+                    let [mut k] = ws.regions([Role::K]);
                     unsafe {
                         self.device
                             .stream
                             .launch_builder(norm_fn)
-                            .arg(&mut pf.k)
+                            .arg(&mut k.f32())
                             .arg(k_norm_w)
                             .arg(&total_kv_heads)
                             .arg(&hd)
@@ -9265,8 +9286,8 @@ impl CudaBackend {
                 // We'll use it after flash attention, before the output projection.
                 // For now, store in a local variable that persists through the layer scope.
                 // Apply sigmoid gating after attention (step 2e below).
-                // NOTE: pf_gate_buf needs to survive until after attention. Since we're in
-                // the same loop iteration scope, it's alive until the end of this block.
+                // NOTE: the QGateGate region holds the gate until after attention; nothing
+                // else in this layer writes it.
 
                 // Continue to RoPE (step 2c) -- Q and K are now deinterleaved and normalized.
                 // We don't add QKV bias for Q+gate layers (Qwen3.5 has no QKV bias).
@@ -9281,17 +9302,19 @@ impl CudaBackend {
                 let ropeprobe = moe_probe_enabled();
                 let qd = num_heads * head_dim;
                 if ropeprobe && batch > 1 {
-                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let [mut q] = ws.regions([Role::Q]);
+                    let qh = self.device.dtoh_copy_view(&q.f32())?;
                     let o = (batch - 1) * qd;
                     eprintln!("[ROPEPROBE] layer={layer_idx} rotary_dim={rotary_dim_pf} head_dim={head_dim} neox={} PRE q_h0[0..16]={:?}",
                         hp.rope_neox, &qh[o..o + 16.min(qd)]);
                 }
                 unsafe {
+                    let [mut q, mut k] = ws.regions([Role::Q, Role::K]);
                     super::prefill::launch_rope_batched(
                         &self.device,
                         &st.kernels,
-                        &mut pf.q.as_view_mut(),
-                        &mut pf.k.as_view_mut(),
+                        &mut q.f32(),
+                        &mut k.f32(),
                         pos_start,
                         batch,
                         num_heads,
@@ -9303,7 +9326,8 @@ impl CudaBackend {
                     )?;
                 }
                 if ropeprobe && batch > 1 {
-                    let qh = self.device.dtoh_copy(&pf.q)?;
+                    let [mut q, mut k, mut v] = ws.regions([Role::Q, Role::K, Role::V]);
+                    let qh = self.device.dtoh_copy_view(&q.f32())?;
                     let o = (batch - 1) * qd;
                     // dump dims 0..8, 30..38, 62..70 to see split-half (d,d+32) pairing
                     let s = |a: usize, b: usize| qh[o + a..o + b.min(qd)].to_vec();
@@ -9315,8 +9339,8 @@ impl CudaBackend {
                     );
                     // post-rope K (cached) + V, last token, kv-head 0, first 3
                     let kvd = num_kv_heads * head_dim;
-                    let kh = self.device.dtoh_copy(&pf.k)?;
-                    let vh = self.device.dtoh_copy(&pf.v)?;
+                    let kh = self.device.dtoh_copy_view(&k.f32())?;
+                    let vh = self.device.dtoh_copy_view(&v.f32())?;
                     let ko = (batch - 1) * kvd;
                     eprintln!(
                         "[KVPROBE] layer={layer_idx} POST k_h0[0..3]={:?} v_h0[0..3]={:?}",
@@ -9343,13 +9367,14 @@ impl CudaBackend {
                     (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                     layer_idx,
                 )?;
+                let [mut k, mut v] = ws.regions([Role::K, Role::V]);
                 write_kv_batch(
                     &self.device,
                     &st.kernels,
                     kv_cache,
                     st.kv16_overflow.as_mut(),
-                    &pf.k.as_view(),
-                    &pf.v.as_view(),
+                    &k.f32().as_view(),
+                    &v.f32().as_view(),
                     pos_start,
                     batch,
                     num_kv_heads,
@@ -9369,19 +9394,21 @@ impl CudaBackend {
 
                 // 2e. Flash Attention
                 unsafe {
-                    if batch >= 16 && pf.attn_scores.is_some() {
+                    if batch >= 16 && ws.has(Role::Scores) {
                         // The score block was sized before the layer loop
                         // under exactly the conditions the tiled route needs,
                         // so its presence is the whole decision; without it
                         // the scalar kernel computes the same exact-F32
                         // attention.
+                        let [mut q, mut attn_out, mut scores] =
+                            ws.regions([Role::Q, Role::AttnOut, Role::Scores]);
                         super::prefill::launch_flash_attention_sgemm(
                             &self.device,
                             &st.kernels,
-                            &pf.q.as_view(),
+                            &q.f32().as_view(),
                             &kv_view,
-                            &mut pf.attn_out.as_view_mut(),
-                            pf.attn_scores.as_mut().map(|s| s.as_view_mut()).as_mut(),
+                            &mut attn_out.f32(),
+                            Some(&mut scores.f32()),
                             batch,
                             num_heads,
                             num_kv_heads,
@@ -9389,12 +9416,13 @@ impl CudaBackend {
                             pos_start,
                         )?;
                     } else {
+                        let [mut q, mut attn_out] = ws.regions([Role::Q, Role::AttnOut]);
                         super::prefill::launch_flash_attention_br4(
                             &self.device,
                             &st.kernels,
-                            &pf.q.as_view(),
+                            &q.f32().as_view(),
                             &kv_view,
-                            &mut pf.attn_out.as_view_mut(),
+                            &mut attn_out.f32(),
                             batch,
                             num_heads,
                             num_kv_heads,
@@ -9407,7 +9435,8 @@ impl CudaBackend {
                 // [ATTNPROBE] dump raw attention output (pre-gate) for full-attn
                 // layers (last token, head 0, first 3 dims) vs llama attn_pregate.
                 if ropeprobe && batch > 1 {
-                    let ah = self.device.dtoh_copy(&pf.attn_out)?;
+                    let [mut attn_out] = ws.regions([Role::AttnOut]);
+                    let ah = self.device.dtoh_copy_view(&attn_out.f32())?;
                     let o = (batch - 1) * qd;
                     eprintln!(
                         "[ATTNPROBE] layer={layer_idx} attn_out_h0[0..3]={:?}",
@@ -9417,9 +9446,9 @@ impl CudaBackend {
 
                 // 2e.5. Sigmoid gating: attn_out = sigmoid(gate) * attn_out (per token)
                 //
-                // FIX-3: write through pf.q (sized [batch * q_dim], unused after
+                // FIX-3: write through Q (sized [batch * q_dim], unused after
                 // attention) then memcpy back to attn_out. Previously the temp was
-                // pf.normed which is sized [batch * hidden_dim]; that overflowed for
+                // Normed which is sized [batch * hidden_dim]; that overflowed for
                 // Qwen3.5-MoE-35B-A3B where `q_dim=4096 > hidden_dim=2048`, corrupting
                 // adjacent GPU memory and producing gibberish output.
                 if let Some(ref sigmoid_fn) = st.kernels.sigmoid_mul {
@@ -9431,24 +9460,27 @@ impl CudaBackend {
                         block_dim: (block, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    // Use pf.q as temp output (sized [batch * q_dim], free until next layer).
+                    // Use Q as temp output (sized [batch * q_dim], free until next layer).
+                    let [mut attn_gate, mut attn_out, mut q] =
+                        ws.regions([Role::QGateGate, Role::AttnOut, Role::Q]);
                     unsafe {
                         self.device
                             .stream
                             .launch_builder(sigmoid_fn)
-                            .arg(&*pf_gate_buf)
-                            .arg(&pf.attn_out)
-                            .arg(&mut pf.q)
+                            .arg(&attn_gate.f32().as_view())
+                            .arg(&attn_out.f32().as_view())
+                            .arg(&mut q.f32())
                             .arg(&total_elems)
                             .launch(launch_cfg)
                     }
                     .map_err(|e| RuntimeError::Compute(format!("sigmoid_mul prefill: {e}")))?;
                     // Copy q -> attn_out (both [batch * q_dim])
+                    let [mut q, mut attn_out] = ws.regions([Role::Q, Role::AttnOut]);
                     self.device
                         .stream
                         .memcpy_dtod(
-                            &pf.q.slice(..batch * q_dim),
-                            &mut pf.attn_out.slice_mut(..batch * q_dim),
+                            &q.f32().slice(..batch * q_dim),
+                            &mut attn_out.f32().slice_mut(..batch * q_dim),
                         )
                         .map_err(|e| {
                             RuntimeError::Compute(format!("sigmoid_mul prefill dtod: {e}"))
@@ -9461,17 +9493,26 @@ impl CudaBackend {
 
                 // 2f. Output projection + residual
                 unsafe {
+                    let [mut attn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::AttnOut,
+                            Role::X,
+                            Role::AttnProj,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_residual(
                         &self.device,
                         &st.kernels,
                         &lw.wo,
                         None,
-                        &pf.attn_out.as_view(),
-                        &pf.x.as_view(),
-                        &mut pf.attn_proj.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &attn_out.f32().as_view(),
+                        &x.f32().as_view(),
+                        &mut attn_proj.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         hidden_dim,
                         q_dim,
@@ -9483,44 +9524,62 @@ impl CudaBackend {
                 // dense. See `prefill_moe_ffn_layer` doc-comment for context.
                 let is_moe_layer = lw.moe_layer_blob.is_some();
                 if is_moe_layer {
-                    self.prefill_moe_ffn_layer(layer_idx, batch, st, pf, eps)?;
+                    self.prefill_moe_ffn_layer(layer_idx, batch, st, ws, eps)?;
                 } else {
                     unsafe {
+                        let [mut attn_proj, mut normed] =
+                            ws.regions([Role::AttnProj, Role::Normed]);
                         super::prefill::launch_rmsnorm_batched(
                             &self.device,
                             &st.kernels,
-                            &pf.attn_proj.as_view(),
+                            &attn_proj.f32().as_view(),
                             &lw.ffn_norm,
-                            &mut pf.normed.as_view_mut(),
+                            &mut normed.f32(),
                             eps,
                             batch,
                             hidden_dim,
                         )?;
+                        let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                            ws.regions([
+                                Role::Normed,
+                                Role::Gate,
+                                Role::DequantF32,
+                                Role::ActivationF16,
+                                Role::DequantF16,
+                            ]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
                             &lw.w_gate,
                             None,
-                            &pf.normed.as_view(),
-                            &mut pf.gate.as_view_mut(),
-                            &mut pf.dequant_f32.as_view_mut(),
-                            &mut pf.activation_f16.as_view_mut(),
-                            &mut pf.dequant_f16.as_view_mut(),
+                            &normed.f32().as_view(),
+                            &mut gate.f32(),
+                            &mut dequant_f32.f32(),
+                            &mut activation_f16.u8(),
+                            &mut dequant_f16.u8(),
                             batch,
                             inter_dim,
                             hidden_dim,
                             "gate",
                         )?;
+                        let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                            ws.regions([
+                                Role::Normed,
+                                Role::Up,
+                                Role::DequantF32,
+                                Role::ActivationF16,
+                                Role::DequantF16,
+                            ]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
                             &lw.w_up,
                             None,
-                            &pf.normed.as_view(),
-                            &mut pf.up.as_view_mut(),
-                            &mut pf.dequant_f32.as_view_mut(),
-                            &mut pf.activation_f16.as_view_mut(),
-                            &mut pf.dequant_f16.as_view_mut(),
+                            &normed.f32().as_view(),
+                            &mut up.f32(),
+                            &mut dequant_f32.f32(),
+                            &mut activation_f16.u8(),
+                            &mut dequant_f16.u8(),
                             batch,
                             inter_dim,
                             hidden_dim,
@@ -9528,26 +9587,35 @@ impl CudaBackend {
                         )?;
                     }
                     unsafe {
+                        let [mut gate, mut up] = ws.regions([Role::Gate, Role::Up]);
                         super::prefill::launch_swiglu_batched(
                             &self.device,
                             &st.kernels,
-                            &mut pf.gate.as_view_mut(),
-                            &pf.up.as_view(),
+                            &mut gate.f32(),
+                            &up.f32().as_view(),
                             batch,
                             inter_dim,
                         )?;
                     }
                     unsafe {
+                        let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                            ws.regions([
+                                Role::Gate,
+                                Role::Down,
+                                Role::DequantF32,
+                                Role::ActivationF16,
+                                Role::DequantF16,
+                            ]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
                             &lw.w_down,
                             None,
-                            &pf.gate.as_view(),
-                            &mut pf.down.as_view_mut(),
-                            &mut pf.dequant_f32.as_view_mut(),
-                            &mut pf.activation_f16.as_view_mut(),
-                            &mut pf.dequant_f16.as_view_mut(),
+                            &gate.f32().as_view(),
+                            &mut down.f32(),
+                            &mut dequant_f32.f32(),
+                            &mut activation_f16.u8(),
+                            &mut dequant_f16.u8(),
                             batch,
                             hidden_dim,
                             inter_dim,
@@ -9555,20 +9623,22 @@ impl CudaBackend {
                         )?;
                     }
                     unsafe {
+                        let [mut attn_proj, mut down] = ws.regions([Role::AttnProj, Role::Down]);
                         super::prefill::launch_residual_add_batched(
                             &self.device,
                             &st.kernels,
-                            &mut pf.attn_proj.as_view_mut(),
-                            &pf.down.as_view(),
+                            &mut attn_proj.f32(),
+                            &down.f32().as_view(),
                             batch,
                             hidden_dim,
                         )?;
                     }
+                    let [mut attn_proj, mut x] = ws.regions([Role::AttnProj, Role::X]);
                     self.device
                         .stream
                         .memcpy_dtod(
-                            &pf.attn_proj.slice(..batch * hidden_dim),
-                            &mut pf.x.slice_mut(..batch * hidden_dim),
+                            &attn_proj.f32().slice(..batch * hidden_dim),
+                            &mut x.f32().slice_mut(..batch * hidden_dim),
                         )
                         .map_err(|e| {
                             RuntimeError::Compute(format!("dtod x<-attn_proj qgate prefill: {e}"))
@@ -9578,46 +9648,70 @@ impl CudaBackend {
             }
 
             unsafe {
+                let [mut normed, mut q, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                    .regions([
+                        Role::Normed,
+                        Role::Q,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.wq,
                     None,
-                    &pf.normed.as_view(),
-                    &mut pf.q.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut q.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     q_dim,
                     hidden_dim,
                     "wq",
                 )?;
+                let [mut normed, mut k, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                    .regions([
+                        Role::Normed,
+                        Role::K,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.wk,
                     None,
-                    &pf.normed.as_view(),
-                    &mut pf.k.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut k.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     kv_dim,
                     hidden_dim,
                     "wk",
                 )?;
+                let [mut normed, mut v, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                    .regions([
+                        Role::Normed,
+                        Role::V,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.wv,
                     None,
-                    &pf.normed.as_view(),
-                    &mut pf.v.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut v.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     kv_dim,
                     hidden_dim,
@@ -9633,10 +9727,11 @@ impl CudaBackend {
                         let total = (batch * q_dim) as u32;
                         let dim_u32 = q_dim as u32;
                         let g = (total + block - 1) / block;
+                        let [mut q] = ws.regions([Role::Q]);
                         self.device
                             .stream
                             .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.q)
+                            .arg(&mut q.f32())
                             .arg(bq)
                             .arg(&total)
                             .arg(&dim_u32)
@@ -9653,10 +9748,11 @@ impl CudaBackend {
                         let total = (batch * kv_dim) as u32;
                         let dim_u32 = kv_dim as u32;
                         let g = (total + block - 1) / block;
+                        let [mut k] = ws.regions([Role::K]);
                         self.device
                             .stream
                             .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.k)
+                            .arg(&mut k.f32())
                             .arg(bk)
                             .arg(&total)
                             .arg(&dim_u32)
@@ -9673,10 +9769,11 @@ impl CudaBackend {
                         let total = (batch * kv_dim) as u32;
                         let dim_u32 = kv_dim as u32;
                         let g = (total + block - 1) / block;
+                        let [mut v] = ws.regions([Role::V]);
                         self.device
                             .stream
                             .launch_builder(&st.kernels.bias_add_batched)
-                            .arg(&mut pf.v)
+                            .arg(&mut v.f32())
                             .arg(bv)
                             .arg(&total)
                             .arg(&dim_u32)
@@ -9695,11 +9792,12 @@ impl CudaBackend {
             // 2c. Batched RoPE with per-token positions.
             let rotary_dim = hp.rotary_dim.unwrap_or(0) as u32;
             unsafe {
+                let [mut q, mut k] = ws.regions([Role::Q, Role::K]);
                 super::prefill::launch_rope_batched(
                     &self.device,
                     &st.kernels,
-                    &mut pf.q.as_view_mut(),
-                    &mut pf.k.as_view_mut(),
+                    &mut q.f32(),
+                    &mut k.f32(),
                     pos_start,
                     batch,
                     num_heads,
@@ -9720,13 +9818,14 @@ impl CudaBackend {
                 (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                 layer_idx,
             )?;
+            let [mut k, mut v] = ws.regions([Role::K, Role::V]);
             write_kv_batch(
                 &self.device,
                 &st.kernels,
                 kv_cache,
                 st.kv16_overflow.as_mut(),
-                &pf.k.as_view(),
-                &pf.v.as_view(),
+                &k.f32().as_view(),
+                &v.f32().as_view(),
                 pos_start,
                 batch,
                 num_kv_heads,
@@ -9746,12 +9845,13 @@ impl CudaBackend {
 
             // 2e. Flash Attention: single kernel for ALL tokens with causal masking.
             unsafe {
+                let [mut q, mut attn_out] = ws.regions([Role::Q, Role::AttnOut]);
                 super::prefill::launch_flash_attention_br4(
                     &self.device,
                     &st.kernels,
-                    &pf.q.as_view(),
+                    &q.f32().as_view(),
                     &kv_view,
-                    &mut pf.attn_out.as_view_mut(),
+                    &mut attn_out.f32(),
                     batch,
                     num_heads,
                     num_kv_heads,
@@ -9762,17 +9862,26 @@ impl CudaBackend {
 
             // 2f. Batched output projection + residual via GEMM (no F16 caches).
             unsafe {
+                let [mut attn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::AttnOut,
+                        Role::X,
+                        Role::AttnProj,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_residual(
                     &self.device,
                     &st.kernels,
                     &lw.wo,
                     None,
-                    &pf.attn_out.as_view(),
-                    &pf.x.as_view(),
-                    &mut pf.attn_proj.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &attn_out.f32().as_view(),
+                    &x.f32().as_view(),
+                    &mut attn_proj.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     hidden_dim,
                     q_dim,
@@ -9789,45 +9898,62 @@ impl CudaBackend {
             // path.
             let is_moe_layer = lw.moe_layer_blob.is_some();
             if is_moe_layer {
-                self.prefill_moe_ffn_layer(layer_idx, batch, st, pf, eps)?;
+                self.prefill_moe_ffn_layer(layer_idx, batch, st, ws, eps)?;
             } else {
                 // 2g. FFN: batched RMSNorm + GEMM gate/up (always F32 path for precision).
                 unsafe {
+                    let [mut attn_proj, mut normed] = ws.regions([Role::AttnProj, Role::Normed]);
                     super::prefill::launch_rmsnorm_batched(
                         &self.device,
                         &st.kernels,
-                        &pf.attn_proj.as_view(),
+                        &attn_proj.f32().as_view(),
                         &lw.ffn_norm,
-                        &mut pf.normed.as_view_mut(),
+                        &mut normed.f32(),
                         eps,
                         batch,
                         hidden_dim,
                     )?;
+                    let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Normed,
+                            Role::Gate,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.w_gate,
                         None,
-                        &pf.normed.as_view(),
-                        &mut pf.gate.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &normed.f32().as_view(),
+                        &mut gate.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         inter_dim,
                         hidden_dim,
                         "gate",
                     )?;
+                    let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Normed,
+                            Role::Up,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.w_up,
                         None,
-                        &pf.normed.as_view(),
-                        &mut pf.up.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &normed.f32().as_view(),
+                        &mut up.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         inter_dim,
                         hidden_dim,
@@ -9837,11 +9963,12 @@ impl CudaBackend {
 
                 // 2h. Batched SwiGLU (standard path, no F16 fusion).
                 unsafe {
+                    let [mut gate, mut up] = ws.regions([Role::Gate, Role::Up]);
                     super::prefill::launch_swiglu_batched(
                         &self.device,
                         &st.kernels,
-                        &mut pf.gate.as_view_mut(),
-                        &pf.up.as_view(),
+                        &mut gate.f32(),
+                        &up.f32().as_view(),
                         batch,
                         inter_dim,
                     )?;
@@ -9849,16 +9976,24 @@ impl CudaBackend {
 
                 // 2i. Batched down projection via GEMM (no F16 caches).
                 unsafe {
+                    let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                        ws.regions([
+                            Role::Gate,
+                            Role::Down,
+                            Role::DequantF32,
+                            Role::ActivationF16,
+                            Role::DequantF16,
+                        ]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
                         &lw.w_down,
                         None,
-                        &pf.gate.as_view(),
-                        &mut pf.down.as_view_mut(),
-                        &mut pf.dequant_f32.as_view_mut(),
-                        &mut pf.activation_f16.as_view_mut(),
-                        &mut pf.dequant_f16.as_view_mut(),
+                        &gate.f32().as_view(),
+                        &mut down.f32(),
+                        &mut dequant_f32.f32(),
+                        &mut activation_f16.u8(),
+                        &mut dequant_f16.u8(),
                         batch,
                         hidden_dim,
                         inter_dim,
@@ -9867,22 +10002,24 @@ impl CudaBackend {
                 }
 
                 // 2j. Batched residual add: x = attn_proj + down.
-                // Write result directly to pf.x (eliminates the separate memcpy_dtod).
+                // Write result directly to X (eliminates the separate memcpy_dtod).
                 unsafe {
+                    let [mut attn_proj, mut down] = ws.regions([Role::AttnProj, Role::Down]);
                     super::prefill::launch_residual_add_batched(
                         &self.device,
                         &st.kernels,
-                        &mut pf.attn_proj.as_view_mut(),
-                        &pf.down.as_view(),
+                        &mut attn_proj.f32(),
+                        &down.f32().as_view(),
                         batch,
                         hidden_dim,
                     )?;
                 }
+                let [mut attn_proj, mut x] = ws.regions([Role::AttnProj, Role::X]);
                 self.device
                     .stream
                     .memcpy_dtod(
-                        &pf.attn_proj.slice(..batch * hidden_dim),
-                        &mut pf.x.slice_mut(..batch * hidden_dim),
+                        &attn_proj.f32().slice(..batch * hidden_dim),
+                        &mut x.f32().slice_mut(..batch * hidden_dim),
                     )
                     .map_err(|e| {
                         RuntimeError::Compute(format!("dtod x<-attn_proj prefill: {e}"))
@@ -9919,8 +10056,7 @@ impl CudaBackend {
         layer_idx: usize,
         batch: usize,
         st: &mut MutableState,
-        pf: &mut super::prefill::PrefillScratch,
-        gdn_pf: &mut super::prefill::GdnPrefillScratch,
+        ws: &mut Workspace,
         eps: f32,
     ) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
@@ -9980,12 +10116,13 @@ impl CudaBackend {
 
         // 1. Batched RMSNorm: x[T, hidden] -> normed[T, hidden]
         unsafe {
+            let [mut x, mut normed] = ws.regions([Role::X, Role::Normed]);
             super::prefill::launch_rmsnorm_batched(
                 &self.device,
                 &st.kernels,
-                &pf.x.as_view(),
+                &x.f32().as_view(),
                 &lw.attn_norm,
-                &mut pf.normed.as_view_mut(),
+                &mut normed.f32(),
                 eps,
                 batch,
                 hidden_dim,
@@ -9995,16 +10132,24 @@ impl CudaBackend {
         // 2. Batched QKV GEMM: normed[T, hidden] @ wq^T -> qkv[T, qkv_dim]
         // wq for GDN is the fused [qkv_dim, hidden_dim] weight.
         unsafe {
+            let [mut normed, mut qkv, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                .regions([
+                    Role::Normed,
+                    Role::GdnQkv,
+                    Role::DequantF32,
+                    Role::ActivationF16,
+                    Role::DequantF16,
+                ]);
             super::prefill::launch_gemm_projection(
                 &self.device,
                 &st.kernels,
                 &lw.wq,
                 lw.wq_f16.as_ref(),
-                &pf.normed.as_view(),
-                &mut gdn_pf.qkv.as_view_mut(),
-                &mut pf.dequant_f32.as_view_mut(),
-                &mut pf.activation_f16.as_view_mut(),
-                &mut pf.dequant_f16.as_view_mut(),
+                &normed.f32().as_view(),
+                &mut qkv.f32(),
+                &mut dequant_f32.f32(),
+                &mut activation_f16.u8(),
+                &mut dequant_f16.u8(),
                 batch,
                 p.qkv_dim,
                 hidden_dim,
@@ -10020,16 +10165,24 @@ impl CudaBackend {
                 ))
             })?;
             unsafe {
+                let [mut normed, mut gdn_gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::Normed,
+                        Role::GdnGate,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     attn_gate,
                     lw.attn_gate_f16.as_ref(),
-                    &pf.normed.as_view(),
-                    &mut gdn_pf.gate.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut gdn_gate.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     p.value_dim,
                     hidden_dim,
@@ -10046,16 +10199,24 @@ impl CudaBackend {
                 ))
             })?;
             unsafe {
+                let [mut normed, mut alpha_raw, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::Normed,
+                        Role::GdnAlphaRaw,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     ssm_alpha,
                     lw.ssm_alpha_f16.as_ref(),
-                    &pf.normed.as_view(),
-                    &mut gdn_pf.alpha_raw.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut alpha_raw.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     p.num_heads,
                     hidden_dim,
@@ -10071,16 +10232,24 @@ impl CudaBackend {
             })?;
 
             unsafe {
+                let [mut normed, mut beta_raw, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::Normed,
+                        Role::GdnBetaRaw,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     ssm_beta,
                     lw.ssm_beta_f16.as_ref(),
-                    &pf.normed.as_view(),
-                    &mut gdn_pf.beta_raw.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut beta_raw.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     p.num_heads,
                     hidden_dim,
@@ -10102,10 +10271,16 @@ impl CudaBackend {
         // token embedding) gives a clean kernel-only comparison.
         if moe_probe_enabled() {
             let ss = |v: &[f32]| -> f64 { v.iter().map(|&e| (e as f64) * (e as f64)).sum() };
-            let qkv_h = self.device.dtoh_copy(&gdn_pf.qkv)?;
-            let alpha_h = self.device.dtoh_copy(&gdn_pf.alpha_raw)?;
-            let beta_h = self.device.dtoh_copy(&gdn_pf.beta_raw)?;
-            let gate_h = self.device.dtoh_copy(&gdn_pf.gate)?;
+            let [mut qkv, mut alpha_raw, mut beta_raw, mut gdn_gate] = ws.regions([
+                Role::GdnQkv,
+                Role::GdnAlphaRaw,
+                Role::GdnBetaRaw,
+                Role::GdnGate,
+            ]);
+            let qkv_h = self.device.dtoh_copy_view(&qkv.f32())?;
+            let alpha_h = self.device.dtoh_copy_view(&alpha_raw.f32())?;
+            let beta_h = self.device.dtoh_copy_view(&beta_raw.f32())?;
+            let gate_h = self.device.dtoh_copy_view(&gdn_gate.f32())?;
             for t in 0..batch {
                 let qo = t * p.qkv_dim;
                 let ao = t * p.num_heads;
@@ -10160,7 +10335,8 @@ impl CudaBackend {
         // dump pre-conv1d input (= qkv after batched proj)
         if do_dump {
             self.device.synchronize()?;
-            let host = self.device.dtoh_copy(&gdn_pf.qkv)?;
+            let [mut qkv] = ws.regions([Role::GdnQkv]);
+            let host = self.device.dtoh_copy_view(&qkv.f32())?;
             let n = batch * p.qkv_dim;
             let dir = dump_dir.as_ref().unwrap();
             let path = format!("{dir}/L{layer_idx}-qkv_pre_conv.bin");
@@ -10193,14 +10369,15 @@ impl CudaBackend {
                     block_dim: (config.block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
+                let [mut qkv, mut conv_out] = ws.regions([Role::GdnQkv, Role::GdnConvOut]);
                 unsafe {
                     self.device
                         .stream
                         .launch_builder(conv_fn)
-                        .arg(&gdn_pf.qkv)
+                        .arg(&qkv.f32().as_view())
                         .arg(&mut gdn.conv_states[gdn_idx])
                         .arg(conv1d_weight)
-                        .arg(&mut gdn_pf.conv_out)
+                        .arg(&mut conv_out.f32())
                         .arg(&conv_dim_u32)
                         .arg(&kernel_size_u32)
                         .arg(&state_pos)
@@ -10219,7 +10396,8 @@ impl CudaBackend {
                 // dump conv1d-post-SiLU (pre-L2-norm)
                 if do_dump {
                     self.device.synchronize()?;
-                    let host = self.device.dtoh_copy(&gdn_pf.conv_out)?;
+                    let [mut conv_out] = ws.regions([Role::GdnConvOut]);
+                    let host = self.device.dtoh_copy_view(&conv_out.f32())?;
                     let n = batch * p.qkv_dim;
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-conv_silu.bin");
@@ -10244,16 +10422,22 @@ impl CudaBackend {
                     block_dim: (config.block_dim, 1, 1),
                     shared_mem_bytes: 0,
                 };
+                let [mut beta_raw, mut alpha_raw, mut alpha_out, mut beta_out] = ws.regions([
+                    Role::GdnBetaRaw,
+                    Role::GdnAlphaRaw,
+                    Role::GdnAlphaOut,
+                    Role::GdnBetaOut,
+                ]);
                 unsafe {
                     self.device
                         .stream
                         .launch_builder(gates_fn)
                         .arg(dt_bias)
                         .arg(ssm_a)
-                        .arg(&gdn_pf.beta_raw)
-                        .arg(&gdn_pf.alpha_raw)
-                        .arg(&mut gdn_pf.alpha_out)
-                        .arg(&mut gdn_pf.beta_out)
+                        .arg(&beta_raw.f32().as_view())
+                        .arg(&alpha_raw.f32().as_view())
+                        .arg(&mut alpha_out.f32())
+                        .arg(&mut beta_out.f32())
                         .arg(&num_heads_u32)
                         .arg(&batch_u32)
                         .launch(launch_cfg)
@@ -10272,7 +10456,8 @@ impl CudaBackend {
                     let dir = dump_dir.as_ref().unwrap();
                     let n_heads = batch * p.num_heads;
                     {
-                        let host = self.device.dtoh_copy(&gdn_pf.alpha_out)?;
+                        let [mut alpha_out] = ws.regions([Role::GdnAlphaOut]);
+                        let host = self.device.dtoh_copy_view(&alpha_out.f32())?;
                         let path = format!("{dir}/L{layer_idx}-alpha.bin");
                         let bytes: Vec<u8> = host[..n_heads]
                             .iter()
@@ -10286,7 +10471,8 @@ impl CudaBackend {
                         );
                     }
                     {
-                        let host = self.device.dtoh_copy(&gdn_pf.beta_out)?;
+                        let [mut beta_out] = ws.regions([Role::GdnBetaOut]);
+                        let host = self.device.dtoh_copy_view(&beta_out.f32())?;
                         let path = format!("{dir}/L{layer_idx}-beta.bin");
                         let bytes: Vec<u8> = host[..n_heads]
                             .iter()
@@ -10311,7 +10497,8 @@ impl CudaBackend {
                         );
                     }
                     {
-                        let host = self.device.dtoh_copy(&gdn_pf.alpha_raw)?;
+                        let [mut alpha_raw] = ws.regions([Role::GdnAlphaRaw]);
+                        let host = self.device.dtoh_copy_view(&alpha_raw.f32())?;
                         let path = format!("{dir}/L{layer_idx}-alpha_raw.bin");
                         let bytes: Vec<u8> = host[..n_heads]
                             .iter()
@@ -10325,7 +10512,8 @@ impl CudaBackend {
                         );
                     }
                     {
-                        let host = self.device.dtoh_copy(&gdn_pf.beta_raw)?;
+                        let [mut beta_raw] = ws.regions([Role::GdnBetaRaw]);
+                        let host = self.device.dtoh_copy_view(&beta_raw.f32())?;
                         let path = format!("{dir}/L{layer_idx}-beta_raw.bin");
                         let bytes: Vec<u8> = host[..n_heads]
                             .iter()
@@ -10388,11 +10576,12 @@ impl CudaBackend {
                 let qkv_dim_u32 = p.qkv_dim as u32;
                 let q_offset = 0u32;
                 let k_offset = p.qk_dim as u32;
+                let [mut conv_out] = ws.regions([Role::GdnConvOut]);
                 unsafe {
                     self.device
                         .stream
                         .launch_builder(l2_fn)
-                        .arg(&mut gdn_pf.conv_out)
+                        .arg(&mut conv_out.f32())
                         .arg(&num_kv_heads_u32)
                         .arg(&head_dim_u32)
                         .arg(&batch_u32)
@@ -10409,7 +10598,8 @@ impl CudaBackend {
                 // V channels untouched). This is the candidate-3 measurement point.
                 if do_dump {
                     self.device.synchronize()?;
-                    let host = self.device.dtoh_copy(&gdn_pf.conv_out)?;
+                    let [mut conv_out] = ws.regions([Role::GdnConvOut]);
+                    let host = self.device.dtoh_copy_view(&conv_out.f32())?;
                     let n = batch * p.qkv_dim;
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-conv_l2norm.bin");
@@ -10440,15 +10630,21 @@ impl CudaBackend {
                 };
                 let qk_dim_u32 = p.qk_dim as u32;
                 let qkv_dim_u32 = p.qkv_dim as u32;
+                let [mut conv_out, mut alpha_out, mut beta_out, mut raw_out] = ws.regions([
+                    Role::GdnConvOut,
+                    Role::GdnAlphaOut,
+                    Role::GdnBetaOut,
+                    Role::GdnRawOut,
+                ]);
                 unsafe {
                     self.device
                         .stream
                         .launch_builder(state_fn)
                         .arg(&mut gdn.h_states[gdn_idx])
-                        .arg(&gdn_pf.conv_out)
-                        .arg(&gdn_pf.alpha_out)
-                        .arg(&gdn_pf.beta_out)
-                        .arg(&mut gdn_pf.raw_out)
+                        .arg(&conv_out.f32().as_view())
+                        .arg(&alpha_out.f32().as_view())
+                        .arg(&beta_out.f32().as_view())
+                        .arg(&mut raw_out.f32())
                         .arg(&num_heads_u32)
                         .arg(&head_dim_u32)
                         .arg(&head_dim_u32) // val_dim per head = head_dim
@@ -10465,7 +10661,8 @@ impl CudaBackend {
                 // dump raw_out (post-state-update, pre-norm-gate)
                 if do_dump {
                     self.device.synchronize()?;
-                    let host = self.device.dtoh_copy(&gdn_pf.raw_out)?;
+                    let [mut raw_out] = ws.regions([Role::GdnRawOut]);
+                    let host = self.device.dtoh_copy_view(&raw_out.f32())?;
                     let n = batch * p.value_dim;
                     let dir = dump_dir.as_ref().unwrap();
                     let path = format!("{dir}/L{layer_idx}-raw_out.bin");
@@ -10553,9 +10750,13 @@ impl CudaBackend {
                     let chunk_t_u32 = chunk_t as u32;
                     let off = t_base * heads_stride;
                     let len = chunk_t * heads_stride;
-                    let raw_out_chunk = gdn_pf.raw_out.slice(off..off + len);
-                    let gate_chunk = gdn_pf.gate.slice(off..off + len);
-                    let mut gdn_out_chunk = gdn_pf.gdn_out.slice_mut(off..off + len);
+                    let [mut raw_out, mut gdn_gate, mut gdn_out] =
+                        ws.regions([Role::GdnRawOut, Role::GdnGate, Role::GdnOut]);
+                    let (raw_out, gdn_gate, mut gdn_out) =
+                        (raw_out.f32(), gdn_gate.f32(), gdn_out.f32());
+                    let raw_out_chunk = raw_out.slice(off..off + len);
+                    let gate_chunk = gdn_gate.slice(off..off + len);
+                    let mut gdn_out_chunk = gdn_out.slice_mut(off..off + len);
                     let launch_cfg = CudarcLaunchConfig {
                         grid_dim: (num_heads_u32, chunk_t_u32, 1),
                         block_dim: (block_dim, 1, 1),
@@ -10584,7 +10785,8 @@ impl CudaBackend {
             // dump gdn_out (= pre-ssm_out-GEMM input, post-norm-gate)
             if do_dump {
                 self.device.synchronize()?;
-                let host = self.device.dtoh_copy(&gdn_pf.gdn_out)?;
+                let [mut gdn_out] = ws.regions([Role::GdnOut]);
+                let host = self.device.dtoh_copy_view(&gdn_out.f32())?;
                 let n = batch * p.value_dim;
                 let dir = dump_dir.as_ref().unwrap();
                 let path = format!("{dir}/L{layer_idx}-gdn_out.bin");
@@ -10661,7 +10863,9 @@ impl CudaBackend {
             for t in 0..batch {
                 // Conv1D decode
                 {
-                    let qkv_t = gdn_pf.qkv.slice(t * p.qkv_dim..(t + 1) * p.qkv_dim);
+                    let [mut qkv] = ws.regions([Role::GdnQkv]);
+                    let qkv = qkv.f32();
+                    let qkv_t = qkv.slice(t * p.qkv_dim..(t + 1) * p.qkv_dim);
                     let state_pos = gdn.conv_positions[gdn_idx];
                     unsafe {
                         self.device
@@ -10695,12 +10899,11 @@ impl CudaBackend {
                 })?;
                 // Compute gates
                 {
-                    let alpha_raw_t = gdn_pf
-                        .alpha_raw
-                        .slice(t * p.num_heads..(t + 1) * p.num_heads);
-                    let beta_raw_t = gdn_pf
-                        .beta_raw
-                        .slice(t * p.num_heads..(t + 1) * p.num_heads);
+                    let [mut alpha_raw, mut beta_raw] =
+                        ws.regions([Role::GdnAlphaRaw, Role::GdnBetaRaw]);
+                    let (alpha_raw, beta_raw) = (alpha_raw.f32(), beta_raw.f32());
+                    let alpha_raw_t = alpha_raw.slice(t * p.num_heads..(t + 1) * p.num_heads);
+                    let beta_raw_t = beta_raw.slice(t * p.num_heads..(t + 1) * p.num_heads);
                     unsafe {
                         self.device
                             .stream
@@ -10804,10 +11007,10 @@ impl CudaBackend {
                 })?;
                 // SiLU(gate) * normed_output -> batched output
                 {
-                    let gate_t = gdn_pf.gate.slice(t * p.value_dim..(t + 1) * p.value_dim);
-                    let mut out_t = gdn_pf
-                        .gdn_out
-                        .slice_mut(t * p.value_dim..(t + 1) * p.value_dim);
+                    let [mut gdn_gate, mut gdn_out] = ws.regions([Role::GdnGate, Role::GdnOut]);
+                    let (gdn_gate, mut gdn_out) = (gdn_gate.f32(), gdn_out.f32());
+                    let gate_t = gdn_gate.slice(t * p.value_dim..(t + 1) * p.value_dim);
+                    let mut out_t = gdn_out.slice_mut(t * p.value_dim..(t + 1) * p.value_dim);
                     unsafe {
                         self.device
                             .stream
@@ -10840,17 +11043,26 @@ impl CudaBackend {
                 RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_out weight missing",))
             })?;
             unsafe {
+                let [mut gdn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::GdnOut,
+                        Role::X,
+                        Role::AttnProj,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_residual(
                     &self.device,
                     &st.kernels,
                     ssm_out,
                     lw.ssm_out_f16.as_ref(),
-                    &gdn_pf.gdn_out.as_view(),
-                    &pf.x.as_view(),
-                    &mut pf.attn_proj.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &gdn_out.f32().as_view(),
+                    &x.f32().as_view(),
+                    &mut attn_proj.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     hidden_dim,
                     p.value_dim,
@@ -10861,7 +11073,8 @@ impl CudaBackend {
             // dump linear_attn_out (= post-ssm_out-GEMM + residual)
             if do_dump {
                 self.device.synchronize()?;
-                let host = self.device.dtoh_copy(&pf.attn_proj)?;
+                let [mut attn_proj] = ws.regions([Role::AttnProj]);
+                let host = self.device.dtoh_copy_view(&attn_proj.f32())?;
                 let n = batch * hidden_dim;
                 let dir = dump_dir.as_ref().unwrap();
                 let path = format!("{dir}/L{layer_idx}-linear_attn_out.bin");
@@ -10887,44 +11100,61 @@ impl CudaBackend {
         if is_moe_layer {
             // NLL releases the `lw` (&) and `gdn` (&mut) borrows of `st` at
             // this point — they are not used downstream in this branch.
-            self.prefill_moe_ffn_layer(layer_idx, batch, st, pf, eps)?;
+            self.prefill_moe_ffn_layer(layer_idx, batch, st, ws, eps)?;
         } else {
             unsafe {
+                let [mut attn_proj, mut normed] = ws.regions([Role::AttnProj, Role::Normed]);
                 super::prefill::launch_rmsnorm_batched(
                     &self.device,
                     &st.kernels,
-                    &pf.attn_proj.as_view(),
+                    &attn_proj.f32().as_view(),
                     &lw.ffn_norm,
-                    &mut pf.normed.as_view_mut(),
+                    &mut normed.f32(),
                     eps,
                     batch,
                     hidden_dim,
                 )?;
+                let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
+                    ws.regions([
+                        Role::Normed,
+                        Role::Gate,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.w_gate,
                     lw.w_gate_f16.as_ref(),
-                    &pf.normed.as_view(),
-                    &mut pf.gate.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut gate.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     inter_dim,
                     hidden_dim,
                     "gate",
                 )?;
+                let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                    .regions([
+                        Role::Normed,
+                        Role::Up,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.w_up,
                     lw.w_up_f16.as_ref(),
-                    &pf.normed.as_view(),
-                    &mut pf.up.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &normed.f32().as_view(),
+                    &mut up.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     inter_dim,
                     hidden_dim,
@@ -10934,11 +11164,12 @@ impl CudaBackend {
 
             // Batched SwiGLU.
             unsafe {
+                let [mut gate, mut up] = ws.regions([Role::Gate, Role::Up]);
                 super::prefill::launch_swiglu_batched(
                     &self.device,
                     &st.kernels,
-                    &mut pf.gate.as_view_mut(),
-                    &pf.up.as_view(),
+                    &mut gate.f32(),
+                    &up.f32().as_view(),
                     batch,
                     inter_dim,
                 )?;
@@ -10946,16 +11177,24 @@ impl CudaBackend {
 
             // Batched down projection.
             unsafe {
+                let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
+                    .regions([
+                        Role::Gate,
+                        Role::Down,
+                        Role::DequantF32,
+                        Role::ActivationF16,
+                        Role::DequantF16,
+                    ]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
                     &lw.w_down,
                     lw.w_down_f16.as_ref(),
-                    &pf.gate.as_view(),
-                    &mut pf.down.as_view_mut(),
-                    &mut pf.dequant_f32.as_view_mut(),
-                    &mut pf.activation_f16.as_view_mut(),
-                    &mut pf.dequant_f16.as_view_mut(),
+                    &gate.f32().as_view(),
+                    &mut down.f32(),
+                    &mut dequant_f32.f32(),
+                    &mut activation_f16.u8(),
+                    &mut dequant_f16.u8(),
                     batch,
                     hidden_dim,
                     inter_dim,
@@ -10965,20 +11204,22 @@ impl CudaBackend {
 
             // Batched residual add + swap for next layer.
             unsafe {
+                let [mut attn_proj, mut down] = ws.regions([Role::AttnProj, Role::Down]);
                 super::prefill::launch_residual_add_batched(
                     &self.device,
                     &st.kernels,
-                    &mut pf.attn_proj.as_view_mut(),
-                    &pf.down.as_view(),
+                    &mut attn_proj.f32(),
+                    &down.f32().as_view(),
                     batch,
                     hidden_dim,
                 )?;
             }
+            let [mut attn_proj, mut x] = ws.regions([Role::AttnProj, Role::X]);
             self.device
                 .stream
                 .memcpy_dtod(
-                    &pf.attn_proj.slice(..batch * hidden_dim),
-                    &mut pf.x.slice_mut(..batch * hidden_dim),
+                    &attn_proj.f32().slice(..batch * hidden_dim),
+                    &mut x.f32().slice_mut(..batch * hidden_dim),
                 )
                 .map_err(|e| {
                     RuntimeError::Compute(format!(
@@ -11019,10 +11260,10 @@ impl CudaBackend {
     /// Metal's `encode_moe_ffn_batched` at `metal/moe.rs:1500`).
     ///
     /// Contract (mirrors `prefill_gdn_layer` API shape):
-    /// - Input `pf.attn_proj[batch, hidden_dim]` holds the post-attention
+    /// - Input `AttnProj[batch, hidden_dim]` holds the post-attention
     ///   residual stream from steps 2a-2f.
-    /// - Writes the post-MoE-FFN state to `pf.x[batch, hidden_dim]`.
-    /// - Uses `pf.normed[batch, hidden_dim]` as the batched-RMSNorm output
+    /// - Writes the post-MoE-FFN state to `X[batch, hidden_dim]`.
+    /// - Uses `Normed[batch, hidden_dim]` as the batched-RMSNorm output
     ///   buffer (consumed per-token by the router + per-expert kernels).
     /// - Borrows `st.moe_meta_cache[layer_idx]`, `st.moe_scratch`,
     ///   `lw.moe_layer_blob` (verified `is_some()` by caller).
@@ -11033,7 +11274,7 @@ impl CudaBackend {
         layer_idx: usize,
         batch: usize,
         st: &mut MutableState,
-        pf: &mut super::prefill::PrefillScratch,
+        ws: &mut Workspace,
         eps: f32,
     ) -> Result<(), RuntimeError> {
         let hp = self.hp()?;
@@ -11046,16 +11287,17 @@ impl CudaBackend {
         })?;
 
         // Step 1: Batched FFN-norm over all batch tokens.
-        // pf.attn_proj[batch, H] -> pf.normed[batch, H] via lw.ffn_norm.
+        // AttnProj[batch, H] -> Normed[batch, H] via lw.ffn_norm.
         {
             let lw = &st.layer_weights_cache[layer_idx];
             unsafe {
+                let [mut attn_proj, mut normed] = ws.regions([Role::AttnProj, Role::Normed]);
                 super::prefill::launch_rmsnorm_batched(
                     &self.device,
                     &st.kernels,
-                    &pf.attn_proj.as_view(),
+                    &attn_proj.f32().as_view(),
                     &lw.ffn_norm,
-                    &mut pf.normed.as_view_mut(),
+                    &mut normed.f32(),
                     eps,
                     batch,
                     hidden_dim,
@@ -11063,11 +11305,12 @@ impl CudaBackend {
             }
         }
 
-        // dump E: pf.normed after FFN-RMSNorm (canonical attn_post_norm dump).
+        // dump E: Normed after FFN-RMSNorm (canonical attn_post_norm dump).
         // This is the canonical L0 drift measurement point (3.19% pre-F64).
         if std::env::var("LUMEN_DUMP_NORMED").is_ok() {
             self.device.synchronize()?;
-            let normed_host = self.device.dtoh_copy(&pf.normed)?;
+            let [mut normed] = ws.regions([Role::Normed]);
+            let normed_host = self.device.dtoh_copy_view(&normed.f32())?;
             let tok0: Vec<f32> = normed_host[..hidden_dim].to_vec();
             let s: f64 = tok0.iter().map(|&v| v as f64).sum();
             let a: f64 = tok0.iter().map(|&v| (v as f64).abs()).sum();
@@ -11078,14 +11321,14 @@ impl CudaBackend {
         }
 
         // Step 2: Per-token loop. Each iteration calls encode_moe_ffn_decode
-        // on a single-token slice of pf.normed (input), pf.attn_proj (residual),
-        // and pf.x (output). The decode function reads expert_ids back to CPU
+        // on a single-token slice of Normed (input), AttnProj (residual),
+        // and X (output). The decode function reads expert_ids back to CPU
         // host memory once per call (one sync per token, ~K * 4 bytes).
         //
         // Borrow strategy: extract the MoE meta, the layer blob and the
         // scratch references once outside the loop, take per-token splits of
-        // pf.{normed, attn_proj, x} inside; pf is a separate argument, so the
-        // borrows of `st` fields stay disjoint from it.
+        // the Normed, AttnProj and X regions inside; the workspace is a separate
+        // argument, so the borrows of `st` fields stay disjoint from it.
         let moe_meta = st
             .moe_meta_cache
             .get(layer_idx)
@@ -11135,7 +11378,7 @@ impl CudaBackend {
         // with a single grouped dispatch over all `batch` tokens (weights read
         // once per expert). The SHARED expert is still run per-token below
         // (byte-identical to the legacy path); only the routed expert FFN is
-        // batched. Result `pf.x = residual + Σ routed`, bit-identical to the
+        // batched. Result `X = residual + Σ routed`, bit-identical to the
         // per-token oracle, validated via the `[CHK]` x_sumsq dump.
         // Q8_0: batched/grouped tiled path. Q4_0: grouped
         // f32act tiled path (REQUIRES the parent tiled flag + the q4 f32act tiled
@@ -11160,6 +11403,8 @@ impl CudaBackend {
                      num_experts={num_experts} engaged=1"
                 );
             }
+            let [mut normed, mut attn_proj, mut x] =
+                ws.regions([Role::Normed, Role::AttnProj, Role::X]);
             super::moe::encode_moe_ffn_prefill_grouped(
                 &self.device,
                 &st.kernels,
@@ -11168,9 +11413,9 @@ impl CudaBackend {
                 batched_offsets,
                 repacked,
                 &moe_layer_blob,
-                &pf.normed.as_view(),
-                &pf.attn_proj.as_view(),
-                &mut pf.x.as_view_mut(),
+                &normed.f32().as_view(),
+                &attn_proj.f32().as_view(),
+                &mut x.f32(),
                 batch,
                 hidden_dim,
                 inter_dim,
@@ -11199,14 +11444,15 @@ impl CudaBackend {
             && st.kernels.shared_down_q4_0_sigmoid_accum_batched.is_some()
             && st.kernels.shared_down_q4_0_residual_accum_batched.is_some();
         if use_batched_shared {
+            let [mut normed, mut x] = ws.regions([Role::Normed, Role::X]);
             super::moe::encode_shared_expert_ffn_prefill_batched(
                 &self.device,
                 &st.kernels,
                 moe_scratch,
                 &moe_meta,
                 &moe_layer_blob,
-                &pf.normed.as_view(),
-                &mut pf.x.as_view_mut(),
+                &normed.f32().as_view(),
+                &mut x.f32(),
                 batch,
                 hidden_dim,
             )?;
@@ -11227,8 +11473,10 @@ impl CudaBackend {
                 // Skip the per-token routed dispatch + its probes; jump to the
                 // shared-expert block below using the same (off,end) slices.
                 if moe_meta.shared_gate.is_some() {
-                    let normed_view2 = pf.normed.slice(off..end);
-                    let mut output_view2 = pf.x.slice_mut(off..end);
+                    let [mut normed, mut x] = ws.regions([Role::Normed, Role::X]);
+                    let (normed, mut x) = (normed.f32(), x.f32());
+                    let normed_view2 = normed.slice(off..end);
+                    let mut output_view2 = x.slice_mut(off..end);
                     super::moe::encode_shared_expert_ffn_decode(
                         &self.device,
                         &st.kernels,
@@ -11242,9 +11490,12 @@ impl CudaBackend {
                 }
                 continue;
             }
-            let normed_view = pf.normed.slice(off..end);
-            let residual_view = pf.attn_proj.slice(off..end);
-            let mut output_view = pf.x.slice_mut(off..end);
+            let [mut normed, mut attn_proj, mut x] =
+                ws.regions([Role::Normed, Role::AttnProj, Role::X]);
+            let (normed, attn_proj, mut x) = (normed.f32(), attn_proj.f32(), x.f32());
+            let normed_view = normed.slice(off..end);
+            let residual_view = attn_proj.slice(off..end);
+            let mut output_view = x.slice_mut(off..end);
             super::moe::encode_moe_ffn_decode(
                 &self.device,
                 &st.kernels,
@@ -11268,7 +11519,7 @@ impl CudaBackend {
             // is exactly the routed-expert combine added to the residual stream:
             //   ffn_moe_out[i] = Σ_k expert_weights[k] * expert_output_buf[k*H+i]
             // (the value `moe_expert_accum_option_a` adds to `residual[i]`).
-            // Probed from `moe_scratch` only (no `pf` borrow conflict). For the
+            // Probed from `moe_scratch` only (no workspace borrow conflict). For the
             // default prefill V2 path: `router_logits` is populated by the
             // parallel `moe_router_logits_v2` launch, `expert_weights` by the
             // top-K finalize, and `expert_output_buf` by the batched-down launch.
@@ -11316,10 +11567,12 @@ impl CudaBackend {
             // FIX: shared-expert FFN dispatch (Qwen3.5-MoE always-active
             // expert). Mirrors the decode-path dispatch at compute_layer_gpu.
             // Each prefill token runs the shared expert sigmoid-gated and
-            // accumulates into pf.x[t..t+H] (the per-token output slice).
+            // accumulates into X[t..t+H] (the per-token output slice).
             if moe_meta.shared_gate.is_some() {
-                let normed_view2 = pf.normed.slice(off..end);
-                let mut output_view2 = pf.x.slice_mut(off..end);
+                let [mut normed, mut x] = ws.regions([Role::Normed, Role::X]);
+                let (normed, mut x) = (normed.f32(), x.f32());
+                let normed_view2 = normed.slice(off..end);
+                let mut output_view2 = x.slice_mut(off..end);
                 // opt-in fused path (same gating as decode).
                 super::moe::encode_shared_expert_ffn_decode(
                     &self.device,
@@ -11334,13 +11587,14 @@ impl CudaBackend {
             }
         }
 
-        // [PROBE] prefill-side localization (env LUMEN_MOE_PROBE=1). pf.x = the
-        // per-token layer-output residual; pf.attn_proj = attention output
+        // [PROBE] prefill-side localization (env LUMEN_MOE_PROBE=1). X = the
+        // per-token layer-output residual; AttnProj = attention output
         // (still intact before Step 3). Dump EVERY position so a single prefill
         // run gives the no-cache reference for every decode position.
         if moe_probe_enabled() {
-            let xh = self.device.dtoh_copy(&pf.x)?;
-            let ah = self.device.dtoh_copy(&pf.attn_proj)?;
+            let [mut x, mut attn_proj] = ws.regions([Role::X, Role::AttnProj]);
+            let xh = self.device.dtoh_copy_view(&x.f32())?;
+            let ah = self.device.dtoh_copy_view(&attn_proj.f32())?;
             let k = 16usize;
             // Full-vector checksums per position (layout-independent, precise
             // cross-engine localization). sum / sumsq / absmax over hidden_dim.
@@ -11379,17 +11633,18 @@ impl CudaBackend {
             }
         }
 
-        // Step 3: keep pf.attn_proj coherent with pf.x for any downstream code
+        // Step 3: keep AttnProj coherent with X for any downstream code
         // that reads attn_proj after FFN. The dense FFN path also writes the
-        // residual-add result to pf.attn_proj before memcpying to pf.x, so we
+        // residual-add result to AttnProj before memcpying to X, so we
         // mirror that contract here. (The decode-path MoE branch doesn't need
         // this because decode's compute_layer_gpu writes to st.scratch.x_gpu
         // directly with no downstream attn_proj reader.)
+        let [mut x, mut attn_proj] = ws.regions([Role::X, Role::AttnProj]);
         self.device
             .stream
             .memcpy_dtod(
-                &pf.x.slice(..batch * hidden_dim),
-                &mut pf.attn_proj.slice_mut(..batch * hidden_dim),
+                &x.f32().slice(..batch * hidden_dim),
+                &mut attn_proj.f32().slice_mut(..batch * hidden_dim),
             )
             .map_err(|e| {
                 RuntimeError::Compute(format!("dtod attn_proj<-x MoE prefill L{layer_idx}: {e}"))

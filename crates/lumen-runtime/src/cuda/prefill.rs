@@ -33,103 +33,14 @@ use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
 use super::kv_cache::KvView;
 use super::types::LaunchConfig;
+use super::workspace::Workspace;
 use lumen_format::quantization::QuantScheme;
 
-/// Pre-allocated GPU scratch buffers for the batched prefill path.
-///
-/// Sized for the longest slice a request can run; allocated once at load (see
-/// [`PrefillWorkspace`]) and reused across every request and layer. All
-/// buffers are [rows, dim] matrices of which a slice uses its first rows.
-pub(crate) struct PrefillScratch {
-    /// Activation matrix: [batch, hidden_dim].
-    pub x: CudaSlice<f32>,
-    /// Normalized activation: [batch, hidden_dim].
-    pub normed: CudaSlice<f32>,
-    /// Q projection: [batch, q_dim].
-    pub q: CudaSlice<f32>,
-    /// K projection: [batch, kv_dim].
-    pub k: CudaSlice<f32>,
-    /// V projection: [batch, kv_dim].
-    pub v: CudaSlice<f32>,
-    /// Attention output: [batch, q_dim] (filled token-at-a-time).
-    pub attn_out: CudaSlice<f32>,
-    /// Score block of the tiled SGEMM prefill attention: `group ×
-    /// min(rows, 512) × context` F32, reused across every KV head, layer and
-    /// request. `None` when the tiled route is not taken (switch off, kernel
-    /// not loaded, no fused Q+gate attention layer); the dispatcher then
-    /// takes the scalar attention, which needs no score scratch.
-    pub attn_scores: Option<CudaSlice<f32>>,
-    /// Q+gate fusion temporaries: the fused projection `[batch, q_dim * 2]`
-    /// and the deinterleaved gate `[batch, q_dim]`. Present when a layer fuses
-    /// Q and gate.
-    pub q_gate: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
-    /// Output projection + residual: [batch, hidden_dim].
-    pub attn_proj: CudaSlice<f32>,
-    /// Gate FFN: [batch, inter_dim].
-    pub gate: CudaSlice<f32>,
-    /// Up FFN: [batch, inter_dim].
-    pub up: CudaSlice<f32>,
-    /// Down projection: [batch, hidden_dim].
-    pub down: CudaSlice<f32>,
-    /// Token IDs on GPU: [batch].
-    pub token_ids_gpu: CudaSlice<u32>,
-    /// Single-token Q for attention: [q_dim].
-    /// Used by `launch_attention_for_token` (sequential prefill fallback).
-    #[allow(dead_code)]
-    pub q_single: CudaSlice<f32>,
-    /// Single-token attention output: [q_dim].
-    /// Used by `launch_attention_for_token` (sequential prefill fallback).
-    #[allow(dead_code)]
-    pub attn_out_single: CudaSlice<f32>,
-    /// F32 scratch for dequantized Q8_0 weights: [max_weight_elements].
-    ///
-    /// Sized to hold the largest projection weight matrix in F32 format.
-    /// Reused across all projections within a layer. Replaces the per-row
-    /// matvec fallback with: dequant Q8_0 -> F32 scratch -> cuBLAS SGEMM.
-    pub dequant_f32: CudaSlice<f32>,
-    /// F16 activation scratch for HGEMM input conversion: [batch * max_in_dim * 2] bytes.
-    ///
-    /// Used to convert F32 activations to F16 before `cublasGemmEx` HGEMM.
-    /// Reused across all projections. Only allocated when F16 weight caches exist.
-    pub activation_f16: CudaSlice<u8>,
-    /// F16 scratch for dequantized Q8_0/Q4_0 weights: [max_weight_elements * 2] bytes.
-    ///
-    /// Sized to hold the largest projection weight matrix in F16 format.
-    /// Reused across all projections within a layer. Enables the HGEMM path
-    /// (312 TFLOPS tensor cores) for quantized weights that lack a persistent
-    /// F16 cache (e.g., GDN layers). Replaces the slow dequant->F32->SGEMM
-    /// path (19.5 TFLOPS) with dequant->F16->HGEMM.
-    pub dequant_f16: CudaSlice<u8>,
-}
-
-/// Pre-allocated GPU scratch buffers for GDN batched prefill.
-///
-/// Holds batched projections and per-token outputs specific to GDN layers.
-/// Part of the [`PrefillWorkspace`] when the model has GDN layers.
-pub(crate) struct GdnPrefillScratch {
-    /// Batched QKV output: [batch, qkv_dim].
-    pub qkv: CudaSlice<f32>,
-    /// Batched alpha raw projection: [batch, num_heads].
-    pub alpha_raw: CudaSlice<f32>,
-    /// Batched beta raw projection: [batch, num_heads].
-    pub beta_raw: CudaSlice<f32>,
-    /// Batched gate projection: [batch, value_dim].
-    pub gate: CudaSlice<f32>,
-    /// Batched GDN output (per-token gated output): [batch, value_dim].
-    pub gdn_out: CudaSlice<f32>,
-    /// Batched conv1d + SiLU output: [batch, qkv_dim].
-    pub conv_out: CudaSlice<f32>,
-    /// Raw output from gdn_prefill_fused_v3: [batch, num_heads * val_dim].
-    pub raw_out: CudaSlice<f32>,
-    /// Computed alpha gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
-    pub alpha_out: CudaSlice<f32>,
-    /// Computed beta gates: [batch, num_heads]. Output of gdn_compute_gates_batched.
-    pub beta_out: CudaSlice<f32>,
-}
-
-/// Element counts of the buffers in a [`GdnPrefillScratch`] for `batch` rows.
-/// [`alloc_gdn_prefill_scratch`] allocates exactly these, and the load-time
-/// memory plan sums them, so the two cannot disagree.
+/// Element counts of the GDN prefill's workspace values for `batch` rows: the
+/// QKV projection and conv output (`qkv`), the four per-head gate values
+/// (`heads`) and the three value-side outputs (`value`), all F32. The
+/// workspace planner places exactly these, and the load-time memory plan
+/// counts what it places, so the two cannot disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GdnPrefillScratchLayout {
     pub qkv: usize,
@@ -145,37 +56,12 @@ impl GdnPrefillScratchLayout {
             value: batch * value_dim,
         }
     }
-
-    /// Device bytes of the scratch: two `qkv` buffers (projection and conv
-    /// output), four per-head gate buffers and three `value` buffers, all F32.
-    pub(crate) fn bytes(&self) -> u64 {
-        4 * (2 * self.qkv + 4 * self.heads + 3 * self.value) as u64
-    }
 }
 
-/// Allocate GDN prefill scratch buffers.
-pub(crate) fn alloc_gdn_prefill_scratch(
-    device: &super::ffi::CudaDevice,
-    layout: &GdnPrefillScratchLayout,
-) -> Result<GdnPrefillScratch, RuntimeError> {
-    let l = layout;
-    Ok(GdnPrefillScratch {
-        qkv: device.alloc_zeros(l.qkv)?,
-        alpha_raw: device.alloc_zeros(l.heads)?,
-        beta_raw: device.alloc_zeros(l.heads)?,
-        gate: device.alloc_zeros(l.value)?,
-        gdn_out: device.alloc_zeros(l.value)?,
-        conv_out: device.alloc_zeros(l.qkv)?,
-        raw_out: device.alloc_zeros(l.value)?,
-        alpha_out: device.alloc_zeros(l.heads)?,
-        beta_out: device.alloc_zeros(l.heads)?,
-    })
-}
-
-/// Element counts of the buffers in a [`PrefillScratch`] for `batch` rows of
-/// one model's geometry (`activation_f16` and `dequant_f16` in bytes).
-/// [`alloc_prefill_scratch`] allocates exactly these, and the load-time
-/// memory plan sums them, so the two cannot disagree.
+/// Element counts of the prefill's workspace values for `batch` rows of one
+/// model's geometry (`activation_f16` and `dequant_f16` in bytes). The
+/// workspace planner places exactly these, and the load-time memory plan
+/// counts what it places, so the two cannot disagree.
 ///
 /// `dequant_f32` holds the largest projection weight matrix in F32 across ALL
 /// kernels that share this scratch: standard attention (wq/wk/wv/wo), FFN
@@ -251,62 +137,6 @@ impl PrefillScratchLayout {
             dequant_f16: max_weight_elems * 2,
         }
     }
-
-    /// Device bytes of the scratch: four `hidden` buffers (x, normed,
-    /// attn_proj, down), two `q` (q, attn_out), two `kv`, two `inter` (gate,
-    /// up), the Q+gate pair, the token ids, two single-token `q` buffers and
-    /// the dequant / activation scratch.
-    pub(crate) fn bytes(&self) -> u64 {
-        let (qg_fused, qg_gate) = self.q_gate.unwrap_or((0, 0));
-        let f32_elems = 4 * self.hidden
-            + 2 * self.q
-            + 2 * self.kv
-            + 2 * self.inter
-            + qg_fused
-            + qg_gate
-            + 2 * self.q_single
-            + self.dequant_f32;
-        4 * (f32_elems + self.token_ids) as u64 + (self.activation_f16 + self.dequant_f16) as u64
-    }
-}
-
-/// Allocate the prefill scratch a [`PrefillScratchLayout`] describes.
-pub(crate) fn alloc_prefill_scratch(
-    device: &CudaDevice,
-    layout: &PrefillScratchLayout,
-) -> Result<PrefillScratch, RuntimeError> {
-    let l = layout;
-    Ok(PrefillScratch {
-        x: device.alloc_zeros(l.hidden)?,
-        normed: device.alloc_zeros(l.hidden)?,
-        q: device.alloc_zeros(l.q)?,
-        k: device.alloc_zeros(l.kv)?,
-        v: device.alloc_zeros(l.kv)?,
-        attn_out: device.alloc_zeros(l.q)?,
-        attn_scores: None,
-        q_gate: match l.q_gate {
-            Some((fused, gate)) => Some((device.alloc_zeros(fused)?, device.alloc_zeros(gate)?)),
-            None => None,
-        },
-        attn_proj: device.alloc_zeros(l.hidden)?,
-        gate: device.alloc_zeros(l.inter)?,
-        up: device.alloc_zeros(l.inter)?,
-        down: device.alloc_zeros(l.hidden)?,
-        token_ids_gpu: device.alloc_zeros(l.token_ids)?,
-        q_single: device.alloc_zeros(l.q_single)?,
-        attn_out_single: device.alloc_zeros(l.q_single)?,
-        dequant_f32: device.alloc_zeros(l.dequant_f32)?,
-        activation_f16: device.alloc_zeros(l.activation_f16)?,
-        dequant_f16: device.alloc_zeros(l.dequant_f16)?,
-    })
-}
-
-/// The batched F32 prefill's buffers: [`PrefillScratch`] (its score block
-/// included) and the GDN prefill scratch, allocated once at load and lent to
-/// every request.
-pub(crate) struct PrefillWorkspace {
-    pub scratch: PrefillScratch,
-    pub gdn: Option<GdnPrefillScratch>,
 }
 
 /// What [`alloc_prefill_workspace`] allocates: the scratch layouts for the
@@ -320,30 +150,20 @@ pub(crate) struct PrefillWorkspaceLayout {
 }
 
 impl PrefillWorkspaceLayout {
-    /// Device bytes of the whole workspace.
+    /// Device bytes of the whole workspace: the arena its regions lie in.
     pub(crate) fn bytes(&self) -> u64 {
-        self.scratch.bytes()
-            + self.gdn.map_or(0, |g| g.bytes())
-            + 4 * self.score_elems.unwrap_or(0) as u64
+        super::workspace::unshared(self).bytes() as u64
     }
 }
 
-/// Allocate the workspace `layout` describes. The score block is part of the
-/// selected route, so failing to allocate it fails the load.
+/// Allocate the workspace `layout` describes: one arena with every value in
+/// its own region. The score block is part of the selected route, so failing
+/// to allocate it fails the load.
 pub(crate) fn alloc_prefill_workspace(
     device: &CudaDevice,
     layout: &PrefillWorkspaceLayout,
-) -> Result<PrefillWorkspace, RuntimeError> {
-    let mut scratch = alloc_prefill_scratch(device, &layout.scratch)?;
-    scratch.attn_scores = match layout.score_elems {
-        Some(n) => Some(device.alloc_zeros(n)?),
-        None => None,
-    };
-    let gdn = match &layout.gdn {
-        Some(g) => Some(alloc_gdn_prefill_scratch(device, g)?),
-        None => None,
-    };
-    Ok(PrefillWorkspace { scratch, gdn })
+) -> Result<Workspace, RuntimeError> {
+    Workspace::alloc(device, super::workspace::unshared(layout))
 }
 
 /// Tokens per prefill slice. A prompt longer than this runs through the
@@ -3206,7 +3026,7 @@ pub(crate) fn attn_sgemm_block_rows(batch: usize, qb: usize) -> usize {
 /// without per-head q/k norms takes the plain prefill dispatch, which runs the
 /// scalar kernel.
 ///
-/// `scores` is the block `alloc_prefill_scratch` sized for this prefill; it
+/// `scores` is the block `alloc_prefill_workspace` sized for this prefill; it
 /// is never allocated here (see the check below for why).
 ///
 /// Both GEMMs batch over the query group with `stride_a = 0`, which points
@@ -4014,7 +3834,7 @@ mod tests {
     /// Qwen3.8-27B (hidden 5120, 24 query / 4 KV heads of 256, FFN 17408,
     /// GDN qkv 10240 and value 6144 over 48 heads, fused Q+gate) at the
     /// 2048-row slice and a 32768-token context: the bytes the load reserves
-    /// for its prefill, element by element from the allocators' arithmetic.
+    /// for its prefill, element by element from the layouts' arithmetic.
     #[test]
     fn the_27b_prefill_workspace_is_what_its_buffers_take() {
         let scratch = PrefillScratchLayout::new(
@@ -4030,12 +3850,7 @@ mod tests {
         // dequant_f32 is the FFN matrix, activation_f16 the FFN row width.
         assert_eq!(scratch.dequant_f32, 17408 * 5120);
         assert_eq!(scratch.activation_f16, 2048 * 17408 * 2);
-        assert_eq!(scratch.bytes(), 1_327_554_560);
         let gdn = GdnPrefillScratchLayout::new(2048, 10240, 48, 6144);
-        assert_eq!(
-            gdn.bytes(),
-            4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144)
-        );
         let scores = attn_score_block_elems(2048, 24, 4, 32768 - 2048).unwrap();
         // group 6 x min(rows, 512) x 32768 keys.
         assert_eq!(scores, 6 * 512 * 32768);
@@ -4044,10 +3859,18 @@ mod tests {
             gdn: Some(gdn),
             score_elems: Some(scores),
         };
+        // The scratch values take 1_327_554_560 bytes, the GDN values
+        // 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144) and the
+        // score block 4 * 6 * 512 * 32768. Every value's bytes are a multiple
+        // of the 256-byte region alignment at 2048 rows, so the arena holds no
+        // padding between them: 0 bytes.
         assert_eq!(
             ws.bytes(),
-            scratch.bytes() + gdn.bytes() + 4 * scores as u64
+            1_327_554_560
+                + 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144)
+                + 4 * scores as u64
         );
+        assert_eq!(ws.bytes(), 2_050_547_712);
     }
 
     /// The production planar prefill launchers on NVFP4 and FP8 planes of many groups:

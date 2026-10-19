@@ -1153,7 +1153,7 @@ pub(crate) fn ensure_prefill_grouped(
 /// write) rather than full `CudaSlice` so callers can pass a per-token slice
 /// of a batched buffer. Decode callers can construct a full-buffer view via
 /// `pf.normed.slice(..)` / `pf.x_gpu.slice_mut(..)`. Prefill callers slice the
-/// batched buffer per token: `pf.normed.slice(t*H..(t+1)*H)`. Byte-identical
+/// workspace's batched `Normed` view per token: `normed.slice(t*H..(t+1)*H)`. Byte-identical
 /// kernels, only the parameter binding changes.
 ///
 /// **(Phase-F dispatch wiring)**: when `LUMEN_CUDA_MOE_BATCHED=1` is
