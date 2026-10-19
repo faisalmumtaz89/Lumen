@@ -107,6 +107,14 @@ fn primary_scheme(quant: &str) -> Option<QuantScheme> {
     }
 }
 
+/// How many of a quantization's files are downloaded already.
+#[derive(Clone, Copy)]
+pub(crate) enum Held {
+    Nothing,
+    Part,
+    All,
+}
+
 /// What is known of where a model would run before anything is downloaded:
 /// its memory, and for a CUDA device its compute capability.
 #[derive(Clone, Copy)]
@@ -176,8 +184,8 @@ fn ruling(
 /// The refusal for `quant` of `entry`, which the user named `name`, when it
 /// cannot run on `device`, `target`'s; `None` when it is not ruled out.
 /// `sizes` holds the download size of each of the model's quants known,
-/// `cached` the quants already downloaded and converted, and `downloaded`
-/// whether `quant`'s files are all downloaded already.
+/// `cached` the quants already downloaded and converted, and `held` how many
+/// of `quant`'s files are downloaded already.
 pub(crate) fn refusal(
     entry: &ModelEntry,
     name: &str,
@@ -186,12 +194,12 @@ pub(crate) fn refusal(
     device: Device,
     sizes: &BTreeMap<String, u64>,
     cached: &[String],
-    downloaded: bool,
+    held: Held,
 ) -> Option<String> {
-    let outcome = if downloaded {
-        "its downloaded files were not converted"
-    } else {
-        "nothing was downloaded"
+    let outcome = match held {
+        Held::Nothing => "nothing was downloaded",
+        Held::Part => "nothing more was downloaded",
+        Held::All => "its downloaded files were not converted",
     };
     let gib = |bytes: u64| format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64);
     let model = &entry.display_name;
@@ -327,10 +335,13 @@ fn check_against(
         .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
         .cloned()
         .collect();
-    let downloaded = src.files.iter().all(|f| downloaded(f).is_some());
-    match refusal(
-        entry, name, quant, target, device, &sizes, &cached, downloaded,
-    ) {
+    let present = src.files.iter().filter(|f| downloaded(f).is_some()).count();
+    let held = match present {
+        0 => Held::Nothing,
+        n if n == src.files.len() => Held::All,
+        _ => Held::Part,
+    };
+    match refusal(entry, name, quant, target, device, &sizes, &cached, held) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -458,7 +469,7 @@ mod tests {
                 memory(24 * GIB),
                 &s,
                 &[],
-                false
+                Held::Nothing
             ),
             None
         );
@@ -471,7 +482,7 @@ mod tests {
                 memory(24 * GIB),
                 &BTreeMap::new(),
                 &[],
-                false
+                Held::Nothing
             ),
             None,
             "an unknown size refuses nothing"
@@ -496,7 +507,7 @@ mod tests {
             memory(24 * GIB),
             &s,
             &cached,
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -537,7 +548,7 @@ mod tests {
             memory(12 * GIB),
             &s,
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -561,7 +572,7 @@ mod tests {
             memory(12 * GIB),
             &s,
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -588,7 +599,7 @@ mod tests {
             memory(16 * GIB),
             &s,
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -619,7 +630,7 @@ mod tests {
             t4,
             &sizes_27b(),
             &[],
-            true,
+            Held::All,
         )
         .unwrap();
         assert!(
@@ -627,6 +638,21 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("nothing was downloaded"), "{message}");
+        let part = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q4_K_M",
+            Target::Cuda(0),
+            t4,
+            &sizes_27b(),
+            &[],
+            Held::Part,
+        )
+        .unwrap();
+        assert!(
+            part.contains("so it cannot run there; nothing more was downloaded."),
+            "{part}"
+        );
     }
 
     #[test]
@@ -640,7 +666,7 @@ mod tests {
             t4,
             &sizes_27b(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -667,7 +693,7 @@ mod tests {
             t4,
             &sizes_27b(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(!q8.contains(":q4_k_m"), "{q8}");
@@ -688,7 +714,7 @@ mod tests {
             device,
             &BTreeMap::new(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -714,7 +740,7 @@ mod tests {
                     device,
                     &sizes_27b(),
                     &[],
-                    false
+                    Held::Nothing
                 ),
                 None
             );
@@ -727,7 +753,7 @@ mod tests {
             gpu(24 * GIB, (7, 9)),
             &sizes_27b(),
             &[],
-            false
+            Held::Nothing
         )
         .is_some());
     }
@@ -748,7 +774,7 @@ mod tests {
             gpu(at_least - 1, (8, 0)),
             &sizes_27b(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -768,7 +794,7 @@ mod tests {
                 gpu(at_least, (8, 0)),
                 &sizes_27b(),
                 &[],
-                false
+                Held::Nothing
             ),
             None
         );
@@ -792,7 +818,7 @@ mod tests {
                     device,
                     &sizes_27b(),
                     &[],
-                    false
+                    Held::Nothing
                 ),
                 None
             );
@@ -812,7 +838,7 @@ mod tests {
                 gpu(80 * GIB, (8, 0)),
                 &s,
                 &[],
-                false
+                Held::Nothing
             ),
             None
         );
@@ -835,7 +861,7 @@ mod tests {
             gpu(24 * GIB, (8, 6)),
             &s,
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(message.contains("take at least 28.29 GiB"), "{message}");
@@ -848,7 +874,7 @@ mod tests {
                 gpu(32 * GIB, (8, 6)),
                 &s,
                 &[],
-                false
+                Held::Nothing
             ),
             None
         );
@@ -870,7 +896,7 @@ mod tests {
                 gpu(memory, (8, 0)),
                 &s,
                 &[],
-                false,
+                Held::Nothing,
             )
         };
         assert!(rule(at_least - 1).is_some());
@@ -908,7 +934,7 @@ mod tests {
             gpu(80 * GIB, (8, 0)),
             &sizes_27b(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(
@@ -923,7 +949,7 @@ mod tests {
             gpu(80 * GIB, (8, 0)),
             &sizes_27b(),
             &[],
-            false,
+            Held::Nothing,
         )
         .unwrap();
         assert!(!on_0.contains("--cuda-device"), "{on_0}");
