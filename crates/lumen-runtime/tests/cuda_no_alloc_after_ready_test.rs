@@ -7,14 +7,17 @@
 //! a decode into the context's last slot). CUPTI records every allocation call,
 //! synchronous, stream-ordered, managed or from a pool, the program's own and the
 //! CUDA libraries' alike, and every driver call that makes device memory without
-//! an allocation record (a module or library load, a virtual-memory create or
-//! map); none may be made by the program, and a window that lost records fails.
+//! an allocation record (a module or library load, a function or global lookup,
+//! which loads a lazily loaded module's code, a virtual-memory create or map);
+//! none may be made by the program, and a window that lost records fails.
 //! What a request may still take is the code and static data of a library
 //! kernel's module loaded the first time a request launches it (CUDA's default
-//! lazy loading): a CUDA library makes those load calls itself, so the code that
-//! calls the driver lies outside this executable, which tells them from the
-//! program's, and the serving plan's allowance covers them. A virtual-memory call
-//! fails whoever makes it. The loads and the static data the driver records are
+//! lazy loading): a CUDA library makes those calls itself, so the code that calls
+//! the driver lies outside this executable, which tells them from the program's,
+//! and the serving plan's allowance covers them. A virtual-memory call fails
+//! whoever makes it. Program code another shared object runs, as a callback that
+//! ends in a tail call to the driver, would be taken for that object's; Lumen
+//! hands no CUDA library a callback. The loads and the static data the driver records are
 //! printed, and with
 //! `LUMEN_NO_ALLOC_ISOLATED_GPU=1`
 //! (nothing else on the GPU) free memory may fall by at most one allocation
@@ -72,22 +75,28 @@ impl Allocation {
 }
 
 static RECORDED: Mutex<Vec<Allocation>> = Mutex::new(Vec::new());
-/// Driver calls that make device memory no allocation record shows.
-const MEMORY_CALLS: [cupti::CUpti_driver_api_trace_cbid; 8] = [
+/// Driver calls that make device memory, or load a module's code, without an
+/// allocation record.
+const MEMORY_CALLS: [cupti::CUpti_driver_api_trace_cbid; 13] = [
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoad,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadData,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadDataEx,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadFatBinary,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryLoadData,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryLoadFromFile,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleGetFunction,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleGetGlobal_v2,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryGetModule,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuKernelGetFunction,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryGetGlobal,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemCreate,
     cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemMap,
 ];
 
 /// The [`MEMORY_CALLS`] the program made while a window records.
 static CALLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// The module and library loads a CUDA library made while a window records: its
-/// lazy load of a kernel's module.
+/// The loads and lookups a CUDA library made while a window records: its lazy
+/// load of a kernel's module.
 static LIBRARY_LOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
@@ -526,7 +535,7 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
         .partition(Allocation::is_module_load);
     let free_after = free_memory(&ctx);
     println!(
-        "{label}/{precision:?}: {} allocation calls, {} library module loads, static data {loads:?}, free {free} -> {free_after} bytes",
+        "{label}/{precision:?}: {} allocation calls, {} library loads and lookups, static data {loads:?}, free {free} -> {free_after} bytes",
         calls.len(),
         recorded.library_loads.len()
     );
