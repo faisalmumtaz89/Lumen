@@ -18,8 +18,6 @@ pub(crate) struct ServingPlan {
     pub workspace: u64,
     /// The GDN layers' recurrent and conv state and their decode scratch.
     pub gdn_state: u64,
-    /// The grouped MoE prefill scratch.
-    pub moe_grouped: u64,
     /// The F16 dequant caches (the full-attention projections' with their
     /// sizing margin, and the GDN alpha/beta copies when they are made).
     pub f16_caches: u64,
@@ -47,7 +45,6 @@ impl ServingPlan {
             + self.widening
             + self.workspace
             + self.gdn_state
-            + self.moe_grouped
             + self.f16_caches
             + self.decode_scratch
             + self.allowance
@@ -80,7 +77,6 @@ pub(crate) fn refusal(
     ];
     for (label, bytes) in [
         ("linear-attention state", need.gdn_state),
-        ("MoE prompt workspace", need.moe_grouped),
         ("F16 weight caches", need.f16_caches),
         ("decode scratch", need.decode_scratch),
         ("headroom", need.allowance),

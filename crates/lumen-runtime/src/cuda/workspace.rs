@@ -27,14 +27,16 @@ use super::prefill::PrefillWorkspaceLayout;
 pub(crate) enum Elem {
     F32,
     U32,
+    I32,
     U8,
+    I8,
 }
 
 impl Elem {
     fn size(self) -> usize {
         match self {
-            Elem::F32 | Elem::U32 => 4,
-            Elem::U8 => 1,
+            Elem::F32 | Elem::U32 | Elem::I32 => 4,
+            Elem::U8 | Elem::I8 => 1,
         }
     }
 }
@@ -109,10 +111,41 @@ pub(crate) enum Role {
     GdnAlphaOut,
     /// Computed beta gates: [batch, num_heads].
     GdnBetaOut,
+    /// Grouped MoE: batched router logits, [batch, num_experts].
+    MoeRouterLogits,
+    /// Grouped MoE: top-K expert ids, [batch, num_experts] (the first top_k of
+    /// each row valid).
+    MoeExpertIds,
+    /// Grouped MoE: top-K expert weights, [batch, top_k].
+    MoeExpertWeights,
+    /// Grouped MoE: each compact column's expert, [batch * top_k].
+    MoeColExpert,
+    /// Grouped MoE: each compact column's token, [batch * top_k].
+    MoeColSrcTok,
+    /// Grouped MoE: each (token, slot)'s compact column, [batch * top_k].
+    MoeDstToCol,
+    /// Grouped MoE: each expert's first compact column, [num_experts + 1].
+    MoeExpertBounds,
+    /// Grouped MoE: the tiled gate+up kernel's tile list, 4 per tile.
+    MoeGateUpTiles,
+    /// Grouped MoE: per-column SwiGLU output, [batch * top_k, inter_dim].
+    MoeSwiglu,
+    /// Grouped MoE: per-column down output, [batch * top_k, hidden_dim].
+    MoeDown,
+    /// Batched shared expert: SwiGLU output, [batch, inter_dim].
+    MoeSharedSwiglu,
+    /// Batched shared expert: sigmoid-gate logits, [batch].
+    MoeSharedLogit,
+    /// W10 gate+up: the prequantized activation, int8 by compact column.
+    MoeW10Activation,
+    /// W10 gate+up: the prequantized activation's scales.
+    MoeW10Scales,
+    /// W10 gate+up: the bucketed tile list.
+    MoeW10Tiles,
 }
 
 /// The number of roles.
-pub(crate) const ROLES: usize = 28;
+pub(crate) const ROLES: usize = 43;
 
 impl Role {
     /// Every role, in the order the unshared layout places them.
@@ -145,12 +178,52 @@ impl Role {
         Role::GdnRawOut,
         Role::GdnAlphaOut,
         Role::GdnBetaOut,
+        Role::MoeRouterLogits,
+        Role::MoeExpertIds,
+        Role::MoeExpertWeights,
+        Role::MoeColExpert,
+        Role::MoeColSrcTok,
+        Role::MoeDstToCol,
+        Role::MoeExpertBounds,
+        Role::MoeGateUpTiles,
+        Role::MoeSwiglu,
+        Role::MoeDown,
+        Role::MoeSharedSwiglu,
+        Role::MoeSharedLogit,
+        Role::MoeW10Activation,
+        Role::MoeW10Scales,
+        Role::MoeW10Tiles,
+    ];
+
+    /// The grouped MoE prefill's routed-expert values, which one MoE FFN
+    /// writes and uses up.
+    pub(crate) const MOE_ROUTED: [Role; 13] = [
+        Role::MoeRouterLogits,
+        Role::MoeExpertIds,
+        Role::MoeExpertWeights,
+        Role::MoeColExpert,
+        Role::MoeColSrcTok,
+        Role::MoeDstToCol,
+        Role::MoeExpertBounds,
+        Role::MoeGateUpTiles,
+        Role::MoeSwiglu,
+        Role::MoeDown,
+        Role::MoeW10Activation,
+        Role::MoeW10Scales,
+        Role::MoeW10Tiles,
     ];
 
     pub(crate) fn elem(self) -> Elem {
         match self {
-            Role::TokenIds => Elem::U32,
+            Role::TokenIds | Role::MoeExpertIds => Elem::U32,
+            Role::MoeColExpert
+            | Role::MoeColSrcTok
+            | Role::MoeDstToCol
+            | Role::MoeExpertBounds
+            | Role::MoeGateUpTiles
+            | Role::MoeW10Tiles => Elem::I32,
             Role::ActivationF16 | Role::DequantF16 => Elem::U8,
+            Role::MoeW10Activation => Elem::I8,
             _ => Elem::F32,
         }
     }
@@ -176,9 +249,17 @@ impl Region {
 
 /// The region of every role a workspace holds; `None` for a role this load's
 /// layout has no value for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RegionTable {
     regions: [Option<Region>; ROLES],
+}
+
+impl Default for RegionTable {
+    fn default() -> Self {
+        Self {
+            regions: [None; ROLES],
+        }
+    }
 }
 
 impl RegionTable {
@@ -216,16 +297,7 @@ impl RegionTable {
     /// has no region, one is requested twice, or two share a byte, as
     /// `<[T]>::get_disjoint_mut` refuses overlapping indices.
     fn disjoint<const N: usize>(&self, roles: &[Role; N]) -> [Region; N] {
-        let regions = roles.map(|role| {
-            self.get(role)
-                .unwrap_or_else(|| panic!("workspace: {role:?} has no region"))
-        });
-        for i in 0..N {
-            for j in 0..i {
-                assert_apart((roles[j], regions[j]), (roles[i], regions[i]));
-            }
-        }
-        regions
+        self.disjoint_from(&[], roles)
     }
 
     /// [`RegionTable::disjoint`] of `roles`, which must also be apart from
@@ -235,10 +307,33 @@ impl RegionTable {
         lent: &[(Role, Region)],
         roles: &[Role; M],
     ) -> [Region; M] {
-        let regions = self.disjoint(roles);
-        for (&role, &region) in roles.iter().zip(&regions) {
-            for &lent in lent {
-                assert_apart(lent, (role, region));
+        let regions = self.present_from(lent, roles);
+        std::array::from_fn(|i| {
+            regions[i].unwrap_or_else(|| panic!("workspace: {:?} has no region", roles[i]))
+        })
+    }
+
+    /// The regions of `roles` the table has, in order (`None` for a role it
+    /// has none for), refused as [`RegionTable::disjoint_from`] refuses them.
+    fn present_from<const M: usize>(
+        &self,
+        lent: &[(Role, Region)],
+        roles: &[Role; M],
+    ) -> [Option<Region>; M] {
+        let regions = roles.map(|role| self.get(role));
+        for i in 0..M {
+            for j in 0..i {
+                let (a, b) = (roles[j], roles[i]);
+                assert!(a != b, "workspace: {a:?} requested twice");
+                if let (Some(ra), Some(rb)) = (regions[j], regions[i]) {
+                    assert_apart((a, ra), (b, rb));
+                }
+            }
+            // A lent role has a region, so only a present one can be it.
+            if let Some(region) = regions[i] {
+                for &lent in lent {
+                    assert_apart(lent, (roles[i], region));
+                }
             }
         }
         regions
@@ -280,6 +375,21 @@ fn unshared_len(layout: &PrefillWorkspaceLayout, role: Role) -> Option<usize> {
             gdn.map(|g| g.heads)
         }
         Role::GdnGate | Role::GdnOut | Role::GdnRawOut => gdn.map(|g| g.value),
+        Role::MoeRouterLogits
+        | Role::MoeExpertIds
+        | Role::MoeExpertWeights
+        | Role::MoeColExpert
+        | Role::MoeColSrcTok
+        | Role::MoeDstToCol
+        | Role::MoeExpertBounds
+        | Role::MoeGateUpTiles
+        | Role::MoeSwiglu
+        | Role::MoeDown
+        | Role::MoeSharedSwiglu
+        | Role::MoeSharedLogit
+        | Role::MoeW10Activation
+        | Role::MoeW10Scales
+        | Role::MoeW10Tiles => layout.grouped.and_then(|g| g.len(role)),
     }
 }
 
@@ -377,8 +487,20 @@ impl Steps {
         // expert accumulating into X, the probes and AttnProj made X's copy.
         self.op(moe, "MoE norm", &[AttnProj], &[Normed], &[]);
         self.op(moe, "MoE normed dump", &[Normed], &[], &[]);
-        self.op(moe, "MoE routed experts", &[Normed, AttnProj], &[X], &[]);
-        self.op(moe, "MoE shared expert", &[Normed, X], &[X], &[]);
+        self.op(
+            moe,
+            "MoE routed experts",
+            &[Normed, AttnProj],
+            &[X],
+            &Role::MOE_ROUTED,
+        );
+        self.op(
+            moe,
+            "MoE shared expert",
+            &[Normed, X],
+            &[X],
+            &[MoeSharedSwiglu, MoeSharedLogit],
+        );
         self.op(moe, "MoE probe", &[X, AttnProj], &[], &[]);
         self.op(moe, "MoE output", &[X], &[AttnProj], &[]);
     }
@@ -678,10 +800,26 @@ unsafe fn view<'a>(whole: &mut CudaViewMut<'a, u8>, role: Role, region: Region) 
                 .transmute_mut::<u32>(region.len)
                 .expect("a region holds its elements"),
         )),
+        Elem::I32 => Typed::I32(std::mem::transmute::<
+            CudaViewMut<'_, i32>,
+            CudaViewMut<'a, i32>,
+        >(
+            bytes
+                .transmute_mut::<i32>(region.len)
+                .expect("a region holds its elements"),
+        )),
         Elem::U8 => Typed::U8(std::mem::transmute::<
             CudaViewMut<'_, u8>,
             CudaViewMut<'a, u8>,
         >(bytes)),
+        Elem::I8 => Typed::I8(std::mem::transmute::<
+            CudaViewMut<'_, i8>,
+            CudaViewMut<'a, i8>,
+        >(
+            bytes
+                .transmute_mut::<i8>(region.len)
+                .expect("a region holds its elements"),
+        )),
     };
     RoleView { role, view }
 }
@@ -705,10 +843,27 @@ impl<const N: usize> Rest<'_, N> {
     /// one.
     pub(crate) fn regions<const M: usize>(&mut self, roles: [Role; M]) -> [RoleView<'_>; M] {
         let regions = self.table.disjoint_from(&self.lent, &roles);
-        // SAFETY: the regions share no byte with each other (`disjoint`) or
-        // with a lent one (checked above), and every view borrows `self`; see
-        // `view`.
+        // SAFETY: the regions share no byte with each other or with a lent
+        // one (`disjoint_from`), and every view borrows `self`; see `view`.
         std::array::from_fn(|i| unsafe { view(&mut self.whole, roles[i], regions[i]) })
+    }
+
+    /// Whether this load's layout has a region for `role`.
+    pub(crate) fn has(&self, role: Role) -> bool {
+        self.table.get(role).is_some()
+    }
+
+    /// [`Rest::regions`] of the roles of `roles` this load's layout has a
+    /// region for; `None` for the others.
+    pub(crate) fn present<const M: usize>(
+        &mut self,
+        roles: [Role; M],
+    ) -> [Option<RoleView<'_>>; M] {
+        let regions = self.table.present_from(&self.lent, &roles);
+        // SAFETY: as in `regions`; see `view`.
+        std::array::from_fn(|i| {
+            regions[i].map(|region| unsafe { view(&mut self.whole, roles[i], region) })
+        })
     }
 }
 
@@ -716,7 +871,9 @@ impl<const N: usize> Rest<'_, N> {
 enum Typed<'a> {
     F32(CudaViewMut<'a, f32>),
     U32(CudaViewMut<'a, u32>),
+    I32(CudaViewMut<'a, i32>),
     U8(CudaViewMut<'a, u8>),
+    I8(CudaViewMut<'a, i8>),
 }
 
 /// One role's region, borrowed from a [`Workspace`] by
@@ -743,11 +900,61 @@ impl RoleView<'_> {
         }
     }
 
+    /// The region as I32 elements. Panics when the role holds another type.
+    pub(crate) fn i32(&mut self) -> CudaViewMut<'_, i32> {
+        match &mut self.view {
+            Typed::I32(v) => v.slice_mut(..),
+            _ => elem_mismatch(self.role, Elem::I32),
+        }
+    }
+
     /// The region as bytes. Panics when the role holds another type.
     pub(crate) fn u8(&mut self) -> CudaViewMut<'_, u8> {
         match &mut self.view {
             Typed::U8(v) => v.slice_mut(..),
             _ => elem_mismatch(self.role, Elem::U8),
+        }
+    }
+
+    /// The region as I8 elements. Panics when the role holds another type.
+    pub(crate) fn i8(&mut self) -> CudaViewMut<'_, i8> {
+        match &mut self.view {
+            Typed::I8(v) => v.slice_mut(..),
+            _ => elem_mismatch(self.role, Elem::I8),
+        }
+    }
+}
+
+impl<'a> RoleView<'a> {
+    /// [`RoleView::f32`] for the whole borrow.
+    pub(crate) fn into_f32(self) -> CudaViewMut<'a, f32> {
+        match self.view {
+            Typed::F32(v) => v,
+            _ => elem_mismatch(self.role, Elem::F32),
+        }
+    }
+
+    /// [`RoleView::u32`] for the whole borrow.
+    pub(crate) fn into_u32(self) -> CudaViewMut<'a, u32> {
+        match self.view {
+            Typed::U32(v) => v,
+            _ => elem_mismatch(self.role, Elem::U32),
+        }
+    }
+
+    /// [`RoleView::i32`] for the whole borrow.
+    pub(crate) fn into_i32(self) -> CudaViewMut<'a, i32> {
+        match self.view {
+            Typed::I32(v) => v,
+            _ => elem_mismatch(self.role, Elem::I32),
+        }
+    }
+
+    /// [`RoleView::i8`] for the whole borrow.
+    pub(crate) fn into_i8(self) -> CudaViewMut<'a, i8> {
+        match self.view {
+            Typed::I8(v) => v,
+            _ => elem_mismatch(self.role, Elem::I8),
         }
     }
 }
@@ -762,6 +969,7 @@ fn elem_mismatch(role: Role, wanted: Elem) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda::moe::PrefillGroupedLayout;
     use crate::cuda::prefill::test_models::{
         dense_switches, moe_switches, Model, MOE, Q27B, Q9B, ROWS,
     };
@@ -786,11 +994,18 @@ mod tests {
     }
 
     #[test]
-    fn token_ids_are_u32_the_conversion_scratch_bytes_the_rest_f32() {
+    fn each_role_holds_the_element_type_its_kernels_take() {
         for role in Role::ALL {
             let want = match role {
-                Role::TokenIds => Elem::U32,
+                Role::TokenIds | Role::MoeExpertIds => Elem::U32,
+                Role::MoeColExpert
+                | Role::MoeColSrcTok
+                | Role::MoeDstToCol
+                | Role::MoeExpertBounds
+                | Role::MoeGateUpTiles
+                | Role::MoeW10Tiles => Elem::I32,
                 Role::ActivationF16 | Role::DequantF16 => Elem::U8,
+                Role::MoeW10Activation => Elem::I8,
                 _ => Elem::F32,
             };
             assert_eq!(role.elem(), want, "{role:?}");
@@ -903,6 +1118,10 @@ mod tests {
             scratch,
             Some(GdnPrefillScratchLayout::new(3, 56, 4, 32)),
             Some(77),
+            Some(PrefillGroupedLayout {
+                w10: true,
+                ..PrefillGroupedLayout::new(3, 2, 4, 40, 128)
+            }),
             PrefillRoutes::default(),
             ConversionScratch::default(),
         );
@@ -933,6 +1152,7 @@ mod tests {
             PrefillScratchLayout::new(3, 40, 24, 8, 72, None, None, false),
             None,
             None,
+            None,
             PrefillRoutes::default(),
             ConversionScratch::default(),
         );
@@ -952,7 +1172,9 @@ mod tests {
                     | Role::GdnRawOut
                     | Role::GdnAlphaOut
                     | Role::GdnBetaOut
-            );
+                    | Role::MoeSharedSwiglu
+                    | Role::MoeSharedLogit
+            ) || Role::MOE_ROUTED.contains(&role);
             assert_eq!(t.get(role).is_none(), absent, "{role:?}");
         }
     }
@@ -1028,17 +1250,23 @@ mod tests {
         sets
     }
 
-    fn is_conversion(role: Role) -> bool {
+    /// A route's scratch: a GEMM's conversion scratch, the grouped MoE
+    /// FFN's, held only when some layer takes the route.
+    fn route_scratch(role: Role) -> bool {
         matches!(
             role,
-            Role::DequantF32 | Role::ActivationF16 | Role::DequantF16
-        )
+            Role::DequantF32
+                | Role::ActivationF16
+                | Role::DequantF16
+                | Role::MoeSharedSwiglu
+                | Role::MoeSharedLogit
+        ) || Role::MOE_ROUTED.contains(&role)
     }
 
     /// At every operation of a slice, the compact regions of the values live
     /// there share no byte; every value an operation on a taken path touches
-    /// has a region (a conversion region only where some GEMM's route takes
-    /// it); and every value is written before it is read.
+    /// has a region (a route's scratch only where some layer takes the
+    /// route); and every value is written before it is read.
     #[test]
     fn the_values_live_at_each_operation_lie_apart() {
         for (name, layout) in every_route_set() {
@@ -1062,7 +1290,7 @@ mod tests {
                     }
                 }
                 for &role in step.reads.iter().chain(step.writes).chain(step.scratch) {
-                    if !is_conversion(role) {
+                    if !route_scratch(role) {
                         assert!(
                             regions.get(role).is_some(),
                             "{name}: {} touches {role:?}, which has no region",
@@ -1111,6 +1339,16 @@ mod tests {
                 "{name}"
             );
             assert_eq!(compact.get(Role::QSingle), None, "{name}");
+            for role in Role::MOE_ROUTED
+                .into_iter()
+                .chain([Role::MoeSharedSwiglu, Role::MoeSharedLogit])
+            {
+                assert_eq!(
+                    compact.get(role).map(|r| r.len),
+                    layout.grouped.and_then(|g| g.len(role)),
+                    "{name}: {role:?}"
+                );
+            }
         }
     }
 
@@ -1124,11 +1362,13 @@ mod tests {
     }
 
     /// The compact arena of each served model's default route set at 2048
-    /// rows and 32768 keys (unshared: 2_050_547_712 B on the 27B,
-    /// 1_376_821_248 B on the 9B, 1_141_940_224 B on the 35B-A3B), and the
-    /// values whose bytes stack to its end. `f32(dim)` is a [2048, dim] F32
-    /// value; every byte count is a multiple of the region alignment, so the
-    /// stacks hold no padding.
+    /// rows and 32768 keys, and the values whose bytes stack to its end.
+    /// `f32(dim)` is a [2048, dim] F32 value; every byte count is a multiple
+    /// of the region alignment, so the stacks hold no padding. The unshared
+    /// arena holds what one buffer per value takes: 2_050_547_712 B on the
+    /// 27B and 1_376_821_248 B on the 9B; on the 35B-A3B 1_141_940_224 B and
+    /// the grouped MoE scratch's 215_512_068 B (W10 on), with 252 B of
+    /// padding after the expert bounds' 257 x 4 bytes.
     #[test]
     fn the_compact_sizes_of_the_served_models() {
         let f32 = |dim: usize| ROWS * dim * 4;
@@ -1214,6 +1454,12 @@ mod tests {
             assert_eq!(name, want_name);
             assert_eq!(arithmetic, bytes, "{name}");
             assert_eq!(layout.bytes(), bytes as u64, "{name}");
+            let one_buffer_each = match &name[..3] {
+                "27B" => 2_050_547_712,
+                "9B " => 1_376_821_248,
+                _ => 1_141_940_224 + 215_512_068 + 252,
+            };
+            assert_eq!(unshared(layout).bytes(), one_buffer_each, "{name}");
         }
     }
 }

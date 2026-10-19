@@ -158,13 +158,15 @@ pub(crate) struct PrefillRoutes {
 
 /// What [`alloc_prefill_workspace`] allocates: the scratch layouts for the
 /// longest slice, when the tiled attention is the route the score block's
-/// element count for the whole context, the paths a slice can take and the
-/// conversion scratch its GEMMs take.
+/// element count for the whole context, when a MoE layer takes the grouped
+/// route its scratch for the longest slice, the paths a slice can take and
+/// the conversion scratch its GEMMs take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefillWorkspaceLayout {
     pub scratch: PrefillScratchLayout,
     pub gdn: Option<GdnPrefillScratchLayout>,
     pub score_elems: Option<usize>,
+    pub grouped: Option<super::moe::PrefillGroupedLayout>,
     pub routes: PrefillRoutes,
     pub conversion: ConversionScratch,
     /// Place every value in its own region (the unshared layout) instead of
@@ -195,6 +197,7 @@ impl PrefillWorkspaceLayout {
         scratch: PrefillScratchLayout,
         gdn: Option<GdnPrefillScratchLayout>,
         score_elems: Option<usize>,
+        grouped: Option<super::moe::PrefillGroupedLayout>,
         routes: PrefillRoutes,
         conversion: ConversionScratch,
     ) -> Self {
@@ -202,6 +205,7 @@ impl PrefillWorkspaceLayout {
             scratch,
             gdn,
             score_elems,
+            grouped,
             routes,
             conversion,
             #[cfg(feature = "test-state-snapshot")]
@@ -351,6 +355,17 @@ pub(crate) mod test_models {
                     ROWS, self.gdn.0, self.gdn.1, self.gdn.2,
                 )),
                 attn_score_block_elems(ROWS, self.heads, self.kv_heads, CONTEXT - ROWS),
+                // 256 experts, 8 routed per token, the W10 gate+up on.
+                self.moe.then(|| super::super::moe::PrefillGroupedLayout {
+                    w10: true,
+                    ..super::super::moe::PrefillGroupedLayout::new(
+                        ROWS,
+                        8,
+                        256,
+                        self.hidden,
+                        self.inter,
+                    )
+                }),
                 PrefillRoutes {
                     plain_attention: false,
                     gdn_fused: true,
@@ -4372,6 +4387,7 @@ mod tests {
             scratch,
             Some(gdn),
             Some(scores),
+            None,
             PrefillRoutes::default(),
             ConversionScratch::default(),
         );

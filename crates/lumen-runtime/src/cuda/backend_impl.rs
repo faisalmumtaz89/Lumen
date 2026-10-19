@@ -8915,8 +8915,6 @@ impl CudaBackend {
             )
             .bytes();
         }
-        plan.moe_grouped =
-            Self::grouped_moe_layout(st, hp, ws.scratch.token_ids).map_or(0, |l| l.bytes());
         plan
     }
 
@@ -9025,6 +9023,7 @@ impl CudaBackend {
                 rows,
                 &scratch,
             ),
+            grouped: Self::grouped_moe_layout(st, hp, rows),
             #[cfg(feature = "test-state-snapshot")]
             unshared: st.unshared_prefill_workspace,
         }
@@ -11308,12 +11307,12 @@ impl CudaBackend {
                      num_experts={num_experts} engaged=1"
                 );
             }
-            let [mut normed, mut attn_proj, mut x] =
-                ws.regions([Role::Normed, Role::AttnProj, Role::X]);
+            let ([mut normed, mut attn_proj, mut x], mut grouped) =
+                ws.lend([Role::Normed, Role::AttnProj, Role::X]);
             super::moe::encode_moe_ffn_prefill_grouped(
                 &self.device,
                 &st.kernels,
-                moe_scratch,
+                &mut grouped,
                 &moe_meta,
                 batched_offsets,
                 repacked,
@@ -11349,11 +11348,11 @@ impl CudaBackend {
             && st.kernels.shared_down_q4_0_sigmoid_accum_batched.is_some()
             && st.kernels.shared_down_q4_0_residual_accum_batched.is_some();
         if use_batched_shared {
-            let [mut normed, mut x] = ws.regions([Role::Normed, Role::X]);
+            let ([mut normed, mut x], mut grouped) = ws.lend([Role::Normed, Role::X]);
             super::moe::encode_shared_expert_ffn_prefill_batched(
                 &self.device,
                 &st.kernels,
-                moe_scratch,
+                &mut grouped,
                 &moe_meta,
                 &moe_layer_blob,
                 &normed.f32().as_view(),
@@ -22145,11 +22144,11 @@ impl ComputeBackend for CudaBackend {
                 );
             }
         }
-        // The batched F32 prefill's workspace, for the longest slice and the
+        // The batched F32 prefill's workspace (the grouped MoE prefill scratch
+        // in it, when a layer takes that route), for the longest slice and the
         // whole context, so no request allocates it and every check below sees
-        // the memory net of it; and, for a GDN model, the recurrent state and
-        // the grouped MoE prefill scratch (at the slice's rows, when a layer
-        // takes that route) for the same reason.
+        // the memory net of it; and, for a GDN model, the recurrent state for
+        // the same reason.
         let before_workspace = if verbose {
             synced_free(&self.device)
         } else {
@@ -22183,24 +22182,19 @@ impl ComputeBackend for CudaBackend {
         if gdn_layers > 0 {
             st.gdn_scratch_gpu = Some(self.alloc_gdn_scratch(&cache)?);
         }
-        let grouped = Self::grouped_moe_layout(st, &hp_copy, prefill_layout.scratch.token_ids);
-        if let (Some(grouped), Some(moe_scratch)) = (grouped, st.moe_scratch.as_mut()) {
-            super::moe::ensure_prefill_grouped(moe_scratch, &self.device, &grouped)?;
-        }
         if verbose {
-            let planned = grouped.map_or(0, |g| g.bytes())
-                + if gdn_layers > 0 {
-                    super::gdn::GdnStateLayout::new(
-                        &super::gdn::GdnParams::from_hyperparams(&hp_copy),
-                        gdn_layers,
-                        gdn_register_resident(),
-                    )
-                    .bytes()
-                } else {
-                    0
-                };
+            let planned = if gdn_layers > 0 {
+                super::gdn::GdnStateLayout::new(
+                    &super::gdn::GdnParams::from_hyperparams(&hp_copy),
+                    gdn_layers,
+                    gdn_register_resident(),
+                )
+                .bytes()
+            } else {
+                0
+            };
             mem_line(
-                "GDN state and MoE prompt workspace",
+                "GDN state",
                 planned,
                 before_state,
                 synced_free(&self.device),

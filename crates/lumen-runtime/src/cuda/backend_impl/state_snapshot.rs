@@ -242,11 +242,11 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Fill every region of the retained F32 prefill workspace and every buffer
-    /// of the grouped MoE prefill scratch with 0xFF bytes (NaN as F32), so a
-    /// test can show no request reads a row of them that the request did not
-    /// write first. Returns which of the parts a model may not have were there
-    /// to fill.
+    /// Fill every region of the retained F32 prefill workspace, the grouped MoE
+    /// prefill scratch's among them, with 0xFF bytes (NaN as F32), so a test
+    /// can show no request reads a row of them that the request did not write
+    /// first. Returns which of the parts a model may not have were there to
+    /// fill.
     pub fn poison_prefill_workspace(&self) -> Result<PoisonedParts, RuntimeError> {
         use super::super::workspace::{Elem, Role};
         use cudarc::driver::{DevicePtr, DeviceSlice};
@@ -283,47 +283,25 @@ impl CudaBackend {
                     let view = region.u32();
                     poison!(view);
                 }
+                Elem::I32 => {
+                    let view = region.i32();
+                    poison!(view);
+                }
                 Elem::U8 => {
                     let view = region.u8();
                     poison!(view);
                 }
+                Elem::I8 => {
+                    let view = region.i8();
+                    poison!(view);
+                }
             }
         }
-        let mut parts = PoisonedParts {
+        let parts = PoisonedParts {
             q_gate: ws.has(Role::QGateFused),
             score_block: ws.has(Role::Scores),
-            ..PoisonedParts::default()
+            grouped_moe: ws.has(Role::MoeRouterLogits),
         };
-        if let Some(m) = st
-            .moe_scratch
-            .as_ref()
-            .and_then(|m| m.prefill_grouped.as_ref())
-        {
-            poison!(
-                m.swiglu_compact,
-                m.down_compact,
-                m.col_expert,
-                m.col_src_tok,
-                m.dst_to_col,
-                m.expert_bounds,
-                m.gate_up_tiles16,
-                m.router_logits_batched,
-                m.expert_ids_batched,
-                m.expert_weights_batched,
-                m.shared_swiglu_batched,
-                m.shared_logit_batched,
-            );
-            for q in m.w10_xq_q.iter() {
-                poison!(q);
-            }
-            for d in m.w10_xq_d.iter() {
-                poison!(d);
-            }
-            for t in m.w10_tiles.iter() {
-                poison!(t);
-            }
-            parts.grouped_moe = true;
-        }
         self.device.synchronize()?;
         Ok(parts)
     }
