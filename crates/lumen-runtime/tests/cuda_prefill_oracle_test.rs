@@ -2,8 +2,9 @@
 //! the prefill stores its intermediates can be shown to leave every bit as it
 //! was. For each model, KV precision and prompt length the test prefills a
 //! prompt, decodes four tokens and prefills a second prompt after them, and
-//! digests the hidden states, the logits, the KV cache and the GDN state at
-//! each step. `LUMEN_PREFILL_ORACLE=capture` writes the digests to
+//! digests the hidden states, the logits and, on an F32 KV store (the one
+//! state snapshots cover), the KV cache and the GDN state at each step; on a
+//! 16-bit store the decode logits, which read the cache, stand for it. `LUMEN_PREFILL_ORACLE=capture` writes the digests to
 //! `LUMEN_PREFILL_ORACLE_FILE`; `check` compares them with that file and names
 //! every case that differs.
 #![cfg(all(feature = "cuda", feature = "test-state-snapshot"))]
@@ -113,10 +114,12 @@ fn run(lbc: &[u8], label: &str, lines: &mut Vec<String>) {
             let hidden = cuda
                 .prefill(&prompt(len, vocab, n), &provider, &mut kv)
                 .unwrap_or_else(|e| panic!("{case}: prefill: {e}"));
-            let snap = cuda.snapshot_state(&kv).unwrap();
+            let snap = (precision == KvPrecision::F32).then(|| cuda.snapshot_state(&kv).unwrap());
             step("prefill", &|h| {
                 digest_f32(h, &hidden);
-                digest_state(h, &snap);
+                if let Some(snap) = &snap {
+                    digest_state(h, snap);
+                }
             });
             let mut token = (len % vocab) as u32;
             for d in 0..4 {
@@ -129,10 +132,12 @@ fn run(lbc: &[u8], label: &str, lines: &mut Vec<String>) {
             let hidden = cuda
                 .prefill(&prompt(CONTINUATION, vocab, n + 100), &provider, &mut kv)
                 .unwrap_or_else(|e| panic!("{case}: continuation: {e}"));
-            let snap = cuda.snapshot_state(&kv).unwrap();
+            let snap = (precision == KvPrecision::F32).then(|| cuda.snapshot_state(&kv).unwrap());
             step("continuation", &|h| {
                 digest_f32(h, &hidden);
-                digest_state(h, &snap);
+                if let Some(snap) = &snap {
+                    digest_state(h, snap);
+                }
             });
         }
     }
