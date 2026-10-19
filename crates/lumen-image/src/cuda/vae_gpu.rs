@@ -1837,7 +1837,8 @@ unsafe fn sgemm(
 /// Compile `vae_ops.cu` and `vae_conv.cu` and resolve their entry points.
 fn load_ops(dev: &CudaDevice) -> Result<VaeOps, RuntimeError> {
     let module: Arc<_> = dev.compile_and_load(VAE_OPS_SOURCE)?;
-    let conv_module: Arc<_> = dev.compile_and_load_with_arch(VAE_CONV_SOURCE, "compute_80")?;
+    let conv_module: Arc<_> =
+        dev.compile_and_load_with_arch(VAE_CONV_SOURCE, crate::pipeline::MIN_COMPUTE_TARGET)?;
     let get = |module: &Arc<cudarc::driver::CudaModule>,
                name: &str|
      -> Result<CudaFunction, RuntimeError> {

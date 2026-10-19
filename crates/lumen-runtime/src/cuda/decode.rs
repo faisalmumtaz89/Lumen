@@ -1256,7 +1256,7 @@ pub(crate) fn compile_all_kernels(
 
     // For kernels needing SM 80+ features.
     let load_fn_sm80 = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
-        let module = device.compile_and_load_with_arch(source, "compute_80")?;
+        let module = device.compile_and_load_with_arch(source, SM80_TARGET)?;
         module.load_function(name).map_err(|e| {
             RuntimeError::Compute(format!("Failed to load SM80 CUDA kernel '{name}': {e}"))
         })
@@ -1296,7 +1296,7 @@ pub(crate) fn compile_all_kernels(
     // --prec-div=false --prec-sqrt=false). Accelerates scale multiplication
     // in bandwidth-bound GEMV kernels where full FP precision is unnecessary.
     let load_fn_sm80_fast_math = |source: &str, name: &str| -> Result<CudaFunction, RuntimeError> {
-        let module = device.compile_and_load_with_arch_fast_math(source, "compute_80")?;
+        let module = device.compile_and_load_with_arch_fast_math(source, SM80_TARGET)?;
         module.load_function(name).map_err(|e| {
             RuntimeError::Compute(format!(
                 "Failed to load SM80 fast_math CUDA kernel '{name}': {e}"
@@ -4362,6 +4362,21 @@ pub(crate) fn fused_glu_shared_bytes_f16(hidden_dim: u32) -> u32 {
 /// F32 variant covers hidden_dim <= 12288 (12288 * 4 = 49152).
 /// F16 variant covers hidden_dim <= 24576 (24576 * 2 = 49152).
 pub(crate) const FUSED_GLU_SHMEM_LIMIT: u32 = 49152;
+
+/// The NVRTC target of the kernels that need SM 80 features, the Q8_1
+/// activation quantizer among them: the compute capability CUDA's native
+/// K-quant route needs
+/// ([`CUDA_KQUANT_COMPUTE_CAPABILITY`](lumen_format::serving_rules::CUDA_KQUANT_COMPUTE_CAPABILITY)).
+const SM80_TARGET: &str = "compute_80";
+
+#[cfg(test)]
+mod sm80_target_tests {
+    #[test]
+    fn the_sm80_target_is_the_kquant_route_compute_capability() {
+        let (major, minor) = lumen_format::serving_rules::CUDA_KQUANT_COMPUTE_CAPABILITY;
+        assert_eq!(super::SM80_TARGET, format!("compute_{major}{minor}"));
+    }
+}
 
 #[cfg(test)]
 mod announce_route_once_tests {

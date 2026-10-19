@@ -74,7 +74,7 @@ impl ImageKernels {
             f32_to_bf16_bits: get("f32_to_bf16_bits")?,
             mask_softmax_rows: get("mask_softmax_rows")?,
             flash_attn: device
-                .compile_and_load_with_arch(FLASH_ATTN_SOURCE, "compute_80")?
+                .compile_and_load_with_arch(FLASH_ATTN_SOURCE, crate::pipeline::MIN_COMPUTE_TARGET)?
                 .load_function("flash_attn_bf16")
                 .map_err(|e| RuntimeError::Compute(format!("load flash_attn_bf16: {e}")))?,
         })

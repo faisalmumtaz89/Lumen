@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **A model the GPU cannot run was downloaded and converted before it was refused.** On a Tesla T4
+  (compute capability 7.5) `lumen pull qwen3.8-27b:q4_k_m` offered the 16.2 GB download, and the
+  conversion that follows, although the K-quants need 8.0; the refusal then named a missing kernel,
+  not the cause. On an A100-80GB `lumen run qwen3.8-27b:bf16` downloaded 54.7 GB and converted it
+  before failing with an out-of-memory error, because below 9.0 the BF16 weights are held as F32 and
+  take at least 91 GiB. `lumen run`, `lumen pull` and `lumen-server` (which pulls through it) now refuse
+  both before the first byte, saying why and listing the quantizations not ruled out on that GPU, from
+  which the K-quants are now dropped on a GPU below 8.0. The image commands are also refused on a GPU
+  below 8.0 before downloading, and their memory refusal no longer cites a 2048x2048 generation for a
+  1024x1024 or 512x512 request.
+
 ## [0.48.5] — 2026-10-19
 
 ### Fixed

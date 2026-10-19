@@ -21777,6 +21777,18 @@ impl ComputeBackend for CudaBackend {
                     }
                 }
             }
+            // below the route's compute capability nothing it needs can load: say so, and
+            // what serves instead; above it the missing kernel or scratch is the diagnosis
+            let (need_major, need_minor) =
+                lumen_format::serving_rules::CUDA_KQUANT_COMPUTE_CAPABILITY;
+            let below = match self.device.compute_capability() {
+                Ok(cc) if cc < (need_major, need_minor) => format!(
+                    "; the K-quant route needs compute capability {need_major}.{need_minor} and \
+                     this device is {}.{}, so serve a Q4_0 or Q8_0 model on it",
+                    cc.0, cc.1
+                ),
+                _ => String::new(),
+            };
             for (tag, needed, group) in [
                 ("q4_k", needed[0], st.kernels.kq4.is_some()),
                 ("q5_k", needed[1], st.kernels.kq5.is_some()),
@@ -21786,7 +21798,7 @@ impl ComputeBackend for CudaBackend {
                     return Err(RuntimeError::Compute(format!(
                         "CUDA: this is a K-quant artifact and the {tag} kernels did not load on \
                          this device (see the `[CUDA] kquant {tag}: FAILED` line above); refused \
-                         at load rather than at the first token"
+                         at load rather than at the first token{below}"
                     )));
                 }
             }
@@ -21798,12 +21810,11 @@ impl ComputeBackend for CudaBackend {
             if needed.iter().any(|&n| n)
                 && (st.kernels.quantize_f32_to_q8_1.is_none() || st.scratch.input_q8_1.is_none())
             {
-                return Err(RuntimeError::Compute(
+                return Err(RuntimeError::Compute(format!(
                     "CUDA: this is a K-quant artifact and the Q8_1 activation quantizer \
                      (`quantize_f32_to_q8_1`) or its scratch is unavailable on this device; \
-                     refused at load rather than at the first token"
-                        .into(),
-                ));
+                     refused at load rather than at the first token{below}"
+                )));
             }
         }
         if crate::runtime_defaults::kquant_artifact()

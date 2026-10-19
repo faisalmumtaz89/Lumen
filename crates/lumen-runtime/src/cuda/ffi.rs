@@ -48,6 +48,23 @@ pub fn device_total_memory(ordinal: usize) -> Option<u64> {
     Some(total as u64)
 }
 
+/// Compute capability of CUDA device `ordinal` as `(major, minor)`, read from
+/// the driver without creating a context; `None` when the CUDA libraries or the
+/// driver cannot be loaded or there is no such device.
+pub fn device_compute_capability(ordinal: usize) -> Option<(i32, i32)> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    if ordinal >= device_count().ok()? {
+        return None;
+    }
+    let dev = cudarc::driver::result::device::get(i32::try_from(ordinal).ok()?).ok()?;
+    // SAFETY: `dev` is a device handle cuDeviceGet returned after cuInit.
+    let attribute = |a| unsafe { cudarc::driver::result::device::get_attribute(dev, a) }.ok();
+    Some((
+        attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+        attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+    ))
+}
+
 /// Fail with an error that names the CUDA libraries that cannot be loaded.
 /// cudarc panics on the first use of a missing library, so the entry points
 /// check them before any driver, cuBLAS or NVRTC call.
