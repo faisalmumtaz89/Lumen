@@ -1299,6 +1299,14 @@ mod tests {
                     }
                 }
             }
+            for role in Role::ALL {
+                if regions.get(role).is_some() {
+                    assert!(
+                        live[role as usize].iter().any(|&l| l),
+                        "{name}: {role:?} has a region but no operation holds it"
+                    );
+                }
+            }
             for role in [Role::DequantF32, Role::ActivationF16, Role::DequantF16] {
                 assert_eq!(
                     regions.get(role).map(|r| r.len),
@@ -1309,6 +1317,102 @@ mod tests {
             for role in Role::ALL {
                 if let Some(r) = regions.get(role) {
                     assert_eq!(r.offset % REGION_ALIGN, 0, "{name}: {role:?}");
+                }
+            }
+        }
+    }
+
+    /// Values the prefill holds at one instant, read off `prefill_slice`,
+    /// `prefill_gdn_layer` and `prefill_moe_ffn_layer` independently of the
+    /// liveness table (the census of the workspace's values), with the route
+    /// each instant is on: the compact regions of each set share no byte.
+    #[test]
+    fn the_values_the_code_holds_together_lie_apart() {
+        use Role::*;
+        type Taken = fn(&PrefillWorkspaceLayout) -> bool;
+        let fused: Taken = |l| l.scratch.q_gate.is_some();
+        let tiled: Taken = |l| l.scratch.q_gate.is_some() && l.score_elems.is_some();
+        let plain: Taken = |l| l.routes.plain_attention;
+        let dense: Taken = |l| l.routes.dense_ffn;
+        let gdn: Taken = |l| l.gdn.is_some();
+        let gdn_fused: Taken = |l| l.gdn.is_some() && l.routes.gdn_fused;
+        let gdn_loop: Taken = |l| l.gdn.is_some() && !l.routes.gdn_fused;
+        let moe: Taken = |l| l.routes.moe_ffn;
+        // A GEMM's operands with each conversion arm.
+        let f16 = [ActivationF16, DequantF16];
+        let f32_ = [DequantF32];
+        let mut instants: Vec<(Taken, Vec<Role>)> = Vec::new();
+        for arm in [&f16[..], &f32_[..]] {
+            let gemm = |operands: &[Role]| [operands, arm].concat();
+            // wv, with the fused Q+gate and K still to be read.
+            instants.push((fused, gemm(&[X, Normed, QGateFused, K, V])));
+            instants.push((fused, gemm(&[X, AttnOut, AttnProj])));
+            instants.push((plain, gemm(&[X, Normed, Q, K, V])));
+            instants.push((plain, gemm(&[X, AttnOut, AttnProj])));
+            instants.push((dense, gemm(&[X, Normed, AttnProj, Gate, Up])));
+            instants.push((dense, gemm(&[X, AttnProj, Gate, Down])));
+            // gdn_beta, with the other three projections still to be read.
+            instants.push((
+                gdn,
+                gemm(&[X, Normed, GdnQkv, GdnGate, GdnAlphaRaw, GdnBetaRaw]),
+            ));
+            instants.push((gdn, gemm(&[X, GdnOut, AttnProj])));
+        }
+        instants.extend([
+            (fused, vec![X, QGateFused, Q, QGateGate, K, V]),
+            (tiled, vec![X, Q, QGateGate, AttnOut, Scores]),
+            (fused, vec![X, Q, QGateGate, AttnOut]),
+            (plain, vec![X, Q, K, V]),
+            (dense, vec![X, AttnProj, Gate, Up]),
+            (
+                gdn_fused,
+                vec![X, GdnQkv, GdnGate, GdnAlphaRaw, GdnBetaRaw, GdnConvOut],
+            ),
+            (
+                gdn_fused,
+                vec![
+                    X,
+                    GdnGate,
+                    GdnConvOut,
+                    GdnAlphaRaw,
+                    GdnBetaRaw,
+                    GdnAlphaOut,
+                    GdnBetaOut,
+                ],
+            ),
+            (
+                gdn_fused,
+                vec![X, GdnGate, GdnConvOut, GdnAlphaOut, GdnBetaOut, GdnRawOut],
+            ),
+            (gdn_fused, vec![X, GdnGate, GdnRawOut, GdnOut]),
+            (
+                gdn_loop,
+                vec![X, GdnQkv, GdnAlphaRaw, GdnBetaRaw, GdnGate, GdnOut],
+            ),
+            (
+                moe,
+                [&[X, Normed, AttnProj][..], &Role::MOE_ROUTED].concat(),
+            ),
+            (moe, vec![X, Normed, MoeSharedSwiglu, MoeSharedLogit]),
+        ]);
+        for (name, layout) in every_route_set() {
+            let regions = compact(&layout, &liveness(&layout));
+            for (taken, roles) in &instants {
+                if !taken(&layout) {
+                    continue;
+                }
+                let here: Vec<(Role, Region)> = roles
+                    .iter()
+                    .filter_map(|&role| regions.get(role).map(|r| (role, r)))
+                    .collect();
+                for i in 0..here.len() {
+                    for j in 0..i {
+                        let ((a, ra), (b, rb)) = (here[j], here[i]);
+                        assert!(
+                            ra.end(a) <= rb.offset || rb.end(b) <= ra.offset,
+                            "{name}: {a:?} and {b:?} share bytes"
+                        );
+                    }
                 }
             }
         }

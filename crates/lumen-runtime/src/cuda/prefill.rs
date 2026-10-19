@@ -4562,8 +4562,8 @@ mod tests {
             got,
             sizes(None, Some(ROWS * 4096 * 2), Some(2 * 2048 * 4096))
         );
-        // With the MMQ switch set, the residual GEMMs take MMQ too, and only
-        // the cache arm of the alpha/beta pair converts anything.
+        // With the MMQ switch set, the residual GEMMs take MMQ too, and the
+        // alpha/beta pair prefers MMQ over its cache: nothing converts.
         let mmq_everywhere = GemmSwitches {
             q8_proj_mmq_set: true,
             ..moe_switches(false)
@@ -4574,6 +4574,21 @@ mod tests {
             &mmq_everywhere,
         );
         assert_eq!(got, ConversionScratch::default());
+    }
+
+    /// A model whose only converting GEMM is the cached alpha/beta pair (MoE
+    /// planes, Q8_0 gates) takes the activation scratch at the pair's
+    /// hidden-wide row for the cache arm, and the F32 scratch at the largest
+    /// plane (the fused Q+gate and GDN QKV weights, 8192 x 2048).
+    #[test]
+    fn the_f16_cache_arm_takes_the_activation_scratch() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Planar, WeightClass::Q8Raw, true),
+            &moe_switches(false),
+        );
+        assert_eq!(got, sizes(Some(8192 * 2048), Some(ROWS * 2048 * 2), None));
     }
 
     /// MoE BF16: BF16 GEMMs convert their activations (widest row 4096), the
