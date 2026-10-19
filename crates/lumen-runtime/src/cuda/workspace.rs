@@ -1,5 +1,5 @@
 //! The batched F32 prefill's workspace: one device allocation holding every
-//! value the prefill keeps between kernels, each value (a [`Role`]) in its own
+//! value the prefill keeps between kernels, each value (a [`Role`]) in a
 //! region of it.
 //!
 //! The workspace is sized for the longest slice a request can run, allocated
@@ -8,6 +8,12 @@
 //! caller borrows the regions one operation needs with
 //! [`Workspace::regions`], which refuses two regions that share a byte, so
 //! the operands of one call never alias.
+//!
+//! [`liveness`] lists the operations of a slice and the values each reads,
+//! writes or uses up inside itself; a value is live from the operation that
+//! writes it to the last one that reads it. [`compact`] lets two values share
+//! bytes only when no operation has both live, so a value keeps its bytes
+//! from its writer to its last reader.
 
 use cudarc::driver::{CudaSlice, CudaViewMut};
 
@@ -64,18 +70,20 @@ pub(crate) enum Role {
     Down,
     /// Token IDs: [batch].
     TokenIds,
-    /// Single-token Q: [q_dim]. Never read.
+    /// Single-token Q: [q_dim]. Never read; only the unshared layout holds it.
     QSingle,
-    /// Single-token attention output: [q_dim]. Never read.
+    /// Single-token attention output: [q_dim]. Never read; only the unshared
+    /// layout holds it.
     AttnOutSingle,
     /// F32 scratch for a dequantized projection weight, sized to the largest
-    /// one; the operand of the SGEMM routes.
+    /// one a GEMM's route decodes into it; the operand of the SGEMM routes.
     DequantF32,
     /// F16 (or BF16) activation scratch for the HGEMM input conversion, in
-    /// bytes: [batch * max_in_dim * 2].
+    /// bytes: [batch * in_dim * 2] for the widest row a route converts.
     ActivationF16,
     /// F16 scratch for a dequantized projection weight, in bytes, sized to
-    /// the largest one; the operand of the dequant-to-F16 HGEMM routes.
+    /// the largest one a GEMM's route dequantizes into it; the operand of the
+    /// dequant-to-F16 HGEMM routes.
     DequantF16,
     /// Score block of the tiled SGEMM prefill attention: `group × min(rows,
     /// 512) × context` F32, reused across every KV head, layer and request.
@@ -246,37 +254,45 @@ fn assert_apart((a, ra): (Role, Region), (b, rb): (Role, Region)) {
     );
 }
 
-/// The layout that gives every role `layout` has a value for its own region,
-/// in [`Role::ALL`]'s order: the bytes of one buffer per value, each offset
-/// rounded up to [`REGION_ALIGN`]. The Q+gate pair is present only when a
-/// layer fuses them, the score block only when the tiled attention is the
-/// route, the GDN values only for a model with GDN layers.
-pub(crate) fn unshared(layout: &PrefillWorkspaceLayout) -> RegionTable {
+/// The element count of `role`'s value in `layout` with the conversion
+/// scratch sized to the model's largest weight and widest row; `None` when
+/// the model has no such value. The Q+gate pair is present only when a layer
+/// fuses them, the score block only when the tiled attention is the route,
+/// the GDN values only for a model with GDN layers.
+fn unshared_len(layout: &PrefillWorkspaceLayout, role: Role) -> Option<usize> {
     let s = &layout.scratch;
     let gdn = layout.gdn;
+    match role {
+        Role::X | Role::Normed | Role::AttnProj | Role::Down => Some(s.hidden),
+        Role::Q | Role::AttnOut => Some(s.q),
+        Role::K | Role::V => Some(s.kv),
+        Role::QGateFused => s.q_gate.map(|(fused, _)| fused),
+        Role::QGateGate => s.q_gate.map(|(_, gate)| gate),
+        Role::Gate | Role::Up => Some(s.inter),
+        Role::TokenIds => Some(s.token_ids),
+        Role::QSingle | Role::AttnOutSingle => Some(s.q_single),
+        Role::DequantF32 => Some(s.dequant_f32),
+        Role::ActivationF16 => Some(s.activation_f16),
+        Role::DequantF16 => Some(s.dequant_f16),
+        Role::Scores => layout.score_elems,
+        Role::GdnQkv | Role::GdnConvOut => gdn.map(|g| g.qkv),
+        Role::GdnAlphaRaw | Role::GdnBetaRaw | Role::GdnAlphaOut | Role::GdnBetaOut => {
+            gdn.map(|g| g.heads)
+        }
+        Role::GdnGate | Role::GdnOut | Role::GdnRawOut => gdn.map(|g| g.value),
+    }
+}
+
+/// The layout that gives every role `layout` has a value for its own region,
+/// in [`Role::ALL`]'s order: the bytes of one buffer per value, each offset
+/// rounded up to [`REGION_ALIGN`], the conversion scratch sized to the
+/// model's largest weight and widest row.
+#[cfg(any(test, feature = "test-state-snapshot"))]
+pub(crate) fn unshared(layout: &PrefillWorkspaceLayout) -> RegionTable {
     let mut table = RegionTable::default();
     let mut end = 0usize;
     for role in Role::ALL {
-        let len = match role {
-            Role::X | Role::Normed | Role::AttnProj | Role::Down => Some(s.hidden),
-            Role::Q | Role::AttnOut => Some(s.q),
-            Role::K | Role::V => Some(s.kv),
-            Role::QGateFused => s.q_gate.map(|(fused, _)| fused),
-            Role::QGateGate => s.q_gate.map(|(_, gate)| gate),
-            Role::Gate | Role::Up => Some(s.inter),
-            Role::TokenIds => Some(s.token_ids),
-            Role::QSingle | Role::AttnOutSingle => Some(s.q_single),
-            Role::DequantF32 => Some(s.dequant_f32),
-            Role::ActivationF16 => Some(s.activation_f16),
-            Role::DequantF16 => Some(s.dequant_f16),
-            Role::Scores => layout.score_elems,
-            Role::GdnQkv | Role::GdnConvOut => gdn.map(|g| g.qkv),
-            Role::GdnAlphaRaw | Role::GdnBetaRaw | Role::GdnAlphaOut | Role::GdnBetaOut => {
-                gdn.map(|g| g.heads)
-            }
-            Role::GdnGate | Role::GdnOut | Role::GdnRawOut => gdn.map(|g| g.value),
-        };
-        if let Some(len) = len {
+        if let Some(len) = unshared_len(layout, role) {
             let region = Region {
                 offset: end.next_multiple_of(REGION_ALIGN),
                 len,
@@ -284,6 +300,298 @@ pub(crate) fn unshared(layout: &PrefillWorkspaceLayout) -> RegionTable {
             end = region.end(role);
             table.regions[role as usize] = Some(region);
         }
+    }
+    table
+}
+
+/// One operation of a prefill slice and the values it touches: `reads`
+/// values an earlier operation wrote, `writes` values a later one reads (an
+/// in-place operation reads and writes its value), `scratch` values it
+/// writes and uses up itself. An operation on a path the load cannot take
+/// touches no value.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Step {
+    pub name: &'static str,
+    pub reads: &'static [Role],
+    pub writes: &'static [Role],
+    pub scratch: &'static [Role],
+}
+
+struct Steps(Vec<Step>);
+
+impl Steps {
+    fn op(
+        &mut self,
+        on: bool,
+        name: &'static str,
+        reads: &'static [Role],
+        writes: &'static [Role],
+        scratch: &'static [Role],
+    ) {
+        let (reads, writes, scratch) = if on {
+            (reads, writes, scratch)
+        } else {
+            (&[][..], &[][..], &[][..])
+        };
+        self.0.push(Step {
+            name,
+            reads,
+            writes,
+            scratch,
+        });
+    }
+
+    /// A projection or residual GEMM, as its two conversion arms: the F32
+    /// dequant scratch, or the F16 activation and weight pair (an arm takes
+    /// one of the two or neither, never both).
+    fn gemm(
+        &mut self,
+        on: bool,
+        name: &'static str,
+        reads: &'static [Role],
+        writes: &'static [Role],
+    ) {
+        self.op(on, name, reads, writes, &[Role::DequantF32]);
+        self.op(
+            on,
+            name,
+            reads,
+            writes,
+            &[Role::ActivationF16, Role::DequantF16],
+        );
+    }
+
+    /// The FFN that follows a layer's attention or GDN block, from its
+    /// output in `AttnProj` to the layer's output in `X`.
+    fn ffn(&mut self, dense: bool, moe: bool) {
+        use Role::*;
+        self.op(dense, "FFN norm", &[AttnProj], &[Normed], &[]);
+        self.gemm(dense, "FFN gate", &[Normed], &[Gate]);
+        self.gemm(dense, "FFN up", &[Normed], &[Up]);
+        self.op(dense, "SwiGLU", &[Gate, Up], &[Gate], &[]);
+        self.gemm(dense, "FFN down", &[Gate], &[Down]);
+        self.op(dense, "FFN residual", &[AttnProj, Down], &[AttnProj], &[]);
+        self.op(dense, "FFN output", &[AttnProj], &[X], &[]);
+        // `prefill_moe_ffn_layer`: the normed dump, the routed experts (grouped
+        // or per token, the residual in AttnProj, the output in X), the shared
+        // expert accumulating into X, the probes and AttnProj made X's copy.
+        self.op(moe, "MoE norm", &[AttnProj], &[Normed], &[]);
+        self.op(moe, "MoE normed dump", &[Normed], &[], &[]);
+        self.op(moe, "MoE routed experts", &[Normed, AttnProj], &[X], &[]);
+        self.op(moe, "MoE shared expert", &[Normed, X], &[X], &[]);
+        self.op(moe, "MoE probe", &[X, AttnProj], &[], &[]);
+        self.op(moe, "MoE output", &[X], &[AttnProj], &[]);
+    }
+}
+
+/// The operations of one prefill slice for `layout`'s model, in order: the
+/// embedding, an attention layer of each kind (with the fused Q+gate
+/// projection, without it), a GDN layer (fused state update, per-token
+/// loop), each followed by its FFN (dense, MoE), and the slice's last row.
+/// No value but `X` outlives a layer, so one layer of each kind stands for
+/// all of them. Diagnostic reads (probes, dumps) are operations of their own
+/// at the point they run.
+pub(crate) fn liveness(layout: &PrefillWorkspaceLayout) -> Vec<Step> {
+    use Role::*;
+    let r = layout.routes;
+    let fused = layout.scratch.q_gate.is_some();
+    let tiled = fused && layout.score_elems.is_some();
+    let gdn = layout.gdn.is_some();
+    let (gdn_fused, gdn_loop) = (gdn && r.gdn_fused, gdn && !r.gdn_fused);
+    let mut t = Steps(Vec::new());
+    t.op(true, "token upload", &[], &[TokenIds], &[]);
+    t.op(true, "embed", &[TokenIds], &[X], &[]);
+
+    t.op(fused, "attention norm", &[X], &[Normed], &[]);
+    t.gemm(fused, "wq_qgate", &[Normed], &[QGateFused]);
+    t.gemm(fused, "wk", &[Normed], &[K]);
+    t.gemm(fused, "wv", &[Normed], &[V]);
+    t.op(
+        fused,
+        "Q+gate deinterleave",
+        &[QGateFused],
+        &[Q, QGateGate],
+        &[],
+    );
+    t.op(fused, "Q and K norms", &[Q, K], &[Q, K], &[]);
+    t.op(fused, "RoPE", &[Q, K], &[Q, K], &[]);
+    t.op(fused, "RoPE probe", &[Q, K, V], &[], &[]);
+    t.op(fused, "KV write", &[K, V], &[], &[]);
+    t.op(tiled, "tiled attention", &[Q], &[AttnOut], &[Scores]);
+    t.op(fused, "scalar attention", &[Q], &[AttnOut], &[]);
+    t.op(fused, "attention probe", &[AttnOut], &[], &[]);
+    // The gated output goes through Q, free after the attention, and back.
+    t.op(fused, "sigmoid gate", &[QGateGate, AttnOut], &[Q], &[]);
+    t.op(fused, "gated output copy", &[Q], &[AttnOut], &[]);
+    t.gemm(fused, "wo + residual", &[AttnOut, X], &[AttnProj]);
+    t.ffn(fused && r.dense_ffn, fused && r.moe_ffn);
+
+    let plain = r.plain_attention;
+    t.op(plain, "attention norm", &[X], &[Normed], &[]);
+    t.gemm(plain, "wq", &[Normed], &[Q]);
+    t.gemm(plain, "wk", &[Normed], &[K]);
+    t.gemm(plain, "wv", &[Normed], &[V]);
+    t.op(plain, "QKV bias", &[Q, K, V], &[Q, K, V], &[]);
+    t.op(plain, "RoPE", &[Q, K], &[Q, K], &[]);
+    t.op(plain, "KV write", &[K, V], &[], &[]);
+    t.op(plain, "scalar attention", &[Q], &[AttnOut], &[]);
+    t.gemm(plain, "wo + residual", &[AttnOut, X], &[AttnProj]);
+    t.ffn(plain && r.dense_ffn, plain && r.moe_ffn);
+
+    t.op(gdn, "GDN norm", &[X], &[Normed], &[]);
+    t.gemm(gdn, "gdn_qkv", &[Normed], &[GdnQkv]);
+    t.gemm(gdn, "gdn_gate", &[Normed], &[GdnGate]);
+    t.gemm(gdn, "gdn_alpha", &[Normed], &[GdnAlphaRaw]);
+    t.gemm(gdn, "gdn_beta", &[Normed], &[GdnBetaRaw]);
+    t.op(
+        gdn,
+        "GDN projection probe",
+        &[GdnQkv, GdnAlphaRaw, GdnBetaRaw, GdnGate],
+        &[],
+        &[],
+    );
+    t.op(gdn_fused, "conv1d + SiLU", &[GdnQkv], &[GdnConvOut], &[]);
+    // The raw gates' dumps run after the gates kernel, in this operation.
+    t.op(
+        gdn_fused,
+        "gates",
+        &[GdnAlphaRaw, GdnBetaRaw],
+        &[GdnAlphaOut, GdnBetaOut],
+        &[],
+    );
+    t.op(gdn_fused, "Q/K L2 norm", &[GdnConvOut], &[GdnConvOut], &[]);
+    t.op(
+        gdn_fused,
+        "state scan",
+        &[GdnConvOut, GdnAlphaOut, GdnBetaOut],
+        &[GdnRawOut],
+        &[],
+    );
+    t.op(
+        gdn_fused,
+        "norm + gate",
+        &[GdnRawOut, GdnGate],
+        &[GdnOut],
+        &[],
+    );
+    // Each token reads its row of the projections and writes its output row.
+    t.op(
+        gdn_loop,
+        "per-token state update",
+        &[GdnQkv, GdnAlphaRaw, GdnBetaRaw, GdnGate],
+        &[GdnOut],
+        &[],
+    );
+    t.gemm(gdn, "gdn_ssm_out + residual", &[GdnOut, X], &[AttnProj]);
+    t.op(gdn, "GDN output dump", &[AttnProj], &[], &[]);
+    t.ffn(gdn && r.dense_ffn, gdn && r.moe_ffn);
+
+    t.op(true, "last row", &[X], &[], &[]);
+    t.0
+}
+
+/// For each role, whether its value is live at each operation of `table`:
+/// from an operation that writes it to the last that reads what it wrote,
+/// and at each operation it is scratch of. `X` is live throughout: every
+/// layer carries it to the next, and the slice's last row is read from it
+/// after the last.
+fn live(table: &[Step]) -> [Vec<bool>; ROLES] {
+    std::array::from_fn(|i| {
+        let role = Role::ALL[i];
+        let mut live = vec![role == Role::X; table.len()];
+        let mut written = None;
+        for (s, step) in table.iter().enumerate() {
+            if step.reads.contains(&role) {
+                let w = written.unwrap_or_else(|| {
+                    panic!("workspace: {} reads {role:?} before a write", step.name)
+                });
+                live[w..=s].fill(true);
+            }
+            if step.writes.contains(&role) {
+                written = Some(s);
+                live[s] = true;
+            }
+            if step.scratch.contains(&role) {
+                live[s] = true;
+            }
+        }
+        live
+    })
+}
+
+/// The element count of each role's region in the compact layout: as in the
+/// unshared one, but the conversion scratch sized per GEMM route
+/// (`layout.conversion`), and none for a value no path of this load writes:
+/// the single-token pair (never read), the attention values of a model with
+/// no attention layer, the dense FFN values of a model with no dense FFN,
+/// the fused state update's values when the GDN layers take the per-token
+/// loop.
+fn compact_len(layout: &PrefillWorkspaceLayout, role: Role) -> Option<usize> {
+    let r = layout.routes;
+    let attention = layout.scratch.q_gate.is_some() || r.plain_attention;
+    match role {
+        Role::QSingle | Role::AttnOutSingle => None,
+        Role::Q | Role::K | Role::V | Role::AttnOut if !attention => None,
+        Role::Gate | Role::Up | Role::Down if !r.dense_ffn => None,
+        Role::GdnConvOut | Role::GdnAlphaOut | Role::GdnBetaOut | Role::GdnRawOut
+            if !r.gdn_fused =>
+        {
+            None
+        }
+        Role::DequantF32 => layout.conversion.dequant_f32,
+        Role::ActivationF16 => layout.conversion.activation_f16,
+        Role::DequantF16 => layout.conversion.dequant_f16,
+        _ => unshared_len(layout, role),
+    }
+}
+
+/// The layout that lets values share bytes: each role `layout` has a value
+/// for gets a region apart from the region of every role live at an
+/// operation of `table` it is live at. Roles are placed largest first (a
+/// role live throughout before all, as it is apart from every other), each
+/// at the lowest offset, a multiple of [`REGION_ALIGN`], clear of the
+/// regions already placed for the roles live with it.
+pub(crate) fn compact(layout: &PrefillWorkspaceLayout, table: &[Step]) -> RegionTable {
+    let live = live(table);
+    let together = |a: Role, b: Role| {
+        live[a as usize]
+            .iter()
+            .zip(&live[b as usize])
+            .any(|(&x, &y)| x && y)
+    };
+    let mut order: Vec<(Role, usize)> = Role::ALL
+        .into_iter()
+        .filter_map(|role| compact_len(layout, role).map(|len| (role, len)))
+        .collect();
+    order.sort_by_key(|&(role, len)| {
+        let throughout = live[role as usize].iter().all(|&l| l);
+        (!throughout, std::cmp::Reverse(len * role.elem().size()))
+    });
+    let mut table = RegionTable::default();
+    let mut placed: Vec<(Role, Region)> = Vec::new();
+    for (role, len) in order {
+        let bytes = len * role.elem().size();
+        let clash: Vec<(Role, Region)> = placed
+            .iter()
+            .copied()
+            .filter(|&(other, _)| together(role, other))
+            .collect();
+        let offset = std::iter::once(0)
+            .chain(
+                clash
+                    .iter()
+                    .map(|&(other, r)| r.end(other).next_multiple_of(REGION_ALIGN)),
+            )
+            .filter(|&offset| {
+                clash
+                    .iter()
+                    .all(|&(other, r)| offset + bytes <= r.offset || r.end(other) <= offset)
+            })
+            .min()
+            .expect("the end of the last clashing region is clear");
+        let region = Region { offset, len };
+        table.regions[role as usize] = Some(region);
+        placed.push((role, region));
     }
     table
 }
@@ -454,7 +762,13 @@ fn elem_mismatch(role: Role, wanted: Elem) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda::prefill::{GdnPrefillScratchLayout, PrefillScratchLayout};
+    use crate::cuda::prefill::test_models::{
+        dense_switches, moe_switches, Model, MOE, Q27B, Q9B, ROWS,
+    };
+    use crate::cuda::prefill::{
+        ConversionScratch, GdnPrefillScratchLayout, GemmSwitches, PrefillRoutes,
+        PrefillScratchLayout, WeightClass,
+    };
 
     fn table(entries: &[(Role, usize, usize)]) -> RegionTable {
         let mut t = RegionTable::default();
@@ -585,11 +899,13 @@ mod tests {
     #[test]
     fn the_unshared_layout_gives_every_value_its_own_aligned_region() {
         let scratch = PrefillScratchLayout::new(3, 40, 24, 8, 72, Some(56), Some(32), true);
-        let layout = PrefillWorkspaceLayout {
+        let layout = PrefillWorkspaceLayout::of(
             scratch,
-            gdn: Some(GdnPrefillScratchLayout::new(3, 56, 4, 32)),
-            score_elems: Some(77),
-        };
+            Some(GdnPrefillScratchLayout::new(3, 56, 4, 32)),
+            Some(77),
+            PrefillRoutes::default(),
+            ConversionScratch::default(),
+        );
         let t = unshared(&layout);
         let mut end = 0;
         for role in Role::ALL {
@@ -613,11 +929,13 @@ mod tests {
 
     #[test]
     fn the_unshared_layout_leaves_out_the_values_the_model_has_none_of() {
-        let layout = PrefillWorkspaceLayout {
-            scratch: PrefillScratchLayout::new(3, 40, 24, 8, 72, None, None, false),
-            gdn: None,
-            score_elems: None,
-        };
+        let layout = PrefillWorkspaceLayout::of(
+            PrefillScratchLayout::new(3, 40, 24, 8, 72, None, None, false),
+            None,
+            None,
+            PrefillRoutes::default(),
+            ConversionScratch::default(),
+        );
         let t = unshared(&layout);
         for role in Role::ALL {
             let absent = matches!(
@@ -636,6 +954,266 @@ mod tests {
                     | Role::GdnBetaOut
             );
             assert_eq!(t.get(role).is_none(), absent, "{role:?}");
+        }
+    }
+
+    /// The layout of `model` with every weight `weight` and the GDN gates
+    /// `alpha_beta` under `switches`.
+    fn layout_of(
+        model: &Model,
+        weight: WeightClass,
+        alpha_beta: WeightClass,
+        switches: &GemmSwitches,
+    ) -> PrefillWorkspaceLayout {
+        let ab_cache = model.moe && alpha_beta == WeightClass::Q8Raw;
+        model.layout(ConversionScratch::plan(
+            &model.gemms(weight, alpha_beta, ab_cache),
+            switches,
+            ROWS,
+            &model.scratch(),
+        ))
+    }
+
+    /// The default route set of each served model and scheme, at 2048 rows
+    /// and 32768 keys.
+    fn route_sets() -> Vec<(String, PrefillWorkspaceLayout)> {
+        use WeightClass::*;
+        let mut sets = Vec::new();
+        for model in [Q27B, Q9B] {
+            for (scheme, weight, alpha_beta) in [
+                ("Q8_0", Q8Raw, Q8Raw),
+                ("BF16", Bf16Raw, Q8Raw),
+                ("NVFP4", Planar, F32),
+                ("F32", F32, F32),
+            ] {
+                sets.push((
+                    format!("{} {scheme}", model.name),
+                    layout_of(&model, weight, alpha_beta, &dense_switches()),
+                ));
+            }
+        }
+        sets.push((
+            "35B-A3B Q8_0".into(),
+            layout_of(&MOE, Q8Raw, Q8Raw, &moe_switches(false)),
+        ));
+        sets.push((
+            "35B-A3B BF16".into(),
+            layout_of(&MOE, Bf16Raw, Q8Raw, &moe_switches(true)),
+        ));
+        sets
+    }
+
+    /// Each route set and its variants on the paths a load can also take:
+    /// the plain attention, the per-token GDN loop, no score block, a dense
+    /// and a MoE FFN in one model.
+    fn every_route_set() -> Vec<(String, PrefillWorkspaceLayout)> {
+        let mut sets = route_sets();
+        for (name, layout) in route_sets() {
+            let mut plain = layout;
+            plain.routes.plain_attention = true;
+            let mut per_token = layout;
+            per_token.routes.gdn_fused = false;
+            let mut scalar = layout;
+            scalar.score_elems = None;
+            let mut mixed = layout;
+            mixed.routes.dense_ffn = true;
+            mixed.routes.moe_ffn = true;
+            sets.extend([
+                (format!("{name} + plain attention"), plain),
+                (format!("{name} + per-token GDN"), per_token),
+                (format!("{name} + scalar attention"), scalar),
+                (format!("{name} + dense and MoE FFN"), mixed),
+            ]);
+        }
+        sets
+    }
+
+    fn is_conversion(role: Role) -> bool {
+        matches!(
+            role,
+            Role::DequantF32 | Role::ActivationF16 | Role::DequantF16
+        )
+    }
+
+    /// At every operation of a slice, the compact regions of the values live
+    /// there share no byte; every value an operation on a taken path touches
+    /// has a region (a conversion region only where some GEMM's route takes
+    /// it); and every value is written before it is read.
+    #[test]
+    fn the_values_live_at_each_operation_lie_apart() {
+        for (name, layout) in every_route_set() {
+            let table = liveness(&layout);
+            let regions = compact(&layout, &table);
+            let live = live(&table);
+            for (s, step) in table.iter().enumerate() {
+                let here: Vec<(Role, Region)> = Role::ALL
+                    .into_iter()
+                    .filter(|&role| live[role as usize][s])
+                    .filter_map(|role| regions.get(role).map(|r| (role, r)))
+                    .collect();
+                for i in 0..here.len() {
+                    for j in 0..i {
+                        let ((a, ra), (b, rb)) = (here[j], here[i]);
+                        assert!(
+                            ra.end(a) <= rb.offset || rb.end(b) <= ra.offset,
+                            "{name}: {}: {a:?} and {b:?} share bytes",
+                            step.name
+                        );
+                    }
+                }
+                for &role in step.reads.iter().chain(step.writes).chain(step.scratch) {
+                    if !is_conversion(role) {
+                        assert!(
+                            regions.get(role).is_some(),
+                            "{name}: {} touches {role:?}, which has no region",
+                            step.name
+                        );
+                    }
+                }
+            }
+            for role in [Role::DequantF32, Role::ActivationF16, Role::DequantF16] {
+                assert_eq!(
+                    regions.get(role).map(|r| r.len),
+                    compact_len(&layout, role),
+                    "{name}: {role:?}"
+                );
+            }
+            for role in Role::ALL {
+                if let Some(r) = regions.get(role) {
+                    assert_eq!(r.offset % REGION_ALIGN, 0, "{name}: {role:?}");
+                }
+            }
+        }
+    }
+
+    /// The compact layout never takes more than the unshared one, and holds
+    /// a value exactly where the unshared one does, except the values no path
+    /// writes and the conversion scratch no route takes.
+    #[test]
+    fn the_compact_layout_is_never_larger_than_the_unshared_one() {
+        for (name, layout) in every_route_set() {
+            let compact = compact(&layout, &liveness(&layout));
+            let unshared = unshared(&layout);
+            assert!(compact.bytes() <= unshared.bytes(), "{name}");
+            for role in Role::ALL {
+                if compact.get(role).is_some() {
+                    assert!(unshared.get(role).is_some(), "{name}: {role:?}");
+                }
+            }
+            assert_eq!(
+                compact.get(Role::Scores).is_some(),
+                layout.score_elems.is_some(),
+                "{name}"
+            );
+            assert_eq!(
+                compact.get(Role::QGateFused).is_some(),
+                layout.scratch.q_gate.is_some(),
+                "{name}"
+            );
+            assert_eq!(compact.get(Role::QSingle), None, "{name}");
+        }
+    }
+
+    #[cfg(feature = "test-state-snapshot")]
+    #[test]
+    fn the_test_switch_selects_the_unshared_layout() {
+        let (_, mut layout) = route_sets().remove(0);
+        assert_eq!(layout.regions(), compact(&layout, &liveness(&layout)));
+        layout.unshared = true;
+        assert_eq!(layout.regions(), unshared(&layout));
+    }
+
+    /// The compact arena of each served model's default route set at 2048
+    /// rows and 32768 keys (unshared: 2_050_547_712 B on the 27B,
+    /// 1_376_821_248 B on the 9B, 1_141_940_224 B on the 35B-A3B), and the
+    /// values whose bytes stack to its end. `f32(dim)` is a [2048, dim] F32
+    /// value; every byte count is a multiple of the region alignment, so the
+    /// stacks hold no padding.
+    #[test]
+    fn the_compact_sizes_of_the_served_models() {
+        let f32 = |dim: usize| ROWS * dim * 4;
+        let want = [
+            // The up GEMM's F16 arm (X, Normed, AttnProj, Gate, Up, the F16
+            // pair) holds 660_602_880 B; placed largest first, AttnOut (live
+            // with the pair in `wo`) lands above the pair and AttnProj above
+            // AttnOut: X + DequantF16 (17408 x 5120 two-byte elements) + Gate
+            // + Up + ActivationF16 (2048 x 17408 two-byte elements) + AttnOut
+            // + AttnProj.
+            (
+                "27B Q8_0",
+                f32(5120)
+                    + 17408 * 5120 * 2
+                    + 2 * f32(17408)
+                    + ROWS * 17408 * 2
+                    + f32(6144)
+                    + f32(5120),
+                668_991_488,
+            ),
+            // The tiled attention: X, the score block (6 x 512 x 32768), Q,
+            // AttnOut and the gate.
+            (
+                "27B BF16",
+                f32(5120) + 6 * 512 * 32768 * 4 + 3 * f32(6144),
+                595_591_168,
+            ),
+            // The up GEMM's F32 arm: X, the F32 scratch (17408 x 5120),
+            // Normed, Gate, Up, AttnProj.
+            (
+                "27B NVFP4",
+                f32(5120) + 17408 * 5120 * 4 + 2 * f32(17408) + 2 * f32(5120),
+                767_557_632,
+            ),
+            (
+                "27B F32",
+                f32(5120) + 6 * 512 * 32768 * 4 + 3 * f32(6144),
+                595_591_168,
+            ),
+            // The up GEMM's F16 arm with AttnProj: X, Normed, AttnProj, Gate,
+            // Up, the F16 pair (12288 x 4096 and 2048 x 12288 two-byte
+            // elements).
+            (
+                "9B Q8_0",
+                3 * f32(4096) + 2 * f32(12288) + 12288 * 4096 * 2 + ROWS * 12288 * 2,
+                452_984_832,
+            ),
+            // The tiled attention: X, the score block (4 x 512 x 32768), Q,
+            // AttnOut and the gate.
+            (
+                "9B BF16",
+                f32(4096) + 4 * 512 * 32768 * 4 + 3 * f32(4096),
+                402_653_184,
+            ),
+            // The up GEMM's F32 arm: X, the F32 scratch (12288 x 4096),
+            // Normed, Gate, Up, AttnProj.
+            (
+                "9B NVFP4",
+                f32(4096) + 12288 * 4096 * 4 + 2 * f32(12288) + 2 * f32(4096),
+                503_316_480,
+            ),
+            (
+                "9B F32",
+                f32(4096) + 4 * 512 * 32768 * 4 + 3 * f32(4096),
+                402_653_184,
+            ),
+            // The tiled attention: X, the score block (8 x 512 x 32768), Q,
+            // AttnOut and the gate (q_dim 4096).
+            (
+                "35B-A3B Q8_0",
+                f32(2048) + 8 * 512 * 32768 * 4 + 3 * f32(4096),
+                654_311_424,
+            ),
+            (
+                "35B-A3B BF16",
+                f32(2048) + 8 * 512 * 32768 * 4 + 3 * f32(4096),
+                654_311_424,
+            ),
+        ];
+        let sets = route_sets();
+        assert_eq!(sets.len(), want.len());
+        for ((name, layout), (want_name, arithmetic, bytes)) in sets.iter().zip(want) {
+            assert_eq!(name, want_name);
+            assert_eq!(arithmetic, bytes, "{name}");
+            assert_eq!(layout.bytes(), bytes as u64, "{name}");
         }
     }
 }

@@ -966,6 +966,10 @@ struct MutableState {
     /// The layout `prefill_workspace` was allocated from, kept when the native
     /// route releases the workspace.
     prefill_layout: Option<super::prefill::PrefillWorkspaceLayout>,
+    /// Lay the workspace out with every value in its own region
+    /// (`set_unshared_prefill_workspace`).
+    #[cfg(feature = "test-state-snapshot")]
+    unshared_prefill_workspace: bool,
     /// The native NVFP4/FP8 prefill route, published by `preload_weights` when the model and the
     /// runtime meet its conditions (`native_prefill`); `None` selects the F32 prefill.
     native_prefill: Option<native_prefill_forward::NativePrefill>,
@@ -8893,7 +8897,7 @@ impl CudaBackend {
             allowance: super::memory_plan::SERVING_ALLOWANCE_BYTES,
             ..Default::default()
         };
-        let ws = Self::prefill_workspace_layout(&st.kernels, hp, layers, context);
+        let ws = Self::prefill_workspace_layout(st, hp, layers, context);
         // A model the native route may serve gets the larger of the two routes'
         // needs: publication decides which one serves, after this plan, and
         // the native route also selects its GEMM plans then.
@@ -8954,13 +8958,16 @@ impl CudaBackend {
     /// cache (the last slice of a prompt ending at the context attends over
     /// every key). The route conditions are the ones the attention dispatch
     /// reads, fixed at load; a head geometry the tiled route cannot host
-    /// leaves the scalar attention.
+    /// leaves the scalar attention. The conversion scratch is what the
+    /// slice's GEMMs take on `layers`' weights under the switches as the
+    /// load reads them ([`Self::prefill_gemms`]).
     fn prefill_workspace_layout(
-        kernels: &super::decode::KernelSet,
+        st: &MutableState,
         hp: &ModelHyperparams,
         layers: &[LayerWeightsGpu],
         context: usize,
     ) -> super::prefill::PrefillWorkspaceLayout {
+        let kernels = &st.kernels;
         let num_heads = hp.num_heads as usize;
         let num_kv_heads = hp.num_kv_heads as usize;
         let head_dim = hp.head_dim as usize;
@@ -9004,7 +9011,99 @@ impl CudaBackend {
             } else {
                 None
             },
+            routes: super::prefill::PrefillRoutes {
+                plain_attention: layers
+                    .iter()
+                    .any(|lw| lw.layer_type != 1 && lw.attn_q_norm.is_none()),
+                gdn_fused: Self::gdn_fused_prefill(kernels),
+                dense_ffn: layers.iter().any(|lw| lw.moe_layer_blob.is_none()),
+                moe_ffn: layers.iter().any(|lw| lw.moe_layer_blob.is_some()),
+            },
+            conversion: super::prefill::ConversionScratch::plan(
+                &Self::prefill_gemms(hp, layers),
+                &super::prefill::GemmSwitches::read(kernels),
+                rows,
+                &scratch,
+            ),
+            #[cfg(feature = "test-state-snapshot")]
+            unshared: st.unshared_prefill_workspace,
         }
+    }
+
+    /// Whether the GDN layers prefill through the fused batched state update
+    /// (every one of its kernels loaded) rather than the per-token loop.
+    fn gdn_fused_prefill(kernels: &super::decode::KernelSet) -> bool {
+        kernels.ssm_conv1d_silu_prefill.is_some()
+            && kernels.gdn_compute_gates_batched.is_some()
+            && kernels.l2_normalize_qk_strided.is_some()
+            && kernels.gdn_prefill_fused_v3.is_some()
+            && kernels.gdn_prefill_norm_gate.is_some()
+    }
+
+    /// The GEMMs a prefill slice runs over `layers`, with the weights as they
+    /// are resident now and the F16 caches the load builds: a GDN layer's
+    /// `ssm_alpha` / `ssm_beta` cache under [`gdn_ab_f16_enabled`] for a raw
+    /// Q8_0 weight, and no other (an attention layer's GEMMs are passed no
+    /// cache, and `dequant_layer_q8_to_f16` builds none for a GDN layer).
+    fn prefill_gemms(
+        hp: &ModelHyperparams,
+        layers: &[LayerWeightsGpu],
+    ) -> Vec<super::prefill::PrefillGemm> {
+        use super::prefill::{PrefillGemm, WeightClass};
+        let hidden = hp.hidden_dim as usize;
+        let q_dim = hp.num_heads as usize * hp.head_dim as usize;
+        let kv_dim = hp.num_kv_heads as usize * hp.head_dim as usize;
+        let inter = hp.intermediate_dim as usize;
+        let gemm = |weight: &GpuWeightBuf, out_dim: usize, in_dim: usize| PrefillGemm {
+            weight: WeightClass::of(weight),
+            out_dim,
+            in_dim,
+            residual: false,
+            gdn_alpha_beta: false,
+            f16_cache: false,
+        };
+        let mut gemms = Vec::new();
+        for lw in layers {
+            if lw.layer_type == 1 {
+                let p = super::gdn::GdnParams::from_hyperparams(hp);
+                gemms.push(gemm(&lw.wq, p.qkv_dim, hidden));
+                if let Some(w) = &lw.attn_gate {
+                    gemms.push(gemm(w, p.value_dim, hidden));
+                }
+                for w in [&lw.ssm_alpha, &lw.ssm_beta].into_iter().flatten() {
+                    gemms.push(PrefillGemm {
+                        gdn_alpha_beta: true,
+                        f16_cache: gdn_ab_f16_enabled() && matches!(w, GpuWeightBuf::Q8Raw(_)),
+                        ..gemm(w, p.num_heads, hidden)
+                    });
+                }
+                if let Some(w) = &lw.ssm_out {
+                    gemms.push(PrefillGemm {
+                        residual: true,
+                        ..gemm(w, hidden, p.value_dim)
+                    });
+                }
+            } else {
+                let q_out = if lw.attn_q_norm.is_some() {
+                    2 * q_dim
+                } else {
+                    q_dim
+                };
+                gemms.push(gemm(&lw.wq, q_out, hidden));
+                gemms.push(gemm(&lw.wk, kv_dim, hidden));
+                gemms.push(gemm(&lw.wv, kv_dim, hidden));
+                gemms.push(PrefillGemm {
+                    residual: true,
+                    ..gemm(&lw.wo, hidden, q_dim)
+                });
+            }
+            if lw.moe_layer_blob.is_none() {
+                gemms.push(gemm(&lw.w_gate, inter, hidden));
+                gemms.push(gemm(&lw.w_up, inter, hidden));
+                gemms.push(gemm(&lw.w_down, hidden, inter));
+            }
+        }
+        gemms
     }
 
     /// One slice of a prefill: embed `tokens`, run every layer over them at
@@ -10195,11 +10294,7 @@ impl CudaBackend {
             );
         }
 
-        let has_fused_prefill = st.kernels.ssm_conv1d_silu_prefill.is_some()
-            && st.kernels.gdn_compute_gates_batched.is_some()
-            && st.kernels.l2_normalize_qk_strided.is_some()
-            && st.kernels.gdn_prefill_fused_v3.is_some()
-            && st.kernels.gdn_prefill_norm_gate.is_some();
+        let has_fused_prefill = Self::gdn_fused_prefill(&st.kernels);
 
         if has_fused_prefill {
             // === FUSED BATCHED PATH (3.4x speedup) ===
@@ -20032,6 +20127,8 @@ impl ComputeBackend for CudaBackend {
             gdn_scratch_gpu: None,
             prefill_workspace: None,
             prefill_layout: None,
+            #[cfg(feature = "test-state-snapshot")]
+            unshared_prefill_workspace: false,
             native_prefill: None,
             native_prefill_refusal: None,
             _cublas_workspace: cublas_workspace,
@@ -21990,13 +22087,8 @@ impl ComputeBackend for CudaBackend {
                 (native_prefill_forward::serving_bytes(st.kv_max_seq_len, st.kv_precision)
                     + selection)
                     .saturating_sub(
-                        Self::prefill_workspace_layout(
-                            &st.kernels,
-                            &hp_copy,
-                            &cache,
-                            st.kv_max_seq_len,
-                        )
-                        .bytes(),
+                        Self::prefill_workspace_layout(st, &hp_copy, &cache, st.kv_max_seq_len)
+                            .bytes(),
                     )
             });
         let verbose = super::decode::cuda_verbose();
@@ -22064,7 +22156,7 @@ impl ComputeBackend for CudaBackend {
             0
         };
         let prefill_layout =
-            Self::prefill_workspace_layout(&st.kernels, &hp_copy, &cache, st.kv_max_seq_len);
+            Self::prefill_workspace_layout(st, &hp_copy, &cache, st.kv_max_seq_len);
         st.prefill_workspace = Some(super::prefill::alloc_prefill_workspace(
             &self.device,
             &prefill_layout,

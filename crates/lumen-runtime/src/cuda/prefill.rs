@@ -60,8 +60,9 @@ impl GdnPrefillScratchLayout {
 
 /// Element counts of the prefill's workspace values for `batch` rows of one
 /// model's geometry (`activation_f16` and `dequant_f16` in bytes). The
-/// workspace planner places exactly these, and the load-time memory plan
-/// counts what it places, so the two cannot disagree.
+/// workspace planner places these, the conversion scratch at most these
+/// ([`ConversionScratch::plan`]), and the load-time memory plan counts what
+/// it places, so the two cannot disagree.
 ///
 /// `dequant_f32` holds the largest projection weight matrix in F32 across ALL
 /// kernels that share this scratch: standard attention (wq/wk/wv/wo), FFN
@@ -139,41 +140,270 @@ impl PrefillScratchLayout {
     }
 }
 
+/// The paths of a prefill slice a load can take, beyond those the layouts'
+/// optional parts record (the fused Q+gate attention, the tiled attention,
+/// the GDN layers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PrefillRoutes {
+    /// An attention layer without the fused Q+gate projection.
+    pub plain_attention: bool,
+    /// The GDN layers' fused batched state update; otherwise their per-token
+    /// loop over the decode kernels.
+    pub gdn_fused: bool,
+    /// A layer with a dense FFN.
+    pub dense_ffn: bool,
+    /// A layer with a MoE FFN.
+    pub moe_ffn: bool,
+}
+
 /// What [`alloc_prefill_workspace`] allocates: the scratch layouts for the
-/// longest slice and, when the tiled attention is the route, the score
-/// block's element count for the whole context.
+/// longest slice, when the tiled attention is the route the score block's
+/// element count for the whole context, the paths a slice can take and the
+/// conversion scratch its GEMMs take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefillWorkspaceLayout {
     pub scratch: PrefillScratchLayout,
     pub gdn: Option<GdnPrefillScratchLayout>,
     pub score_elems: Option<usize>,
+    pub routes: PrefillRoutes,
+    pub conversion: ConversionScratch,
+    /// Place every value in its own region (the unshared layout) instead of
+    /// sharing bytes between values never live together, so a test can
+    /// compare the two.
+    #[cfg(feature = "test-state-snapshot")]
+    pub unshared: bool,
 }
 
 impl PrefillWorkspaceLayout {
+    /// Where each value lies in the workspace's arena.
+    pub(crate) fn regions(&self) -> super::workspace::RegionTable {
+        #[cfg(feature = "test-state-snapshot")]
+        if self.unshared {
+            return super::workspace::unshared(self);
+        }
+        super::workspace::compact(self, &super::workspace::liveness(self))
+    }
+
     /// Device bytes of the whole workspace: the arena its regions lie in.
     pub(crate) fn bytes(&self) -> u64 {
-        super::workspace::unshared(self).bytes() as u64
+        self.regions().bytes() as u64
+    }
+
+    /// The layout of these parts with the compact planner.
+    #[cfg(test)]
+    pub(crate) fn of(
+        scratch: PrefillScratchLayout,
+        gdn: Option<GdnPrefillScratchLayout>,
+        score_elems: Option<usize>,
+        routes: PrefillRoutes,
+        conversion: ConversionScratch,
+    ) -> Self {
+        Self {
+            scratch,
+            gdn,
+            score_elems,
+            routes,
+            conversion,
+            #[cfg(feature = "test-state-snapshot")]
+            unshared: false,
+        }
     }
 }
 
-/// Allocate the workspace `layout` describes: one arena with every value in
-/// its own region. The score block is part of the selected route, so failing
-/// to allocate it fails the load.
+/// The served models' prefill geometry at the 2048-row slice and a 32768-token
+/// context, for the workspace's unit tests.
+#[cfg(test)]
+pub(crate) mod test_models {
+    use super::*;
+
+    /// A model's geometry: hidden width, query and KV heads of `head_dim`,
+    /// FFN width, GDN `(qkv_dim, num_heads, value_dim)`, and whether its FFN
+    /// is MoE (no dense FFN).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Model {
+        pub name: &'static str,
+        pub hidden: usize,
+        pub heads: usize,
+        pub kv_heads: usize,
+        pub head_dim: usize,
+        pub inter: usize,
+        pub gdn: (usize, usize, usize),
+        pub moe: bool,
+    }
+
+    /// Qwen3.8-27B: 24 query / 4 KV heads of 256, FFN 17408, GDN 10240 / 48 / 6144.
+    pub(crate) const Q27B: Model = Model {
+        name: "27B",
+        hidden: 5120,
+        heads: 24,
+        kv_heads: 4,
+        head_dim: 256,
+        inter: 17408,
+        gdn: (10240, 48, 6144),
+        moe: false,
+    };
+    /// Qwen3.5-9B: 16 query / 4 KV heads of 256, FFN 12288, GDN 8192 / 32 / 4096.
+    pub(crate) const Q9B: Model = Model {
+        name: "9B",
+        hidden: 4096,
+        heads: 16,
+        kv_heads: 4,
+        head_dim: 256,
+        inter: 12288,
+        gdn: (8192, 32, 4096),
+        moe: false,
+    };
+    /// Qwen3.5-35B-A3B: 16 query / 2 KV heads of 256, expert FFN 512, GDN
+    /// 8192 / 32 / 4096, every layer MoE.
+    pub(crate) const MOE: Model = Model {
+        name: "35B-A3B",
+        hidden: 2048,
+        heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        inter: 512,
+        gdn: (8192, 32, 4096),
+        moe: true,
+    };
+
+    pub(crate) const ROWS: usize = 2048;
+    pub(crate) const CONTEXT: usize = 32768;
+
+    impl Model {
+        pub(crate) fn q_dim(&self) -> usize {
+            self.heads * self.head_dim
+        }
+
+        pub(crate) fn scratch(&self) -> PrefillScratchLayout {
+            PrefillScratchLayout::new(
+                ROWS,
+                self.hidden,
+                self.q_dim(),
+                self.kv_heads * self.head_dim,
+                self.inter,
+                Some(self.gdn.0),
+                Some(self.gdn.2),
+                true,
+            )
+        }
+
+        /// The GEMMs of a fused Q+gate attention layer and a GDN layer, each
+        /// with its FFN, every weight `weight` but the GDN alpha/beta pair,
+        /// `alpha_beta` (passed an F16 cache when `ab_cache`).
+        pub(crate) fn gemms(
+            &self,
+            weight: WeightClass,
+            alpha_beta: WeightClass,
+            ab_cache: bool,
+        ) -> Vec<PrefillGemm> {
+            let (h, q, kv, i) = (
+                self.hidden,
+                self.q_dim(),
+                self.kv_heads * self.head_dim,
+                self.inter,
+            );
+            let (qkv, heads, value) = self.gdn;
+            let g = |out_dim, in_dim| PrefillGemm {
+                weight,
+                out_dim,
+                in_dim,
+                residual: false,
+                gdn_alpha_beta: false,
+                f16_cache: false,
+            };
+            let ab = PrefillGemm {
+                weight: alpha_beta,
+                gdn_alpha_beta: true,
+                f16_cache: ab_cache,
+                ..g(heads, h)
+            };
+            let mut gemms = vec![
+                g(2 * q, h),
+                g(kv, h),
+                g(kv, h),
+                PrefillGemm {
+                    residual: true,
+                    ..g(h, q)
+                },
+                g(qkv, h),
+                g(value, h),
+                ab,
+                ab,
+                PrefillGemm {
+                    residual: true,
+                    ..g(h, value)
+                },
+            ];
+            if !self.moe {
+                for _ in 0..2 {
+                    gemms.extend([g(i, h), g(i, h), g(h, i)]);
+                }
+            }
+            gemms
+        }
+
+        /// The workspace layout of this model with conversion scratch
+        /// `conversion` and the fused GDN path.
+        pub(crate) fn layout(&self, conversion: ConversionScratch) -> PrefillWorkspaceLayout {
+            PrefillWorkspaceLayout::of(
+                self.scratch(),
+                Some(GdnPrefillScratchLayout::new(
+                    ROWS, self.gdn.0, self.gdn.1, self.gdn.2,
+                )),
+                attn_score_block_elems(ROWS, self.heads, self.kv_heads, CONTEXT - ROWS),
+                PrefillRoutes {
+                    plain_attention: false,
+                    gdn_fused: true,
+                    dense_ffn: !self.moe,
+                    moe_ffn: self.moe,
+                },
+                conversion,
+            )
+        }
+    }
+
+    /// The default switches of a dense model: projections through HGEMM, the
+    /// Q8_0 split layout releasing the raw planes.
+    pub(crate) fn dense_switches() -> GemmSwitches {
+        GemmSwitches {
+            mmq_kernel: true,
+            mmq_residual_kernel: true,
+            q8_split: true,
+            ..GemmSwitches::default()
+        }
+    }
+
+    /// The default switches of a MoE model: Q8_0 projections through MMQ,
+    /// BF16 weights past the F16 caches, `bf16` alpha/beta through F32.
+    pub(crate) fn moe_switches(bf16: bool) -> GemmSwitches {
+        GemmSwitches {
+            q8_proj_mmq: true,
+            gdn_ab_f32: bf16,
+            moe_bf16_native: true,
+            mmq_kernel: true,
+            mmq_residual_kernel: true,
+            ..GemmSwitches::default()
+        }
+    }
+}
+
+/// Allocate the workspace `layout` describes: one arena with its values'
+/// regions. The score block is part of the selected route, so failing to
+/// allocate it fails the load.
 pub(crate) fn alloc_prefill_workspace(
     device: &CudaDevice,
     layout: &PrefillWorkspaceLayout,
 ) -> Result<Workspace, RuntimeError> {
-    Workspace::alloc(device, super::workspace::unshared(layout))
+    Workspace::alloc(device, layout.regions())
 }
 
 /// Tokens per prefill slice. A prompt longer than this runs through the
-/// layers in slices, each through one scratch sized for the slice, so the
-/// per-token scratch is bounded by this and not by the prompt: on the 27B
-/// dense model it measures about 0.55 MiB per token over a fixed ~0.6 GiB, so a
-/// slice takes at most ~1.8 GiB, which fits beside the weights and a 16k-token
-/// KV cache on a 32 GB card. The tiled attention's score block still grows with the prompt
-/// (`group × min(slice, 512) × keys` F32: ~190 MiB at 16k keys on the 27B).
-/// Prompts up to this length run as one slice, exactly as before.
+/// layers in slices, each through one workspace sized for the slice, so the
+/// workspace is bounded by this and not by the prompt: on the 27B Q8_0 model
+/// it takes 668,991,488 bytes with a 32768-token context. The tiled
+/// attention's score block, which shares the workspace, grows with the
+/// context (`group × min(slice, 512) × keys` F32: ~384 MiB at 32k keys on the
+/// 27B). Prompts up to this length run as one slice, exactly as before.
 pub(crate) const PREFILL_SLICE_TOKENS: usize = 2048;
 
 /// Element count of the tiled prefill attention's score block for one
@@ -468,6 +698,233 @@ fn moe_bf16_native_path(weight: &GpuWeightBuf) -> bool {
         && moe_bf16_native_enabled()
 }
 
+/// `LUMEN_CUDA_PREFILL_F32` present: the prefill GEMMs take their F32 SGEMM
+/// fallback where the weight has one.
+fn prefill_f32_forced() -> bool {
+    std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok()
+}
+
+/// `LUMEN_CUDA_Q8_PROJ_MMQ` present, whatever its value: a raw Q8_0 weight
+/// prefers MMQ over an F16 cache, and the residual GEMM takes MMQ.
+fn q8_proj_mmq_set() -> bool {
+    std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok()
+}
+
+/// Whether the GDN alpha/beta projections take the F32 SGEMM, from the value
+/// of `LUMEN_CUDA_GDN_AB_F32` (`0`/`false` off, any other value on; unset: on
+/// for a MoE BF16 model).
+fn gdn_ab_f32_on(env: Option<&str>) -> bool {
+    match env {
+        Some("0") | Some("false") | Some("FALSE") => false,
+        Some(_) => true,
+        None => crate::runtime_defaults::model_is_moe_bf16(),
+    }
+}
+
+/// A prefill GEMM's weight as [`launch_gemm_projection`] and
+/// [`launch_gemm_residual`] dispatch on it: the variant that picks the arm,
+/// and with it the conversion scratch the arm takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WeightClass {
+    F32,
+    F16Raw,
+    Bf16Raw,
+    Q8Raw,
+    Q8Split,
+    Q4Raw,
+    KQuant,
+    Ct4Raw,
+    /// NVFP4 or FP8 planes.
+    Planar,
+    /// `Q8Aligned` (per-row matvec) or `Q4Aligned` (refused): no scratch.
+    Aligned,
+}
+
+impl WeightClass {
+    pub(crate) fn of(weight: &GpuWeightBuf) -> Self {
+        match weight {
+            GpuWeightBuf::F32(_) => Self::F32,
+            GpuWeightBuf::F16Raw(_) => Self::F16Raw,
+            GpuWeightBuf::Bf16Raw(_) => Self::Bf16Raw,
+            GpuWeightBuf::Q8Raw(_) => Self::Q8Raw,
+            GpuWeightBuf::Q8Split(_) => Self::Q8Split,
+            GpuWeightBuf::Q4Raw(_) => Self::Q4Raw,
+            GpuWeightBuf::Q4KRaw(_) | GpuWeightBuf::Q5KRaw(_) | GpuWeightBuf::Q6KRaw(_) => {
+                Self::KQuant
+            }
+            GpuWeightBuf::Ct4Raw(_) => Self::Ct4Raw,
+            GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => Self::Planar,
+            GpuWeightBuf::Q8Aligned(_) | GpuWeightBuf::Q4Aligned(_) => Self::Aligned,
+        }
+    }
+}
+
+/// One GEMM a prefill slice runs, as far as the conversion scratch its route
+/// takes depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillGemm {
+    pub weight: WeightClass,
+    pub out_dim: usize,
+    pub in_dim: usize,
+    /// Run by [`launch_gemm_residual`], not [`launch_gemm_projection`].
+    pub residual: bool,
+    /// The `gdn_alpha` / `gdn_beta` projection.
+    pub gdn_alpha_beta: bool,
+    /// Passed an F16 cache the load builds.
+    pub f16_cache: bool,
+}
+
+/// The switches the prefill GEMMs' routes read, read as the GEMMs read them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GemmSwitches {
+    /// [`prefill_f32_forced`].
+    pub force_f32: bool,
+    /// [`q8_proj_mmq_set`].
+    pub q8_proj_mmq_set: bool,
+    /// `q8_proj_mmq_enabled()`: the projection GEMM's MMQ route.
+    pub q8_proj_mmq: bool,
+    /// [`gdn_ab_f32_on`].
+    pub gdn_ab_f32: bool,
+    /// A BF16 weight bypasses an F16 cache ([`moe_bf16_native_path`]).
+    pub moe_bf16_native: bool,
+    pub mmq_kernel: bool,
+    pub mmq_residual_kernel: bool,
+    /// A raw Q8_0 plane may be resident only in the split layout by the time a
+    /// request runs (`q8_split_release_raw_enabled()`).
+    pub q8_split: bool,
+}
+
+impl GemmSwitches {
+    pub(crate) fn read(kernels: &KernelSet) -> Self {
+        Self {
+            force_f32: prefill_f32_forced(),
+            q8_proj_mmq_set: q8_proj_mmq_set(),
+            q8_proj_mmq: crate::runtime_defaults::q8_proj_mmq_enabled(),
+            gdn_ab_f32: gdn_ab_f32_on(std::env::var("LUMEN_CUDA_GDN_AB_F32").ok().as_deref()),
+            moe_bf16_native: crate::runtime_defaults::model_is_moe() && moe_bf16_native_enabled(),
+            mmq_kernel: kernels.mmq_q8_0_batched.is_some(),
+            mmq_residual_kernel: kernels.mmq_q8_0_batched_residual.is_some(),
+            q8_split: crate::runtime_defaults::q8_split_release_raw_enabled(),
+        }
+    }
+}
+
+/// Lengths of the conversion scratch regions (`dequant_f32` in F32
+/// elements, the others in bytes); `None` for one no GEMM's route takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversionScratch {
+    pub dequant_f32: Option<usize>,
+    pub activation_f16: Option<usize>,
+    pub dequant_f16: Option<usize>,
+}
+
+impl ConversionScratch {
+    /// The scratch `gemms` take over `rows` rows under `switches`: each region
+    /// is the largest need, capped at `bound`, of the GEMMs whose route can
+    /// reach an arm that takes it. `bound` is the scratch sized to the model's
+    /// largest weight and widest row, so every length comparison a GEMM makes
+    /// on a region decides as it does on `bound`: a need within `bound` is
+    /// within the region, and a need over `bound` is over the region, which
+    /// never exceeds `bound`. The arms follow [`launch_gemm_projection`] and
+    /// [`launch_gemm_residual`]; an arm counts whenever a GEMM can reach it:
+    /// an F16-cache arm and the arm the GEMM takes without the cache, and a
+    /// raw Q8_0 weight's split-layout arm when its raw copy can be released.
+    pub(crate) fn plan(
+        gemms: &[PrefillGemm],
+        switches: &GemmSwitches,
+        rows: usize,
+        bound: &PrefillScratchLayout,
+    ) -> Self {
+        let mut scratch = Self::default();
+        for gemm in gemms {
+            scratch.add(gemm, gemm.weight, switches, rows, bound);
+            if gemm.weight == WeightClass::Q8Raw && switches.q8_split {
+                scratch.add(gemm, WeightClass::Q8Split, switches, rows, bound);
+            }
+        }
+        scratch
+    }
+
+    fn add(
+        &mut self,
+        gemm: &PrefillGemm,
+        weight: WeightClass,
+        sw: &GemmSwitches,
+        rows: usize,
+        bound: &PrefillScratchLayout,
+    ) {
+        fn grow(region: &mut Option<usize>, need: usize, bound: usize) {
+            *region = Some(region.unwrap_or(0).max(need.min(bound)));
+        }
+        let (out_dim, in_dim) = (gemm.out_dim, gemm.in_dim);
+        let dequant_f16_need = 2 * out_dim * in_dim;
+        let dequant_f16_short = dequant_f16_need > bound.dequant_f16;
+        let dequant_f32 =
+            |s: &mut Self| grow(&mut s.dequant_f32, out_dim * in_dim, bound.dequant_f32);
+        let activation = |s: &mut Self| {
+            grow(
+                &mut s.activation_f16,
+                rows * in_dim * 2,
+                bound.activation_f16,
+            )
+        };
+        let f16_pair = |s: &mut Self| {
+            grow(&mut s.dequant_f16, dequant_f16_need, bound.dequant_f16);
+            activation(s);
+        };
+        let q8raw = weight == WeightClass::Q8Raw;
+        let mmq_kernel = if gemm.residual {
+            sw.mmq_residual_kernel
+        } else {
+            sw.mmq_kernel
+        };
+        let prefer_mmq_over_f16cache =
+            sw.q8_proj_mmq_set && q8raw && in_dim % 32 == 0 && mmq_kernel;
+        let force_alpha_beta_f32 = !gemm.residual && sw.gdn_ab_f32 && gemm.gdn_alpha_beta && q8raw;
+        let moe_bf16_native = weight == WeightClass::Bf16Raw && sw.moe_bf16_native;
+        if gemm.f16_cache
+            && !sw.force_f32
+            && !prefer_mmq_over_f16cache
+            && !force_alpha_beta_f32
+            && !moe_bf16_native
+        {
+            activation(self);
+        }
+        match weight {
+            WeightClass::Planar => dequant_f32(self),
+            WeightClass::F32 | WeightClass::Aligned => {}
+            WeightClass::F16Raw | WeightClass::Bf16Raw => activation(self),
+            WeightClass::Q8Raw => {
+                let use_mmq = if gemm.residual {
+                    sw.q8_proj_mmq_set
+                } else {
+                    sw.q8_proj_mmq && !force_alpha_beta_f32
+                } && mmq_kernel
+                    && in_dim % 32 == 0;
+                if use_mmq {
+                    // MMQ reads the raw plane and takes no scratch.
+                } else if sw.force_f32 || force_alpha_beta_f32 || dequant_f16_short {
+                    dequant_f32(self);
+                } else {
+                    f16_pair(self);
+                }
+            }
+            WeightClass::Q4Raw | WeightClass::Q8Split => {
+                if sw.force_f32 || dequant_f16_short {
+                    dequant_f32(self);
+                } else {
+                    f16_pair(self);
+                }
+            }
+            WeightClass::KQuant | WeightClass::Ct4Raw => {
+                if !(sw.force_f32 || dequant_f16_short) {
+                    f16_pair(self);
+                }
+            }
+        }
+    }
+}
+
 /// One line per process for the Q8_0 dequant -> F16 -> HGEMM prefill route on a raw AoS plane.
 fn announce_q8_hgemm_once() {
     static Q8_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
@@ -551,13 +1008,13 @@ pub(crate) unsafe fn launch_gemm_projection<const N: usize>(
     // tensor-core fast path AND the F16-cache Q8/Q4 paths; force the SGEMM-F32
     // fallback paths in the `match weight` block. Used to test whether HGEMM-F16
     // rounding accounts for the L0 drift on the Q8 projection.
-    let force_f32 = std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok();
+    let force_f32 = prefill_f32_forced();
 
     // when LUMEN_CUDA_Q8_PROJ_MMQ=1, also bypass the F16-cache
     // fast path so that Q8Raw weights are routed to mmq_q8_0_batched (MMQ-style
     // INT8xINT8->INT32->F32-scale dp4a math). The F16 cache would otherwise
     // short-circuit before the match arm.
-    let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
+    let q8_proj_mmq = q8_proj_mmq_set();
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
     let prefer_mmq_over_f16cache =
         q8_proj_mmq && weight_is_q8raw && in_dim % 32 == 0 && kernels.mmq_q8_0_batched.is_some();
@@ -581,12 +1038,8 @@ pub(crate) unsafe fn launch_gemm_projection<const N: usize>(
     // q8 (adds a DD-REP). Env override: `LUMEN_CUDA_GDN_AB_F32=0` forces OFF, any
     // other value forces ON.
     let gdn_ab_f32_env = std::env::var("LUMEN_CUDA_GDN_AB_F32").ok();
-    let gdn_ab_f32_on = match gdn_ab_f32_env.as_deref() {
-        Some("0") | Some("false") | Some("FALSE") => false,
-        Some(_) => true,
-        None => crate::runtime_defaults::model_is_moe_bf16(),
-    };
-    let gdn_ab_f32 = gdn_ab_f32_on && (label == "gdn_alpha" || label == "gdn_beta");
+    let gdn_ab_f32 =
+        gdn_ab_f32_on(gdn_ab_f32_env.as_deref()) && (label == "gdn_alpha" || label == "gdn_beta");
     let force_alpha_beta_f32 = gdn_ab_f32 && weight_is_q8raw;
 
     // Fast path: HGEMM with pre-dequanted F16 weights (tensor core, 312 TFLOPS on A100).
@@ -1310,7 +1763,7 @@ pub(crate) unsafe fn launch_gemm_residual<const N: usize>(
     // diagnostic: when LUMEN_CUDA_PREFILL_F32=1, bypass HGEMM-F16 paths
     // and use the SGEMM-F32 fallbacks. Used to test the HGEMM-F16-precision
     // hypothesis on the linear_attn_out (ssm_out residual) GEMM.
-    let force_f32 = std::env::var("LUMEN_CUDA_PREFILL_F32").is_ok();
+    let force_f32 = prefill_f32_forced();
 
     // same env gate as's projection MMQ (LUMEN_CUDA_Q8_PROJ_MMQ=1)
     // also covers the residual GEMM site (ssm_out). When the env is set AND the
@@ -1322,7 +1775,7 @@ pub(crate) unsafe fn launch_gemm_residual<const N: usize>(
     // closed `qkv_pre_conv` drift 7700x; closes the residual
     // `linear_attn_out` drift (~0.226 max-abs persists with alone) by
     // extending the same MMQ math to this second Q8 projection site.
-    let q8_proj_mmq = std::env::var("LUMEN_CUDA_Q8_PROJ_MMQ").is_ok();
+    let q8_proj_mmq = q8_proj_mmq_set();
     let q8_residual_mmq = q8_proj_mmq;
     let weight_is_q8raw = matches!(weight, GpuWeightBuf::Q8Raw(_));
     let prefer_mmq_over_f16cache = q8_residual_mmq
@@ -3888,6 +4341,7 @@ pub(crate) unsafe fn launch_kv_widen_16<'a>(
 #[cfg(test)]
 mod tests {
     use super::super::workspace::RegionTable;
+    use super::test_models::{dense_switches, moe_switches, Model, MOE, Q27B, Q9B, ROWS};
     use super::*;
     use lumen_format::planar_dequant::{dequantize_fp8, dequantize_nvfp4};
 
@@ -3914,23 +4368,229 @@ mod tests {
         let scores = attn_score_block_elems(2048, 24, 4, 32768 - 2048).unwrap();
         // group 6 x min(rows, 512) x 32768 keys.
         assert_eq!(scores, 6 * 512 * 32768);
-        let ws = PrefillWorkspaceLayout {
+        let ws = PrefillWorkspaceLayout::of(
             scratch,
-            gdn: Some(gdn),
-            score_elems: Some(scores),
-        };
-        // The scratch values take 1_327_554_560 bytes, the GDN values
-        // 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144) and the
-        // score block 4 * 6 * 512 * 32768. Every value's bytes are a multiple
-        // of the 256-byte region alignment at 2048 rows, so the arena holds no
-        // padding between them: 0 bytes.
+            Some(gdn),
+            Some(scores),
+            PrefillRoutes::default(),
+            ConversionScratch::default(),
+        );
+        // One buffer per value: the scratch values take 1_327_554_560 bytes,
+        // the GDN values 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 *
+        // 6144) and the score block 4 * 6 * 512 * 32768. Every value's bytes
+        // are a multiple of the 256-byte region alignment at 2048 rows, so the
+        // arena holds no padding between them: 0 bytes.
+        let unshared = super::super::workspace::unshared(&ws).bytes() as u64;
         assert_eq!(
-            ws.bytes(),
+            unshared,
             1_327_554_560
                 + 4 * (2 * 2048 * 10240 + 4 * 2048 * 48 + 3 * 2048 * 6144)
                 + 4 * scores as u64
         );
-        assert_eq!(ws.bytes(), 2_050_547_712);
+        assert_eq!(unshared, 2_050_547_712);
+    }
+
+    fn plan(model: &Model, gemms: &[PrefillGemm], switches: &GemmSwitches) -> ConversionScratch {
+        ConversionScratch::plan(gemms, switches, ROWS, &model.scratch())
+    }
+
+    fn sizes(
+        f32: Option<usize>,
+        activation: Option<usize>,
+        f16: Option<usize>,
+    ) -> ConversionScratch {
+        ConversionScratch {
+            dequant_f32: f32,
+            activation_f16: activation,
+            dequant_f16: f16,
+        }
+    }
+
+    /// A dense model whose projections dequantize to F16 (Q8_0, its split
+    /// layout, Q4_0, the K-quants, INT4) takes the F16 pair at the largest
+    /// weight (the FFN matrix, 2 bytes an element) and the widest row (the
+    /// down projection's FFN width), and no F32 dequant scratch: no GEMM's
+    /// F16 need exceeds the one-size bound, so none falls back.
+    #[test]
+    fn the_f16_dequant_schemes_take_the_f16_pair_at_the_largest_weight() {
+        for model in [Q27B, Q9B] {
+            for weight in [
+                WeightClass::Q8Raw,
+                WeightClass::Q8Split,
+                WeightClass::Q4Raw,
+                WeightClass::KQuant,
+                WeightClass::Ct4Raw,
+            ] {
+                let got = plan(
+                    &model,
+                    &model.gemms(weight, WeightClass::Q8Raw, false),
+                    &dense_switches(),
+                );
+                let ffn = model.inter * model.hidden;
+                assert_eq!(
+                    got,
+                    sizes(None, Some(ROWS * model.inter * 2), Some(2 * ffn)),
+                    "{} {weight:?}",
+                    model.name
+                );
+                assert_eq!(got.dequant_f16, Some(model.scratch().dequant_f16));
+            }
+        }
+    }
+
+    /// BF16 weights convert only their activations; the Q8_0 alpha/beta pair
+    /// still dequantizes to F16 at its own size (heads x hidden).
+    #[test]
+    fn bf16_weights_take_the_activation_scratch_and_q8_gates_their_own_f16() {
+        for model in [Q27B, Q9B] {
+            let got = plan(
+                &model,
+                &model.gemms(WeightClass::Bf16Raw, WeightClass::Q8Raw, false),
+                &dense_switches(),
+            );
+            let gates = model.gdn.1 * model.hidden;
+            assert_eq!(
+                got,
+                sizes(None, Some(ROWS * model.inter * 2), Some(2 * gates)),
+                "{}",
+                model.name
+            );
+        }
+    }
+
+    /// Planar weights decode into the F32 scratch only, at the largest
+    /// weight; F32 weights take no scratch at all.
+    #[test]
+    fn planar_weights_take_the_f32_scratch_and_f32_weights_none() {
+        for model in [Q27B, Q9B] {
+            let planar = plan(
+                &model,
+                &model.gemms(WeightClass::Planar, WeightClass::F32, false),
+                &dense_switches(),
+            );
+            let f32 = plan(
+                &model,
+                &model.gemms(WeightClass::F32, WeightClass::F32, false),
+                &dense_switches(),
+            );
+            assert_eq!(
+                planar,
+                sizes(Some(model.inter * model.hidden), None, None),
+                "{}",
+                model.name
+            );
+            assert_eq!(f32, ConversionScratch::default(), "{}", model.name);
+        }
+    }
+
+    /// A mixed import (planar projections, a BF16 GDN output projection)
+    /// takes the F32 scratch for the planes and the activation scratch at the
+    /// BF16 GEMM's row.
+    #[test]
+    fn a_mixed_import_takes_the_scratch_of_each_of_its_routes() {
+        let model = Q27B;
+        let mut gemms = model.gemms(WeightClass::Planar, WeightClass::F32, false);
+        let ssm_out = gemms
+            .iter_mut()
+            .find(|g| g.residual && g.in_dim == model.gdn.2)
+            .unwrap();
+        ssm_out.weight = WeightClass::Bf16Raw;
+        let got = plan(&model, &gemms, &dense_switches());
+        assert_eq!(
+            got,
+            sizes(
+                Some(model.inter * model.hidden),
+                Some(ROWS * model.gdn.2 * 2),
+                None
+            )
+        );
+    }
+
+    /// `LUMEN_CUDA_PREFILL_F32` sends the Q8_0 and Q4_0 projections to the F32
+    /// fallback (and leaves the K-quants refused, needing nothing).
+    #[test]
+    fn the_f32_switch_takes_the_f32_scratch() {
+        let model = Q27B;
+        let switches = GemmSwitches {
+            force_f32: true,
+            ..dense_switches()
+        };
+        for weight in [WeightClass::Q8Raw, WeightClass::Q4Raw] {
+            let got = plan(&model, &model.gemms(weight, weight, false), &switches);
+            assert_eq!(
+                got,
+                sizes(Some(model.inter * model.hidden), None, None),
+                "{weight:?}"
+            );
+        }
+        let kquant = plan(
+            &model,
+            &model.gemms(WeightClass::KQuant, WeightClass::KQuant, false),
+            &switches,
+        );
+        assert_eq!(kquant, ConversionScratch::default());
+    }
+
+    /// The MoE model's Q8_0 projections take MMQ (no scratch); its residual
+    /// GEMMs (`wo`, `ssm_out`, 2048 x 4096) dequantize to F16, and the cached
+    /// alpha/beta pair converts its hidden-wide rows.
+    #[test]
+    fn moe_q8_takes_the_f16_pair_of_its_residual_gemms_only() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Q8Raw, WeightClass::Q8Raw, true),
+            &moe_switches(false),
+        );
+        assert_eq!(
+            got,
+            sizes(None, Some(ROWS * 4096 * 2), Some(2 * 2048 * 4096))
+        );
+        // With the MMQ switch set, the residual GEMMs take MMQ too, and only
+        // the cache arm of the alpha/beta pair converts anything.
+        let mmq_everywhere = GemmSwitches {
+            q8_proj_mmq_set: true,
+            ..moe_switches(false)
+        };
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Q8Raw, WeightClass::Q8Raw, true),
+            &mmq_everywhere,
+        );
+        assert_eq!(got, ConversionScratch::default());
+    }
+
+    /// MoE BF16: BF16 GEMMs convert their activations (widest row 4096), the
+    /// Q8_0 alpha/beta pair takes the F32 SGEMM at heads x hidden.
+    #[test]
+    fn moe_bf16_takes_the_activation_scratch_and_f32_gates() {
+        let model = MOE;
+        let got = plan(
+            &model,
+            &model.gemms(WeightClass::Bf16Raw, WeightClass::Q8Raw, true),
+            &moe_switches(true),
+        );
+        assert_eq!(got, sizes(Some(32 * 2048), Some(ROWS * 4096 * 2), None));
+    }
+
+    /// A GEMM whose F16 need exceeds the one-size bound takes the F32
+    /// fallback as with the bound, and that fallback's own length check
+    /// fails as with the bound: the regions are capped at the bound.
+    #[test]
+    fn a_need_over_the_bound_is_planned_as_the_bound_decides_it() {
+        let model = Q27B;
+        let bound = model.scratch();
+        let over = PrefillGemm {
+            weight: WeightClass::Q8Raw,
+            out_dim: model.inter + 1,
+            in_dim: model.hidden,
+            residual: false,
+            gdn_alpha_beta: false,
+            f16_cache: false,
+        };
+        let got = plan(&model, &[over], &dense_switches());
+        assert_eq!(got, sizes(Some(bound.dequant_f32), None, None));
+        assert!(got.dequant_f32.unwrap() < over.out_dim * over.in_dim);
     }
 
     /// The production planar prefill launchers on NVFP4 and FP8 planes of many groups:

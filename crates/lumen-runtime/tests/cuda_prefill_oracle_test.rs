@@ -6,7 +6,9 @@
 //! state snapshots cover), the KV cache and the GDN state at each step; on a
 //! 16-bit store the decode logits, which read the cache, stand for it. `LUMEN_PREFILL_ORACLE=capture` writes the digests to
 //! `LUMEN_PREFILL_ORACLE_FILE`; `check` compares them with that file and names
-//! every case that differs.
+//! every case that differs. `LUMEN_PREFILL_ORACLE_LAYOUT=unshared` prefills
+//! through a workspace that gives every value its own region, so a record
+//! captured that way checks the shared layout against it.
 #![cfg(all(feature = "cuda", feature = "test-state-snapshot"))]
 
 mod common;
@@ -54,6 +56,10 @@ fn backend(provider: &SyncWeightProvider, precision: KvPrecision) -> CudaBackend
         provider.output_proj.clone(),
     );
     cuda.init(&hp).expect("init");
+    if std::env::var("LUMEN_PREFILL_ORACLE_LAYOUT").as_deref() == Ok("unshared") {
+        cuda.set_unshared_prefill_workspace()
+            .expect("before preload");
+    }
     cuda.preload_weights(provider).expect("preload");
     cuda
 }

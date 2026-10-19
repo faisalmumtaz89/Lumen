@@ -224,6 +224,24 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Lay the F32 prefill workspace out with every value in its own region,
+    /// sized as the one-size-fits-all scratch, instead of letting values never
+    /// live together share bytes, so a test can show the two layouts prefill
+    /// alike. Call between `init` and `preload_weights`.
+    pub fn set_unshared_prefill_workspace(&self) -> Result<(), RuntimeError> {
+        let mut guard = self.state.lock().unwrap();
+        let st = guard
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Compute("CUDA backend not initialized".into()))?;
+        if st.prefill_layout.is_some() {
+            return Err(RuntimeError::Config(
+                "set_unshared_prefill_workspace must be called before preload_weights()".into(),
+            ));
+        }
+        st.unshared_prefill_workspace = true;
+        Ok(())
+    }
+
     /// Fill every region of the retained F32 prefill workspace and every buffer
     /// of the grouped MoE prefill scratch with 0xFF bytes (NaN as F32), so a
     /// test can show no request reads a row of them that the request did not
