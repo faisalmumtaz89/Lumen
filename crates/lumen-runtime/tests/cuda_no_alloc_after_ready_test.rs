@@ -4,19 +4,20 @@
 //! them (cold prompts of one and several slices, decode greedy and sampled, a
 //! generated tail caught up, short and long suffixes, a divergent prompt that
 //! restarts, the same prompt again, a prompt longer than the context refused and
-//! the context filled to its last slot). CUPTI records every allocation call,
+//! a decode into the context's last slot). CUPTI records every allocation call,
 //! synchronous, stream-ordered, managed or from a pool, the program's own and the
-//! CUDA libraries' alike, and the static data of a module the driver loads: no
-//! allocation call may be recorded, and a window that lost records fails. The one
-//! record a request may leave is the driver loading a library kernel's module the
-//! first time a request launches it (CUDA loads modules lazily), which the serving
-//! plan's allowance covers; those are printed. Module code and virtual-memory
-//! mappings leave no record, so with `LUMEN_NO_ALLOC_ISOLATED_GPU=1` (nothing else
-//! on the GPU) free memory may fall by at most one allocation granule, the driver's
-//! smallest unit of device memory, which one module load takes. Before it is
-//! trusted the recorder must see a synchronous driver allocation, a stream
-//! allocation and a buffer clone, each as an allocation call.
-//! `LUMEN_CUDA_PROFILE` creates CUDA events per stage and is not part of a
+//! CUDA libraries' alike, and every driver call that makes device memory without
+//! an allocation record (a module or library load, a virtual-memory create or
+//! map); none may be made, and a window that lost records fails. What a request
+//! may still take is the code and static data of a library kernel's module the
+//! driver loads, with no call, the first time a request launches it (CUDA's
+//! default lazy loading), which the serving plan's allowance covers: the static
+//! data the driver records is printed, and with `LUMEN_NO_ALLOC_ISOLATED_GPU=1`
+//! (nothing else on the GPU) free memory may fall by at most one allocation
+//! granule, the driver's smallest unit of device memory, across the requests.
+//! Before it is trusted the recorder must see a synchronous driver allocation, a
+//! stream allocation and a buffer clone, each as an allocation call, and a module
+//! load. `LUMEN_CUDA_PROFILE` creates CUDA events per stage and is not part of a
 //! request's contract.
 #![cfg(all(feature = "cuda", feature = "test-cupti"))]
 
@@ -38,6 +39,7 @@ use lumen_runtime::session::Session;
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::alloc::{alloc, dealloc, Layout};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 
 const CONTEXT: usize = 8192;
@@ -65,6 +67,22 @@ impl Allocation {
 }
 
 static RECORDED: Mutex<Vec<Allocation>> = Mutex::new(Vec::new());
+/// Driver calls that make device memory no allocation record shows.
+const MEMORY_CALLS: [cupti::CUpti_driver_api_trace_cbid; 8] = [
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoad,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadData,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadDataEx,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuModuleLoadFatBinary,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryLoadData,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuLibraryLoadFromFile,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemCreate,
+    cupti::CUpti_driver_api_trace_cbid::CUPTI_DRIVER_TRACE_CBID_cuMemMap,
+];
+
+/// The [`MEMORY_CALLS`] made while a window records.
+static CALLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static WATCHING: AtomicBool = AtomicBool::new(false);
+
 /// Why a recording window cannot be trusted: a buffer CUPTI could not be given,
 /// or a record it could not decode.
 static LOST: Mutex<Option<String>> = Mutex::new(None);
@@ -146,7 +164,36 @@ extern "C" fn buffer_completed(
     }
 }
 
-/// Records device allocations from `start` until `allocations`.
+unsafe extern "C" fn driver_call(
+    _userdata: *mut std::ffi::c_void,
+    domain: cupti::CUpti_CallbackDomain,
+    _cbid: cupti::CUpti_CallbackId,
+    data: *const std::ffi::c_void,
+) {
+    if !WATCHING.load(Ordering::SeqCst)
+        || domain != cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_DRIVER_API
+    {
+        return;
+    }
+    // SAFETY: a driver-API callback's data is a `CUpti_CallbackData`.
+    let data = unsafe { &*(data as *const cupti::CUpti_CallbackData) };
+    if data.callbackSite == cupti::CUpti_ApiCallbackSite::CUPTI_API_ENTER {
+        // SAFETY: CUPTI's NUL-terminated name of the called function.
+        let name = unsafe { std::ffi::CStr::from_ptr(data.functionName) };
+        CALLED
+            .lock()
+            .unwrap()
+            .push(name.to_string_lossy().into_owned());
+    }
+}
+
+/// What a window recorded: device allocations, and the [`MEMORY_CALLS`] made.
+struct Recorded {
+    allocations: Vec<Allocation>,
+    memory_calls: Vec<String>,
+}
+
+/// Records device allocations and memory calls from `start` until `finish`.
 struct Recorder;
 
 impl Recorder {
@@ -154,16 +201,39 @@ impl Recorder {
         REGISTER.call_once(|| {
             activity::register_callbacks(Some(buffer_requested), Some(buffer_completed))
                 .expect("register the CUPTI activity buffers");
+            let mut subscriber: cupti::CUpti_SubscriberHandle = std::ptr::null_mut();
+            // SAFETY: `subscriber` is a valid out-parameter; the callback lives
+            // as long as the process, and so does the subscription.
+            unsafe {
+                cudarc::cupti::result::subscribe(
+                    &mut subscriber,
+                    Some(driver_call),
+                    std::ptr::null_mut(),
+                )
+                .expect("subscribe to CUPTI callbacks");
+                for call in MEMORY_CALLS {
+                    cudarc::cupti::result::enable_callback(
+                        1,
+                        subscriber,
+                        cupti::CUpti_CallbackDomain::CUPTI_CB_DOMAIN_DRIVER_API,
+                        call as cupti::CUpti_CallbackId,
+                    )
+                    .expect("enable a driver callback");
+                }
+            }
         });
         RECORDED.lock().unwrap().clear();
         *LOST.lock().unwrap() = None;
+        CALLED.lock().unwrap().clear();
+        WATCHING.store(true, Ordering::SeqCst);
         activity::enable(cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2)
             .expect("enable CUPTI memory records");
         Recorder
     }
 
-    /// The allocations recorded, or why the window lost some.
-    fn allocations(self, ctx: &CudaContext) -> Result<Vec<Allocation>, String> {
+    /// What the window recorded, or why it lost records.
+    fn finish(self, ctx: &CudaContext) -> Result<Recorded, String> {
+        WATCHING.store(false, Ordering::SeqCst);
         activity::disable(cupti::CUpti_ActivityKind::CUPTI_ACTIVITY_KIND_MEMORY2).unwrap();
         activity::flush_all(cupti::CUpti_ActivityFlag::CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32)
             .unwrap();
@@ -178,12 +248,16 @@ impl Recorder {
                 return Err(format!("CUPTI dropped {dropped} records"));
             }
         }
-        Ok(std::mem::take(&mut *RECORDED.lock().unwrap()))
+        Ok(Recorded {
+            allocations: std::mem::take(&mut *RECORDED.lock().unwrap()),
+            memory_calls: std::mem::take(&mut *CALLED.lock().unwrap()),
+        })
     }
 }
 
-/// The recorder sees a synchronous driver allocation, a stream allocation and
-/// a device-to-device clone made in the context the backend uses.
+/// The recorder sees a synchronous driver allocation, a stream allocation, a
+/// device-to-device clone and a module load made in the context the backend
+/// uses.
 fn recorder_sees_every_allocation_kind(ctx: &std::sync::Arc<CudaContext>) {
     let stream = ctx.default_stream();
     let recorder = Recorder::start();
@@ -197,11 +271,29 @@ fn recorder_sees_every_allocation_kind(ctx: &std::sync::Arc<CudaContext>) {
     let b = a.clone();
     stream.synchronize().unwrap();
     drop((a, b));
-    let seen = recorder.allocations(ctx).unwrap();
-    let calls = seen.iter().filter(|a| !a.is_module_load()).count();
+    let ptx = c".version 7.0\n.target sm_52\n.address_size 64\n";
+    // SAFETY: an empty PTX module, unloaded at once.
+    unsafe {
+        let mut module = std::ptr::null_mut();
+        driver_sys::cuModuleLoadData(&mut module, ptx.as_ptr().cast())
+            .result()
+            .unwrap();
+        driver_sys::cuModuleUnload(module).result().unwrap();
+    }
+    let seen = recorder.finish(ctx).unwrap();
+    let calls = seen
+        .allocations
+        .iter()
+        .filter(|a| !a.is_module_load())
+        .count();
     assert!(
         calls >= 3,
-        "the recorder saw {calls} of 3 planted allocation calls: {seen:?}"
+        "the recorder saw {calls} of 3 planted allocation calls: {:?}",
+        seen.allocations
+    );
+    assert!(
+        !seen.memory_calls.is_empty(),
+        "the recorder did not see the planted module load"
     );
 }
 
@@ -322,9 +414,11 @@ fn requests(cuda: &CudaBackend, provider: &SyncWeightProvider, precision: KvPrec
     assert!(s
         .extend_with_cache(&prompt(CONTEXT + 1, vocab, 5), cuda, provider, threshold)
         .is_err());
+    // The first token comes from the prompt's logits; the second is decoded into
+    // the context's last slot.
     s.extend_with_cache(&prompt(CONTEXT - 1, vocab, 6), cuda, provider, threshold)
         .expect("a prompt filling the context");
-    decode(&mut s, 1);
+    decode(&mut s, 2);
 }
 
 /// The fixtures: a dense GDN hybrid, a Qwen3.5-shaped MoE model with Q8_0
@@ -361,8 +455,9 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
     let stack = stack_limit(&ctx);
     let recorder = Recorder::start();
     requests(&cuda, &provider, precision);
-    let (loads, calls): (Vec<_>, Vec<_>) = recorder
-        .allocations(&ctx)?
+    let recorded = recorder.finish(&ctx)?;
+    let (loads, calls): (Vec<_>, Vec<_>) = recorded
+        .allocations
         .into_iter()
         .partition(Allocation::is_module_load);
     let free_after = free_memory(&ctx);
@@ -372,6 +467,12 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
     );
     if !calls.is_empty() {
         return Err(format!("requests allocated device memory: {calls:?}"));
+    }
+    if !recorded.memory_calls.is_empty() {
+        return Err(format!(
+            "requests made device memory outside the allocation records: {:?}",
+            recorded.memory_calls
+        ));
     }
     if stack_limit(&ctx) != stack {
         return Err("a request grew the stack".into());
