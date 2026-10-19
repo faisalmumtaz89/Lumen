@@ -62,8 +62,9 @@ impl Target {
     /// default device.
     fn flag(self) -> String {
         match self {
-            Target::Cuda(0) | Target::Host => String::new(),
+            Target::Cuda(0) => String::new(),
             Target::Cuda(ordinal) => format!(" --cuda-device {ordinal}"),
+            Target::Host => " --simd".into(),
         }
     }
 
@@ -174,8 +175,9 @@ fn ruling(
 
 /// The refusal for `quant` of `entry`, which the user named `name`, when it
 /// cannot run on `device`, `target`'s; `None` when it is not ruled out.
-/// `sizes` holds the download size of each of the model's quants known, and
-/// `cached` the quants already downloaded and converted.
+/// `sizes` holds the download size of each of the model's quants known,
+/// `cached` the quants already downloaded and converted, and `downloaded`
+/// whether `quant`'s files are all downloaded already.
 pub(crate) fn refusal(
     entry: &ModelEntry,
     name: &str,
@@ -184,13 +186,19 @@ pub(crate) fn refusal(
     device: Device,
     sizes: &BTreeMap<String, u64>,
     cached: &[String],
+    downloaded: bool,
 ) -> Option<String> {
+    let outcome = if downloaded {
+        "its downloaded files were not converted"
+    } else {
+        "nothing was downloaded"
+    };
     let gib = |bytes: u64| format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64);
     let model = &entry.display_name;
     let mut message = match ruling(entry, quant, target, device, sizes.get(quant).copied())? {
         Ruling::Capability { need, have } => format!(
             "{model} {quant} needs a CUDA GPU of compute capability {}.{} or newer and {} \
-             compute capability {}.{}, so it cannot run there; nothing was downloaded.",
+             compute capability {}.{}, so it cannot run there; {outcome}.",
             need.0,
             need.1,
             target.holder(),
@@ -199,7 +207,7 @@ pub(crate) fn refusal(
         ),
         Ruling::Weights { size, memory } => format!(
             "{model} {quant} is a {} download whose weights alone are more than the {} of \
-             memory {}, so it cannot run there; nothing was downloaded.",
+             memory {}, so it cannot run there; {outcome}.",
             gib(size),
             gib(memory),
             target.holder()
@@ -212,7 +220,7 @@ pub(crate) fn refusal(
         } => format!(
             "{model} {quant} is a {} download whose weights take at least {} on a GPU of \
              compute capability {}.{}, which holds BF16 weights as F32 (below 9.0), more than \
-             the {} of memory {}, so it cannot run there; nothing was downloaded.",
+             the {} of memory {}, so it cannot run there; {outcome}.",
             gib(size),
             gib(at_least),
             have.0,
@@ -297,9 +305,9 @@ fn check_against(
     target: Target,
     device: impl FnOnce() -> Device,
 ) -> Result<(), String> {
-    if !entry.gguf_files.contains_key(quant) {
+    let Some(src) = entry.gguf_files.get(quant) else {
         return Ok(());
-    }
+    };
     let device = device();
     let mut sizes = BTreeMap::new();
     if let Some(size) = download_size(entry, quant) {
@@ -319,7 +327,10 @@ fn check_against(
         .filter(|q| crate::cache::cached_lbc(&entry.key, q).is_some())
         .cloned()
         .collect();
-    match refusal(entry, name, quant, target, device, &sizes, &cached) {
+    let downloaded = src.files.iter().all(|f| downloaded(f).is_some());
+    match refusal(
+        entry, name, quant, target, device, &sizes, &cached, downloaded,
+    ) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -446,7 +457,8 @@ mod tests {
                 Target::Cuda(0),
                 memory(24 * GIB),
                 &s,
-                &[]
+                &[],
+                false
             ),
             None
         );
@@ -458,7 +470,8 @@ mod tests {
                 Target::Cuda(0),
                 memory(24 * GIB),
                 &BTreeMap::new(),
-                &[]
+                &[],
+                false
             ),
             None,
             "an unknown size refuses nothing"
@@ -483,6 +496,7 @@ mod tests {
             memory(24 * GIB),
             &s,
             &cached,
+            false,
         )
         .unwrap();
         assert!(
@@ -523,6 +537,7 @@ mod tests {
             memory(12 * GIB),
             &s,
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -546,6 +561,7 @@ mod tests {
             memory(12 * GIB),
             &s,
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -572,6 +588,7 @@ mod tests {
             memory(16 * GIB),
             &s,
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -585,7 +602,31 @@ mod tests {
             message.contains("\nNot ruled out on this machine:"),
             "{message}"
         );
-        assert!(message.contains("lumen run qwen3.8-27b:q4_0"), "{message}");
+        assert!(
+            message.contains("lumen run qwen3.8-27b:q4_0 --simd \"…\""),
+            "a CPU suggestion runs on the CPU: {message}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_of_downloaded_files_says_they_were_not_converted() {
+        let t4 = gpu(15_645_278_208, (7, 5));
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q4_K_M",
+            Target::Cuda(0),
+            t4,
+            &sizes_27b(),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(
+            message.contains("so it cannot run there; its downloaded files were not converted."),
+            "{message}"
+        );
+        assert!(!message.contains("nothing was downloaded"), "{message}");
     }
 
     #[test]
@@ -599,6 +640,7 @@ mod tests {
             t4,
             &sizes_27b(),
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -625,6 +667,7 @@ mod tests {
             t4,
             &sizes_27b(),
             &[],
+            false,
         )
         .unwrap();
         assert!(!q8.contains(":q4_k_m"), "{q8}");
@@ -645,6 +688,7 @@ mod tests {
             device,
             &BTreeMap::new(),
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -669,7 +713,8 @@ mod tests {
                     Target::Cuda(0),
                     device,
                     &sizes_27b(),
-                    &[]
+                    &[],
+                    false
                 ),
                 None
             );
@@ -681,7 +726,8 @@ mod tests {
             Target::Cuda(0),
             gpu(24 * GIB, (7, 9)),
             &sizes_27b(),
-            &[]
+            &[],
+            false
         )
         .is_some());
     }
@@ -702,6 +748,7 @@ mod tests {
             gpu(at_least - 1, (8, 0)),
             &sizes_27b(),
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -720,7 +767,8 @@ mod tests {
                 Target::Cuda(0),
                 gpu(at_least, (8, 0)),
                 &sizes_27b(),
-                &[]
+                &[],
+                false
             ),
             None
         );
@@ -743,7 +791,8 @@ mod tests {
                     target,
                     device,
                     &sizes_27b(),
-                    &[]
+                    &[],
+                    false
                 ),
                 None
             );
@@ -762,7 +811,8 @@ mod tests {
                 Target::Cuda(0),
                 gpu(80 * GIB, (8, 0)),
                 &s,
-                &[]
+                &[],
+                false
             ),
             None
         );
@@ -785,6 +835,7 @@ mod tests {
             gpu(24 * GIB, (8, 6)),
             &s,
             &[],
+            false,
         )
         .unwrap();
         assert!(message.contains("take at least 28.29 GiB"), "{message}");
@@ -796,7 +847,8 @@ mod tests {
                 Target::Cuda(0),
                 gpu(32 * GIB, (8, 6)),
                 &s,
-                &[]
+                &[],
+                false
             ),
             None
         );
@@ -818,6 +870,7 @@ mod tests {
                 gpu(memory, (8, 0)),
                 &s,
                 &[],
+                false,
             )
         };
         assert!(rule(at_least - 1).is_some());
@@ -855,6 +908,7 @@ mod tests {
             gpu(80 * GIB, (8, 0)),
             &sizes_27b(),
             &[],
+            false,
         )
         .unwrap();
         assert!(
@@ -869,6 +923,7 @@ mod tests {
             gpu(80 * GIB, (8, 0)),
             &sizes_27b(),
             &[],
+            false,
         )
         .unwrap();
         assert!(!on_0.contains("--cuda-device"), "{on_0}");

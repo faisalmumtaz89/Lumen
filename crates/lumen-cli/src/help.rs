@@ -47,9 +47,9 @@ ARGUMENTS:
                           run is refused before its first byte: a K-quant below compute
                           capability 8.0, weights bigger than its memory, judged from the
                           download size, or a dense BF16 model whose weights, held as F32 below
-                          compute capability 9.0, cannot fit. With --cpu, outside macOS with no
-                          NVIDIA GPU, or on a build without CUDA, the check is made against the
-                          memory this machine has available.
+                          compute capability 9.0, cannot fit. With --cpu, or outside macOS with
+                          no NVIDIA GPU or on a build without CUDA, the check is made against
+                          the memory this machine has available.
 
 OPTIONS:
     --quant <scheme>      Quantization format. Available: Q8_0, Q4_0, BF16;

@@ -183,7 +183,7 @@ fn pull_cmd(args: &[String]) {
 
     #[cfg(not(all(feature = "download", feature = "cuda")))]
     let _ = cuda_device;
-    #[cfg(not(all(feature = "download", any(feature = "cuda", not(target_os = "macos")))))]
+    #[cfg(not(feature = "download"))]
     let _ = cpu;
 
     // Quant priority: colon tag > --quant flag > the model's default.
@@ -217,10 +217,13 @@ fn pull_cmd(args: &[String]) {
             std::process::exit(1);
         }
     }
-    // For a CPU run, or without a GPU `lumen run` picks, the model runs on a
-    // CPU backend from this machine's memory.
-    #[cfg(all(feature = "download", not(target_os = "macos")))]
-    if cpu || !(cfg!(feature = "cuda") && lumen_runtime::runtime_defaults::nvidia_gpu_present()) {
+    // For a CPU run, or outside macOS (where `lumen run` picks Metal) without a
+    // GPU it picks, the model runs on a CPU backend from this machine's memory.
+    #[cfg(feature = "download")]
+    if cpu
+        || (cfg!(not(target_os = "macos"))
+            && !(cfg!(feature = "cuda") && lumen_runtime::runtime_defaults::nvidia_gpu_present()))
+    {
         if let Err(e) = fit::check_host(entry, resolved_name, quant) {
             eprintln!("Error: {e}");
             std::process::exit(1);
