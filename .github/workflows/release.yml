@@ -36,12 +36,12 @@ jobs:
     # oldest glibc the Linux binaries start on; packaging/ci/glibc_floor.sh checks it.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
       # Its key carries no Ubuntu version: a cache from a newer one holds build
       # scripts that need that one's glibc.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: ubuntu-22.04
       - name: build
@@ -50,7 +50,7 @@ jobs:
           cargo build --release --locked -p lumen-image --bin lbi-convert
       - name: glibc the binaries need
         run: packaging/ci/glibc_floor.sh target/release/lumen target/release/lumen-server target/release/lbi-convert
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-cuda-bins
           path: |
@@ -64,17 +64,17 @@ jobs:
     name: build macOS arm64 tarball
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # LUMEN_TAG = the actual git tag, so the asset name matches the Release tag
       # (was defaulting to b<rev-count>, which 404'd the installer).
       - name: build tarball
         env:
           LUMEN_TAG: ${{ github.ref_name }}
         run: bash packaging/macos/build-tarball.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-tarball
           path: dist/*
@@ -91,19 +91,19 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: guard — secrets present
         run: |
           if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
             echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET not set — cannot validate a release"; exit 1
           fi
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - name: install modal
         run: pip install 'modal~=1.4'
       # Promote: stage the SAME binary that will ship into the Modal image.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-cuda-bins
           path: packaging/modal/bin
@@ -117,7 +117,7 @@ jobs:
         run: modal app stop lumen-phase1-arch-validation 2>/dev/null || true
       - name: gate
         run: grep -q "VALIDATION PASSED" modal-validation.log || { echo "::error::release CUDA validation FAILED — not publishing"; exit 1; }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with: { name: release-cuda-validation, path: modal-validation.log, if-no-files-found: warn }
 
@@ -131,8 +131,8 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: macos-tarball
           path: dist
@@ -159,16 +159,16 @@ jobs:
     permissions:
       contents: write   # create the Release + upload assets (scoped to this job)
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { name: macos-tarball, path: dist }
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { name: linux-cuda-bins, path: linux-bins }
       - name: package linux tarball + checksums + homebrew formula
         env:
           TAG: ${{ github.ref_name }}
         run: bash packaging/macos/finalize-release.sh
-      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # A tag with a hyphen (v0.1.0-rc.1) is a SemVer pre-release: mark it as a
           # GitHub prerelease so it does NOT become "Latest release" — which keeps the
@@ -192,12 +192,12 @@ jobs:
       contents: read
       packages: write   # ghcr push (scoped to this job)
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Promote: bake the SAME validated binary into the image (Dockerfile COPYs
       # bin/ from its build context = packaging/modal).
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { name: linux-cuda-bins, path: packaging/modal/bin }
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
