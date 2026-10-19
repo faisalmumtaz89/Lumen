@@ -12,6 +12,7 @@ pub mod disk;
 
 use crate::compute::simd_kernels;
 use crate::error::RuntimeError;
+use lumen_format::serving_rules::ServingBackend;
 
 /// Precision for KV cache storage.
 ///
@@ -66,6 +67,35 @@ impl KvPrecision {
             Self::F32 | Self::F16 | Self::Bf16 => true,
             Self::Int8 | Self::Int4 => false,
         }
+    }
+}
+
+/// Whether `backend` stores a KV cache of `precision`, and why not: the CPU
+/// backends store F32 or F16, Metal F16 (its GPU-resident KV buffers and their
+/// CPU mirror are allocated as F16 at init), CUDA F32, F16 or BF16. Each
+/// backend's `validate_kv_precision` refuses with it, and the binaries check
+/// the precision they resolved with it before a model is downloaded.
+pub fn kv_precision_supported(
+    backend: ServingBackend,
+    precision: KvPrecision,
+) -> Result<(), String> {
+    match (backend, precision) {
+        (ServingBackend::Cpu, KvPrecision::F32 | KvPrecision::F16)
+        | (ServingBackend::Metal, KvPrecision::F16)
+        | (ServingBackend::Cuda, KvPrecision::F32 | KvPrecision::F16 | KvPrecision::Bf16) => Ok(()),
+        (ServingBackend::Cuda, other) => Err(format!(
+            "CUDA KV cache precision {other:?} is not implemented (f32, f16 or bf16)"
+        )),
+        (_, other) if !other.is_implemented() => Err(format!(
+            "KV cache precision {other:?} is not yet implemented"
+        )),
+        (ServingBackend::Cpu, other) => Err(format!(
+            "the CPU backends store the KV cache as F32 or F16 (requested {other:?})"
+        )),
+        (ServingBackend::Metal, other) => Err(format!(
+            "Metal backend KV cache is F16-only (requested {other:?}); set --kv-precision f16 \
+             explicitly or omit the flag"
+        )),
     }
 }
 
@@ -922,6 +952,45 @@ impl std::fmt::Debug for KvCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_backend_stores_its_own_kv_precisions() {
+        use lumen_format::serving_rules::ServingBackend::{Cpu, Cuda, Metal};
+        let all = [
+            KvPrecision::F32,
+            KvPrecision::F16,
+            KvPrecision::Bf16,
+            KvPrecision::Int8,
+            KvPrecision::Int4,
+        ];
+        for (backend, stored) in [
+            (Cpu, &[KvPrecision::F32, KvPrecision::F16][..]),
+            (Metal, &[KvPrecision::F16][..]),
+            (
+                Cuda,
+                &[KvPrecision::F32, KvPrecision::F16, KvPrecision::Bf16][..],
+            ),
+        ] {
+            for p in all {
+                assert_eq!(
+                    super::kv_precision_supported(backend, p).is_ok(),
+                    stored.contains(&p),
+                    "{backend:?} {p:?}"
+                );
+            }
+        }
+        let cpu = super::kv_precision_supported(Cpu, KvPrecision::Bf16).unwrap_err();
+        assert!(cpu.contains("F32 or F16 (requested Bf16)"), "{cpu}");
+        let metal = super::kv_precision_supported(Metal, KvPrecision::F32).unwrap_err();
+        assert!(
+            metal.contains("F16-only") && metal.contains("Metal"),
+            "{metal}"
+        );
+        let int8 = super::kv_precision_supported(Cpu, KvPrecision::Int8).unwrap_err();
+        assert!(int8.contains("not yet implemented"), "{int8}");
+        let cuda = super::kv_precision_supported(Cuda, KvPrecision::Int4).unwrap_err();
+        assert!(cuda.contains("f32, f16 or bf16"), "{cuda}");
+    }
+
     use super::*;
 
     fn test_config() -> KvCacheConfig {

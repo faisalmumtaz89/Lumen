@@ -965,13 +965,42 @@ async fn run(args: Args) -> Result<(), String> {
         return Err("a model is required: pass `MODEL:QUANT` or --model (try --help)".to_string());
     }
 
+    // The backend, and what this build and machine and the KV precision allow
+    // on it, are decided before the model is resolved, so a server that cannot
+    // start downloads nothing. A backend this build cannot construct is refused
+    // for that reason first, with the message the backend construction below
+    // gives, before admission could name the kill switch instead of the build.
+    let backend_choice = select_backend(args.backend);
+    if matches!(backend_choice, BackendChoice::Cuda) && !cfg!(feature = "cuda") {
+        return Err("--backend cuda requires building with --features cuda".to_string());
+    }
+    if matches!(backend_choice, BackendChoice::Metal) && !cfg!(target_os = "macos") {
+        return Err("--backend metal is only supported on macOS".to_string());
+    }
+    let admission_backend = match backend_choice {
+        BackendChoice::Cuda => lumen_format::serving_rules::ServingBackend::Cuda,
+        BackendChoice::Metal => lumen_format::serving_rules::ServingBackend::Metal,
+        BackendChoice::Cpu | BackendChoice::Auto => {
+            lumen_format::serving_rules::ServingBackend::Cpu
+        }
+    };
+    let kv_precision = resolve_kv_precision(
+        args.kv_precision,
+        if matches!(backend_choice, BackendChoice::Metal) {
+            KvPrecision::F16
+        } else {
+            KvPrecision::F32
+        },
+    );
+    lumen_runtime::kv::kv_precision_supported(admission_backend, kv_precision)?;
+
     let lbc_path = match resolve_model_path(&args.model, args.quant.as_deref())? {
         ModelLocation::Cached(path) => path,
         ModelLocation::Missing(spec) => {
             // the device the model is checked against is the one it will run
-            // on: the CPU when the server is told so
+            // on: this machine's memory for the CPU backend
             let device =
-                (!matches!(args.backend, BackendChoice::Cpu)).then_some(args.backend_device);
+                (!matches!(backend_choice, BackendChoice::Cpu)).then_some(args.backend_device);
             fetch(&spec, device).await?;
             match resolve_model_path(&args.model, args.quant.as_deref())? {
                 ModelLocation::Cached(path) => path,
@@ -996,25 +1025,7 @@ async fn run(args: Args) -> Result<(), String> {
     // so without this it would reach the provider and fail as a missing kernel or, worse, a misread plane.
     // Admission is backend-dependent: the planar schemes are served by the CUDA kernels only, and only
     // while the kill switch leaves them on; the switch is published the same way the CLI publishes it.
-    // The backend is resolved here, before admission and the weight-provider choice, which both depend on
-    // it. A backend this build cannot construct is refused for that reason first, with the message the
-    // backend construction below gives, before any weight provider opens and before admission could name
-    // the kill switch instead of the build.
     lumen_runtime::runtime_defaults::publish_cuda_nvfp4_admission();
-    let backend_choice = select_backend(args.backend);
-    if matches!(backend_choice, BackendChoice::Cuda) && !cfg!(feature = "cuda") {
-        return Err("--backend cuda requires building with --features cuda".to_string());
-    }
-    if matches!(backend_choice, BackendChoice::Metal) && !cfg!(target_os = "macos") {
-        return Err("--backend metal is only supported on macOS".to_string());
-    }
-    let admission_backend = match backend_choice {
-        BackendChoice::Cuda => lumen_format::serving_rules::ServingBackend::Cuda,
-        BackendChoice::Metal => lumen_format::serving_rules::ServingBackend::Metal,
-        BackendChoice::Cpu | BackendChoice::Auto => {
-            lumen_format::serving_rules::ServingBackend::Cpu
-        }
-    };
     if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, admission_backend) {
         return Err(lumen_format::serving_rules::no_serving_kernels_message(
             scheme,
@@ -1070,14 +1081,8 @@ async fn run(args: Args) -> Result<(), String> {
         let context = args
             .context_len
             .min(lbc.header.hyperparams.max_seq_len as usize);
-        lumen_runtime::compute::check_cpu_memory(
-            &lbc,
-            context,
-            resolve_kv_precision(args.kv_precision, KvPrecision::F32),
-            true,
-            false,
-        )
-        .map_err(|e| e.to_string())?;
+        lumen_runtime::compute::check_cpu_memory(&lbc, context, kv_precision, true, false)
+            .map_err(|e| e.to_string())?;
     }
 
     // Provider selection: the Metal GPU-resident path, CUDA NVFP4 and the CPU
@@ -1227,12 +1232,7 @@ async fn run(args: Args) -> Result<(), String> {
                 metal
                     .preload_weights(provider.as_dyn())
                     .map_err(|e| format!("Metal preload_weights: {e}"))?;
-                // Metal holds F16 only; a requested F32 or BF16 is refused by
-                // validate_kv_precision at the engine.
-                (
-                    Box::new(metal),
-                    resolve_kv_precision(args.kv_precision, KvPrecision::F16),
-                )
+                (Box::new(metal), kv_precision)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -1242,7 +1242,6 @@ async fn run(args: Args) -> Result<(), String> {
         BackendChoice::Cuda => {
             #[cfg(feature = "cuda")]
             {
-                let kv_precision = resolve_kv_precision(args.kv_precision, KvPrecision::F32);
                 let mut cuda = CudaBackend::new(args.backend_device).map_err(|e| {
                     format!(
                         "CUDA backend unavailable (device {}): {e}",
@@ -1281,13 +1280,10 @@ async fn run(args: Args) -> Result<(), String> {
                 return Err("--backend cuda requires building with --features cuda".to_string());
             }
         }
-        BackendChoice::Cpu => {
-            // The CPU cache stores F32 or F16; the engine refuses any other precision.
-            (
-                Box::new(cpu_backend(&provider, &hyperparams_capped)?),
-                resolve_kv_precision(args.kv_precision, KvPrecision::F32),
-            )
-        }
+        BackendChoice::Cpu => (
+            Box::new(cpu_backend(&provider, &hyperparams_capped)?),
+            kv_precision,
+        ),
         BackendChoice::Auto => {
             return Err("internal: select_backend should have resolved Auto".to_string());
         }

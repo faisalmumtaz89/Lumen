@@ -45,6 +45,14 @@ use crate::telemetry::PerLayerTiming;
 use crate::weight::cache::{PrefetchPriority, WeightProvider};
 use lumen_format::ModelHyperparams;
 use std::path::Path;
+
+/// Whether `backend` saves and resumes sessions (`--session-save` /
+/// `--session-resume`): the CPU backends and Metal copy the KV cache and the
+/// recurrent state to and from the host; CUDA's `sync_kv_to_cpu` and
+/// `sync_kv_from_cpu` are not wired, so a CUDA run is refused before it starts.
+pub fn persists_sessions(backend: lumen_format::serving_rules::ServingBackend) -> bool {
+    backend != lumen_format::serving_rules::ServingBackend::Cuda
+}
 use std::time::{Duration, Instant};
 
 /// The result of a single prefill call.
@@ -1635,6 +1643,13 @@ fn forward_pass(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_cuda_has_no_session_persistence() {
+        use lumen_format::serving_rules::ServingBackend::{Cpu, Cuda, Metal};
+        assert!(super::persists_sessions(Cpu) && super::persists_sessions(Metal));
+        assert!(!super::persists_sessions(Cuda));
+    }
+
     use super::*;
     use crate::pipeline::PipelineMode;
     use lumen_format::test_model::{generate_test_model, TestModelConfig};

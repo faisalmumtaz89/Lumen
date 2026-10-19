@@ -1000,6 +1000,116 @@ pub(crate) fn run_inference(args: &[String]) {
         }
     }
 
+    // Everything the arguments, the build and this machine decide is refused
+    // here, before the model is resolved, so a run that cannot go ahead
+    // downloads nothing.
+    let token_ids: Option<Vec<u32>> = tokens_str.as_ref().map(|tokens| {
+        let ids: Vec<u32> = tokens
+            .split_whitespace()
+            .map(|s| {
+                s.parse::<u32>().unwrap_or_else(|_| {
+                    eprintln!("Error: token IDs must be non-negative integers, got: {s}");
+                    std::process::exit(1);
+                })
+            })
+            .collect();
+        if ids.is_empty() {
+            eprintln!("Error: --tokens must contain at least one token ID");
+            std::process::exit(1);
+        }
+        ids
+    });
+    match &prompt_str {
+        Some(prompt) if prompt.is_empty() => {
+            eprintln!("Error: --prompt must not be empty");
+            std::process::exit(1);
+        }
+        None if token_ids.is_none() => {
+            eprintln!("No prompt provided.\n");
+            eprintln!("Usage:");
+            eprintln!(
+                "  lumen run {} \"What is the capital of France?\"",
+                model_str
+            );
+            eprintln!("  lumen run --model {} --prompt \"Hello\"", model_str);
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+    // A backend this build cannot construct is refused for that reason first,
+    // with the message `create_backend` gives and in its order (CUDA is taken
+    // before Metal).
+    if use_cuda && !cfg!(feature = "cuda") {
+        eprintln!("Error: --cuda requires building with --features cuda");
+        std::process::exit(1);
+    }
+    if use_metal && !use_cuda && !cfg!(target_os = "macos") {
+        eprintln!("Error: --metal is only supported on macOS");
+        std::process::exit(1);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if use_accelerate {
+        eprintln!("Error: --accelerate is only supported on macOS");
+        std::process::exit(1);
+    }
+    let sessions = session_save_path.is_some() || session_resume_path.is_some();
+    if use_accelerate && sessions {
+        // The Accelerate path uses a separate prefill backend; the
+        // session-driven path is not yet plumbed through it because
+        // `Session::extend_with_prefill_backend` exists but the
+        // `generate_with_session` API only accepts a single
+        // `ComputeBackend`.
+        eprintln!(
+            "Error: --session-resume / --session-save is not supported \
+             with --accelerate (the Accelerate batched-prefill path \
+             uses a distinct backend; resume requires the unified \
+             compute backend). Re-run without --accelerate."
+        );
+        std::process::exit(2);
+    }
+    let serving_backend = if use_cuda {
+        lumen_format::serving_rules::ServingBackend::Cuda
+    } else if use_metal {
+        lumen_format::serving_rules::ServingBackend::Metal
+    } else {
+        lumen_format::serving_rules::ServingBackend::Cpu
+    };
+    if sessions && !lumen_runtime::session::persists_sessions(serving_backend) {
+        eprintln!(
+            "Error: the CUDA backend does not save or resume sessions \
+             (--session-save / --session-resume); they run on Metal and the CPU backends"
+        );
+        std::process::exit(2);
+    }
+    // resolve KV precision once at the dispatch site so all three
+    // run_with_* paths see the same value and any --kv-precision / env / default
+    // resolution logic lives in one place.
+    let kv_precision = resolve_kv_precision(kv_precision_override, use_metal, use_cuda, verbose);
+    if let Err(e) = lumen_runtime::kv::kv_precision_supported(serving_backend, kv_precision) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    // A GPU backend serves the linear-attention (GDN) layers only from weights
+    // it preloaded: the sync provider always preloads, the async one never,
+    // and the mmap one when the weights are GPU-resident.
+    let preloads = !use_async && (use_sync || gpu_resident);
+    let refuse_unpreloaded_gdn = || {
+        let mode = if use_async {
+            "--async"
+        } else {
+            "--no-gpu-resident / --streaming"
+        };
+        eprintln!(
+            "Error: on {} this model's linear-attention (GDN) layers run only from \
+             GPU-resident weights, which {mode} does not load; run without it, or with --sync",
+            if use_cuda { "CUDA" } else { "Metal" }
+        );
+        std::process::exit(1);
+    };
+    if (use_cuda || use_metal) && !preloads && registry_model_is_gdn(&model_path) {
+        refuse_unpreloaded_gdn();
+    }
+
     // Dual-mode --model: if the value looks like a file path (contains / or \,
     // or ends with .lbc/.gguf), treat it as a direct path. Otherwise, try to
     // resolve it as a preset name from the model registry.
@@ -1030,27 +1140,9 @@ pub(crate) fn run_inference(args: &[String]) {
     });
 
     // Resolve prompt tokens: either from --tokens (raw IDs) or --prompt (text -> tokenizer).
-    let (prompt_tokens, tokenizer) = if let Some(ref tokens) = tokens_str {
-        // --tokens mode: parse integer IDs (existing behavior, unchanged).
-        let ids: Vec<u32> = tokens
-            .split_whitespace()
-            .map(|s| {
-                s.parse::<u32>().unwrap_or_else(|_| {
-                    eprintln!("Error: token IDs must be non-negative integers, got: {s}");
-                    std::process::exit(1);
-                })
-            })
-            .collect();
-        if ids.is_empty() {
-            eprintln!("Error: --tokens must contain at least one token ID");
-            std::process::exit(1);
-        }
+    let (prompt_tokens, tokenizer) = if let Some(ids) = token_ids {
         (ids, None) // No tokenizer needed for --tokens mode
     } else if let Some(ref prompt) = prompt_str {
-        if prompt.is_empty() {
-            eprintln!("Error: --prompt must not be empty");
-            std::process::exit(1);
-        }
         // The tokenizer section the open above parsed, taken so the file
         // stays usable for the checks after it.
         let tok_section = lbc.tokenizer.take().unwrap_or_else(|| {
@@ -1096,47 +1188,31 @@ pub(crate) fn run_inference(args: &[String]) {
         }
         (ids, Some(tokenizer))
     } else {
-        eprintln!("No prompt provided.\n");
-        eprintln!("Usage:");
-        eprintln!(
-            "  lumen run {} \"What is the capital of France?\"",
-            model_str
-        );
-        eprintln!("  lumen run --model {} --prompt \"Hello\"", model_str);
-        std::process::exit(1);
+        unreachable!("a run with neither --tokens nor a prompt was refused above")
     };
-
-    // A backend this build cannot construct is refused for that reason first,
-    // with the message `create_backend` gives and in its order (CUDA is taken
-    // before Metal), before any weight provider opens and before the scheme
-    // rule below could name the kill switch instead of the build.
-    if use_cuda && !cfg!(feature = "cuda") {
-        eprintln!("Error: --cuda requires building with --features cuda");
-        std::process::exit(1);
-    }
-    if use_metal && !use_cuda && !cfg!(target_os = "macos") {
-        eprintln!("Error: --metal is only supported on macOS");
-        std::process::exit(1);
-    }
 
     // Scheme admission, decided from the parsed header and index before any
     // provider opens. The backend is resolved by now, and the kill switch is
     // part of what makes CUDA unable to serve: it lives in the runtime's env
     // cache, so it is published into the admission flag before asking.
     lumen_runtime::runtime_defaults::publish_cuda_nvfp4_admission();
-    let admission_backend = if use_cuda {
-        lumen_format::serving_rules::ServingBackend::Cuda
-    } else if use_metal {
-        lumen_format::serving_rules::ServingBackend::Metal
-    } else {
-        lumen_format::serving_rules::ServingBackend::Cpu
-    };
+    let admission_backend = serving_backend;
     if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, admission_backend) {
         eprintln!(
             "Error: {}",
             lumen_format::serving_rules::no_serving_kernels_message(scheme, admission_backend)
         );
         std::process::exit(1);
+    }
+    // A local file's linear-attention (GDN) layers are named by its index.
+    if (use_cuda || use_metal)
+        && !preloads
+        && lbc
+            .layer_indices
+            .iter()
+            .any(|layer| layer.subtensors.layer_type == Some(1))
+    {
+        refuse_unpreloaded_gdn();
     }
 
     // When the operator did NOT pass the flag, honour the shared env resolvers
@@ -1207,11 +1283,6 @@ pub(crate) fn run_inference(args: &[String]) {
         .and_then(|s| s.to_str())
         .unwrap_or(&model_path)
         .to_string();
-
-    // resolve KV precision once at the dispatch site so all three
-    // run_with_* paths see the same value and any --kv-precision / env / default
-    // resolution logic lives in one place.
-    let kv_precision = resolve_kv_precision(kv_precision_override, use_metal, use_cuda, verbose);
 
     // Bundle session flags into a single SessionFlags struct so
     // the run_with_* signatures stay readable.
@@ -1561,15 +1632,29 @@ fn effective_max_seq_len(
 /// - Preset with quant tag: `qwen3.5-9b:q4_0` (downloads specific quant)
 /// - Preset without tag: `qwen3.5-9b` (errors with available quants if multiple exist,
 ///   or auto-selects if only one quant is available)
-fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>, cpu: bool) -> String {
-    // Heuristic: looks like a file path if it contains path separators or
-    // ends with a known model file extension.
-    let looks_like_path = value.contains('/')
+/// Whether a model argument names a file rather than a registry model: it
+/// has a path separator or a model file's extension.
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/')
         || value.contains('\\')
         || value.ends_with(".lbc")
-        || value.ends_with(".gguf");
+        || value.ends_with(".gguf")
+}
 
-    if looks_like_path {
+/// Whether `value` names a registry text model whose layers include
+/// linear-attention (GDN) ones, from its architecture.
+fn registry_model_is_gdn(value: &str) -> bool {
+    if looks_like_path(value) {
+        return false;
+    }
+    let (name, _) = crate::registry::split_model_tag(value);
+    crate::registry::load_registry()
+        .resolve(name)
+        .is_some_and(|entry| entry.checkpoint.is_none() && entry.is_gdn_hybrid())
+}
+
+fn resolve_model_path(value: &str, verbose: bool, gpu: Option<usize>, cpu: bool) -> String {
+    if looks_like_path(value) {
         return value.to_owned();
     }
 
@@ -2742,21 +2827,6 @@ fn run_engine(
         if verbose {
             eprintln!("Running inference with Accelerate batched prefill...\n");
         }
-        if session_flags.is_active() {
-            // The Accelerate path uses a separate prefill backend; the
-            // session-driven path is not yet plumbed through it because
-            // `Session::extend_with_prefill_backend` exists but the
-            // `generate_with_session` API only accepts a single
-            // `ComputeBackend`. Fail explicitly so the operator knows the
-            // combination is intentionally unsupported.
-            eprintln!(
-                "Error: --session-resume / --session-save is not supported \
-                 with --accelerate (the Accelerate batched-prefill path \
-                 uses a distinct backend; resume requires the unified \
-                 compute backend). Re-run without --accelerate."
-            );
-            std::process::exit(2);
-        }
         let mut accel = match AccelerateBatchBackend::new(
             hyperparams,
             prompt_tokens.len(),
@@ -2795,12 +2865,6 @@ fn run_engine(
             }
         }
         return;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    if use_accelerate {
-        eprintln!("Error: --accelerate is only supported on macOS");
-        std::process::exit(1);
     }
 
     if verbose {
