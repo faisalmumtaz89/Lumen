@@ -88,11 +88,12 @@ fn main() {
 fn pull_cmd(args: &[String]) {
     let reg = registry::load_registry();
 
-    // Parse arguments: positional model name, optional --quant, --cuda-device
-    // and --yes.
+    // Parse arguments: positional model name, optional --quant, --cuda-device,
+    // --cpu and --yes.
     let mut model_name: Option<&str> = None;
     let mut quant_override: Option<String> = None;
     let mut cuda_device: usize = 0;
+    let mut cpu = false;
     let mut skip_confirm = false;
 
     let mut i = 0;
@@ -119,6 +120,9 @@ fn pull_cmd(args: &[String]) {
                     eprintln!("Error: --cuda-device must be a non-negative integer, got: {value}");
                     std::process::exit(1);
                 });
+            }
+            "--cpu" => {
+                cpu = true;
             }
             "--yes" | "-y" => {
                 skip_confirm = true;
@@ -179,6 +183,8 @@ fn pull_cmd(args: &[String]) {
 
     #[cfg(not(all(feature = "download", feature = "cuda")))]
     let _ = cuda_device;
+    #[cfg(not(feature = "download"))]
+    let _ = cpu;
 
     // Quant priority: colon tag > --quant flag > the model's default.
     let quant_owned: String = tag_quant.or(quant_override).unwrap_or_else(|| {
@@ -205,14 +211,19 @@ fn pull_cmd(args: &[String]) {
     });
 
     #[cfg(all(feature = "download", feature = "cuda"))]
-    if let Err(e) = fit::check(entry, resolved_name, quant, cuda_device) {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
+    if !cpu {
+        if let Err(e) = fit::check(entry, resolved_name, quant, cuda_device) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
-    // Without a GPU `lumen run` picks, the model runs on a CPU backend from
-    // this machine's memory.
-    #[cfg(all(feature = "download", not(target_os = "macos")))]
-    if !(cfg!(feature = "cuda") && lumen_runtime::runtime_defaults::nvidia_gpu_present()) {
+    // For a CPU run, or outside macOS (where `lumen run` picks Metal) without a
+    // GPU it picks, the model runs on a CPU backend from this machine's memory.
+    #[cfg(feature = "download")]
+    if cpu
+        || (cfg!(not(target_os = "macos"))
+            && !(cfg!(feature = "cuda") && lumen_runtime::runtime_defaults::nvidia_gpu_present()))
+    {
         if let Err(e) = fit::check_host(entry, resolved_name, quant) {
             eprintln!("Error: {e}");
             std::process::exit(1);

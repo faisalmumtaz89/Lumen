@@ -484,30 +484,52 @@ pub const GPU_DEVICE: usize = 0;
 /// refuses it instead.
 pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
 
-/// Refuse a device whose total memory is below [`PEAK_DEVICE_BYTES`].
-pub fn check_device_memory(total_bytes: u64) -> Result<(), PipelineError> {
+/// The compute capability the GPU pipeline needs: the text tower's flash
+/// attention and the VAE's convolutions are built for it.
+pub const MIN_COMPUTE_CAPABILITY: (i32, i32) = (8, 0);
+
+/// The NVRTC target of the kernels built for [`MIN_COMPUTE_CAPABILITY`].
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const MIN_COMPUTE_TARGET: &str = "compute_80";
+
+/// Refuse a device of compute capability `cc` below [`MIN_COMPUTE_CAPABILITY`],
+/// or whose total memory is below [`PEAK_DEVICE_BYTES`]: one requirement for
+/// every request size, which the server serves any of.
+pub fn check_device_facts(cc: (i32, i32), total_bytes: u64) -> Result<(), PipelineError> {
+    let (need_major, need_minor) = MIN_COMPUTE_CAPABILITY;
+    if cc < MIN_COMPUTE_CAPABILITY {
+        return Err(PipelineError::Unsupported(format!(
+            "image generation needs a CUDA GPU of compute capability {need_major}.{need_minor} \
+             or newer and the device has compute capability {}.{}",
+            cc.0, cc.1
+        )));
+    }
     if total_bytes < PEAK_DEVICE_BYTES {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(PipelineError::Unsupported(format!(
-            "the device has {:.1} GiB of memory ({total_bytes} bytes) and a generation at \
-             2048x2048 needs {:.1} GiB ({PEAK_DEVICE_BYTES} bytes)",
-            gib(total_bytes),
+            "image generation needs a CUDA device with at least {:.1} GiB of memory \
+             ({PEAK_DEVICE_BYTES} bytes; the startup minimum, from the measured 2048x2048 peak) \
+             and the device has {:.1} GiB ({total_bytes} bytes)",
             gib(PEAK_DEVICE_BYTES),
+            gib(total_bytes),
         )));
     }
     Ok(())
 }
 
-/// Refuse a machine without CUDA device [`GPU_DEVICE`], or whose device has
-/// less memory than [`check_device_memory`] asks.
+/// Refuse a machine without CUDA device [`GPU_DEVICE`], or whose device
+/// [`check_device_facts`] refuses.
 #[cfg(feature = "cuda")]
 pub fn check_device() -> Result<(), PipelineError> {
     let dev = lumen_runtime::cuda::ffi::CudaDevice::new(GPU_DEVICE)
         .map_err(|e| PipelineError::Unsupported(format!("no CUDA device: {e}")))?;
+    let cc = dev
+        .compute_capability()
+        .map_err(|e| PipelineError::Unsupported(format!("device compute capability query: {e}")))?;
     let total = dev
         .total_memory()
         .map_err(|e| PipelineError::Unsupported(format!("device memory query: {e}")))?;
-    check_device_memory(total as u64)
+    check_device_facts(cc, total as u64)
 }
 
 /// Generate one image on the GPU.
@@ -1078,14 +1100,16 @@ mod request_limit_tests {
 }
 
 #[cfg(test)]
-mod device_memory_tests {
-    use super::{check_device_memory, PEAK_DEVICE_BYTES};
+mod device_facts_tests {
+    use super::{check_device_facts, PEAK_DEVICE_BYTES};
 
     /// A device below the measured peak is refused with both amounts in the
-    /// message; one at or above it passes.
+    /// message, and no request size in it; one at or above it passes.
     #[test]
     fn a_small_device_is_refused_with_both_amounts_named() {
-        let err = check_device_memory(16 << 30).unwrap_err().to_string();
+        let err = check_device_facts((8, 0), 16 << 30)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("16.0 GiB") && err.contains(&(16u64 << 30).to_string()),
             "{err}"
@@ -1094,7 +1118,35 @@ mod device_memory_tests {
             err.contains("21.0 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
             "{err}"
         );
-        assert!(check_device_memory(PEAK_DEVICE_BYTES).is_ok());
-        assert!(check_device_memory(32 << 30).is_ok());
+        assert!(
+            err.contains("at least 21.0 GiB") && err.contains("the device has 16.0 GiB"),
+            "{err}"
+        );
+        assert!(err.contains("startup minimum"), "{err}");
+        assert!(!err.contains("a generation at"), "{err}");
+        assert!(check_device_facts((8, 0), PEAK_DEVICE_BYTES - 1).is_err());
+        assert!(check_device_facts((8, 0), PEAK_DEVICE_BYTES).is_ok());
+        assert!(check_device_facts((12, 0), 32 << 30).is_ok());
+    }
+
+    #[test]
+    fn the_kernel_target_is_the_minimum_compute_capability() {
+        let (major, minor) = super::MIN_COMPUTE_CAPABILITY;
+        assert_eq!(super::MIN_COMPUTE_TARGET, format!("compute_{major}{minor}"));
+    }
+
+    /// Below compute capability 8.0 a device is refused on that first, with
+    /// both capabilities named, whatever its memory.
+    #[test]
+    fn a_device_below_compute_capability_8_is_refused_on_it_first() {
+        for total in [15 << 30, 48u64 << 30] {
+            let err = check_device_facts((7, 5), total).unwrap_err().to_string();
+            assert!(
+                err.contains("compute capability 8.0 or newer")
+                    && err.contains("compute capability 7.5"),
+                "{err}"
+            );
+            assert!(!err.contains("GiB"), "{err}");
+        }
     }
 }

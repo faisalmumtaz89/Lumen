@@ -452,7 +452,8 @@ fn resolve_model_path(model: &str, quant_arg: Option<&str>) -> Result<ModelLocat
 }
 
 /// Download `spec` with the `lumen` installed beside this server, as
-/// `lumen pull <spec> --yes`, checking CUDA device `cuda_device` when given;
+/// `lumen pull <spec> --yes`, checking CUDA device `cuda_device` when given,
+/// else this machine's memory for the CPU backend;
 /// its output goes where this server's does. The server's own signals are
 /// left as they are. On Linux the download dies with the server, however it
 /// stops; elsewhere a Ctrl-C or a service manager stops the process group, so
@@ -475,8 +476,14 @@ async fn fetch(spec: &str, cuda_device: Option<usize>) -> Result<(), String> {
         .args(["pull", spec, "--yes"])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    if let Some(device) = cuda_device.filter(|d| *d != 0) {
-        command.args(["--cuda-device", &device.to_string()]);
+    match cuda_device {
+        Some(0) => {}
+        Some(device) => {
+            command.args(["--cuda-device", &device.to_string()]);
+        }
+        None => {
+            command.arg("--cpu");
+        }
     }
     // The kernel kills the download when the thread that forked it ends.
     // `main` drives `run`, and so this, with `block_on` on the main thread,
@@ -929,7 +936,11 @@ async fn run(args: Args) -> Result<(), String> {
             ));
         }
         if !lumen_cli::cache::cached_image(key) {
-            fetch(args.model.trim_end_matches(':'), None).await?;
+            fetch(
+                args.model.trim_end_matches(':'),
+                Some(lumen_image::pipeline::GPU_DEVICE),
+            )
+            .await?;
         }
         let checkpoint_dir = lumen_cli::cache::image_checkpoint_dir(key);
         let lbi_dir = lumen_cli::cache::image_lbi_dir(key);
@@ -957,7 +968,11 @@ async fn run(args: Args) -> Result<(), String> {
     let lbc_path = match resolve_model_path(&args.model, args.quant.as_deref())? {
         ModelLocation::Cached(path) => path,
         ModelLocation::Missing(spec) => {
-            fetch(&spec, Some(args.backend_device)).await?;
+            // the device the model is checked against is the one it will run
+            // on: the CPU when the server is told so
+            let device =
+                (!matches!(args.backend, BackendChoice::Cpu)).then_some(args.backend_device);
+            fetch(&spec, device).await?;
             match resolve_model_path(&args.model, args.quant.as_deref())? {
                 ModelLocation::Cached(path) => path,
                 ModelLocation::Missing(_) => {

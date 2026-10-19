@@ -253,7 +253,14 @@ pub(crate) fn image_cmd(args: &[String]) {
     // downloads it.
     #[cfg(feature = "cuda")]
     if let Err(e) = lumen_image::pipeline::check_device() {
-        eprintln!("Error: {e}");
+        if crate::cache::cached_image(&entry.key) {
+            eprintln!("Error: {} cannot run here: {e}.", entry.display_name);
+        } else {
+            eprintln!(
+                "Error: {} cannot run here: {e}; nothing was downloaded.",
+                entry.display_name
+            );
+        }
         std::process::exit(1);
     }
     let output = Output::prepare(&args.output, args.named).unwrap_or_else(|e| {

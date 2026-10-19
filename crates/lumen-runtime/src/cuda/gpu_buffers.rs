@@ -625,8 +625,8 @@ fn upload_tensor(
             // (native-vs-upcast, greedy) returned NATIVE-CORRECT-ON-H100. On sm_90+
             // native is also VRAM-frugal enough to run 27B-bf16 (54 GB), which the
             // F32-upcast (~108 GB) cannot fit on an 80 GB card at all.
-            let (cc_major, _cc_minor) = device.compute_capability().unwrap_or((0, 0));
-            if cc_major >= 9 {
+            let cc = device.compute_capability().unwrap_or((0, 0));
+            if !lumen_format::serving_rules::cuda_bf16_layers_as_f32(cc) {
                 let gpu_buf = device.htod_copy(raw)?;
                 return Ok(GpuWeightBuf::Bf16Raw(gpu_buf));
             }

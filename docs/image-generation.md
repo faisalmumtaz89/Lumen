@@ -21,7 +21,7 @@ limits as the endpoint's request below, and the same prompt, size, steps and see
 same bytes as the server does. Its first run downloads and converts the model, as
 `lumen pull qwen-image` below does, without asking first. It runs on CUDA only, like the
 server, on the first visible CUDA device, and is refused before the download unless that
-device has at least 21.0 GiB of memory.
+device has compute capability 8.0+ and at least 21.0 GiB of memory.
 
 `lumen pull qwen-image` downloads the checkpoint from Hugging Face (30.8 GiB, pinned to one
 commit), converts it into the three `.lbi` containers under `qwen-image-2-1/lbi/` in the
@@ -52,7 +52,8 @@ The rest of this page covers that by-hand path and the endpoint.
   transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
   generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
   2048×2048 one (the VAE decode). The server refuses to start, and `lumen image` to run, on
-  a device with less than 21.0 GiB in total, naming both amounts. The transformer and the VAE normally stay loaded
+  a device below compute capability 8.0 or with less than 21.0 GiB in total, naming both amounts:
+  one requirement for every size, since the server serves any size per request. The transformer and the VAE normally stay loaded
   between generations, and the server uses spare room beside them: on a 32 GiB card,
   1024×1024 generations take up to about 30 GiB. See [Device memory](#device-memory).
 

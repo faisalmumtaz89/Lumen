@@ -37,8 +37,10 @@ The bin is gated behind the `bin` Cargo feature so library embedders that wire t
 A registry model that is not downloaded yet is fetched at start with the `lumen`
 installed beside `lumen-server`, as `lumen pull <model> --yes` would, into the cache
 `lumen` uses. Its messages go to the server's output, and its progress bar does too when
-that output is a terminal. Every check `lumen pull` makes applies: on CUDA whether the GPU
-can hold the model's weights, and for the image model its disk need. Stopping the server
+that output is a terminal. Every check `lumen pull` makes applies, against the device the
+server will run on (`--backend-device`, or this machine's memory with `--backend cpu`): on
+CUDA whether the GPU can run the model and hold its weights, and for the image model its
+compute capability, memory and disk need. Stopping the server
 stops the download on Linux, and with Ctrl-C or the service manager on macOS; the next
 start continues it. A `lumen-server` without `lumen` beside it refuses and says to install
 both or to run `lumen pull` first. A deployment that must never download points `--model`

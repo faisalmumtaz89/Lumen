@@ -566,6 +566,31 @@ pub fn scheme_has_no_serving_kernels(quant: QuantScheme, backend: ServingBackend
         && (backend != ServingBackend::Cuda || !cuda_planar_kernels_enabled())
 }
 
+/// A CUDA device's compute capability, `(major, minor)`.
+pub type ComputeCapability = (i32, i32);
+
+/// The compute capability CUDA's native K-quant route needs: a K-quant plane's decode matvec reads
+/// its activation from the Q8_1 scratch, and the kernel that fills it (`quantize_f32_to_q8_1`) is
+/// built for this target. An artifact whose primary scheme is a K-quant superblock (the registry's
+/// Q4_K_M and Q5_K_M) has no other CUDA route, so a device below it cannot serve one. Other formats
+/// with an SM80-only default route (CtInt4G32) name their own fallback at load.
+pub const CUDA_KQUANT_COMPUTE_CAPABILITY: ComputeCapability = (8, 0);
+
+/// The least compute capability CUDA serves an artifact whose primary scheme is `quant` on, when it
+/// has one.
+pub fn cuda_minimum_compute_capability(quant: QuantScheme) -> Option<ComputeCapability> {
+    quant
+        .is_kquant_superblock()
+        .then_some(CUDA_KQUANT_COMPUTE_CAPABILITY)
+}
+
+/// Whether CUDA holds BF16 layer weights as F32 on a device of compute capability `cc`: below 9.0
+/// the cuBLAS BF16 GEMM path is wrong, so each BF16 layer tensor is upcast to F32 when it is
+/// uploaded, at twice its bytes. The embedding and output head stay BF16.
+pub fn cuda_bf16_layers_as_f32(cc: ComputeCapability) -> bool {
+    cc.0 < 9
+}
+
 /// Whether the CUDA planar kernels are on for admission purposes.
 ///
 /// `lumen-format` is a dependency OF `lumen-runtime`, so it cannot read the runtime's env cache; the
@@ -1211,6 +1236,38 @@ mod tests {
     use super::*;
     use crate::index::{ExpertSlice, SubtensorOffsets, TensorSlice};
     use crate::quantization::QuantScheme;
+
+    #[test]
+    fn only_kquant_artifacts_need_a_compute_capability_on_cuda() {
+        for quant in [QuantScheme::Q4_K, QuantScheme::Q5_K, QuantScheme::Q6_K] {
+            assert_eq!(
+                cuda_minimum_compute_capability(quant),
+                Some((8, 0)),
+                "{quant:?}"
+            );
+        }
+        for quant in [
+            QuantScheme::Q8_0,
+            QuantScheme::Q4_0,
+            QuantScheme::Bf16,
+            QuantScheme::F16,
+            QuantScheme::F32,
+            QuantScheme::Q2_K,
+            QuantScheme::Q3_K,
+        ] {
+            assert_eq!(cuda_minimum_compute_capability(quant), None, "{quant:?}");
+        }
+    }
+
+    #[test]
+    fn bf16_layers_are_held_as_f32_below_compute_capability_9() {
+        for cc in [(7, 5), (8, 0), (8, 6), (8, 9)] {
+            assert!(cuda_bf16_layers_as_f32(cc), "{cc:?}");
+        }
+        for cc in [(9, 0), (10, 0), (12, 0)] {
+            assert!(!cuda_bf16_layers_as_f32(cc), "{cc:?}");
+        }
+    }
 
     fn sl(length: u64, quant: QuantScheme) -> TensorSlice {
         TensorSlice {
