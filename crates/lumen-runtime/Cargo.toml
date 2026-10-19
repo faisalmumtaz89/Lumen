@@ -36,6 +36,9 @@ test-state-snapshot = ["cuda"]
 # prefill copied to the host at layer boundaries, for the layer oracle of
 # `cuda_native_prefill_test`.
 test-prefill-dump = ["cuda"]
+# Test-only feature: cudarc's CUPTI bindings, so `cuda_no_alloc_after_ready_test`
+# can record every device allocation the process makes while requests run.
+test-cupti = ["cuda", "cudarc/cupti"]
 
 [dependencies]
 lumen-format.workspace = true
