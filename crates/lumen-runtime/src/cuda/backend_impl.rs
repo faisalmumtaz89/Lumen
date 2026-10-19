@@ -9104,14 +9104,8 @@ impl CudaBackend {
                     ));
                 }
                 unsafe {
-                    let [mut normed, mut q_gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Normed,
-                            Role::QGateFused,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut normed, mut q_gate], mut conversion) =
+                        ws.lend([Role::Normed, Role::QGateFused]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9119,22 +9113,13 @@ impl CudaBackend {
                         None,
                         &normed.f32().as_view(),
                         &mut q_gate.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         q_gate_dim,
                         hidden_dim,
                         "wq_qgate",
                     )?;
-                    let [mut normed, mut k, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Normed,
-                            Role::K,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut normed, mut k], mut conversion) = ws.lend([Role::Normed, Role::K]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9142,22 +9127,13 @@ impl CudaBackend {
                         None,
                         &normed.f32().as_view(),
                         &mut k.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         kv_dim,
                         hidden_dim,
                         "wk",
                     )?;
-                    let [mut normed, mut v, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Normed,
-                            Role::V,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut normed, mut v], mut conversion) = ws.lend([Role::Normed, Role::V]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9165,9 +9141,7 @@ impl CudaBackend {
                         None,
                         &normed.f32().as_view(),
                         &mut v.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         kv_dim,
                         hidden_dim,
@@ -9493,15 +9467,8 @@ impl CudaBackend {
 
                 // 2f. Output projection + residual
                 unsafe {
-                    let [mut attn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::AttnOut,
-                            Role::X,
-                            Role::AttnProj,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut attn_out, mut x, mut attn_proj], mut conversion) =
+                        ws.lend([Role::AttnOut, Role::X, Role::AttnProj]);
                     super::prefill::launch_gemm_residual(
                         &self.device,
                         &st.kernels,
@@ -9510,9 +9477,7 @@ impl CudaBackend {
                         &attn_out.f32().as_view(),
                         &x.f32().as_view(),
                         &mut attn_proj.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         hidden_dim,
                         q_dim,
@@ -9539,14 +9504,8 @@ impl CudaBackend {
                             batch,
                             hidden_dim,
                         )?;
-                        let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                            ws.regions([
-                                Role::Normed,
-                                Role::Gate,
-                                Role::DequantF32,
-                                Role::ActivationF16,
-                                Role::DequantF16,
-                            ]);
+                        let ([mut normed, mut gate], mut conversion) =
+                            ws.lend([Role::Normed, Role::Gate]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
@@ -9554,22 +9513,14 @@ impl CudaBackend {
                             None,
                             &normed.f32().as_view(),
                             &mut gate.f32(),
-                            &mut dequant_f32.f32(),
-                            &mut activation_f16.u8(),
-                            &mut dequant_f16.u8(),
+                            &mut conversion,
                             batch,
                             inter_dim,
                             hidden_dim,
                             "gate",
                         )?;
-                        let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                            ws.regions([
-                                Role::Normed,
-                                Role::Up,
-                                Role::DequantF32,
-                                Role::ActivationF16,
-                                Role::DequantF16,
-                            ]);
+                        let ([mut normed, mut up], mut conversion) =
+                            ws.lend([Role::Normed, Role::Up]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
@@ -9577,9 +9528,7 @@ impl CudaBackend {
                             None,
                             &normed.f32().as_view(),
                             &mut up.f32(),
-                            &mut dequant_f32.f32(),
-                            &mut activation_f16.u8(),
-                            &mut dequant_f16.u8(),
+                            &mut conversion,
                             batch,
                             inter_dim,
                             hidden_dim,
@@ -9598,14 +9547,8 @@ impl CudaBackend {
                         )?;
                     }
                     unsafe {
-                        let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                            ws.regions([
-                                Role::Gate,
-                                Role::Down,
-                                Role::DequantF32,
-                                Role::ActivationF16,
-                                Role::DequantF16,
-                            ]);
+                        let ([mut gate, mut down], mut conversion) =
+                            ws.lend([Role::Gate, Role::Down]);
                         super::prefill::launch_gemm_projection(
                             &self.device,
                             &st.kernels,
@@ -9613,9 +9556,7 @@ impl CudaBackend {
                             None,
                             &gate.f32().as_view(),
                             &mut down.f32(),
-                            &mut dequant_f32.f32(),
-                            &mut activation_f16.u8(),
-                            &mut dequant_f16.u8(),
+                            &mut conversion,
                             batch,
                             hidden_dim,
                             inter_dim,
@@ -9648,14 +9589,7 @@ impl CudaBackend {
             }
 
             unsafe {
-                let [mut normed, mut q, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                    .regions([
-                        Role::Normed,
-                        Role::Q,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut q], mut conversion) = ws.lend([Role::Normed, Role::Q]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -9663,22 +9597,13 @@ impl CudaBackend {
                     None,
                     &normed.f32().as_view(),
                     &mut q.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     q_dim,
                     hidden_dim,
                     "wq",
                 )?;
-                let [mut normed, mut k, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                    .regions([
-                        Role::Normed,
-                        Role::K,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut k], mut conversion) = ws.lend([Role::Normed, Role::K]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -9686,22 +9611,13 @@ impl CudaBackend {
                     None,
                     &normed.f32().as_view(),
                     &mut k.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     kv_dim,
                     hidden_dim,
                     "wk",
                 )?;
-                let [mut normed, mut v, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                    .regions([
-                        Role::Normed,
-                        Role::V,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut v], mut conversion) = ws.lend([Role::Normed, Role::V]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -9709,9 +9625,7 @@ impl CudaBackend {
                     None,
                     &normed.f32().as_view(),
                     &mut v.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     kv_dim,
                     hidden_dim,
@@ -9862,15 +9776,8 @@ impl CudaBackend {
 
             // 2f. Batched output projection + residual via GEMM (no F16 caches).
             unsafe {
-                let [mut attn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::AttnOut,
-                        Role::X,
-                        Role::AttnProj,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut attn_out, mut x, mut attn_proj], mut conversion) =
+                    ws.lend([Role::AttnOut, Role::X, Role::AttnProj]);
                 super::prefill::launch_gemm_residual(
                     &self.device,
                     &st.kernels,
@@ -9879,9 +9786,7 @@ impl CudaBackend {
                     &attn_out.f32().as_view(),
                     &x.f32().as_view(),
                     &mut attn_proj.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     hidden_dim,
                     q_dim,
@@ -9913,14 +9818,8 @@ impl CudaBackend {
                         batch,
                         hidden_dim,
                     )?;
-                    let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Normed,
-                            Role::Gate,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut normed, mut gate], mut conversion) =
+                        ws.lend([Role::Normed, Role::Gate]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9928,22 +9827,13 @@ impl CudaBackend {
                         None,
                         &normed.f32().as_view(),
                         &mut gate.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         inter_dim,
                         hidden_dim,
                         "gate",
                     )?;
-                    let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Normed,
-                            Role::Up,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut normed, mut up], mut conversion) = ws.lend([Role::Normed, Role::Up]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9951,9 +9841,7 @@ impl CudaBackend {
                         None,
                         &normed.f32().as_view(),
                         &mut up.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         inter_dim,
                         hidden_dim,
@@ -9976,14 +9864,7 @@ impl CudaBackend {
 
                 // 2i. Batched down projection via GEMM (no F16 caches).
                 unsafe {
-                    let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                        ws.regions([
-                            Role::Gate,
-                            Role::Down,
-                            Role::DequantF32,
-                            Role::ActivationF16,
-                            Role::DequantF16,
-                        ]);
+                    let ([mut gate, mut down], mut conversion) = ws.lend([Role::Gate, Role::Down]);
                     super::prefill::launch_gemm_projection(
                         &self.device,
                         &st.kernels,
@@ -9991,9 +9872,7 @@ impl CudaBackend {
                         None,
                         &gate.f32().as_view(),
                         &mut down.f32(),
-                        &mut dequant_f32.f32(),
-                        &mut activation_f16.u8(),
-                        &mut dequant_f16.u8(),
+                        &mut conversion,
                         batch,
                         hidden_dim,
                         inter_dim,
@@ -10132,14 +10011,7 @@ impl CudaBackend {
         // 2. Batched QKV GEMM: normed[T, hidden] @ wq^T -> qkv[T, qkv_dim]
         // wq for GDN is the fused [qkv_dim, hidden_dim] weight.
         unsafe {
-            let [mut normed, mut qkv, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                .regions([
-                    Role::Normed,
-                    Role::GdnQkv,
-                    Role::DequantF32,
-                    Role::ActivationF16,
-                    Role::DequantF16,
-                ]);
+            let ([mut normed, mut qkv], mut conversion) = ws.lend([Role::Normed, Role::GdnQkv]);
             super::prefill::launch_gemm_projection(
                 &self.device,
                 &st.kernels,
@@ -10147,9 +10019,7 @@ impl CudaBackend {
                 lw.wq_f16.as_ref(),
                 &normed.f32().as_view(),
                 &mut qkv.f32(),
-                &mut dequant_f32.f32(),
-                &mut activation_f16.u8(),
-                &mut dequant_f16.u8(),
+                &mut conversion,
                 batch,
                 p.qkv_dim,
                 hidden_dim,
@@ -10165,14 +10035,8 @@ impl CudaBackend {
                 ))
             })?;
             unsafe {
-                let [mut normed, mut gdn_gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::Normed,
-                        Role::GdnGate,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut gdn_gate], mut conversion) =
+                    ws.lend([Role::Normed, Role::GdnGate]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -10180,9 +10044,7 @@ impl CudaBackend {
                     lw.attn_gate_f16.as_ref(),
                     &normed.f32().as_view(),
                     &mut gdn_gate.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     p.value_dim,
                     hidden_dim,
@@ -10199,14 +10061,8 @@ impl CudaBackend {
                 ))
             })?;
             unsafe {
-                let [mut normed, mut alpha_raw, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::Normed,
-                        Role::GdnAlphaRaw,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut alpha_raw], mut conversion) =
+                    ws.lend([Role::Normed, Role::GdnAlphaRaw]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -10214,9 +10070,7 @@ impl CudaBackend {
                     lw.ssm_alpha_f16.as_ref(),
                     &normed.f32().as_view(),
                     &mut alpha_raw.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     p.num_heads,
                     hidden_dim,
@@ -10232,14 +10086,8 @@ impl CudaBackend {
             })?;
 
             unsafe {
-                let [mut normed, mut beta_raw, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::Normed,
-                        Role::GdnBetaRaw,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut beta_raw], mut conversion) =
+                    ws.lend([Role::Normed, Role::GdnBetaRaw]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -10247,9 +10095,7 @@ impl CudaBackend {
                     lw.ssm_beta_f16.as_ref(),
                     &normed.f32().as_view(),
                     &mut beta_raw.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     p.num_heads,
                     hidden_dim,
@@ -11043,15 +10889,8 @@ impl CudaBackend {
                 RuntimeError::Compute(format!("GDN prefill L{layer_idx}: ssm_out weight missing",))
             })?;
             unsafe {
-                let [mut gdn_out, mut x, mut attn_proj, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::GdnOut,
-                        Role::X,
-                        Role::AttnProj,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut gdn_out, mut x, mut attn_proj], mut conversion) =
+                    ws.lend([Role::GdnOut, Role::X, Role::AttnProj]);
                 super::prefill::launch_gemm_residual(
                     &self.device,
                     &st.kernels,
@@ -11060,9 +10899,7 @@ impl CudaBackend {
                     &gdn_out.f32().as_view(),
                     &x.f32().as_view(),
                     &mut attn_proj.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     hidden_dim,
                     p.value_dim,
@@ -11114,14 +10951,7 @@ impl CudaBackend {
                     batch,
                     hidden_dim,
                 )?;
-                let [mut normed, mut gate, mut dequant_f32, mut activation_f16, mut dequant_f16] =
-                    ws.regions([
-                        Role::Normed,
-                        Role::Gate,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut gate], mut conversion) = ws.lend([Role::Normed, Role::Gate]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -11129,22 +10959,13 @@ impl CudaBackend {
                     lw.w_gate_f16.as_ref(),
                     &normed.f32().as_view(),
                     &mut gate.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     inter_dim,
                     hidden_dim,
                     "gate",
                 )?;
-                let [mut normed, mut up, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                    .regions([
-                        Role::Normed,
-                        Role::Up,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut normed, mut up], mut conversion) = ws.lend([Role::Normed, Role::Up]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -11152,9 +10973,7 @@ impl CudaBackend {
                     lw.w_up_f16.as_ref(),
                     &normed.f32().as_view(),
                     &mut up.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     inter_dim,
                     hidden_dim,
@@ -11177,14 +10996,7 @@ impl CudaBackend {
 
             // Batched down projection.
             unsafe {
-                let [mut gate, mut down, mut dequant_f32, mut activation_f16, mut dequant_f16] = ws
-                    .regions([
-                        Role::Gate,
-                        Role::Down,
-                        Role::DequantF32,
-                        Role::ActivationF16,
-                        Role::DequantF16,
-                    ]);
+                let ([mut gate, mut down], mut conversion) = ws.lend([Role::Gate, Role::Down]);
                 super::prefill::launch_gemm_projection(
                     &self.device,
                     &st.kernels,
@@ -11192,9 +11004,7 @@ impl CudaBackend {
                     lw.w_down_f16.as_ref(),
                     &gate.f32().as_view(),
                     &mut down.f32(),
-                    &mut dequant_f32.f32(),
-                    &mut activation_f16.u8(),
-                    &mut dequant_f16.u8(),
+                    &mut conversion,
                     batch,
                     hidden_dim,
                     inter_dim,

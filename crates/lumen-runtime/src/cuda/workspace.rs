@@ -178,6 +178,23 @@ impl RegionTable {
         self.regions[role as usize]
     }
 
+    /// The roles of `entries`, each with its element count, back to back at
+    /// aligned offsets.
+    #[cfg(test)]
+    pub(crate) fn of(entries: &[(Role, usize)]) -> Self {
+        let mut table = Self::default();
+        let mut end = 0usize;
+        for &(role, len) in entries {
+            let region = Region {
+                offset: end.next_multiple_of(REGION_ALIGN),
+                len,
+            };
+            end = region.end(role);
+            table.regions[role as usize] = Some(region);
+        }
+        table
+    }
+
     /// Bytes of the arena the regions lie in.
     pub(crate) fn bytes(&self) -> usize {
         Role::ALL
@@ -197,17 +214,36 @@ impl RegionTable {
         });
         for i in 0..N {
             for j in 0..i {
-                let (a, b) = (roles[j], roles[i]);
-                assert!(a != b, "workspace: {a:?} requested twice");
-                let (ra, rb) = (regions[j], regions[i]);
-                assert!(
-                    ra.end(a) <= rb.offset || rb.end(b) <= ra.offset,
-                    "workspace: {a:?} and {b:?} overlap"
-                );
+                assert_apart((roles[j], regions[j]), (roles[i], regions[i]));
             }
         }
         regions
     }
+
+    /// [`RegionTable::disjoint`] of `roles`, which must also be apart from
+    /// every one of `lent`.
+    fn disjoint_from<const M: usize>(
+        &self,
+        lent: &[(Role, Region)],
+        roles: &[Role; M],
+    ) -> [Region; M] {
+        let regions = self.disjoint(roles);
+        for (&role, &region) in roles.iter().zip(&regions) {
+            for &lent in lent {
+                assert_apart(lent, (role, region));
+            }
+        }
+        regions
+    }
+}
+
+/// Panics, naming the roles, when `a` and `b` are one role or share a byte.
+fn assert_apart((a, ra): (Role, Region), (b, rb): (Role, Region)) {
+    assert!(a != b, "workspace: {a:?} requested twice");
+    assert!(
+        ra.end(a) <= rb.offset || rb.end(b) <= ra.offset,
+        "workspace: {a:?} and {b:?} overlap"
+    );
 }
 
 /// The layout that gives every role `layout` has a value for its own region,
@@ -277,48 +313,94 @@ impl Workspace {
     /// when a role has no region, is requested twice, or shares a byte with
     /// another requested role. Every view borrows the whole workspace, so no
     /// other borrow of it coexists with them.
-    pub(crate) fn regions<'a, const N: usize>(&'a mut self, roles: [Role; N]) -> [RoleView<'a>; N] {
+    pub(crate) fn regions<const N: usize>(&mut self, roles: [Role; N]) -> [RoleView<'_>; N] {
+        self.lend(roles).0
+    }
+
+    /// [`Workspace::regions`] of `roles`, and the rest of the workspace, from
+    /// which the same operation borrows the regions it picks only once it has
+    /// started: a GEMM's conversion scratch, which its weight's route selects.
+    pub(crate) fn lend<const N: usize>(
+        &mut self,
+        roles: [Role; N],
+    ) -> ([RoleView<'_>; N], Rest<'_, N>) {
         let regions = self.regions.disjoint(&roles);
         let mut whole = self.arena.as_view_mut();
-        std::array::from_fn(|i| {
-            let (role, region) = (roles[i], regions[i]);
-            let mut bytes = whole.slice_mut(region.offset..region.end(role));
-            // SAFETY: `disjoint` has checked that no two requested regions
-            // share a byte, so the views alias no device memory, as the
-            // results of `<[T]>::get_disjoint_mut` alias no element. Each
-            // region's offset is a multiple of `REGION_ALIGN` and its byte
-            // length is `len` elements of the role's type, so the typed view
-            // is aligned and in bounds. A view carries only the arena's
-            // device pointer, length and event and stream references, which
-            // live as long as the borrow of `self`; the shorter lifetime
-            // `slice_mut` and `transmute_mut` give it only records the
-            // borrow of `whole`, which nothing uses after this closure.
-            let view = unsafe {
-                match role.elem() {
-                    Elem::F32 => Typed::F32(std::mem::transmute::<
-                        CudaViewMut<'_, f32>,
-                        CudaViewMut<'a, f32>,
-                    >(
-                        bytes
-                            .transmute_mut::<f32>(region.len)
-                            .expect("a region holds its elements"),
-                    )),
-                    Elem::U32 => Typed::U32(std::mem::transmute::<
-                        CudaViewMut<'_, u32>,
-                        CudaViewMut<'a, u32>,
-                    >(
-                        bytes
-                            .transmute_mut::<u32>(region.len)
-                            .expect("a region holds its elements"),
-                    )),
-                    Elem::U8 => Typed::U8(std::mem::transmute::<
-                        CudaViewMut<'_, u8>,
-                        CudaViewMut<'a, u8>,
-                    >(bytes)),
-                }
-            };
-            RoleView { role, view }
-        })
+        // SAFETY: `disjoint` has checked that no two of the regions share a
+        // byte, and the rest lends none of them; see `view`.
+        let views = std::array::from_fn(|i| unsafe { view(&mut whole, roles[i], regions[i]) });
+        let rest = Rest {
+            whole,
+            table: &self.regions,
+            lent: std::array::from_fn(|i| (roles[i], regions[i])),
+        };
+        (views, rest)
+    }
+}
+
+/// The view of `role`'s `region` of the arena `whole` views, for as long as
+/// the arena is borrowed.
+///
+/// # Safety
+///
+/// No other view of a byte of `region` may exist while the returned one
+/// does, as the results of `<[T]>::get_disjoint_mut` alias no element. Each
+/// region's offset is a multiple of `REGION_ALIGN` and its byte length is
+/// `len` elements of the role's type, so the typed view is aligned and in
+/// bounds. A view carries only the arena's device pointer, length and event
+/// and stream references, which live as long as the arena's borrow `'a`; the
+/// shorter lifetime `slice_mut` and `transmute_mut` give it only records the
+/// borrow of `whole`, which the view does not use.
+unsafe fn view<'a>(whole: &mut CudaViewMut<'a, u8>, role: Role, region: Region) -> RoleView<'a> {
+    let mut bytes = whole.slice_mut(region.offset..region.end(role));
+    let view = match role.elem() {
+        Elem::F32 => Typed::F32(std::mem::transmute::<
+            CudaViewMut<'_, f32>,
+            CudaViewMut<'a, f32>,
+        >(
+            bytes
+                .transmute_mut::<f32>(region.len)
+                .expect("a region holds its elements"),
+        )),
+        Elem::U32 => Typed::U32(std::mem::transmute::<
+            CudaViewMut<'_, u32>,
+            CudaViewMut<'a, u32>,
+        >(
+            bytes
+                .transmute_mut::<u32>(region.len)
+                .expect("a region holds its elements"),
+        )),
+        Elem::U8 => Typed::U8(std::mem::transmute::<
+            CudaViewMut<'_, u8>,
+            CudaViewMut<'a, u8>,
+        >(bytes)),
+    };
+    RoleView { role, view }
+}
+
+/// The regions of a [`Workspace`] that [`Workspace::lend`] did not lend, for
+/// the operation it lent them to.
+pub(crate) struct Rest<'a, const N: usize> {
+    whole: CudaViewMut<'a, u8>,
+    table: &'a RegionTable,
+    lent: [(Role, Region); N],
+}
+
+impl<const N: usize> Rest<'_, N> {
+    /// Elements of `role`'s region; 0 when this load's layout has none.
+    pub(crate) fn len(&self, role: Role) -> usize {
+        self.table.get(role).map_or(0, |r| r.len)
+    }
+
+    /// Views of the regions of `roles`, refused as [`Workspace::regions`]
+    /// refuses them, and also when one is a lent role or shares a byte with
+    /// one.
+    pub(crate) fn regions<const M: usize>(&mut self, roles: [Role; M]) -> [RoleView<'_>; M] {
+        let regions = self.table.disjoint_from(&self.lent, &roles);
+        // SAFETY: the regions share no byte with each other (`disjoint`) or
+        // with a lent one (checked above), and every view borrows `self`; see
+        // `view`.
+        std::array::from_fn(|i| unsafe { view(&mut self.whole, roles[i], regions[i]) })
     }
 }
 
@@ -459,6 +541,35 @@ mod tests {
     fn a_role_requested_twice_is_refused() {
         let t = table(&[(Role::Q, 0, 64), (Role::K, 256, 64)]);
         t.disjoint(&[Role::Q, Role::K, Role::Q]);
+    }
+
+    #[test]
+    fn the_rest_lends_regions_apart_from_the_lent_ones() {
+        let t = table(&[
+            (Role::Normed, 0, 64),
+            (Role::Q, 256, 64),
+            (Role::DequantF16, 512, 256),
+            (Role::ActivationF16, 768, 256),
+        ]);
+        let lent = [(Role::Normed, t.get(Role::Normed).unwrap())];
+        let got = t.disjoint_from(&lent, &[Role::DequantF16, Role::ActivationF16]);
+        assert_eq!(got[1], t.get(Role::ActivationF16).unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "workspace: Normed requested twice")]
+    fn the_rest_refuses_a_lent_role() {
+        let t = table(&[(Role::Normed, 0, 64)]);
+        let lent = [(Role::Normed, t.get(Role::Normed).unwrap())];
+        t.disjoint_from(&lent, &[Role::Normed]);
+    }
+
+    #[test]
+    #[should_panic(expected = "workspace: Q and DequantF32 overlap")]
+    fn the_rest_refuses_a_region_a_lent_one_shares() {
+        let t = table(&[(Role::Q, 0, 64), (Role::DequantF32, 128, 64)]);
+        let lent = [(Role::Q, t.get(Role::Q).unwrap())];
+        t.disjoint_from(&lent, &[Role::DequantF32]);
     }
 
     #[test]

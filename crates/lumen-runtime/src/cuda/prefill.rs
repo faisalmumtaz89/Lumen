@@ -33,7 +33,7 @@ use super::ffi::CudaDevice;
 use super::gpu_buffers::GpuWeightBuf;
 use super::kv_cache::KvView;
 use super::types::LaunchConfig;
-use super::workspace::Workspace;
+use super::workspace::{Rest, Role, Workspace};
 use lumen_format::quantization::QuantScheme;
 
 /// Element counts of the GDN prefill's workspace values for `batch` rows: the
@@ -510,18 +510,18 @@ fn announce_q8_split_hgemm_once() {
 /// # Safety
 ///
 /// `input` must be [batch, in_dim]. `weight` must be [out_dim, in_dim].
-/// `output` must be [batch, out_dim]. `dequant_scratch` must have at least
-/// `out_dim * in_dim` elements (only used for Q8_0 weights).
-pub(crate) unsafe fn launch_gemm_projection(
+/// `output` must be [batch, out_dim]. `conversion` lends the conversion
+/// scratch the weight's route takes: an `ActivationF16` region the route
+/// borrows must hold `batch * in_dim` 16-bit elements (the conversion does
+/// not check); the dequant regions' lengths are checked.
+pub(crate) unsafe fn launch_gemm_projection<const N: usize>(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
     weight_f16_cache: Option<&CudaSlice<u8>>,
     input: &CudaView<'_, f32>,
     output: &mut CudaViewMut<'_, f32>,
-    dequant_scratch: &mut CudaViewMut<'_, f32>,
-    activation_f16: &mut CudaViewMut<'_, u8>,
-    dequant_f16: &mut CudaViewMut<'_, u8>,
+    conversion: &mut Rest<'_, N>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -598,6 +598,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
+        let [mut activation] = conversion.regions([Role::ActivationF16]);
+        let activation_f16 = &mut activation.u8();
         static HGEMM_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if super::decode::cuda_verbose()
@@ -637,6 +639,8 @@ pub(crate) unsafe fn launch_gemm_projection(
         // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
         // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
         GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+            let dequant_scratch = &mut dequant_f32.f32();
             dequant_planar_into_scratch(
                 device,
                 kernels,
@@ -759,7 +763,10 @@ pub(crate) unsafe fn launch_gemm_projection(
             // the Q8 projection (qkv_pre_conv) path.
             // also force F32 SGEMM for `gdn_alpha`/`gdn_beta` to
             // restore the F32-GGUF path for these projections.
-            if force_f32 || force_alpha_beta_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32
+                || force_alpha_beta_f32
+                || conversion.len(Role::DequantF16) < f16_bytes_needed
+            {
                 if force_alpha_beta_f32 {
                     static AB_F32_LOGGED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
@@ -773,14 +780,16 @@ pub(crate) unsafe fn launch_gemm_projection(
                     }
                 }
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_0_to_f32(
                     device,
                     kernels,
@@ -810,6 +819,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 announce_q8_hgemm_once();
 
                 // Step 1: Dequantize Q8_0 -> F16 in scratch buffer.
@@ -847,6 +859,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             // Native F16 weights: cublasGemmEx HGEMM directly (no dequant needed).
             // Convert F32 activations to F16, then HGEMM with F16 weights.
             // note: when LUMEN_CUDA_PREFILL_F32=1, this branch CANNOT
@@ -904,16 +918,18 @@ pub(crate) unsafe fn launch_gemm_projection(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q4_0_to_f32(
                     device,
                     kernels,
@@ -943,6 +959,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 static Q4_HGEMM_LOGGED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if super::decode::cuda_verbose()
@@ -992,14 +1011,17 @@ pub(crate) unsafe fn launch_gemm_projection(
                 super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: {scheme:?} requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_kquant_to_f16(
                 device,
                 kernels,
@@ -1035,14 +1057,17 @@ pub(crate) unsafe fn launch_gemm_projection(
             // exists for this format (its dequant kernel emits F16 only).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
             launch_f32_to_f16_fast(
                 device,
@@ -1095,11 +1120,11 @@ pub(crate) unsafe fn launch_gemm_projection(
             // activation conversion. The buffer holds bytes (`u8`), so the
             // interpretation is determined by the cuBLAS `cudaDataType_t`.
             let activation_needed = batch * in_dim * 2;
-            if activation_f16.len() < activation_needed {
+            if conversion.len(Role::ActivationF16) < activation_needed {
                 return Err(RuntimeError::Compute(format!(
                     "bf16_gemm {label}: activation scratch too small: have {} bytes, \
                      need {} (batch={batch}, in_dim={in_dim})",
-                    activation_f16.len(),
+                    conversion.len(Role::ActivationF16),
                     activation_needed,
                 )));
             }
@@ -1112,6 +1137,8 @@ pub(crate) unsafe fn launch_gemm_projection(
             }
 
             // Step 1: Convert F32 activation to BF16 via vectorized kernel.
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             launch_f32_to_bf16_fast(
                 device,
                 kernels,
@@ -1143,15 +1170,17 @@ pub(crate) unsafe fn launch_gemm_projection(
             // keeps its raw planes and never reaches this arm.
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
-                if dequant_scratch.len() < num_elements {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_split_to_f32(
                     device,
                     kernels,
@@ -1182,6 +1211,9 @@ pub(crate) unsafe fn launch_gemm_projection(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 announce_q8_split_hgemm_once();
                 launch_dequant_q8_split_to_f16(
                     device,
@@ -1231,9 +1263,9 @@ pub(crate) unsafe fn launch_gemm_projection(
 /// # Safety
 ///
 /// `input` must be [batch, in_dim]. `weight` must be [out_dim, in_dim].
-/// `residual` and `output` must be [batch, out_dim]. `dequant_scratch` must
-/// have at least `out_dim * in_dim` elements (only used for Q8_0 weights).
-pub(crate) unsafe fn launch_gemm_residual(
+/// `residual` and `output` must be [batch, out_dim]. `conversion` lends the
+/// conversion scratch as for [`launch_gemm_projection`].
+pub(crate) unsafe fn launch_gemm_residual<const N: usize>(
     device: &CudaDevice,
     kernels: &KernelSet,
     weight: &GpuWeightBuf,
@@ -1241,9 +1273,7 @@ pub(crate) unsafe fn launch_gemm_residual(
     input: &CudaView<'_, f32>,
     residual: &CudaView<'_, f32>,
     output: &mut CudaViewMut<'_, f32>,
-    dequant_scratch: &mut CudaViewMut<'_, f32>,
-    activation_f16: &mut CudaViewMut<'_, u8>,
-    dequant_f16: &mut CudaViewMut<'_, u8>,
+    conversion: &mut Rest<'_, N>,
     batch: usize,
     out_dim: usize,
     in_dim: usize,
@@ -1331,6 +1361,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         && !moe_bf16_native_path(weight)
         && weight_f16_cache.is_some();
     if let Some(w_f16) = weight_f16_cache.filter(|_| f16_cache_active) {
+        let [mut activation] = conversion.regions([Role::ActivationF16]);
+        let activation_f16 = &mut activation.u8();
         // Copy residual -> output for beta=1.0 accumulation.
         device
             .stream
@@ -1371,6 +1403,8 @@ pub(crate) unsafe fn launch_gemm_residual(
         // several times the planes' bytes and a model sized for the planes cannot hold both. This is the
         // route the Q8_0 fallback already takes, so prefill keeps one GEMM rather than gaining a second.
         GpuWeightBuf::Nvfp4Raw(_) | GpuWeightBuf::Fp8Raw(_) => {
+            let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+            let dequant_scratch = &mut dequant_f32.f32();
             dequant_planar_into_scratch(
                 device,
                 kernels,
@@ -1479,16 +1513,18 @@ pub(crate) unsafe fn launch_gemm_residual(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_0_to_f32(
                     device,
                     kernels,
@@ -1529,6 +1565,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
                 device
                     .stream
@@ -1577,6 +1616,8 @@ pub(crate) unsafe fn launch_gemm_residual(
             }
         }
         GpuWeightBuf::F16Raw(w_f16) => {
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             // Native F16 weights: cublasGemmEx HGEMM with residual (no dequant needed).
             // Copy residual -> output, convert F32 activation to F16, then HGEMM beta=1.0.
             // note: when LUMEN_CUDA_PREFILL_F32=1, this branch CANNOT
@@ -1631,16 +1672,18 @@ pub(crate) unsafe fn launch_gemm_residual(
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
             // diagnostic: force SGEMM-F32 fallback when LUMEN_CUDA_PREFILL_F32=1.
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 // Fallback to F32 SGEMM if dequant_f16 buffer is too small.
-                if dequant_scratch.len() < num_elements {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q4_0_to_f32(
                     device,
                     kernels,
@@ -1681,6 +1724,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 // Step 1: Copy residual -> output for beta=1.0 accumulation.
                 device
                     .stream
@@ -1735,12 +1781,12 @@ pub(crate) unsafe fn launch_gemm_residual(
                 super::gpu_buffers::kquant_weight(weight).expect("matched a K-quant variant");
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: {scheme:?} requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
             device
@@ -1752,6 +1798,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("dtod residual copy ({scheme:?}) {label}: {e}"))
                 })?;
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_kquant_to_f16(
                 device,
                 kernels,
@@ -1787,12 +1836,12 @@ pub(crate) unsafe fn launch_gemm_residual(
             // exists for this format (its dequant kernel emits F16 only).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
                 return Err(RuntimeError::Compute(format!(
                     "gemm {label}: CtInt4G32 requires the F16 HGEMM path \
                      (dequant_f16 has {} bytes, need {f16_bytes_needed}; \
                      LUMEN_CUDA_PREFILL_F32 is unsupported for this format)",
-                    dequant_f16.len(),
+                    conversion.len(Role::DequantF16),
                 )));
             }
             // beta=1.0 accumulates into `output`, so it must hold the residual first.
@@ -1805,6 +1854,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                 .map_err(|e| {
                     RuntimeError::Compute(format!("dtod residual copy (CtInt4G32) {label}: {e}"))
                 })?;
+            let [mut weight_f16, mut activation] =
+                conversion.regions([Role::DequantF16, Role::ActivationF16]);
+            let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
             launch_dequant_ct4_to_f16(device, kernels, w_ct4, dequant_f16, num_elements, label)?;
             launch_f32_to_f16_fast(
                 device,
@@ -1850,11 +1902,11 @@ pub(crate) unsafe fn launch_gemm_residual(
             // accumulates W * A + residual into output.
             // replaces the per-row matvec_bf16_residual fallback (the 42x gap).
             let activation_needed = batch * in_dim * 2;
-            if activation_f16.len() < activation_needed {
+            if conversion.len(Role::ActivationF16) < activation_needed {
                 return Err(RuntimeError::Compute(format!(
                     "bf16_gemm_residual {label}: activation scratch too small: have {} bytes, \
                      need {} (batch={batch}, in_dim={in_dim})",
-                    activation_f16.len(),
+                    conversion.len(Role::ActivationF16),
                     activation_needed,
                 )));
             }
@@ -1871,6 +1923,8 @@ pub(crate) unsafe fn launch_gemm_residual(
                 })?;
 
             // Step 2: Convert F32 activation to BF16 via vectorized kernel.
+            let [mut activation] = conversion.regions([Role::ActivationF16]);
+            let activation_f16 = &mut activation.u8();
             launch_f32_to_bf16_fast(
                 device,
                 kernels,
@@ -1901,15 +1955,17 @@ pub(crate) unsafe fn launch_gemm_residual(
             // projection arm).
             let num_elements = out_dim * in_dim;
             let f16_bytes_needed = num_elements * 2;
-            if force_f32 || dequant_f16.len() < f16_bytes_needed {
-                if dequant_scratch.len() < num_elements {
+            if force_f32 || conversion.len(Role::DequantF16) < f16_bytes_needed {
+                if conversion.len(Role::DequantF32) < num_elements {
                     return Err(RuntimeError::Compute(format!(
                         "sgemm_residual {label}: dequant scratch too small: have {} elements, \
                          need {} (out_dim={out_dim}, in_dim={in_dim})",
-                        dequant_scratch.len(),
+                        conversion.len(Role::DequantF32),
                         num_elements,
                     )));
                 }
+                let [mut dequant_f32] = conversion.regions([Role::DequantF32]);
+                let dequant_scratch = &mut dequant_f32.f32();
                 launch_dequant_q8_split_to_f32(
                     device,
                     kernels,
@@ -1951,6 +2007,9 @@ pub(crate) unsafe fn launch_gemm_residual(
                         ))
                     })?;
             } else {
+                let [mut weight_f16, mut activation] =
+                    conversion.regions([Role::DequantF16, Role::ActivationF16]);
+                let (dequant_f16, activation_f16) = (&mut weight_f16.u8(), &mut activation.u8());
                 device
                     .stream
                     .memcpy_dtod(
@@ -3828,6 +3887,7 @@ pub(crate) unsafe fn launch_kv_widen_16<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace::RegionTable;
     use super::*;
     use lumen_format::planar_dequant::{dequantize_fp8, dequantize_nvfp4};
 
@@ -3955,10 +4015,10 @@ mod tests {
                 let x_gpu = device.htod_copy(&x).unwrap();
                 let residual_gpu = device.htod_copy(&residual).unwrap();
                 let mut out = device.alloc_zeros::<f32>(batch * out_dim).unwrap();
-                let mut scratch = device.alloc_zeros::<f32>(n).unwrap();
-                // The F16 operands belong to the other arms; the planar arm does not touch them.
-                let mut activation_f16 = device.alloc_zeros::<u8>(1).unwrap();
-                let mut dequant_f16 = device.alloc_zeros::<u8>(1).unwrap();
+                // The planar arm borrows the F32 dequant scratch only.
+                let mut ws =
+                    Workspace::alloc(&device, RegionTable::of(&[(Role::DequantF32, n)])).unwrap();
+                let ([], mut conversion) = ws.lend([]);
                 unsafe {
                     launch_gemm_residual(
                         &device,
@@ -3968,9 +4028,7 @@ mod tests {
                         &x_gpu.as_view(),
                         &residual_gpu.as_view(),
                         &mut out.as_view_mut(),
-                        &mut scratch.as_view_mut(),
-                        &mut activation_f16.as_view_mut(),
-                        &mut dequant_f16.as_view_mut(),
+                        &mut conversion,
                         batch,
                         out_dim,
                         in_dim,
