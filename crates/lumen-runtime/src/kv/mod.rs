@@ -952,6 +952,8 @@ impl std::fmt::Debug for KvCache {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn each_backend_stores_its_own_kv_precisions() {
         use lumen_format::serving_rules::ServingBackend::{Cpu, Cuda, Metal};
@@ -990,8 +992,6 @@ mod tests {
         let cuda = super::kv_precision_supported(Cuda, KvPrecision::Int4).unwrap_err();
         assert!(cuda.contains("f32, f16 or bf16"), "{cuda}");
     }
-
-    use super::*;
 
     fn test_config() -> KvCacheConfig {
         KvCacheConfig {

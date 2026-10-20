@@ -1092,11 +1092,14 @@ pub(crate) fn run_inference(args: &[String]) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
-    // Metal decodes only from GPU-resident weights, and CUDA serves the
+    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal && !use_cuda, context_len);
+    // Metal decodes only from GPU-resident weights (its prefill does not need
+    // them, so a run of one token works without), and CUDA serves the
     // linear-attention (GDN) layers only from them: the sync provider always
     // preloads them, the async one never, and the mmap one when the weights
     // are GPU-resident.
     let preloads = !use_async && (use_sync || gpu_resident);
+    let metal_unloaded = use_metal && !use_cuda && !preloads && max_tokens > 1;
     let unloaded = if use_async {
         "--async"
     } else {
@@ -1111,7 +1114,7 @@ pub(crate) fn run_inference(args: &[String]) {
     };
     // A registry model is refused here, before its download; a local file,
     // which has nothing to download, after the scheme admission below.
-    if use_metal && !use_cuda && !preloads && !looks_like_path(&model_path) {
+    if metal_unloaded && !looks_like_path(&model_path) {
         refuse_unloaded_metal();
     }
     let refuse_unloaded_gdn = || {
@@ -1211,15 +1214,14 @@ pub(crate) fn run_inference(args: &[String]) {
     // part of what makes CUDA unable to serve: it lives in the runtime's env
     // cache, so it is published into the admission flag before asking.
     lumen_runtime::runtime_defaults::publish_cuda_nvfp4_admission();
-    let admission_backend = serving_backend;
-    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, admission_backend) {
+    if let Some(scheme) = lumen_format::serving_rules::unservable_scheme(&lbc, serving_backend) {
         eprintln!(
             "Error: {}",
-            lumen_format::serving_rules::no_serving_kernels_message(scheme, admission_backend)
+            lumen_format::serving_rules::no_serving_kernels_message(scheme, serving_backend)
         );
         std::process::exit(1);
     }
-    if use_metal && !use_cuda && !preloads {
+    if metal_unloaded {
         refuse_unloaded_metal();
     }
     // A local file's linear-attention (GDN) layers are named by its index.
@@ -1254,7 +1256,6 @@ pub(crate) fn run_inference(args: &[String]) {
         repeat_last_n,
     };
     // CUDA is taken before Metal when both are asked for.
-    let max_tokens = cli_resolve_max_tokens(max_tokens, use_metal && !use_cuda, context_len);
     // A resumed session keeps the cache capacity it was saved with, which the
     // loader requires; without `--context-len` the capacity would follow this
     // run's prompt and answer lengths.

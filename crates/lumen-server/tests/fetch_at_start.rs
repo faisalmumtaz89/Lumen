@@ -38,7 +38,8 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .args(args)
         .env("LUMEN_CACHE_DIR", dir.join("cache"))
         .env("https_proxy", "ftp://127.0.0.1:9")
-        .env("HTTPS_PROXY", "ftp://127.0.0.1:9");
+        .env("HTTPS_PROXY", "ftp://127.0.0.1:9")
+        .env_remove("LUMEN_KV_PRECISION");
     command
 }
 

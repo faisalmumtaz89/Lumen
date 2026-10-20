@@ -169,4 +169,18 @@ fn metal_runs_it_cannot_serve_are_refused_before_the_download() {
         !output.contains("is not supported with --accelerate"),
         "{output}"
     );
+    // A one-token run never decodes, and Metal's prefill needs no resident
+    // weights, so it is not refused either.
+    let (_, output, _) = run(
+        "metal-one-token",
+        &[
+            "qwen3.5-9b:q4_0",
+            "--metal",
+            "--no-gpu-resident",
+            "--max-tokens",
+            "1",
+            "hi",
+        ],
+    );
+    assert!(!output.contains("Metal decodes only"), "{output}");
 }

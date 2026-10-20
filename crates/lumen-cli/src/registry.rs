@@ -334,6 +334,8 @@ pub fn load_registry() -> Registry {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn every_text_model_is_a_gdn_hybrid() {
         let reg = load_registry();
@@ -346,8 +348,6 @@ mod tests {
             );
         }
     }
-
-    use super::*;
 
     #[test]
     fn load_registry_succeeds() {
