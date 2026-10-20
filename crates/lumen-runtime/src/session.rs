@@ -47,6 +47,14 @@ use lumen_format::ModelHyperparams;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Whether `backend` saves and resumes sessions (`--session-save` /
+/// `--session-resume`): the CPU backends and Metal copy the KV cache and the
+/// recurrent state to and from the host; CUDA's `sync_kv_to_cpu` and
+/// `sync_kv_from_cpu` are not wired, so a CUDA run is refused before it starts.
+pub fn persists_sessions(backend: lumen_format::serving_rules::ServingBackend) -> bool {
+    backend != lumen_format::serving_rules::ServingBackend::Cuda
+}
+
 /// The result of a single prefill call.
 #[derive(Debug, Clone)]
 pub struct PrefillResult {
@@ -1641,6 +1649,13 @@ mod tests {
     use lumen_format::ModelHyperparams;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn only_cuda_has_no_session_persistence() {
+        use lumen_format::serving_rules::ServingBackend::{Cpu, Cuda, Metal};
+        assert!(super::persists_sessions(Cpu) && super::persists_sessions(Metal));
+        assert!(!super::persists_sessions(Cuda));
+    }
 
     use crate::compute::cpu_naive::NaiveF32Backend;
     use crate::compute::ComputeBackend;

@@ -289,15 +289,11 @@ pub trait ComputeBackend: Send + Sync {
     /// Backends with a hardcoded precision MUST override this and return
     /// `RuntimeError::Unsupported` for mismatched configs.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        match precision {
-            KvPrecision::F32 | KvPrecision::F16 => Ok(()),
-            other if !other.is_implemented() => Err(RuntimeError::Unsupported(format!(
-                "KV cache precision {other:?} is not yet implemented"
-            ))),
-            other => Err(RuntimeError::Unsupported(format!(
-                "the CPU backends store the KV cache as F32 or F16 (requested {other:?})"
-            ))),
-        }
+        crate::kv::kv_precision_supported(
+            lumen_format::serving_rules::ServingBackend::Cpu,
+            precision,
+        )
+        .map_err(RuntimeError::Unsupported)
     }
 
     // ====================================================================

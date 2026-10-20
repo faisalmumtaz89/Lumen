@@ -2074,14 +2074,11 @@ impl CudaBackend {
     /// allocates every layer's cache in that storage. The session's
     /// `kv_precision` must then agree (`validate_kv_precision`).
     pub fn set_kv_precision(&mut self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        match precision {
-            KvPrecision::F32 | KvPrecision::F16 | KvPrecision::Bf16 => {}
-            other => {
-                return Err(RuntimeError::Unsupported(format!(
-                    "CUDA KV cache precision {other:?} is not implemented (f32, f16 or bf16)"
-                )))
-            }
-        }
+        crate::kv::kv_precision_supported(
+            lumen_format::serving_rules::ServingBackend::Cuda,
+            precision,
+        )
+        .map_err(RuntimeError::Unsupported)?;
         if self.state.lock().map(|g| g.is_some()).unwrap_or(true) {
             return Err(RuntimeError::Config(
                 "set_kv_precision must be called before init()".into(),

@@ -49,6 +49,13 @@ impl Checkpoint {
 }
 
 impl ModelEntry {
+    /// Whether the model's layers include linear-attention (GDN) ones: the
+    /// `qwen35` and `qwen35moe` architectures, every text model the converter
+    /// accepts, are hybrids of GDN and full-attention layers.
+    pub fn is_gdn_hybrid(&self) -> bool {
+        matches!(self.architecture.as_str(), "qwen35" | "qwen35moe")
+    }
+
     /// What a listing shows after the name: the quantizations a text model
     /// comes in, sorted, its default marked, or what the image model is.
     pub fn variants(&self) -> String {
@@ -328,6 +335,19 @@ pub fn load_registry() -> Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_text_model_is_a_gdn_hybrid() {
+        let reg = load_registry();
+        for entry in reg.list().iter().filter(|e| e.checkpoint.is_none()) {
+            assert!(
+                entry.is_gdn_hybrid(),
+                "{}: {}",
+                entry.key,
+                entry.architecture
+            );
+        }
+    }
 
     #[test]
     fn load_registry_succeeds() {

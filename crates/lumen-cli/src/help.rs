@@ -188,7 +188,10 @@ OPTIONS:
     --accelerate          Use Accelerate AMX batched prefill (macOS only, use with --simd)
     --gpu-resident        Pre-load all weights into GPU Metal buffers (DEFAULT with --metal)
     --no-gpu-resident     Disable GPU-resident mode, use SSD-streaming (alias: --streaming).
-                          CUDA only: Metal decode requires resident weights
+                          Refused on Metal, which decodes only from resident weights, and
+                          on CUDA for a model with linear-attention (GDN) layers, which
+                          every converted model has; with --sync the weights are preloaded
+                          (a CtInt4G32 model refuses it even then)
     --option-a            MoE: dispatch only top-K experts per token (streaming + GPU-resident)
     --routing-bias <f>    MoE: cache-conditional routing bias lambda (default: 0.0 = disabled)
     --context-len <n>     Max context length for KV cache (default: auto-sized to prompt + generation + headroom;

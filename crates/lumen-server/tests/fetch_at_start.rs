@@ -38,7 +38,8 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .args(args)
         .env("LUMEN_CACHE_DIR", dir.join("cache"))
         .env("https_proxy", "ftp://127.0.0.1:9")
-        .env("HTTPS_PROXY", "ftp://127.0.0.1:9");
+        .env("HTTPS_PROXY", "ftp://127.0.0.1:9")
+        .env_remove("LUMEN_KV_PRECISION");
     command
 }
 
@@ -221,4 +222,73 @@ fn the_image_model_is_fetched_by_its_name_until_every_file_it_serves_is_cached()
     assert_ne!(code, Some(0), "{stderr}");
     assert!(stderr.contains("could not download qwen-image"), "{stderr}");
     assert_eq!(args.as_deref(), Some("pull qwen-image --yes"));
+}
+
+#[test]
+fn a_server_its_backend_cannot_run_is_refused_before_any_fetch() {
+    let _serial = serial();
+    let dir = install("refuse", Some(&format!("{RECORD}\nexit 3")));
+    let (code, stderr) = server(
+        &dir,
+        &[
+            "qwen3.5-9b:q4_0",
+            "--backend",
+            "cpu",
+            "--kv-precision",
+            "bf16",
+        ],
+    );
+    let args = asked(&dir);
+    #[cfg(not(target_os = "macos"))]
+    let metal = server(&dir, &["qwen3.5-9b:q4_0", "--backend", "metal"]);
+    #[cfg(target_os = "macos")]
+    let metal = server(
+        &dir,
+        &[
+            "qwen3.5-9b:q4_0",
+            "--backend",
+            "metal",
+            "--kv-precision",
+            "f32",
+        ],
+    );
+    let metal_args = asked(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("the CPU backends store the KV cache as F32 or F16 (requested Bf16)"),
+        "{stderr}"
+    );
+    assert_eq!(args, None, "fetched before refusing: {stderr}");
+    assert_ne!(metal.0, Some(0), "{}", metal.1);
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        metal
+            .1
+            .contains("--backend metal is only supported on macOS"),
+        "{}",
+        metal.1
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        metal.1.contains("Metal backend KV cache is F16-only"),
+        "{}",
+        metal.1
+    );
+    assert_eq!(metal_args, None, "fetched before refusing: {}", metal.1);
+}
+
+#[test]
+fn a_cpu_server_fetches_for_this_machines_memory() {
+    let _serial = serial();
+    let dir = install("cpu", Some(&format!("{RECORD}\nexit 3")));
+    let (code, stderr) = server(&dir, &["qwen3.5-9b:q4_0", "--backend", "cpu"]);
+    let args = asked(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert_eq!(
+        args.as_deref(),
+        Some("pull qwen3.5-9b:q4_0 --yes --cpu"),
+        "{stderr}"
+    );
 }

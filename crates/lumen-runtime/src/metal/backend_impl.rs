@@ -3102,15 +3102,11 @@ impl ComputeBackend for MetalF32Backend {
     /// choice on Metal — F32 KV would just waste 2x memory without quality
     /// gain. Reject the mismatch up front.
     fn validate_kv_precision(&self, precision: KvPrecision) -> Result<(), RuntimeError> {
-        if precision != KvPrecision::F16 {
-            return Err(RuntimeError::Unsupported(format!(
-                "Metal backend KV cache is F16-only (requested {precision:?}); \
-                 set --kv-precision f16 explicitly or omit the flag. The Metal \
-                 path's GPU-resident KV buffers are allocated as F16 in \
-                 backend_impl.rs::init and the CPU mirror must match.",
-            )));
-        }
-        Ok(())
+        crate::kv::kv_precision_supported(
+            lumen_format::serving_rules::ServingBackend::Metal,
+            precision,
+        )
+        .map_err(RuntimeError::Unsupported)
     }
 
     fn set_global_tensors(
