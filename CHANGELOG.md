@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **On a 16 GB GPU the 27B Q4_0 was downloaded and converted, then failed to load.** The check that refuses a model
+  whose weights alone exceed the GPU before downloading it allowed every download the largest conversion
+  shrinkage of any model, 2.2 GiB, but the 27B Q4_0 grows when converted: on a Tesla T4 `lumen run qwen3.8-27b`
+  downloaded 16 GB, converted it, and ran out of GPU memory after six minutes. Each registry quantization is now
+  judged by its own conversion, so the T4 refuses it before the first byte and no longer suggests it.
+
 ## [0.49.0] — 2026-10-20
 
 ### Added
