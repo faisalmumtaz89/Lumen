@@ -10,9 +10,10 @@
 //! backend reads all of them from host memory, and each registry
 //! quantization's converted weights differ from its download by the amount
 //! [`CONVERSION`] records (the MTP layer the converter drops, the tensors it
-//! re-quantizes, and the file's metadata), so a CUDA device is held to that
-//! quantization's own amount, and any other download to the most conversion
-//! removes from any of them, [`CONVERSION_SHRINK`]. The tests below hold the
+//! re-quantizes, and the file's metadata), so wherever a model converts as it
+//! does for CUDA (everywhere but macOS, whose conversion targets Metal) a
+//! download is held to its quantization's own amount, and any other download
+//! to the most conversion removes from any of them, [`CONVERSION_SHRINK`]. The tests below hold the
 //! censuses. These are bounds on the weights only: what serving needs beside them is
 //! checked when the model loads, and once it is converted
 //! `lumen_runtime::compute::check_cpu_memory` checks a CPU run's whole need.
@@ -58,12 +59,14 @@ const CONVERSION_SHRINK: u64 = 2_362_232_013;
 /// that fit `memory` bytes on `target`: not when, short by the most its
 /// conversion may remove, it is still bigger.
 fn may_fit(entry: &ModelEntry, quant: &str, target: Target, size: u64, memory: u64) -> bool {
-    let row = match target {
-        Target::Cuda(_) => CONVERSION
-            .iter()
-            .find(|(key, q, measured, _)| *key == entry.key && *q == quant && *measured == size),
-        Target::Host => None,
+    let converts_for_cuda = match target {
+        Target::Cuda(_) => true,
+        Target::Host => !cfg!(target_os = "macos"),
     };
+    let row = CONVERSION
+        .iter()
+        .filter(|_| converts_for_cuda)
+        .find(|(key, q, measured, _)| *key == entry.key && *q == quant && *measured == size);
     let least = match row {
         Some(&(_, _, _, shrink)) => {
             i128::from(size) - i128::from(shrink + CONVERSION_MARGIN) * (1 << 30) / 1000
@@ -514,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn a_download_of_another_size_and_a_cpu_run_keep_the_widest_bound() {
+    fn a_download_of_another_size_and_a_cpu_run_on_macos_keep_the_widest_bound() {
         let e = entry();
         let other = 16_056_478_688 + 1;
         let s = sizes(&[("Q4_0", other)]);
@@ -534,8 +537,13 @@ mod tests {
         };
         assert!(!refused(Target::Cuda(0), gpu(at, BLACKWELL), &s));
         assert!(refused(Target::Cuda(0), gpu(at - 1, BLACKWELL), &s));
+        // a CPU run converts as CUDA does except on macOS, whose conversion targets Metal
         let measured = sizes_27b();
-        let host_at = 16_056_478_688 - CONVERSION_SHRINK;
+        let host_at = if cfg!(target_os = "macos") {
+            16_056_478_688 - CONVERSION_SHRINK
+        } else {
+            (16_056_478_688i128 + 441 * GIB as i128 / 1000) as u64
+        };
         assert!(!refused(Target::Host, memory(host_at), &measured));
         assert!(refused(Target::Host, memory(host_at - 1), &measured));
     }
