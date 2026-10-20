@@ -30,9 +30,11 @@
 # Install location (no --prefix/LUMEN_PREFIX): the first of ~/.local/bin,
 # /opt/homebrew/bin (Apple-Silicon Homebrew) and /usr/local/bin that is both
 # already on $PATH AND writable without sudo is chosen. No sudo, no profile
-# edits in that case. Failing that, it uses /usr/local/bin via sudo (with a
-# clear heads-up), or finally ~/.local/bin with a one-line, idempotent PATH
-# addition to your shell profile.
+# edits in that case. Failing that, /usr/local/bin when sudo works there
+# without a password (`sudo -n`), or finally ~/.local/bin with a one-line,
+# idempotent PATH addition to your shell profile. sudo is only ever run with
+# -n, so the installer never waits for a password: an explicit --prefix it
+# cannot write without one is refused, with what to do.
 #
 # (Path note: this script lives under packaging/macos/ for URL stability but is
 #  cross-platform — it serves both the macOS Metal and Linux CUDA binaries.)
@@ -269,8 +271,8 @@ fi
 # Robust, cross-platform location logic (macOS Metal + Linux CUDA). The goal:
 # pick a directory that is already on $PATH and writable WITHOUT sudo so the
 # common Linux + Homebrew-Mac case needs no password and no profile edit. Only
-# when none qualifies do we fall back to sudo /usr/local/bin or to ~/.local/bin
-# with a one-line PATH addition.
+# when none qualifies do we fall back to /usr/local/bin with sudo that needs no
+# password, or to ~/.local/bin with a one-line PATH addition.
 tar -C "$TMP" -xzf "$TMP/pkg.tar.gz"
 SRC="$(find "$TMP" -maxdepth 1 -type d -name "lumen-*-$PLAT" | head -1)"
 [ -n "$SRC" ] && [ -d "$SRC/bin" ] || die "unexpected tarball layout under $TMP"
@@ -295,7 +297,7 @@ writable_nosudo() {
     p="$parent"
   done
 }
-# Copy the binaries into $1 using the command prefix $2 ("" or "sudo"):
+# Copy the binaries into $1 using the command prefix $2 ("" or "sudo -n"):
 # lumen and lumen-server always, lbi-convert when the tarball carries it (the
 # Linux/CUDA tarball does from v0.33.0; the macOS one does not).
 # stderr is suppressed so a no-sudo probe failure is SILENT — the caller decides
@@ -326,10 +328,10 @@ if [ -n "$PREFIX" ]; then
   # (1) Explicit --prefix / LUMEN_PREFIX → honor it. No auto-selection.
   if writable_nosudo "$PREFIX" && install_to "$PREFIX" ""; then
     DEST="$PREFIX"
+  elif have sudo && install_to "$PREFIX" "sudo -n"; then
+    DEST="$PREFIX"
   elif have sudo; then
-    info "Admin access is needed to write $PREFIX — you'll be asked for your password."
-    install_to "$PREFIX" "sudo" && DEST="$PREFIX"
-    [ -n "$DEST" ] || die "could not install to $PREFIX (even with sudo). Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
+    die "cannot write $PREFIX without sudo asking for a password, and the installer asks nothing. Run 'sudo -v' and then the installer again, or pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
   else
     die "cannot write $PREFIX and 'sudo' is unavailable. Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
   fi
@@ -345,10 +347,9 @@ else
 
   if [ -z "$DEST" ]; then
     # (3) None of those is on $PATH and writable. If /usr/local/bin is on $PATH
-    # and sudo is available, install there with sudo (after a clear heads-up).
-    if on_path "/usr/local/bin" && have sudo; then
-      info "Admin access is needed to write /usr/local/bin — you'll be asked for your password."
-      install_to "/usr/local/bin" "sudo" && DEST="/usr/local/bin"
+    # and sudo writes there without asking for a password, install there.
+    if on_path "/usr/local/bin" && have sudo && install_to "/usr/local/bin" "sudo -n"; then
+      DEST="/usr/local/bin"
     fi
   fi
 
@@ -474,9 +475,14 @@ if [ -n "$CUDA_LIBS_MISSING" ]; then
     field "CUDA libs" "NVRTC + cuBLAS 12.9 ${C_DIM}·${C_RESET} $LIBDIR"
   else
     S=""
-    writable_nosudo "$LIBDIR" || S="sudo"
+    writable_nosudo "$LIBDIR" || S="sudo -n"
     if [ -n "$S" ] && ! have sudo; then
       die "cannot write $LIBDIR for the CUDA libraries and 'sudo' is unavailable; pick a writable --prefix."
+    fi
+    # Checked before the download; each write below is run with -n too, as
+    # sudo's rules are per command and its credentials can expire meanwhile.
+    if [ -n "$S" ] && ! sudo -n true 2>/dev/null; then
+      die "Lumen is installed in $DEST, but its CUDA libraries go in $LIBDIR, which needs sudo with a password, and the installer asks nothing. Run 'sudo -v' and then the installer again, or install with --prefix \"\$HOME/.local/bin\"."
     fi
     info "fetching NVIDIA's CUDA libraries (NVRTC and cuBLAS, 670 MB), which this machine lacks"
     fetch_wheel "$NVRTC_WHEEL" "$NVRTC_SHA256" "$TMP/NVRTC.whl"
@@ -494,7 +500,7 @@ if [ -n "$CUDA_LIBS_MISSING" ]; then
       && $S install -m 0644 "$TMP/cudalibs/"* "$LIBDIR.new/" \
       && $S rm -rf "$LIBDIR" \
       && $S mv "$LIBDIR.new" "$LIBDIR" \
-      || die "could not write the CUDA libraries to $LIBDIR."
+      || die "could not write the CUDA libraries to $LIBDIR${S:+ (sudo without a password was refused; run 'sudo -v' and then the installer again)}."
     field "CUDA libs" "NVRTC + cuBLAS 12.9 → $LIBDIR ${C_DIM}·${C_RESET} $OK_MARK verified"
   fi
 fi
