@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.49.0] — 2026-10-20
+
 ### Fixed
 
 - **The RTX 5090 decode rates in docs/support.md did not say they were measured on Linux.** The page now
@@ -2305,7 +2307,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.5...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.5...v0.49.0
 [0.48.5]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.4...v0.48.5
 [0.48.4]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.3...v0.48.4
 [0.48.3]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.2...v0.48.3
