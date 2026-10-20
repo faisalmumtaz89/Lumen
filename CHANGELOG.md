@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **The installer said it asks nothing, then asked for a sudo password, and on WSL waited for it forever.**
+  For a user without passwordless sudo, `curl -fsSL https://servelumen.com/install.sh | bash` printed "you'll
+  be asked for your password" and ran sudo: where a terminal was attached (Ubuntu under WSL) it waited for a
+  password and installed nothing, and elsewhere it fell back to `~/.local/bin` after a false heads-up. sudo
+  now runs only with `-n`, so the installer never waits: when no directory on `PATH` is writable, it uses
+  sudo for `/usr/local/bin` only when sudo needs no password there, and otherwise installs in `~/.local/bin`
+  with a `PATH` line; an explicit `--prefix` it cannot write, even with sudo without a password, is refused
+  with what to do.
+
 - **A run the arguments ruled out downloaded and converted the model first.** `lumen run` with no prompt,
   an empty `--prompt`, a malformed `--tokens`, `--metal` or `--accelerate` off macOS, `--cuda` on a build
   without CUDA, a KV precision the backend cannot store (`--simd --kv-precision bf16`, Metal with f32),
