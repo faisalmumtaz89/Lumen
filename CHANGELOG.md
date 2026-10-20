@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Fixed
 
+- **The RTX 5090 decode rates in docs/support.md did not say they were measured on Linux.** Under WSL on
+  Windows 11 an RTX 5090 decodes at 84-85 % of them for the dense Q4_0 models and 60 % for the MoE; the page
+  now names the platform and gives the WSL rates.
+
 - **The installer said it asks nothing, then asked for a sudo password, and on WSL waited for it forever.**
   For a user without passwordless sudo, `curl -fsSL https://servelumen.com/install.sh | bash` printed "you'll
   be asked for your password" and ran sudo: where a terminal was attached (Ubuntu under WSL) it waited for a
