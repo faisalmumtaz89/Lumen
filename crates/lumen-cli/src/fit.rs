@@ -13,9 +13,10 @@
 //! re-quantizes, and the file's metadata), so wherever a model converts as it
 //! does for CUDA (everywhere but macOS, whose conversion targets Metal) a
 //! download is held to its quantization's own amount, and any other download
-//! to the most conversion removes from any of them, [`CONVERSION_SHRINK`]. The tests below hold the
-//! censuses. These are bounds on the weights only: what serving needs beside them is
-//! checked when the model loads, and once it is converted
+//! to the most conversion removes from any of them, [`CONVERSION_SHRINK`].
+//! The tests below hold the censuses. These are bounds on the weights only:
+//! what serving needs beside them is checked when the model loads, and once it
+//! is converted
 //! `lumen_runtime::compute::check_cpu_memory` checks a CPU run's whole need.
 #![cfg_attr(not(all(feature = "download", feature = "cuda")), allow(dead_code))]
 
