@@ -970,6 +970,7 @@ async fn run(args: Args) -> Result<(), String> {
     // start downloads nothing. A backend this build cannot construct is refused
     // for that reason first, with the message the backend construction below
     // gives, before admission could name the kill switch instead of the build.
+    let explicit_cpu = matches!(args.backend, BackendChoice::Cpu);
     let backend_choice = select_backend(args.backend);
     if matches!(backend_choice, BackendChoice::Cuda) && !cfg!(feature = "cuda") {
         return Err("--backend cuda requires building with --features cuda".to_string());
@@ -998,9 +999,8 @@ async fn run(args: Args) -> Result<(), String> {
         ModelLocation::Cached(path) => path,
         ModelLocation::Missing(spec) => {
             // the device the model is checked against is the one it will run
-            // on: this machine's memory for the CPU backend
-            let device =
-                (!matches!(backend_choice, BackendChoice::Cpu)).then_some(args.backend_device);
+            // on: the CPU when the server is told so
+            let device = (!explicit_cpu).then_some(args.backend_device);
             fetch(&spec, device).await?;
             match resolve_model_path(&args.model, args.quant.as_deref())? {
                 ModelLocation::Cached(path) => path,

@@ -137,7 +137,7 @@ fn metal_runs_it_cannot_serve_are_refused_before_the_download() {
             mode.trim_start_matches('-'),
             &["qwen3.5-9b:q4_0", "--metal", mode, "hi"],
             1,
-            "linear-attention (GDN) layers run only from GPU-resident weights",
+            "Metal decodes only from GPU-resident weights",
         );
     }
     refused(
@@ -151,5 +151,22 @@ fn metal_runs_it_cannot_serve_are_refused_before_the_download() {
         ],
         2,
         "is not supported with --accelerate",
+    );
+    // Metal on the mmap provider never takes the Accelerate path, so its
+    // session run is not refused: it goes on to the download.
+    let (_, output, _) = run(
+        "metal-accelerate-session",
+        &[
+            "qwen3.5-9b:q4_0",
+            "--metal",
+            "--accelerate",
+            "--session-save",
+            "/tmp/lumen-flag-refusals-m.bin",
+            "hi",
+        ],
+    );
+    assert!(
+        !output.contains("is not supported with --accelerate"),
+        "{output}"
     );
 }

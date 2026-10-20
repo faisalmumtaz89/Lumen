@@ -1053,7 +1053,10 @@ pub(crate) fn run_inference(args: &[String]) {
         std::process::exit(1);
     }
     let sessions = session_save_path.is_some() || session_resume_path.is_some();
-    if use_accelerate && sessions {
+    // Metal on the mmap provider runs its own batched-prefill path, which
+    // takes the session flags and never reaches the Accelerate one.
+    let metal_mmap = use_metal && !use_async && !use_sync;
+    if use_accelerate && sessions && !metal_mmap {
         // The Accelerate path uses a separate prefill backend; the
         // session-driven path is not yet plumbed through it because
         // `Session::extend_with_prefill_backend` exists but the
@@ -1089,25 +1092,37 @@ pub(crate) fn run_inference(args: &[String]) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
-    // A GPU backend serves the linear-attention (GDN) layers only from weights
-    // it preloaded: the sync provider always preloads, the async one never,
-    // and the mmap one when the weights are GPU-resident.
+    // Metal decodes only from GPU-resident weights, and CUDA serves the
+    // linear-attention (GDN) layers only from them: the sync provider always
+    // preloads them, the async one never, and the mmap one when the weights
+    // are GPU-resident.
     let preloads = !use_async && (use_sync || gpu_resident);
-    let refuse_unpreloaded_gdn = || {
-        let mode = if use_async {
-            "--async"
-        } else {
-            "--no-gpu-resident / --streaming"
-        };
+    let unloaded = if use_async {
+        "--async"
+    } else {
+        "--no-gpu-resident / --streaming"
+    };
+    let refuse_unloaded_metal = || {
         eprintln!(
-            "Error: on {} this model's linear-attention (GDN) layers run only from \
-             GPU-resident weights, which {mode} does not load; run without it, or with --sync",
-            if use_cuda { "CUDA" } else { "Metal" }
+            "Error: Metal decodes only from GPU-resident weights, which {unloaded} does not \
+             load; run without it, or with --sync"
         );
         std::process::exit(1);
     };
-    if (use_cuda || use_metal) && !preloads && registry_model_is_gdn(&model_path) {
-        refuse_unpreloaded_gdn();
+    // A registry model is refused here, before its download; a local file,
+    // which has nothing to download, after the scheme admission below.
+    if use_metal && !use_cuda && !preloads && !looks_like_path(&model_path) {
+        refuse_unloaded_metal();
+    }
+    let refuse_unloaded_gdn = || {
+        eprintln!(
+            "Error: on CUDA this model's linear-attention (GDN) layers run only from \
+             GPU-resident weights, which {unloaded} does not load; run without it, or with --sync"
+        );
+        std::process::exit(1);
+    };
+    if use_cuda && !preloads && registry_model_is_gdn(&model_path) {
+        refuse_unloaded_gdn();
     }
 
     // Dual-mode --model: if the value looks like a file path (contains / or \,
@@ -1204,15 +1219,18 @@ pub(crate) fn run_inference(args: &[String]) {
         );
         std::process::exit(1);
     }
+    if use_metal && !use_cuda && !preloads {
+        refuse_unloaded_metal();
+    }
     // A local file's linear-attention (GDN) layers are named by its index.
-    if (use_cuda || use_metal)
+    if use_cuda
         && !preloads
         && lbc
             .layer_indices
             .iter()
             .any(|layer| layer.subtensors.layer_type == Some(1))
     {
-        refuse_unpreloaded_gdn();
+        refuse_unloaded_gdn();
     }
 
     // When the operator did NOT pass the flag, honour the shared env resolvers

@@ -33,7 +33,7 @@ The canonical, always-up-to-date reference is `lumen run --help` (printed by [`c
 | `--kv-disk-dir <path>` | Directory for disk-persistent KV cache |
 | `--kv-disk-space-mb <n>` | KV cache space budget on disk |
 | `--session-save <p>` / `--session-resume <p>` | Persist / restore a Session across runs (Metal and the CPU backends). The file holds the full history and the next token's logits, so a resumed run on the same backend whose `--tokens` start with the saved history continues token for token as if it had never stopped (with `--temperature 0` and the same sampling flags; a sampled run restarts its random numbers from its seed). A resumed session keeps the cache size it was saved with, and a `--context-len` of another size is refused; a file an earlier version saved after generation is refused |
-| `--no-gpu-resident` | Stream weights from disk instead of GPU memory. Every converted model has linear-attention (GDN) layers, which CUDA and Metal serve only from GPU-resident weights, so on those backends it is refused (with `--sync`, which preloads the weights, it has no effect) |
+| `--no-gpu-resident` | Stream weights from disk instead of GPU memory. Metal decodes only from GPU-resident weights, and CUDA serves linear-attention (GDN) layers, which every converted model has, only from them, so on those backends it is refused; with `--sync`, which preloads the weights, it has no effect, except that a CtInt4G32 model refuses it |
 | `--gpu-resident` | Force GPU-resident weights |
 | `--verbose` | Show diagnostics and metrics |
 | `--profile` | Per-operation timing breakdown (implies `--verbose`) |

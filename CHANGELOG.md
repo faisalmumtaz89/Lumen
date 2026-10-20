@@ -12,8 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **A run the arguments ruled out downloaded and converted the model first.** `lumen run` with no prompt,
   an empty `--prompt`, a malformed `--tokens`, `--metal` or `--accelerate` off macOS, `--cuda` on a build
   without CUDA, a KV precision the backend cannot store (`--simd --kv-precision bf16`, Metal with f32),
-  `--session-save` on CUDA, or `--async` / `--no-gpu-resident` / `--streaming` on CUDA or Metal (whose
-  linear-attention layers need GPU-resident weights) downloaded and converted the model, 11.5 GB for the
+  `--session-save` on CUDA, or `--async` / `--no-gpu-resident` / `--streaming` on Metal (which decodes
+  only from GPU-resident weights) or on CUDA (whose linear-attention layers need them) downloaded and converted the model, 11.5 GB for the
   9B Q4_0, before failing; the last ones failed only after loading. They are now refused before the
   download, as `lumen-server` now refuses a backend it cannot build or a KV precision it cannot store
   before fetching the model.
