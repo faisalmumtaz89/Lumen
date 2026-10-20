@@ -9,6 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [0.49.0] — 2026-10-20
 
+### Added
+
+- **`lumen pull --cpu`** checks a model against this machine's memory instead of the GPU's, for a CPU run;
+  `lumen-server --backend cpu` pulls with it.
+
 ### Fixed
 
 - **The RTX 5090 decode rates in docs/support.md did not say they were measured on Linux.** The page now
