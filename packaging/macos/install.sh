@@ -331,7 +331,7 @@ if [ -n "$PREFIX" ]; then
   elif have sudo && install_to "$PREFIX" "sudo -n"; then
     DEST="$PREFIX"
   elif have sudo; then
-    die "cannot write $PREFIX without sudo asking for a password, and the installer asks nothing. Run 'sudo -v' and then the installer again, or pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
+    die "cannot install to $PREFIX: it is not writable, and sudo did not write it without a password (the installer never asks for one). If sudo needs your password there, run 'sudo -v' and then the installer again; otherwise pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
   else
     die "cannot write $PREFIX and 'sudo' is unavailable. Pick a writable --prefix, e.g. --prefix \"\$HOME/.local/bin\"."
   fi
@@ -479,11 +479,11 @@ if [ -n "$CUDA_LIBS_MISSING" ]; then
     if [ -n "$S" ] && ! have sudo; then
       die "cannot write $LIBDIR for the CUDA libraries and 'sudo' is unavailable; pick a writable --prefix."
     fi
-    # Checked before the download; each write below is run with -n too, as
-    # sudo's rules are per command and its credentials can expire meanwhile.
-    if [ -n "$S" ] && ! sudo -n true 2>/dev/null; then
-      die "Lumen is installed in $DEST, but its CUDA libraries go in $LIBDIR, which needs sudo with a password, and the installer asks nothing. Run 'sudo -v' and then the installer again, or install with --prefix \"\$HOME/.local/bin\"."
-    fi
+    # The libraries' parent is made before the download, so a directory that
+    # cannot be written is said before 670 MB arrive; every write is run with
+    # -n, as sudo's rules are per command and its credentials can expire.
+    no_libdir="Lumen is installed in $DEST, but its CUDA libraries go in $LIBDIR, which it cannot write${S:+, and sudo did not write it without a password (the installer never asks for one)}. ${S:+If sudo needs your password there, run 'sudo -v' and then the installer again; otherwise }make $LIBDIR writable, or install with a --prefix whose ../lib/lumen you can write."
+    $S mkdir -p "$(dirname -- "$LIBDIR")" 2>/dev/null || die "$no_libdir"
     info "fetching NVIDIA's CUDA libraries (NVRTC and cuBLAS, 670 MB), which this machine lacks"
     fetch_wheel "$NVRTC_WHEEL" "$NVRTC_SHA256" "$TMP/NVRTC.whl"
     fetch_wheel "$CUBLAS_WHEEL" "$CUBLAS_SHA256" "$TMP/CUBLAS.whl"
@@ -500,7 +500,7 @@ if [ -n "$CUDA_LIBS_MISSING" ]; then
       && $S install -m 0644 "$TMP/cudalibs/"* "$LIBDIR.new/" \
       && $S rm -rf "$LIBDIR" \
       && $S mv "$LIBDIR.new" "$LIBDIR" \
-      || die "could not write the CUDA libraries to $LIBDIR${S:+ (sudo without a password was refused; run 'sudo -v' and then the installer again)}."
+      || die "$no_libdir"
     field "CUDA libs" "NVRTC + cuBLAS 12.9 → $LIBDIR ${C_DIM}·${C_RESET} $OK_MARK verified"
   fi
 fi
