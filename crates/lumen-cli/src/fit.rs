@@ -7,12 +7,16 @@
 //! weights as F32, whose weights take at least [`BF16_AS_F32`]'s share of its
 //! download there. The CUDA backend holds the converted weights on the device
 //! (all but one norm vector per dense layer, at most 1.3 MB per model), a CPU
-//! backend reads all of them from host memory, and for every model in the
-//! registry the converted weights fall short of the download by at most
-//! [`CONVERSION_SHRINK`] (the MTP layer the converter drops, the tensors it
-//! re-quantizes, and the file's metadata). The tests below hold those censuses.
-//! These are bounds on the weights only: what serving needs beside them is
-//! checked when the model loads, and once it is converted
+//! backend reads all of them from host memory, and each registry
+//! quantization's converted weights differ from its download by the amount
+//! [`CONVERSION`] records (the MTP layer the converter drops, the tensors it
+//! re-quantizes, and the file's metadata), so wherever a model converts as it
+//! does for CUDA (everywhere but macOS, whose conversion targets Metal) a
+//! download is held to its quantization's own amount, and any other download
+//! to the most conversion removes from any of them, [`CONVERSION_SHRINK`].
+//! The tests below hold the censuses. These are bounds on the weights only:
+//! what serving needs beside them is checked when the model loads, and once it
+//! is converted
 //! `lumen_runtime::compute::check_cpu_memory` checks a CPU run's whole need.
 #![cfg_attr(not(all(feature = "download", feature = "cuda")), allow(dead_code))]
 
@@ -23,15 +27,54 @@ use lumen_format::serving_rules::{self, ComputeCapability};
 
 use crate::registry::ModelEntry;
 
+/// Download minus converted weight bytes of every registry quantization, in
+/// thousandths of a GiB, for the download of the bytes given: each file's real
+/// header (metadata, tokenizer, tensor table) at its full length, converted
+/// for the CUDA target, and the weights of the result summed (every layer
+/// tensor, the embedding, the final norm and the output head).
+const CONVERSION: [(&str, &str, u64, i64); 11] = [
+    ("qwen3-5-9b", "Q8_0", 9_804_541_984, 268),
+    ("qwen3-5-9b", "Q4_0", 5_741_391_904, -43),
+    ("qwen3-5-9b", "BF16", 18_407_321_344, 820),
+    ("qwen3-5-moe-35b-a3b", "Q8_0", 37_812_647_744, 227),
+    ("qwen3-5-moe-35b-a3b", "Q4_0", 20_836_243_264, 106),
+    ("qwen3-5-moe-35b-a3b", "BF16", 71_065_941_760, 1287),
+    ("qwen3-8-27b", "Q8_0", 29_047_086_048, 431),
+    ("qwen3-8-27b", "Q4_0", 16_056_478_688, -451),
+    ("qwen3-8-27b", "Q4_K_M", 17_442_399_968, 233),
+    ("qwen3-8-27b", "Q5_K_M", 20_923_877_088, 233),
+    ("qwen3-8-27b", "BF16", 54_657_735_616, 2140),
+];
+
+/// What a [`CONVERSION`] row is widened by, in thousandths of a GiB, so the
+/// weights it bounds are never overstated: the half thousandth its rounding
+/// hides and the norm vectors the CUDA backend keeps on the host.
+const CONVERSION_MARGIN: i64 = 10;
+
 /// The most a registry model's converted weights fall short of its download,
-/// 2.2 GiB: the census maximum, 2.140 GiB for qwen3.8-27b BF16, rounded up to
-/// a tenth of a GiB.
+/// 2.2 GiB: the [`CONVERSION`] maximum, 2.140 GiB for qwen3.8-27b BF16,
+/// rounded up to a tenth of a GiB.
 const CONVERSION_SHRINK: u64 = 2_362_232_013;
 
-/// Whether a download of `size` bytes may have weights that fit `memory`
-/// bytes: not when, short by the most conversion removes, it is still bigger.
-fn may_fit(size: u64, memory: u64) -> bool {
-    size.saturating_sub(CONVERSION_SHRINK) <= memory
+/// Whether a download of `size` bytes of `quant` of `entry` may have weights
+/// that fit `memory` bytes on `target`: not when, short by the most its
+/// conversion may remove, it is still bigger.
+fn may_fit(entry: &ModelEntry, quant: &str, target: Target, size: u64, memory: u64) -> bool {
+    let converts_for_cuda = match target {
+        Target::Cuda(_) => true,
+        Target::Host => !cfg!(target_os = "macos"),
+    };
+    let row = CONVERSION
+        .iter()
+        .filter(|_| converts_for_cuda)
+        .find(|(key, q, measured, _)| *key == entry.key && *q == quant && *measured == size);
+    let least = match row {
+        Some(&(_, _, _, shrink)) => {
+            i128::from(size) - i128::from(shrink + CONVERSION_MARGIN) * (1 << 30) / 1000
+        }
+        None => i128::from(size.saturating_sub(CONVERSION_SHRINK)),
+    };
+    least <= i128::from(memory)
 }
 
 /// Where a model would run: a CUDA device, or this machine's memory for a CPU
@@ -162,7 +205,7 @@ fn ruling(
         }
     }
     let (size, memory) = (size?, device.memory?);
-    if !may_fit(size, memory) {
+    if !may_fit(entry, quant, target, size, memory) {
         return Some(Ruling::Weights { size, memory });
     }
     let have = cuda_cc?;
@@ -376,25 +419,6 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// Download minus converted weight bytes of every registry model, in
-    /// GiB: each file's real header (metadata, tokenizer, tensor table) at
-    /// its full length, converted for the CUDA target, and the weights of the
-    /// result summed (every layer tensor, the embedding, the final norm and
-    /// the output head).
-    const CENSUS: [(&str, &str, f64); 11] = [
-        ("qwen3.5-9b", "Q8_0", 0.268),
-        ("qwen3.5-9b", "Q4_0", -0.043),
-        ("qwen3.5-9b", "BF16", 0.820),
-        ("qwen3.5-moe", "Q8_0", 0.227),
-        ("qwen3.5-moe", "Q4_0", 0.106),
-        ("qwen3.5-moe", "BF16", 1.287),
-        ("qwen3.8-27b", "Q8_0", 0.431),
-        ("qwen3.8-27b", "Q4_0", -0.451),
-        ("qwen3.8-27b", "Q4_K_M", 0.233),
-        ("qwen3.8-27b", "Q5_K_M", 0.233),
-        ("qwen3.8-27b", "BF16", 2.140),
-    ];
-
     fn entry() -> ModelEntry {
         crate::registry::load_registry()
             .resolve("qwen3.8-27b")
@@ -408,8 +432,8 @@ mod tests {
 
     #[test]
     fn the_shrink_is_the_census_maximum_rounded_up_and_covers_every_registry_model() {
-        let max = CENSUS.iter().map(|c| c.2).fold(f64::MIN, f64::max);
-        let rounded = (max * 10.0).ceil() / 10.0;
+        let max = CONVERSION.iter().map(|c| c.3).max().unwrap();
+        let rounded = (max as f64 / 100.0).ceil() / 10.0;
         assert_eq!(CONVERSION_SHRINK, (rounded * GIB as f64).ceil() as u64);
         let reg = crate::registry::load_registry();
         let mut cells = 0;
@@ -417,15 +441,112 @@ mod tests {
             for quant in entry.gguf_files.keys() {
                 cells += 1;
                 assert!(
-                    CENSUS
-                        .iter()
-                        .any(|c| reg.resolve(c.0).unwrap().key == entry.key && c.1 == quant),
+                    CONVERSION.iter().any(|c| c.0 == entry.key && c.1 == quant),
                     "{} {quant} is not in the census",
                     entry.key
                 );
             }
         }
-        assert_eq!(cells, CENSUS.len());
+        assert_eq!(cells, CONVERSION.len());
+    }
+
+    /// A device at compute capability 12.0, where no rule but the weights
+    /// one can refuse a registry quantization that is not BF16 below 9.0.
+    const BLACKWELL: ComputeCapability = (12, 0);
+
+    #[test]
+    fn each_quantization_is_held_to_its_own_conversion_with_the_margin() {
+        for &(key, quant, size, shrink) in &CONVERSION {
+            let e = crate::registry::load_registry()
+                .resolve(key)
+                .unwrap()
+                .clone();
+            let s = sizes(&[(quant, size)]);
+            let least = (size as i128 - (shrink + 10) as i128 * GIB as i128 / 1000) as u64;
+            let refused = |memory: u64| {
+                refusal(
+                    &e,
+                    key,
+                    quant,
+                    Target::Cuda(0),
+                    gpu(memory, BLACKWELL),
+                    &s,
+                    &[],
+                    Held::Nothing,
+                )
+                .is_some()
+            };
+            assert!(
+                !refused(least),
+                "{key} {quant} refused with room for its least weights"
+            );
+            assert!(
+                refused(least - 1),
+                "{key} {quant} admitted one byte short of them"
+            );
+        }
+    }
+
+    #[test]
+    fn no_bound_exceeds_the_file_a_real_conversion_wrote() {
+        // `.lbc` files converted for CUDA from these very downloads, which hold
+        // the weights and more (header, tokenizer, the host-kept norms).
+        let converted = [
+            ("qwen3-5-9b", "Q8_0", 9_528_454_404u64),
+            ("qwen3-5-9b", "Q4_0", 5_799_718_148),
+            ("qwen3-5-9b", "BF16", 17_538_264_324),
+            ("qwen3-5-moe-35b-a3b", "Q4_0", 20_733_275_396),
+            ("qwen3-8-27b", "Q8_0", 28_600_219_073),
+            ("qwen3-8-27b", "Q4_0", 16_556_012_993),
+            ("qwen3-8-27b", "Q4_K_M", 17_203_507_632),
+            ("qwen3-8-27b", "Q5_K_M", 20_689_367_472),
+        ];
+        for (key, quant, file) in converted {
+            let &(_, _, size, _) = CONVERSION
+                .iter()
+                .find(|c| c.0 == key && c.1 == quant)
+                .unwrap();
+            let e = crate::registry::load_registry()
+                .resolve(key)
+                .unwrap()
+                .clone();
+            assert!(
+                may_fit(&e, quant, Target::Cuda(0), size, file),
+                "{key} {quant}: the bound exceeds the {file}-byte conversion"
+            );
+        }
+    }
+
+    #[test]
+    fn a_download_of_another_size_and_a_cpu_run_on_macos_keep_the_widest_bound() {
+        let e = entry();
+        let other = 16_056_478_688 + 1;
+        let s = sizes(&[("Q4_0", other)]);
+        let at = other - CONVERSION_SHRINK;
+        let refused = |target: Target, device: Device, s: &BTreeMap<String, u64>| {
+            refusal(
+                &e,
+                "qwen3.8-27b",
+                "Q4_0",
+                target,
+                device,
+                s,
+                &[],
+                Held::Nothing,
+            )
+            .is_some()
+        };
+        assert!(!refused(Target::Cuda(0), gpu(at, BLACKWELL), &s));
+        assert!(refused(Target::Cuda(0), gpu(at - 1, BLACKWELL), &s));
+        // a CPU run converts as CUDA does except on macOS, whose conversion targets Metal
+        let measured = sizes_27b();
+        let host_at = if cfg!(target_os = "macos") {
+            16_056_478_688 - CONVERSION_SHRINK
+        } else {
+            (16_056_478_688i128 + 441 * GIB as i128 / 1000) as u64
+        };
+        assert!(!refused(Target::Host, memory(host_at), &measured));
+        assert!(refused(Target::Host, memory(host_at - 1), &measured));
     }
 
     /// A device whose memory is known and whose compute capability is not.
@@ -453,6 +574,36 @@ mod tests {
             ("Q4_K_M", 17_442_399_968),
             ("Q4_0", 16_056_478_688),
         ])
+    }
+
+    #[test]
+    fn the_27b_q4_0_whose_conversion_outgrows_a_t4_is_refused() {
+        let message = refusal(
+            &entry(),
+            "qwen3.8-27b",
+            "Q4_0",
+            Target::Cuda(0),
+            gpu(15_360 << 20, (7, 5)),
+            &sizes_27b(),
+            &[],
+            Held::Nothing,
+        )
+        .expect("refused");
+        assert!(
+            message.starts_with(
+                "Qwen3.8 27B Q4_0 is a 14.95 GiB download whose weights alone are more than \
+                 the 15.00 GiB of memory CUDA device 0 has, so it cannot run there; nothing was \
+                 downloaded."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "\nEvery quantization of Qwen3.8 27B is ruled out on that GPU: a smaller model or \
+                 a larger GPU is needed."
+            ),
+            "{message}"
+        );
     }
 
     #[test]
@@ -656,7 +807,8 @@ mod tests {
     }
 
     #[test]
-    fn a_kquant_is_refused_below_compute_capability_8_naming_both_and_what_runs() {
+    fn a_kquant_is_refused_below_compute_capability_8_naming_both_and_offering_nothing_that_cannot_run(
+    ) {
         let t4 = gpu(15_645_278_208, (7, 5));
         let message = refusal(
             &entry(),
@@ -677,14 +829,11 @@ mod tests {
             ),
             "{message}"
         );
-        assert!(
-            message.contains("\nNot ruled out on that GPU:\n  lumen run qwen3.8-27b:q4_0 \"…\""),
-            "{message}"
-        );
-        for q in [":q5_k_m", ":q8_0", ":bf16"] {
-            assert!(!message.contains(q), "{q}: {message}");
-        }
-        // a size refusal on the same GPU does not offer a K-quant either
+        // the Q4_0's conversion outgrows a T4, so no quantization of the 27B is offered
+        let none = "\nEvery quantization of Qwen3.8 27B is ruled out on that GPU: a smaller \
+                    model or a larger GPU is needed.";
+        assert!(message.ends_with(none), "{message}");
+        // nor by a size refusal on the same GPU
         let q8 = refusal(
             &entry(),
             "qwen3.8-27b",
@@ -696,8 +845,7 @@ mod tests {
             Held::Nothing,
         )
         .unwrap();
-        assert!(!q8.contains(":q4_k_m"), "{q8}");
-        assert!(q8.contains(":q4_0"), "{q8}");
+        assert!(q8.ends_with(none), "{q8}");
     }
 
     #[test]
