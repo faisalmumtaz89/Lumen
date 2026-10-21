@@ -46,6 +46,33 @@
 // MIO queue with the loads.
 #define NVFP4W_TWO_POW_126 8.5070591730234616e37f
 
+#ifdef NVFP4W_HW_E2M1
+// The same values from the hardware conversion, for a build targeting compute_120a (the only targets that have
+// it): `cvt.rn.f16x2.e2m1x2` turns a byte's low nibble into the low f16 half and its high nibble into the high
+// half; every E2M1 value is exact in f16 and in f32, and code 0x8 converts to -0.0 as the construction below does,
+// so the products, and with them the matvec's output, are byte-identical to the default build. Both helpers issue
+// the same conversion of the same byte, which the compiler computes once.
+extern "C" __device__ __forceinline__ unsigned int nvfp4w_e2m1x2(unsigned int byte)
+{
+    unsigned int halves;
+    asm("{ .reg .b8 b; cvt.u8.u32 b, %1; cvt.rn.f16x2.e2m1x2 %0, b; }" : "=r"(halves) : "r"(byte & 0xFFu));
+    return halves;
+}
+
+extern "C" __device__ __forceinline__ float nvfp4w_e2m1_lo(unsigned int byte)
+{
+    float v;
+    asm("{ .reg .b16 l, h; mov.b32 {l, h}, %1; cvt.f32.f16 %0, l; }" : "=f"(v) : "r"(nvfp4w_e2m1x2(byte)));
+    return v;
+}
+
+extern "C" __device__ __forceinline__ float nvfp4w_e2m1_hi(unsigned int byte)
+{
+    float v;
+    asm("{ .reg .b16 l, h; mov.b32 {l, h}, %1; cvt.f32.f16 %0, h; }" : "=f"(v) : "r"(nvfp4w_e2m1x2(byte)));
+    return v;
+}
+#else
 extern "C" __device__ __forceinline__ float nvfp4w_e2m1_lo(unsigned int byte)
 {
     return __uint_as_float(((byte & 0x8u) << 28) | ((byte & 0x7u) << 22)) * NVFP4W_TWO_POW_126;
@@ -55,6 +82,7 @@ extern "C" __device__ __forceinline__ float nvfp4w_e2m1_hi(unsigned int byte)
 {
     return __uint_as_float(((byte & 0x80u) << 24) | ((byte & 0x70u) << 18)) * NVFP4W_TWO_POW_126;
 }
+#endif
 
 extern "C" __device__ __forceinline__ float nvfp4w_e4m3_to_f32(unsigned int code)
 {

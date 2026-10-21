@@ -719,6 +719,13 @@ pub const NATIVE_PREFILL_ATTN_KERNEL_SOURCE: &str = concat!(
 /// fused kernels are bit-identical to the plain matvec followed by the unfused residual add or SwiGLU.
 pub const MATVEC_NVFP4_WIDE_KERNEL_SOURCE: &str = include_str!("matvec_nvfp4_wide.cu");
 
+/// [`MATVEC_NVFP4_WIDE_KERNEL_SOURCE`] built to decode E2M1 with the hardware conversion; it compiles only for
+/// `compute_120a` ([`crate::cuda::ffi::CudaDevice::fp4_native_arch`]) and its output is byte-identical to the
+/// default build's.
+pub fn matvec_nvfp4_wide_hw_source() -> String {
+    format!("#define NVFP4W_HW_E2M1\n{MATVEC_NVFP4_WIDE_KERNEL_SOURCE}")
+}
+
 /// FP8 E4M3 matvec with a per-tensor scale: plain, residual, residual-rounded, and the three-matrix
 /// q/k/v launch. Its E4M3 decode is the same arithmetic as `dequant_fp8_to_f32`.
 pub const MATVEC_FP8_KERNEL_SOURCE: &str = include_str!("matvec_fp8.cu");

@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **NVFP4 decode is about 2% faster on compute capability 12.0 GPUs (RTX 50-series).** The decode matvecs for
+  NVFP4 weights (the projections, the fused FFN kernels and the output head) decode each 4-bit weight with the
+  GPU's FP4 conversion instruction instead of bit arithmetic, where the device and NVRTC admit the `compute_120a`
+  target the native prefill already uses; the output is byte-identical. Qwen3.8 27B NVFP4 on an RTX 5090 (WSL2,
+  450 W power limit), 256-token decode after a 1,024-token prompt: 70.4 -> 72.4 tok/s (median of three alternated
+  runs each); after a 30,000-token prompt: 63.9 -> 65.4 tok/s. Other devices build and run the kernels as before.
+
 ## [0.49.1] — 2026-10-20
 
 ### Fixed
