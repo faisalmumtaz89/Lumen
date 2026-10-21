@@ -12823,6 +12823,13 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Whether a token replays the decode graph: one was captured, and no BF16
+    /// cuBLAS failure has since routed the BF16 matvecs to the legacy kernel
+    /// for the backend's lifetime, a route the graph does not hold.
+    fn replays_decode_graph(st: &MutableState) -> bool {
+        st.decode_graph.is_some() && !BF16_GEMMEX_FALLBACK_ARMED.load(Ordering::Relaxed)
+    }
+
     /// Decode one token, through the decode graph when one was captured, and
     /// read back its logits.
     fn decode_token_logits(
@@ -12834,7 +12841,7 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<Logits, RuntimeError> {
-        if st.decode_graph.is_some() {
+        if Self::replays_decode_graph(st) {
             self.launch_decode_graph(token_id, seq_pos, num_layers, hp, st, kv)?;
         } else {
             self.enqueue_decode_token(token_id, seq_pos, num_layers, hp.vocab_size, st)?;
@@ -12913,7 +12920,7 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<u32, RuntimeError> {
-        if st.decode_graph.is_some() {
+        if Self::replays_decode_graph(st) {
             self.launch_decode_graph(token_id, seq_pos, num_layers, hp, st, kv)?;
         } else {
             self.enqueue_decode_token(token_id, seq_pos, num_layers, hp.vocab_size, st)?;
