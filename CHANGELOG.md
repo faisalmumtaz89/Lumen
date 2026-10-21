@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.50.0] — 2026-10-22
+
 ### Changed
 
 - **CUDA decode is faster on dense models.** Each decode token now runs as one replayed CUDA graph, captured
@@ -2340,7 +2342,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.1...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.50.0...HEAD
+[0.50.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.1...v0.50.0
 [0.49.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.0...v0.49.1
 [0.49.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.5...v0.49.0
 [0.48.5]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.4...v0.48.5
