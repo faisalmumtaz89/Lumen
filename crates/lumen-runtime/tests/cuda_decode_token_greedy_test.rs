@@ -230,3 +230,98 @@ fn decode_token_greedy_errors_without_preload() {
         "decode_token_greedy without preload must return Err"
     );
 }
+
+/// A token id outside the vocabulary and a token past `max_seq_len` are refused,
+/// on the greedy and the logits path, before anything runs: with the decode
+/// graph live the graph is not launched, the sequence does not advance, and the
+/// decode after a refused token id equals a backend that never saw it.
+#[test]
+fn decode_refuses_out_of_range_tokens_and_a_full_context_before_launching() {
+    let config = TestModelConfig {
+        num_layers: 2,
+        num_heads: 2,
+        num_kv_heads: 2,
+        head_dim: 128,
+        hidden_dim: 32,
+        intermediate_dim: 64,
+        vocab_size: 256,
+        max_seq_len: 128,
+        seed: 11,
+    };
+    let lbc_data = generate_test_model(&config);
+    let provider = write_and_open(&lbc_data, "refuse");
+    let (Some(backend), Some(reference)) = (
+        make_preloaded_backend(&provider),
+        make_preloaded_backend(&provider),
+    ) else {
+        return;
+    };
+    let hp = provider.lbc().header.hyperparams;
+    let kv_cfg = KvCacheConfig {
+        max_seq_len: hp.max_seq_len as usize,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision: KvPrecision::F32,
+    };
+    let mut kv = KvCache::new(kv_cfg.clone()).expect("kv");
+    let mut kv_ref = KvCache::new(kv_cfg).expect("kv_ref");
+    let graph = lumen_runtime::runtime_defaults::cuda_graph_enabled();
+
+    let mut token = 1u32;
+    let mut token_ref = 1u32;
+    let mut step = |token: &mut u32, token_ref: &mut u32, kv: &mut KvCache| {
+        *token = backend
+            .decode_token_greedy(*token, &provider, kv)
+            .expect("decode");
+        *token_ref = reference
+            .decode_token_greedy(*token_ref, &provider, &mut kv_ref)
+            .expect("reference decode");
+        assert_eq!(*token, *token_ref, "position {}", kv.seq_len());
+    };
+    for _ in 0..4 {
+        step(&mut token, &mut token_ref, &mut kv);
+    }
+    if graph {
+        assert_eq!(backend.decode_graph_launches(), 4, "the decode graph ran");
+    }
+
+    let launches = backend.decode_graph_launches();
+    let seq_len = kv.seq_len();
+    let greedy = backend.decode_token_greedy(hp.vocab_size, &provider, &mut kv);
+    let logits = backend.decode_token(hp.vocab_size, &provider, &mut kv);
+    for (path, err) in [
+        ("greedy", greedy.err().map(|e| e.to_string())),
+        ("logits", logits.err().map(|e| e.to_string())),
+    ] {
+        let err = err.unwrap_or_else(|| panic!("{path}: token id {} decoded", hp.vocab_size));
+        assert!(err.contains("out of range"), "{path}: {err}");
+    }
+    assert_eq!(backend.decode_graph_launches(), launches);
+    assert_eq!(kv.seq_len(), seq_len);
+    for _ in 0..4 {
+        step(&mut token, &mut token_ref, &mut kv);
+    }
+
+    while kv.seq_len() < hp.max_seq_len as usize {
+        step(&mut token, &mut token_ref, &mut kv);
+    }
+    let launches = backend.decode_graph_launches();
+    if graph {
+        assert_eq!(
+            launches, hp.max_seq_len as u64,
+            "every token through the graph"
+        );
+    }
+    let greedy = backend.decode_token_greedy(token, &provider, &mut kv);
+    let logits = backend.decode_token(token, &provider, &mut kv);
+    for (path, err) in [
+        ("greedy", greedy.err().map(|e| e.to_string())),
+        ("logits", logits.err().map(|e| e.to_string())),
+    ] {
+        let err = err.unwrap_or_else(|| panic!("{path}: decoded past max_seq_len"));
+        assert!(err.contains("max_seq_len"), "{path}: {err}");
+    }
+    assert_eq!(backend.decode_graph_launches(), launches);
+    assert_eq!(kv.seq_len(), hp.max_seq_len as usize);
+}
