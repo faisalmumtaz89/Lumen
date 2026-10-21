@@ -1367,15 +1367,53 @@ pub(crate) fn compile_all_kernels(
             None
         }
     };
-    let nvfp4_decode = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_DECODE);
+    // On a device that admits the native FP4 target (compute_120a), the NVFP4 matvecs are the build that decodes
+    // E2M1 with the hardware conversion (byte-identical output, less arithmetic per weight); where the target is not
+    // admitted, or that build does not compile or load, they are the default build.
+    let nvfp4_hw = match device.fp4_native_arch() {
+        Ok(Some(arch)) => {
+            let load = || -> Result<[CudaFunction; 3], RuntimeError> {
+                let module = device
+                    .compile_and_load_with_arch(&shaders::matvec_nvfp4_wide_hw_source(), arch)?;
+                let function = |name: &str| {
+                    module.load_function(name).map_err(|e| {
+                        RuntimeError::Compute(format!("Failed to load CUDA kernel '{name}': {e}"))
+                    })
+                };
+                Ok([
+                    function(NVFP4_DECODE)?,
+                    function(NVFP4_GLU)?,
+                    function(NVFP4_RESIDUAL)?,
+                ])
+            };
+            match load() {
+                Ok(functions) => {
+                    cuda_log!("[CUDA] NVFP4 matvecs: {arch} build, hardware E2M1 conversion");
+                    Some(functions)
+                }
+                Err(e) => {
+                    cuda_log!("[CUDA] NVFP4 matvecs: {arch} build refused ({e}); default build");
+                    None
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            cuda_log!("[CUDA] NVFP4 matvecs: native FP4 target query failed ({e}); default build");
+            None
+        }
+    };
+    let [nvfp4_decode, nvfp4_glu, nvfp4_residual] = match nvfp4_hw {
+        Some(functions) => functions.map(Some),
+        None => [NVFP4_DECODE, NVFP4_GLU, NVFP4_RESIDUAL]
+            .map(|name| load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, name)),
+    };
     let nvfp4_prefill = load_planar(shaders::DEQUANT_NVFP4_KERNEL_SOURCE, NVFP4_PREFILL);
     let fp8_decode = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_DECODE);
     let fp8_residual = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_RESIDUAL);
     let fp8_residual_rounded = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_RESIDUAL_ROUNDED);
     let fp8_qkv = load_planar(shaders::MATVEC_FP8_KERNEL_SOURCE, FP8_QKV);
     let fp8_prefill = load_planar(shaders::DEQUANT_FP8_KERNEL_SOURCE, FP8_PREFILL);
-    let nvfp4_glu = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_GLU);
-    let nvfp4_residual = load_planar(shaders::MATVEC_NVFP4_WIDE_KERNEL_SOURCE, NVFP4_RESIDUAL);
     let fp8_gdn_in = load_planar(
         &format!(
             "{}\n{}\n{}",
