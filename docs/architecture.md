@@ -27,6 +27,7 @@ The forward-pass surface is transformer + GDN-hybrid (dense or MoE FFN). v1's sh
 - **Dense FFN**: SwiGLU (gate + up + SwiGLU fused, then the down projection)
 - **MoE FFN**: routes the top-K experts per token through stacked gate + up + SwiGLU + down kernels
 - **Decode attention**: one split-K flash-decoding kernel pair (`attention_decode_partial_f32` / `_f16` / `_bf16` + `attention_decode_merge`), compiled at load for the model's group size (query heads per KV head, 1 to 8) and head dimension (128 or 256), serving every context the cache holds with fixed scratch and no route switch: one CTA per (KV head, chunk) so each K and V row is read once for the whole group, one 16-key tile per CTA up to a per-model bound and a balanced run of whole tiles at a fixed split count above it (`LUMEN_CUDA_ATTN_ONE_TILE`, `LUMEN_CUDA_ATTN_TARGET`)
+- **CUDA decode graph**: on a dense model with an F32 or BF16 KV cache, one token's launches are captured as a CUDA graph when the model loads and replayed per token, with the per-token arguments (token id, position, attention split, GDN conv ring) written into the graph's nodes before each replay (`cuda/decode_graph.rs`, `LUMEN_CUDA_GRAPH`)
 
 ## LBC binary format
 
@@ -48,7 +49,7 @@ Each `Session` records its prompt history. On the next turn, `Session::extend_wi
 
 | Backend | Source root | Notable kernels |
 |---|---|---|
-| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (the kernel set and the decode matvecs), `attention_decode.rs` (decode attention: one kernel per model shape), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~23K LoC dispatch) |
+| CUDA | `crates/lumen-runtime/src/cuda/` | `decode.rs` (the kernel set and the decode matvecs), `attention_decode.rs` (decode attention: one kernel per model shape), `decode_graph.rs` (decode as one CUDA graph per token), `prefill.rs` (FA2 prefill), `shaders/` (NVRTC kernels), `backend_impl.rs` (~23K LoC dispatch) |
 | Metal | `crates/lumen-runtime/src/metal/` | `gdn.rs`, `moe.rs`, `prefill.rs`, `decode_*.rs`, `shaders/*.msl` |
 | CPU | `crates/lumen-runtime/src/compute/cpu_naive.rs` + `crates/lumen-runtime/src/accelerate/` | Scalar reference + SIMD NEON |
 

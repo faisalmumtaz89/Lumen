@@ -20,6 +20,7 @@ use crate::error::RuntimeError;
 use crate::kv::KvPrecision;
 
 use super::decode::{KernelSet, ATTN_DECODE_BLOCK_DIM};
+use super::decode_graph::{refuse_in_capture, register, Geometry, Slot};
 use super::ffi::CudaDevice;
 use super::kv_cache::KvRef;
 
@@ -342,7 +343,7 @@ impl DecodeAttentionLaunch {
 /// construction (the backend refused any other shape at init, and the
 /// policy and the scratch come from one `DecodeScratch::allocate`), so a
 /// failure here is an engine defect and is an error, never a fallback.
-fn admit(
+pub(crate) fn admit(
     kernels: &KernelSet,
     scratch: &DecodeScratch,
     num_heads: u32,
@@ -422,6 +423,12 @@ unsafe fn launch_pair<K: DeviceRepr>(
             shared_mem_bytes: spec.partial_shared_bytes(store != KvPrecision::F32),
         })
         .map_err(|e| RuntimeError::Compute(format!("{}: {e}", launch.route_name(store))))?;
+    register(
+        device,
+        11,
+        &[(6, Slot::Keys), (9, Slot::Splits), (10, Slot::Partition)],
+        Geometry::SplitGrid,
+    )?;
     device
         .stream
         .launch_builder(&kernels.attention_decode_merge)
@@ -436,6 +443,7 @@ unsafe fn launch_pair<K: DeviceRepr>(
             shared_mem_bytes: decode_attention_merge_shared_bytes(s),
         })
         .map_err(|e| RuntimeError::Compute(format!("attention_decode_merge: {e}")))?;
+    register(device, 5, &[(4, Slot::Splits)], Geometry::MergeShared)?;
     Ok(())
 }
 
@@ -552,6 +560,8 @@ pub(crate) unsafe fn launch_attention_decode(
     }
     announce_route(store, num_heads, num_kv_heads, head_dim, seq_len, launch);
     if let Some((dir, lengths)) = attention_dump_config() {
+        // Whether a call dumps depends on its length, which a replayed graph never asks.
+        refuse_in_capture("LUMEN_CUDA_ATTN_DUMP")?;
         if lengths.contains(&seq_len) {
             dump_attention_call(
                 device,

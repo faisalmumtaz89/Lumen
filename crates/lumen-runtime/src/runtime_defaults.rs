@@ -1352,6 +1352,17 @@ pub fn gdn_p123_fuse_enabled() -> bool {
     })
 }
 
+/// `LUMEN_CUDA_GRAPH` (default ON; `=0` opts out): decode replays one CUDA graph per token, captured
+/// when the model loads, instead of launching every kernel from the host (`cuda/decode_graph.rs`).
+/// Byte-identical; models and settings the graph does not cover decode eagerly either way.
+pub fn cuda_graph_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("LUMEN_CUDA_GRAPH") {
+        Ok(v) => v != "0",
+        Err(_) => canonical_default_on(),
+    })
+}
+
 /// `LUMEN_CUDA_ROPE_TAB` (default ON; `=0` opts out): NeoX RoPE reads its cos/sin pairs from
 /// a per-CTA shared table computed once (identical expression, identical
 /// inputs => identical bits) instead of every thread recomputing
@@ -1945,6 +1956,7 @@ const KNOWN_LUMEN_ENV_VARS: &[&str] = &[
     "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
     "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
     "LUMEN_CUDA_GPU_SAMPLE",
+    "LUMEN_CUDA_GRAPH",
     "LUMEN_CUDA_KQUANT",
     "LUMEN_CUDA_LEGACY_DEFAULTS",
     "LUMEN_CUDA_MAX_SEQ_LEN",
@@ -4325,6 +4337,7 @@ mod tests {
         "LUMEN_CUDA_GDN_SKIP_DUP_QKV",
         "LUMEN_CUDA_GDN_SUBSTAGE_TIMING",
         "LUMEN_CUDA_GPU_SAMPLE",
+        "LUMEN_CUDA_GRAPH",
         "LUMEN_CUDA_KQUANT",
         "LUMEN_CUDA_LEGACY_DEFAULTS",
         "LUMEN_CUDA_MAX_SEQ_LEN",

@@ -25,7 +25,9 @@
 //! Before it is trusted the recorder must see a synchronous driver allocation, a
 //! stream allocation and a buffer clone, each as an allocation call, and a module
 //! load. `LUMEN_CUDA_PROFILE` creates CUDA events per stage and is not part of a
-//! request's contract.
+//! request's contract. The dense model at an F32 or BF16 cache decodes through
+//! the decode graph (unless `LUMEN_CUDA_GRAPH=0`), and the case fails unless the
+//! graph ran; every other case decodes eagerly and fails if it did.
 #![cfg(all(feature = "cuda", feature = "test-cupti"))]
 
 mod common;
@@ -535,9 +537,10 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
         .partition(Allocation::is_module_load);
     let free_after = free_memory(&ctx);
     println!(
-        "{label}/{precision:?}: {} allocation calls, {} library loads and lookups, static data {loads:?}, free {free} -> {free_after} bytes",
+        "{label}/{precision:?}: {} allocation calls, {} library loads and lookups, static data {loads:?}, free {free} -> {free_after} bytes, {} decode graph launches",
         calls.len(),
-        recorded.library_loads.len()
+        recorded.library_loads.len(),
+        cuda.decode_graph_launches()
     );
     if !calls.is_empty() {
         return Err(format!("requests allocated device memory: {calls:?}"));
@@ -550,6 +553,15 @@ fn check(label: &str, precision: KvPrecision) -> Result<(), String> {
     }
     if stack_limit(&ctx) != stack {
         return Err("a request grew the stack".into());
+    }
+    let graph_expected = runtime_defaults::cuda_graph_enabled()
+        && label == "gdn-hybrid"
+        && precision != KvPrecision::F16;
+    let launches = cuda.decode_graph_launches();
+    if graph_expected != (launches > 0) {
+        return Err(format!(
+            "the decode graph ran {launches} tokens; expected it to run: {graph_expected}"
+        ));
     }
     let granule = allocation_granule(&ctx);
     if std::env::var("LUMEN_NO_ALLOC_ISOLATED_GPU").as_deref() == Ok("1")

@@ -6,6 +6,7 @@
 //! cudarc 0.19 API: CudaContext (device) -> CudaStream (ops) -> CudaModule (kernels).
 //! cuBLAS handle is created alongside the stream for GEMV dispatch.
 
+use super::decode_graph::refuse_in_capture;
 use crate::error::RuntimeError;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits};
@@ -15,6 +16,8 @@ use std::sync::Arc;
 ///
 /// Owns the device context, default stream, compiled kernel modules,
 /// and a cuBLAS handle bound to the default stream for GEMV operations.
+/// While the calling thread captures the decode graph, the host copies,
+/// allocations and synchronization below fail (`decode_graph::refuse_in_capture`).
 pub struct CudaDevice {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -442,6 +445,7 @@ impl CudaDevice {
 
     /// Copy host data to a new device buffer.
     pub fn htod_copy<T: DeviceRepr>(&self, host_data: &[T]) -> Result<CudaSlice<T>, RuntimeError> {
+        refuse_in_capture("htod_copy")?;
         self.stream.clone_htod(host_data).map_err(cuda_driver_err)
     }
 
@@ -454,6 +458,7 @@ impl CudaDevice {
         host_data: &[T],
         dst: &mut Dst,
     ) -> Result<(), RuntimeError> {
+        refuse_in_capture("htod_copy_into")?;
         self.stream
             .memcpy_htod(host_data, dst)
             .map_err(cuda_driver_err)
@@ -464,6 +469,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<CudaSlice<T>, RuntimeError> {
+        refuse_in_capture("alloc_zeros")?;
         self.stream.alloc_zeros(len).map_err(cuda_driver_err)
     }
 
@@ -481,6 +487,7 @@ impl CudaDevice {
         &self,
         len: usize,
     ) -> Result<CudaSlice<T>, RuntimeError> {
+        refuse_in_capture("alloc_uninit")?;
         self.stream.alloc(len).map_err(cuda_driver_err)
     }
 
@@ -489,6 +496,7 @@ impl CudaDevice {
         &self,
         device_buf: &CudaSlice<T>,
     ) -> Result<Vec<T>, RuntimeError> {
+        refuse_in_capture("dtoh_copy")?;
         self.stream.clone_dtoh(device_buf).map_err(cuda_driver_err)
     }
 
@@ -501,11 +509,13 @@ impl CudaDevice {
         T: DeviceRepr,
         Src: cudarc::driver::DevicePtr<T>,
     {
+        refuse_in_capture("dtoh_copy_view")?;
         self.stream.clone_dtoh(device_view).map_err(cuda_driver_err)
     }
 
     /// Synchronize the default stream (wait for all pending GPU work).
     pub fn synchronize(&self) -> Result<(), RuntimeError> {
+        refuse_in_capture("synchronize")?;
         self.stream.synchronize().map_err(cuda_driver_err)
     }
 
