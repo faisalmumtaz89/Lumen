@@ -9,14 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ### Changed
 
-- **CUDA decode is 7 to 8% faster on dense models.** Each decode token now runs as one replayed CUDA graph, captured
+- **CUDA decode is faster on dense models.** Each decode token now runs as one replayed CUDA graph, captured
   when the model loads, instead of hundreds of kernel launches from the host (597 on Qwen3.8 27B); the token's id,
   position, attention split and GDN ring values are written into the graph before each replay, and the output is
   byte-identical. Dense models with an F32 or BF16 KV cache take it; MoE models, an F16 KV cache and K-quant weights
   decode as before, and `LUMEN_CUDA_GRAPH=0` turns it off. A `[CUDA] decode graph:` line at load says whether the
   graph is live. Qwen3.8 27B NVFP4 on an RTX 5090 (WSL2, 450 W power limit), BF16 KV, server, 256-token decode after
-  a 1,024-token prompt: 70.9 -> 76.4 tok/s (median of three alternated rounds of five requests each); after a
-  30,000-token prompt: 64.4 -> 68.9 tok/s.
+  a 1,024-token prompt: 71.55 -> 77.08 tok/s (median of three alternated rounds of five requests each); after a
+  30,000-token prompt: 64.96 -> 69.95 tok/s.
 - **NVFP4 decode is about 2% faster on compute capability 12.0 GPUs (RTX 50-series).** The decode matvecs for
   NVFP4 weights (the projections, the fused FFN kernels and the output head) decode each 4-bit weight with the
   GPU's FP4 conversion instruction instead of bit arithmetic, where the device and NVRTC admit the `compute_120a`
