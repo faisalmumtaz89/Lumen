@@ -24,6 +24,8 @@ pub mod cublaslt;
 /// Measured, verified cuBLASLt algorithm selection, cached per library identity.
 pub mod cublaslt_algo_cache;
 pub(crate) mod decode;
+/// Decode as one CUDA graph per token.
+pub(crate) mod decode_graph;
 /// CUDA device wrapper (context, stream, buffer management).
 pub mod ffi;
 pub(crate) mod gdn;

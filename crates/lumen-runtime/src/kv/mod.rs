@@ -737,6 +737,15 @@ impl KvCache {
     /// Called after all layers have processed a new token.
     /// Returns an error if advancing would exceed max_seq_len.
     pub fn advance_seq_len(&mut self) -> Result<(), RuntimeError> {
+        self.ensure_room()?;
+        self.seq_len += 1;
+        Ok(())
+    }
+
+    /// Refuse a token when the sequence has no position left for it: the
+    /// check `advance_seq_len` makes, for a caller that must refuse before
+    /// computing the token.
+    pub fn ensure_room(&self) -> Result<(), RuntimeError> {
         if self.seq_len + 1 > self.config.max_seq_len {
             return Err(RuntimeError::KvCache(format!(
                 "sequence length {} would exceed max_seq_len {}",
@@ -744,7 +753,6 @@ impl KvCache {
                 self.config.max_seq_len
             )));
         }
-        self.seq_len += 1;
         Ok(())
     }
 

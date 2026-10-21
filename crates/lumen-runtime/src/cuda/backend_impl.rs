@@ -30,6 +30,7 @@ use super::decode::{
     FUSED_GLU_BLOCK_DIM, FUSED_GLU_SHMEM_LIMIT, HGEMV_BLOCK_DIM, HGEMV_SHMEM_LIMIT, Q8_0_BLOCK_DIM,
     Q8_1_QUANT_BLOCK_DIM, SMEM_BLOCK_DIM,
 };
+use super::decode_graph::{self, DecodeGraph, DecodePlan};
 use super::ffi::CudaDevice;
 use super::gpu_buffers::{upload_layer_weights, GpuWeightBuf, LayerWeightsGpu};
 use super::kv_cache::{KvCacheGpu, KvStore, KvView};
@@ -876,6 +877,16 @@ struct GdnScratchGpu {
     k_norm_buf_rr: Option<CudaSlice<f32>>,
 }
 
+impl GdnScratchGpu {
+    /// Move GDN layer `gdn_idx`'s conv ring past one decoded token: the eager
+    /// decode calls it after the launch that writes the slot, the decode graph
+    /// after the replay.
+    fn advance_conv_ring(&mut self, gdn_idx: usize) {
+        let slots = (self.params.conv_kernel_size - 1) as u32;
+        self.conv_positions[gdn_idx] = (self.conv_positions[gdn_idx] + 1) % slots;
+    }
+}
+
 /// Per-call mutable state protected by a Mutex for interior mutability.
 ///
 /// `compute_layer` takes `&self`, so mutable GPU state (scratch buffers,
@@ -957,6 +968,9 @@ struct MutableState {
     /// Number of decode tokens processed this sequence; used as the step
     /// ordinal for the XCHK forensic probe.
     decode_token_count: usize,
+    /// The decode graph `preload_weights` captured; `None` while decode runs
+    /// eagerly.
+    decode_graph: Option<DecodeGraph>,
     /// GDN scratch (lazy-allocated on first GDN layer, persists for sequence lifetime).
     gdn_scratch_gpu: Option<GdnScratchGpu>,
     /// The batched F32 prefill's buffers, allocated by `preload_weights` for
@@ -981,8 +995,9 @@ struct MutableState {
     /// cuBLAS must not allocate memory internally during graph capture (cudaMalloc
     /// is forbidden on a capturing stream). This 4 MB buffer is registered via
     /// `cublasSetWorkspace_v2` so cuBLAS uses it instead of allocating on-the-fly.
-    /// Held here only so it outlives the cuBLAS handle; nothing reads it.
-    _cublas_workspace: Option<CudaSlice<u8>>,
+    /// Held here so it outlives the cuBLAS handle; `None` when it could not be
+    /// bound, which keeps decode eager.
+    cublas_workspace: Option<CudaSlice<u8>>,
     /// Pre-computed per-layer batched GEMM pointer arrays.
     /// Populated once in `preload_weights()`, eliminates per-layer htod memcpys.
     /// `None` until preload completes.
@@ -1213,7 +1228,7 @@ fn moe_probe_enabled() -> bool {
 /// CUDA port of the Metal decode-delay fix.
 ///
 /// Returns the configured per-decode-step delay in microseconds. `0` (the
-/// default) means OFF — `decode_token` / `decode_token_normal` skip the
+/// default) means OFF — `decode_token_logits` / `decode_token_greedy_argmax` skip the
 /// sleep entirely and the path is bit-exact when disabled.
 ///
 /// # Background — the race this addresses
@@ -1230,8 +1245,8 @@ fn moe_probe_enabled() -> bool {
 /// first effective (30/30), and `delay=50` was fully deterministic.
 ///
 /// The CUDA analogue of Metal's `commit_and_wait` is `device.synchronize()`
-/// at the end of `decode_token` (line ~15077) and `decode_token_normal`
-/// (line ~7128). Inserting a small CPU `thread::sleep` after each of those
+/// at the end of `decode_token_logits` and `decode_token_greedy_argmax`
+/// (eager and graph alike). Inserting a small CPU `thread::sleep` after each of those
 /// two sync points is the byte-by-byte port of the mitigation.
 ///
 /// # Cost
@@ -2093,6 +2108,17 @@ impl CudaBackend {
         self.kv_precision
     }
 
+    /// Tokens the decode graph has run since the model loaded; 0 while decode
+    /// runs eagerly.
+    pub fn decode_graph_launches(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|st| st.decode_graph.as_ref())
+            .map_or(0, DecodeGraph::launches)
+    }
+
     /// Run a tiny `cublasGemmEx` BF16 probe to verify the tensor-core BF16
     /// path is functional on this device. The probe uses the exact same
     /// data-type / accumulator / algo combination the hot path uses
@@ -2373,14 +2399,7 @@ impl CudaBackend {
     /// and copying back to host, it leaves the embedding in `st.scratch.x_gpu`.
     fn embed_token_gpu(&self, token_id: u32, st: &mut MutableState) -> Result<(), RuntimeError> {
         let hidden_dim = self.cached_hidden_dim;
-        let vocab_size = self.cached_vocab_size;
-
-        if (token_id as usize) >= vocab_size {
-            return Err(RuntimeError::Compute(format!(
-                "token_id {} out of range (vocab_size={vocab_size})",
-                token_id,
-            )));
-        }
+        self.check_token_id(token_id)?;
 
         let config = LaunchConfig::for_elements(hidden_dim);
         let launch_cfg = CudarcLaunchConfig {
@@ -2506,7 +2525,26 @@ impl CudaBackend {
             }
             .map_err(|e| RuntimeError::Compute(format!("CUDA embed_token_f32 gpu launch: {e}")))?;
         }
+        // Every embedding kernel takes (table, x, token_id, hidden_dim).
+        decode_graph::register(
+            &self.device,
+            4,
+            &[(2, decode_graph::Slot::Token)],
+            decode_graph::Geometry::Fixed,
+        )?;
 
+        Ok(())
+    }
+
+    /// Refuse a token id outside the vocabulary.
+    fn check_token_id(&self, token_id: u32) -> Result<(), RuntimeError> {
+        let vocab_size = self.cached_vocab_size;
+        if (token_id as usize) >= vocab_size {
+            return Err(RuntimeError::Compute(format!(
+                "token_id {} out of range (vocab_size={vocab_size})",
+                token_id,
+            )));
+        }
         Ok(())
     }
 
@@ -3402,13 +3440,7 @@ impl CudaBackend {
                     (st.kv_num_kv_heads, st.kv_max_seq_len, st.kv_head_dim),
                     layer_idx,
                 )?;
-                if kv_cache.seq_len() >= kv_cache.max_seq_len {
-                    return Err(RuntimeError::KvCache(format!(
-                        "KV cache full: seq_len={} >= max_seq_len={}",
-                        kv_cache.seq_len(),
-                        kv_cache.max_seq_len,
-                    )));
-                }
+                kv_cache.ensure_room()?;
                 {
                     static SHOWN: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
@@ -3502,6 +3534,18 @@ impl CudaBackend {
                     }
                 }
                 .map_err(|e| RuntimeError::Compute(format!("attn_prep_fused L{layer_idx}: {e}")))?;
+                // The F32 kernel takes 17 arguments with `pos` the 10th; the
+                // 16-bit twins add the overflow counter before it.
+                let (args, pos_arg) = match kv_cache.precision() {
+                    KvPrecision::F32 => (17, 9),
+                    _ => (18, 10),
+                };
+                decode_graph::register(
+                    &self.device,
+                    args,
+                    &[(pos_arg, decode_graph::Slot::Position)],
+                    decode_graph::Geometry::Fixed,
+                )?;
                 // The fused kernel replaced append_kv, which also advances the
                 // cache's seq_len (attention below must cover the token just
                 // appended at `pos`). Advance it here or the current token
@@ -3744,6 +3788,12 @@ impl CudaBackend {
                         .launch(launch_cfg)
                 }
                 .map_err(|e| RuntimeError::Compute(format!("rope launch: {e}")))?;
+                decode_graph::register(
+                    &self.device,
+                    8,
+                    &[(2, decode_graph::Slot::Position)],
+                    decode_graph::Geometry::Fixed,
+                )?;
             }
 
             // 3. KV cache write.
@@ -7509,7 +7559,6 @@ impl CudaBackend {
             let qkv_dim_u32 = p.qkv_dim as u32;
             let qk_dim_u32 = p.qk_dim as u32;
             let kernel_size_u32 = p.conv_kernel_size as u32;
-            let buf_slots = (p.conv_kernel_size - 1) as u32;
             let batch_u32 = 1u32;
             let state_pos = gdn.conv_positions[gdn_idx];
 
@@ -7590,7 +7639,13 @@ impl CudaBackend {
                 .map_err(|e| {
                     RuntimeError::Compute(format!("GDN decode p123-fused L{layer_idx}: {e}"))
                 })?;
-                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+                decode_graph::register(
+                    &self.device,
+                    17,
+                    &[(16, decode_graph::Slot::Ring(gdn_idx))],
+                    decode_graph::Geometry::Fixed,
+                )?;
+                gdn.advance_conv_ring(gdn_idx);
             }
 
             // 1. ssm_conv1d_silu_prefill: conv1d + SiLU, advances conv_state.
@@ -7621,7 +7676,13 @@ impl CudaBackend {
                         "GDN decode-via-prefill conv1d_silu L{layer_idx}: {e}"
                     ))
                 })?;
-                gdn.conv_positions[gdn_idx] = (state_pos + batch_u32) % buf_slots;
+                decode_graph::register(
+                    &self.device,
+                    8,
+                    &[(6, decode_graph::Slot::Ring(gdn_idx))],
+                    decode_graph::Geometry::Fixed,
+                )?;
+                gdn.advance_conv_ring(gdn_idx);
             }
 
             // 2. gdn_compute_gates_batched: alpha/beta gates (-> alpha_buf/beta_buf).
@@ -7861,6 +7922,7 @@ impl CudaBackend {
                 })?;
             }
         } else if use_register_resident_phase4 {
+            decode_graph::refuse_in_capture("the register-resident GDN decode")?;
             // === TWO-LAUNCH PATH: Phase 1-3 + Phase 4 (2 launches; replaces megakernel) ===
             // F64-internal-accumulator variant for Phase 4 (decode path).
             // When `LUMEN_CUDA_GDN_F64_ACCUM=1`, replace the F32 lane-strided
@@ -8034,10 +8096,9 @@ impl CudaBackend {
             }
 
             // Advance circular buffer position.
-            let buf_slots = (p.conv_kernel_size - 1) as u32;
-
-            gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
+            gdn.advance_conv_ring(gdn_idx);
         } else if let Some(ref mega_fn_f32) = st.kernels.gdn_decode_megakernel {
+            decode_graph::refuse_in_capture("the GDN decode megakernel")?;
             // === FUSED PATH: 8 launches -> 2 ===
             // Kernel 1 (gdn_decode_megakernel): conv1d+silu, gates, L2 norm, state update.
             //
@@ -8186,9 +8247,9 @@ impl CudaBackend {
             }
 
             // Advance circular buffer position (host-scalar path).
-            let buf_slots = (p.conv_kernel_size - 1) as u32;
-            gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
+            gdn.advance_conv_ring(gdn_idx);
         } else {
+            decode_graph::refuse_in_capture("the unfused GDN decode")?;
             // === UNFUSED FALLBACK PATH ===
             // Step 3a: Conv1D decode
             {
@@ -8220,8 +8281,7 @@ impl CudaBackend {
                 }
                 .map_err(|e| RuntimeError::Compute(format!("GDN conv1d L{layer_idx}: {e}")))?;
 
-                let buf_slots = (p.conv_kernel_size - 1) as u32;
-                gdn.conv_positions[gdn_idx] = (state_pos + 1) % buf_slots;
+                gdn.advance_conv_ring(gdn_idx);
             }
 
             // Step 3b: SiLU activation on conv output
@@ -12583,16 +12643,19 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Normal (non-graph) decode path. Used for first token and as fallback.
-    fn decode_token_normal(
+    /// Enqueue one decode token: the embedding, every layer with its commit
+    /// copy, the final norm and head, and the argmax. Launches and device
+    /// copies only, the same for both decode paths and for the decode graph's
+    /// capture; each layer advances the host counters its launches consume
+    /// (its KV length, its GDN conv ring) as it goes.
+    fn enqueue_decode_token(
         &self,
         token_id: u32,
         seq_pos: usize,
         num_layers: usize,
-        hp: &ModelHyperparams,
+        vocab: u32,
         st: &mut MutableState,
-        kv: &mut crate::kv::KvCache,
-    ) -> Result<Logits, RuntimeError> {
+    ) -> Result<(), RuntimeError> {
         if let Some(p) = st.profiler.as_mut() {
             p.begin(
                 "embed",
@@ -12606,13 +12669,11 @@ impl CudaBackend {
         }
         for layer in 0..num_layers {
             let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
-            // FIX-DTOD: For DENSE layers, dense FFN writes to a separate
-            // buffer (attn_proj) and we propagate the post-FFN residual to x_gpu
-            // here. For MoE layers, `encode_moe_ffn_decode` writes the MoE FFN
-            // output IN-PLACE to st.scratch.x_gpu; the unconditional dtod
-            // OVERWROTE that output with the stale pre-FFN attn+residual,
-            // destroying the MoE contribution every layer, every token. Gate
-            // on moe_meta_cache to skip the dtod for MoE layers.
+            // Commit the layer result per the typed contract: NeedsCommit
+            // means the post-FFN state is in `attn_proj` (dense layers whose
+            // down route did not fold the residual); InPlace covers both the
+            // direct-residual fold and the MoE FFN, which write `x_gpu`
+            // themselves.
             if layer_out == LayerOutput::NeedsCommit {
                 self.device
                     .stream
@@ -12628,9 +12689,162 @@ impl CudaBackend {
             );
         }
         self.compute_final_gpu(st)?;
-        {
-            let vocab = hp.vocab_size;
-            self.launch_argmax(st, vocab)?;
+        self.launch_argmax(st, vocab)
+    }
+
+    /// Capture the decode graph at load, or say why decode stays eager. The
+    /// capture enqueues a token at the current position without running it;
+    /// the host counters the enqueue advances are put back whatever it ends in.
+    fn capture_decode_graph(
+        &self,
+        st: &mut MutableState,
+        num_layers: usize,
+        vocab: u32,
+        kquant_planes: bool,
+    ) -> Result<DecodeGraph, String> {
+        if !crate::runtime_defaults::cuda_graph_enabled() {
+            return Err("LUMEN_CUDA_GRAPH=0".into());
+        }
+        if st.has_moe_layers {
+            return Err("MoE layers".into());
+        }
+        if st.kv_precision == KvPrecision::F16 {
+            return Err("F16 KV cache".into());
+        }
+        if kquant_planes {
+            return Err("K-quant planes".into());
+        }
+        if st.profiler.is_some() {
+            return Err("LUMEN_CUDA_PROFILE".into());
+        }
+        // The decode diagnostics key their output on the decode ordinal, which a
+        // replay never reads.
+        if moe_probe_enabled() {
+            return Err("LUMEN_MOE_PROBE".into());
+        }
+        if std::env::var("LUMEN_XCHK").as_deref() == Ok("1") {
+            return Err("LUMEN_XCHK".into());
+        }
+        // Without a bound workspace cuBLAS allocates its own, which a capture refuses.
+        if st.cublas_workspace.is_none() {
+            return Err("no bound cuBLAS workspace".into());
+        }
+        let kv_lens: Vec<Option<usize>> = st
+            .kv_caches
+            .iter()
+            .map(|c| c.as_ref().map(KvCacheGpu::seq_len))
+            .collect();
+        let seq_pos = kv_lens.iter().flatten().next().copied().unwrap_or(0);
+        let rings = st
+            .gdn_scratch_gpu
+            .as_ref()
+            .map(|g| g.conv_positions.clone());
+        let captured = DecodeGraph::capture(&self.device, || {
+            self.enqueue_decode_token(0, seq_pos, num_layers, vocab, st)
+        });
+        for (cache, len) in st.kv_caches.iter_mut().zip(kv_lens) {
+            if let (Some(cache), Some(len)) = (cache.as_mut(), len) {
+                cache.reset();
+                cache.advance_seq_len_by(len);
+            }
+        }
+        if let (Some(gdn), Some(rings)) = (st.gdn_scratch_gpu.as_mut(), rings) {
+            gdn.conv_positions = rings;
+        }
+        captured.map_err(|e| e.to_string())
+    }
+
+    /// One token through the decode graph, in place of `enqueue_decode_token`:
+    /// the eager path's refusals first (token id, every KV cache's room, the
+    /// sequence's room), with nothing launched or advanced when one refuses;
+    /// then the token's values written into the graph, the replay, and the
+    /// host counters the eager enqueue advances, in layer order.
+    fn launch_decode_graph(
+        &self,
+        token_id: u32,
+        seq_pos: usize,
+        num_layers: usize,
+        hp: &ModelHyperparams,
+        st: &mut MutableState,
+        kv: &crate::kv::KvCache,
+    ) -> Result<(), RuntimeError> {
+        self.check_token_id(token_id)?;
+        let mut attention = false;
+        for cache in st.kv_caches.iter().flatten() {
+            cache.ensure_room()?;
+            // The fused prep takes its position from the cache, the unfused
+            // RoPE from the sequence; the graph writes one value to both.
+            if cache.seq_len() != seq_pos {
+                return Err(RuntimeError::Compute(format!(
+                    "decode graph: a KV cache holds {} positions at sequence position {seq_pos}",
+                    cache.seq_len()
+                )));
+            }
+            attention = true;
+        }
+        kv.ensure_room()?;
+        let (splits, partition) = if attention {
+            let launch = super::attention_decode::admit(
+                &st.kernels,
+                &st.scratch.attn_scratch,
+                hp.num_heads,
+                hp.num_kv_heads,
+                hp.head_dim,
+                seq_pos as u32 + 1,
+            )?;
+            (launch.chunks, launch.partition)
+        } else {
+            (0, 0)
+        };
+        let plan = DecodePlan {
+            token: token_id,
+            position: seq_pos as u32,
+            splits,
+            partition,
+            rings: st
+                .gdn_scratch_gpu
+                .as_ref()
+                .map_or(&[], |g| g.conv_positions.as_slice()),
+        };
+        st.decode_graph
+            .as_mut()
+            .expect("launch_decode_graph runs with a captured graph")
+            .launch(&self.device, &plan)?;
+        for layer in 0..num_layers {
+            if let Some(cache) = st.kv_caches[layer].as_mut() {
+                cache.advance_seq_len_by(1);
+            }
+            if let Some(gdn) = st.gdn_scratch_gpu.as_mut() {
+                if let Some(gdn_idx) = gdn.gdn_layer_map[layer] {
+                    gdn.advance_conv_ring(gdn_idx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a token replays the decode graph: one was captured, and no BF16
+    /// cuBLAS failure has since routed the BF16 matvecs to the legacy kernel
+    /// for the backend's lifetime, a route the graph does not hold.
+    fn replays_decode_graph(st: &MutableState) -> bool {
+        st.decode_graph.is_some() && !BF16_GEMMEX_FALLBACK_ARMED.load(Ordering::Relaxed)
+    }
+
+    /// Decode one token, through the decode graph when one was captured, and
+    /// read back its logits.
+    fn decode_token_logits(
+        &self,
+        token_id: u32,
+        seq_pos: usize,
+        num_layers: usize,
+        hp: &ModelHyperparams,
+        st: &mut MutableState,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<Logits, RuntimeError> {
+        if Self::replays_decode_graph(st) {
+            self.launch_decode_graph(token_id, seq_pos, num_layers, hp, st, kv)?;
+        } else {
+            self.enqueue_decode_token(token_id, seq_pos, num_layers, hp.vocab_size, st)?;
         }
         // Full real-logits readback (see `decode_token` for the full
         // rationale). Was a one-hot synthesis that destroyed the
@@ -12688,18 +12902,16 @@ impl CudaBackend {
         Ok(Logits { data: logits_host })
     }
 
-    /// GPU-side greedy decode (normal / non-graph path) returning the token id
-    /// directly. Runs the IDENTICAL compute pipeline as `decode_token_normal`
-    /// (embed -> per-layer -> final projection -> on-GPU `argmax_f32`), in the
-    /// same kernel order with the same per-layer dtod propagation, so the
-    /// selected token is bit-identical to `argmax(decode_token(..).data)`. The
-    /// only difference is the readback: instead of copying the full vocab logits
-    /// to the host (~vocab*4 bytes) and running CPU argmax, it copies back ONLY
-    /// the 4-byte argmax index the kernel already wrote into `st.argmax_result`.
-    /// That removes the per-token full-vocab D2H copy + the host-side argmax scan
-    /// from the greedy decode loop. Advances `kv.seq_len()` and the decode
-    /// counter internally (matching the `decode_token_greedy` trait contract).
-    fn decode_token_greedy_normal(
+    /// Greedy decode returning the token id directly. Runs the same pipeline as
+    /// `decode_token_logits` (embed -> per-layer -> final projection -> on-GPU
+    /// `argmax_f32`), so the selected token is bit-identical to
+    /// `argmax(decode_token(..).data)`. The only difference is the readback:
+    /// instead of copying the full vocab logits to the host (~vocab*4 bytes)
+    /// and running CPU argmax, it copies back ONLY the 4-byte argmax index the
+    /// kernel already wrote into `st.argmax_result`. Advances `kv.seq_len()` and
+    /// the decode counter internally (matching the `decode_token_greedy` trait
+    /// contract).
+    fn decode_token_greedy_argmax(
         &self,
         token_id: u32,
         seq_pos: usize,
@@ -12708,42 +12920,10 @@ impl CudaBackend {
         st: &mut MutableState,
         kv: &mut crate::kv::KvCache,
     ) -> Result<u32, RuntimeError> {
-        if let Some(p) = st.profiler.as_mut() {
-            p.begin(
-                "embed",
-                super::profiler::LayerType::Whole,
-                &self.device.stream,
-            );
-        }
-        self.embed_token_gpu(token_id, st)?;
-        if let Some(p) = st.profiler.as_mut() {
-            p.end("embed", &self.device.stream);
-        }
-        for layer in 0..num_layers {
-            let layer_out = self.compute_layer_gpu(layer, seq_pos, st)?;
-            // Commit the layer result per the typed contract: NeedsCommit
-            // means the post-FFN state is in `attn_proj` (dense layers whose
-            // down route did not fold the residual); InPlace covers both the
-            // direct-residual fold and the MoE FFN, which write `x_gpu`
-            // themselves.
-            if layer_out == LayerOutput::NeedsCommit {
-                self.device
-                    .stream
-                    .memcpy_dtod(&st.scratch.attn_proj, &mut st.scratch.x_gpu)
-                    .map_err(|e| RuntimeError::Compute(format!("dtod x_gpu<-attn_proj: {e}")))?;
-            }
-        }
-        if let Some(p) = st.profiler.as_mut() {
-            p.begin(
-                "final_argmax",
-                super::profiler::LayerType::Whole,
-                &self.device.stream,
-            );
-        }
-        self.compute_final_gpu(st)?;
-        {
-            let vocab = hp.vocab_size;
-            self.launch_argmax(st, vocab)?;
+        if Self::replays_decode_graph(st) {
+            self.launch_decode_graph(token_id, seq_pos, num_layers, hp, st, kv)?;
+        } else {
+            self.enqueue_decode_token(token_id, seq_pos, num_layers, hp.vocab_size, st)?;
         }
         // Sync is still required to make the argmax index host-visible, but we
         // copy back only the single u32 the kernel wrote -- NOT the full vocab.
@@ -18137,6 +18317,7 @@ unsafe fn launch_bf16_matvec_with_fallback(
         )? {
             Bf16LaunchOutcome::Success => return Ok(Bf16MatvecRoute::HgemvBf16),
             Bf16LaunchOutcome::CublasFailure(status) => {
+                super::decode_graph::refuse_in_capture("a failed cublasGemmEx BF16")?;
                 arm_bf16_gemmex_runtime_fallback(label, status);
                 // fall through to the legacy launch below
             }
@@ -18231,6 +18412,7 @@ unsafe fn launch_bf16_matvec_residual_with_fallback(
         )? {
             Bf16LaunchOutcome::Success => return Ok(()),
             Bf16LaunchOutcome::CublasFailure(status) => {
+                super::decode_graph::refuse_in_capture("a failed cublasGemmEx BF16")?;
                 arm_bf16_gemmex_runtime_fallback(label, status);
                 // fall through to the legacy launch below
             }
@@ -18534,6 +18716,8 @@ unsafe fn launch_hgemv_f16_batched(
     }
 
     // Upload pointer arrays to pre-allocated device buffers (24 bytes max).
+    // A capture would record copies from these stack arrays.
+    super::decode_graph::refuse_in_capture("the batched HGEMV pointer upload")?;
     device
         .stream
         .memcpy_htod(&host_a[..batch_count], dev_a_ptrs)
@@ -20120,6 +20304,7 @@ impl ComputeBackend for CudaBackend {
             has_gdn_layers: false,
             has_moe_layers: false,
             decode_token_count: 0,
+            decode_graph: None,
             gdn_scratch_gpu: None,
             prefill_workspace: None,
             prefill_layout: None,
@@ -20127,7 +20312,7 @@ impl ComputeBackend for CudaBackend {
             unshared_prefill_workspace: false,
             native_prefill: None,
             native_prefill_refusal: None,
-            _cublas_workspace: cublas_workspace,
+            cublas_workspace,
             precomputed_ptrs: None,
             algo_cache: AlgoCache::new(),
             moe_scratch,
@@ -21512,6 +21697,11 @@ impl ComputeBackend for CudaBackend {
                     kv_cache.reset();
                 }
                 st.decode_token_count = 0;
+                if super::decode::cuda_verbose() {
+                    if let Some(graph) = st.decode_graph.as_ref() {
+                        eprintln!("[CUDA] decode graph: {} launches", graph.launches());
+                    }
+                }
                 if let Some(counter) = st.kv16_overflow.as_mut() {
                     let _ = self.device.stream.memset_zeros(counter);
                 }
@@ -21721,6 +21911,8 @@ impl ComputeBackend for CudaBackend {
                 "CUDA backend not initialized: call init() before preload_weights".into(),
             )
         })?;
+        // A graph from an earlier load holds the buffers this one replaces.
+        st.decode_graph = None;
 
         let mut cache = Vec::with_capacity(num_layers);
         // Does this artifact CARRY an as-stored K-quant plane? Taken on the layer views
@@ -23052,6 +23244,19 @@ impl ComputeBackend for CudaBackend {
                 )?);
             }
         }
+
+        // Last, once every buffer a decode token reads or writes is in place: the graph keeps
+        // their addresses for the backend's lifetime.
+        match self.capture_decode_graph(st, num_layers, hp_copy.vocab_size, kquant_planes) {
+            Ok(graph) => {
+                let (nodes, per_token) = graph.node_counts()?;
+                eprintln!(
+                    "[CUDA] decode graph: live ({nodes} nodes, {per_token} with per-token arguments)"
+                );
+                st.decode_graph = Some(graph);
+            }
+            Err(why) => eprintln!("[CUDA] decode graph: eager ({why})"),
+        }
         Ok(())
     }
 
@@ -23059,8 +23264,8 @@ impl ComputeBackend for CudaBackend {
     ///
     /// Active only when the engine selects the greedy fast path, which requires
     /// `caps().gpu_argmax == true` -- i.e. weights preloaded AND
-    /// `LUMEN_CUDA_GPU_SAMPLE=1`. Runs the same non-graph compute pipeline as the
-    /// first-token / GDN `decode_token` path and reads back only the on-GPU
+    /// `LUMEN_CUDA_GPU_SAMPLE=1`. Runs the same compute pipeline as the
+    /// `decode_token` path and reads back only the on-GPU
     /// argmax index, eliminating the per-token full-vocab logits D2H copy and the
     /// host-side argmax. Advances `kv.seq_len()` internally (the caller must NOT
     /// call `advance_seq_len`). Falls back with an explicit error if weights are
@@ -23089,7 +23294,7 @@ impl ComputeBackend for CudaBackend {
             ));
         }
 
-        self.decode_token_greedy_normal(token_id, seq_pos, num_layers, hp, st, kv)
+        self.decode_token_greedy_argmax(token_id, seq_pos, num_layers, hp, st, kv)
     }
 
     fn decode_token(
@@ -23114,10 +23319,7 @@ impl ComputeBackend for CudaBackend {
             ));
         }
 
-        // CUDA graph capture removed (condor/tern/harrier/osprey all NO-GO):
-        // the sampling decode path runs the eager pipeline, identical to the
-        // greedy path, via `decode_token_normal`.
-        self.decode_token_normal(token_id, seq_pos, num_layers, hp, st, kv)
+        self.decode_token_logits(token_id, seq_pos, num_layers, hp, st, kv)
     }
 }
 

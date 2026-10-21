@@ -519,3 +519,91 @@ fn bf16_warning_emitted_exactly_once_across_repeated_failures() {
     // runs the closure at most once for the entire process
     // lifetime).
 }
+
+/// A BF16 cuBLAS failure after the decode graph was captured routes the
+/// eager BF16 matvecs to the legacy kernel for the backend's lifetime, a
+/// route the graph does not hold: decode stops replaying the graph.
+#[test]
+fn decode_stops_replaying_the_graph_once_the_bf16_fallback_arms() {
+    use lumen_format::test_model::{generate_test_model, TestModelConfig};
+    use lumen_runtime::kv::{KvCache, KvCacheConfig, KvPrecision};
+    use lumen_runtime::weight::provider_sync::SyncWeightProvider;
+
+    let _g = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    if !lumen_runtime::runtime_defaults::cuda_graph_enabled() {
+        eprintln!("skipping: LUMEN_CUDA_GRAPH=0");
+        return;
+    }
+    let Some(mut backend) = try_cuda_backend() else {
+        eprintln!("skipping: no CUDA device available");
+        return;
+    };
+    reset_bf16_gemmex_state_for_tests();
+    let config = TestModelConfig {
+        num_layers: 2,
+        num_heads: 2,
+        num_kv_heads: 2,
+        head_dim: 128,
+        hidden_dim: 32,
+        intermediate_dim: 64,
+        vocab_size: 256,
+        max_seq_len: 128,
+        seed: 5,
+    };
+    let dir = std::env::temp_dir().join(format!("lumen_bf16_graph_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test_model.lbc");
+    std::fs::write(&path, generate_test_model(&config)).unwrap();
+    let provider = SyncWeightProvider::open(&path).unwrap();
+    let hp = provider.lbc().header.hyperparams;
+    backend.set_global_tensors(
+        provider.embedding.clone(),
+        provider.final_norm.clone(),
+        provider.output_proj.clone(),
+    );
+    backend.init(&hp).expect("init");
+    backend.preload_weights(&provider).expect("preload");
+    let mut kv = KvCache::new(KvCacheConfig {
+        max_seq_len: hp.max_seq_len as usize,
+        num_layers: hp.num_layers as usize,
+        num_kv_heads: hp.num_kv_heads as usize,
+        head_dim: hp.head_dim as usize,
+        precision: KvPrecision::F32,
+    })
+    .expect("kv");
+
+    let mut token = 1u32;
+    for _ in 0..2 {
+        token = backend
+            .decode_token_greedy(token, &provider, &mut kv)
+            .expect("decode");
+    }
+    assert_eq!(backend.decode_graph_launches(), 2, "the decode graph ran");
+
+    let weight_bf16 = f32_to_bf16_bytes(&[0.5f32; 16 * 32]);
+    inject_next_bf16_cublas_failure();
+    backend
+        .dispatch_bf16_matvec_for_tests(
+            &weight_bf16,
+            &[1.0f32; 16],
+            32,
+            16,
+            None,
+            "fallback_after_capture",
+        )
+        .expect("the matvec survives the injected failure");
+    assert!(bf16_gemmex_fallback_armed_for_tests());
+
+    for _ in 0..2 {
+        token = backend
+            .decode_token_greedy(token, &provider, &mut kv)
+            .expect("decode after the fallback armed");
+    }
+    assert_eq!(
+        backend.decode_graph_launches(),
+        2,
+        "decode replayed the graph after the BF16 fallback armed"
+    );
+    reset_bf16_gemmex_state_for_tests();
+    let _ = std::fs::remove_dir_all(&dir);
+}

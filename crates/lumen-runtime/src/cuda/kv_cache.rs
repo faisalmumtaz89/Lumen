@@ -17,6 +17,7 @@ use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, LaunchConfig as CudarcLaunchConfig, PushKernelArg,
 };
 
+use super::decode_graph::{register, Geometry, Slot};
 use super::ffi::CudaDevice;
 use super::shaders::{KV_CACHE_16_KERNEL_SOURCE, KV_CACHE_KERNEL_SOURCE};
 use super::types::LaunchConfig;
@@ -231,12 +232,7 @@ impl KvCacheGpu {
         v_data: &CudaSlice<f32>,
         overflow: Option<&mut CudaSlice<u32>>,
     ) -> Result<(), RuntimeError> {
-        if self.seq_len >= self.max_seq_len {
-            return Err(RuntimeError::KvCache(format!(
-                "KV cache full: seq_len={} >= max_seq_len={}",
-                self.seq_len, self.max_seq_len,
-            )));
-        }
+        self.ensure_room()?;
 
         let pos = self.seq_len as u32;
         let num_kv_heads = self.num_kv_heads as u32;
@@ -269,6 +265,7 @@ impl KvCacheGpu {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("kv_cache_write {which} launch: {e}"))
                     })?;
+                    register(device, 6, &[(2, Slot::Position)], Geometry::Fixed)?;
                 }
             }
             KvStore::F16 { k, v } | KvStore::Bf16 { k, v } => {
@@ -294,11 +291,23 @@ impl KvCacheGpu {
                     .map_err(|e| {
                         RuntimeError::Compute(format!("16-bit kv_cache_write {which} launch: {e}"))
                     })?;
+                    register(device, 7, &[(3, Slot::Position)], Geometry::Fixed)?;
                 }
             }
         }
 
-        self.seq_len += 1;
+        self.advance_seq_len_by(1);
+        Ok(())
+    }
+
+    /// Refuse a token when the cache has no position left for it.
+    pub fn ensure_room(&self) -> Result<(), RuntimeError> {
+        if self.seq_len >= self.max_seq_len {
+            return Err(RuntimeError::KvCache(format!(
+                "KV cache full: seq_len={} >= max_seq_len={}",
+                self.seq_len, self.max_seq_len,
+            )));
+        }
         Ok(())
     }
 
