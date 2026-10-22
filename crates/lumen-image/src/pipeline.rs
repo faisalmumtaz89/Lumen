@@ -671,8 +671,9 @@ pub struct GpuResident {
     decode_needs_room: Option<usize>,
     /// The text encoder's first layers, kept between generations.
     text_layers: ResidentLayers,
-    /// Per image size, the longest prompt measured and the device bytes its
-    /// denoising and decoding took above what was allocated when they began.
+    /// Per image size, the longest prompt measured and the most device bytes
+    /// the denoising and decoding of that prompt or a shorter one measured
+    /// before it took above what was allocated when they began.
     room: HashMap<(usize, usize), (usize, usize)>,
     /// Per image size, the bands its decode last needed to fit.
     decode_bands: HashMap<(usize, usize), usize>,
