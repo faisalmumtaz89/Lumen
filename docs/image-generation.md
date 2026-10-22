@@ -104,7 +104,7 @@ curl http://localhost:8000/v1/images/generations \
 | `model` | the served image model id | must match `LUMEN_IMAGE_MODEL_ID` when given |
 | `prompt` | required | up to 8 KiB |
 | `size` | `1024x1024` | `WxH`, each side 32–4096; sides round down to a multiple of 32 |
-| `num_inference_steps` | `40` | 1–200 |
+| `num_inference_steps` | `40` | 2–200 |
 | `seed` | `42` | any `u64` |
 | `true_cfg_scale` | `1.0` | must be `1.0`: one conditional pass per step, no negative prompt |
 | `n` | `1` | must be `1`: one image per request |

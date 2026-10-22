@@ -251,6 +251,11 @@ pub const MIN_SIDE: usize = 32;
 /// answering.
 pub const MAX_SIDE: usize = 4096;
 
+/// The fewest denoising steps a request may ask for: with one step the
+/// schedule's terminal stretch divides zero by zero (the reference's own
+/// one-step schedule is `[NaN, 0]`), so no image is defined.
+pub const MIN_STEPS: usize = 2;
+
 /// The most denoising steps a request may ask for.
 ///
 /// Each step is a full forward pass, so this bounds the request's duration
@@ -286,10 +291,12 @@ pub fn parse_size(size: &str) -> Result<(usize, usize), String> {
     Ok((w, h))
 }
 
-/// Whether a step count is within 1..=[`MAX_STEPS`].
+/// Whether a step count is within [`MIN_STEPS`]..=[`MAX_STEPS`].
 pub fn check_steps(steps: usize) -> Result<(), String> {
-    if steps == 0 {
-        return Err("num_inference_steps must be at least 1".to_string());
+    if steps < MIN_STEPS {
+        return Err(format!(
+            "num_inference_steps must be at least {MIN_STEPS}: one step leaves the schedule undefined"
+        ));
     }
     if steps > MAX_STEPS {
         return Err(format!(
@@ -1244,9 +1251,10 @@ mod request_limit_tests {
         assert!(parse_size("-1024x1024")
             .unwrap_err()
             .contains("not a number"));
-        assert_eq!(check_steps(1), Ok(()));
+        assert_eq!(check_steps(2), Ok(()));
         assert_eq!(check_steps(200), Ok(()));
-        assert!(check_steps(0).unwrap_err().contains("at least 1"));
+        assert!(check_steps(1).unwrap_err().contains("at least 2"));
+        assert!(check_steps(0).unwrap_err().contains("at least 2"));
         assert!(check_steps(201).unwrap_err().contains("maximum"));
     }
 }
