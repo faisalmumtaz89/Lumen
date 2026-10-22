@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **Image generation is faster.** The CUDA memory pool handed the memory freed during a generation back to the
+  driver at every synchronize, several times per denoising step, and mapped it again for the next allocations,
+  including the gigabytes the VAE decode takes. The pool now keeps that memory from the first denoising step to the
+  end of the decode and is trimmed afterwards, so an idle server holds no more device memory than before.
+  Qwen-Image-2.1 on an RTX 5090, 1024x1024, 40 steps: 15.50 -> 15.28 s per image (median of three alternated
+  rounds of ten prompts); images are byte-identical.
+
 ### Fixed
 
 - **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
