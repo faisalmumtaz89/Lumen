@@ -1541,7 +1541,7 @@ fn image_config(
                 lbi_dir.display(),
                 checkpoint_dir.display(),
                 if settings.use_gpu {
-                    "; the CUDA device must have the memory a 2048x2048 generation uses"
+                    "; the CUDA device must have the memory a 4096x4096 generation uses"
                 } else {
                     ""
                 }
