@@ -484,10 +484,12 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
-/// The most device memory a generation needs, in bytes: 24,142 MiB, measured
-/// as the device's used memory while the image server denoises a 4096x4096
-/// image, the largest size a request may ask for, with an 8,192-byte prompt,
-/// the longest it may send, on an RTX 5090 with a 10 ms `nvidia-smi` sampler.
+/// The most device memory a generation needs, in bytes: 24,144 MiB, the
+/// highest of seven measurements of the device's used memory while the image
+/// server denoises a 4096x4096 image, the largest size a request may ask for,
+/// with an 8,192-byte prompt, the longest it may send, on an RTX 5090 with a
+/// 10 ms `nvidia-smi` sampler: each was 23,915 MiB above the idle device, which
+/// used 227-229 MiB.
 /// The server keeps the VAE loaded while it denoises; [`generate_gpu`], which
 /// loads one component at a time, peaks at 23,666 MiB there (21,672 MiB of live
 /// allocations at once and 1,437 MiB of context, kernels and cuBLAS workspaces
@@ -497,7 +499,7 @@ pub const GPU_DEVICE: usize = 0;
 /// decoding go higher beside the resident transformer, but release it and run
 /// again when they run out; denoising cannot, so a device with less total
 /// memory could fail such a request, and the startup check refuses it instead.
-pub const PEAK_DEVICE_BYTES: u64 = 24_142 << 20;
+pub const PEAK_DEVICE_BYTES: u64 = 24_144 << 20;
 
 /// The compute capability the GPU pipeline needs: the text tower's flash
 /// attention and the VAE's convolutions are built for it.
