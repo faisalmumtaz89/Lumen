@@ -436,7 +436,10 @@ mod tests {
             .contains("not WxH"));
         assert!(parse(&["A", "--steps", "0"])
             .unwrap_err()
-            .contains("at least 1"));
+            .contains("at least 2"));
+        assert!(parse(&["A", "--steps", "1"])
+            .unwrap_err()
+            .contains("at least 2"));
         assert!(parse(&["A", "--steps", "201"])
             .unwrap_err()
             .contains("maximum"));

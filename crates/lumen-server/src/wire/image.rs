@@ -147,6 +147,8 @@ mod tests {
         );
         assert!(mk("32x32", 8).dimensions().is_ok(), "one latent tile");
         assert!(mk("512x512", 0).check_steps().is_err(), "zero steps");
+        assert!(mk("512x512", 1).check_steps().is_err(), "one step");
+        assert!(mk("512x512", 2).check_steps().is_ok(), "at the step floor");
         assert!(
             mk("512x512", 201).check_steps().is_err(),
             "past the step cap"

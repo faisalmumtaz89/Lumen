@@ -89,7 +89,7 @@ OPTIONS:
                           directory, never overwriting a file already there)
     --size <WxH>          Image size, each side 32 to 4096 pixels, rounded down to a
                           multiple of 32 (default: 1024x1024)
-    --steps <n>           Denoising steps, 1 to 200 (default: 40)
+    --steps <n>           Denoising steps, 2 to 200 (default: 40)
     --seed <n>            Seed; the same prompt, size, steps and seed give the same
                           picture (default: random)
     -h, --help            Print this help message
