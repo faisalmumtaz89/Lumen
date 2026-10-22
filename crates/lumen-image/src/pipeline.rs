@@ -643,9 +643,10 @@ impl GpuSources {
 /// more), and how much room a generation needs depends on its size. The first
 /// generation of a size keeps no text layers, and the device memory its
 /// denoising and decoding use above that point is recorded (the peak of the
-/// memory pool they allocate from). Later generations of that size, with a
-/// prompt no longer than the recorded one, keep as many layers from the first
-/// as leave that much free plus [`RESIDENT_TEXT_MARGIN`], and load only the
+/// memory pool they allocate from). Later generations of that size keep as
+/// many layers from the first as leave that much free plus
+/// [`RESIDENT_TEXT_MARGIN`], a longer prompt than the recorded one that much
+/// more in proportion to its text rows ([`room_for`]), and load only the
 /// rest. A denoising or decoding step that still runs out of memory drops the
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
@@ -717,8 +718,8 @@ impl GpuResident {
         let room = self
             .room
             .get(&size)
-            .filter(|&&(tokens, _)| self.dit.is_some() && ids.len() <= tokens)
-            .map(|&(_, bytes)| bytes);
+            .filter(|_| self.dit.is_some())
+            .and_then(|&(tokens, bytes)| room_for(bytes, tokens, ids.len()));
         let resident = std::mem::take(&mut self.text_layers);
         let (text, kept) = match encode_prompt_gpu(&self.sources, &self.dev, &ids, resident, room) {
             Ok(encoded) => encoded,
@@ -835,6 +836,25 @@ fn out_of_memory(text: &str) -> bool {
 #[cfg(feature = "cuda")]
 fn is_out_of_memory(e: &PipelineError) -> bool {
     out_of_memory(&format!("{e}"))
+}
+
+/// The room a generation of `tokens` prompt ids needs at a size where one of
+/// `measured` ids took `bytes`: the same for a prompt no longer, otherwise
+/// scaled by the ratio of their text rows (the ids after the stripped system
+/// prefix), rounded up. Every allocation of a generation at a fixed size grows
+/// at most linearly in its text rows, so the ratio bounds the longer prompt's
+/// need; a measurement without text rows bounds no longer prompt.
+#[cfg(feature = "cuda")]
+fn room_for(bytes: usize, measured: usize, tokens: usize) -> Option<usize> {
+    let text_rows = |ids: usize| ids.saturating_sub(SYSTEM_PREFIX_TOKENS) as u128;
+    let (measured, tokens) = (text_rows(measured), text_rows(tokens));
+    if tokens <= measured {
+        return Some(bytes);
+    }
+    if measured == 0 {
+        return None;
+    }
+    usize::try_from((bytes as u128 * tokens).div_ceil(measured)).ok()
 }
 
 /// The smaller of a remembered threshold and a new one.
@@ -1096,6 +1116,31 @@ mod request_limit_tests {
         assert_eq!(check_steps(200), Ok(()));
         assert!(check_steps(0).unwrap_err().contains("at least 1"));
         assert!(check_steps(201).unwrap_err().contains("maximum"));
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod room_tests {
+    use super::{room_for, SYSTEM_PREFIX_TOKENS};
+
+    /// A prompt no longer than the measured one needs the measured room; a
+    /// longer one that room times the ratio of text rows, rounded up; a
+    /// measurement without text rows covers no longer prompt.
+    #[test]
+    fn a_longer_prompt_needs_the_measured_room_scaled_by_its_text_rows() {
+        let p = SYSTEM_PREFIX_TOKENS;
+        assert_eq!(room_for(1000, p + 26, p + 26), Some(1000));
+        assert_eq!(room_for(1000, p + 26, p + 3), Some(1000));
+        assert_eq!(room_for(1000, p + 26, p + 28), Some(1077));
+        assert_eq!(room_for(1000, p + 20, p + 40), Some(2000));
+        assert_eq!(
+            room_for(3 << 30, p + 26, p + 300),
+            Some(((3u128 << 30) * 300).div_ceil(26) as usize)
+        );
+        assert_eq!(room_for(1000, p, p), Some(1000));
+        assert_eq!(room_for(1000, p, p + 1), None);
+        assert_eq!(room_for(1000, p - 2, p), Some(1000));
+        assert_eq!(room_for(usize::MAX, p + 1, p + 2), None);
     }
 }
 
