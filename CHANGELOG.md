@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.51.0] — 2026-10-22
+
 ### Changed
 
 - **Image generation is faster.** The CUDA memory pool handed the memory freed during a generation back to the
@@ -22,7 +24,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   from the reference's own bf16 decode of the same latents. On each image that is no further from it, and from the
   reference's f32 decode, than bf16 decoders that differ from the reference only in summation order, attention kernel
   or norm reduction are, give or take the spread between those decoders. Qwen-Image-2.1 on an RTX 5090,
-  server: decode 0.32 -> 0.16 s at 1024×1024 and 14.5 -> 0.64 s at 2048×2048; 1024×1024, 40 steps: 15.04 -> 14.60 s
+  server: decode 0.32 -> 0.16 s at 1024×1024 and 14.9 -> 0.67 s at 2048×2048; 1024×1024, 40 steps: 15.11 -> 14.70 s
   per image (median of three alternated rounds of ten prompts), partly because the smaller decode leaves room for all
   of the text encoder's layers to stay on the GPU.
 
@@ -2379,7 +2381,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.50.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.51.0...HEAD
+[0.51.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.1...v0.50.0
 [0.49.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.0...v0.49.1
 [0.49.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.48.5...v0.49.0
