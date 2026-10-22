@@ -31,7 +31,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 - **Image generation's startup memory check covers every size a request may ask for.** The minimum was the
   measured peak of a 2048×2048 generation, but a request may ask for 4096×4096, which peaks higher while denoising,
   so a device that passed the check could run out on such a request. It is now the measured peak of that size with
-  the longest prompt a request may send, while the server denoises it: 23.6 GiB (24,142 MiB on an RTX 5090), up from
+  the longest prompt a request may send, while the server denoises it: 23.6 GiB (24,144 MiB on an RTX 5090), up from
   21.0 GiB.
 - **An image request for one denoising step is refused up front.** With one step the schedule's terminal stretch
   divides zero by zero, in the reference too, so the image was computed from NaN latents. `num_inference_steps` and
