@@ -476,17 +476,20 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
-/// The most device memory a generation uses, in bytes: 23,666 MiB, measured
-/// as the device's used memory at the peak of a 4096x4096 generation, the
-/// largest size a request may ask for, with an 8,192-byte prompt, the longest
-/// it may send (reached while denoising; with a short prompt 4096x4096 peaks
-/// at 22,610 MiB, 2048x2048 at 16,402 MiB, 1024x1024 at 14,930 MiB), on an
-/// RTX 5090 with a 10 ms `nvidia-smi` sampler. Of it, 21,672 MiB are live
-/// allocations at once and 1,437 MiB the context, kernels and cuBLAS
-/// workspaces outside the memory pool; the rest is pool memory a generation
-/// keeps for reuse. A device with less total memory could fail such a request,
-/// so the startup check refuses it instead.
-pub const PEAK_DEVICE_BYTES: u64 = 23_666 << 20;
+/// The most device memory a generation needs, in bytes: 24,142 MiB, measured
+/// as the device's used memory while the image server denoises a 4096x4096
+/// image, the largest size a request may ask for, with an 8,192-byte prompt,
+/// the longest it may send, on an RTX 5090 with a 10 ms `nvidia-smi` sampler.
+/// The server keeps the VAE loaded while it denoises; [`generate_gpu`], which
+/// loads one component at a time, peaks at 23,666 MiB there (21,672 MiB of live
+/// allocations at once and 1,437 MiB of context, kernels and cuBLAS workspaces
+/// outside the memory pool; the rest is pool memory a generation keeps for
+/// reuse), and with a short prompt at 22,610 MiB for 4096x4096, 16,402 MiB for
+/// 2048x2048 and 14,930 MiB for 1024x1024. The server's prompt encoding and
+/// decoding go higher beside the resident transformer, but release it and run
+/// again when they run out; denoising cannot, so a device with less total
+/// memory could fail such a request, and the startup check refuses it instead.
+pub const PEAK_DEVICE_BYTES: u64 = 24_142 << 20;
 
 /// The compute capability the GPU pipeline needs: the text tower's flash
 /// attention and the VAE's convolutions are built for it.
@@ -1289,11 +1292,11 @@ mod device_facts_tests {
             "{err}"
         );
         assert!(
-            err.contains("23.1 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
+            err.contains("23.6 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
             "{err}"
         );
         assert!(
-            err.contains("at least 23.1 GiB") && err.contains("the device has 12.0 GiB"),
+            err.contains("at least 23.6 GiB") && err.contains("the device has 12.0 GiB"),
             "{err}"
         );
         assert!(err.contains("startup minimum"), "{err}");

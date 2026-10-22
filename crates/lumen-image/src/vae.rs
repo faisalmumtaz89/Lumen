@@ -1803,6 +1803,26 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A NaN or an infinity reaching the output is refused rather than
+    /// clamped into a pixel (`f32::max` would turn a NaN into -1).
+    #[test]
+    fn decode_refuses_a_non_finite_output() {
+        let path = scratch("nonfinite");
+        write_tiny_lbi(&path, None);
+        let decoder = VaeDecoder::load(&path).unwrap();
+        let (h, w) = (2usize, 3usize);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut latents = vec![0.1f32; 3 * h * w];
+            latents[4] = bad;
+            let err = decoder.decode(&latents, 1, h, w).unwrap_err();
+            assert!(
+                matches!(err, VaeError::NonFinite(n) if n > 0),
+                "{bad}: {err}"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn decode_rejects_a_wrongly_sized_latent() {
         let path = scratch("badlatent");

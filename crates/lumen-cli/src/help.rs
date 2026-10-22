@@ -79,7 +79,7 @@ USAGE:
     lumen image [OPTIONS] [--] \"<prompt>\"
 
 Makes one picture with Qwen-Image-2.1 and writes a PNG, on the first visible NVIDIA CUDA
-device, which needs at least 23.1 GiB of memory. The first run downloads and converts the
+device, which needs at least 23.6 GiB of memory. The first run downloads and converts the
 model (30.8 GiB kept; up to 78.0 GiB free while converting).
 A prompt that begins with `-` goes after `--`.
 

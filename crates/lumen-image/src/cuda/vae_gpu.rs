@@ -766,8 +766,9 @@ impl VaeGpu {
     }
 
     /// Decode latents `[batch, z_dim, 1, h, w]` to `[batch, out_channels, 1,
-    /// h * 16, w * 16]`, equal to [`crate::vae::VaeDecoder::decode`] on the same
-    /// inputs, including the clamp to `[-1, 1]`.
+    /// h * 16, w * 16]`, in the layout [`crate::vae::VaeDecoder::decode`]
+    /// returns and with the same clamp to `[-1, 1]`; that decoder computes in
+    /// f32, this one in bf16, so their values differ by the rounding.
     ///
     /// The temporal axis is folded away and stays folded, as in the reference:
     /// it is 1 at every point of a single-frame decode.
