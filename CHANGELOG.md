@@ -35,7 +35,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   21.0 GiB.
 - **An image request for one denoising step is refused up front.** With one step the schedule's terminal stretch
   divides zero by zero, in the reference too, so the image was computed from NaN latents. `num_inference_steps` and
-  `lumen image --steps` now take 2 to 200; one step is answered with a 400 naming the minimum.
+  `lumen image --steps` now take 2 to 200: the endpoint answers one step with a 400 naming the minimum, `lumen image`
+  refuses it before loading anything, and the generation functions refuse it whoever calls them.
 - **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
   keeps the text encoder's first layers on the GPU between generations, but a prompt even one token longer than
   the one it had measured made it free them all, so the next generation uploaded the encoder again. A longer prompt
