@@ -22,7 +22,12 @@ venv/bin/python oracle_dump.py --model /path/to/Qwen-Image-2.1 --out /path/to/or
 `oracle_dump.py` writes, per tag: `prompt_input_ids`, `prompt_attention_mask`,
 `encoder_hidden_states`, `encoder_hidden_states_mask`, `img_mask`, `dit_timestep`,
 `dit_inputs`, `dit_out_prefill`, `dit_out_decode`, `scheduler_sigmas`, `scheduler_timesteps`,
-`latents`, `vae_decode_input`, `vae_decode_output`, `raw_image`, `out_<tag>.png` and `init_noise` (also as
+`latents`, `vae_decode_input`, `vae_decode_output`, `vae_decode_input_bf16`, `vae_decode_output_bf16` (the same
+final latents denormalised and decoded with the autoencoder loaded in bf16, the precision of Lumen's GPU decoder),
+`vae_decode_bars` (`vae-check-gpu`'s bars: the largest relative L2 distance, from the bf16 decode and from the f32
+one, of a bf16 decoder that differs from the reference only in summation order, attention kernel or norm reduction,
+plus the spread of those distances),
+`raw_image`, `out_<tag>.png` and `init_noise` (also as
 `init_noise_<H>x<W>.npy`, which `generate --init-latents` accepts), plus `meta_<tag>.json`
 (prompt, seed, size, steps and tensor shapes) and, for `--tag main`, `environment.json`
 (checkpoint hashes and library versions). `oracle_common.py` holds the shared loader.

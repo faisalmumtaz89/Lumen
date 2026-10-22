@@ -6,6 +6,7 @@ so a later stage can be exercised with oracle-supplied inputs and its own error
 cannot hide behind upstream error.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -16,11 +17,81 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from oracle_common import component_dtypes, generate_noise, load_pipe
+from oracle_common import component_dtypes, generate_noise, latent_dims, load_pipe
 
 
 def np_save(path, t):
     np.save(path, t.detach().to(torch.float32).cpu().numpy())
+
+
+def bf16_variant_bars(vae, z, ref16, ref32):
+    """The bars `vae-check-gpu` holds Lumen's GPU decode to on this image, from
+    the bf16 decode `ref16` and from the f32 decode `ref32`: the largest distance
+    of a bf16 decoder that differs from `vae.decode` only in summation order
+    (convolutions summed as one GEMM or exactly, each keeping the bf16 output
+    and the separate bias add), attention kernel (SDPA's math kernel) or norm
+    reduction (in f64), plus the spread between the largest and the smallest of
+    those distances, since one more such decoder can land past the largest.
+    Relative L2 over every channel, the decode clamped to [-1, 1] as Lumen's
+    is."""
+    import torch.nn.functional as F
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    conv_forward, normalize = torch.nn.Conv2d._conv_forward, F.normalize
+    mode = {}
+
+    def conv(self, x, w, b):
+        if mode["conv"] is None or x.dtype != torch.bfloat16:
+            return conv_forward(self, x, w, b)
+        ph, pw = self.padding
+        if mode["conv"] == "exact":
+            tf32 = torch.backends.cudnn.allow_tf32
+            torch.backends.cudnn.allow_tf32 = False
+            try:
+                out = F.conv2d(x.float(), w.float(), None, 1, (ph, pw)).to(torch.bfloat16)
+            finally:
+                torch.backends.cudnn.allow_tf32 = tf32
+        else:
+            n, c, h, wd = x.shape
+            oc, _, kh, kw = w.shape
+            oh, ow = h + 2 * ph - kh + 1, wd + 2 * pw - kw + 1
+            wm = w.reshape(oc, -1)
+            out = torch.empty(n, oc, oh, ow, dtype=torch.bfloat16, device=x.device)
+            xp = F.pad(x, (pw, pw, ph, ph))
+            rows = max(1, (1 << 30) // (c * kh * kw * ow * 2))
+            for r0 in range(0, oh, rows):
+                r1 = min(oh, r0 + rows)
+                cols = F.unfold(xp[:, :, r0:r1 + kh - 1], (kh, kw))
+                out[:, :, r0:r1] = (wm @ cols).view(n, oc, r1 - r0, ow)
+        return out + b.view(1, -1, 1, 1) if b is not None else out
+
+    def norm(x, *a, **k):
+        if mode["f64"] and x.dtype == torch.float32:
+            return normalize(x.double(), *a, **k).float()
+        return normalize(x, *a, **k)
+
+    def rel(a, b):
+        return float(torch.linalg.norm((a - b).double()) / torch.linalg.norm(b.double()))
+
+    reduced = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.nn.Conv2d._conv_forward, F.normalize = conv, norm
+    d16, d32 = [], []
+    try:
+        for conv_mode, math_sdpa, f64 in (("gemm", False, False), ("exact", False, False),
+                                          (None, True, False), ("gemm", True, False),
+                                          ("exact", True, False), ("exact", True, True),
+                                          ("gemm", True, True)):
+            mode.update(conv=conv_mode, f64=f64)
+            backend = sdpa_kernel(SDPBackend.MATH) if math_sdpa else contextlib.nullcontext()
+            with torch.no_grad(), backend:
+                out = vae.decode(z, return_dict=False)[0].float().clamp(-1, 1)
+            d16.append(rel(out, ref16.float()))
+            d32.append(rel(out, ref32.float()))
+    finally:
+        torch.nn.Conv2d._conv_forward, F.normalize = conv_forward, normalize
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = reduced
+    return tuple(2 * max(d) - min(d) for d in (d16, d32))
 
 
 def sha256(path, chunk=1 << 20):
@@ -224,6 +295,28 @@ def main():
             torch.from_numpy(vae_in[0]))
     np_save(os.path.join(args.out, f"vae_decode_output_{args.tag}.npy"),
             torch.from_numpy(vae_out[0]))
+
+    # The same final latents decoded with the VAE loaded in bf16, the precision
+    # Lumen's GPU decoder and SGLang run it at: the pipeline's own unpack, cast
+    # to the VAE's dtype, `* std + mean` in that dtype, then `vae.decode`.
+    from diffusers import AutoencoderKLQwenImage21
+    vae16 = AutoencoderKLQwenImage21.from_pretrained(
+        args.model, subfolder="vae", torch_dtype=torch.bfloat16).to("cuda").eval()
+    lat_h, lat_w = latent_dims(pipe, args.height, args.width)
+    z = vae16.config.z_dim
+    lat = torch.from_numpy(step_latents[-1]).to("cuda").view(1, lat_h * lat_w, z)
+    lat = lat.transpose(1, 2).reshape(1, z, 1, lat_h, lat_w).to(vae16.dtype)
+    mean = torch.tensor(vae16.config.latents_mean).view(1, z, 1, 1, 1).to(lat.device, lat.dtype)
+    std = torch.tensor(vae16.config.latents_std).view(1, z, 1, 1, 1).to(lat.device, lat.dtype)
+    z16 = lat * std + mean
+    with torch.no_grad():
+        out16 = vae16.decode(z16, return_dict=False)[0]
+    bar16, bar32 = bf16_variant_bars(vae16, z16, out16, torch.from_numpy(vae_out[0]).to("cuda"))
+    np_save(os.path.join(args.out, f"vae_decode_input_bf16_{args.tag}.npy"), z16)
+    np_save(os.path.join(args.out, f"vae_decode_output_bf16_{args.tag}.npy"), out16)
+    np_save(os.path.join(args.out, f"vae_decode_bars_{args.tag}.npy"),
+            torch.tensor([bar16, bar32]))
+    del vae16
 
     meta = {
         "prompt": args.prompt,

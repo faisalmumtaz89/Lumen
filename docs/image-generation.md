@@ -21,7 +21,7 @@ limits as the endpoint's request below, and the same prompt, size, steps and see
 same bytes as the server does. Its first run downloads and converts the model, as
 `lumen pull qwen-image` below does, without asking first. It runs on CUDA only, like the
 server, on the first visible CUDA device, and is refused before the download unless that
-device has compute capability 8.0+ and at least 21.0 GiB of memory.
+device has compute capability 8.0+ and at least 23.6 GiB of memory.
 
 `lumen pull qwen-image` downloads the checkpoint from Hugging Face (30.8 GiB, pinned to one
 commit), converts it into the three `.lbi` containers under `qwen-image-2-1/lbi/` in the
@@ -49,10 +49,13 @@ The rest of this page covers that by-hand path and the endpoint.
 - NVIDIA CUDA, compute capability 8.0+ (the CPU path exists for reference checks only
   and takes minutes per image).
 - Device memory: the text encoder's language tower (12.9 GiB of BF16 weights), the
-  transformer (13.3 GiB) and the VAE decoder (about 1 GiB). Loaded one at a time, a
-  generation's device memory peaks at 15.3 GiB for a 1024×1024 image and 21.0 GiB for a
-  2048×2048 one (the VAE decode). The server refuses to start, and `lumen image` to run, on
-  a device below compute capability 8.0 or with less than 21.0 GiB in total, naming both amounts:
+  transformer (13.3 GiB) and the VAE decoder (0.5 GiB). Loaded one at a time, as `lumen
+  image` runs, a generation's device memory peaks at 14.6 GiB for a 1024×1024 image and
+  16.0 GiB for a 2048×2048 one with a short prompt, and at 23.1 GiB for a 4096×4096 one, the
+  largest size a request may ask for, with the longest prompt it may send; the server, which
+  keeps the VAE loaded while it denoises, needs 23.6 GiB while it denoises that one. The server refuses to
+  start, and `lumen image` to run, on a device below compute capability 8.0 or with less than
+  23.6 GiB in total, naming both amounts:
   one requirement for every size, since the server serves any size per request. The transformer and the VAE normally stay loaded
   between generations, and the server uses spare room beside them: on a 32 GiB card,
   1024×1024 generations take up to about 30 GiB. See [Device memory](#device-memory).
@@ -127,7 +130,7 @@ with no `Accept` header, or `*/*`, the response is JSON.
 ## Device memory
 
 Generations run one at a time. On CUDA the server loads the transformer and the VAE on
-device 0 at startup and keeps them there between generations (about 14.4 GiB), except
+device 0 at startup and keeps them there between generations (about 13.9 GiB), except
 when the transformer has to make room as described below, and the text encoder loads for
 each image; the server fails to start if that device cannot hold them. The text encoder's first layers stay
 loaded between images when there is room. The first image of a size that runs with the
@@ -136,13 +139,12 @@ that size's denoising and decoding need; later images of that size, with the tra
 loaded and a prompt no longer than the measured one, keep as many layers as leave that
 much free plus 512 MiB, so each loads only the rest. A denoising or decoding step that
 still runs out of memory drops the kept layers and that size's record and runs again. On an RTX 5090,
-repeated 1024×1024 images settle with about 10 GiB of the 12.9 GiB kept, and the
-encoder's upload drops from 12.9 GiB to 2.9 GiB. Prompt encoding and image
-decoding run beside the resident transformer when they fit. When one runs out of device
-memory there — a 2048×2048 decode on a 32 GiB card, or any prompt on a card much smaller
-than 32 GiB — the transformer is released and the step
-retried, along with any text-encoder layers kept beside it. A decode that still does not
-fit on its own, as at 3840×2176 on a 32 GiB card, is split into horizontal bands, twice
+repeated 1024×1024 images settle with all 36 of the language tower's layers kept. Prompt
+encoding and image decoding run beside the resident transformer when they fit. When one
+runs out of device memory there, as any prompt does on a card much smaller than 32 GiB, the
+transformer is released and the step retried, along with any text-encoder layers kept
+beside it. A decode that
+still does not fit on its own is split into horizontal bands, twice
 as many at each retry down to bands of 512 image rows, and the count is remembered for
 the size; every band is decoded with enough neighbouring rows that the image is the same
 as a one-pass decode, bit for bit. After an encoding the transformer is

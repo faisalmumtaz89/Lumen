@@ -476,13 +476,20 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
-/// The most device memory a generation uses, in bytes: 21,491 MiB, measured
-/// as the device's used memory at the peak of a 2048x2048 generation (the
-/// VAE decode; a 1024x1024 generation peaks at 15,663 MiB while denoising) on
-/// an RTX 5090 with a 10 ms `nvidia-smi` sampler. A device with
-/// less total memory would fail a request at that size, so the startup check
-/// refuses it instead.
-pub const PEAK_DEVICE_BYTES: u64 = 21_491 << 20;
+/// The most device memory a generation needs, in bytes: 24,142 MiB, measured
+/// as the device's used memory while the image server denoises a 4096x4096
+/// image, the largest size a request may ask for, with an 8,192-byte prompt,
+/// the longest it may send, on an RTX 5090 with a 10 ms `nvidia-smi` sampler.
+/// The server keeps the VAE loaded while it denoises; [`generate_gpu`], which
+/// loads one component at a time, peaks at 23,666 MiB there (21,672 MiB of live
+/// allocations at once and 1,437 MiB of context, kernels and cuBLAS workspaces
+/// outside the memory pool; the rest is pool memory a generation keeps for
+/// reuse), and with a short prompt at 22,610 MiB for 4096x4096, 16,402 MiB for
+/// 2048x2048 and 14,930 MiB for 1024x1024. The server's prompt encoding and
+/// decoding go higher beside the resident transformer, but release it and run
+/// again when they run out; denoising cannot, so a device with less total
+/// memory could fail such a request, and the startup check refuses it instead.
+pub const PEAK_DEVICE_BYTES: u64 = 24_142 << 20;
 
 /// The compute capability the GPU pipeline needs: the text tower's flash
 /// attention and the VAE's convolutions are built for it.
@@ -508,7 +515,7 @@ pub fn check_device_facts(cc: (i32, i32), total_bytes: u64) -> Result<(), Pipeli
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(PipelineError::Unsupported(format!(
             "image generation needs a CUDA device with at least {:.1} GiB of memory \
-             ({PEAK_DEVICE_BYTES} bytes; the startup minimum, from the measured 2048x2048 peak) \
+             ({PEAK_DEVICE_BYTES} bytes; the startup minimum, from the measured 4096x4096 peak) \
              and the device has {:.1} GiB ({total_bytes} bytes)",
             gib(PEAK_DEVICE_BYTES),
             gib(total_bytes),
@@ -649,9 +656,9 @@ impl GpuSources {
 /// image-only server runs them (no text model shares its process).
 ///
 /// The text encoder loads for each generation, but its first layers can stay:
-/// the three do not fit on a 32 GiB card together with a decode's activations
-/// (3.1 GiB is left with all three resident, and a 1024x1024 decode needs
-/// more), and how much room a generation needs depends on its size. The first
+/// how many fit beside the transformer, the VAE and a generation's activations
+/// depends on the size (on a 32 GiB card all 36 stay beside 1024x1024
+/// generations, fewer beside larger ones). The first
 /// generation of a size keeps no text layers, and the device memory its
 /// denoising and decoding use above that point is recorded (the peak of the
 /// memory pool they allocate from). Later generations of that size keep as
@@ -663,8 +670,8 @@ impl GpuSources {
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
-/// there — a 2048x2048 decode on a 32 GiB card, any encode on a card much
-/// smaller than 32 GiB — is retried once with the transformer
+/// there, as any encode does on a card much smaller than 32 GiB, is retried
+/// once with the transformer
 /// released, and the next generation loads it again. The smallest prompt and
 /// the smallest image that ran out are remembered, so work at least that large
 /// releases the transformer first instead of failing again.
@@ -1204,7 +1211,7 @@ fn decode_gpu(
 ) -> Result<Rgba, String> {
     let lat_h = latent_side(req.height);
     let lat_w = latent_side(req.width);
-    let denorm = crate::vae::denormalize_latents_with(
+    let denorm = crate::vae::denormalize_latents_bf16(
         latents,
         1,
         lat_h,
@@ -1277,19 +1284,19 @@ mod device_facts_tests {
     /// message, and no request size in it; one at or above it passes.
     #[test]
     fn a_small_device_is_refused_with_both_amounts_named() {
-        let err = check_device_facts((8, 0), 16 << 30)
+        let err = check_device_facts((8, 0), 12 << 30)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("16.0 GiB") && err.contains(&(16u64 << 30).to_string()),
+            err.contains("12.0 GiB") && err.contains(&(12u64 << 30).to_string()),
             "{err}"
         );
         assert!(
-            err.contains("21.0 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
+            err.contains("23.6 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
             "{err}"
         );
         assert!(
-            err.contains("at least 21.0 GiB") && err.contains("the device has 16.0 GiB"),
+            err.contains("at least 23.6 GiB") && err.contains("the device has 12.0 GiB"),
             "{err}"
         );
         assert!(err.contains("startup minimum"), "{err}");

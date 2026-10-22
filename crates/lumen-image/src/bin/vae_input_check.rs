@@ -3,7 +3,10 @@
 //! The components each pass their own check, but the transform that bridges the
 //! transformer's output layout to the decoder's input layout is the pipeline's,
 //! and a wrong layout there still decodes to a finite image of the right shape.
-//! So it is checked directly against the tensor the decoder was actually given.
+//! So it is checked directly against the tensor the decoder was actually given,
+//! and the GPU path's bf16 transform against the bf16 decoder input
+//! `oracle_dump.py` writes, bit for bit: every value there is the reference's
+//! own bf16 arithmetic on the same latents.
 //!
 //! Usage: `vae-input-check <oracle-dir> [tag]`
 
@@ -11,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lumen_image::npy;
-use lumen_image::vae::{denormalize_latents_with, VaeConfig};
+use lumen_image::vae::{denormalize_latents_bf16, denormalize_latents_with, VaeConfig};
 
 fn rel_l2(got: &[f32], want: &[f32]) -> f32 {
     let mut num = 0f64;
@@ -37,6 +40,8 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("latents: {e}"))?;
     let want = npy::load(&oracle.join(format!("vae_decode_input_{tag}.npy")))
         .map_err(|e| format!("vae_decode_input: {e}"))?;
+    let want16 = npy::load(&oracle.join(format!("vae_decode_input_bf16_{tag}.npy")))
+        .map_err(|e| format!("vae_decode_input_bf16: {e}"))?;
 
     // The final denoising step's latent, [batch, tokens, channels].
     if latents.shape.len() != 4 {
@@ -72,6 +77,29 @@ fn run() -> Result<(), String> {
     if r > 1e-5 {
         return Err(format!(
             "the pipeline's latent transform does not reproduce the decoder input (rel-L2 {r:.3e})"
+        ));
+    }
+    let ours16 = denormalize_latents_bf16(last, 1, side, side, &cfg.latents_mean, &cfg.latents_std)
+        .map_err(|e| format!("{e}"))?;
+    if ours16.len() != want16.data.len() {
+        return Err(format!(
+            "the bf16 transform gives {} values, the oracle's bf16 decoder input has {}",
+            ours16.len(),
+            want16.data.len()
+        ));
+    }
+    let differ = ours16
+        .iter()
+        .zip(&want16.data)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "bf16 decoder input  {differ} of {} values differ",
+        ours16.len()
+    );
+    if differ > 0 {
+        return Err(format!(
+            "the GPU path's bf16 transform does not reproduce the bf16 decoder input ({differ} values)"
         ));
     }
     Ok(())

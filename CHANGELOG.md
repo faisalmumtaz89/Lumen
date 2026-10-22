@@ -15,9 +15,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   end of the decode and is trimmed afterwards, so an idle server holds no more device memory than before.
   Qwen-Image-2.1 on an RTX 5090, 1024x1024, 40 steps: 15.50 -> 15.28 s per image (median of three alternated
   rounds of ten prompts); images are byte-identical.
+- **The image decoder runs in bf16 on CUDA, as the reference does when loaded in bf16, about twice as fast.** It
+  ran in f32 with TF32 convolutions; its weights and activations are now bf16, every convolution runs on one bf16
+  tensor-core kernel, and each operation rounds where the reference's bf16 operation does. Pictures change slightly:
+  on twelve test images (1024×1024, 768×1344, 256×256) the decode is 60.4-65.0 dB (1024×1024), 61.2 dB and 56.9 dB
+  from the reference's own bf16 decode of the same latents. On each image that is no further from it, and from the
+  reference's f32 decode, than bf16 decoders that differ from the reference only in summation order, attention kernel
+  or norm reduction are, give or take the spread between those decoders. Qwen-Image-2.1 on an RTX 5090,
+  server: decode 0.32 -> 0.16 s at 1024×1024 and 14.5 -> 0.64 s at 2048×2048; 1024×1024, 40 steps: 15.04 -> 14.60 s
+  per image (median of three alternated rounds of ten prompts), partly because the smaller decode leaves room for all
+  of the text encoder's layers to stay on the GPU.
 
 ### Fixed
 
+- **Image generation's startup memory check covers every size a request may ask for.** The minimum was the
+  measured peak of a 2048×2048 generation, but a request may ask for 4096×4096, which peaks higher while denoising,
+  so a device that passed the check could run out on such a request. It is now the measured peak of that size with
+  the longest prompt a request may send, while the server denoises it: 23.6 GiB (24,142 MiB on an RTX 5090), up from
+  21.0 GiB.
 - **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
   keeps the text encoder's first layers on the GPU between generations, but a prompt even one token longer than
   the one it had measured made it free them all, so the next generation uploaded the encoder again. A longer prompt

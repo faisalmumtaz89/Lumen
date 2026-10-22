@@ -1,16 +1,21 @@
 //! The Qwen-Image-2.1 VAE decoder, on the GPU.
 //!
 //! This mirrors [`crate::vae`] step for step: the same shapes and the same
-//! operand order. The elementwise kernels keep the CPU's accumulation order
-//! per output element. The convolutions run as TF32 tensor-core products with
-//! f32 accumulation, as the reference's cuDNN convolutions do under torch's
-//! default `allow_tf32`: on cuBLAS after im2col, or in `vae_conv.cu` for the
-//! layers the reference sums tap by tap ([`DIRECT_MAX_IN_C`]). The attention
-//! products run in full f32, the accuracy of the reference's f32 attention
-//! kernel. `vae-check-gpu`
-//! checks the GPU decode against the reference's own output within 1.5e-4
-//! relative error and against [`crate::vae`], which convolves in full f32,
-//! within 1e-3.
+//! operand order, computed in bf16 as the reference computes when it is
+//! loaded in bf16 (SGLang's choice for this model). Weights and activations
+//! are stored as bf16; each op computes in f32 and rounds its result to bf16
+//! where the reference's bf16 op does: a convolution sums its products in f32
+//! and rounds twice, `B(B(sum) + bias)`, as cuDNN's output and the separate
+//! bias add do; the norm, SiLU and the residual adds round once per op output
+//! (`vae_ops.cu` spells each out). Every convolution, 1x1 and 3x3, runs on the
+//! bf16 tensor-core kernel in `vae_conv.cu`. The mid block's attention widens
+//! q, k and v to f32 and runs the products and softmax in full f32, rounding
+//! the context to bf16; the reference's kernel also keeps its scores and
+//! softmax in f32 but rounds the unnormalised weights to bf16 before their
+//! product with v, so this is an approximation of it, no less accurate.
+//! `vae-check-gpu` checks the GPU decode against the reference's bf16 decode
+//! of the same input and reports its distance from the f32 decode and from
+//! [`crate::vae`], which decodes in f32.
 //!
 //! The four things [`crate::vae`]'s module doc calls out are the ones a
 //! plausible "improvement" would silently break, and they carry over unchanged:
@@ -38,33 +43,30 @@
 //! layout. There is one layout for the whole decoder, so a silent
 //! transposition has nowhere to hide — the one place the reference does
 //! transpose (its attention block) is handled by reading the channel-major
-//! activation directly. The only other layout is internal to a `conv_tf32`
-//! convolution: the channels-last copy of its input, which lives for one
-//! band of the convolution.
+//! activation directly. The only other layout is internal to a convolution:
+//! the channels-last copy of its input, which lives for one band of it.
 //!
-//! The two host round trips are the latents going up and the decoded f32 image
-//! coming back. The clamp to `[-1, 1]` runs on the host after the download, as
-//! the reference's `torch.clamp` runs on the finished tensor; it is the same two
-//! `f32::min`/`f32::max` operations and costs nothing in precision.
+//! The two host round trips are the latents going up, rounded to bf16 as the
+//! reference casts them to the VAE's dtype, and the decoded bf16 image coming
+//! back. The clamp to `[-1, 1]` runs on the host after the download, widened to
+//! f32, as the reference's `torch.clamp` runs on the finished tensor; clamping
+//! a bf16 value gives a bf16 value, so the order costs nothing.
 //!
-//! Dtype. Every weight is f32 on the device, widened on the host by the
-//! container's own reader. That is not a lossy shortcut: the reference's loader
-//! goes through `LbiFile::read_f32` for *every* tensor, so a checkpoint stored as
-//! bf16 or f16 is already widened to f32 on the CPU side and the comparison is
-//! one of summation order rather than of precision. A `conv_tf32` convolution's
-//! weights are stored already rounded to TF32, which is the rounding every TF32
-//! product applies to them anyway.
+//! Dtype. Every weight is read by the container's own reader and rounded to
+//! bf16 once, at load, as loading the reference with `torch_dtype=bfloat16`
+//! rounds it.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 use lumen_format::QuantScheme;
 use lumen_runtime::cuda::ffi::CudaDevice;
 use lumen_runtime::error::RuntimeError;
 
 use super::launch::{self, DevVec};
 use crate::lbi::{LbiError, LbiFile};
+use crate::tensor::{bf16_bits, bf16_f32};
 use crate::vae::{VaeConfig, VaeError};
 
 /// The reference hard-codes `QwenImage21MidBlock(dims[0], dropout,
@@ -93,49 +95,29 @@ const ATTN_THREADS: u32 = 256;
 const ATTN_SCORE_BUDGET: usize = 1 << 30;
 
 /// The grid-x limit CUDA allows (2^31 - 1). The decoder's largest activation —
-/// 288 channels at 1024x1024 — needs 1.2 million blocks at 256 threads, four
+/// 288 channels at 1024x1024 — needs 1.2 million blocks at 256 threads, three
 /// orders of magnitude below this, so the clamp is a guard against a malformed
 /// config rather than a limit the shipped architecture ever approaches.
 const GRID_X_MAX: u64 = 0x7fff_ffff;
 
-/// Output rows per cuBLAS convolution product. Fixed rather than derived from
-/// the image height, so a decode in bands runs every row through products of
-/// the same shape as the whole-image decode does.
-const CONV_ROWS: usize = 16;
-
-/// Bytes a convolution's staged input — the column matrix of a cuBLAS
-/// convolution, the channels-last copy of a `conv_tf32` one — may occupy per
-/// band.
+/// Bytes the channels-last copy of a convolution's input may occupy per band.
 ///
-/// 256 MiB keeps the largest layer's staging to a few bands while leaving the
-/// rest of the card for the activations, which reach 1.2 GB at 1024x1024.
+/// 256 MiB keeps the largest layer's copy to a few bands while leaving the
+/// rest of the card for the activations, which reach 0.6 GB at 1024x1024.
 const CONV_COL_BUDGET: usize = 256 * 1024 * 1024;
 
-/// The widest input, in channels, of a 3x3 convolution `conv_tf32` runs.
-///
-/// The two paths sum a convolution's terms in different orders: the cuBLAS
-/// path's column matrix goes channel by channel with the kernel taps
-/// innermost, `conv_tf32` goes tap by tap with the channels innermost, 8 terms
-/// to a tensor-core product. Run layer by layer on the reference's own inputs,
-/// the reference's outputs were measured closer to the cuBLAS path for every
-/// 1x1 convolution and every 3x3 one over 576 or more channels, and closer to
-/// `conv_tf32` for the 3x3 ones over at most 288 channels — `conv_in`, over the
-/// 64 latent channels, and the highest-resolution layers. Each layer runs on
-/// the path measured closer.
-const DIRECT_MAX_IN_C: usize = 288;
-
-/// Output channels and output pixels per `conv_tf32` block, and its threads.
+/// Output channels and output pixels per `conv_bf16` block, and its threads.
 const CONV_TILE: usize = 128;
 const CONV_THREADS: u32 = 128;
 
-/// Input channels per k slice of `conv_tf32`: a convolution it runs has a
+/// Input channels per 16-byte chunk of `conv_bf16`: a convolution it runs has a
 /// multiple of this many input channels.
-const CONV_K_SLICE: usize = 16;
+const CONV_K_SLICE: usize = 8;
 
 /// The elementwise kernel source this module compiles.
 pub const VAE_OPS_SOURCE: &str = include_str!("vae_ops.cu");
 
-/// The convolution kernel source, compiled for sm_80 (tensor-core TF32).
+/// The convolution kernel source, compiled for sm_80 (bf16 tensor cores).
 pub const VAE_CONV_SOURCE: &str = include_str!("vae_conv.cu");
 
 // ---------------------------------------------------------------------------
@@ -209,14 +191,42 @@ fn cuda<E: std::fmt::Display>(what: &str, e: E) -> VaeGpuError {
 }
 
 // ---------------------------------------------------------------------------
+// bf16 buffers
+// ---------------------------------------------------------------------------
+
+/// A bf16 tensor on the device, as raw bits, plus its length.
+struct Bf16Vec {
+    buf: CudaSlice<u16>,
+    len: usize,
+}
+
+/// A device buffer of `len` bf16 values for a kernel output. As with
+/// `launch::alloc`, its contents are unspecified until a kernel writes them,
+/// and every launcher that takes one writes all of it.
+fn alloc_bf16(dev: &CudaDevice, len: usize) -> Result<Bf16Vec, VaeGpuError> {
+    // Safety: any bit pattern is a valid bf16, and the callers write every
+    // element before reading the buffer.
+    let buf = unsafe { dev.alloc_uninit::<u16>(len) }.map_err(|e| cuda("alloc", e))?;
+    Ok(Bf16Vec { buf, len })
+}
+
+/// `data` rounded to bf16 and copied to the device.
+fn upload_bf16(dev: &CudaDevice, data: &[f32]) -> Result<Bf16Vec, VaeGpuError> {
+    let bits: Vec<u16> = data.iter().map(|&v| bf16_bits(v)).collect();
+    Ok(Bf16Vec {
+        buf: dev.htod_copy(&bits)?,
+        len: bits.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Weights resident on the device
 // ---------------------------------------------------------------------------
 
 /// A 2-D convolution with stride 1 and symmetric zero padding, resident on the
-/// device, with an `[out_c]` bias. A cuBLAS convolution keeps the `nn.Conv2d`
-/// `[out_c, in_c, k, k]` weights `vae.rs` also stores; a `direct` one, which
-/// `conv_tf32` runs, keeps them reordered to `[out_c, k, k, in_c]` and rounded
-/// to TF32, the order and precision it multiplies in.
+/// device, with an `[out_c]` bias. The `nn.Conv2d` `[out_c, in_c, k, k]`
+/// weights are kept reordered to `[out_c, k, k, in_c]`, the order `conv_bf16`
+/// multiplies in.
 struct GpuConv {
     out_c: usize,
     in_c: usize,
@@ -224,9 +234,8 @@ struct GpuConv {
     kw: usize,
     pad_h: usize,
     pad_w: usize,
-    direct: bool,
-    weight: DevVec,
-    bias: DevVec,
+    weight: Bf16Vec,
+    bias: Bf16Vec,
 }
 
 impl GpuConv {
@@ -234,11 +243,11 @@ impl GpuConv {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         gpu.conv(self, x, batch, h, w)
     }
 
@@ -255,14 +264,14 @@ impl GpuConv {
     ) -> Result<Self, VaeGpuError> {
         let wname = format!("{prefix}.weight");
         let bname = format!("{prefix}.bias");
-        let direct = k == 3 && in_c <= DIRECT_MAX_IN_C && in_c % CONV_K_SLICE == 0;
+        if in_c % CONV_K_SLICE != 0 {
+            return Err(VaeGpuError::KernelLimit(format!(
+                "{prefix}: conv_bf16 needs a multiple of {CONV_K_SLICE} input channels, not {in_c}"
+            )));
+        }
         let weight = read_exact(file, &wname, &[out_c, in_c, k, k])?;
-        let weight = if direct {
-            conv_weight_tf32(&weight, out_c, in_c, k)
-        } else {
-            weight
-        };
-        let bias = launch::upload(dev, &read_exact(file, &bname, &[out_c])?)?;
+        let weight = conv_weight_taps_outer(&weight, out_c, in_c, k);
+        let bias = upload_bf16(dev, &read_exact(file, &bname, &[out_c])?)?;
         Ok(Self {
             out_c,
             in_c,
@@ -270,17 +279,18 @@ impl GpuConv {
             kw: k,
             pad_h: pad,
             pad_w: pad,
-            direct,
-            weight: launch::upload(dev, &weight)?,
+            weight: upload_bf16(dev, &weight)?,
             bias,
         })
     }
 }
 
-/// `QwenImage21RMS_norm`'s `gamma`, resident on the device.
+/// `QwenImage21RMS_norm`'s `gamma`, resident on the device, and its `scale`,
+/// `dim ** 0.5` as the f32 scalar torch multiplies by.
 struct GpuNorm {
-    gamma: DevVec,
+    gamma: Bf16Vec,
     dim: usize,
+    scale: f32,
 }
 
 impl GpuNorm {
@@ -288,10 +298,10 @@ impl GpuNorm {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         rows: usize,
         hw: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         gpu.rms_norm(self, x, rows, hw)
     }
 
@@ -320,8 +330,9 @@ impl GpuNorm {
             return Err(mismatch(name, &canonical, &entry.shape));
         }
         Ok(Self {
-            gamma: read_f32_tensor(dev, file, name)?,
+            gamma: upload_bf16(dev, &read_f32(file, name)?)?,
             dim,
+            scale: (dim as f64).sqrt() as f32,
         })
     }
 }
@@ -343,11 +354,11 @@ impl GpuResnet {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         let hw = h * w;
         let residual = match &self.shortcut {
             Some(conv) => conv.apply(gpu, x, batch, h, w)?,
@@ -423,12 +434,12 @@ impl GpuAttn {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         c: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         let seq = h * w;
         // Note the absence of an activation after the norm: the reference's
         // attention block normalises and then goes straight into `to_qkv`.
@@ -470,11 +481,11 @@ impl GpuMidBlock {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         let mut cur = self.resnets[0].apply(gpu, x, batch, h, w)?;
         for (attn, resnet) in self.attentions.iter().zip(&self.resnets[1..]) {
             let c = attn.to_qkv.in_c;
@@ -535,11 +546,11 @@ impl GpuUpBlock {
     fn apply(
         &self,
         gpu: &VaeGpu,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         let mut c = self.resnets[0].conv1.in_c;
         let mut cur = gpu.copy(x)?;
         for resnet in &self.resnets {
@@ -559,8 +570,6 @@ impl GpuUpBlock {
 
 /// The kernels in `vae_ops.cu`.
 struct VaeOps {
-    im2col: CudaFunction,
-    bias_add: CudaFunction,
     to_channels_last: CudaFunction,
     conv: CudaFunction,
     nearest_2x: CudaFunction,
@@ -569,6 +578,8 @@ struct VaeOps {
     silu: CudaFunction,
     add: CudaFunction,
     softmax: CudaFunction,
+    widen: CudaFunction,
+    round: CudaFunction,
     copy_rows: CudaFunction,
 }
 
@@ -755,8 +766,9 @@ impl VaeGpu {
     }
 
     /// Decode latents `[batch, z_dim, 1, h, w]` to `[batch, out_channels, 1,
-    /// h * 16, w * 16]`, equal to [`crate::vae::VaeDecoder::decode`] on the same
-    /// inputs, including the clamp to `[-1, 1]`.
+    /// h * 16, w * 16]`, in the layout [`crate::vae::VaeDecoder::decode`]
+    /// returns and with the same clamp to `[-1, 1]`; that decoder computes in
+    /// f32, this one in bf16, so their values differ by the rounding.
     ///
     /// The temporal axis is folded away and stays folded, as in the reference:
     /// it is 1 at every point of a single-frame decode.
@@ -851,7 +863,7 @@ impl VaeGpu {
         // `_decode` runs `post_quant_conv` over the whole latent, then feeds the
         // decoder one frame at a time with `first_chunk=True` on frame 0. There
         // is exactly one frame here, so that loop runs once.
-        let z = launch::upload(&self.dev, latents)?;
+        let z = upload_bf16(&self.dev, latents)?;
         let x = self.post_quant_conv.apply(self, &z, batch, h, w)?;
         drop(z);
         let x = self.conv_in.apply(self, &x, batch, h, w)?;
@@ -880,12 +892,12 @@ impl VaeGpu {
             let scale = self.scale();
             let c_mid = x.len / (batch * h * w);
             let c_out = self.conv_out.out_c;
-            let mut out = launch::alloc(&self.dev, batch * c_out * h * scale * w * scale)?;
+            let mut out = alloc_bf16(&self.dev, batch * c_out * h * scale * w * scale)?;
             let per_band = h.div_ceil(bands);
             for r0 in (0..h).step_by(per_band) {
                 let r1 = (r0 + per_band).min(h);
                 let (a, b) = (r0.saturating_sub(halo), (r1 + halo).min(h));
-                let mut band = launch::alloc(&self.dev, batch * c_mid * (b - a) * w)?;
+                let mut band = alloc_bf16(&self.dev, batch * c_mid * (b - a) * w)?;
                 self.copy_rows(
                     &x.buf.slice(..),
                     &mut band.buf.slice_mut(..),
@@ -910,23 +922,28 @@ impl VaeGpu {
         };
 
         // The clamp is the reference's `v.max(-1.0).min(1.0)` on the finished
-        // tensor; `download` synchronizes first, so the copy is complete.
-        let mut data = launch::download(&self.dev, &out)?;
-        for v in data.iter_mut() {
-            *v = v.max(-1.0).min(1.0);
+        // tensor; the device is synchronized first, so the copy is complete.
+        // `f32::max` would turn a NaN into -1, so a non-finite value is refused
+        // before it.
+        let bits = self.dev.dtoh_copy(&out.buf)?;
+        self.dev.synchronize()?;
+        let data: Vec<f32> = bits.into_iter().map(bf16_f32).collect();
+        let non_finite = data.iter().filter(|v| !v.is_finite()).count();
+        if non_finite > 0 {
+            return Err(VaeGpuError::Vae(VaeError::NonFinite(non_finite)));
         }
-        Ok(data)
+        Ok(data.into_iter().map(|v| v.max(-1.0).min(1.0)).collect())
     }
 
     /// The decoder after the mid block, over `[batch, c, h, w]`: the up blocks,
     /// `norm_out`, SiLU and `conv_out`, to `[batch, 3, h * scale, w * scale]`.
     fn upsample_half(
         &self,
-        mut x: DevVec,
+        mut x: Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         // The spatial extent is carried through the stack because the
         // upsamplers double it. Each layer checks the activation it is handed
         // against the extent it is about to use, so a size that went out of
@@ -1010,7 +1027,7 @@ impl VaeGpu {
     /// where the extent changes hands rather than a substitute for them.
     fn check_extent(
         &self,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         c: usize,
         h: usize,
@@ -1027,16 +1044,20 @@ impl VaeGpu {
     // -- op wrappers ---------------------------------------------------------
 
     /// One 2-D convolution, `[batch, in_c, h, w]` to `[batch, out_c, h, w]`, on
-    /// the path whose summation order is the reference's for this layer: see
-    /// [`DIRECT_MAX_IN_C`].
+    /// `conv_bf16`, fed a channels-last copy of the input that
+    /// `to_channels_last_bf16` makes in bands of rows.
+    ///
+    /// A band's copy holds its output rows plus the `pad_h` rows either side the
+    /// kernel window reaches, within `CONV_COL_BUDGET`; each output value is
+    /// computed the same way whichever band it falls in.
     fn conv(
         &self,
         w: &GpuConv,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         h: usize,
         wd: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         // Every convolution in this decoder preserves the spatial extent. If one
         // ever did not, the caller's (h, w) — handed unchanged to the next op —
         // would be silently wrong, so it is checked rather than assumed.
@@ -1063,174 +1084,20 @@ impl VaeGpu {
         for (name, v) in [("out_c", w.out_c), ("hw", hw), ("k", k)] {
             if v > i32::MAX as usize {
                 return Err(VaeGpuError::KernelLimit(format!(
-                    "convolution {name}={v} exceeds the i32 cuBLAS limit"
+                    "convolution {name}={v} exceeds the kernel's 32-bit index limit"
                 )));
             }
         }
-        if w.direct {
-            self.conv_direct(w, x, batch, h, wd)
-        } else {
-            self.conv_gemm(w, x, batch, h, wd)
-        }
-    }
-
-    /// A convolution as im2col plus a cuBLAS TF32 GEMM.
-    ///
-    /// The output rows are processed in bands of a fixed row count so the
-    /// column matrix stays bounded: at 1024x1024 with 144 channels and a 3x3
-    /// kernel the full matrix would be 5.4 GB. Each band's GEMM writes a
-    /// staging buffer `[out_c, band_rows * w]` (`ldc = band_rows * w`), and the
-    /// band's rows are then copied into `out`, `[out_c, h * w]` per image.
-    ///
-    /// Column-major mapping for the row-major buffers: `col[K, P]` is
-    /// `col_cm[P, K]`, `W[out_c, K]` is `W_cm[K, out_c]`, and the wanted
-    /// `out[out_c, P] = W · col` is `out_cm[P, out_c] = col_cm · W_cm`, so both
-    /// operands are un-transposed with `(m, n, k) = (P, out_c, K)`.
-    fn conv_gemm(
-        &self,
-        w: &GpuConv,
-        x: &DevVec,
-        batch: usize,
-        h: usize,
-        wd: usize,
-    ) -> Result<DevVec, VaeGpuError> {
-        let hw = h * wd;
-        let k = w.in_c * w.kh * w.kw;
-        // Uninitialized: every element is written by a band's GEMM.
-        let mut out = DevVec {
-            buf: unsafe { self.dev.alloc_uninit::<f32>(batch * w.out_c * hw) }
-                .map_err(|e| cuda("conv out alloc", e))?,
-            len: batch * w.out_c * hw,
-        };
-        if batch * w.out_c * hw == 0 {
-            return Ok(out);
-        }
-        // Rows per product: CONV_ROWS, or fewer when a row is so wide the
-        // column matrix would pass its budget. The count depends only on the
-        // width, and every product writes the same `staging` buffer with the
-        // same stride before its rows are copied into place, so the same row
-        // of an image goes through the same cuBLAS call — shape, operands'
-        // alignment and strides — whether the image is decoded whole or in
-        // bands, and is summed in the same order. The last band of rows is
-        // padded to the full shape.
-        let band_rows = (CONV_COL_BUDGET / (k * wd * 4)).clamp(1, CONV_ROWS);
-        let col = DevVec {
-            buf: unsafe { self.dev.alloc_uninit::<f32>(k * band_rows * wd) }
-                .map_err(|e| cuda("conv col alloc", e))?,
-            len: k * band_rows * wd,
-        };
-        let mut staging = launch::alloc(&self.dev, w.out_c * band_rows * wd)?;
-
-        let (icu, ihu, iwu) = (w.in_c as u32, h as u32, wd as u32);
-        let (khu, kwu, phu, pwu) = (w.kh as u32, w.kw as u32, w.pad_h as u32, w.pad_w as u32);
-        for b in 0..batch {
-            let x_img = x.buf.slice(b * w.in_c * hw..(b + 1) * w.in_c * hw);
-            let mut row0 = 0usize;
-            while row0 < h {
-                let rows = band_rows.min(h - row0);
-                // Always a full product; rows past the image are computed
-                // from whatever the kernel window reads and dropped.
-                let p = band_rows * wd;
-                let total = (k * p) as u64;
-                // Safety: `col` holds `k * band_rows * wd` floats and `x_img` is
-                // one image's `[in_c, h, w]`; the grid covers exactly `k * p`.
-                unsafe {
-                    self.dev
-                        .stream
-                        .launch_builder(&self.ops.im2col)
-                        .arg(&x_img)
-                        .arg(&col.buf)
-                        .arg(&icu)
-                        .arg(&ihu)
-                        .arg(&iwu)
-                        .arg(&khu)
-                        .arg(&kwu)
-                        .arg(&phu)
-                        .arg(&pwu)
-                        .arg(&(row0 as u32))
-                        .arg(&(band_rows as u32))
-                        .launch(cfg_1d(total, THREADS))
-                        .map_err(|e| cuda("im2col_band", e))?;
-                }
-                // Safety: `col` holds the band's `k * p` columns, the weight is
-                // `[out_c, k]` and `staging` holds `out_c * p`.
-                unsafe {
-                    sgemm(
-                        &self.dev,
-                        Math::Tf32,
-                        Op::N,
-                        Op::N,
-                        1.0,
-                        &col.buf.slice(..),
-                        p,
-                        &w.weight.buf.slice(..),
-                        k,
-                        &mut staging.buf.slice_mut(..),
-                        p,
-                        p,
-                        w.out_c,
-                        k,
-                    )
-                    .map_err(VaeGpuError::Cuda)?;
-                }
-                let mut image = out.buf.slice_mut(b * w.out_c * hw..(b + 1) * w.out_c * hw);
-                self.copy_rows(
-                    &staging.buf.slice(..),
-                    &mut image,
-                    w.out_c,
-                    wd,
-                    (band_rows, 0),
-                    (h, row0),
-                    rows,
-                )?;
-                row0 += rows;
-            }
-            // Safety: the plane is `out_c * hw` floats and `bias` holds `out_c`.
-            let out_img = out.buf.slice(b * w.out_c * hw..(b + 1) * w.out_c * hw);
-            unsafe {
-                self.dev
-                    .stream
-                    .launch_builder(&self.ops.bias_add)
-                    .arg(&out_img)
-                    .arg(&w.bias.buf)
-                    .arg(&(w.out_c as u32))
-                    .arg(&(hw as u32))
-                    .launch(cfg_1d((w.out_c * hw) as u64, THREADS))
-                    .map_err(|e| cuda("bias_add_channels", e))?;
-            }
-        }
-        Ok(out)
-    }
-
-    /// A convolution on `conv_tf32`, fed a channels-last TF32 copy of the input
-    /// that `to_channels_last_tf32` makes in bands of rows.
-    ///
-    /// A band's copy holds its output rows plus the `pad_h` rows either side the
-    /// kernel window reaches, within `CONV_COL_BUDGET`; each output value is
-    /// computed the same way whichever band it falls in.
-    fn conv_direct(
-        &self,
-        w: &GpuConv,
-        x: &DevVec,
-        batch: usize,
-        h: usize,
-        wd: usize,
-    ) -> Result<DevVec, VaeGpuError> {
-        let hw = h * wd;
         // Uninitialized: every element is written by a band's launch.
-        let mut out = DevVec {
-            buf: unsafe { self.dev.alloc_uninit::<f32>(batch * w.out_c * hw) }
-                .map_err(|e| cuda("conv out alloc", e))?,
-            len: batch * w.out_c * hw,
-        };
+        let mut out = alloc_bf16(&self.dev, batch * w.out_c * hw)?;
         if batch * w.out_c * hw == 0 {
             return Ok(out);
         }
         let row_values = w.in_c * wd;
-        let band = (CONV_COL_BUDGET / (row_values * 4))
+        let band = (CONV_COL_BUDGET / (row_values * 2))
             .saturating_sub(2 * w.pad_h)
             .clamp(1, h);
-        let xt = launch::alloc(&self.dev, row_values * (band + 2 * w.pad_h).min(h))?;
+        let xt = alloc_bf16(&self.dev, row_values * (band + 2 * w.pad_h).min(h))?;
 
         let (in_c, out_c, hu, wu, ku) = (
             w.in_c as u32,
@@ -1251,7 +1118,7 @@ impl VaeGpu {
                 let src = x_img.slice(a * wd..);
                 // Safety: `src` holds `in_c` planes `hw` apart of which the
                 // first `n` values each are read, and `xt` holds `n * in_c`
-                // floats; the grid covers exactly `n x in_c`.
+                // values; the grid covers exactly `n x in_c`.
                 unsafe {
                     self.dev
                         .stream
@@ -1266,7 +1133,7 @@ impl VaeGpu {
                             block_dim: (256, 1, 1),
                             shared_mem_bytes: 0,
                         })
-                        .map_err(|e| cuda("to_channels_last_tf32", e))?;
+                        .map_err(|e| cuda("to_channels_last_bf16", e))?;
                 }
                 // Safety: `xt` holds input rows `a..e` channels-last, which is
                 // every row the window of output rows `r0..r1` reads inside the
@@ -1293,7 +1160,7 @@ impl VaeGpu {
                             block_dim: (CONV_THREADS, 1, 1),
                             shared_mem_bytes: 0,
                         })
-                        .map_err(|e| cuda("conv_tf32", e))?;
+                        .map_err(|e| cuda("conv_bf16", e))?;
                 }
                 r0 = r1;
             }
@@ -1308,10 +1175,10 @@ impl VaeGpu {
     fn rms_norm(
         &self,
         norm: &GpuNorm,
-        x: &DevVec,
+        x: &Bf16Vec,
         rows: usize,
         hw: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         // The channel reduction reads `rows / C` batches of `C` channel rows, so
         // a row count that is not a multiple of the width would silently read
         // another batch's rows as this one's channels.
@@ -1329,7 +1196,7 @@ impl VaeGpu {
                 &[x.len as u64],
             ));
         }
-        let out = launch::alloc(&self.dev, x.len)?;
+        let out = alloc_bf16(&self.dev, x.len)?;
         let positions = (rows / norm.dim) as u64 * (hw as u64);
         if positions == 0 {
             return Ok(out);
@@ -1348,19 +1215,20 @@ impl VaeGpu {
                 .arg(&hwu)
                 .arg(&ru)
                 .arg(&NORMALIZE_EPS)
+                .arg(&norm.scale)
                 .launch(cfg_1d(positions, THREADS))
                 .map_err(|e| cuda("rms_norm_channels", e))?;
         }
         Ok(out)
     }
 
-    /// SiLU in place, the reference's `silu_in_place`.
-    fn silu_inplace(&self, x: &mut DevVec) -> Result<(), VaeGpuError> {
+    /// SiLU in place.
+    fn silu_inplace(&self, x: &mut Bf16Vec) -> Result<(), VaeGpuError> {
         let n = x.len as u32;
         if n == 0 {
             return Ok(());
         }
-        // Safety: the buffer is `n` floats and the grid covers exactly that.
+        // Safety: the buffer is `n` values and the grid covers exactly that.
         unsafe {
             self.dev
                 .stream
@@ -1373,8 +1241,8 @@ impl VaeGpu {
         Ok(())
     }
 
-    /// `dst += src`, the reference's `Tensor4::add_assign`.
-    fn add_inplace(&self, dst: &mut DevVec, src: &DevVec) -> Result<(), VaeGpuError> {
+    /// `dst = B(dst + src)`, the reference's residual add.
+    fn add_inplace(&self, dst: &mut Bf16Vec, src: &Bf16Vec) -> Result<(), VaeGpuError> {
         if dst.len != src.len {
             return Err(mismatch("add", &[dst.len as u64], &[src.len as u64]));
         }
@@ -1382,7 +1250,7 @@ impl VaeGpu {
         if n == 0 {
             return Ok(());
         }
-        // Safety: both buffers are `n` floats and the grid covers exactly that.
+        // Safety: both buffers are `n` values and the grid covers exactly that.
         unsafe {
             self.dev
                 .stream
@@ -1399,12 +1267,12 @@ impl VaeGpu {
     /// `QwenImage21Upsample(scale_factor=(2, 2), mode="nearest-exact")`.
     fn nearest_2x(
         &self,
-        x: &DevVec,
+        x: &Bf16Vec,
         batch: usize,
         c: usize,
         h: usize,
         w: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         if x.len != batch * c * h * w {
             return Err(mismatch(
                 "upsample input",
@@ -1412,7 +1280,7 @@ impl VaeGpu {
                 &[x.len as u64],
             ));
         }
-        let out = launch::alloc(&self.dev, batch * c * h * 2 * w * 2)?;
+        let out = alloc_bf16(&self.dev, batch * c * h * 2 * w * 2)?;
         let total = (batch as u64) * (c as u64) * (2 * h as u64) * (2 * w as u64);
         if total == 0 {
             return Ok(out);
@@ -1435,7 +1303,7 @@ impl VaeGpu {
         Ok(out)
     }
 
-    /// The reference's `dup_up_first_chunk`, accumulated into `dst`.
+    /// The reference's `dup_up_first_chunk`, added into `dst`.
     ///
     /// `dst` holds the block output at the *upsampled* size and `src` the
     /// block's input, the operand order the reference's
@@ -1446,8 +1314,8 @@ impl VaeGpu {
     /// mismatch either way is a bug here rather than in a checkpoint.
     fn dup_up_add(
         &self,
-        dst: &mut DevVec,
-        src: &DevVec,
+        dst: &mut Bf16Vec,
+        src: &Bf16Vec,
         batch: usize,
         h: usize,
         w: usize,
@@ -1513,9 +1381,10 @@ impl VaeGpu {
 
     /// `ctx = softmax(Q K^T / sqrt(C)) V` over the spatial positions.
     ///
-    /// `qkv` is the projections' channel-major output `[batch, 3C, seq]`,
+    /// `qkv` is the projections' channel-major bf16 output `[batch, 3C, seq]`,
     /// `[q | k | v]` stacked on the channel axis, so each of the three is a
-    /// `[C, seq]` row-major plane. Read as column-major each is `[seq, C]` with
+    /// `[C, seq]` row-major plane. It is widened to f32, the products and the
+    /// softmax run in full f32, and the context is rounded to bf16. Read as column-major each is `[seq, C]` with
     /// leading dimension `seq`, which is exactly the operand shape the two
     /// products want: the scores `S[t, j] = q[:, t] · k[:, j]` are, as the
     /// column-major `Sᵀ`, `k_cm · q_cmᵀ`; and the context `ctx[c, t] = Σ_j
@@ -1524,11 +1393,11 @@ impl VaeGpu {
     /// SGEMM per batch item, with the row softmax in between.
     fn attention(
         &self,
-        qkv: &DevVec,
+        qkv: &Bf16Vec,
         batch: usize,
         seq: usize,
         c: usize,
-    ) -> Result<DevVec, VaeGpuError> {
+    ) -> Result<Bf16Vec, VaeGpuError> {
         if qkv.len != batch * 3 * c * seq {
             return Err(mismatch(
                 "attention qkv",
@@ -1537,13 +1406,14 @@ impl VaeGpu {
             ));
         }
         if seq == 0 || c == 0 || batch == 0 {
-            return Ok(launch::alloc(&self.dev, batch * c * seq)?);
+            return alloc_bf16(&self.dev, batch * c * seq);
         }
         if seq as u64 > GRID_X_MAX {
             return Err(VaeGpuError::KernelLimit(format!(
                 "softmax_rows_f32 grid {seq} exceeds the {GRID_X_MAX} limit"
             )));
         }
+        let qkv = self.widen(qkv)?;
         let mut ctx = launch::alloc(&self.dev, batch * c * seq)?;
         // The scores are `seq` rows of `seq`, one per query position, and each
         // row's softmax and product with V stand alone, so the queries run in
@@ -1567,7 +1437,6 @@ impl VaeGpu {
             unsafe {
                 sgemm(
                     &self.dev,
-                    Math::F32,
                     Op::N,
                     Op::T,
                     scale,
@@ -1604,7 +1473,6 @@ impl VaeGpu {
             unsafe {
                 sgemm(
                     &self.dev,
-                    Math::F32,
                     Op::T,
                     Op::N,
                     1.0,
@@ -1621,7 +1489,43 @@ impl VaeGpu {
                 .map_err(VaeGpuError::Cuda)?;
             }
         }
-        Ok(ctx)
+        self.round(&ctx)
+    }
+
+    /// A bf16 buffer widened to f32.
+    fn widen(&self, x: &Bf16Vec) -> Result<DevVec, VaeGpuError> {
+        let out = launch::alloc(&self.dev, x.len)?;
+        let n = x.len as u64;
+        // Safety: both buffers hold `n` values and the grid covers exactly that.
+        unsafe {
+            self.dev
+                .stream
+                .launch_builder(&self.ops.widen)
+                .arg(&x.buf)
+                .arg(&out.buf)
+                .arg(&n)
+                .launch(cfg_1d(n, THREADS))
+                .map_err(|e| cuda("widen_bf16", e))?;
+        }
+        Ok(out)
+    }
+
+    /// An f32 buffer rounded to bf16.
+    fn round(&self, x: &DevVec) -> Result<Bf16Vec, VaeGpuError> {
+        let out = alloc_bf16(&self.dev, x.len)?;
+        let n = x.len as u64;
+        // Safety: both buffers hold `n` values and the grid covers exactly that.
+        unsafe {
+            self.dev
+                .stream
+                .launch_builder(&self.ops.round)
+                .arg(&x.buf)
+                .arg(&out.buf)
+                .arg(&n)
+                .launch(cfg_1d(n, THREADS))
+                .map_err(|e| cuda("round_bf16", e))?;
+        }
+        Ok(out)
     }
 
     /// `rows` rows of every one of `planes` planes `w` wide, from `src`
@@ -1629,8 +1533,8 @@ impl VaeGpu {
     #[allow(clippy::too_many_arguments)]
     fn copy_rows(
         &self,
-        src: &cudarc::driver::CudaView<f32>,
-        dst: &mut cudarc::driver::CudaViewMut<f32>,
+        src: &cudarc::driver::CudaView<u16>,
+        dst: &mut cudarc::driver::CudaViewMut<u16>,
         planes: usize,
         w: usize,
         (src_h, src_row0): (usize, usize),
@@ -1669,8 +1573,8 @@ impl VaeGpu {
     }
 
     /// A device-to-device copy, for a residual path that keeps its operand.
-    fn copy(&self, src: &DevVec) -> Result<DevVec, VaeGpuError> {
-        let mut dst = launch::alloc(&self.dev, src.len)?;
+    fn copy(&self, src: &Bf16Vec) -> Result<Bf16Vec, VaeGpuError> {
+        let mut dst = alloc_bf16(&self.dev, src.len)?;
         self.dev
             .stream
             .memcpy_dtod(&src.buf, &mut dst.buf)
@@ -1683,12 +1587,8 @@ impl VaeGpu {
 // Loading helpers
 // ---------------------------------------------------------------------------
 
-/// The tensor `name` at exactly `shape`, decoded to f32 on the host.
-///
-/// The reference's default is f32: everything it reads goes through
-/// `LbiFile::read_f32`, so a 16-bit weight is widened before use. Widening it on
-/// the host and uploading f32 is the same value the reference computes with, and
-/// it keeps every kernel here on one dtype — see this module's doc comment.
+/// The tensor `name` at exactly `shape`, decoded to f32 on the host by the
+/// container's own reader; the loaders round it to bf16 on upload.
 fn read_exact(file: &LbiFile, name: &str, shape: &[usize]) -> Result<Vec<f32>, VaeGpuError> {
     let want: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
     let entry = file
@@ -1698,11 +1598,6 @@ fn read_exact(file: &LbiFile, name: &str, shape: &[usize]) -> Result<Vec<f32>, V
         return Err(mismatch(name, &want, &entry.shape));
     }
     read_f32(file, name)
-}
-
-/// A tensor decoded to f32 by the container's own reader, then uploaded.
-fn read_f32_tensor(dev: &CudaDevice, file: &LbiFile, name: &str) -> Result<DevVec, VaeGpuError> {
-    Ok(launch::upload(dev, &read_f32(file, name)?)?)
 }
 
 /// A tensor decoded to f32 by the container's own reader.
@@ -1719,28 +1614,19 @@ fn read_f32(file: &LbiFile, name: &str) -> Result<Vec<f32>, VaeGpuError> {
     }
 }
 
-/// `nn.Conv2d` weights `[out_c, in_c, k, k]` as `conv_tf32` reads them:
-/// `[out_c, k, k, in_c]`, each value rounded to TF32.
-fn conv_weight_tf32(w: &[f32], out_c: usize, in_c: usize, k: usize) -> Vec<f32> {
+/// `nn.Conv2d` weights `[out_c, in_c, k, k]` as `conv_bf16` reads them:
+/// `[out_c, k, k, in_c]`.
+fn conv_weight_taps_outer(w: &[f32], out_c: usize, in_c: usize, k: usize) -> Vec<f32> {
     let taps = k * k;
     let mut out = vec![0.0f32; w.len()];
     for o in 0..out_c {
         for i in 0..in_c {
             for t in 0..taps {
-                out[(o * taps + t) * in_c + i] = tf32_round(w[(o * in_c + i) * taps + t]);
+                out[(o * taps + t) * in_c + i] = w[(o * in_c + i) * taps + t];
             }
         }
     }
     out
-}
-
-/// `x` rounded to TF32 (10 mantissa bits) to nearest, ties away from zero: the
-/// `cvt.rna.tf32.f32` the input copy applies to activations.
-fn tf32_round(x: f32) -> f32 {
-    if !x.is_finite() {
-        return x;
-    }
-    f32::from_bits(x.to_bits().wrapping_add(0x1000) & !0x1fff)
 }
 
 /// A cuBLAS operand transpose.
@@ -1759,21 +1645,9 @@ impl Op {
     }
 }
 
-/// How an f32 GEMM multiplies, matching what the reference's operation does
-/// in f32 under torch's defaults.
-#[derive(Clone, Copy)]
-enum Math {
-    /// TF32 tensor-core products with f32 accumulation: a convolution, which
-    /// cuDNN runs this way while `torch.backends.cudnn.allow_tf32` is true,
-    /// its default.
-    Tf32,
-    /// Full f32 products: the attention, whose f32 kernel in the reference
-    /// computes at full f32 accuracy.
-    F32,
-}
-
 /// f32 `C_cm[m, n] = alpha · op(A_cm) · op(B_cm)`, `op(A)` being `[m, k]` and
-/// `op(B)` `[k, n]`, with the products computed as `math` says.
+/// `op(B)` `[k, n]`, with full f32 products: the reference's attention keeps
+/// its scores and softmax in f32.
 ///
 /// # Safety
 ///
@@ -1782,7 +1656,6 @@ enum Math {
 #[allow(clippy::too_many_arguments)]
 unsafe fn sgemm(
     dev: &CudaDevice,
-    math: Math,
     op_a: Op,
     op_b: Op,
     alpha: f32,
@@ -1820,10 +1693,7 @@ unsafe fn sgemm(
         c_ptr as *mut std::ffi::c_void,
         cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F,
         ldc as i32,
-        match math {
-            Math::Tf32 => cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
-            Math::F32 => cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-        },
+        cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
         cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
     );
     if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -1847,16 +1717,16 @@ fn load_ops(dev: &CudaDevice) -> Result<VaeOps, RuntimeError> {
             .map_err(|e| RuntimeError::Compute(format!("load {name}: {e}")))
     };
     Ok(VaeOps {
-        im2col: get(&module, "im2col_band")?,
-        bias_add: get(&module, "bias_add_channels")?,
-        to_channels_last: get(&conv_module, "to_channels_last_tf32")?,
-        conv: get(&conv_module, "conv_tf32")?,
+        to_channels_last: get(&conv_module, "to_channels_last_bf16")?,
+        conv: get(&conv_module, "conv_bf16")?,
         nearest_2x: get(&module, "nearest_2x")?,
         dup_up: get(&module, "dup_up_first_chunk")?,
         rms_norm: get(&module, "rms_norm_channels")?,
         silu: get(&module, "silu_inplace")?,
         add: get(&module, "add_inplace")?,
         softmax: get(&module, "softmax_rows_f32")?,
+        widen: get(&module, "widen_bf16")?,
+        round: get(&module, "round_bf16")?,
         copy_rows: get(&module, "copy_rows")?,
     })
 }
@@ -1984,25 +1854,6 @@ mod tests {
         assert!(DupUp::new(5, 3, 1, 2).is_err());
     }
 
-    /// `vae.rs`'s `rms_norm_is_normalize_times_sqrt_dim`, evaluated the way the
-    /// kernel's expression is parenthesized: `(v / denom) * sqrt(C) * gamma`.
-    #[test]
-    fn rms_norm_mirrors_the_reference() {
-        let x = [1.0f32, 2., 3., 4.];
-        let denom = x
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            .sqrt()
-            .max(NORMALIZE_EPS);
-        let scale = (x.len() as f32).sqrt();
-        let got: Vec<f32> = x.iter().map(|v| (v / denom) * scale * 1.0).collect();
-        let want = [0.36514837, 0.73029673, 1.0954452, 1.4605935];
-        for (g, w) in got.iter().zip(&want) {
-            assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
-        }
-    }
-
     /// The clamp, not an epsilon, is what keeps an all-zero channel vector
     /// finite: `F.normalize` divides by `max(||x||, 1e-12)`, so the result is
     /// still zero. An epsilon-RMS with eps = 1e-6 would be the same zero here,
@@ -2097,7 +1948,7 @@ mod tests {
         assert_eq!(c.grid_dim, (2, 1, 1));
         let c = cfg_1d((THREADS as u64) * 4096, THREADS);
         assert_eq!(c.grid_dim, (4096, 1, 1));
-        // 288 channels at 1024x1024, the decoder's largest f32 activation.
+        // 288 channels at 1024x1024, the decoder's largest activation.
         let total = 288u64 * 1024 * 1024;
         let c = cfg_1d(total, THREADS);
         assert_eq!(c.grid_dim, ((total / THREADS as u64) as u32, 1, 1));
@@ -2106,34 +1957,369 @@ mod tests {
         assert!((c.grid_dim.0 as u64) * THREADS as u64 >= total);
     }
 
-    /// TF32 keeps 10 mantissa bits, rounding to nearest with ties away from
-    /// zero, as `cvt.rna.tf32.f32` does on the device.
+    /// Deterministic values `k / den` with `|k| <= span`: every one is exact
+    /// in bf16, and sums of their products stay exact in f32 whatever the
+    /// order, so a kernel's result depends only on where it rounds.
+    fn exact_values(n: usize, span: i64, den: f32, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as i64 % (2 * span + 1) - span) as f32 / den
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u16> {
+        v.iter().map(|&x| bf16_bits(x)).collect()
+    }
+
+    /// Every bf16 kernel against a host rendering of the reference's bf16 op,
+    /// bit for bit, on inputs chosen so that only the rounding points decide
+    /// the result; each check also shows that a kernel rounding elsewhere
+    /// would fail it. Run on a CUDA device with `--ignored`.
     #[test]
-    fn tf32_round_keeps_ten_mantissa_bits_ties_away() {
-        let ulp = 2f32.powi(-10);
-        assert_eq!(tf32_round(1.0), 1.0);
-        assert_eq!(tf32_round(1.0 + ulp), 1.0 + ulp);
-        // Exactly half an ulp rounds away from zero, just under it rounds down.
-        assert_eq!(tf32_round(1.0 + ulp / 2.0), 1.0 + ulp);
-        assert_eq!(tf32_round(-(1.0 + ulp / 2.0)), -(1.0 + ulp));
-        assert_eq!(tf32_round(1.0 + ulp / 2.0 - 2f32.powi(-23)), 1.0);
-        assert_eq!(tf32_round(0.0).to_bits(), 0);
-        assert_eq!(tf32_round(-0.0).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(tf32_round(f32::INFINITY), f32::INFINITY);
-        assert!(tf32_round(f32::NAN).is_nan());
-        // Every result has its low 13 bits clear.
-        for x in [0.1f32, -3.7, 1e-30, 6.5e4, 123_456.79] {
-            assert_eq!(tf32_round(x).to_bits() & 0x1fff, 0, "{x}");
+    #[ignore = "needs a CUDA device"]
+    fn bf16_kernels_round_where_the_reference_does() {
+        let dev = CudaDevice::new(0).expect("a CUDA device");
+        let ops = load_ops(&dev).expect("the VAE kernels compile");
+        let up = |v: &[u16]| dev.htod_copy(v).unwrap();
+        let down = |b: &CudaSlice<u16>| {
+            let v = dev.dtoh_copy(b).unwrap();
+            dev.synchronize().unwrap();
+            v
+        };
+        let b = |x: f32| bf16_f32(bf16_bits(x));
+
+        // conv_bf16: `B(B(sum) + bias)`. A dot product of 1 + 1/256 with bias
+        // 1/256 is 1 with the two roundings and 1.0078125 with one.
+        let conv = |in_c: usize,
+                    out_c: usize,
+                    k: usize,
+                    h: usize,
+                    w: usize,
+                    x: &[f32],
+                    wt: &[f32],
+                    bias: &[f32]| {
+            let hw = h * w;
+            let xb = up(&bits(x));
+            let xt = unsafe { dev.alloc_uninit::<u16>(in_c * hw) }.unwrap();
+            let wb = up(&bits(&conv_weight_taps_outer(wt, out_c, in_c, k)));
+            let bb = up(&bits(bias));
+            let y = unsafe { dev.alloc_uninit::<u16>(out_c * hw) }.unwrap();
+            let (icu, ocu, hu, wu, ku, n) = (
+                in_c as u32,
+                out_c as u32,
+                h as u32,
+                w as u32,
+                k as u32,
+                hw as u32,
+            );
+            unsafe {
+                dev.stream
+                    .launch_builder(&ops.to_channels_last)
+                    .arg(&xb)
+                    .arg(&xt)
+                    .arg(&icu)
+                    .arg(&n)
+                    .arg(&(hw as u64))
+                    .launch(LaunchConfig {
+                        grid_dim: (hw.div_ceil(32) as u32, in_c.div_ceil(32) as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .unwrap();
+                dev.stream
+                    .launch_builder(&ops.conv)
+                    .arg(&xt)
+                    .arg(&wb)
+                    .arg(&bb)
+                    .arg(&y)
+                    .arg(&icu)
+                    .arg(&ocu)
+                    .arg(&hu)
+                    .arg(&wu)
+                    .arg(&ku)
+                    .arg(&0u32)
+                    .arg(&0u32)
+                    .arg(&n)
+                    .launch(LaunchConfig {
+                        grid_dim: (
+                            hw.div_ceil(CONV_TILE) as u32,
+                            out_c.div_ceil(CONV_TILE) as u32,
+                            1,
+                        ),
+                        block_dim: (CONV_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .unwrap();
+            }
+            down(&y)
+        };
+        let conv_sum =
+            |in_c: usize, out_c: usize, k: usize, h: usize, w: usize, x: &[f32], wt: &[f32]| {
+                let pad = (k / 2) as i64;
+                let mut sums = vec![0.0f32; out_c * h * w];
+                for o in 0..out_c {
+                    for yy in 0..h as i64 {
+                        for xx in 0..w as i64 {
+                            let mut acc = 0.0f32;
+                            for i in 0..in_c {
+                                for ky in 0..k as i64 {
+                                    for kx in 0..k as i64 {
+                                        let (iy, ix) = (yy + ky - pad, xx + kx - pad);
+                                        if iy < 0 || ix < 0 || iy >= h as i64 || ix >= w as i64 {
+                                            continue;
+                                        }
+                                        acc += wt
+                                            [((o * in_c + i) * k + ky as usize) * k + kx as usize]
+                                            * x[(i * h + iy as usize) * w + ix as usize];
+                                    }
+                                }
+                            }
+                            sums[(o * h + yy as usize) * w + xx as usize] = acc;
+                        }
+                    }
+                }
+                sums
+            };
+        let mut x = vec![0.0f32; 8];
+        x[0] = 1.0;
+        x[1] = 1.0 / 256.0;
+        let mut wt = vec![0.0f32; 8];
+        wt[0] = 1.0;
+        wt[1] = 1.0;
+        let got = conv(8, 1, 1, 1, 1, &x, &wt, &[1.0 / 256.0]);
+        assert_eq!(
+            bf16_f32(got[0]),
+            1.0,
+            "conv_bf16 must round the sum before adding the bias"
+        );
+        assert_eq!(b(1.0 + 1.0 / 256.0 + 1.0 / 256.0), 1.0078125);
+        for (in_c, out_c, k, h, w) in [
+            (144, 136, 3, 9, 21),
+            (1152, 4, 3, 5, 7),
+            (64, 160, 3, 5, 6),
+            (1152, 136, 1, 6, 7),
+            (288, 144, 1, 3, 37),
+        ] {
+            let x = exact_values(in_c * h * w, 8, 8.0, 1);
+            let wt = exact_values(out_c * in_c * k * k, 8, 16.0, 2);
+            let bias = exact_values(out_c, 32, 64.0, 3);
+            let got = conv(in_c, out_c, k, h, w, &x, &wt, &bias);
+            let sums = conv_sum(in_c, out_c, k, h, w, &x, &wt);
+            let hw = h * w;
+            let want: Vec<u16> = sums
+                .iter()
+                .enumerate()
+                .map(|(j, &s)| bf16_bits(b(s) + bias[j / hw]))
+                .collect();
+            let fused: Vec<u16> = sums
+                .iter()
+                .enumerate()
+                .map(|(j, &s)| bf16_bits(s + bias[j / hw]))
+                .collect();
+            assert_eq!(got, want, "conv_bf16 {in_c}->{out_c} {k}x{k} {h}x{w}");
+            assert_ne!(
+                got, fused,
+                "a one-rounding conv must fail on {in_c}->{out_c} {k}x{k}"
+            );
         }
+
+        // rms_norm_channels: n = B(x / d), s = B(n * scale), out = B(B(s * gamma) + 0).
+        for c in [144usize, 1152] {
+            let (batch, hw) = (2usize, 37usize);
+            let mut x = exact_values(batch * c * hw, 8, 8.0, 4);
+            for cc in 0..c {
+                x[cc * hw + 5] = 0.0;
+            }
+            let gamma = exact_values(c, 64, 32.0, 5);
+            let scale = (c as f64).sqrt() as f32;
+            let out = unsafe { dev.alloc_uninit::<u16>(x.len()) }.unwrap();
+            let (xb, gb) = (up(&bits(&x)), up(&bits(&gamma)));
+            let (cu, hwu, ru) = (c as u32, hw as u32, (batch * c) as u32);
+            unsafe {
+                dev.stream
+                    .launch_builder(&ops.rms_norm)
+                    .arg(&xb)
+                    .arg(&gb)
+                    .arg(&out)
+                    .arg(&cu)
+                    .arg(&hwu)
+                    .arg(&ru)
+                    .arg(&NORMALIZE_EPS)
+                    .arg(&scale)
+                    .launch(cfg_1d((batch * hw) as u64, THREADS))
+                    .unwrap();
+            }
+            let got = down(&out);
+            let norm = |round_n: bool, scale: f32| {
+                let mut want = vec![0u16; x.len()];
+                for n in 0..batch {
+                    for p in 0..hw {
+                        let at = |cc: usize| (n * c + cc) * hw + p;
+                        let d = (0..c)
+                            .map(|cc| x[at(cc)] * x[at(cc)])
+                            .sum::<f32>()
+                            .sqrt()
+                            .max(NORMALIZE_EPS);
+                        for cc in 0..c {
+                            let nv = if round_n {
+                                b(x[at(cc)] / d)
+                            } else {
+                                x[at(cc)] / d
+                            };
+                            want[at(cc)] = bf16_bits(b(b(nv * scale) * gamma[cc]) + 0.0);
+                        }
+                    }
+                }
+                want
+            };
+            assert_eq!(got, norm(true, scale), "rms_norm_channels, C={c}");
+            assert_ne!(
+                got,
+                norm(false, scale),
+                "a norm without its first rounding must fail, C={c}"
+            );
+            if c == 1152 {
+                assert_ne!(got, norm(true, b(scale)), "a bf16-rounded scale must fail");
+            }
+        }
+
+        // add_inplace and dup_up_first_chunk: B(a + b); silu_inplace: one rounding.
+        let a = exact_values(4099, 1000, 37.0, 6);
+        let c2 = exact_values(4099, 1000, 41.0, 7);
+        let ab = up(&bits(&a));
+        let cb = up(&bits(&c2));
+        let n = a.len() as u32;
+        unsafe {
+            dev.stream
+                .launch_builder(&ops.add)
+                .arg(&ab)
+                .arg(&cb)
+                .arg(&n)
+                .launch(cfg_1d(n as u64, THREADS))
+                .unwrap();
+        }
+        let want: Vec<u16> = a
+            .iter()
+            .zip(&c2)
+            .map(|(&p, &q)| bf16_bits(b(p) + b(q)))
+            .collect();
+        assert_eq!(down(&ab), want, "add_inplace");
+        let sb = up(&bits(&a));
+        unsafe {
+            dev.stream
+                .launch_builder(&ops.silu)
+                .arg(&sb)
+                .arg(&n)
+                .launch(cfg_1d(n as u64, THREADS))
+                .unwrap();
+        }
+        // The device's `expf` and the host's may differ in the last f32 bit,
+        // which moves the bf16 result only when the f32 value lies within a
+        // few bits of a rounding tie; everywhere else the result must be exact,
+        // which pins a single rounding to nearest (a tie's direction falls
+        // inside the allowance).
+        let got = down(&sb);
+        let (mut exact, mut off) = (0usize, 0usize);
+        for (&v, &g) in a.iter().zip(&got) {
+            let v = b(v);
+            let r = v / (1.0 + (-v).exp());
+            let want = bf16_bits(r);
+            let near_tie = ((r.to_bits() & 0xffff) as i32 - 0x8000).abs() <= 64;
+            if near_tie {
+                off += usize::from((want as i32 - g as i32).abs() > 1);
+            } else {
+                exact += 1;
+                off += usize::from(want != g);
+            }
+        }
+        assert_eq!(off, 0, "silu_inplace");
+        assert!(
+            exact > a.len() * 9 / 10,
+            "silu_inplace: only {exact} values away from a tie"
+        );
+        let spec = DupUp::new(4, 2, 2, 2).unwrap();
+        let (bt, h, w) = (1usize, 2usize, 3usize);
+        let src = exact_values(bt * 4 * h * w, 1000, 37.0, 8);
+        let dst = exact_values(bt * spec.out_c * h * 2 * w * 2, 1000, 41.0, 9);
+        let gathered = dup_up_reference(
+            &src.iter().map(|&v| b(v)).collect::<Vec<_>>(),
+            bt,
+            4,
+            h,
+            w,
+            &spec,
+        );
+        let (xb, db) = (up(&bits(&src)), up(&bits(&dst)));
+        let args = [
+            bt,
+            4,
+            h,
+            w,
+            spec.out_c,
+            spec.factor_t,
+            spec.factor_s,
+            spec.repeats,
+        ]
+        .map(|v| v as u32);
+        unsafe {
+            let mut l = dev.stream.launch_builder(&ops.dup_up);
+            l.arg(&xb).arg(&db);
+            for v in &args {
+                l.arg(v);
+            }
+            l.launch(cfg_1d(dst.len() as u64, THREADS)).unwrap();
+        }
+        let want: Vec<u16> = dst
+            .iter()
+            .zip(&gathered)
+            .map(|(&d, &g)| bf16_bits(b(d) + g))
+            .collect();
+        assert_eq!(down(&db), want, "dup_up_first_chunk");
+
+        // widen_bf16 and round_bf16 are exact conversions.
+        let f: Vec<f32> = exact_values(1000, 1 << 20, 3.0, 10);
+        let fd = dev.htod_copy(&f).unwrap();
+        let rb = unsafe { dev.alloc_uninit::<u16>(f.len()) }.unwrap();
+        let wd = unsafe { dev.alloc_uninit::<f32>(f.len()) }.unwrap();
+        let nf = f.len() as u64;
+        unsafe {
+            dev.stream
+                .launch_builder(&ops.round)
+                .arg(&fd)
+                .arg(&rb)
+                .arg(&nf)
+                .launch(cfg_1d(nf, THREADS))
+                .unwrap();
+            dev.stream
+                .launch_builder(&ops.widen)
+                .arg(&rb)
+                .arg(&wd)
+                .arg(&nf)
+                .launch(cfg_1d(nf, THREADS))
+                .unwrap();
+        }
+        assert_eq!(down(&rb), bits(&f), "round_bf16");
+        let widened = dev.dtoh_copy(&wd).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            widened,
+            f.iter().map(|&v| b(v)).collect::<Vec<_>>(),
+            "widen_bf16"
+        );
     }
 
     /// `[out_c, in_c, k, k]` becomes `[out_c, k, k, in_c]`: weight
     /// (o, i, ky, kx) lands at k index `(ky * k + kx) * in_c + i` of row o.
     #[test]
-    fn conv_weight_tf32_puts_taps_outside_channels() {
+    fn conv_weight_puts_taps_outside_channels() {
         let (out_c, in_c, k) = (2, 3, 3);
         let w: Vec<f32> = (0..out_c * in_c * k * k).map(|v| v as f32).collect();
-        let t = conv_weight_tf32(&w, out_c, in_c, k);
+        let t = conv_weight_taps_outer(&w, out_c, in_c, k);
         for o in 0..out_c {
             for i in 0..in_c {
                 for ky in 0..k {
