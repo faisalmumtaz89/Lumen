@@ -1180,6 +1180,37 @@ pub fn denormalize_latents_with(
     mean: &[f32],
     std: &[f32],
 ) -> Result<Vec<f32>, VaeError> {
+    denormalize(latents, batch, h, w, mean, std, |l, s, m| l * s + m)
+}
+
+/// [`denormalize_latents_with`] as the reference computes it once the
+/// latents, `latents_std` and `latents_mean` are cast to bf16, the GPU
+/// decoder's precision: each operand rounded to bf16, the product rounded,
+/// then the sum. The product of two bf16 values is exact in f32, so rounding
+/// the f32 product gives the bf16 product.
+pub fn denormalize_latents_bf16(
+    latents: &[f32],
+    batch: usize,
+    h: usize,
+    w: usize,
+    mean: &[f32],
+    std: &[f32],
+) -> Result<Vec<f32>, VaeError> {
+    let b = crate::tensor::bf16_round;
+    denormalize(latents, batch, h, w, mean, std, |l, s, m| {
+        b(b(b(l) * b(s)) + b(m))
+    })
+}
+
+fn denormalize(
+    latents: &[f32],
+    batch: usize,
+    h: usize,
+    w: usize,
+    mean: &[f32],
+    std: &[f32],
+    op: impl Fn(f32, f32, f32) -> f32,
+) -> Result<Vec<f32>, VaeError> {
     if mean.len() != std.len() {
         return Err(VaeError::BadConfig(format!(
             "latents_mean has {} entries but latents_std has {}",
@@ -1209,7 +1240,7 @@ pub fn denormalize_latents_with(
             for c in 0..z {
                 let src = (b * hw + p) * z + c;
                 let dst = (b * z + c) * hw + p;
-                out[dst] = latents[src] * std[c] + mean[c];
+                out[dst] = op(latents[src], std[c], mean[c]);
             }
         }
     }
@@ -1223,6 +1254,27 @@ pub fn denormalize_latents_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The product is rounded to bf16 before the mean is added: with latent
+    /// and std 1.0078125 the product 1.0157470703125 rounds to 1.015625, and
+    /// adding 2^-8 then lands on a tie that rounds to even, 1.015625; one
+    /// rounding of the whole expression would give 1.0234375. A negative zero
+    /// survives, as torch's product and sum keep it. The latents arrive
+    /// token-major and leave channel-major.
+    #[test]
+    fn bf16_denormalisation_rounds_the_product_before_the_mean() {
+        let latents = [1.0078125f32, 0.0, 2.0, 3.0, -0.0, 1.0];
+        let got =
+            denormalize_latents_bf16(&latents, 1, 1, 3, &[1.0 / 256.0, 0.5], &[1.0078125, 1.0])
+                .unwrap();
+        assert_eq!(got, vec![1.015625, 2.015625, 1.0 / 256.0, 0.5, 3.5, 1.5]);
+        assert_eq!(
+            crate::tensor::bf16_round(1.0078125f32 * 1.0078125 + 1.0 / 256.0),
+            1.0234375
+        );
+        let zero = denormalize_latents_bf16(&[-0.0], 1, 1, 1, &[-0.0], &[1.0]).unwrap();
+        assert_eq!(zero[0].to_bits(), (-0.0f32).to_bits());
+    }
     use crate::lbi::LbiWriter;
     use lumen_format::QuantScheme;
 

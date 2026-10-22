@@ -47,8 +47,10 @@ def bf16_variant_bars(vae, z, ref16, ref32):
         if mode["conv"] == "exact":
             tf32 = torch.backends.cudnn.allow_tf32
             torch.backends.cudnn.allow_tf32 = False
-            out = F.conv2d(x.float(), w.float(), None, 1, (ph, pw)).to(torch.bfloat16)
-            torch.backends.cudnn.allow_tf32 = tf32
+            try:
+                out = F.conv2d(x.float(), w.float(), None, 1, (ph, pw)).to(torch.bfloat16)
+            finally:
+                torch.backends.cudnn.allow_tf32 = tf32
         else:
             n, c, h, wd = x.shape
             oc, _, kh, kw = w.shape

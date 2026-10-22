@@ -19,16 +19,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   ran in f32 with TF32 convolutions; its weights and activations are now bf16, every convolution runs on one bf16
   tensor-core kernel, and each operation rounds where the reference's bf16 operation does. Pictures change slightly:
   on twelve test images (1024×1024, 768×1344, 256×256) the decode is 60.4-65.0 dB (1024×1024), 61.2 dB and 56.9 dB
-  from the reference's own bf16 decode of the same latents, within the spread of bf16 decoders that differ from it
-  only in summation order, and as close to the f32 decode as those decoders are. Qwen-Image-2.1 on an RTX 5090,
+  from the reference's own bf16 decode of the same latents. On each image that is no further from it, and from the
+  reference's f32 decode, than bf16 decoders that differ from the reference only in summation order, attention kernel
+  or norm reduction are, give or take the spread between those decoders. Qwen-Image-2.1 on an RTX 5090,
   server: decode 0.32 -> 0.16 s at 1024×1024 and 14.5 -> 0.64 s at 2048×2048; 1024×1024, 40 steps: 15.04 -> 14.60 s
   per image (median of three alternated rounds of ten prompts), partly because the smaller decode leaves room for all
   of the text encoder's layers to stay on the GPU.
-- **Image generation needs a CUDA device with 16.0 GiB, down from 21.0 GiB.** The startup minimum is the measured
-  peak of a 2048×2048 generation, now 16,402 MiB on an RTX 5090.
 
 ### Fixed
 
+- **Image generation's startup memory check covers every size a request may ask for.** The minimum was the
+  measured peak of a 2048×2048 generation, but a request may ask for 4096×4096, which peaks higher while denoising,
+  so a device that passed the check could run out on such a request. It is now that size's measured peak: 22.1 GiB
+  (22,610 MiB on an RTX 5090), up from 21.0 GiB.
 - **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
   keeps the text encoder's first layers on the GPU between generations, but a prompt even one token longer than
   the one it had measured made it free them all, so the next generation uploaded the encoder again. A longer prompt

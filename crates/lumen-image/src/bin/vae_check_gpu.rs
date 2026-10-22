@@ -164,6 +164,11 @@ fn run() -> Result<(), String> {
             bars.data.len()
         ));
     };
+    if !(bar16.is_finite() && bar32.is_finite() && bar16 > 0.0 && bar32 > 0.0) {
+        return Err(format!(
+            "vae_decode_bars [{bar16}, {bar32}] are not positive and finite"
+        ));
+    }
 
     // The oracle's VAE input is [batch, 64, 1, H, W] with H,W the latent size.
     if z.shape.len() != 5 || z16.shape != z.shape {
@@ -289,15 +294,15 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // The mid block's attention in chunks of query rows, 23 of them with a
-    // short last one, against the one chunk these latents take by default.
-    // The chunks' products have another shape, so their sums round
+    // The mid block's attention in chunks of query rows, about 23 of them
+    // with a short last one, against the one chunk these latents take by
+    // default. The chunks' products have another shape, so their sums round
     // differently, and the decoder carries that to the output at the scale of
     // a bf16 rounding here and there, a summation-order difference the bar
     // allows; a chunk that read or wrote the wrong rows moves the output by
-    // order one. The latents must be large enough for the budget to split
-    // them, as 1024x1024's are.
-    gpu_decoder.set_attention_score_budget(3_000_000);
+    // order one.
+    let seq = h * w;
+    gpu_decoder.set_attention_score_budget(seq.div_ceil(23) * seq * 4);
     let chunked = gpu_decoder
         .decode(&z16.data, batch, h, w)
         .map_err(|e| format!("gpu, chunked attention: {e}"))?;

@@ -137,6 +137,9 @@ pub enum VaeGpuError {
     /// A launch a kernel cannot express. Every one of these is a programming
     /// error in this module rather than a property of a checkpoint.
     KernelLimit(String),
+    /// The decode produced this many NaN or infinite values, which the clamp
+    /// would otherwise turn into ordinary pixels.
+    NonFinite(usize),
 }
 
 impl std::fmt::Display for VaeGpuError {
@@ -151,6 +154,7 @@ impl std::fmt::Display for VaeGpuError {
                 )
             }
             Self::KernelLimit(m) => write!(f, "kernel limit: {m}"),
+            Self::NonFinite(n) => write!(f, "the decode produced {n} non-finite values"),
         }
     }
 }
@@ -922,12 +926,16 @@ impl VaeGpu {
 
         // The clamp is the reference's `v.max(-1.0).min(1.0)` on the finished
         // tensor; the device is synchronized first, so the copy is complete.
+        // `f32::max` would turn a NaN into -1, so a non-finite value is refused
+        // before it.
         let bits = self.dev.dtoh_copy(&out.buf)?;
         self.dev.synchronize()?;
-        Ok(bits
-            .into_iter()
-            .map(|b| bf16_f32(b).max(-1.0).min(1.0))
-            .collect())
+        let data: Vec<f32> = bits.into_iter().map(bf16_f32).collect();
+        let non_finite = data.iter().filter(|v| !v.is_finite()).count();
+        if non_finite > 0 {
+            return Err(VaeGpuError::NonFinite(non_finite));
+        }
+        Ok(data.into_iter().map(|v| v.max(-1.0).min(1.0)).collect())
     }
 
     /// The decoder after the mid block, over `[batch, c, h, w]`: the up blocks,
@@ -2213,19 +2221,28 @@ mod tests {
                 .launch(cfg_1d(n as u64, THREADS))
                 .unwrap();
         }
+        // The device's `expf` and the host's may differ in the last f32 bit,
+        // which moves the bf16 result only when the f32 value lies within a
+        // few bits of a rounding tie; everywhere else the result must be exact,
+        // which pins the single round-to-nearest-even.
         let got = down(&sb);
-        let off = a
-            .iter()
-            .zip(&got)
-            .filter(|(&v, &g)| {
-                let v = b(v);
-                let want = bf16_bits(v / (1.0 + (-v).exp()));
-                want != g && (want as i32 - g as i32).abs() != 1
-            })
-            .count();
-        assert_eq!(
-            off, 0,
-            "silu_inplace beyond one bf16 ulp of the reference expression"
+        let (mut exact, mut off) = (0usize, 0usize);
+        for (&v, &g) in a.iter().zip(&got) {
+            let v = b(v);
+            let r = v / (1.0 + (-v).exp());
+            let want = bf16_bits(r);
+            let near_tie = ((r.to_bits() & 0xffff) as i32 - 0x8000).abs() <= 64;
+            if near_tie {
+                off += usize::from((want as i32 - g as i32).abs() > 1);
+            } else {
+                exact += 1;
+                off += usize::from(want != g);
+            }
+        }
+        assert_eq!(off, 0, "silu_inplace");
+        assert!(
+            exact > a.len() * 9 / 10,
+            "silu_inplace: only {exact} values away from a tie"
         );
         let spec = DupUp::new(4, 2, 2, 2).unwrap();
         let (bt, h, w) = (1usize, 2usize, 3usize);

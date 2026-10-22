@@ -476,12 +476,13 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
-/// The most device memory a generation uses, in bytes: 16,402 MiB, measured
-/// as the device's used memory at the peak of a 2048x2048 generation (a
-/// 1024x1024 generation peaks at 14,930 MiB) on an RTX 5090 with a 10 ms
+/// The most device memory a generation uses, in bytes: 22,610 MiB, measured
+/// as the device's used memory at the peak of a 4096x4096 generation, the
+/// largest size a request may ask for (reached while denoising; 2048x2048
+/// peaks at 16,402 MiB, 1024x1024 at 14,930 MiB), on an RTX 5090 with a 10 ms
 /// `nvidia-smi` sampler. A device with less total memory would fail a request
 /// at that size, so the startup check refuses it instead.
-pub const PEAK_DEVICE_BYTES: u64 = 16_402 << 20;
+pub const PEAK_DEVICE_BYTES: u64 = 22_610 << 20;
 
 /// The compute capability the GPU pipeline needs: the text tower's flash
 /// attention and the VAE's convolutions are built for it.
@@ -507,7 +508,7 @@ pub fn check_device_facts(cc: (i32, i32), total_bytes: u64) -> Result<(), Pipeli
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(PipelineError::Unsupported(format!(
             "image generation needs a CUDA device with at least {:.1} GiB of memory \
-             ({PEAK_DEVICE_BYTES} bytes; the startup minimum, from the measured 2048x2048 peak) \
+             ({PEAK_DEVICE_BYTES} bytes; the startup minimum, from the measured 4096x4096 peak) \
              and the device has {:.1} GiB ({total_bytes} bytes)",
             gib(PEAK_DEVICE_BYTES),
             gib(total_bytes),
@@ -1203,8 +1204,9 @@ fn decode_gpu(
 ) -> Result<Rgba, String> {
     let lat_h = latent_side(req.height);
     let lat_w = latent_side(req.width);
-    let denorm = denormalize_latents_bf16(
+    let denorm = crate::vae::denormalize_latents_bf16(
         latents,
+        1,
         lat_h,
         lat_w,
         &vae.config().latents_mean,
@@ -1215,33 +1217,6 @@ fn decode_gpu(
         .decode_in_bands(&denorm, 1, lat_h, lat_w, bands)
         .map_err(|e| format!("{e}"))?;
     Ok(Rgba::from_planar_rgba(lat_w * 16, lat_h * 16, &decoded))
-}
-
-/// `latents * std + mean` for the bf16 decoder, as the reference computes it
-/// once the latents, `latents_std` and `latents_mean` are cast to the VAE's
-/// bf16: each operand rounded to bf16, the product rounded, then the sum. The
-/// product of two bf16 values is exact in f32, so the f32 product below rounds
-/// to the bf16 product.
-#[cfg(feature = "cuda")]
-fn denormalize_latents_bf16(
-    latents: &[f32],
-    h: usize,
-    w: usize,
-    mean: &[f32],
-    std: &[f32],
-) -> Result<Vec<f32>, crate::vae::VaeError> {
-    use crate::tensor::bf16_round;
-    let round = |v: &[f32]| v.iter().map(|&x| bf16_round(x)).collect::<Vec<f32>>();
-    let zero = vec![0.0f32; mean.len()];
-    let product =
-        crate::vae::denormalize_latents_with(&round(latents), 1, h, w, &zero, &round(std))?;
-    let mean = round(mean);
-    let hw = h * w;
-    Ok(product
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| bf16_round(bf16_round(v) + mean[i / hw]))
-        .collect())
 }
 
 #[cfg(test)]
@@ -1294,29 +1269,6 @@ mod room_tests {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
-mod denormalize_tests {
-    use super::denormalize_latents_bf16;
-
-    /// The product is rounded to bf16 before the mean is added: with latent
-    /// and std 1.0078125 the product 1.0157470703125 rounds to 1.015625, and
-    /// adding 2^-8 then lands on a tie that rounds to even, 1.015625; one
-    /// rounding of the whole expression would give 1.0234375. The latents
-    /// arrive token-major and leave channel-major.
-    #[test]
-    fn the_product_rounds_before_the_mean_is_added() {
-        let (h, w) = (1usize, 2usize);
-        let latents = [1.0078125f32, 0.0, 2.0, 3.0];
-        let got = denormalize_latents_bf16(&latents, h, w, &[1.0 / 256.0, 0.5], &[1.0078125, 1.0])
-            .unwrap();
-        assert_eq!(got, vec![1.015625, 2.015625, 0.5, 3.5]);
-        assert_eq!(
-            crate::tensor::bf16_round(1.0078125f32 * 1.0078125 + 1.0 / 256.0),
-            1.0234375
-        );
-    }
-}
-
 #[cfg(test)]
 mod device_facts_tests {
     use super::{check_device_facts, PEAK_DEVICE_BYTES};
@@ -1333,11 +1285,11 @@ mod device_facts_tests {
             "{err}"
         );
         assert!(
-            err.contains("16.0 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
+            err.contains("22.1 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
             "{err}"
         );
         assert!(
-            err.contains("at least 16.0 GiB") && err.contains("the device has 12.0 GiB"),
+            err.contains("at least 22.1 GiB") && err.contains("the device has 12.0 GiB"),
             "{err}"
         );
         assert!(err.contains("startup minimum"), "{err}");
