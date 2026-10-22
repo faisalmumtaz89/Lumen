@@ -152,7 +152,7 @@ fn run() -> Result<(), String> {
     };
 
     // The oracle's own inputs, read before the device is touched so a bad
-    // oracle directory fails without a 1 GiB upload in the way.
+    // oracle directory fails without a weight upload in the way.
     let z = load("vae_decode_input")?;
     let want = load("vae_decode_output")?;
     let z16 = load("vae_decode_input_bf16")?;

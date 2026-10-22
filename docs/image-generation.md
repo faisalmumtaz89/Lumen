@@ -53,7 +53,7 @@ The rest of this page covers that by-hand path and the endpoint.
   image` runs, a generation's device memory peaks at 14.6 GiB for a 1024×1024 image and
   16.0 GiB for a 2048×2048 one with a short prompt, and at 23.1 GiB for a 4096×4096 one, the
   largest size a request may ask for, with the longest prompt it may send; the server, which
-  keeps the VAE loaded while it denoises, at 23.6 GiB for that one. The server refuses to
+  keeps the VAE loaded while it denoises, needs 23.6 GiB while it denoises that one. The server refuses to
   start, and `lumen image` to run, on a device below compute capability 8.0 or with less than
   23.6 GiB in total, naming both amounts:
   one requirement for every size, since the server serves any size per request. The transformer and the VAE normally stay loaded
