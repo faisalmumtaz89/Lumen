@@ -553,9 +553,12 @@ pub fn generate_gpu(
     let ids = sources.tokenizer.encode(&render_prompt(req.prompt))?;
     let (text, _) = encode_prompt_gpu(sources, &dev, &ids, ResidentLayers::default(), None)?;
     let dit = sources.load_dit(&dev)?;
-    let pool = PoolReuse::start(&dev)?;
-    let latents = denoise_gpu(&dit, req, &text, progress)?;
+    let pool = PoolReuse::start(&dev);
+    let latents = denoise_gpu(&dit, req, &text, progress);
+    // The transformer's weights are freed before the pool is trimmed, on
+    // every exit.
     drop(dit);
+    let latents = latents?;
     // The VAE's kernels and cuBLAS handle load outside the pool.
     pool.release_unused()?;
     let vae = crate::cuda::vae_gpu::VaeGpu::load_with(&sources.vae, &dev, None)
@@ -573,6 +576,7 @@ pub fn generate_gpu(
             Err(e) => return Err(PipelineError::Unsupported(e)),
         }
     };
+    drop(vae);
     pool.finish()?;
     Ok(image)
 }
@@ -767,13 +771,7 @@ impl GpuResident {
             Some(dit) => dit,
             None => self.sources.load_dit(&self.dev)?,
         };
-        let pool = match PoolReuse::start(&self.dev) {
-            Ok(pool) => pool,
-            Err(e) => {
-                self.dit = Some(dit);
-                return Err(e);
-            }
-        };
+        let pool = PoolReuse::start(&self.dev);
         let mut latents = denoise_gpu(&dit, req, &text, progress);
         // Kept layers are only ever an estimate's worth: a step that runs out
         // beside them drops them and the estimate, and runs again.
@@ -1005,13 +1003,13 @@ fn memory_pool_peak(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Result<usize,
 /// again. A denoising step synchronizes several times and the decode allocates
 /// gigabytes, so from just before the denoising steps to the end of the decode
 /// the threshold is raised and that memory is reused instead. Afterwards the
-/// pool is trimmed, so between generations the device holds only what is kept
-/// on purpose, and the next prompt encode reads free memory as before.
+/// threshold is restored and the pool trimmed, handing its unused memory back
+/// to the driver before the next prompt encode reads free memory.
 ///
 /// The pool belongs to the device, not to one pipeline: this assumes one
-/// generation at a time on the device, as the image server runs them. A
-/// device without memory pools allocates outside any pool, and this does
-/// nothing there.
+/// generation at a time on the device, as the image server runs them. On a
+/// device without memory pools, or whose pool cannot be read, nothing is
+/// kept.
 #[cfg(feature = "cuda")]
 struct PoolReuse {
     ctx: std::sync::Arc<cudarc::driver::CudaContext>,
@@ -1021,23 +1019,20 @@ struct PoolReuse {
 
 #[cfg(feature = "cuda")]
 impl PoolReuse {
-    fn start(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Result<Self, PipelineError> {
+    fn start(dev: &lumen_runtime::cuda::ffi::CudaDevice) -> Self {
         use cudarc::driver::sys::CUdevice_attribute as Attr;
-        let pools = dev
+        let supported = dev
             .ctx
             .attribute(Attr::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)
-            .map_err(|e| PipelineError::Unsupported(format!("memory pool: {e}")))?;
-        let pool = if pools == 0 {
-            None
-        } else {
-            let pool = memory_pool(dev)?;
-            set_release_threshold(pool, u64::MAX)?;
-            Some(pool)
-        };
-        Ok(Self {
+            .is_ok_and(|v| v != 0);
+        let pool = supported
+            .then(|| memory_pool(dev).ok())
+            .flatten()
+            .filter(|&pool| set_release_threshold(pool, u64::MAX).is_ok());
+        Self {
             ctx: dev.ctx.clone(),
             pool,
-        })
+        }
     }
 
     /// Hand the pool's unused memory back to the driver once every queued
@@ -1056,18 +1051,23 @@ impl PoolReuse {
     }
 
     /// Restore the release threshold and trim the pool, once the generation's
-    /// device buffers are dropped.
+    /// device buffers are dropped. A failure leaves the guard armed, so
+    /// dropping it tries again.
     fn finish(mut self) -> Result<(), PipelineError> {
         let result = self.restore();
-        self.pool = None;
+        if result.is_ok() {
+            self.pool = None;
+        }
         result
     }
 
+    /// Both steps are attempted; the first failure is reported.
     fn restore(&self) -> Result<(), PipelineError> {
-        if let Some(pool) = self.pool {
-            set_release_threshold(pool, 0)?;
-        }
-        self.release_unused()
+        let threshold = self
+            .pool
+            .map_or(Ok(()), |pool| set_release_threshold(pool, 0));
+        let trim = self.release_unused();
+        threshold.and(trim)
     }
 }
 
