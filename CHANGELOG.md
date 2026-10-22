@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Fixed
+
+- **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
+  keeps the text encoder's first layers on the GPU between generations, but a prompt even one token longer than
+  the one it had measured made it free them all, so the next generation uploaded the encoder again. A longer prompt
+  now keeps them against the measured memory scaled by its text length and measures the memory again.
+  Qwen-Image-2.1 on an RTX 5090, 1024x1024, ten prompts of 32-46 tokens in a row: after the first two generations
+  no prompt encoding took longer than 0.33 s, where two re-uploads took 1.18-1.21 s; images are byte-identical.
+
 ## [0.50.0] — 2026-10-22
 
 ### Changed
