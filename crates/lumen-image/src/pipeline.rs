@@ -645,9 +645,10 @@ impl GpuSources {
 /// denoising and decoding use above that point is recorded (the peak of the
 /// memory pool they allocate from). Later generations of that size keep as
 /// many layers from the first as leave that much free plus
-/// [`RESIDENT_TEXT_MARGIN`], a longer prompt than the recorded one that much
-/// more in proportion to its text rows ([`room_for`]), and load only the
-/// rest. A denoising or decoding step that still runs out of memory drops the
+/// [`RESIDENT_TEXT_MARGIN`], and load only the rest; a prompt longer than the
+/// recorded one reserves that much more in proportion to its text rows
+/// ([`room_for`]) and records the size again, keeping the larger figure. A
+/// denoising or decoding step that still runs out of memory drops the
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
@@ -715,11 +716,10 @@ impl GpuResident {
         // Layers are kept only beside a resident transformer: the room was
         // measured with it loaded, and the free memory of a device without it
         // would count the space its reload needs.
-        let room = self
-            .room
-            .get(&size)
+        let recorded = self.room.get(&size).copied();
+        let room = recorded
             .filter(|_| self.dit.is_some())
-            .and_then(|&(tokens, bytes)| room_for(bytes, tokens, ids.len()));
+            .and_then(|(tokens, bytes)| room_for(bytes, tokens, ids.len()));
         let resident = std::mem::take(&mut self.text_layers);
         let (text, kept) = match encode_prompt_gpu(&self.sources, &self.dev, &ids, resident, room) {
             Ok(encoded) => encoded,
@@ -738,15 +738,18 @@ impl GpuResident {
         };
         self.text_layers = kept;
 
-        // A size not yet measured runs with no text layers kept; its room is
-        // recorded only from a run with denoising steps that keeps the
-        // transformer throughout, so the figure is what the same run needs
-        // next time. The measurement starts once every free queued so far has
-        // taken effect.
+        // A size not yet measured runs with no text layers kept, and a prompt
+        // longer than the measured one with the scaled room; either records the
+        // size's room, from a run with denoising steps that keeps the
+        // transformer and its text layers throughout, so the figure is what the
+        // same run needs next time. The pool's growth above the start does not
+        // depend on the layers kept. The measurement starts once every free
+        // queued so far has taken effect.
         // A device whose pool cannot be read is never measured, so it keeps
         // no text layers.
-        let measure_from = match (room, &self.dit) {
-            (None, Some(_)) if req.steps > 0 => {
+        let longer = recorded.map_or(true, |(tokens, _)| ids.len() > tokens);
+        let mut measure_from = match &self.dit {
+            Some(_) if req.steps > 0 && longer => {
                 synchronize(&self.dev)?;
                 memory_pool_reset(&self.dev).ok()
             }
@@ -760,6 +763,7 @@ impl GpuResident {
         // Kept layers are only ever an estimate's worth: a step that runs out
         // beside them drops them and the estimate, and runs again.
         if matches!(&latents, Err(e) if is_out_of_memory(e)) && !self.text_layers.is_empty() {
+            measure_from = None;
             if let Err(e) = self.forget_room(size) {
                 self.dit = Some(dit);
                 return Err(e);
@@ -783,6 +787,7 @@ impl GpuResident {
             match decode_gpu(&self.vae, req, &latents, bands) {
                 Ok(image) => break image,
                 Err(e) if out_of_memory(&e) && !self.text_layers.is_empty() => {
+                    measure_from = None;
                     self.forget_room(size)?;
                 }
                 Err(e) if out_of_memory(&e) && self.dit.is_some() => {
@@ -800,8 +805,9 @@ impl GpuResident {
             // A peak that cannot be read leaves the size unmeasured; the image
             // stands either way.
             if let Ok(peak) = memory_pool_peak(&self.dev) {
-                self.room
-                    .insert(size, (ids.len(), peak.saturating_sub(start)));
+                let bytes = peak.saturating_sub(start);
+                let bytes = recorded.map_or(bytes, |(_, earlier)| bytes.max(earlier));
+                self.room.insert(size, (ids.len(), bytes));
             }
         }
         Ok(image)
