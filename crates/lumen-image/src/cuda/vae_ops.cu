@@ -1,23 +1,21 @@
 // Kernels the VAE decoder's GPU forward needs.
 //
-// The CPU reference is `crate::vae`, and it is the specification. The
-// elementwise kernels here compute the same expression in the same order per
-// output element; the attention products and most convolutions run on cuBLAS
-// (`vae_gpu.rs`) and the rest in `vae_conv.cu`, with accumulation orders of
-// their own, and are checked end-to-end against the reference decode. The four
-// surprises in that file are restated in `vae_gpu.rs`; the kernels need to know
-// that the convolutions are 2-D, that the norm is `F.normalize` rather than an
-// epsilon RMS, and that the DupUp3D shortcut is parameter-free.
+// The decoder runs in bf16, as the reference does when loaded in bf16: every
+// activation is stored as bf16, and each op computes in f32 and rounds its
+// result to bf16 exactly where the reference's bf16 op does (B below is round
+// to nearest even). The four surprises in `crate::vae` are restated in
+// `vae_gpu.rs`; the kernels need to know that the convolutions are 2-D (they
+// run in `vae_conv.cu`), that the norm is `F.normalize` rather than an epsilon
+// RMS, and that the DupUp3D shortcut is parameter-free.
 //
 // Written here:
-//   - im2col_band            a cuBLAS convolution's column matrix, one band
-//                            of output rows at a time
-//   - bias_add_channels      a cuBLAS convolution's bias, after the GEMM
+//   - copy_rows              a run of rows between two planes (banding)
 //   - nearest_2x             nearest-exact 2x upsampling
-//   - dup_up_first_chunk     the parameter-free DupUp3D shortcut, accumulated
+//   - dup_up_first_chunk     the parameter-free DupUp3D shortcut, added
 //   - rms_norm_channels      F.normalize over the channel axis, times sqrt(C)
-//   - silu_inplace           SiLU, matching crate::tensor::silu
-//   - add_inplace            dst += src
+//   - silu_inplace           SiLU
+//   - add_inplace            dst = B(dst + src)
+//   - widen_bf16, round_bf16 the attention's f32 operands and its output
 //   - softmax_rows_f32       row softmax of the attention scores, in place
 //
 // NVRTC-compatible: no includes, extern "C" linkage.
@@ -26,6 +24,22 @@
 // and a kernel that reads it as though it were would still produce plausible
 // numbers. The column of each spatial position is the innermost axis, which is
 // what the per-element index splits below assume.
+
+typedef unsigned short bf16_bits;
+
+__device__ __forceinline__ float bf16_f32(bf16_bits b)
+{
+    return __uint_as_float((unsigned int)b << 16);
+}
+
+// Round to the nearest bf16, ties to even, as torch's float -> bfloat16 does.
+__device__ __forceinline__ bf16_bits f32_bf16(float f)
+{
+    unsigned int u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (bf16_bits)((u >> 16) | 0x40u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (bf16_bits)(u >> 16);
+}
 
 // ---------------------------------------------------------------------------
 // A run of rows copied between two planes of the same width:
@@ -37,8 +51,8 @@
 // image. Each element is a copy, so no arithmetic is involved.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void copy_rows(
-    const float* __restrict__ src,   // [NC, src_h, W]
-    float* __restrict__ dst,         // [NC, dst_h, W]
+    const bf16_bits* __restrict__ src,   // [NC, src_h, W]
+    bf16_bits* __restrict__ dst,         // [NC, dst_h, W]
     unsigned int NC,
     unsigned int W,
     unsigned int src_h,
@@ -69,8 +83,8 @@ extern "C" __global__ void copy_rows(
 // counter covers them and the batch is not a separate argument.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void nearest_2x(
-    const float* __restrict__ x,     // [N, C, H, W]
-    float* __restrict__ out,         // [N, C, 2H, 2W]
+    const bf16_bits* __restrict__ x,     // [N, C, H, W]
+    bf16_bits* __restrict__ out,         // [N, C, 2H, 2W]
     unsigned int NC,
     unsigned int H,
     unsigned int W)
@@ -110,14 +124,14 @@ extern "C" __global__ void nearest_2x(
 // `factor_s` rather than from `IC` and `OC`, because only those two determine
 // the permute the reference performs.
 //
-// The result is *accumulated* into `out` because the shortcut is added to the
-// block's output, and a separate output buffer would be a second copy of the
-// largest activation in the decoder for no gain. One thread per output element,
-// each reading exactly one input element, so the add is exact.
+// The result is *added* into `out`, `out = B(out + shortcut)`, because the
+// shortcut is added to the block's output, and a separate output buffer would
+// be a second copy of the largest activation in the decoder for no gain. One
+// thread per output element, each reading exactly one input element.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void dup_up_first_chunk(
-    const float* __restrict__ x,     // [N, IC, H, W]
-    float* __restrict__ out,         // [N, OC, H*factor_s, W*factor_s], accumulated
+    const bf16_bits* __restrict__ x,     // [N, IC, H, W]
+    bf16_bits* __restrict__ out,         // [N, OC, H*factor_s, W*factor_s], added to
     unsigned int N,
     unsigned int IC,
     unsigned int H,
@@ -150,17 +164,22 @@ extern "C" __global__ void dup_up_first_chunk(
 
     unsigned int j = o * factor + ft * fs * fs + fs1 * fs + fs2;
     unsigned int src_c = j / repeats;
-    out[i] += x[((unsigned long long)(b * IC + src_c)) * H * W + y * W + xi];
+    out[i] = f32_bf16(bf16_f32(out[i]) + bf16_f32(x[((unsigned long long)(b * IC + src_c)) * H * W + y * W + xi]));
 }
 
 // ---------------------------------------------------------------------------
-// `QwenImage21RMS_norm`: out = (x / max(||x||_2, 1e-12)) * sqrt(C) * gamma,
-// where the norm runs over the channel axis at a fixed spatial position.
+// `QwenImage21RMS_norm` in bf16, with the reference's three roundings:
+//
+//     n   = B(x / max(||x||_2, 1e-12))     F.normalize on x widened to f32
+//     s   = B(n * scale)                   scale = sqrt(C) as an f32 scalar
+//     out = B(B(s * gamma) + 0.0)          `+ self.bias`, the float 0.0
+//
+// where the norm runs over the channel axis at a fixed spatial position. The
+// `+ 0.0` changes nothing but the sign of a zero, which it makes positive.
 //
 // This is `F.normalize`, *not* `x / sqrt(mean(x^2) + eps)`: the guard is a clamp
 // on the norm and there is no epsilon inside the square root, so the two
-// disagree sharply for a small-magnitude channel vector. `bias` is False at
-// every construction site, so there is no additive term.
+// disagree sharply for a small-magnitude channel vector.
 //
 // One thread per spatial position of each batch item. The thread reduces the
 // channel column once, walking `cc` in ascending order (the order the
@@ -173,13 +192,14 @@ extern "C" __global__ void dup_up_first_chunk(
 // reduction starts.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void rms_norm_channels(
-    const float* __restrict__ x,       // [rows, HW]
-    const float* __restrict__ gamma,   // [C]
-    float* __restrict__ out,           // [rows, HW]
+    const bf16_bits* __restrict__ x,       // [rows, HW]
+    const bf16_bits* __restrict__ gamma,   // [C]
+    bf16_bits* __restrict__ out,           // [rows, HW]
     unsigned int C,
     unsigned int HW,
     unsigned int rows,
-    float eps)
+    float eps,
+    float scale)
 {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long positions = (unsigned long long)(rows / C) * HW;
@@ -188,48 +208,72 @@ extern "C" __global__ void rms_norm_channels(
     unsigned int p = (unsigned int)(i % HW);
     unsigned int n = (unsigned int)(i / HW);
 
-    const float* xp = x + (unsigned long long)n * C * HW + p;
-    float* op = out + (unsigned long long)n * C * HW + p;
+    const bf16_bits* xp = x + (unsigned long long)n * C * HW + p;
+    bf16_bits* op = out + (unsigned long long)n * C * HW + p;
     float sum_sq = 0.0f;
     for (unsigned int cc = 0; cc < C; cc++) {
-        float vv = xp[(unsigned long long)cc * HW];
+        float vv = bf16_f32(xp[(unsigned long long)cc * HW]);
         sum_sq += vv * vv;
     }
     float denom = sqrtf(sum_sq);
     if (denom < eps) denom = eps;
-    float scale = sqrtf((float)C);
 
     for (unsigned int cc = 0; cc < C; cc++) {
         unsigned long long off = (unsigned long long)cc * HW;
-        op[off] = (xp[off] / denom) * scale * gamma[cc];
+        float nv = bf16_f32(f32_bf16(bf16_f32(xp[off]) / denom));
+        float sv = bf16_f32(f32_bf16(nv * scale));
+        float gv = bf16_f32(f32_bf16(sv * bf16_f32(gamma[cc])));
+        op[off] = f32_bf16(gv + 0.0f);
     }
 }
 
 // ---------------------------------------------------------------------------
-// SiLU, matching `crate::tensor::silu` (`x / (1 + exp(-x))`). `expf` is the same
-// f32 exponential the CPU uses.
+// SiLU, `B(x / (1 + exp(-x)))` in f32, the expression torch's kernel uses.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void silu_inplace(
-    float* __restrict__ x,
+    bf16_bits* __restrict__ x,
     unsigned int n)
 {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float v = x[i];
-    x[i] = v / (1.0f + expf(-v));
+    float v = bf16_f32(x[i]);
+    x[i] = f32_bf16(v / (1.0f + expf(-v)));
 }
 
 // ---------------------------------------------------------------------------
-// dst += src, elementwise.
+// dst = B(dst + src), elementwise.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void add_inplace(
-    float* __restrict__ dst,
-    const float* __restrict__ src,
+    bf16_bits* __restrict__ dst,
+    const bf16_bits* __restrict__ src,
     unsigned int n)
 {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    dst[i] += src[i];
+    dst[i] = f32_bf16(bf16_f32(dst[i]) + bf16_f32(src[i]));
+}
+
+// ---------------------------------------------------------------------------
+// The attention's operands widened to f32, and its f32 context rounded back.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void widen_bf16(
+    const bf16_bits* __restrict__ x,
+    float* __restrict__ out,
+    unsigned long long n)
+{
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = bf16_f32(x[i]);
+}
+
+extern "C" __global__ void round_bf16(
+    const float* __restrict__ x,
+    bf16_bits* __restrict__ out,
+    unsigned long long n)
+{
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = f32_bf16(x[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,68 +345,4 @@ extern "C" __global__ void softmax_rows_f32(
     for (unsigned int j = tid; j < cols; j += blockDim.x) {
         row[j] *= inv;
     }
-}
-
-// ---------------------------------------------------------------------------
-// im2col for a band of output rows, so a convolution becomes one GEMM.
-//
-// `col[k, p] = x[ic, oy + ki - pad_h, ox + kj - pad_w]` with `k = (ic*KH+ki)*KW+kj`
-// and `p` the pixel index within the band, zero outside the image. A direct
-// convolution reads every tap from global memory with no reuse; the GEMM
-// that consumes this column matrix reads each input value once per tap into
-// a tile and reuses it across every output channel.
-//
-// One thread per column element, `p` fastest, so both the read (a run along
-// `ox`) and the write are coalesced.
-// ---------------------------------------------------------------------------
-extern "C" __global__ void im2col_band(
-    const float* __restrict__ x,     // [IC, IH, IW], one image
-    float* __restrict__ col,         // [K, band_rows * IW]
-    unsigned int IC,
-    unsigned int IH,
-    unsigned int IW,
-    unsigned int KH,
-    unsigned int KW,
-    unsigned int pad_h,
-    unsigned int pad_w,
-    unsigned int row0,               // first output row of the band
-    unsigned int band_rows)
-{
-    unsigned long long P = (unsigned long long)band_rows * IW;
-    unsigned long long K = (unsigned long long)IC * KH * KW;
-    unsigned long long total = K * P;
-    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-
-    unsigned long long k = i / P;
-    unsigned long long p = i - k * P;
-    unsigned int kj = (unsigned int)(k % KW);
-    unsigned int t = (unsigned int)(k / KW);
-    unsigned int ki = t % KH;
-    unsigned int ic = t / KH;
-    unsigned int oy = row0 + (unsigned int)(p / IW);
-    unsigned int ox = (unsigned int)(p % IW);
-
-    int iy = (int)(oy + ki) - (int)pad_h;
-    int ix = (int)(ox + kj) - (int)pad_w;
-    float v = 0.0f;
-    if (iy >= 0 && iy < (int)IH && ix >= 0 && ix < (int)IW) {
-        v = x[((unsigned long long)ic * IH + iy) * IW + ix];
-    }
-    col[i] = v;
-}
-
-// ---------------------------------------------------------------------------
-// out[oc, p] += bias[oc] over a [OC, HW] plane.
-// ---------------------------------------------------------------------------
-extern "C" __global__ void bias_add_channels(
-    float* __restrict__ out,
-    const float* __restrict__ bias,
-    unsigned int OC,
-    unsigned int HW)
-{
-    unsigned long long total = (unsigned long long)OC * HW;
-    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    out[i] += bias[i / HW];
 }

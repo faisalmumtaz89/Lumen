@@ -1,22 +1,22 @@
-//! The VAE decoder's GPU forward, against the same oracle tensors `vae-check`
-//! compares — and against the CPU decoder on the same input.
+//! The VAE decoder's GPU forward, against the reference decodes `oracle_dump.py`
+//! writes — and against the CPU decoder on the same input.
 //!
-//! Three numbers per pair, so the check answers two questions at once:
-//!   - GPU vs the reference's own output: does the GPU path decode as the
-//!     reference does?
-//!   - GPU vs the CPU decoder on the same latents: does the GPU path compute
-//!     the same function as the independent f32 implementation?
+//! The GPU decoder runs in bf16, the CPU decoder (`vae.rs`) in f32. The GPU
+//! decodes `vae_decode_input_bf16`, the final latents denormalised in bf16 as
+//! Lumen's pipeline does, and is held to the image's own bars
+//! (`vae_decode_bars`): the largest distance, from the reference's bf16 decode
+//! and from its f32 one, of a bf16 decoder that differs from the reference only
+//! in summation order, attention kernel or norm reduction, plus the spread of
+//! those distances. On the reference
+//! images the f32 decoder lands outside the first bar, so it tells a bf16
+//! decoder that rounds where the reference does from one that does not. The
+//! CPU decoder is held to the reference's f32 decode within 1e-3, and its
+//! distance from the GPU decoder is reported.
 //!
-//! The reference runs its convolutions in TF32 (torch's default for cuDNN),
-//! as the GPU path does; `vae.rs` runs them in full f32. So the first
-//! comparison is the sharper one: on the `main` oracle case the GPU decode is
-//! rel-L2 5.5e-5 from the reference (the reference itself lands 5.6e-5 from its
-//! own output when cuDNN picks another algorithm), where full-f32 convolutions
-//! land 3.6e-4 away, and its 1.5e-4 bar tells the two apart. The GPU decode is
-//! 3.6e-4 from the CPU decoder, the TF32 rounding, and that bar of 1e-3 catches
-//! a decoder that computes something else. The run fails when either distance is above its
-//! bar, or when a decode split into bands differs from the one-pass decode in any bit —
-//! on the oracle latents and on wide, tall and large pseudo-random ones.
+//! The run fails when any distance is above its bar, or when a decode split
+//! into bands differs from the one-pass decode in any bit — on the oracle
+//! latents and on wide, tall and large pseudo-random ones. Every comparison runs
+//! before the result is reported.
 //!
 //! Usage: `vae-check-gpu <lbi-dir> <oracle-dir> [tag]`
 
@@ -97,8 +97,8 @@ fn pseudo(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Print the three distances and fail when the relative L2 is above `bar`.
-fn report(label: &str, got: &[f32], want: &[f32], bar: f32) -> Result<(), String> {
+/// Print the three distances and return the relative L2.
+fn distance(label: &str, got: &[f32], want: &[f32]) -> Result<f32, String> {
     if got.len() != want.len() {
         return Err(format!(
             "{label}: {got_len} values against {want_len}",
@@ -112,9 +112,15 @@ fn report(label: &str, got: &[f32], want: &[f32], bar: f32) -> Result<(), String
         max_abs(got, want),
         psnr(got, want)
     );
+    Ok(r)
+}
+
+/// Print the three distances and fail when the relative L2 is above `bar`.
+fn report(label: &str, got: &[f32], want: &[f32], bar: f32) -> Result<(), String> {
+    let r = distance(label, got, want)?;
     if r.is_nan() || r > bar {
         return Err(format!(
-            "{label}: rel-L2 {r:.3e} is not within the {bar:.0e} bar"
+            "{label}: rel-L2 {r:.3e} is not within the {bar:.3e} bar"
         ));
     }
     Ok(())
@@ -145,14 +151,26 @@ fn run() -> Result<(), String> {
         npy::load(&p).map_err(|e| format!("{}: {e}", p.display()))
     };
 
-    // The oracle's own input, read before the device is touched so a bad oracle
-    // directory fails without a 1 GiB upload in the way.
+    // The oracle's own inputs, read before the device is touched so a bad
+    // oracle directory fails without a 1 GiB upload in the way.
     let z = load("vae_decode_input")?;
     let want = load("vae_decode_output")?;
+    let z16 = load("vae_decode_input_bf16")?;
+    let want16 = load("vae_decode_output_bf16")?;
+    let bars = load("vae_decode_bars")?;
+    let &[bar16, bar32] = bars.data.as_slice() else {
+        return Err(format!(
+            "vae_decode_bars holds {} values, not 2",
+            bars.data.len()
+        ));
+    };
 
     // The oracle's VAE input is [batch, 64, 1, H, W] with H,W the latent size.
-    if z.shape.len() != 5 {
-        return Err(format!("vae_decode_input shape {:?} is not 5-D", z.shape));
+    if z.shape.len() != 5 || z16.shape != z.shape {
+        return Err(format!(
+            "vae_decode_input shapes {:?} and {:?} are not one 5-D shape",
+            z.shape, z16.shape
+        ));
     }
     let (batch, channels, frames, h, w) =
         (z.shape[0], z.shape[1], z.shape[2], z.shape[3], z.shape[4]);
@@ -167,7 +185,7 @@ fn run() -> Result<(), String> {
 
     let lbi = lbi_dir.join("vae.lbi");
 
-    // --- the CPU reference, which is what the GPU path must reproduce --------
+    // --- the CPU decoder, in f32 ----------------------------------------------
     let cpu_decoder = VaeDecoder::load(&lbi).map_err(|e| format!("{e}"))?;
     let t0 = Instant::now();
     let cpu = cpu_decoder
@@ -194,27 +212,36 @@ fn run() -> Result<(), String> {
         gib(free_after),
     );
 
-    let free_pre = dev.free_memory().map_err(|e| e.to_string())?;
     let t1 = Instant::now();
+    let got16 = gpu_decoder
+        .decode(&z16.data, batch, h, w)
+        .map_err(|e| format!("gpu: {e}"))?;
+    let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "gpu decoder   {gpu_ms:>9.1} ms  ({:.2}x the CPU)",
+        cpu_ms / gpu_ms
+    );
     let got = gpu_decoder
         .decode(&z.data, batch, h, w)
         .map_err(|e| format!("gpu: {e}"))?;
-    let gpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
-    let free_post = dev.free_memory().map_err(|e| e.to_string())?;
-    println!(
-        "gpu decoder   {gpu_ms:>9.1} ms  ({:.2}x the CPU, peak activation {:.2} GiB)",
-        cpu_ms / gpu_ms,
-        (free_pre as f64 - free_post as f64) / (1u64 << 30) as f64,
-    );
+
+    let mut failures = Vec::new();
+    let mut check = |result: Result<(), String>| {
+        if let Err(e) = result {
+            println!("  FAIL: {e}");
+            failures.push(e);
+        }
+    };
 
     // --- the comparisons ----------------------------------------------------
-    println!("comparisons:");
-    report("gpu vs oracle", &got, &want.data, 1.5e-4)?;
-    report("gpu vs cpu", &got, &cpu, 1e-3)?;
+    println!("comparisons (bars {bar16:.3e} and {bar32:.3e}):");
+    check(report("gpu vs bf16 oracle", &got16, &want16.data, bar16));
+    check(report("gpu vs f32 oracle", &got16, &want.data, bar32));
+    check(distance("gpu vs cpu", &got, &cpu).map(|_| ()));
     // The CPU path should reproduce `vae-check`'s own number. Reporting it makes
     // a bad oracle dump indistinguishable from a bad GPU path only if this line
     // is also wrong, which is the point of printing it.
-    report("cpu vs oracle", &cpu, &want.data, 1e-3)?;
+    check(report("cpu vs oracle", &cpu, &want.data, 1e-3));
 
     // A banded decode keeps only values computed from the whole-image inputs,
     // so it must reproduce the one-pass decode bit for bit: two bands, an
@@ -226,12 +253,15 @@ fn run() -> Result<(), String> {
         gpu_decoder.halo_rows()
     );
     for bands in [2, 5, h] {
-        let banded = gpu_decoder
-            .decode_in_bands(&z.data, batch, h, w, bands)
-            .map_err(|e| format!("gpu, {bands} bands: {e}"))?;
-        same_bits(&format!("{bands} bands vs one pass"), &banded, &got)?;
+        match gpu_decoder.decode_in_bands(&z16.data, batch, h, w, bands) {
+            Ok(banded) => check(same_bits(
+                &format!("{bands} bands vs one pass"),
+                &banded,
+                &got16,
+            )),
+            Err(e) => check(Err(format!("gpu, {bands} bands: {e}"))),
+        }
     }
-    let channels = z.data.len() / (batch * h * w);
     // Widths of an even number of latent columns that are not a multiple of
     // four (4064 pixels is 254), where a band's rows are not 16-byte aligned
     // the way the whole image's are, with band heights odd and even.
@@ -248,48 +278,50 @@ fn run() -> Result<(), String> {
             .decode_in_bands(&latents, batch, lh, lw, 1)
             .map_err(|e| format!("gpu, {lh}x{lw} latent: {e}"))?;
         for bands in splits {
-            let banded = gpu_decoder
-                .decode_in_bands(&latents, batch, lh, lw, bands)
-                .map_err(|e| format!("gpu, {lh}x{lw} latent, {bands} bands: {e}"))?;
-            same_bits(
-                &format!("{lh}x{lw} latent, {bands} bands vs one pass"),
-                &banded,
-                &one,
-            )?;
+            match gpu_decoder.decode_in_bands(&latents, batch, lh, lw, bands) {
+                Ok(banded) => check(same_bits(
+                    &format!("{lh}x{lw} latent, {bands} bands vs one pass"),
+                    &banded,
+                    &one,
+                )),
+                Err(e) => check(Err(format!("gpu, {lh}x{lw} latent, {bands} bands: {e}"))),
+            }
         }
     }
 
     // The mid block's attention in chunks of query rows, 23 of them with a
     // short last one, against the one chunk these latents take by default.
     // The chunks' products have another shape, so their sums round
-    // differently, and the decoder's TF32 convolutions carry that to the
-    // output at the scale of the reference's own algorithm-to-algorithm
-    // spread (5.3e-5 here); a chunk that read or wrote the wrong rows moves
-    // the output by order one, so the oracle bar separates the two.
+    // differently, and the decoder carries that to the output at the scale of
+    // a bf16 rounding here and there, a summation-order difference the bar
+    // allows; a chunk that read or wrote the wrong rows moves the output by
+    // order one. The latents must be large enough for the budget to split
+    // them, as 1024x1024's are.
     gpu_decoder.set_attention_score_budget(3_000_000);
     let chunked = gpu_decoder
-        .decode(&z.data, batch, h, w)
+        .decode(&z16.data, batch, h, w)
         .map_err(|e| format!("gpu, chunked attention: {e}"))?;
     gpu_decoder.set_attention_score_budget(usize::MAX);
     let differ = chunked
         .iter()
-        .zip(&got)
+        .zip(&got16)
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
     println!(
         "attention in chunks: {differ} of {} values differ",
-        got.len()
+        got16.len()
     );
-    report("chunked vs whole", &chunked, &got, 1.5e-4)?;
-    report("chunked vs oracle", &chunked, &want.data, 1.5e-4)?;
+    check(report("chunked vs whole", &chunked, &got16, bar16));
+    check(report(
+        "chunked vs bf16 oracle",
+        &chunked,
+        &want16.data,
+        bar16,
+    ));
 
-    if got.len() != want.data.len() {
-        return Err(format!(
-            "gpu output has {} values, the reference has {} (shape {:?})",
-            got.len(),
-            want.data.len(),
-            want.shape
-        ));
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
-    Ok(())
 }

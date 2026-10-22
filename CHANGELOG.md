@@ -15,6 +15,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   end of the decode and is trimmed afterwards, so an idle server holds no more device memory than before.
   Qwen-Image-2.1 on an RTX 5090, 1024x1024, 40 steps: 15.50 -> 15.28 s per image (median of three alternated
   rounds of ten prompts); images are byte-identical.
+- **The image decoder runs in bf16 on CUDA, as the reference does when loaded in bf16, about twice as fast.** It
+  ran in f32 with TF32 convolutions; its weights and activations are now bf16, every convolution runs on one bf16
+  tensor-core kernel, and each operation rounds where the reference's bf16 operation does. Pictures change slightly:
+  on twelve test images (1024×1024, 768×1344, 256×256) the decode is 60.4-65.0 dB (1024×1024), 61.2 dB and 56.9 dB
+  from the reference's own bf16 decode of the same latents, within the spread of bf16 decoders that differ from it
+  only in summation order, and as close to the f32 decode as those decoders are. Qwen-Image-2.1 on an RTX 5090,
+  server: decode 0.32 -> 0.16 s at 1024×1024 and 14.5 -> 0.64 s at 2048×2048; 1024×1024, 40 steps: 15.04 -> 14.60 s
+  per image (median of three alternated rounds of ten prompts), partly because the smaller decode leaves room for all
+  of the text encoder's layers to stay on the GPU.
+- **Image generation needs a CUDA device with 16.0 GiB, down from 21.0 GiB.** The startup minimum is the measured
+  peak of a 2048×2048 generation, now 16,402 MiB on an RTX 5090.
 
 ### Fixed
 

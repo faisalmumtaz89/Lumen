@@ -3,9 +3,11 @@
 `oracle_dump.py` imports this.
 
 Precision rule: no global dtype override. The checkpoint configures the
-autoencoder for fp32 and it must stay there; casting it (either by a global
-dtype or by widening an already-rounded bf16 tensor) changes every decoded
-pixel. The transformer is requested in bf16.
+autoencoder for fp32 and the pipeline keeps it there; casting it (either by a
+global dtype or by widening an already-rounded bf16 tensor) changes every
+decoded pixel. The transformer is requested in bf16. `oracle_dump.py`
+separately decodes the final latents with the autoencoder loaded in bf16, the
+precision Lumen's GPU decoder runs at.
 """
 import os
 
