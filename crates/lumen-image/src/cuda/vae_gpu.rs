@@ -137,9 +137,6 @@ pub enum VaeGpuError {
     /// A launch a kernel cannot express. Every one of these is a programming
     /// error in this module rather than a property of a checkpoint.
     KernelLimit(String),
-    /// The decode produced this many NaN or infinite values, which the clamp
-    /// would otherwise turn into ordinary pixels.
-    NonFinite(usize),
 }
 
 impl std::fmt::Display for VaeGpuError {
@@ -154,7 +151,6 @@ impl std::fmt::Display for VaeGpuError {
                 )
             }
             Self::KernelLimit(m) => write!(f, "kernel limit: {m}"),
-            Self::NonFinite(n) => write!(f, "the decode produced {n} non-finite values"),
         }
     }
 }
@@ -933,7 +929,7 @@ impl VaeGpu {
         let data: Vec<f32> = bits.into_iter().map(bf16_f32).collect();
         let non_finite = data.iter().filter(|v| !v.is_finite()).count();
         if non_finite > 0 {
-            return Err(VaeGpuError::NonFinite(non_finite));
+            return Err(VaeGpuError::Vae(VaeError::NonFinite(non_finite)));
         }
         Ok(data.into_iter().map(|v| v.max(-1.0).min(1.0)).collect())
     }
@@ -2224,7 +2220,8 @@ mod tests {
         // The device's `expf` and the host's may differ in the last f32 bit,
         // which moves the bf16 result only when the f32 value lies within a
         // few bits of a rounding tie; everywhere else the result must be exact,
-        // which pins the single round-to-nearest-even.
+        // which pins a single rounding to nearest (a tie's direction falls
+        // inside the allowance).
         let got = down(&sb);
         let (mut exact, mut off) = (0usize, 0usize);
         for (&v, &g) in a.iter().zip(&got) {

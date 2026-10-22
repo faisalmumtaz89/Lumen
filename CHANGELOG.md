@@ -30,8 +30,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 - **Image generation's startup memory check covers every size a request may ask for.** The minimum was the
   measured peak of a 2048×2048 generation, but a request may ask for 4096×4096, which peaks higher while denoising,
-  so a device that passed the check could run out on such a request. It is now that size's measured peak: 22.1 GiB
-  (22,610 MiB on an RTX 5090), up from 21.0 GiB.
+  so a device that passed the check could run out on such a request. It is now that size's measured peak with the
+  longest prompt a request may send: 23.1 GiB (23,666 MiB on an RTX 5090), up from 21.0 GiB.
 - **Image generation no longer reloads the whole text encoder after a slightly longer prompt.** The image server
   keeps the text encoder's first layers on the GPU between generations, but a prompt even one token longer than
   the one it had measured made it free them all, so the next generation uploaded the encoder again. A longer prompt

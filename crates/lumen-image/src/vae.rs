@@ -73,6 +73,9 @@ pub enum VaeError {
     Unsupported(String),
     /// A config field is present but malformed or internally inconsistent.
     BadConfig(String),
+    /// The decode produced this many NaN or infinite values, which the clamp
+    /// would otherwise turn into ordinary pixels.
+    NonFinite(usize),
 }
 
 impl std::fmt::Display for VaeError {
@@ -90,6 +93,7 @@ impl std::fmt::Display for VaeError {
             ),
             Self::Unsupported(m) => write!(f, "unsupported VAE configuration: {m}"),
             Self::BadConfig(m) => write!(f, "bad VAE configuration: {m}"),
+            Self::NonFinite(n) => write!(f, "the decode produced {n} non-finite values"),
         }
     }
 }
@@ -1164,6 +1168,12 @@ impl VaeDecoder {
         silu_in_place(&mut x);
         let mut out = self.conv_out.apply(&x);
 
+        // `f32::max` would turn a NaN into -1, so a non-finite value is refused
+        // before the clamp.
+        let non_finite = out.data.iter().filter(|v| !v.is_finite()).count();
+        if non_finite > 0 {
+            return Err(VaeError::NonFinite(non_finite));
+        }
         for v in out.data.iter_mut() {
             *v = v.max(-1.0).min(1.0);
         }

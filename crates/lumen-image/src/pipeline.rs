@@ -476,13 +476,17 @@ pub fn generate_cpu(
 /// The CUDA device ordinal the GPU pipeline runs on.
 pub const GPU_DEVICE: usize = 0;
 
-/// The most device memory a generation uses, in bytes: 22,610 MiB, measured
+/// The most device memory a generation uses, in bytes: 23,666 MiB, measured
 /// as the device's used memory at the peak of a 4096x4096 generation, the
-/// largest size a request may ask for (reached while denoising; 2048x2048
-/// peaks at 16,402 MiB, 1024x1024 at 14,930 MiB), on an RTX 5090 with a 10 ms
-/// `nvidia-smi` sampler. A device with less total memory would fail a request
-/// at that size, so the startup check refuses it instead.
-pub const PEAK_DEVICE_BYTES: u64 = 22_610 << 20;
+/// largest size a request may ask for, with an 8,192-byte prompt, the longest
+/// it may send (reached while denoising; with a short prompt 4096x4096 peaks
+/// at 22,610 MiB, 2048x2048 at 16,402 MiB, 1024x1024 at 14,930 MiB), on an
+/// RTX 5090 with a 10 ms `nvidia-smi` sampler. Of it, 21,672 MiB are live
+/// allocations at once and 1,437 MiB the context, kernels and cuBLAS
+/// workspaces outside the memory pool; the rest is pool memory a generation
+/// keeps for reuse. A device with less total memory could fail such a request,
+/// so the startup check refuses it instead.
+pub const PEAK_DEVICE_BYTES: u64 = 23_666 << 20;
 
 /// The compute capability the GPU pipeline needs: the text tower's flash
 /// attention and the VAE's convolutions are built for it.
@@ -649,9 +653,9 @@ impl GpuSources {
 /// image-only server runs them (no text model shares its process).
 ///
 /// The text encoder loads for each generation, but its first layers can stay:
-/// the three do not fit on a 32 GiB card together with a decode's activations
-/// (3.1 GiB is left with all three resident, and a 1024x1024 decode needs
-/// more), and how much room a generation needs depends on its size. The first
+/// how many fit beside the transformer, the VAE and a generation's activations
+/// depends on the size (on a 32 GiB card all 36 stay beside 1024x1024
+/// generations, fewer beside larger ones). The first
 /// generation of a size keeps no text layers, and the device memory its
 /// denoising and decoding use above that point is recorded (the peak of the
 /// memory pool they allocate from). Later generations of that size keep as
@@ -663,8 +667,8 @@ impl GpuSources {
 /// kept layers and that size's figure and runs again, before anything else is
 /// released. Encoding and decoding each run beside the
 /// resident transformer when they fit; one that runs out of device memory
-/// there — a 2048x2048 decode on a 32 GiB card, any encode on a card much
-/// smaller than 32 GiB — is retried once with the transformer
+/// there, as any encode does on a card much smaller than 32 GiB, is retried
+/// once with the transformer
 /// released, and the next generation loads it again. The smallest prompt and
 /// the smallest image that ran out are remembered, so work at least that large
 /// releases the transformer first instead of failing again.
@@ -1285,11 +1289,11 @@ mod device_facts_tests {
             "{err}"
         );
         assert!(
-            err.contains("22.1 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
+            err.contains("23.1 GiB") && err.contains(&PEAK_DEVICE_BYTES.to_string()),
             "{err}"
         );
         assert!(
-            err.contains("at least 22.1 GiB") && err.contains("the device has 12.0 GiB"),
+            err.contains("at least 23.1 GiB") && err.contains("the device has 12.0 GiB"),
             "{err}"
         );
         assert!(err.contains("startup minimum"), "{err}");
