@@ -35,10 +35,10 @@ jobs:
     name: cpu tests + lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml -> 1.93.1 + rustfmt/clippy)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       # HARD gates. The repo is fmt-clean and clippy-clean under the pinned toolchain
       # (rust-toolchain.toml 1.93.1). clippy uses the deliberate [workspace.lints]
       # policy (deny clippy::all + a curated allow-list) — no `-D warnings` needed
@@ -64,12 +64,12 @@ jobs:
     # oldest glibc the Linux binaries start on; packaging/ci/glibc_floor.sh checks it.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
       # Its key carries no Ubuntu version: a cache from a newer one holds build
       # scripts that need that one's glibc.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: ubuntu-22.04
       - name: build server (cuda)
@@ -110,7 +110,7 @@ jobs:
         run: cargo test --locked -p lumen-cli --features cuda --release --test image_model_refusals --test download_fit
       - name: compile all cuda test targets (no GPU run)
         run: cargo test --locked -p lumen-runtime -p lumen-server --features lumen-runtime/cuda,lumen-runtime/test-state-snapshot,lumen-runtime/test-prefill-dump,lumen-runtime/test-fault-injection,lumen-runtime/test-cupti,lumen-server/cuda --release --no-run
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lumen-linux-x86_64-cuda
           path: |
@@ -127,10 +127,10 @@ jobs:
     name: build macos/metal (arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       # clippy the metal-only path here (cfg(macos) code is excluded on the ubuntu
       # run). Same [workspace.lints] policy.
       - name: clippy (workspace, metal path)
@@ -146,7 +146,7 @@ jobs:
             echo "::error::non-system dynamic dependency found in lumen-server"
             exit 1
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lumen-macos-arm64-metal
           path: |
