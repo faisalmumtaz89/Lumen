@@ -18,7 +18,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   runs): with one tool (391-token prompt) 42.0 -> 19.8 ms, with twenty tools (1,755 tokens) 142.5 -> 21.8 ms, with
   twenty tools and a 1,100-token thread 240.4 -> 101.1 ms. A request without such a block takes what it took (20.0
   and 20.1 ms) and answers as before; decode is unchanged (81.6 tok/s). The request that keeps the block is
-  prefilled in two calls and took 2 to 17 ms longer than before in these runs, once per block. A request sent again
+  prefilled in two calls and took 2 to 18 ms longer than before in these runs, once per block. A request sent again
   with the same seed gets the same reply whether its block was kept or restored. On the native NVFP4/FP8 prefill
   route that reply can be worded differently from the one the request gets without the kept block, as a continued
   conversation's can: the logits after the two-call prefill were 2.6% to 3.7% (relative L2) from the one-call
