@@ -3,8 +3,9 @@
 //! returns and covers requests driven through `Session` the way the server drives
 //! them (cold prompts of one and several slices, decode greedy and sampled, a
 //! generated tail caught up, short and long suffixes, a divergent prompt that
-//! restarts, the same prompt again, a prompt longer than the context refused and
-//! a decode into the context's last slot). CUPTI records every allocation call,
+//! restarts, the same prompt again, a leading block kept and then restored, a
+//! prompt longer than the context refused and a decode into the context's last
+//! slot). CUPTI records every allocation call,
 //! synchronous, stream-ordered, managed or from a pool, the program's own and the
 //! CUDA libraries' alike, and every driver call that makes device memory without
 //! an allocation record (a module or library load, a function or global lookup,
@@ -45,7 +46,7 @@ use lumen_runtime::cuda::CudaBackend;
 use lumen_runtime::kv::KvPrecision;
 use lumen_runtime::runtime_defaults;
 use lumen_runtime::sampling::SamplingParams;
-use lumen_runtime::session::Session;
+use lumen_runtime::session::{PrefixCheckpoint, Session};
 use lumen_runtime::weight::provider_sync::SyncWeightProvider;
 use std::alloc::{alloc, dealloc, Layout};
 use std::io::Write;
@@ -457,17 +458,17 @@ fn requests(cuda: &CudaBackend, provider: &SyncWeightProvider, precision: KvPrec
     };
 
     // A cold one-slice prompt, then decode.
-    s.extend_with_cache(&prompt(15, vocab, 1), cuda, provider, threshold)
+    s.extend_with_cache(&prompt(15, vocab, 1), cuda, provider, threshold, None)
         .expect("cold prompt");
     decode(&mut s, 4);
     // The generated tail is caught up and a long suffix prefilled after it.
     let mut next = s.tokens().to_vec();
     next.extend(prompt(600, vocab, 2));
-    s.extend_with_cache(&next, cuda, provider, threshold)
+    s.extend_with_cache(&next, cuda, provider, threshold, None)
         .expect("long suffix");
     // A short suffix is decoded token by token.
     next.extend(prompt(threshold / 2, vocab, 3));
-    s.extend_with_cache(&next, cuda, provider, threshold)
+    s.extend_with_cache(&next, cuda, provider, threshold, None)
         .expect("short suffix");
     // Sampled decode reads the logits.
     s.set_sampling(SamplingParams {
@@ -479,20 +480,48 @@ fn requests(cuda: &CudaBackend, provider: &SyncWeightProvider, precision: KvPrec
     // A prompt that diverges early restarts cold, over several slices.
     let mut divergent = next[..10].to_vec();
     divergent.extend(prompt(3000, vocab, 4));
-    s.extend_with_cache(&divergent, cuda, provider, threshold)
+    s.extend_with_cache(&divergent, cuda, provider, threshold, None)
         .expect("divergent prompt");
     // The same prompt again.
-    s.extend_with_cache(&divergent, cuda, provider, threshold)
+    s.extend_with_cache(&divergent, cuda, provider, threshold, None)
         .expect("same prompt");
     decode(&mut s, 2);
+    // A leading block the prompt before had too is kept, and restored for the
+    // prompt after.
+    let block = 2000;
+    let leading_block = || Some(block);
+    for (seed, want) in [
+        (7, PrefixCheckpoint::Captured(block)),
+        (8, PrefixCheckpoint::Restored(block)),
+    ] {
+        let mut shared = divergent[..block].to_vec();
+        shared.extend(prompt(50, vocab, seed));
+        let r = s
+            .extend_with_cache(&shared, cuda, provider, threshold, Some(&leading_block))
+            .expect("a prompt that opens with the block");
+        assert_eq!(r.checkpoint, Some(want));
+        decode(&mut s, 2);
+    }
     // A prompt longer than the context is refused; the next request is served.
     assert!(s
-        .extend_with_cache(&prompt(CONTEXT + 1, vocab, 5), cuda, provider, threshold)
+        .extend_with_cache(
+            &prompt(CONTEXT + 1, vocab, 5),
+            cuda,
+            provider,
+            threshold,
+            None
+        )
         .is_err());
     // The first token comes from the prompt's logits; the second is decoded into
     // the context's last slot.
-    s.extend_with_cache(&prompt(CONTEXT - 1, vocab, 6), cuda, provider, threshold)
-        .expect("a prompt filling the context");
+    s.extend_with_cache(
+        &prompt(CONTEXT - 1, vocab, 6),
+        cuda,
+        provider,
+        threshold,
+        None,
+    )
+    .expect("a prompt filling the context");
     decode(&mut s, 2);
 }
 

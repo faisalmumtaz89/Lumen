@@ -146,11 +146,11 @@ impl GdnStateLayout {
         }
     }
 
-    /// Device bytes: each layer's recurrent and conv state, then two `qkv`,
-    /// four per-head, three `value` and one `hidden` buffer and the optional
-    /// Q/K norm pair, all F32.
+    /// Device bytes: each layer's recurrent and conv state twice (the live
+    /// state and its prefix checkpoint), then two `qkv`, four per-head, three
+    /// `value` and one `hidden` buffer and the optional Q/K norm pair, all F32.
     pub(crate) fn bytes(&self) -> u64 {
-        let elems = self.layers * (self.h_state + self.conv_state)
+        let elems = 2 * self.layers * (self.h_state + self.conv_state)
             + 2 * self.qkv
             + 4 * self.heads
             + 3 * self.value

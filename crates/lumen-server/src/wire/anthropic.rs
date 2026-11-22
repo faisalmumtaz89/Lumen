@@ -229,6 +229,32 @@ impl MessagesRequest {
         &self,
         chat_template: Option<&str>,
     ) -> Result<(String, String), ServerError> {
+        self.prompt_of(&self.messages, chat_template)
+    }
+
+    /// The prompt's leading block (see [`super::leading_block`]).
+    fn leading_block(&self, prompt: &str, chat_template: Option<&str>) -> Option<String> {
+        let text = super::probe_text();
+        let mut probe: Vec<AnthropicMessage> = self
+            .messages
+            .iter()
+            .take_while(|m| m.role == "system")
+            .cloned()
+            .collect();
+        probe.push(AnthropicMessage {
+            role: "user".into(),
+            content: Value::String(text.clone()),
+        });
+        let (rendered, _) = self.prompt_of(&probe, chat_template).ok()?;
+        super::leading_block(prompt, &rendered, &text)
+    }
+
+    /// [`Self::prompt`] with `messages` as the conversation.
+    fn prompt_of(
+        &self,
+        messages: &[AnthropicMessage],
+        chat_template: Option<&str>,
+    ) -> Result<(String, String), ServerError> {
         let reasoning_effort = self.reasoning_effort()?;
         let enable_thinking = self.resolve_thinking();
         let tool_choice = self.tool_choice()?;
@@ -256,7 +282,7 @@ impl MessagesRequest {
         let mut prompt = match chat_template {
             Some(tmpl) => render_prompt_templated(
                 system_text.as_deref(),
-                &self.messages,
+                messages,
                 tools,
                 enable_thinking,
                 reasoning_effort,
@@ -273,7 +299,7 @@ impl MessagesRequest {
                     })
                     .collect();
                 let final_system = compose_system_with_tools(system_text.as_deref(), &tool_schemas);
-                render_prompt(&final_system, &self.messages, enable_thinking)?
+                render_prompt(&final_system, messages, enable_thinking)?
             }
         };
         let response_prefix = tool_choice.response_prefix();
@@ -348,6 +374,7 @@ impl MessagesRequest {
         })?;
         self.check()?;
         let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
+        let leading_block = self.leading_block(&prompt, engine.chat_template());
         let enable_thinking = self.resolve_thinking();
         // Reasoning-token cap within `max_tokens` (Anthropic
         // `thinking.budget_tokens`); falls back to the shared default.
@@ -390,6 +417,7 @@ impl MessagesRequest {
             enable_thinking,
             reasoning_budget,
             response_prefix,
+            leading_block,
         })
     }
 }

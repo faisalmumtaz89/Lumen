@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lumen_format::ModelHyperparams;
 use lumen_runtime::compute::ComputeBackend;
 use lumen_runtime::engine::SamplingParams;
-use lumen_runtime::session::{Session, SuffixPrefillResult};
+use lumen_runtime::session::{PrefixCheckpoint, Session, SuffixPrefillResult};
 use lumen_runtime::weight::cache::WeightProvider;
 use lumen_runtime::{RuntimeConfig, RuntimeError, ServerMemoryBreakdown};
 
@@ -314,6 +314,12 @@ pub struct JobRequest {
     /// call's opener). Reported as the reply's first text, before decoding;
     /// not a generated token. Empty for most requests.
     pub response_prefix: String,
+
+    /// The prompt's leading block as text: what the prompt shares with every
+    /// conversation that has its leading system messages, tools and settings
+    /// (see `wire::leading_block`). The session may keep a prefix checkpoint
+    /// at its end. `None` when the prompt has no such block.
+    pub leading_block: Option<String>,
 }
 
 /// The reply channel the worker uses for token events.
@@ -1487,6 +1493,12 @@ impl EngineWorker {
 
         #[cfg(feature = "fault-injection")]
         crate::fault::before_prefill();
+        // The leading block's length in tokens, when its tokens are the
+        // prompt's first ones.
+        let leading_block = || {
+            let ids = self.tokenizer.encode(request.leading_block.as_deref()?);
+            request.prompt_tokens.starts_with(&ids).then_some(ids.len())
+        };
         // Suffix prefill: reuses KV when the new prompt extends the prior
         // job's tokens; falls back to cold prefill otherwise.
         let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session.extend_with_cache(
@@ -1494,6 +1506,7 @@ impl EngineWorker {
             self.backend(),
             self.weights.as_ref(),
             request.suffix_threshold.max(1),
+            Some(&leading_block),
         );
 
         let prefill = match suffix_result {
@@ -1517,8 +1530,13 @@ impl EngineWorker {
             let secs = prefill.prefill_time.as_secs_f64();
             let n = prefill.suffix_len.max(1);
             let tps = n as f64 / secs.max(1e-9);
+            let checkpoint = match prefill.checkpoint {
+                Some(PrefixCheckpoint::Restored(len)) => format!("restored:{len}"),
+                Some(PrefixCheckpoint::Captured(len)) => format!("captured:{len}"),
+                None => "none".into(),
+            };
             eprintln!(
-                "[prefill-timing] suffix_len={} reused_prefix={} prefill_ms={:.3} prefill_tok_s={:.2}",
+                "[prefill-timing] suffix_len={} reused_prefix={} prefill_ms={:.3} prefill_tok_s={:.2} checkpoint={checkpoint}",
                 prefill.suffix_len, prefill.reused_prefix_len, secs * 1e3, tps
             );
         }

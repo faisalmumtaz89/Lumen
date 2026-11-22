@@ -837,6 +837,9 @@ struct GdnScratchGpu {
     /// Stored on host; uploaded as kernel arg each dispatch.
     conv_positions: Vec<u32>,
 
+    /// The per-layer state as it was at the end of a prompt's leading block.
+    checkpoint: GdnCheckpoint,
+
     /// Layer index mapping: layer_idx -> gdn_scratch_index.
     /// `gdn_layer_map[layer_idx] = Some(gdn_idx)` for GDN layers, `None` for standard.
     gdn_layer_map: Vec<Option<usize>>,
@@ -875,6 +878,19 @@ struct GdnScratchGpu {
     /// Post-conv1d, post-SiLU, post-L2-norm K: [num_kv_heads * head_dim] f32.
     /// Written by `gdn_phase123_register_resident`, read by `gdn_phase4_register_resident`.
     k_norm_buf_rr: Option<CudaSlice<f32>>,
+}
+
+/// A copy of every GDN layer's recurrent state, conv ring and ring position
+/// at the end of `tokens`, the first tokens of the sequence that was being
+/// prefilled. The attention layers' KV rows of those tokens are not copied:
+/// they stay in the KV caches, so the checkpoint holds only while no sequence
+/// has been started over them, and `reset_recurrent_state` empties `tokens`.
+struct GdnCheckpoint {
+    h_states: Vec<CudaSlice<f32>>,
+    conv_states: Vec<CudaSlice<f32>>,
+    conv_positions: Vec<u32>,
+    /// Empty when there is no checkpoint.
+    tokens: Vec<u32>,
 }
 
 impl GdnScratchGpu {
@@ -6377,15 +6393,28 @@ impl CudaBackend {
         let l = super::gdn::GdnStateLayout::new(&params, gdn_count, gdn_register_resident());
         let mut h_states = Vec::with_capacity(gdn_count);
         let mut conv_states = Vec::with_capacity(gdn_count);
+        let mut checkpoint = GdnCheckpoint {
+            h_states: Vec::with_capacity(gdn_count),
+            conv_states: Vec::with_capacity(gdn_count),
+            conv_positions: vec![0u32; gdn_count],
+            tokens: Vec::new(),
+        };
         for _ in 0..gdn_count {
             h_states.push(self.device.alloc_zeros::<f32>(l.h_state)?);
             conv_states.push(self.device.alloc_zeros::<f32>(l.conv_state)?);
+            checkpoint
+                .h_states
+                .push(self.device.alloc_zeros::<f32>(l.h_state)?);
+            checkpoint
+                .conv_states
+                .push(self.device.alloc_zeros::<f32>(l.conv_state)?);
         }
         let gdn = GdnScratchGpu {
             params,
             h_states,
             conv_states,
             conv_positions: vec![0u32; gdn_count],
+            checkpoint,
             gdn_layer_map,
             qkv_buf: self.device.alloc_zeros::<f32>(l.qkv)?,
             qkv_conv_buf: self.device.alloc_zeros::<f32>(l.qkv)?,
@@ -21716,9 +21745,80 @@ impl ComputeBackend for CudaBackend {
                         let _ = self.device.stream.memset_zeros(c);
                     }
                     gdn.conv_positions.fill(0);
+                    gdn.checkpoint.tokens.clear();
                 }
             }
         }
+    }
+
+    fn restore_prefix_checkpoint(
+        &self,
+        tokens: &[u32],
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<Option<usize>, RuntimeError> {
+        let mut guard = self.state.lock().unwrap();
+        let Some(st) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let Some(gdn) = st.gdn_scratch_gpu.as_mut() else {
+            return Ok(None);
+        };
+        let len = gdn.checkpoint.tokens.len();
+        if len == 0 || len >= tokens.len() || tokens[..len] != gdn.checkpoint.tokens[..] {
+            return Ok(None);
+        }
+        let copy = |e| RuntimeError::Compute(format!("restore prefix checkpoint: {e}"));
+        for (kept, live) in gdn.checkpoint.h_states.iter().zip(&mut gdn.h_states) {
+            self.device.stream.memcpy_dtod(kept, live).map_err(copy)?;
+        }
+        for (kept, live) in gdn.checkpoint.conv_states.iter().zip(&mut gdn.conv_states) {
+            self.device.stream.memcpy_dtod(kept, live).map_err(copy)?;
+        }
+        gdn.conv_positions
+            .clone_from(&gdn.checkpoint.conv_positions);
+        // The block's prefill left no overflow count and no decode step behind.
+        if let Some(counter) = st.kv16_overflow.as_mut() {
+            self.device.stream.memset_zeros(counter).map_err(copy)?;
+        }
+        st.decode_token_count = 0;
+        for cache in st.kv_caches.iter_mut().flatten() {
+            cache.reset();
+            cache.advance_seq_len_by(len);
+        }
+        for _ in 0..len {
+            kv.advance_seq_len()?;
+        }
+        Ok(Some(len))
+    }
+
+    fn prefill_and_checkpoint(
+        &self,
+        block: &[u32],
+        weights: &dyn WeightProvider,
+        kv: &mut crate::kv::KvCache,
+    ) -> Result<bool, RuntimeError> {
+        if !self.caps().batched_prefill {
+            return Ok(false);
+        }
+        self.reset_recurrent_state();
+        self.prefill(block, weights, kv)?;
+        let mut guard = self.state.lock().unwrap();
+        let gdn = guard
+            .as_mut()
+            .and_then(|st| st.gdn_scratch_gpu.as_mut())
+            .ok_or_else(|| RuntimeError::Compute("batched prefill left no GDN state".into()))?;
+        let copy = |e| RuntimeError::Compute(format!("keep prefix checkpoint: {e}"));
+        for (live, kept) in gdn.h_states.iter().zip(&mut gdn.checkpoint.h_states) {
+            self.device.stream.memcpy_dtod(live, kept).map_err(copy)?;
+        }
+        for (live, kept) in gdn.conv_states.iter().zip(&mut gdn.checkpoint.conv_states) {
+            self.device.stream.memcpy_dtod(live, kept).map_err(copy)?;
+        }
+        gdn.checkpoint
+            .conv_positions
+            .clone_from(&gdn.conv_positions);
+        gdn.checkpoint.tokens = block.to_vec();
+        Ok(true)
     }
 
     /// CUDA peak VRAM == `total_memory - free_memory` at

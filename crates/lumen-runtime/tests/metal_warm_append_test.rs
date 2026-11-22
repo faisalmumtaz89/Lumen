@@ -131,7 +131,13 @@ impl Model {
     fn append(&self, s: &mut Session, b: &MetalF32Backend, full: &[u32]) {
         let reused = s.token_count();
         let r = s
-            .extend_with_cache(full, b, &self.provider, Session::DEFAULT_SUFFIX_THRESHOLD)
+            .extend_with_cache(
+                full,
+                b,
+                &self.provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+                None,
+            )
             .unwrap();
         assert!(!r.used_single_token_path && !r.fell_back_to_cold);
         assert_eq!(r.reused_prefix_len, reused);
