@@ -193,9 +193,9 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
         let other: Vec<u32> = [block.clone(), tokens(other_len, 2)].concat();
 
         let mut kv = kv_cache(&provider);
-        assert!(cuda
-            .prefill_and_checkpoint(&block, &provider, &mut kv)
-            .expect("keep the block"));
+        assert!(cuda.keeps_prefix_checkpoint());
+        cuda.prefill_and_checkpoint(&block, &provider, &mut kv)
+            .expect("keep the block");
         assert_eq!(kv.seq_len(), block_len, "{tag}");
         let kept = f32_store.then(|| cuda.snapshot_state(&kv).expect("snapshot"));
         let (want_logits, want_tokens) = run_rest(

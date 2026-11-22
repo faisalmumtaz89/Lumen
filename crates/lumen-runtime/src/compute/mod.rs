@@ -499,17 +499,24 @@ pub trait ComputeBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Whether [`Self::prefill_and_checkpoint`] keeps a prefix checkpoint.
+    fn keeps_prefix_checkpoint(&self) -> bool {
+        false
+    }
+
     /// Cold-start the sequence with `block`, as [`Self::reset_recurrent_state`]
     /// and [`Self::prefill`] do, and keep a prefix checkpoint at its end for
-    /// [`Self::restore_prefix_checkpoint`]. `false` means the backend keeps no
-    /// checkpoints and nothing was done, which is the default.
+    /// [`Self::restore_prefix_checkpoint`]. Only for a backend whose
+    /// [`Self::keeps_prefix_checkpoint`] is true.
     fn prefill_and_checkpoint(
         &self,
         _block: &[u32],
         _weights: &dyn WeightProvider,
         _kv: &mut KvCache,
-    ) -> Result<bool, RuntimeError> {
-        Ok(false)
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "this backend keeps no prefix checkpoint".into(),
+        ))
     }
 
     /// Reconcile speculative decode-ahead with the host KV cursor before a

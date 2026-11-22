@@ -21791,15 +21791,16 @@ impl ComputeBackend for CudaBackend {
         Ok(Some(len))
     }
 
+    fn keeps_prefix_checkpoint(&self) -> bool {
+        self.caps().batched_prefill
+    }
+
     fn prefill_and_checkpoint(
         &self,
         block: &[u32],
         weights: &dyn WeightProvider,
         kv: &mut crate::kv::KvCache,
-    ) -> Result<bool, RuntimeError> {
-        if !self.caps().batched_prefill {
-            return Ok(false);
-        }
+    ) -> Result<(), RuntimeError> {
         self.reset_recurrent_state();
         self.prefill(block, weights, kv)?;
         let mut guard = self.state.lock().unwrap();
@@ -21818,7 +21819,7 @@ impl ComputeBackend for CudaBackend {
             .conv_positions
             .clone_from(&gdn.conv_positions);
         gdn.checkpoint.tokens = block.to_vec();
-        Ok(true)
+        Ok(())
     }
 
     /// CUDA peak VRAM == `total_memory - free_memory` at

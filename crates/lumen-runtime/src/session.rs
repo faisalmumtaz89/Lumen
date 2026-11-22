@@ -509,7 +509,7 @@ impl Session {
         let start = Instant::now();
         let checkpoint = match backend.restore_prefix_checkpoint(prompt, &mut self.kv)? {
             Some(len) => Some(PrefixCheckpoint::Restored(len)),
-            None => {
+            None if backend.keeps_prefix_checkpoint() => {
                 let block = leading_block
                     .filter(|_| common >= Self::MIN_CHECKPOINT_TOKENS)
                     .and_then(|block| block())
@@ -517,18 +517,14 @@ impl Session {
                         (Self::MIN_CHECKPOINT_TOKENS..=common).contains(&len) && len < prompt.len()
                     });
                 match block {
-                    Some(len)
-                        if backend.prefill_and_checkpoint(
-                            &prompt[..len],
-                            weights,
-                            &mut self.kv,
-                        )? =>
-                    {
+                    Some(len) => {
+                        backend.prefill_and_checkpoint(&prompt[..len], weights, &mut self.kv)?;
                         Some(PrefixCheckpoint::Captured(len))
                     }
-                    _ => None,
+                    None => None,
                 }
             }
+            None => None,
         };
         let Some(checkpoint) = checkpoint else {
             backend.reset_recurrent_state();
@@ -2553,19 +2549,19 @@ mod tests {
             }
             Ok(Some(kept.len()))
         }
+        fn keeps_prefix_checkpoint(&self) -> bool {
+            self.keeps_checkpoint
+        }
         fn prefill_and_checkpoint(
             &self,
             block: &[u32],
             weights: &dyn WeightProvider,
             kv: &mut crate::kv::KvCache,
-        ) -> Result<bool, RuntimeError> {
-            if !self.keeps_checkpoint {
-                return Ok(false);
-            }
+        ) -> Result<(), RuntimeError> {
             self.reset_recurrent_state();
             self.prefill(block, weights, kv)?;
             *self.checkpoint.lock().unwrap() = Some((block.to_vec(), self.state_val()));
-            Ok(true)
+            Ok(())
         }
         fn sync_kv_to_cpu(
             &self,
@@ -2681,7 +2677,11 @@ mod tests {
         ] {
             let mut backend = MockGpuBackend::new(true);
             backend.keeps_checkpoint = keeps;
-            let leading_block = || reported;
+            let asked = std::cell::Cell::new(false);
+            let leading_block = || {
+                asked.set(true);
+                reported
+            };
             let mut session =
                 Session::new(baseline_config(512), hp, SamplingParams::default()).unwrap();
             for first_token in [10, 20, 30] {
@@ -2706,6 +2706,13 @@ mod tests {
                 );
                 assert_eq!(backend.state_val(), cold_state(true, &prompt), "{tag}");
             }
+            // The block's length is asked for only by a backend that keeps
+            // checkpoints, of a prompt that shares the minimum with its history.
+            assert_eq!(
+                asked.get(),
+                keeps && shared >= min,
+                "shared {shared}, reported {reported:?}"
+            );
         }
     }
 
