@@ -1328,6 +1328,53 @@ mod tests {
         }
     }
 
+    /// The leading block is the rendered system turn, tools included, and
+    /// the header of the first user turn; a later turn does not change it.
+    #[test]
+    fn the_leading_block_ends_where_the_first_user_text_begins() {
+        let template =
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja");
+        let block_of = |messages: Value| {
+            let request = serde_json::from_value::<MessagesRequest>(json!({
+                "model": "m", "max_tokens": 16, "system": "Be exact.",
+                "tools": [{"name": "run_python", "description": "Runs code.",
+                           "input_schema": {"type": "object"}}],
+                "messages": messages,
+            }))
+            .unwrap();
+            let prompt = request.prompt(Some(template)).unwrap().0;
+            let block = request
+                .leading_block(&prompt, Some(template))
+                .expect("a leading block");
+            assert!(
+                prompt.starts_with(&block),
+                "{block:?} does not open {prompt:?}"
+            );
+            block
+        };
+        let block = block_of(json!([{"role": "user", "content": "First question"}]));
+        assert!(
+            block.contains("run_python") && block.contains("Be exact."),
+            "{block:?}"
+        );
+        assert!(
+            block.ends_with("<|im_end|>\n<|im_start|>user\n"),
+            "{block:?}"
+        );
+        let thread = block_of(json!([
+            {"role": "user", "content": "Another question"},
+            {"role": "assistant", "content": "An answer."},
+            {"role": "user", "content": "And then?"},
+        ]));
+        assert_eq!(thread, block);
+        // A system message that opens `messages` is part of it.
+        let inline = block_of(json!([
+            {"role": "system", "content": "Inline rule."},
+            {"role": "user", "content": "First question"},
+        ]));
+        assert!(inline.contains("Inline rule.") && inline.ends_with("<|im_start|>user\n"));
+    }
+
     #[test]
     fn render_prompt_closed_think_tail_when_disabled() {
         // Reasoning off (default) MUST emit the closed empty-think tail —
