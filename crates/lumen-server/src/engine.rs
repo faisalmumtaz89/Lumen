@@ -1168,11 +1168,13 @@ impl EngineWorker {
                 // kernel.  Weights are shared `Arc`s — only KV
                 // buffers + sampler state are reallocated; the cost
                 // is bounded and dominated by `Vec::with_capacity` on
-                // recovery, not by re-staging weights. Its first job
-                // starts cold, which resets the recurrent state.
+                // recovery, not by re-staging weights. The backend's
+                // recurrent state is reset with it, which ends its prefix
+                // checkpoint, so the first job starts cold.
                 match self.fresh_session() {
                     Ok(s) => {
                         session = s;
+                        self.backend().reset_recurrent_state();
                         if let Err(e) = session.validate_backend(self.backend()) {
                             eprintln!(
                                 "[server engine] re-validate_backend after a failed job failed: \
