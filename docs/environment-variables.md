@@ -292,7 +292,7 @@ individual switches also accept `=0`.
 | `LUMEN_XCHK` | OFF (byte-identical) | diagnostic | Cross-backend per-op forensic probe (sumsq trajectories + prompt-id echo). | Central Metal-vs-CUDA byte-identity instrument. |
 | `LUMEN_XCHK2` | OFF (byte-identical) | diagnostic | Single-CB-path forensic variant of `XCHK`. | Forensic hook on the default lean decode path. |
 | `LUMEN_SPEC_DUMP_IDS` | OFF (stderr only) | diagnostic | Dumps raw generated token ids pre-filter (spec-decode acceptance / prefix feed). | Set for raw-id correctness forensics. |
-| `LUMEN_PREFILL_TIMING` | OFF | diagnostic | Prints prefill tok/s (server; MoE-prefill vs llama-bench pp). | Measure MoE prefill throughput. |
+| `LUMEN_PREFILL_TIMING` | OFF | diagnostic | Prints each request's prefill: tokens prefilled, prefix reused, time, tok/s, and what the prefix checkpoint did (`checkpoint=none`, `captured:N`, `restored:N`) (server). | Measure prefill throughput, or see whether a request reused its leading block. |
 | `LUMEN_DUMP_EXPERTS` | unset (no-op) | diagnostic | Dump per-expert routing decisions (adds a DtoH sync when set). | Set for MoE routing triage. |
 | `LUMEN_DUMP_GDN_L0_BIN` | unset (no writes) | diagnostic | Dump GDN layer-0 full-precision binaries. **Value is a directory path** (or `=all` for every GDN layer), *not* a boolean — set it to an existing writable directory, e.g. `/tmp/gdndump`. | Set to a dir for GDN correctness triage. |
 | `LUMEN_DUMP_NORMED` | unset (no-op) | diagnostic | Dump post-RMSNorm activations. | Set to inspect normed activations. |

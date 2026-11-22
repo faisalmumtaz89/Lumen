@@ -7,6 +7,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+### Changed
+
+- **On CUDA a repeated system block is prefilled once.** A model with recurrent (GDN) layers restarted cold for
+  every chat request that was not an exact continuation of the one before, so a fixed system message and tool list
+  were prefilled again each time. The CUDA backend now keeps the recurrent state at the end of the prompt's leading
+  block (the system turn, tools included, up to the first user text) the second consecutive time a request opens
+  with it, and a later request that opens with the same tokens continues from there, in any thread. Qwen3.8-27B
+  NVFP4 on an RTX 5090, time to the first streamed piece (median of ten new threads, two runs): with one tool
+  (391-token prompt) 42.0 -> 19.8 ms, with twenty tools (1,755 tokens) 142.5 -> 21.8 ms, with twenty tools and a
+  1,100-token thread 240.4 -> 101.1 ms. A request without such a block takes what it took (20.0 and 20.1 ms) and
+  answers as before; decode is unchanged (81.6 tok/s). The request that keeps the block is prefilled in two calls
+  and takes 13 to 17 ms longer, once per block. A reply served from the kept state is the reply of the request that
+  kept it, bit for bit. On the native NVFP4/FP8 prefill route it can be worded differently from the same request
+  served cold, as a continued conversation's can: the logits after the two-call prefill are about 3% (relative L2)
+  from the one-call prefill's, on the F32 prefill route 4e-7. The kept state takes device memory at load, counted in
+  the load-time plan (about 160 MiB for Qwen3.8-27B). A request that opens with another block ends it, so a client
+  that wants the reuse keeps its system text, tool list and reasoning setting the same across requests.
+  `LUMEN_PREFILL_TIMING` lines now end with `checkpoint=none`, `captured:N` or `restored:N`.
+
 ## [0.51.0] — 2026-10-22
 
 ### Changed
