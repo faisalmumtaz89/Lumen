@@ -831,13 +831,7 @@ impl InferenceEngine {
                 // Resumed-from-disk path: try to reuse the cached prefix
                 // for any common-prefix tokens, fall back to cold restart
                 // on divergence (the standard `extend_with_cache` matrix).
-                session.extend_with_cache(
-                    prompt_tokens,
-                    backend,
-                    weights,
-                    suffix_threshold,
-                    None,
-                )?;
+                session.extend_with_cache(prompt_tokens, backend, weights, suffix_threshold)?;
             }
         } else if session.token_count() == 0 {
             // Edge case: empty prompt on a fresh session. Mirror the

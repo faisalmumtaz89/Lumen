@@ -500,33 +500,20 @@ impl Session {
         &mut self,
         prompt: &[u32],
         common: usize,
-        leading_block: Option<&dyn Fn() -> Option<usize>>,
+        leading_block: &dyn Fn() -> Option<usize>,
         backend: &dyn ComputeBackend,
         weights: &dyn WeightProvider,
     ) -> Result<SuffixPrefillResult, RuntimeError> {
         self.truncate_to(0);
         self.validate_backend(backend)?;
         let start = Instant::now();
-        let checkpoint = match backend.restore_prefix_checkpoint(prompt, &mut self.kv)? {
-            Some(len) => Some(PrefixCheckpoint::Restored(len)),
-            None if backend.keeps_prefix_checkpoint() => {
-                let block = leading_block
-                    .filter(|_| common >= Self::MIN_CHECKPOINT_TOKENS)
-                    .and_then(|block| block())
-                    .filter(|&len| {
-                        (Self::MIN_CHECKPOINT_TOKENS..=common).contains(&len) && len < prompt.len()
-                    });
-                match block {
-                    Some(len) => {
-                        backend.prefill_and_checkpoint(&prompt[..len], weights, &mut self.kv)?;
-                        Some(PrefixCheckpoint::Captured(len))
-                    }
-                    None => None,
-                }
-            }
-            None => None,
-        };
-        let Some(checkpoint) = checkpoint else {
+        let through_checkpoint =
+            self.prefill_through_checkpoint(prompt, common, leading_block, backend, weights);
+        if through_checkpoint.is_err() {
+            // As after a failed cold prefill: no tokens, and the KV at 0.
+            self.kv.truncate_to(0);
+        }
+        let Some((logits, checkpoint)) = through_checkpoint? else {
             backend.reset_recurrent_state();
             let r = self.extend(prompt, backend, weights)?;
             return Ok(SuffixPrefillResult {
@@ -539,11 +526,6 @@ impl Session {
                 checkpoint: None,
             });
         };
-        let (PrefixCheckpoint::Restored(len) | PrefixCheckpoint::Captured(len)) = checkpoint;
-        let last_hidden = backend.prefill_from(len, &prompt[len..], weights, &mut self.kv)?;
-        let mut x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
-        x.write_f32_from(&last_hidden);
-        let logits = backend.compute_final(&x)?;
         let elapsed = start.elapsed();
         self.prefill_time += elapsed;
         self.tokens.extend_from_slice(prompt);
@@ -561,6 +543,39 @@ impl Session {
             prefill_time: elapsed,
             checkpoint: Some(checkpoint),
         })
+    }
+
+    /// Prefill `prompt` into the empty KV from the backend's prefix
+    /// checkpoint, restored or taken now, and return its logits; `None` when
+    /// the backend has no checkpoint for the prompt and takes none, with
+    /// nothing changed.
+    fn prefill_through_checkpoint(
+        &mut self,
+        prompt: &[u32],
+        common: usize,
+        leading_block: &dyn Fn() -> Option<usize>,
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+    ) -> Result<Option<(Logits, PrefixCheckpoint)>, RuntimeError> {
+        let min = Self::MIN_CHECKPOINT_TOKENS;
+        let checkpoint = match backend.restore_prefix_checkpoint(prompt, &mut self.kv)? {
+            Some(len) => PrefixCheckpoint::Restored(len),
+            None if common >= min && backend.keeps_prefix_checkpoint() => {
+                let Some(len) = leading_block()
+                    .filter(|&len| (min..=common).contains(&len) && len < prompt.len())
+                else {
+                    return Ok(None);
+                };
+                backend.prefill_and_checkpoint(&prompt[..len], weights, &mut self.kv)?;
+                PrefixCheckpoint::Captured(len)
+            }
+            None => return Ok(None),
+        };
+        let (PrefixCheckpoint::Restored(len) | PrefixCheckpoint::Captured(len)) = checkpoint;
+        let last_hidden = backend.prefill_from(len, &prompt[len..], weights, &mut self.kv)?;
+        let mut x = ActivationBuffer::zeros(last_hidden.len(), ComputeDtype::F32);
+        x.write_f32_from(&last_hidden);
+        Ok(Some((backend.compute_final(&x)?, checkpoint)))
     }
 
     /// Default suffix threshold below which the suffix-prefill path uses a
@@ -706,17 +721,6 @@ impl Session {
     /// 5. **No common prefix at all** (`common == 0`): equivalent to a fresh
     ///    `extend(new_full_prompt)` — full cold prefill.
     ///
-    /// A cold restart (3a and 5) first asks the backend for its prefix
-    /// checkpoint: when the prompt starts with a checkpoint's tokens, the
-    /// state at their end is restored and only the rest is prefilled. A
-    /// backend that keeps checkpoints takes one when the prompt and the
-    /// history it diverges from share the prompt's whole leading block,
-    /// `leading_block()` tokens of at least
-    /// [`Self::MIN_CHECKPOINT_TOKENS`]: the block is prefilled, its end
-    /// state kept, and the rest prefilled from there. So a block is kept the
-    /// second consecutive time a prompt opens with it and restored from the
-    /// third; `leading_block` is called for no other prompt.
-    ///
     /// Returns a [`SuffixPrefillResult`] describing what happened. Callers that
     /// only want the eager "I'll figure it out" behavior can ignore the
     /// variant; production callers (server, REPL) inspect it to expose cache
@@ -727,7 +731,32 @@ impl Session {
         backend: &dyn ComputeBackend,
         weights: &dyn WeightProvider,
         suffix_threshold: usize,
-        leading_block: Option<&dyn Fn() -> Option<usize>>,
+    ) -> Result<SuffixPrefillResult, RuntimeError> {
+        self.extend_with_leading_block(new_full_prompt, backend, weights, suffix_threshold, &|| {
+            None
+        })
+    }
+
+    /// [`Self::extend_with_cache`] for a prompt that opens with a leading
+    /// block other prompts open with too, `leading_block()` tokens long.
+    ///
+    /// A cold restart (3a and 5) first asks the backend for its prefix
+    /// checkpoint: when the prompt starts with a checkpoint's tokens, the
+    /// state at their end is restored and only the rest is prefilled. A
+    /// backend that keeps checkpoints takes one when the prompt and the
+    /// history it leaves share the whole leading block, of at least
+    /// [`Self::MIN_CHECKPOINT_TOKENS`] tokens and shorter than the prompt:
+    /// the block is prefilled, its end state kept, and the rest prefilled
+    /// from there. So a block is kept by a prompt that restarts cold after a
+    /// history that opened with it too, and restored by the cold restarts
+    /// after that; `leading_block` is called for no other prompt.
+    pub fn extend_with_leading_block(
+        &mut self,
+        new_full_prompt: &[u32],
+        backend: &dyn ComputeBackend,
+        weights: &dyn WeightProvider,
+        suffix_threshold: usize,
+        leading_block: &dyn Fn() -> Option<usize>,
     ) -> Result<SuffixPrefillResult, RuntimeError> {
         // an empty prompt on a
         // session with existing tokens is a legitimate "use whatever you've
@@ -1069,7 +1098,7 @@ impl Session {
     {
         // Suffix-prefill path (the candidate under test).
         let suffix_result =
-            self.extend_with_cache(new_full_prompt, backend, weights, suffix_threshold, None)?;
+            self.extend_with_cache(new_full_prompt, backend, weights, suffix_threshold)?;
 
         // Snapshot the candidate's next-token argmax. We can't `decode` here
         // because `self` may already have `pending_logits` queued from Path
@@ -1969,7 +1998,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         assert!(r.fell_back_to_cold);
@@ -1999,7 +2027,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         assert_eq!(r.reused_prefix_len, prior_len);
@@ -2031,7 +2058,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         assert_eq!(r.reused_prefix_len, base.len());
@@ -2065,7 +2091,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         // Naive backend has no GDN, so divergence is recoverable: common = 3,
@@ -2098,7 +2123,7 @@ mod tests {
             .unwrap();
         let extended_short = vec![0u32, 1, 2, 3, 4]; // suffix = 2 < threshold
         let r_a = session_a
-            .extend_with_cache(&extended_short, &backend, &provider, threshold, None)
+            .extend_with_cache(&extended_short, &backend, &provider, threshold)
             .unwrap();
         assert!(
             r_a.used_single_token_path,
@@ -2113,7 +2138,7 @@ mod tests {
             .unwrap();
         let extended_long = vec![0u32, 1, 2, 3, 4, 5]; // suffix = 3 == threshold
         let r_b = session_b
-            .extend_with_cache(&extended_long, &backend2, &provider2, threshold, None)
+            .extend_with_cache(&extended_long, &backend2, &provider2, threshold)
             .unwrap();
         // The naive backend has batched_prefill = false, so it also goes via
         // forward_pass per token; the spec is that we did NOT explicitly take
@@ -2229,7 +2254,7 @@ mod tests {
         };
         let mut session = Session::new(cfg, hp, SamplingParams::default()).unwrap();
         let too_long: Vec<u32> = (0..9).collect();
-        let result = session.extend_with_cache(&too_long, &backend, &provider, 32, None);
+        let result = session.extend_with_cache(&too_long, &backend, &provider, 32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -2288,13 +2313,7 @@ mod tests {
         session.extend(&prompt, &backend, &provider).unwrap();
         let prior_len = session.token_count();
         let r = session
-            .extend_with_cache(
-                &[],
-                &backend,
-                &provider,
-                Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
-            )
+            .extend_with_cache(&[], &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD)
             .unwrap();
         assert_eq!(r.reused_prefix_len, prior_len);
         assert_eq!(r.suffix_len, 0);
@@ -2346,7 +2365,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         assert_eq!(r.reused_prefix_len, prior);
@@ -2429,6 +2447,8 @@ mod tests {
         keeps_checkpoint: bool,
         /// The checkpoint's tokens and the state at their end.
         checkpoint: std::sync::Mutex<Option<(Vec<u32>, u64)>>,
+        /// A token a prefill refuses, before it changes anything.
+        refused_token: Option<u32>,
     }
 
     impl MockGpuBackend {
@@ -2443,6 +2463,7 @@ mod tests {
                 gpu_argmax: false,
                 keeps_checkpoint: false,
                 checkpoint: std::sync::Mutex::new(None),
+                refused_token: None,
             }
         }
 
@@ -2507,6 +2528,9 @@ mod tests {
             _weights: &dyn WeightProvider,
             kv: &mut crate::kv::KvCache,
         ) -> Result<Vec<f32>, RuntimeError> {
+            if tokens.iter().any(|&t| Some(t) == self.refused_token) {
+                return Err(RuntimeError::Compute("refused token".into()));
+            }
             self.prefill_calls.fetch_add(1, Ordering::SeqCst);
             for &t in tokens {
                 self.fold(t);
@@ -2617,12 +2641,12 @@ mod tests {
         let mut run = |prompt: &[u32]| {
             let calls = backend.prefill_calls.load(Ordering::SeqCst);
             let r = session
-                .extend_with_cache(
+                .extend_with_leading_block(
                     prompt,
                     &backend,
                     &provider,
                     Session::DEFAULT_SUFFIX_THRESHOLD,
-                    Some(&leading_block),
+                    &leading_block,
                 )
                 .unwrap();
             assert_eq!(backend.state_val(), cold_state(true, prompt));
@@ -2671,6 +2695,7 @@ mod tests {
         for (shared, reported, keeps) in [
             (min + 7, Some(min + 8), true),
             (min - 1, Some(min - 1), true),
+            (min, Some(min - 1), true),
             (min + 7, None, true),
             (min + 7, Some(min + 7 + 4), true),
             (min + 7, Some(min + 7), false),
@@ -2688,12 +2713,12 @@ mod tests {
                 let prompt = block_prompt(shared, first_token, 4);
                 let calls = backend.prefill_calls.load(Ordering::SeqCst);
                 let r = session
-                    .extend_with_cache(
+                    .extend_with_leading_block(
                         &prompt,
                         &backend,
                         &provider,
                         Session::DEFAULT_SUFFIX_THRESHOLD,
-                        Some(&leading_block),
+                        &leading_block,
                     )
                     .unwrap();
                 let tag = format!("shared {shared}, reported {reported:?}, keeps {keeps}");
@@ -2713,6 +2738,86 @@ mod tests {
                 keeps && shared >= min,
                 "shared {shared}, reported {reported:?}"
             );
+        }
+    }
+
+    /// A prompt that is its own leading block is prefilled in one call: no
+    /// rest would follow the block.
+    #[test]
+    fn a_prompt_that_ends_with_its_block_is_not_split() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let mut backend = MockGpuBackend::new(true);
+        backend.keeps_checkpoint = true;
+        let block = Session::MIN_CHECKPOINT_TOKENS + 7;
+        let leading_block = || Some(block);
+        let mut session =
+            Session::new(baseline_config(512), hp, SamplingParams::default()).unwrap();
+        for prompt in [block_prompt(block, 10, 4), block_prompt(block, 10, 0)] {
+            let r = session
+                .extend_with_leading_block(
+                    &prompt,
+                    &backend,
+                    &provider,
+                    Session::DEFAULT_SUFFIX_THRESHOLD,
+                    &leading_block,
+                )
+                .unwrap();
+            assert_eq!(r.checkpoint, None);
+            assert_eq!(backend.state_val(), cold_state(true, &prompt));
+        }
+    }
+
+    /// A rest the backend refuses, after a checkpoint was restored or taken
+    /// for its prompt, leaves the session as a refused cold prefill does,
+    /// without tokens and with the KV at 0, so the prompt after it starts at
+    /// position 0.
+    #[test]
+    fn a_refused_rest_leaves_the_session_empty() {
+        let (provider, _nb, hp) = synthetic_setup();
+        let mut backend = MockGpuBackend::new(true);
+        backend.keeps_checkpoint = true;
+        backend.refused_token = Some(99);
+        let block = Session::MIN_CHECKPOINT_TOKENS + 7;
+        let leading_block = || Some(block);
+        let mut session =
+            Session::new(baseline_config(512), hp, SamplingParams::default()).unwrap();
+        let mut send = |session: &mut Session, prompt: &[u32]| {
+            session.extend_with_leading_block(
+                prompt,
+                &backend,
+                &provider,
+                Session::DEFAULT_SUFFIX_THRESHOLD,
+                &leading_block,
+            )
+        };
+        // After two prompts with the block the refused one restores it; after
+        // the cold start that follows, the next refused one keeps it.
+        for (first_token, before, checkpoint) in
+            [(30, &[10, 20][..], "restored"), (60, &[][..], "kept")]
+        {
+            for &served in before {
+                send(&mut session, &block_prompt(block, served, 4)).unwrap();
+            }
+            let calls = backend.prefill_calls.load(Ordering::SeqCst);
+            let mut refused = block_prompt(block, first_token, 4);
+            refused.push(99);
+            assert!(send(&mut session, &refused).is_err(), "{checkpoint}");
+            // Only a kept block is prefilled before the rest is refused.
+            assert_eq!(
+                backend.prefill_calls.load(Ordering::SeqCst) - calls,
+                u64::from(checkpoint == "kept"),
+                "{checkpoint}"
+            );
+            assert_eq!(
+                (session.token_count(), session.kv().seq_len()),
+                (0, 0),
+                "{checkpoint}"
+            );
+            assert!(session.pending_logits.is_none(), "{checkpoint}");
+            let next = block_prompt(block, first_token + 5, 4);
+            session.extend(&next, &backend, &provider).unwrap();
+            assert_eq!(session.kv().seq_len(), next.len(), "{checkpoint}");
+            assert_eq!(backend.state_val(), cold_state(true, &next), "{checkpoint}");
         }
     }
 
@@ -2741,12 +2846,12 @@ mod tests {
         .iter()
         .map(|prompt| {
             let r = session
-                .extend_with_cache(
+                .extend_with_leading_block(
                     prompt,
                     &backend,
                     &provider,
                     Session::DEFAULT_SUFFIX_THRESHOLD,
-                    Some(&leading_block),
+                    &leading_block,
                 )
                 .unwrap();
             assert_eq!(backend.state_val(), cold_state(true, prompt));
@@ -2964,7 +3069,6 @@ mod tests {
                     &backend,
                     &provider,
                     Session::DEFAULT_SUFFIX_THRESHOLD,
-                    None,
                 )
                 .unwrap();
             assert!(!r.used_single_token_path, "gdn={gdn}");
@@ -3002,7 +3106,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         // No decode — the tail was reconciled, not re-fed, and the suffix went
@@ -3057,13 +3160,8 @@ mod tests {
         let config = baseline_config(64);
         let sampling = SamplingParams::default();
         let mut session = Session::new(config, hp, sampling).unwrap();
-        let r = session.extend_with_cache(
-            &[],
-            &backend,
-            &provider,
-            Session::DEFAULT_SUFFIX_THRESHOLD,
-            None,
-        );
+        let r =
+            session.extend_with_cache(&[], &backend, &provider, Session::DEFAULT_SUFFIX_THRESHOLD);
         assert!(r.is_err());
         let msg = format!("{}", r.unwrap_err());
         assert!(
@@ -3456,7 +3554,6 @@ mod tests {
                 &backend,
                 &provider,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .expect("empty-suffix path must return Ok, not panic");
         // The fix re-runs the last prompt token's forward pass so the
@@ -3507,7 +3604,6 @@ mod tests {
                     &backend,
                     &provider,
                     Session::DEFAULT_SUFFIX_THRESHOLD,
-                    None,
                 )
                 .unwrap_or_else(|e| panic!("cycle {cycle}: empty-suffix returned Err: {e}"));
             assert_eq!(r.suffix_len, 0, "cycle {cycle}: suffix must be empty");
@@ -3561,7 +3657,6 @@ mod tests {
                 &backend2,
                 &provider2,
                 Session::DEFAULT_SUFFIX_THRESHOLD,
-                None,
             )
             .unwrap();
         // NB: the warm path has consumed 2 RNG samples that the cold path

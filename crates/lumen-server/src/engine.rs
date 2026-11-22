@@ -1503,13 +1503,14 @@ impl EngineWorker {
         };
         // Suffix prefill: reuses KV when the new prompt extends the prior
         // job's tokens; falls back to cold prefill otherwise.
-        let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session.extend_with_cache(
-            &request.prompt_tokens,
-            self.backend(),
-            self.weights.as_ref(),
-            request.suffix_threshold.max(1),
-            Some(&leading_block),
-        );
+        let suffix_result: Result<SuffixPrefillResult, RuntimeError> = session
+            .extend_with_leading_block(
+                &request.prompt_tokens,
+                self.backend(),
+                self.weights.as_ref(),
+                request.suffix_threshold.max(1),
+                &leading_block,
+            );
 
         let prefill = match suffix_result {
             Ok(r) => r,

@@ -310,14 +310,14 @@ fn prompt_cache_routes_equal_a_cold_session() {
         };
         let mut warm = session(hp, precision);
         let base = [3u32, 1, 4, 1, 5];
-        warm.extend_with_cache(&base, &backend, &provider, threshold, None)
+        warm.extend_with_cache(&base, &backend, &provider, threshold)
             .unwrap();
         let (gen, _) = generate(&mut warm, &backend, &provider, 5);
         let mut history: Vec<u32> = base.iter().copied().chain(gen).collect();
         // appends below and across the threshold, after generation
         for extra in [&[9u32, 2, 6][..], &[5, 3, 5, 8, 9, 7, 9, 3, 2, 3]] {
             history.extend_from_slice(extra);
-            warm.extend_with_cache(&history, &backend, &provider, threshold, None)
+            warm.extend_with_cache(&history, &backend, &provider, threshold)
                 .unwrap();
             let got = generate(&mut warm, &backend, &provider, 6);
             assert_eq!(
@@ -329,7 +329,7 @@ fn prompt_cache_routes_equal_a_cold_session() {
             history.extend_from_slice(&got.0);
         }
         // the history exactly, then a shorter prefix, then a divergent tail
-        warm.extend_with_cache(&history, &backend, &provider, threshold, None)
+        warm.extend_with_cache(&history, &backend, &provider, threshold)
             .unwrap();
         assert_eq!(
             generate(&mut warm, &backend, &provider, 6),
@@ -337,7 +337,7 @@ fn prompt_cache_routes_equal_a_cold_session() {
             "{precision:?}: exact"
         );
         let shorter = &history[..history.len() - 4];
-        warm.extend_with_cache(shorter, &backend, &provider, threshold, None)
+        warm.extend_with_cache(shorter, &backend, &provider, threshold)
             .unwrap();
         assert_eq!(
             generate(&mut warm, &backend, &provider, 6),
@@ -346,7 +346,7 @@ fn prompt_cache_routes_equal_a_cold_session() {
         );
         let mut divergent = history[..history.len() - 2].to_vec();
         divergent.extend_from_slice(&[60, 61, 62]);
-        warm.extend_with_cache(&divergent, &backend, &provider, threshold, None)
+        warm.extend_with_cache(&divergent, &backend, &provider, threshold)
             .unwrap();
         assert_eq!(
             generate(&mut warm, &backend, &provider, 6),

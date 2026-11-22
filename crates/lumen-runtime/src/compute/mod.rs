@@ -504,10 +504,10 @@ pub trait ComputeBackend: Send + Sync {
         false
     }
 
-    /// Cold-start the sequence with `block`, as [`Self::reset_recurrent_state`]
-    /// and [`Self::prefill`] do, and keep a prefix checkpoint at its end for
-    /// [`Self::restore_prefix_checkpoint`]. Only for a backend whose
-    /// [`Self::keeps_prefix_checkpoint`] is true.
+    /// Cold-start the sequence with `block` in the empty `kv`, as
+    /// [`Self::reset_recurrent_state`] and [`Self::prefill`] do, and keep a
+    /// prefix checkpoint at its end for [`Self::restore_prefix_checkpoint`].
+    /// Only for a backend whose [`Self::keeps_prefix_checkpoint`] is true.
     fn prefill_and_checkpoint(
         &self,
         _block: &[u32],
