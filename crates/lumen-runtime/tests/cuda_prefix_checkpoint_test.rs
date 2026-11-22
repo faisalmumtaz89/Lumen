@@ -6,8 +6,10 @@
 //! kept (compared byte for byte on an F32 KV store, where the comparison before the restore
 //! must differ), and the rest's logits and 64 greedy tokens must be the first run's bit for
 //! bit. Nothing but a longer prompt that starts with the kept tokens restores, and a refused
-//! rest leaves the checkpoint usable. One call prefilling the whole prompt is printed beside
-//! the split one, with the time each takes. Requires a CUDA GPU:
+//! rest leaves the checkpoint usable. The split prefill is compared with one call prefilling
+//! the whole prompt: its recurrent states lie within 0.05 (relative L2) of the one call's, the
+//! bound `cuda_warm_append_test` holds a continued prefill to, and its first token is the one
+//! call's or its near tie; the time each takes is printed. Requires a CUDA GPU:
 //!
 //!   LUMEN_PREFIX_CHECKPOINT_MODEL=/path/to/model.lbc [LUMEN_PREFIX_CHECKPOINT_KV=f32|f16|bf16] \
 //!     cargo test --release -p lumen-runtime --features test-state-snapshot \
@@ -160,6 +162,16 @@ fn differs(got: &StateSnapshot, want: &StateSnapshot, block: usize, head_dim: us
     ]
 }
 
+/// Relative L2 distance of `got` from `want`.
+fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
+    let (mut d, mut n) = (0f64, 0f64);
+    for (&x, &y) in got.iter().zip(want) {
+        d += f64::from(x - y).powi(2);
+        n += f64::from(y).powi(2);
+    }
+    (d / n).sqrt()
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -299,6 +311,7 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
             bits(&want_logits),
             "{tag}: after a refused rest"
         );
+        let split_state = f32_store.then(|| cuda.snapshot_state(&kv).expect("snapshot"));
 
         // The whole prompt in one call, beside the split one.
         cuda.reset_recurrent_state();
@@ -311,8 +324,20 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
         let hidden = cuda.prefill(&prompt, &provider, &mut kv).expect("one call");
         let one_call = logits_of(&cuda, &hidden);
         let (split, whole) = (top2(&want_logits), top2(&one_call));
+        let logits_apart = rel_l2(&want_logits, &one_call);
+        let states_apart = split_state.map(|split| {
+            let whole = cuda.snapshot_state(&kv).expect("snapshot");
+            rel_l2(&split.h_states.concat(), &whole.h_states.concat())
+        });
+        if let Some(apart) = states_apart {
+            assert!(
+                apart <= 0.05,
+                "{tag}: the split prefill's recurrent states are {apart:.3e} from one call's"
+            );
+        }
         println!(
-            "{tag}: one call chooses {} (then {}), split {} (then {}): {}",
+            "{tag}: one call chooses {} (then {}), split {} (then {}): {}; logits {logits_apart:.3e} \
+             apart, recurrent states {}",
             whole.0,
             whole.1,
             split.0,
@@ -321,7 +346,8 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
                 (true, _) => "same token",
                 (false, true) => "near tie",
                 (false, false) => "DIFFERENT",
-            }
+            },
+            states_apart.map_or("not read".into(), |apart| format!("{apart:.3e}"))
         );
         assert!(
             whole.0 == split.0 || (whole.1 == split.0 && split.1 == whole.0),
