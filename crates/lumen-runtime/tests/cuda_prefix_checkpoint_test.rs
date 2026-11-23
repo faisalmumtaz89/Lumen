@@ -7,9 +7,10 @@
 //! must differ), and the rest's logits and 64 greedy tokens must be the first run's bit for
 //! bit. Nothing but a longer prompt that starts with the kept tokens restores, and a refused
 //! rest leaves the checkpoint usable. The split prefill is compared with one call prefilling
-//! the whole prompt: its recurrent states lie within 0.05 (relative L2) of the one call's, the
-//! bound `cuda_warm_append_test` holds a continued prefill to; the distance between their
-//! logits, each one's first two tokens and the time each takes are printed. Requires a CUDA GPU:
+//! the whole prompt: its logits lie within 0.25 (relative L2) of the one call's, the bound
+//! `cuda_native_prefill_test` holds two prefill routes to, and on an F32 KV store its recurrent
+//! states within 0.05, the bound `cuda_warm_append_test` holds a continued prefill to. Each
+//! one's winner and runner-up and the time each takes are printed. Requires a CUDA GPU:
 //!
 //!   LUMEN_PREFIX_CHECKPOINT_MODEL=/path/to/model.lbc [LUMEN_PREFIX_CHECKPOINT_KV=f32|f16|bf16] \
 //!     cargo test --release -p lumen-runtime --features test-state-snapshot \
@@ -329,15 +330,9 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
             let whole = cuda.snapshot_state(&kv).expect("snapshot");
             rel_l2(&split.h_states.concat(), &whole.h_states.concat())
         });
-        if let Some(apart) = states_apart {
-            assert!(
-                apart <= 0.05,
-                "{tag}: the split prefill's recurrent states are {apart:.3e} from one call's"
-            );
-        }
         println!(
-            "{tag}: one call chooses {} (then {}), split {} (then {}), which one call holds {:.3} \
-             logits lower; logits {logits_apart:.3e} apart, recurrent states {}",
+            "{tag}: one call chooses {} (runner-up {}), split {} (runner-up {}), which one call \
+             holds {:.3} logits lower; logits {logits_apart:.3e} apart, recurrent states {}",
             whole.0,
             whole.1,
             split.0,
@@ -345,6 +340,16 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
             one_call[whole.0 as usize] - one_call[split.0 as usize],
             states_apart.map_or("not read".into(), |apart| format!("{apart:.3e}"))
         );
+        assert!(
+            logits_apart <= 0.25,
+            "{tag}: the split prefill's logits are {logits_apart:.3e} from one call's"
+        );
+        if let Some(apart) = states_apart {
+            assert!(
+                apart <= 0.05,
+                "{tag}: the split prefill's recurrent states are {apart:.3e} from one call's"
+            );
+        }
     }
 
     // Milliseconds from a request's first token to its logits, median of 7 after one unmeasured
