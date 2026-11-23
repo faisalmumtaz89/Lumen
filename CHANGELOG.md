@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 
 ## [Unreleased]
 
+## [0.52.0] — 2026-11-23
+
 ### Changed
 
 - **On CUDA a repeated system block is prefilled once.** A model with recurrent (GDN) layers restarted cold for
@@ -2401,7 +2403,8 @@ For pre-`0.1.0` commit-level history see the git log. Notable cumulative work:
 
 - Documentation pass (2026-06-02): added the `docs/` tree, `CONTRIBUTING.md`, `SECURITY.md`, and `CHANGELOG.md`; fixed README hero numbers and the vLLM prefill ratio (2.29× → 2.62×).
 
-[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.51.0...HEAD
+[unreleased]: https://github.com/faisalmumtaz89/Lumen/compare/v0.52.0...HEAD
+[0.52.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.1...v0.50.0
 [0.49.1]: https://github.com/faisalmumtaz89/Lumen/compare/v0.49.0...v0.49.1
