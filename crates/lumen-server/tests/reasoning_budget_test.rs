@@ -120,6 +120,7 @@ fn job(max_tokens: usize, enable_thinking: bool, reasoning_budget: usize) -> Job
         enable_thinking,
         reasoning_budget,
         response_prefix: String::new(),
+        leading_block: None,
     }
 }
 

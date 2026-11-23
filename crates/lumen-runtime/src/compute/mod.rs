@@ -483,6 +483,42 @@ pub trait ComputeBackend: Send + Sync {
     /// that state itself: a backend serves one live hybrid sequence at a time.
     fn reset_recurrent_state(&self) {}
 
+    /// Continue from the backend's prefix checkpoint instead of a cold start.
+    ///
+    /// When the backend holds a checkpoint whose tokens are the first tokens
+    /// of `tokens` and fewer than them, the sequence state is put back to the
+    /// end of those tokens, the empty `kv` is advanced to that length, and the
+    /// length is returned: the caller prefills the rest from there. `None`
+    /// leaves everything as it was. A checkpoint lasts until the next
+    /// [`Self::reset_recurrent_state`]. The default keeps no checkpoint.
+    fn restore_prefix_checkpoint(
+        &self,
+        _tokens: &[u32],
+        _kv: &mut KvCache,
+    ) -> Result<Option<usize>, RuntimeError> {
+        Ok(None)
+    }
+
+    /// Whether [`Self::prefill_and_checkpoint`] keeps a prefix checkpoint.
+    fn keeps_prefix_checkpoint(&self) -> bool {
+        false
+    }
+
+    /// Cold-start the sequence with `block` in the empty `kv`, as
+    /// [`Self::reset_recurrent_state`] and [`Self::prefill`] do, and keep a
+    /// prefix checkpoint at its end for [`Self::restore_prefix_checkpoint`].
+    /// Only for a backend whose [`Self::keeps_prefix_checkpoint`] is true.
+    fn prefill_and_checkpoint(
+        &self,
+        _block: &[u32],
+        _weights: &dyn WeightProvider,
+        _kv: &mut KvCache,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "this backend keeps no prefix checkpoint".into(),
+        ))
+    }
+
     /// Reconcile speculative decode-ahead with the host KV cursor before a
     /// warm append repairs the un-fed tail token.
     ///

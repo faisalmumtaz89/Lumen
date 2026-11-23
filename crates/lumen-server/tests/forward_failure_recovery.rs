@@ -137,6 +137,7 @@ fn job(prompt: &[u32]) -> JobRequest {
         enable_thinking: false,
         reasoning_budget: 0,
         response_prefix: String::new(),
+        leading_block: None,
     }
 }
 

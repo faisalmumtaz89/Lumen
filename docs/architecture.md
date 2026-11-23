@@ -43,7 +43,7 @@ The converter accepts GGUF v2/v3, streams one layer at a time, re-quantizes or p
 
 ## Suffix prefill
 
-Each `Session` records its prompt history. On the next turn, `Session::extend_with_cache` reuses the longest shared prefix from the prior turn's KV cache and only recomputes the new suffix, so a cache-hit turn skips reprocessing the shared prefix and is substantially faster than a cold prefill. On a GDN model a prompt that departs from the history is prefilled cold, since the recurrent state cannot be rolled back. (Cache-reuse throughput is not part of the published benchmark suite.)
+Each `Session` records its prompt history. On the next turn, `Session::extend_with_cache` reuses the longest shared prefix from the prior turn's KV cache and only recomputes the new suffix, so a cache-hit turn skips reprocessing the shared prefix and is substantially faster than a cold prefill. On a GDN model a prompt that departs from the history is prefilled cold, since the recurrent state cannot be rolled back. On CUDA the cold restart can start from a prefix checkpoint instead: the backend keeps one copy of every GDN layer's recurrent state at the end of the prompt's leading block (the rendered system turn, tools included, up to the first user text) when a prompt and the history it departs from share that whole block of at least `Session::MIN_CHECKPOINT_TOKENS` tokens, and a later prompt that starts with the same tokens restores it and prefills only the rest. The block's attention rows are not copied (they stay in the KV cache), so the next start from position 0 ends the checkpoint. (Cache-reuse throughput is not part of the published benchmark suite.)
 
 ## Kernel surface
 

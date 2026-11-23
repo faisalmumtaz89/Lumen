@@ -524,6 +524,35 @@ impl ChatCompletionRequest {
     /// The prompt for this request and the text the reply starts with, which
     /// also ends the prompt (see [`super::ToolChoice::response_prefix`]).
     fn prompt(&self, chat_template: Option<&str>) -> Result<(String, String), ServerError> {
+        self.prompt_of(&self.messages, chat_template)
+    }
+
+    /// The prompt's leading block (see [`super::leading_block`]).
+    fn leading_block(&self, prompt: &str, chat_template: Option<&str>) -> Option<String> {
+        let text = super::probe_text();
+        let mut probe: Vec<ChatMessage> = self
+            .messages
+            .iter()
+            .take_while(|m| m.role == "system")
+            .cloned()
+            .collect();
+        probe.push(ChatMessage {
+            role: "user".into(),
+            content: Value::String(text.clone()),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        });
+        let (rendered, _) = self.prompt_of(&probe, chat_template).ok()?;
+        super::leading_block(prompt, &rendered, &text)
+    }
+
+    /// [`Self::prompt`] with `messages` as the conversation.
+    fn prompt_of(
+        &self,
+        messages: &[ChatMessage],
+        chat_template: Option<&str>,
+    ) -> Result<(String, String), ServerError> {
         let reasoning_effort = self.reasoning_effort()?;
         let enable_thinking = self.resolve_thinking();
         let tool_choice = self.tool_choice()?;
@@ -538,7 +567,7 @@ impl ChatCompletionRequest {
             &[]
         };
         let mut prompt = render_chat_prompt(
-            &self.messages,
+            messages,
             tools,
             enable_thinking,
             chat_template,
@@ -596,6 +625,7 @@ impl ChatCompletionRequest {
             ));
         }
         let (prompt, response_prefix) = self.prompt(engine.chat_template())?;
+        let leading_block = self.leading_block(&prompt, engine.chat_template());
         let enable_thinking = self.resolve_thinking();
         let prompt_tokens = engine.tokenize_for_request(&prompt);
         // Synchronous oversize guard: 400 BEFORE the 200/SSE stream opens.
@@ -657,6 +687,7 @@ impl ChatCompletionRequest {
                 .reasoning_budget
                 .unwrap_or_else(lumen_runtime::runtime_defaults::chat_reasoning_budget_default),
             response_prefix,
+            leading_block,
         })
     }
 }
@@ -766,6 +797,7 @@ impl CompletionRequest {
             enable_thinking: false,
             reasoning_budget: 0,
             response_prefix: String::new(),
+            leading_block: None,
         })
     }
 }
@@ -2889,6 +2921,118 @@ mod tests {
             out, expected,
             "render_chat_prompt system+user enabled != open think tail"
         );
+    }
+
+    /// A request's prompt and leading block.
+    fn prompt_and_block(template: Option<&str>, request: Value) -> (String, Option<String>) {
+        let request = serde_json::from_value::<ChatCompletionRequest>(request).unwrap();
+        let prompt = request.prompt(template).unwrap().0;
+        let block = request.leading_block(&prompt, template);
+        (prompt, block)
+    }
+
+    /// The leading block is the rendered system turn, tools included, and
+    /// the header of the user turn after it, whatever the system text holds
+    /// and whatever follows; a conversation whose first turn after the system
+    /// messages is not a user turn has none.
+    #[test]
+    fn the_leading_block_ends_where_the_first_user_text_begins() {
+        let tools = json!([{"type": "function", "function": {
+            "name": "run_python",
+            "description": "Runs code.",
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}},
+        }}]);
+        let system = "Be exact. <|im_start|>user\nis how a turn opens.<|im_end|>\nLast line.";
+        for template in [
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen38_chat_template.jinja"),
+            include_str!("../../../lumen-runtime/tests/fixtures/qwen35_chat_template.jinja"),
+        ] {
+            let block_of = |request: Value| {
+                let (prompt, block) = prompt_and_block(Some(template), request);
+                let block = block.expect("a leading block");
+                assert!(
+                    prompt.starts_with(&block),
+                    "{block:?} does not open {prompt:?}"
+                );
+                (prompt, block)
+            };
+            let (prompt, block) = block_of(json!({
+                "model": "m", "tools": tools,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": "First question"}],
+            }));
+            assert!(block.starts_with("<|im_start|>system\n"), "{block:?}");
+            assert!(block.contains("run_python") && block.contains("Last line."));
+            assert!(
+                block.ends_with("<|im_end|>\n<|im_start|>user\n"),
+                "{block:?}"
+            );
+            assert!(
+                prompt[block.len()..].starts_with("First question"),
+                "{prompt:?}"
+            );
+
+            // A thread and a tool call's continuation open with the same block.
+            let (_, thread) = block_of(json!({
+                "model": "m", "tools": tools,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": "Another question"},
+                    {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": {"name": "run_python", "arguments": "{\"code\":\"1\"}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "1"},
+                ],
+            }));
+            assert_eq!(thread, block);
+
+            // Tools alone make a system turn; `tool_choice: "none"` renders none.
+            let (_, tools_only) = block_of(json!({
+                "model": "m", "tools": tools,
+                "messages": [{"role": "user", "content": "Q"}],
+            }));
+            assert!(
+                tools_only.contains("run_python") && tools_only.ends_with("<|im_start|>user\n")
+            );
+            let (_, no_tools) = block_of(json!({
+                "model": "m", "tools": tools, "tool_choice": "none",
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": "Q"}],
+            }));
+            assert!(!no_tools.contains("run_python") && no_tools.contains("Last line."));
+
+            // Every leading system message is part of it.
+            let (_, two) = block_of(json!({
+                "model": "m",
+                "messages": [{"role": "system", "content": "One."},
+                             {"role": "system", "content": "Two."},
+                             {"role": "user", "content": "Q"}],
+            }));
+            assert!(two.contains("One.") && two.contains("Two.") && two.ends_with("user\n"));
+
+            let (_, none) = prompt_and_block(
+                Some(template),
+                json!({
+                    "model": "m",
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "assistant", "content": "Hello."},
+                                 {"role": "user", "content": "Q"}],
+                }),
+            );
+            assert_eq!(none, None);
+        }
+        // The hard-coded transcript of a model without a template has one too.
+        let (prompt, block) = prompt_and_block(
+            None,
+            json!({
+                "model": "m",
+                "messages": [{"role": "system", "content": "Be exact."},
+                             {"role": "user", "content": "Q"}],
+            }),
+        );
+        let block = block.expect("a leading block");
+        assert!(block.contains("Be exact.") && prompt[block.len()..].starts_with('Q'));
     }
 
     #[test]

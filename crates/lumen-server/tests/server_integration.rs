@@ -1790,6 +1790,7 @@ fn make_job_request(max_tokens: usize) -> JobRequest {
         enable_thinking: false,
         reasoning_budget: 0,
         response_prefix: String::new(),
+        leading_block: None,
     }
 }
 
@@ -2647,6 +2648,7 @@ fn make_stop_job_request(max_tokens: usize, stop: Vec<String>) -> JobRequest {
         enable_thinking: false,
         reasoning_budget: 0,
         response_prefix: String::new(),
+        leading_block: None,
     }
 }
 

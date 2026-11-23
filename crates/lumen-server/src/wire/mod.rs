@@ -135,6 +135,23 @@ pub(crate) fn part_text(part: &serde_json::Map<String, Value>) -> Option<Cow<'_,
 /// across process restarts. No bit-mixing is done here: the seed is avalanched
 /// downstream by `Xorshift64::new` (`lumen_runtime::sampling`), so distinct
 /// inputs are sufficient for distinct, well-separated RNG streams.
+/// A user message text for the probe conversation [`leading_block`] reads,
+/// which no request's own content holds.
+pub(crate) fn probe_text() -> String {
+    format!("\u{1}{:016x}\u{1}", next_random_seed())
+}
+
+/// The leading block of `prompt`: the text of `probe` before `probe_text`,
+/// where `probe` is the prompt of the conversation made of the request's
+/// leading system messages and one user message `probe_text`, rendered with
+/// the request's tools and settings. Any conversation with those system
+/// messages, tools and settings whose next message is a user message renders
+/// that text first. `None` when `prompt` does not start with it.
+pub(crate) fn leading_block(prompt: &str, probe: &str, probe_text: &str) -> Option<String> {
+    let block = &probe[..probe.find(probe_text)?];
+    prompt.starts_with(block).then(|| block.to_owned())
+}
+
 pub(crate) fn next_random_seed() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     static START: OnceLock<u64> = OnceLock::new();
