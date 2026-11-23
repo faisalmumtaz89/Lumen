@@ -137,7 +137,7 @@ curl -fsS http://localhost:8000/v1/chat/completions \
 
 - `temperature: 0` is greedy/deterministic **regardless of seed**.
 - The Anthropic `/v1/messages` schema has no `seed` field, so it always uses a fresh random seed (matching the upstream Anthropic API).
-- These are two independent properties: the **kernels** are byte-deterministic for fixed inputs (same seed + params ⇒ same tokens; for an NVFP4/FP8 artifact on CUDA, while its measured GEMM plan table stays the same and the request neither continues the one the server ran before it, prompt and reply, nor opens with a leading block the server has kept — see [troubleshooting.md](troubleshooting.md)), while **sampling output varies by default** because the seed is randomized per request. Pin the `seed` to combine both into reproducible output.
+- These are two independent properties: the **kernels** are byte-deterministic for fixed inputs (same seed + params ⇒ same tokens; for an NVFP4/FP8 artifact on CUDA, while its measured GEMM plan table stays the same and the request neither continues the one the server ran before it, prompt and reply, nor keeps a leading block or opens with one the server has kept — see [troubleshooting.md](troubleshooting.md)), while **sampling output varies by default** because the seed is randomized per request. Pin the `seed` to combine both into reproducible output.
 
 ## Reasoning / extended thinking
 
