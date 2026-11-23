@@ -7,10 +7,13 @@
 //! must differ), and the rest's logits and 64 greedy tokens must be the first run's bit for
 //! bit. Nothing but a longer prompt that starts with the kept tokens restores, and a refused
 //! rest leaves the checkpoint usable. The split prefill is compared with one call prefilling
-//! the whole prompt: its logits lie within 0.25 (relative L2) of the one call's, the bound
-//! `cuda_native_prefill_test` holds two prefill routes to, and on an F32 KV store its recurrent
-//! states within 0.05, the bound `cuda_warm_append_test` holds a continued prefill to. Each
-//! one's winner and runner-up and the time each takes are printed. Requires a CUDA GPU:
+//! the whole prompt: on an F32 KV store its recurrent states lie within 0.05 (relative L2) of
+//! the one call's, the bound `cuda_warm_append_test` holds a continued prefill to (measured on
+//! Qwen3.8-27B NVFP4: up to 2.6e-2; a capture that keeps zeroed states lands 0.93 away). A
+//! 16-bit store has no state snapshot, and there the logits do not tell that capture (0.08 to
+//! 0.18 from the one call's) from the route's rounding (0.02 to 0.04) by a margin worth
+//! asserting, so the distance between the logits, each one's winner and runner-up and the time
+//! each takes are printed. Requires a CUDA GPU:
 //!
 //!   LUMEN_PREFIX_CHECKPOINT_MODEL=/path/to/model.lbc [LUMEN_PREFIX_CHECKPOINT_KV=f32|f16|bf16] \
 //!     cargo test --release -p lumen-runtime --features test-state-snapshot \
@@ -339,10 +342,6 @@ fn a_restore_puts_the_sequence_back_to_the_end_of_its_block() {
             split.1,
             one_call[whole.0 as usize] - one_call[split.0 as usize],
             states_apart.map_or("not read".into(), |apart| format!("{apart:.3e}"))
-        );
-        assert!(
-            logits_apart <= 0.25,
-            "{tag}: the split prefill's logits are {logits_apart:.3e} from one call's"
         );
         if let Some(apart) = states_apart {
             assert!(
