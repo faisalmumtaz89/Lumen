@@ -12,7 +12,7 @@ free GitHub-hosted runners. GPUs are needed only to *validate*:
 
 | Workflow | Trigger | Runner | Cost / risk |
 |---|---|---|---|
-| `ci.yml` | every push + PR | hosted ubuntu + macos-14 | free — build both binaries, CPU tests, lint, link-audit |
+| `ci.yml` | every push + PR | hosted ubuntu + macos-15 | free — build both binaries, CPU tests, lint, link-audit |
 | `validate-cuda-modal.yml` | push main / PR (same-repo) / weekly / manual | hosted ubuntu → **Modal** | Modal $ — A100 smoke; skips docs-only PRs; full matrix on manual dispatch |
 | `validate-metal.yml` | push main / manual | **self-hosted Mac** | your Mac's GPU; **never** fork PRs |
 | `release.yml` | tag `v*` (SemVer) | hosted (+ Modal + Mac to validate) | **build → validate the exact bytes → publish only if green** |
