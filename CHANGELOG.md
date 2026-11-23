@@ -21,7 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
   is prefilled in two calls and took 7 to 21 ms longer than before, each time the block is kept. A request sent
   again with the same seed gets the same reply whether its block was kept or restored. On the native NVFP4/FP8
   prefill route that reply can be worded differently from the one the request gets without the kept block, as a
-  continued conversation's can: the logits after the two-call prefill were 2.3% to 3.7% (relative L2, two sessions)
+  continued conversation's can: the logits after the two-call prefill were 2.3% to 3.7% (relative L2, three sessions)
   from the one-call prefill's, on the F32 prefill route at most 2.1e-6. The kept state takes device memory at load,
   counted in the load-time plan (about 160 MiB for Qwen3.8-27B). A request that opens with another block ends it, so
   a client that wants the reuse keeps its system text, tool list and reasoning setting the same across requests.
